@@ -4,6 +4,7 @@
 //
 // This sets the correct bcrypt hashes for the demo accounts.
 require('dotenv').config();
+console.log("DB URL:", process.env.DATABASE_URL);
 const bcrypt = require('bcryptjs');
 const pool   = require('./pool');
 
