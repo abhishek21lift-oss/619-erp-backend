@@ -1,7 +1,7 @@
 // src/routes/reports.js
 const router = require('express').Router();
 const pool = require('../db/pool');
-const { auth } = require('../middleware/auth');
+const { auth, adminOnly } = require('../middleware/auth');
 
 // GET /api/reports/monthly
 router.get('/monthly', auth, async (req, res) => {
@@ -30,9 +30,8 @@ router.get('/monthly', auth, async (req, res) => {
   }
 });
 
-// GET /api/reports/trainer-summary
-router.get('/trainer-summary', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+// GET /api/reports/trainer-summary (admin only)
+router.get('/trainer-summary', auth, adminOnly, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
@@ -57,13 +56,19 @@ router.get('/trainer-summary', auth, async (req, res) => {
 router.get('/dues', auth, async (req, res) => {
   try {
     const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
+    const params = [];
+    let where = 'c.balance_amount > 0';
+    if (tid) {
+      params.push(tid);
+      where += ` AND c.trainer_id = $${params.length}`;
+    }
     const { rows } = await pool.query(`
       SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name,
              c.balance_amount, c.pt_end_date, c.status
       FROM clients c
-      WHERE c.balance_amount > 0
-        ${tid ? "AND c.trainer_id='" + tid + "'" : ''}
-      ORDER BY c.balance_amount DESC LIMIT 100`
+      WHERE ${where}
+      ORDER BY c.balance_amount DESC LIMIT 100`,
+      params
     );
     res.json(rows);
   } catch (err) {

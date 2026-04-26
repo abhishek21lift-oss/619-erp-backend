@@ -4,7 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt    = require('jsonwebtoken');
 const { v4: uuid } = require('uuid');
 const pool   = require('../db/pool');
-const { auth } = require('../middleware/auth');
+const { auth, adminOnly } = require('../middleware/auth');
 
 // POST /api/auth/login
 router.post('/login', async (req, res) => {
@@ -47,29 +47,45 @@ router.get('/me', auth, (req, res) => {
 });
 
 // PUT /api/auth/change-password
-router.put('/change-password', auth, async (req, res) => {
+// Also accepts POST for backwards compatibility with older frontend builds
+async function changePasswordHandler(req, res) {
   try {
-    const { currentPassword, newPassword } = req.body;
+    // Accept both new and legacy field names so a stale frontend still works
+    const currentPassword =
+      req.body.currentPassword ?? req.body.current ?? req.body.oldPassword;
+    const newPassword =
+      req.body.newPassword ?? req.body.newPw ?? req.body.password;
+
     if (!currentPassword || !newPassword)
-      return res.status(400).json({ error: 'Both passwords required' });
-    if (newPassword.length < 6)
+      return res.status(400).json({ error: 'Both current and new password are required' });
+    if (typeof newPassword !== 'string' || newPassword.length < 6)
       return res.status(400).json({ error: 'New password must be at least 6 characters' });
 
-    const { rows } = await pool.query('SELECT password FROM users WHERE id = $1', [req.user.id]);
+    const { rows } = await pool.query(
+      'SELECT password FROM users WHERE id = $1', [req.user.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+
     const valid = await bcrypt.compare(currentPassword, rows[0].password);
-    if (!valid) return res.status(401).json({ error: 'Current password incorrect' });
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
 
     const hashed = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [hashed, req.user.id]);
+    await pool.query(
+      'UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2',
+      [hashed, req.user.id]
+    );
     res.json({ message: 'Password changed successfully' });
   } catch (err) {
+    console.error('Change password error:', err.message);
     res.status(500).json({ error: 'Server error' });
   }
-});
+}
+router.put('/change-password', auth, changePasswordHandler);
+router.post('/change-password', auth, changePasswordHandler);
 
 // POST /api/auth/create-user  (admin only)
-router.post('/create-user', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+// Also accepts /users for compatibility with older frontend builds
+async function createUserHandler(req, res) {
   try {
     const { name, email, password, role = 'trainer', trainer_id } = req.body;
     if (!name || !email || !password)
@@ -92,13 +108,16 @@ router.post('/create-user', auth, async (req, res) => {
     );
     res.status(201).json({ message: 'User created', user: { id, name, email: email.toLowerCase(), role } });
   } catch (err) {
+    console.error('Create user error:', err.message);
     res.status(500).json({ error: 'Server error' });
   }
-});
+}
+router.post('/create-user', auth, adminOnly, createUserHandler);
+// Compatibility alias — the frontend at one point posted here
+router.post('/users', auth, adminOnly, createUserHandler);
 
 // GET /api/auth/users  (admin only)
-router.get('/users', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+router.get('/users', auth, adminOnly, async (req, res) => {
   try {
     const { rows } = await pool.query(
       'SELECT id, name, email, role, trainer_id, is_active, last_login, created_at FROM users ORDER BY created_at DESC'
@@ -110,8 +129,7 @@ router.get('/users', auth, async (req, res) => {
 });
 
 // PUT /api/auth/users/:id/toggle  (admin only)
-router.put('/users/:id/toggle', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+router.put('/users/:id/toggle', auth, adminOnly, async (req, res) => {
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot disable yourself' });
   try {
     const { rows } = await pool.query(
@@ -126,8 +144,7 @@ router.put('/users/:id/toggle', auth, async (req, res) => {
 });
 
 // DELETE /api/auth/users/:id (admin only)
-router.delete('/users/:id', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+router.delete('/users/:id', auth, adminOnly, async (req, res) => {
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
   try {
     await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);

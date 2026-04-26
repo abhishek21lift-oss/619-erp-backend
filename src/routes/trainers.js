@@ -4,9 +4,22 @@ const { v4: uuid } = require('uuid');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
 
+// Fields a non-admin (trainer) is allowed to see about other trainers.
+// Salary, incentive_rate, address, dob, certifications etc. are scrubbed.
+function scrubForNonAdmin(t) {
+  if (!t) return t;
+  const {
+    salary, incentive_rate, address, dob, gender, mobile, email,
+    certifications, notes,
+    ...safe
+  } = t;
+  return safe;
+}
+
 // GET /api/trainers
 router.get('/', auth, async (req, res) => {
   try {
+    const isAdmin = req.user.role === 'admin';
     const { rows } = await pool.query(`
       SELECT t.*,
         COUNT(c.id) FILTER (WHERE c.status='active')  AS active_clients,
@@ -19,15 +32,16 @@ router.get('/', auth, async (req, res) => {
       GROUP BY t.id
       ORDER BY t.name`);
 
-    const withIncentive = rows.map(t => ({
+    const enriched = rows.map(t => ({
       ...t,
       active_clients:  parseInt(t.active_clients),
       total_clients:   parseInt(t.total_clients),
       month_revenue:   parseFloat(t.month_revenue),
       all_time_revenue:parseFloat(t.all_time_revenue),
-      month_incentive: Math.round(parseFloat(t.month_revenue) * parseFloat(t.incentive_rate||0.5))
+      month_incentive: Math.round(parseFloat(t.month_revenue) * parseFloat(t.incentive_rate ?? 0.5))
     }));
-    res.json(withIncentive);
+
+    res.json(isAdmin ? enriched : enriched.map(scrubForNonAdmin));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -38,6 +52,11 @@ router.get('/:id', auth, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM trainers WHERE id=$1', [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Trainer not found' });
+    const isAdmin = req.user.role === 'admin';
+    // Trainers can only see their own full record; otherwise scrub sensitive fields
+    if (!isAdmin && req.user.trainer_id !== rows[0].id) {
+      return res.json(scrubForNonAdmin(rows[0]));
+    }
     res.json(rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });

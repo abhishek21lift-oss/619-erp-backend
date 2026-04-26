@@ -58,8 +58,12 @@ router.post('/', auth, async (req, res) => {
 // GET /api/attendance/today-summary
 router.get('/today-summary', auth, async (req, res) => {
   try {
-    const trainerFilter = req.user.role === 'trainer' && req.user.trainer_id
-      ? `AND a.trainer_id = '${req.user.trainer_id}'` : '';
+    const params = [];
+    let trainerFilter = '';
+    if (req.user.role === 'trainer' && req.user.trainer_id) {
+      params.push(req.user.trainer_id);
+      trainerFilter = `AND a.trainer_id = $${params.length}`;
+    }
 
     const { rows } = await pool.query(`
       SELECT
@@ -68,7 +72,8 @@ router.get('/today-summary', auth, async (req, res) => {
         COUNT(*) FILTER (WHERE a.status='late')    AS late,
         COUNT(*)                                    AS total
       FROM attendance a
-      WHERE a.date = CURRENT_DATE AND a.type = 'client' ${trainerFilter}`
+      WHERE a.date = CURRENT_DATE AND a.type = 'client' ${trainerFilter}`,
+      params
     );
     res.json(rows[0]);
   } catch (err) {
