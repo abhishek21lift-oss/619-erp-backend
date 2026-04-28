@@ -47,17 +47,63 @@ router.get('/', auth, async (req, res) => {
   }
 });
 
-// GET /api/trainers/:id
+// GET /api/trainers/:id  — full profile incl. clients + recent payments + KPIs
 router.get('/:id', auth, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM trainers WHERE id=$1', [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Trainer not found' });
+
     const isAdmin = req.user.role === 'admin';
-    // Trainers can only see their own full record; otherwise scrub sensitive fields
+    const trainer = (!isAdmin && req.user.trainer_id !== rows[0].id)
+      ? scrubForNonAdmin(rows[0])
+      : rows[0];
+
+    // Aggregated stats for this trainer
+    const { rows: stats } = await pool.query(`
+      SELECT
+        (SELECT COUNT(*) FROM clients WHERE trainer_id=$1)::int                                  AS total_clients,
+        (SELECT COUNT(*) FROM clients WHERE trainer_id=$1 AND status='active')::int              AS active_clients,
+        (SELECT COUNT(*) FROM clients WHERE trainer_id=$1 AND status='expired')::int             AS expired_clients,
+        (SELECT COALESCE(SUM(balance_amount),0) FROM clients WHERE trainer_id=$1)::float          AS total_dues,
+        (SELECT COALESCE(SUM(amount),0) FROM payments WHERE trainer_id=$1)::float                 AS lifetime_revenue,
+        (SELECT COALESCE(SUM(amount),0) FROM payments
+          WHERE trainer_id=$1 AND date >= DATE_TRUNC('month', NOW()))::float                       AS month_revenue,
+        (SELECT COALESCE(SUM(incentive_amt),0) FROM payments
+          WHERE trainer_id=$1 AND date >= DATE_TRUNC('month', NOW()))::float                       AS month_incentive
+    `, [req.params.id]);
+
+    // Their clients
+    const { rows: clients } = await pool.query(`
+      SELECT id, client_id, name, mobile, package_type, pt_end_date,
+             status, balance_amount, paid_amount, final_amount
+      FROM clients WHERE trainer_id=$1
+      ORDER BY created_at DESC LIMIT 100
+    `, [req.params.id]);
+
+    // Recent payments collected by this trainer
+    const { rows: payments } = await pool.query(`
+      SELECT id, client_name, amount, method, date, receipt_no, incentive_amt
+      FROM payments WHERE trainer_id=$1
+      ORDER BY date DESC, created_at DESC LIMIT 30
+    `, [req.params.id]);
+
+    // 6-month revenue trend
+    const { rows: monthly } = await pool.query(`
+      SELECT TO_CHAR(DATE_TRUNC('month', date::date), 'Mon YY') AS month,
+             COALESCE(SUM(amount),0)::float AS revenue
+      FROM payments
+      WHERE trainer_id=$1 AND date >= NOW() - INTERVAL '6 months'
+      GROUP BY DATE_TRUNC('month', date::date)
+      ORDER BY DATE_TRUNC('month', date::date)
+    `, [req.params.id]);
+
+    // Hide salary-related stats from non-admin viewers
     if (!isAdmin && req.user.trainer_id !== rows[0].id) {
-      return res.json(scrubForNonAdmin(rows[0]));
+      delete stats[0].lifetime_revenue;
+      delete stats[0].month_incentive;
     }
-    res.json(rows[0]);
+
+    res.json({ ...trainer, stats: stats[0], clients, payments, monthly });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
