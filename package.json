@@ -8,7 +8,10 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js"
+    "dev": "nodemon src/server.js",
+    "start:v3": "node src/server.v3.js",
+    "dev:v3": "nodemon src/server.v3.js",
+    "worker": "node src/workers/renewal.worker.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

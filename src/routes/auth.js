@@ -10,34 +10,77 @@ const { auth, adminOnly } = require('../middleware/auth');
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+
+    // ── Input validation ───────────────────────────────
     if (!email || !password)
-      return res.status(400).json({ error: 'Email and password required' });
+      return res.status(400).json({ error: 'Email and password are required' });
 
-    const { rows } = await pool.query(
-      'SELECT * FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true',
-      [email.trim()]
-    );
+    if (typeof email !== 'string' || typeof password !== 'string')
+      return res.status(400).json({ error: 'Invalid input format' });
+
+    // ── Fetch user from DB ─────────────────────────────
+    let rows;
+    try {
+      const result = await pool.query(
+        'SELECT * FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true',
+        [email.trim()]
+      );
+      rows = result.rows;
+    } catch (dbErr) {
+      console.error('Login DB error:', dbErr.message);
+      return res.status(500).json({ error: 'Database connection error. Please try again.' });
+    }
+
     const user = rows[0];
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
 
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    // ── Verify password ────────────────────────────────
+    let valid = false;
+    try {
+      valid = await bcrypt.compare(password, user.password);
+    } catch (bcryptErr) {
+      console.error('bcrypt error:', bcryptErr.message);
+      return res.status(500).json({ error: 'Authentication error. Please try again.' });
+    }
 
-    await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
+    if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
+    // ── Update last login (non-critical, don't block on failure) ──
+    pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id])
+      .catch(err => console.warn('last_login update failed (non-critical):', err.message));
+
+    // ── Sign JWT ───────────────────────────────────────
+    if (!process.env.JWT_SECRET) {
+      console.error('CRITICAL: JWT_SECRET is not set!');
+      return res.status(500).json({ error: 'Server configuration error. Contact administrator.' });
+    }
+
+    let token;
+    try {
+      token = jwt.sign(
+        { id: user.id, email: user.email, role: user.role },
+        process.env.JWT_SECRET,
+        { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+      );
+    } catch (jwtErr) {
+      console.error('JWT sign error:', jwtErr.message);
+      return res.status(500).json({ error: 'Token generation failed. Contact administrator.' });
+    }
 
     res.json({
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role, trainer_id: user.trainer_id }
+      user: {
+        id:         user.id,
+        name:       user.name,
+        email:      user.email,
+        role:       user.role,
+        trainer_id: user.trainer_id,
+      },
     });
+
   } catch (err) {
-    console.error('Login error:', err.message);
-    res.status(500).json({ error: 'Server error during login' });
+    console.error('Unexpected login error:', err.message, err.stack);
+    res.status(500).json({ error: 'Unexpected server error. Please try again.' });
   }
 });
 

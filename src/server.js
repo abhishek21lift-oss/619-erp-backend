@@ -1,10 +1,26 @@
-// src/server.js — FINAL FIXED VERSION
-
+// src/server.js
 require('dotenv').config();
-const express    = require('express');
-const cors       = require('cors');
-const helmet     = require('helmet');
-const rateLimit  = require('express-rate-limit');
+
+// ─────────────────────────────────────────────────────
+// ✅ STARTUP ENV CHECKS — fail fast with clear messages
+// ─────────────────────────────────────────────────────
+const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET'];
+const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missing.length) {
+  console.error('❌ Missing required environment variables:', missing.join(', '));
+  console.error('   Set them in your .env file or Render dashboard.');
+  process.exit(1);
+}
+
+if (process.env.JWT_SECRET.length < 16) {
+  console.error('❌ JWT_SECRET is too short (minimum 16 characters). Use a strong random secret.');
+  process.exit(1);
+}
+
+const express   = require('express');
+const cors      = require('cors');
+const helmet    = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -15,7 +31,7 @@ const PORT = process.env.PORT || 5000;
 app.use(helmet({ contentSecurityPolicy: false }));
 
 // ─────────────────────────────
-// ✅ CORS — restricted to FRONTEND_URL + localhost
+// ✅ CORS
 // ─────────────────────────────
 const allowedOrigins = [
   process.env.FRONTEND_URL,
@@ -25,20 +41,18 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: (origin, cb) => {
-    // allow same-origin / curl / server-to-server (no Origin header)
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true);          // curl / server-to-server
     if (allowedOrigins.includes(origin)) return cb(null, true);
+    console.warn('⚠️  CORS blocked origin:', origin);
+    console.warn('   Allowed origins:', allowedOrigins);
     return cb(new Error('CORS: origin not allowed'));
   },
   credentials: true,
-  methods: ['GET','POST','PUT','DELETE','PATCH','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-// ✅ HANDLE PREFLIGHT
-app.options('*', (req, res) => {
-  res.sendStatus(200);
-});
+app.options('*', (req, res) => res.sendStatus(200));
 
 // ─────────────────────────────
 // ✅ BODY PARSING
@@ -47,16 +61,19 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ─────────────────────────────
-// ✅ HEALTH CHECK (before rate limit so monitors don't hit it)
+// ✅ HEALTH CHECK
 // ─────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', app: '619 ERP API' });
-});
+app.get('/', (req, res) => res.json({ status: 'ok', app: '619 ERP API' }));
 
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     time: new Date().toISOString(),
+    env: {
+      database: !!process.env.DATABASE_URL,
+      jwt:      !!process.env.JWT_SECRET,
+      frontend: process.env.FRONTEND_URL || '(not set)',
+    },
   });
 });
 
@@ -66,32 +83,33 @@ app.get('/api/health', (req, res) => {
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 2000,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
-
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please wait 15 minutes.' },
 });
 
-// Apply general limiter
 app.use('/api/', apiLimiter);
-
-// ✅ APPLY LOGIN LIMITER BEFORE THE AUTH ROUTER (CRITICAL FIX)
 app.post('/api/auth/login', loginLimiter);
 
 // ─────────────────────────────
 // ✅ ROUTES
 // ─────────────────────────────
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/clients', require('./routes/clients'));
-app.use('/api/trainers', require('./routes/trainers'));
-app.use('/api/payments', require('./routes/payments'));
-app.use('/api/dashboard', require('./routes/dashboard'));
+app.use('/api/auth',       require('./routes/auth'));
+app.use('/api/clients',    require('./routes/clients'));
+app.use('/api/trainers',   require('./routes/trainers'));
+app.use('/api/payments',   require('./routes/payments'));
+app.use('/api/dashboard',  require('./routes/dashboard'));
 app.use('/api/attendance', require('./routes/attendance'));
-app.use('/api/reports', require('./routes/reports'));
+app.use('/api/reports',    require('./routes/reports'));
 
 // ─────────────────────────────
-// ✅ 404 HANDLER
+// ✅ 404
 // ─────────────────────────────
 app.use('/api/*', (req, res) => {
   res.status(404).json({ error: `Not found: ${req.method} ${req.path}` });
@@ -103,16 +121,17 @@ app.use('/api/*', (req, res) => {
 app.use((err, req, res, next) => {
   console.error('Server error:', err.message);
   res.status(err.status || 500).json({
-    error: err.message || 'Internal server error'
+    error: err.message || 'Internal server error',
   });
 });
 
 // ─────────────────────────────
-// ✅ START SERVER
+// ✅ START
 // ─────────────────────────────
 app.listen(PORT, () => {
-  console.log(`🚀 API running on http://localhost:${PORT}`);
+  console.log(`🚀 619 ERP API running on port ${PORT}`);
   console.log(`   Health → http://localhost:${PORT}/api/health`);
+  console.log(`   ENV    → DATABASE_URL ✅  JWT_SECRET ✅  FRONTEND_URL: ${process.env.FRONTEND_URL || '⚠️ not set'}`);
 });
 
 module.exports = app;
