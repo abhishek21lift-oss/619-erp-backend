@@ -37,6 +37,24 @@ router.post('/', auth, async (req, res) => {
     if (!d.ref_id || !d.date || !d.type)
       return res.status(400).json({ error: 'ref_id, date, type required' });
 
+    // ── RBAC: trainers can only mark attendance for clients/trainers assigned to them ──
+    if (req.user.role === 'trainer') {
+      if (d.type === 'client') {
+        const { rows: own } = await pool.query(
+          'SELECT trainer_id FROM clients WHERE id=$1', [d.ref_id]
+        );
+        if (!own[0]) return res.status(404).json({ error: 'Client not found' });
+        if (own[0].trainer_id !== req.user.trainer_id)
+          return res.status(403).json({ error: 'Access denied: client is not assigned to you' });
+      } else if (d.type === 'trainer') {
+        // Trainers can only mark their own attendance, never another trainer's
+        if (d.ref_id !== req.user.trainer_id)
+          return res.status(403).json({ error: 'Access denied' });
+      }
+      // Force trainer_id to the authenticated trainer — never trust client input
+      d.trainer_id = req.user.trainer_id;
+    }
+
     const id = uuid();
     await pool.query(`
       INSERT INTO attendance (id,type,ref_id,ref_name,trainer_id,trainer_name,date,check_in,check_out,status,notes)

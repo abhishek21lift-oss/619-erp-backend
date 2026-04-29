@@ -94,7 +94,10 @@ router.get('/:id', auth, async (req, res) => {
     );
     if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
 
-    if (req.user.role === 'trainer' && rows[0].trainer_id !== req.user.trainer_id)
+    // Trainer can only see their own clients.
+    // Treat a trainer with no trainer_id as having no access (defensive).
+    if (req.user.role === 'trainer' &&
+        (!req.user.trainer_id || rows[0].trainer_id !== req.user.trainer_id))
       return res.status(403).json({ error: 'Access denied' });
 
     // Also fetch full history for this client
@@ -141,7 +144,8 @@ router.post('/:id/renew', auth, async (req, res) => {
     const c = existing[0];
 
     // Trainers can only renew their own clients
-    if (req.user.role === 'trainer' && c.trainer_id !== req.user.trainer_id) {
+    if (req.user.role === 'trainer' &&
+        (!req.user.trainer_id || c.trainer_id !== req.user.trainer_id)) {
       await tx.query('ROLLBACK');
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -247,9 +251,16 @@ router.post('/', auth, async (req, res) => {
 
     await client.query('BEGIN');
 
+    // Serialise concurrent client creates so two requests never produce the same FS####.
+    // FOR UPDATE on a single SELECT does NOT block other readers; an advisory lock does.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('clients_seq'))");
+
     // Generate next sequential client ID inside the transaction
     const { rows: last } = await client.query(
-      `SELECT client_id FROM clients ORDER BY client_id DESC LIMIT 1 FOR UPDATE`
+      `SELECT client_id FROM clients
+        WHERE client_id ~ '^FS[0-9]+$'
+        ORDER BY CAST(SUBSTRING(client_id FROM 3) AS INTEGER) DESC
+        LIMIT 1`
     );
     let clientId = 'FS0001';
     if (last[0]?.client_id) {
@@ -262,7 +273,8 @@ router.post('/', auth, async (req, res) => {
     const disc    = num(d.discount,     0);
     const final   = num(d.final_amount, base - disc);
     const paid    = num(d.paid_amount,  0);
-    const balance = final - paid;
+    // Clamp to zero — overpayment shouldn't show as a negative balance.
+    const balance = Math.max(0, final - paid);
 
     // If trainer is adding, force their trainer_id
     const trainer_id = req.user.role === 'trainer' ? req.user.trainer_id : (d.trainer_id || null);
@@ -328,7 +340,8 @@ router.put('/:id', auth, async (req, res) => {
     const d = req.body;
     const { rows: existing } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
     if (!existing[0]) return res.status(404).json({ error: 'Client not found' });
-    if (req.user.role === 'trainer' && existing[0].trainer_id !== req.user.trainer_id)
+    if (req.user.role === 'trainer' &&
+        (!req.user.trainer_id || existing[0].trainer_id !== req.user.trainer_id))
       return res.status(403).json({ error: 'Access denied' });
 
     const base    = num(d.base_amount,   existing[0].base_amount);
@@ -361,7 +374,7 @@ router.put('/:id', auth, async (req, res) => {
        d.gender||null, d.dob||null, d.address||null,
        trainer_id, trainer_name,
        d.pt_start_date||null, d.pt_end_date||null,
-       d.package_type||null, base, disc, final, paid, final-paid,
+       d.package_type||null, base, disc, final, paid, Math.max(0, final-paid),
        d.payment_method||'CASH', d.payment_date||null,
        num(d.weight, null), d.notes||null,
        d.status||existing[0].status,

@@ -62,6 +62,14 @@ router.post('/', auth, async (req, res) => {
       return res.status(404).json({ error: 'Client not found' });
     }
 
+    // ── RBAC: trainers can only record payments for THEIR OWN clients ──
+    // (Without this check, any trainer could post a payment against any client
+    // by guessing/pasting a client_id — breaking the data isolation guarantee.)
+    if (req.user.role === 'trainer' && cl[0].trainer_id !== req.user.trainer_id) {
+      await tx.query('ROLLBACK');
+      return res.status(403).json({ error: 'Access denied: client is not assigned to you' });
+    }
+
     // Get trainer incentive rate — use ?? not || so a legitimate 0 doesn't fall back to 0.5
     let incentiveRate = 0.5;
     if (cl[0].trainer_id) {
