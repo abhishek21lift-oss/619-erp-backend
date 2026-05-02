@@ -7,7 +7,7 @@ const { auth } = require('../middleware/auth');
 // GET /api/attendance?date=YYYY-MM-DD&type=client
 router.get('/', auth, async (req, res) => {
   try {
-    const { date, type = 'client', ref_id } = req.query;
+    const { date, from, to, type = 'client', ref_id } = req.query;
     const conditions = ['1=1'];
     const params = [];
     let p = 1;
@@ -17,11 +17,20 @@ router.get('/', auth, async (req, res) => {
       params.push(req.user.trainer_id);
     }
     if (date)   { conditions.push(`a.date = $${p++}`);   params.push(date); }
+    // Optional inclusive range — leaderboard, footfall, session views use this.
+    if (from)   { conditions.push(`a.date >= $${p++}`);  params.push(from); }
+    if (to)     { conditions.push(`a.date <= $${p++}`);  params.push(to); }
     if (type)   { conditions.push(`a.type = $${p++}`);   params.push(type); }
     if (ref_id) { conditions.push(`a.ref_id = $${p++}`); params.push(ref_id); }
 
+    // When a range is requested raise the row cap so dashboards don't truncate.
+    const limit = (from || to) ? 5000 : 200;
+
     const { rows } = await pool.query(
-      `SELECT a.* FROM attendance a WHERE ${conditions.join(' AND ')} ORDER BY a.date DESC, a.check_in DESC LIMIT 200`,
+      `SELECT a.* FROM attendance a
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY a.date DESC, a.check_in DESC
+       LIMIT ${limit}`,
       params
     );
     res.json(rows);
