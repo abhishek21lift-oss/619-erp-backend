@@ -297,15 +297,15 @@ router.post('/', auth, async (req, res) => {
         id, client_id, name, mobile, email, gender, dob, address,
         trainer_id, trainer_name, joining_date, pt_start_date, pt_end_date,
         package_type, base_amount, discount, final_amount, paid_amount, balance_amount,
-        payment_method, payment_date, weight, notes, status
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+        payment_method, payment_date, weight, notes, status, photo_url
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
       [id, clientId, d.name.trim(), d.mobile||null, d.email?.toLowerCase()||null,
        d.gender||null, d.dob||null, d.address||null,
        trainer_id, trainer_name,
        d.joining_date||null, d.pt_start_date||null, d.pt_end_date||null,
        d.package_type||null, base, disc, final, paid, balance,
        d.payment_method||'CASH', d.payment_date||null,
-       num(d.weight, null), d.notes||null, d.status||'active']
+       num(d.weight, null), d.notes||null, d.status||'active', d.photo_url||null]
     );
 
     // If paid > 0, auto-create a payment record (in same transaction)
@@ -367,8 +367,8 @@ router.put('/:id', auth, async (req, res) => {
         trainer_id=$7, trainer_name=$8, pt_start_date=$9, pt_end_date=$10,
         package_type=$11, base_amount=$12, discount=$13, final_amount=$14,
         paid_amount=$15, balance_amount=$16, payment_method=$17, payment_date=$18,
-        weight=$19, notes=$20, status=$21, updated_at=NOW()
-      WHERE id=$22`,
+        weight=$19, notes=$20, status=$21, photo_url=$22, updated_at=NOW()
+      WHERE id=$23`,
       [d.name?.trim()||existing[0].name,
        d.mobile||null, d.email?.toLowerCase()||null,
        d.gender||null, d.dob||null, d.address||null,
@@ -378,6 +378,7 @@ router.put('/:id', auth, async (req, res) => {
        d.payment_method||'CASH', d.payment_date||null,
        num(d.weight, null), d.notes||null,
        d.status||existing[0].status,
+       d.photo_url || null,
        req.params.id]
     );
     const { rows } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
