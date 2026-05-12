@@ -75,4 +75,50 @@ function adminOnly(req, res, next) {
   next();
 }
 
-module.exports = { auth, adminOnly, invalidateUserCache };
+/**
+ * Allows admin OR manager roles.
+ * Use for operations that managers should be able to perform
+ * (e.g. delete trainer, edit plans) but regular staff cannot.
+ */
+function adminOrManager(req, res, next) {
+  const role = req.user?.role;
+  if (role !== 'admin' && role !== 'manager') {
+    return res.status(403).json({ error: 'Admin or manager access required' });
+  }
+  next();
+}
+
+/**
+ * Factory for allowlist-based role checks.
+ * Usage: router.delete('/:id', auth, requireRole(['admin','manager']), handler)
+ */
+function requireRole(roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user?.role)) {
+      return res.status(403).json({
+        error: `Access denied. Required role: ${roles.join(' or ')}`,
+      });
+    }
+    next();
+  };
+}
+
+/**
+ * Ensures the authenticated user is either looking at their own resource
+ * OR has an elevated role. Used for member-scoped routes like /me.
+ *
+ * @param {string} paramName - req.params key containing the resource owner's ID.
+ * @param {string[]} elevatedRoles - Roles that may bypass the self-check.
+ */
+function requireSelfOrRole(paramName = 'id', elevatedRoles = ['admin', 'manager']) {
+  return (req, res, next) => {
+    const role = req.user?.role;
+    if (elevatedRoles.includes(role)) return next();
+    const resourceId = req.params[paramName];
+    // Support both user id and member_id comparisons
+    if (req.user?.id === resourceId || req.user?.member_id === resourceId) return next();
+    return res.status(403).json({ error: 'Access denied' });
+  };
+}
+
+module.exports = { auth, adminOnly, adminOrManager, requireRole, requireSelfOrRole, invalidateUserCache };

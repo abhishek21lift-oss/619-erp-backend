@@ -490,6 +490,72 @@ router.put('/:id', auth, async (req, res, next) => {
   }
 });
 
+// GET /api/clients/:id/attendance
+// Returns attendance logs for a single client (used by profile page tab).
+router.get('/:id/attendance', auth, async (req, res, next) => {
+  try {
+    const { rows: client } = await pool.query('SELECT trainer_id FROM clients WHERE id=$1', [req.params.id]);
+    if (!client[0]) return res.status(404).json({ error: 'Client not found' });
+    if (req.user.role === 'trainer' &&
+        (!req.user.trainer_id || client[0].trainer_id !== req.user.trainer_id)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const { rows } = await pool.query(
+      `SELECT id, date, check_in_time, check_out_time, method, notes
+         FROM attendance_logs
+        WHERE ref_id = $1 AND ref_type = 'client'
+        ORDER BY date DESC, check_in_time DESC
+        LIMIT $2 OFFSET $3`,
+      [req.params.id, limit, offset]
+    );
+    // Fallback to the older 'attendance' table schema if attendance_logs doesn't exist
+    res.json(rows);
+  } catch (err) {
+    // Some deployments use a different table name
+    if (err.code === '42P01') {
+      try {
+        const { rows } = await pool.query(
+          `SELECT id, date, check_in, check_out, type as method
+             FROM attendance
+            WHERE ref_id = $1
+            ORDER BY date DESC LIMIT 200`,
+          [req.params.id]
+        );
+        return res.json(rows);
+      } catch (_) {
+        return res.json([]);
+      }
+    }
+    next(err);
+  }
+});
+
+// GET /api/clients/:id/payments
+// Returns payment history for a single client (used by profile page tab).
+router.get('/:id/payments', auth, async (req, res, next) => {
+  try {
+    const { rows: client } = await pool.query('SELECT trainer_id FROM clients WHERE id=$1', [req.params.id]);
+    if (!client[0]) return res.status(404).json({ error: 'Client not found' });
+    if (req.user.role === 'trainer' &&
+        (!req.user.trainer_id || client[0].trainer_id !== req.user.trainer_id)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    const { rows } = await pool.query(
+      `SELECT id, amount, method, date, receipt_no, package_type AS plan, notes
+         FROM payments
+        WHERE client_id = $1
+        ORDER BY date DESC, created_at DESC
+        LIMIT 200`,
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // DELETE /api/clients/:id (admin only)
 //
 // Soft delete by default. The 2026-05-perf-and-soft-delete migration adds

@@ -81,6 +81,15 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ─────────────────────────────
+// INPUT SANITIZATION
+//   Strip null bytes, cap string length, block path traversal.
+//   Runs after body parsing so req.body is already an object.
+// ─────────────────────────────
+const { sanitizeBody, sanitizeQuery } = require('./middleware/sanitize');
+app.use(sanitizeBody);
+app.use(sanitizeQuery);
+
+// ─────────────────────────────
 // REQUEST LOGGER (compact, single line)
 // ─────────────────────────────
 app.use((req, res, next) => {

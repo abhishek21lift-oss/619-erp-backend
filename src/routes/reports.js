@@ -52,6 +52,28 @@ router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
   }
 });
 
+// GET /api/reports/trainers — alias for /trainer-summary (used by frontend Reports page)
+router.get('/trainers', auth, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT t.id, t.name, t.specialization,
+        COUNT(DISTINCT c.id) FILTER (WHERE c.status='active') AS active_clients,
+        COUNT(DISTINCT c.id) AS total_clients,
+        COALESCE(SUM(p.amount) FILTER (WHERE p.date >= DATE_TRUNC('month',NOW())),0) AS month_revenue,
+        COALESCE(SUM(p.amount),0) AS total_revenue
+      FROM trainers t
+      LEFT JOIN clients  c ON c.trainer_id = t.id
+      LEFT JOIN payments p ON p.trainer_id = t.id
+      WHERE t.status = 'active'
+      GROUP BY t.id, t.name, t.specialization
+      ORDER BY total_revenue DESC`
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/reports/dues
 router.get('/dues', auth, async (req, res, next) => {
   try {
