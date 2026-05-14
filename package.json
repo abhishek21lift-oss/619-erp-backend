@@ -1,7 +1,7 @@
 {
   "name": "619-erp-backend",
   "version": "3.0.0",
-  "description": "619 Fitness ERP — Express + Supabase PostgreSQL",
+  "description": "619 Fitness ERP \u2014 Express + Supabase PostgreSQL",
   "main": "src/server.js",
   "engines": {
     "node": ">=18"
@@ -12,7 +12,8 @@
     "start:v3": "node src/server.v3.js",
     "dev:v3": "nodemon src/server.v3.js",
     "worker": "node src/workers/renewal.worker.js",
-    "lint:syntax": "node --check src/server.js"
+    "lint:syntax": "node --check src/server.js",
+    "migrate": "node src/db/migrate.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

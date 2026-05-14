@@ -1,4 +1,11 @@
 // src/routes/attendance.js
+// Matches the actual Supabase 619-erp database schema:
+//   attendance(id, type, ref_id, ref_name, trainer_id, trainer_name,
+//              date, check_in TIME, check_out TIME, status, notes,
+//              created_at, updated_at, branch_id, member_id, booking_id,
+//              pt_session_id, check_in_method, device_id)
+// Unique constraint: (type, ref_id, date)
+
 const router = require('express').Router();
 const { v4: uuid } = require('uuid');
 const pool = require('../db/pool');
@@ -17,19 +24,17 @@ router.get('/', auth, async (req, res, next) => {
       params.push(req.user.trainer_id);
     }
     if (date)   { conditions.push(`a.date = $${p++}`);   params.push(date); }
-    // Optional inclusive range — leaderboard, footfall, session views use this.
     if (from)   { conditions.push(`a.date >= $${p++}`);  params.push(from); }
     if (to)     { conditions.push(`a.date <= $${p++}`);  params.push(to); }
     if (type)   { conditions.push(`a.type = $${p++}`);   params.push(type); }
     if (ref_id) { conditions.push(`a.ref_id = $${p++}`); params.push(ref_id); }
 
-    // When a range is requested raise the row cap so dashboards don't truncate.
     const limit = (from || to) ? 5000 : 200;
 
     const { rows } = await pool.query(
       `SELECT a.* FROM attendance a
        WHERE ${conditions.join(' AND ')}
-       ORDER BY a.date DESC, a.check_in DESC
+       ORDER BY a.date DESC, a.check_in DESC NULLS LAST
        LIMIT ${limit}`,
       params
     );
@@ -43,38 +48,44 @@ router.get('/', auth, async (req, res, next) => {
 router.post('/', auth, async (req, res, next) => {
   try {
     const d = req.body;
-    if (!d.ref_id || !d.date || !d.type)
-      return res.status(400).json({ error: 'ref_id, date, type required' });
+    if (!d.ref_id || !d.date)
+      return res.status(400).json({ error: 'ref_id and date required' });
 
-    // ── RBAC: trainers can only mark attendance for clients/trainers assigned to them ──
+    const type = d.type || 'client';
+
+    // RBAC: trainers can only mark attendance for their own clients
     if (req.user.role === 'trainer') {
-      if (d.type === 'client') {
+      if (type === 'client') {
         const { rows: own } = await pool.query(
           'SELECT trainer_id FROM clients WHERE id=$1', [d.ref_id]
         );
         if (!own[0]) return res.status(404).json({ error: 'Client not found' });
         if (own[0].trainer_id !== req.user.trainer_id)
           return res.status(403).json({ error: 'Access denied: client is not assigned to you' });
-      } else if (d.type === 'trainer') {
-        // Trainers can only mark their own attendance, never another trainer's
+      } else if (type === 'trainer') {
         if (d.ref_id !== req.user.trainer_id)
           return res.status(403).json({ error: 'Access denied' });
       }
-      // Force trainer_id to the authenticated trainer — never trust client input
       d.trainer_id = req.user.trainer_id;
     }
 
     const id = uuid();
     await pool.query(`
-      INSERT INTO attendance (id,type,ref_id,ref_name,trainer_id,trainer_name,date,check_in,check_out,status,notes)
+      INSERT INTO attendance
+        (id, type, ref_id, ref_name, trainer_id, trainer_name, date,
+         check_in, check_out, status, notes)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-      ON CONFLICT (type,ref_id,date) DO UPDATE
-        SET status=$10, check_in=$8, check_out=$9, notes=$11, updated_at=NOW()`,
-      [id, d.type, d.ref_id, d.ref_name||null,
-       d.trainer_id||req.user.trainer_id||null,
-       d.trainer_name||null, d.date,
-       d.check_in||null, d.check_out||null,
-       d.status||'present', d.notes||null]
+      ON CONFLICT (type, ref_id, date) DO UPDATE
+        SET status=$10,
+            check_in=COALESCE(attendance.check_in, $8),
+            check_out=$9,
+            notes=$11,
+            updated_at=NOW()`,
+      [id, type, d.ref_id, d.ref_name || null,
+       d.trainer_id || req.user.trainer_id || null,
+       d.trainer_name || null, d.date,
+       d.check_in || null, d.check_out || null,
+       d.status || 'present', d.notes || null]
     );
     res.status(201).json({ message: 'Attendance marked' });
   } catch (err) {
@@ -83,8 +94,6 @@ router.post('/', auth, async (req, res, next) => {
 });
 
 // POST /api/attendance/biometric
-// A biometric device or the web terminal can send { biometric_code, type }.
-// type is optional: if omitted, members are checked first, then staff.
 router.post('/biometric', auth, async (req, res, next) => {
   try {
     const code = String(req.body?.biometric_code || '').trim();
@@ -104,16 +113,12 @@ router.post('/biometric', auth, async (req, res, next) => {
           `SELECT id, name, client_id, trainer_id, trainer_name
              FROM clients
             WHERE biometric_code = $1 OR client_id = $1 OR member_code = $1
-            LIMIT 1`,
-          [code]
+            LIMIT 1`, [code]
         );
         if (rows[0]) { person = rows[0]; type = 'client'; break; }
       } else {
         const { rows } = await pool.query(
-          `SELECT id, name, biometric_code
-             FROM trainers
-            WHERE biometric_code = $1
-            LIMIT 1`,
+          `SELECT id, name, biometric_code FROM trainers WHERE biometric_code = $1 LIMIT 1`,
           [code]
         );
         if (rows[0]) { person = rows[0]; type = 'trainer'; break; }
@@ -123,28 +128,28 @@ router.post('/biometric', auth, async (req, res, next) => {
     if (!person || !type) return res.status(404).json({ error: 'Biometric code not found' });
 
     if (req.user.role === 'trainer') {
-      if (type === 'client' && person.trainer_id !== req.user.trainer_id) {
+      if (type === 'client' && person.trainer_id !== req.user.trainer_id)
         return res.status(403).json({ error: 'Access denied: member is not assigned to you' });
-      }
-      if (type === 'trainer' && person.id !== req.user.trainer_id) {
+      if (type === 'trainer' && person.id !== req.user.trainer_id)
         return res.status(403).json({ error: 'Access denied' });
-      }
     }
 
     const now = new Date();
     const date = now.toISOString().split('T')[0];
     const checkIn = now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
     const id = uuid();
-
     const trainerId = type === 'trainer' ? person.id : (person.trainer_id || null);
     const trainerName = type === 'trainer' ? person.name : (person.trainer_name || null);
 
     await pool.query(`
-      INSERT INTO attendance (id,type,ref_id,ref_name,trainer_id,trainer_name,date,check_in,status,notes)
+      INSERT INTO attendance
+        (id, type, ref_id, ref_name, trainer_id, trainer_name, date, check_in, status, notes)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'present','biometric')
-      ON CONFLICT (type,ref_id,date) DO UPDATE
-        SET status='present', check_in=COALESCE(attendance.check_in,$8),
-            notes='biometric', updated_at=NOW()`,
+      ON CONFLICT (type, ref_id, date) DO UPDATE
+        SET status='present',
+            check_in=COALESCE(attendance.check_in, $8),
+            notes='biometric',
+            updated_at=NOW()`,
       [id, type, person.id, person.name, trainerId, trainerName, date, checkIn]
     );
 

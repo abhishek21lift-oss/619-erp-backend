@@ -149,6 +149,7 @@ router.get('/summary', auth, async (req, res, next) => {
           AND  type   = 'client'
           ${tFilter}`, params),
 
+
       /* ── 11. Birthdays today ────────────────────────────────────── */
       pool.query(`
         SELECT COUNT(*) AS count
