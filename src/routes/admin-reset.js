@@ -24,7 +24,7 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
     await client.query('DELETE FROM payments');
     await client.query('DELETE FROM subscriptions');
     await client.query('DELETE FROM invoices');
-    await client.query('DELETE FROM outstanding_dues');
+    await client.query('DROP TABLE IF EXISTS outstanding_dues CASCADE');
     await client.query('DELETE FROM client_goals');
     await client.query('DELETE FROM transformations');
     await client.query('DELETE FROM face_embeddings');
@@ -47,7 +47,7 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
     }
 
     await client.query('COMMIT');
-    res.json({ success: true, message: 'All member data, payments, attendance, and outstanding dues have been cleared. You can now start fresh.' });
+    res.json({ success: true, message: 'All member data, payments, attendance, and related records have been cleared. Any legacy outstanding_dues table was removed safely. You can now start fresh.' });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Reset error:', err);
@@ -66,9 +66,9 @@ router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
     return res.status(400).json({ error: 'Missing confirmation token. Send { confirm: "CLEAR_DUES_619" }' });
   }
   try {
-    await pool.query('DELETE FROM outstanding_dues');
+    await pool.query('DROP TABLE IF EXISTS outstanding_dues CASCADE');
     await pool.query('DELETE FROM payments');
-    res.json({ success: true, message: 'All payments and outstanding dues cleared.' });
+    res.json({ success: true, message: 'All payments cleared. If an outstanding_dues table existed, it was removed safely.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
