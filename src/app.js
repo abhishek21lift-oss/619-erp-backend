@@ -1,3 +1,4 @@
+const importRouter = require('./routes/import');
 // src/app.js
 // ─────────────────────────────────────────────────────────────────────────────
 // DEPRECATED ENTRY POINT — do not use.
