@@ -31,6 +31,7 @@ router.get('/', auth, async (req, res, next) => {
       FROM trainers t
       LEFT JOIN clients  c ON c.trainer_id = t.id
       LEFT JOIN payments p ON p.trainer_id = t.id
+      WHERE COALESCE(t.status, 'active') = 'active'
       GROUP BY t.id
       ORDER BY t.name`);
 
