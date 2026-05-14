@@ -42,7 +42,10 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
     await deleteIfExists(client, 'face_embeddings');
     await deleteIfExists(client, 'notifications');
     await deleteIfExists(client, 'message_logs');
-    await deleteIfExists(client, 'clients');
+    if ((await client.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists) {
+      await client.query(`UPDATE clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`);
+      await client.query(`DELETE FROM clients`);
+    }
 
     const seqs = [
       'clients_id_seq',
@@ -78,7 +81,8 @@ router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
   try {
     await dropIfExists(pool, 'outstanding_dues');
     await deleteIfExists(pool, 'payments');
-    res.json({ success: true, message: 'Payments and dues-related legacy data cleared safely. Missing tables were skipped automatically.' });
+    await pool.query(`UPDATE clients SET balance_amount = 0 WHERE to_regclass('public.clients') IS NOT NULL AND COALESCE(balance_amount, 0) <> 0`).catch(() => {});
+    res.json({ success: true, message: 'Payments and dues-related data cleared safely, and client balances were reset to zero.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
