@@ -1,3 +1,4 @@
+const adminResetRouter = require('./routes/admin-reset');
 const importRouter = require('./routes/import');
 // src/app.js
 // ─────────────────────────────────────────────────────────────────────────────
@@ -10,4 +11,5 @@ const importRouter = require('./routes/import');
 //
 // DO NOT add routes here.  Add them in server.js.
 // ─────────────────────────────────────────────────────────────────────────────
-module.exports = require('./server');
+module.exports = require('./server');app.use('/admin', adminResetRouter);
+
