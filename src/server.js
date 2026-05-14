@@ -160,6 +160,7 @@ app.use('/api/checkin',    require('./routes/checkin'));
 app.use('/api/reports',    require('./routes/reports'));
 app.use('/api/plans',      require('./routes/plans'));
 app.use('/api/subscriptions', require('./modules/subscriptions/subscriptions.routes'));
+app.use('/api/admin',        require('./routes/admin-reset'));
 app.use('/api/modules',    require('./modules/operations/operations.routes'));
 
 // ─────────────────────────────
