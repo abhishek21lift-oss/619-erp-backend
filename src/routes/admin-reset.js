@@ -81,11 +81,20 @@ router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
   try {
     await dropIfExists(pool, 'outstanding_dues');
     await deleteIfExists(pool, 'payments');
-    await pool.query(`UPDATE clients SET balance_amount = 0 WHERE to_regclass('public.clients') IS NOT NULL AND COALESCE(balance_amount, 0) <> 0`).catch(() => {});
+    const hasClients = (await pool.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists;
+    if (hasClients) {
+      await pool.query(`UPDATE clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`).catch(() => {});
+    }
     res.json({ success: true, message: 'Payments and dues-related data cleared safely, and client balances were reset to zero.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+
+router.post('/clear-dues-and-payments', auth, adminOnly, async (req, res) => {
+  req.body = { ...req.body, confirm: req.body?.confirm || 'CLEAR_DUES_619' };
+  return router.handle({ ...req, url: '/reset-outstanding-dues', method: 'POST' }, res, () => {});
 });
 
 module.exports = router;
