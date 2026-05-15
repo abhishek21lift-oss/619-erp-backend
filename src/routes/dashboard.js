@@ -60,7 +60,10 @@ router.get('/summary', auth, async (req, res, next) => {
           COUNT(*) FILTER (WHERE status = 'frozen')              AS frozen,
           COUNT(*) FILTER (WHERE created_at >= DATE_TRUNC('month', NOW())) AS new_this_month
         FROM clients
-        ${tWhere}`, params),
+        WHERE NOT EXISTS (
+          SELECT 1 FROM trainers tr WHERE tr.id = clients.id
+        )
+        ${tid ? 'AND trainer_id = $1' : ''}`, params),
 
       /* ── 2. Revenue totals (month / year / all-time) ────────────── */
       pool.query(`
