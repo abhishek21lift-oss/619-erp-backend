@@ -60,7 +60,7 @@ router.get('/summary', auth, async (req, res, next) => {
           COUNT(*) FILTER (WHERE status = 'frozen')              AS frozen,
           COUNT(*) FILTER (WHERE created_at >= DATE_TRUNC('month', NOW())) AS new_this_month
         FROM clients
-        WHERE COALESCE(role, 'member') NOT IN ('trainer', 'staff', 'admin')
+        WHERE role NOT IN ('trainer', 'staff', 'admin')
           ${tid ? 'AND trainer_id = $1' : ''}`, params),
 
       /* ── 2. Revenue totals (month / year / all-time) ────────────── */
@@ -91,7 +91,7 @@ router.get('/summary', auth, async (req, res, next) => {
         SELECT COUNT(*) AS count
         FROM clients
         WHERE status = 'active'
-          AND COALESCE(role, 'member') NOT IN ('trainer', 'staff', 'admin')
+          AND role NOT IN ('trainer', 'staff', 'admin')
           AND pt_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
           ${tFilter}`, params),
 
@@ -100,7 +100,7 @@ router.get('/summary', auth, async (req, res, next) => {
         SELECT COALESCE(SUM(balance_amount), 0) AS total_dues
         FROM clients
         WHERE balance_amount > 0
-          AND COALESCE(role, 'member') NOT IN ('trainer', 'staff', 'admin')
+          AND role NOT IN ('trainer', 'staff', 'admin')
           ${tFilter}`, params),
 
       /* ── 7. Recent payments ─────────────────────────────────────── */
