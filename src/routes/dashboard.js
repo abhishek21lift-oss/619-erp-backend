@@ -60,7 +60,8 @@ router.get('/summary', auth, async (req, res, next) => {
           COUNT(*) FILTER (WHERE status = 'frozen')              AS frozen,
           COUNT(*) FILTER (WHERE created_at >= DATE_TRUNC('month', NOW())) AS new_this_month
         FROM clients
-        ${tWhere}`, params),
+        WHERE role NOT IN ('trainer', 'staff', 'admin')
+          ${tid ? 'AND trainer_id = $1' : ''}`, params),
 
       /* ── 2. Revenue totals (month / year / all-time) ────────────── */
       pool.query(`
@@ -90,6 +91,7 @@ router.get('/summary', auth, async (req, res, next) => {
         SELECT COUNT(*) AS count
         FROM clients
         WHERE status = 'active'
+          AND role NOT IN ('trainer', 'staff', 'admin')
           AND pt_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
           ${tFilter}`, params),
 
@@ -98,6 +100,7 @@ router.get('/summary', auth, async (req, res, next) => {
         SELECT COALESCE(SUM(balance_amount), 0) AS total_dues
         FROM clients
         WHERE balance_amount > 0
+          AND role NOT IN ('trainer', 'staff', 'admin')
           ${tFilter}`, params),
 
       /* ── 7. Recent payments ─────────────────────────────────────── */
@@ -155,6 +158,7 @@ router.get('/summary', auth, async (req, res, next) => {
         SELECT COUNT(*) AS count
         FROM   clients
         WHERE  status = 'active'
+          AND  role NOT IN ('trainer', 'staff', 'admin')
           AND  dob IS NOT NULL
           AND  EXTRACT(DOY FROM dob::date) = EXTRACT(DOY FROM CURRENT_DATE)
           ${tFilter}`, params),
@@ -174,6 +178,7 @@ router.get('/summary', auth, async (req, res, next) => {
         SELECT COUNT(*) AS count
         FROM   clients
         WHERE  status      = 'expired'
+          AND  role NOT IN ('trainer', 'staff', 'admin')
           AND  pt_end_date >= CURRENT_DATE - INTERVAL '30 days'
           ${tFilter}`, params),
 
@@ -182,6 +187,7 @@ router.get('/summary', auth, async (req, res, next) => {
         SELECT COUNT(*) AS count
         FROM   clients
         WHERE  status = 'active'
+          AND  role NOT IN ('trainer', 'staff', 'admin')
           AND  pt_end_date >= CURRENT_DATE
           ${tFilter}`, params),
     ]);
