@@ -608,3 +608,30 @@ router.post('/:id/renew-subscription', auth, async (req, res, next) => {
 });
 
 module.exports = router;
+
+// POST /api/clients/:id/unfreeze
+router.post('/:id/unfreeze', auth, async (req, res, next) => {
+  try {
+    await requireAdmin(req);
+    const { rows } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
+    const c = rows[0];
+
+    const tx = pool;
+    await tx.query(
+      `UPDATE clients
+         SET status='active', is_frozen=FALSE,
+             freeze_from=NULL, freeze_until=NULL, freeze_reason=NULL,
+             updated_at=NOW()
+       WHERE id=$1`,
+      [c.id]
+    );
+    await logAction(tx, c.id, c.name, c.trainer_id, 'unfreeze',
+      { status: c.status, is_frozen: c.is_frozen },
+      { status: 'active', is_frozen: false },
+      0, null, req.body?.notes || null, req.user?.name
+    );
+    const { rows: updated } = await pool.query('SELECT * FROM clients WHERE id=$1', [c.id]);
+    res.json({ message: 'Membership unfrozen successfully', client: updated[0] });
+  } catch (err) { next(err); }
+});
