@@ -149,6 +149,7 @@ app.use('/api/auth/login', loginLimiter);
 // ROUTES
 // ─────────────────────────────
 app.use('/api/auth',       require('./routes/auth'));
+app.use('/api/v1/auth',    require('./routes/auth'));
 app.use('/api/clients',    require('./routes/clients'));
 // Membership action sub-routes: /api/clients/:id/freeze|upgrade|downgrade|etc.
 app.use('/api/clients',    require('./routes/client-actions'));
