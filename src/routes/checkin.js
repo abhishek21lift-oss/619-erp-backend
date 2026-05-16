@@ -264,17 +264,26 @@ router.post('/enroll', auth, async (req, res, next) => {
       }
     }
 
-    const { rowCount } = await pool.query(
+    const clientResult = await pool.query(
       `UPDATE clients
           SET face_descriptor = $1::jsonb,
+              face_enrolled = TRUE,
               face_enrolled_at = NOW()
-        WHERE id = $2`,
+        WHERE id = $2
+      RETURNING id`,
       [JSON.stringify(descriptor), client_id]
     );
 
-    if (rowCount === 0) return res.status(404).json({ error: 'Client not found' });
+    if (clientResult.rowCount === 0) return res.status(404).json({ error: 'Client not found' });
 
-    return res.status(200).json({ message: 'Face enrolled' });
+    await pool.query(
+      `INSERT INTO face_descriptors (id, client_id, descriptor, is_active, created_at, updated_at)
+       VALUES (gen_random_uuid(), $1, $2::float8[], TRUE, NOW(), NOW())
+       ON CONFLICT DO NOTHING`,
+      [client_id, descriptor]
+    ).catch(() => null);
+
+    return res.status(200).json({ message: 'Face enrolled', client_id });
   } catch (err) {
     console.error('[checkin/enroll]', err);
     return next(err);
