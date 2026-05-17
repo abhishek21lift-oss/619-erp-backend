@@ -160,6 +160,7 @@ app.use('/api/attendance', require('./routes/attendance'));
 app.use('/api/checkin',    require('./routes/checkin'));
 app.use('/api/reports',    require('./routes/reports'));
 app.use('/api/plans',      require('./routes/plans'));
+app.use('/api/staff',      require('./routes/staff'));
 app.use('/api/subscriptions', require('./modules/subscriptions/subscriptions.routes'));
 app.use('/api/v1/bookings', require('./modules/bookings/bookings.routes'));
 app.use('/api/bookings',    require('./modules/bookings/bookings.routes'));
