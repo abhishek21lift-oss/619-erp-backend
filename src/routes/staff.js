@@ -1,18 +1,16 @@
 // src/routes/staff.js
 const express = require('express');
 const router  = express.Router();
-const { authenticate } = require('../middleware/auth');
-const db = require('../db');
+const { auth, adminOnly } = require('../middleware/auth');
+const pool = require('../db/pool');
 
-router.use(authenticate);
-
-// ─────────────────────────────────────────────────────────────
-// IMPORTANT: /targets routes MUST come before /:id routes
-// otherwise Express matches "targets" as an :id param.
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+// IMPORTANT: /targets routes MUST come before /:id routes.
+// Express matches routes in order — literal paths before params.
+// ─────────────────────────────────────────────────────────────────
 
 // GET /api/staff/targets
-router.get('/targets', async (req, res, next) => {
+router.get('/targets', auth, async (req, res, next) => {
   try {
     const { month } = req.query;
     let query = `
@@ -26,13 +24,13 @@ router.get('/targets', async (req, res, next) => {
       query += ` AND st.month = $${params.length}`;
     }
     query += ' ORDER BY st.month DESC, s.name';
-    const result = await db.query(query, params);
-    res.json(result.rows);
+    const { rows } = await pool.query(query, params);
+    res.json(rows);
   } catch (err) { next(err); }
 });
 
 // POST /api/staff/targets
-router.post('/targets', async (req, res, next) => {
+router.post('/targets', auth, adminOnly, async (req, res, next) => {
   try {
     const {
       staff_id, month,
@@ -40,7 +38,7 @@ router.post('/targets', async (req, res, next) => {
       achieved_revenue = 0, achieved_clients = 0, achieved_sessions = 0,
     } = req.body;
     if (!staff_id || !month) return res.status(400).json({ error: 'staff_id and month are required' });
-    const result = await db.query(
+    const { rows } = await pool.query(
       `INSERT INTO staff_targets
          (staff_id, month, target_revenue, target_clients, target_sessions,
           achieved_revenue, achieved_clients, achieved_sessions)
@@ -49,12 +47,12 @@ router.post('/targets', async (req, res, next) => {
       [staff_id, month, target_revenue, target_clients, target_sessions,
        achieved_revenue, achieved_clients, achieved_sessions]
     );
-    res.status(201).json({ message: 'Target created', target: result.rows[0] });
+    res.status(201).json({ message: 'Target created', target: rows[0] });
   } catch (err) { next(err); }
 });
 
 // PUT /api/staff/targets/:id
-router.put('/targets/:id', async (req, res, next) => {
+router.put('/targets/:id', auth, adminOnly, async (req, res, next) => {
   try {
     const fields = [
       'target_revenue','target_clients','target_sessions',
@@ -70,32 +68,32 @@ router.put('/targets/:id', async (req, res, next) => {
     });
     if (!updates.length) return res.status(400).json({ error: 'No fields to update' });
     params.push(req.params.id);
-    const result = await db.query(
+    const { rows } = await pool.query(
       `UPDATE staff_targets SET ${updates.join(', ')} WHERE id = $${params.length} RETURNING *`,
       params
     );
-    if (!result.rows.length) return res.status(404).json({ error: 'Target not found' });
-    res.json({ message: 'Target updated', target: result.rows[0] });
+    if (!rows.length) return res.status(404).json({ error: 'Target not found' });
+    res.json({ message: 'Target updated', target: rows[0] });
   } catch (err) { next(err); }
 });
 
 // DELETE /api/staff/targets/:id
-router.delete('/targets/:id', async (req, res, next) => {
+router.delete('/targets/:id', auth, adminOnly, async (req, res, next) => {
   try {
-    const result = await db.query(
+    const { rows } = await pool.query(
       'DELETE FROM staff_targets WHERE id=$1 RETURNING id', [req.params.id]
     );
-    if (!result.rows.length) return res.status(404).json({ error: 'Target not found' });
+    if (!rows.length) return res.status(404).json({ error: 'Target not found' });
     res.json({ message: 'Target deleted' });
   } catch (err) { next(err); }
 });
 
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // STAFF CRUD  (/:id routes come AFTER /targets)
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
 // GET /api/staff
-router.get('/', async (req, res, next) => {
+router.get('/', auth, async (req, res, next) => {
   try {
     const { role, status, search } = req.query;
     let query = 'SELECT * FROM staff WHERE 1=1';
@@ -114,42 +112,42 @@ router.get('/', async (req, res, next) => {
       query += ` AND (name ILIKE $${n} OR email ILIKE $${n} OR phone ILIKE $${n})`;
     }
     query += ' ORDER BY created_at DESC';
-    const result = await db.query(query, params);
-    res.json(result.rows);
+    const { rows } = await pool.query(query, params);
+    res.json(rows);
   } catch (err) { next(err); }
 });
 
 // GET /api/staff/:id
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', auth, async (req, res, next) => {
   try {
-    const result = await db.query('SELECT * FROM staff WHERE id = $1', [req.params.id]);
-    if (!result.rows.length) return res.status(404).json({ error: 'Staff member not found' });
-    res.json(result.rows[0]);
+    const { rows } = await pool.query('SELECT * FROM staff WHERE id = $1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Staff member not found' });
+    res.json(rows[0]);
   } catch (err) { next(err); }
 });
 
 // POST /api/staff
-router.post('/', async (req, res, next) => {
+router.post('/', auth, adminOnly, async (req, res, next) => {
   try {
     const { name, email, phone, role, status = 'active' } = req.body;
     if (!name || !role) return res.status(400).json({ error: 'name and role are required' });
-    const result = await db.query(
+    const { rows } = await pool.query(
       `INSERT INTO staff (name, email, phone, role, status, created_at)
        VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING *`,
       [name, email || null, phone || null, role, status]
     );
-    res.status(201).json({ message: 'Staff member created', staff: result.rows[0] });
+    res.status(201).json({ message: 'Staff member created', staff: rows[0] });
   } catch (err) { next(err); }
 });
 
 // PUT /api/staff/:id
-router.put('/:id', async (req, res, next) => {
+router.put('/:id', auth, adminOnly, async (req, res, next) => {
   try {
     const { name, email, phone, role, status } = req.body;
-    const existing = await db.query('SELECT * FROM staff WHERE id = $1', [req.params.id]);
-    if (!existing.rows.length) return res.status(404).json({ error: 'Staff member not found' });
-    const cur = existing.rows[0];
-    const result = await db.query(
+    const { rows: ex } = await pool.query('SELECT * FROM staff WHERE id = $1', [req.params.id]);
+    if (!ex.length) return res.status(404).json({ error: 'Staff member not found' });
+    const cur = ex[0];
+    const { rows } = await pool.query(
       `UPDATE staff SET name=$1, email=$2, phone=$3, role=$4, status=$5
        WHERE id=$6 RETURNING *`,
       [
@@ -161,17 +159,17 @@ router.put('/:id', async (req, res, next) => {
         req.params.id,
       ]
     );
-    res.json({ message: 'Staff member updated', staff: result.rows[0] });
+    res.json({ message: 'Staff member updated', staff: rows[0] });
   } catch (err) { next(err); }
 });
 
 // DELETE /api/staff/:id
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   try {
-    const result = await db.query(
+    const { rows } = await pool.query(
       'DELETE FROM staff WHERE id = $1 RETURNING id', [req.params.id]
     );
-    if (!result.rows.length) return res.status(404).json({ error: 'Staff member not found' });
+    if (!rows.length) return res.status(404).json({ error: 'Staff member not found' });
     res.json({ message: 'Staff member deleted' });
   } catch (err) { next(err); }
 });
