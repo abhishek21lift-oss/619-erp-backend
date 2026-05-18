@@ -72,7 +72,6 @@ app.use(
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
-// cors() already handles preflight — no need for a manual app.options('*', ...).
 
 // ─────────────────────────────
 // BODY PARSING
@@ -82,15 +81,13 @@ app.use(express.urlencoded({ extended: true }));
 
 // ─────────────────────────────
 // INPUT SANITIZATION
-//   Strip null bytes, cap string length, block path traversal.
-//   Runs after body parsing so req.body is already an object.
 // ─────────────────────────────
 const { sanitizeBody, sanitizeQuery } = require('./middleware/sanitize');
 app.use(sanitizeBody);
 app.use(sanitizeQuery);
 
 // ─────────────────────────────
-// REQUEST LOGGER (compact, single line)
+// REQUEST LOGGER
 // ─────────────────────────────
 app.use((req, res, next) => {
   const start = Date.now();
@@ -141,8 +138,6 @@ const loginLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-// Mount as scoped middleware (not as a route handler) so it runs for the
-// auth router's POST /login regardless of method nuances.
 app.use('/api/auth/login', loginLimiter);
 
 // ─────────────────────────────
@@ -151,7 +146,6 @@ app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth',       require('./routes/auth'));
 app.use('/api/v1/auth',    require('./routes/auth'));
 app.use('/api/clients',    require('./routes/clients'));
-// Membership action sub-routes: /api/clients/:id/freeze|upgrade|downgrade|etc.
 app.use('/api/clients',    require('./routes/client-actions'));
 app.use('/api/trainers',   require('./routes/trainers'));
 app.use('/api/payments',   require('./routes/payments'));
@@ -168,7 +162,7 @@ app.use('/api/admin',        require('./routes/admin-reset'));
 app.use('/api/modules',    require('./modules/operations/operations.routes'));
 
 // ─────────────────────────────
-// 404 (any unmatched /api route)
+// 404
 // ─────────────────────────────
 app.use('/api/*', (req, res) => {
   res.status(404).json({ error: `Not found: ${req.method} ${req.path}` });
@@ -176,8 +170,6 @@ app.use('/api/*', (req, res) => {
 
 // ─────────────────────────────
 // GLOBAL ERROR HANDLER
-//   - Logs the full stack server-side
-//   - In production, hides raw 5xx error messages
 // ─────────────────────────────
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
@@ -194,24 +186,32 @@ app.use((err, req, res, _next) => {
 });
 
 // ─────────────────────────────
-// START
+// START — run migrations first, then listen
 // ─────────────────────────────
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`619 ERP API listening on port ${PORT}  (${NODE_ENV})`);
-  console.log(`  Health → http://localhost:${PORT}/api/health`);
-  console.log(
-    `  CORS   → ${allowedOrigins.length ? allowedOrigins.join(', ') : '(none — server-to-server only)'}`
-  );
-});
+const { runMigrations } = require('./db/migrate');
 
-// Graceful shutdown on container signals (Render, Docker, Kubernetes).
-const shutdown = (sig) => () => {
-  console.log(`Received ${sig} — shutting down…`);
-  server.close(() => process.exit(0));
-  // Hard exit if close hangs.
-  setTimeout(() => process.exit(1), 10_000).unref();
-};
-process.on('SIGTERM', shutdown('SIGTERM'));
-process.on('SIGINT', shutdown('SIGINT'));
+console.log('Running database migrations…');
+runMigrations()
+  .then(() => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`619 ERP API listening on port ${PORT}  (${NODE_ENV})`);
+      console.log(`  Health → http://localhost:${PORT}/api/health`);
+      console.log(
+        `  CORS   → ${allowedOrigins.length ? allowedOrigins.join(', ') : '(none — server-to-server only)'}`
+      );
+    });
+
+    const shutdown = (sig) => () => {
+      console.log(`Received ${sig} — shutting down…`);
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(1), 10_000).unref();
+    };
+    process.on('SIGTERM', shutdown('SIGTERM'));
+    process.on('SIGINT',  shutdown('SIGINT'));
+  })
+  .catch((err) => {
+    console.error('Startup migration failed — aborting:', err.message);
+    process.exit(1);
+  });
 
 module.exports = app;
