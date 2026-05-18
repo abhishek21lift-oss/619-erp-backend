@@ -6,7 +6,7 @@
 //   GET  /api/checkin/logs        — recent check-in events
 //
 // Storage:
-//   * Face descriptors live on `clients.face_descriptor` (JSONB[128])
+//   * Face descriptors live on `clients.face_descriptor` (FLOAT8[128])
 //   * Each successful or failed match is appended to `face_checkin_logs`
 //
 // Recognition:
@@ -86,7 +86,7 @@ router.post('/face', kioskTokenMiddleware, kioskOrAuth, async (req, res, next) =
     }
 
     // Pull every client that has an enrolled descriptor.
-    // `face_descriptor` is JSONB so we filter with IS NOT NULL.
+    // `face_descriptor` is FLOAT8[] so we filter with IS NOT NULL.
     const { rows: clients } = await pool.query(
       `SELECT id, name, status, photo_url, member_code, client_id,
               package_type, pt_end_date, trainer_id, face_descriptor
@@ -183,22 +183,22 @@ router.post('/face', kioskTokenMiddleware, kioskOrAuth, async (req, res, next) =
       });
     }
 
-    // Active member → mark attendance + log.
+    // Active member → mark attendance in attendance_logs (v4 schema) + log.
     const now = new Date();
     const date = now.toISOString().slice(0, 10);
-    const checkIn = now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-    const attId = uuid();
 
+    // FIX: was INSERT INTO attendance (old v3 table with wrong column names).
+    // Now uses attendance_logs with the v4 schema columns.
     await pool.query(
-      `INSERT INTO attendance
-         (id, type, ref_id, ref_name, trainer_id, date, check_in, status, notes)
-       VALUES ($1, 'client', $2, $3, $4, $5, $6, 'present', 'face')
-       ON CONFLICT (type, ref_id, date) DO UPDATE
-         SET status='present',
-             check_in=COALESCE(attendance.check_in, $6),
-             notes='face',
-             updated_at=NOW()`,
-      [attId, member.id, member.name, member.trainer_id || null, date, checkIn]
+      `INSERT INTO attendance_logs
+         (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes)
+       VALUES ($1, 'client', $2, $3::date, NOW(), 'face', 'present', 'Face check-in')
+       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
+         SET status       = 'present',
+             check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
+             method        = 'face',
+             notes         = 'Face check-in'`,
+      [member.id, member.name, date]
     );
 
     const logId = await logCheckIn({
@@ -264,21 +264,26 @@ router.post('/enroll', auth, async (req, res, next) => {
       }
     }
 
+    // FIX: was JSON.stringify(descriptor) with $1::jsonb cast, but face_descriptor
+    // column is FLOAT8[]. Pass the JS array directly — pg driver serialises it as
+    // a PostgreSQL array literal, and ::float8[] makes the cast explicit.
     const clientResult = await pool.query(
       `UPDATE clients
-          SET face_descriptor = $1::jsonb,
-              face_enrolled = TRUE,
+          SET face_descriptor  = $1::float8[],
+              face_enrolled    = TRUE,
               face_enrolled_at = NOW()
         WHERE id = $2
       RETURNING id`,
-      [JSON.stringify(descriptor), client_id]
+      [descriptor, client_id]
     );
 
     if (clientResult.rowCount === 0) return res.status(404).json({ error: 'Client not found' });
 
+    // FIX: removed non-existent created_at / updated_at columns from the INSERT.
+    // face_descriptors has enrolled_at (DEFAULT NOW()) and no updated_at.
     await pool.query(
-      `INSERT INTO face_descriptors (id, client_id, descriptor, is_active, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2::float8[], TRUE, NOW(), NOW())
+      `INSERT INTO face_descriptors (client_id, descriptor, is_active)
+       VALUES ($1, $2::float8[], TRUE)
        ON CONFLICT DO NOTHING`,
       [client_id, descriptor]
     ).catch(() => null);
