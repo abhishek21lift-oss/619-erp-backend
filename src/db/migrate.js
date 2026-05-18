@@ -1,15 +1,23 @@
 // src/db/migrate.js
 // Run all pending SQL migrations in order.
-// Usage: node src/db/migrate.js
-require('dotenv').config();
-const fs = require('fs');
+//
+// Two modes:
+//   1. CLI:    node src/db/migrate.js   (closes pool when done)
+//   2. Module: require('./migrate').runMigrations()  (pool stays open)
+//              Called automatically from server.js on startup.
+
+const fs   = require('fs');
 const path = require('path');
 const pool = require('./pool');
 
-async function run() {
+/**
+ * Apply any pending migrations from src/db/migrations/*.sql.
+ * Safe to call on every startup — already-applied files are skipped.
+ * Does NOT close the pool so the server can keep using it.
+ */
+async function runMigrations() {
   const client = await pool.connect();
   try {
-    // Create migrations tracking table if not exists
     await client.query(`
       CREATE TABLE IF NOT EXISTS _migrations (
         id         SERIAL PRIMARY KEY,
@@ -18,10 +26,8 @@ async function run() {
       )
     `);
 
-    const dir = path.join(__dirname, 'migrations');
-    const files = fs.readdirSync(dir)
-      .filter(f => f.endsWith('.sql'))
-      .sort();
+    const dir   = path.join(__dirname, 'migrations');
+    const files = fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort();
 
     for (const file of files) {
       const { rows } = await client.query(
@@ -36,9 +42,7 @@ async function run() {
       await client.query('BEGIN');
       try {
         await client.query(sql);
-        await client.query(
-          'INSERT INTO _migrations (filename) VALUES ($1)', [file]
-        );
+        await client.query('INSERT INTO _migrations (filename) VALUES ($1)', [file]);
         await client.query('COMMIT');
         console.log(`  ✓ ${file} applied`);
       } catch (err) {
@@ -47,14 +51,21 @@ async function run() {
         throw err;
       }
     }
-    console.log('\n✅ All migrations complete.');
+    console.log('✅ All migrations complete.');
   } finally {
     client.release();
-    await pool.end();
   }
 }
 
-run().catch(err => {
-  console.error('Migration failed:', err.message);
-  process.exit(1);
-});
+// When executed directly as CLI, close the pool after finishing.
+if (require.main === module) {
+  require('dotenv').config();
+  runMigrations()
+    .then(() => pool.end())
+    .catch(err => {
+      console.error('Migration failed:', err.message);
+      process.exit(1);
+    });
+}
+
+module.exports = { runMigrations };
