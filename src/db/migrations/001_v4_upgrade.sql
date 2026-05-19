@@ -109,6 +109,14 @@ CREATE TABLE IF NOT EXISTS notifications (
   is_read    BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Guard: table may pre-exist without these columns
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS user_id    TEXT;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS type       TEXT;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS title      TEXT;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS body       TEXT;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS ref_id     TEXT;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS is_read    BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 -- activity_log
 CREATE TABLE IF NOT EXISTS activity_log (
@@ -124,6 +132,17 @@ CREATE TABLE IF NOT EXISTS activity_log (
   user_agent  TEXT,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Guard: table may pre-exist without these columns
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS user_id     TEXT;
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS user_name   TEXT;
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS action      TEXT;
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS entity_type TEXT;
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS entity_id   TEXT;
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS old_data    JSONB;
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS new_data    JSONB;
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS ip_address  TEXT;
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS user_agent  TEXT;
+ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 -- feature_flags
 CREATE TABLE IF NOT EXISTS feature_flags (
@@ -132,6 +151,9 @@ CREATE TABLE IF NOT EXISTS feature_flags (
   description TEXT,
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE feature_flags ADD COLUMN IF NOT EXISTS value       BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE feature_flags ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE feature_flags ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 INSERT INTO feature_flags (key, value, description) VALUES
   ('face_checkin',       TRUE,  'Enable face recognition check-in'),
@@ -149,6 +171,11 @@ CREATE TABLE IF NOT EXISTS system_settings (
   updated_by  TEXT,
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS value       TEXT;
+ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS type        TEXT NOT NULL DEFAULT 'string';
+ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS updated_by  TEXT;
+ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 INSERT INTO system_settings (key, value, type, description) VALUES
   ('gym_name',            '619 Fitness Studio', 'string', 'Studio display name'),
