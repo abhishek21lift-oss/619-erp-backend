@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS attendance_logs (
 );
 
 -- Migrate data from old attendance table if it exists
+-- NOTE: v3 attendance table has no 'method' column — use literal 'manual'
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'attendance') THEN
@@ -67,7 +68,7 @@ BEGIN
       ref_name,
       date::date,
       (date || ' ' || COALESCE(check_in, '09:00'))::TIMESTAMPTZ,
-      COALESCE(method, 'manual'),
+      'manual',
       COALESCE(status, 'present'),
       COALESCE(created_at, NOW())
     FROM attendance
