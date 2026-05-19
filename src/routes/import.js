@@ -2,8 +2,8 @@ const express = require('express');
 const router  = express.Router();
 const multer  = require('multer');
 const XLSX    = require('xlsx');
-const { pool } = require('../db');
-const authMiddleware = require('../middleware/auth');
+const { pool } = require('../db/pool');
+const { auth } = require('../middleware/auth');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
@@ -12,7 +12,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
    Body: multipart/form-data  field: file (.xlsx/.xls/.csv)
    Returns: { imported, skipped, errors[] }
 ────────────────────────────────────────────── */
-router.post('/import-excel', authMiddleware, upload.single('file'), async (req, res) => {
+router.post('/import-excel', auth, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
   let workbook;

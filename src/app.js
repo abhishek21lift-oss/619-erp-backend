@@ -1,5 +1,3 @@
-const adminResetRouter = require('./routes/admin-reset');
-const importRouter = require('./routes/import');
 // src/app.js
 // ─────────────────────────────────────────────────────────────────────────────
 // DEPRECATED ENTRY POINT — do not use.
@@ -11,5 +9,5 @@ const importRouter = require('./routes/import');
 //
 // DO NOT add routes here.  Add them in server.js.
 // ─────────────────────────────────────────────────────────────────────────────
-module.exports = require('./server');app.use('/admin', adminResetRouter);
+module.exports = require('./server');
 

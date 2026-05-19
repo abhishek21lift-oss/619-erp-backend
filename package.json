@@ -4,7 +4,8 @@
   "description": "619 Fitness ERP \u2014 Express + Supabase PostgreSQL",
   "main": "src/server.js",
   "engines": {
-    "node": ">=18"
+    "node": ">=18",
+    "npm": ">=9"
   },
   "scripts": {
     "start": "node src/server.js",

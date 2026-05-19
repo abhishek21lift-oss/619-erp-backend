@@ -201,9 +201,12 @@ runMigrations()
       );
     });
 
+    const pool = require('./db/pool');
     const shutdown = (sig) => () => {
       console.log(`Received ${sig} — shutting down…`);
-      server.close(() => process.exit(0));
+      server.close(() => {
+        pool.end(() => process.exit(0));
+      });
       setTimeout(() => process.exit(1), 10_000).unref();
     };
     process.on('SIGTERM', shutdown('SIGTERM'));
