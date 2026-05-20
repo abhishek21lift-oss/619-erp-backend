@@ -4,6 +4,8 @@ const { v4: uuid } = require('uuid');
 const pool   = require('../db/pool');
 const { genReceiptNo } = require('../db/receipts');
 const { auth, adminOnly } = require('../middleware/auth');
+const { validate } = require('../middleware/validate');
+const { clientSchemas } = require('../lib/validation');
 
 // Helper: parse a value as a finite number, or return fallback.
 // parseFloat('') is NaN — `??` does NOT catch that. Use this guard instead.
@@ -328,7 +330,7 @@ router.post('/:id/pt-renew', auth, async (req, res, next) => {
 });
 
 // POST /api/clients
-router.post('/', auth, async (req, res, next) => {
+router.post('/', auth, validate(clientSchemas.create), async (req, res, next) => {
   const client = await pool.connect();
   try {
     const d = req.body;
@@ -434,7 +436,7 @@ router.post('/', auth, async (req, res, next) => {
 });
 
 // PUT /api/clients/:id
-router.put('/:id', auth, async (req, res, next) => {
+router.put('/:id', auth, validate(clientSchemas.update), async (req, res, next) => {
   try {
     const d = req.body;
     const { rows: existing } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);

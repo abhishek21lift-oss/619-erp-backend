@@ -4,30 +4,26 @@ const bcrypt = require('bcryptjs');
 const jwt    = require('jsonwebtoken');
 const { v4: uuid } = require('uuid');
 const pool   = require('../db/pool');
+const logger = require('../lib/logger');
 const { auth, adminOnly, invalidateUserCache } = require('../middleware/auth');
+const { validate } = require('../middleware/validate');
+const { authSchemas } = require('../lib/validation');
 
 // POST /api/auth/login
-router.post('/login', async (req, res) => {
+router.post('/login', validate(authSchemas.login), async (req, res) => {
   try {
     const { email, password } = req.body;
-
-    // ── Input validation ───────────────────────────────
-    if (!email || !password)
-      return res.status(400).json({ error: 'Email and password are required' });
-
-    if (typeof email !== 'string' || typeof password !== 'string')
-      return res.status(400).json({ error: 'Invalid input format' });
 
     // ── Fetch user from DB ─────────────────────────────
     let rows;
     try {
       const result = await pool.query(
         'SELECT * FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true',
-        [email.trim()]
+        [email]
       );
       rows = result.rows;
     } catch (dbErr) {
-      console.error('Login DB error:', dbErr.message);
+      logger.error({ err: dbErr.message }, 'Login DB error');
       return res.status(500).json({ error: 'Database connection error. Please try again.' });
     }
 
@@ -39,7 +35,7 @@ router.post('/login', async (req, res) => {
     try {
       valid = await bcrypt.compare(password, user.password);
     } catch (bcryptErr) {
-      console.error('bcrypt error:', bcryptErr.message);
+      logger.error({ err: bcryptErr.message }, 'bcrypt error');
       return res.status(500).json({ error: 'Authentication error. Please try again.' });
     }
 
@@ -47,27 +43,18 @@ router.post('/login', async (req, res) => {
 
     // ── Update last login (non-critical, don't block on failure) ──
     pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id])
-      .catch(err => console.warn('last_login update failed (non-critical):', err.message));
+      .catch(function(err) { logger.warn({ err: err.message }, 'last_login update failed (non-critical)'); });
 
     // ── Sign JWT ───────────────────────────────────────
-    if (!process.env.JWT_SECRET) {
-      console.error('CRITICAL: JWT_SECRET is not set!');
-      return res.status(500).json({ error: 'Server configuration error. Contact administrator.' });
-    }
-
     let token;
     try {
       token = jwt.sign(
-        // The token only carries id; the auth middleware re-loads role,
-        // trainer_id, member_id, and is_active from the DB on every
-        // request so role changes / disablements take effect immediately
-        // without requiring re-login.
         { id: user.id },
         process.env.JWT_SECRET,
         { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
       );
     } catch (jwtErr) {
-      console.error('JWT sign error:', jwtErr.message);
+      logger.error({ err: jwtErr.message }, 'JWT sign error');
       return res.status(500).json({ error: 'Token generation failed. Contact administrator.' });
     }
 
@@ -84,7 +71,7 @@ router.post('/login', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('Unexpected login error:', err.message, err.stack);
+    logger.error({ err: err.message, stack: err.stack }, 'Unexpected login error');
     res.status(500).json({ error: 'Unexpected server error. Please try again.' });
   }
 });
@@ -125,12 +112,12 @@ async function changePasswordHandler(req, res) {
     invalidateUserCache(req.user.id);
     res.json({ message: 'Password changed successfully' });
   } catch (err) {
-    console.error('Change password error:', err.message);
+    logger.error({ err: err.message }, 'Change password error');
     res.status(500).json({ error: 'Server error' });
   }
 }
-router.put('/change-password', auth, changePasswordHandler);
-router.post('/change-password', auth, changePasswordHandler);
+router.put('/change-password', auth, validate(authSchemas.changePassword), changePasswordHandler);
+router.post('/change-password', auth, validate(authSchemas.changePassword), changePasswordHandler);
 
 // POST /api/auth/create-user  (admin only)
 // Also accepts /users for compatibility with older frontend builds
@@ -166,13 +153,13 @@ async function createUserHandler(req, res) {
     );
     res.status(201).json({ message: 'User created', user: { id, name, email: email.toLowerCase(), role } });
   } catch (err) {
-    console.error('Create user error:', err.message);
+    logger.error({ err: err.message }, 'Create user error');
     res.status(500).json({ error: 'Server error' });
   }
 }
-router.post('/create-user', auth, adminOnly, createUserHandler);
+router.post('/create-user', auth, adminOnly, validate(authSchemas.createUser), createUserHandler);
 // Compatibility alias — the frontend at one point posted here
-router.post('/users', auth, adminOnly, createUserHandler);
+router.post('/users', auth, adminOnly, validate(authSchemas.createUser), createUserHandler);
 
 // GET /api/auth/users  (admin only)
 router.get('/users', auth, adminOnly, async (req, res) => {

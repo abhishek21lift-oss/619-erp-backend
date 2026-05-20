@@ -3,6 +3,8 @@ const router = require('express').Router();
 const { v4: uuid } = require('uuid');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { validate } = require('../middleware/validate');
+const { planSchemas } = require('../lib/validation');
 
 // GET /api/plans
 router.get('/', auth, async (req, res, next) => {
@@ -26,7 +28,7 @@ router.get('/', auth, async (req, res, next) => {
 });
 
 // POST /api/plans  (admin only)
-router.post('/', auth, adminOnly, async (req, res, next) => {
+router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res, next) => {
   try {
     const d = req.body;
 
@@ -83,7 +85,7 @@ router.post('/', auth, adminOnly, async (req, res, next) => {
 });
 
 // PUT /api/plans/:id  (admin only)
-router.put('/:id', auth, adminOnly, async (req, res, next) => {
+router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, res, next) => {
   try {
     const d = req.body;
     const { rows: ex } = await pool.query('SELECT * FROM plans WHERE id=$1', [req.params.id]);

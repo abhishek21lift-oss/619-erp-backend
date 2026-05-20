@@ -2,6 +2,8 @@
 const express = require('express');
 const router  = express.Router();
 const { auth, adminOnly } = require('../middleware/auth');
+const { validate } = require('../middleware/validate');
+const { staffSchemas } = require('../lib/validation');
 const pool = require('../db/pool');
 
 // ─────────────────────────────────────────────────────────────────
@@ -48,7 +50,12 @@ router.post('/targets', auth, adminOnly, async (req, res, next) => {
        achieved_revenue, achieved_clients, achieved_sessions]
     );
     res.status(201).json({ message: 'Target created', target: rows[0] });
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (err.code === '23505' && err.constraint === 'staff_targets_staff_id_month_key') {
+      return res.status(409).json({ error: 'A target already exists for this staff member and month. Use edit instead.' });
+    }
+    next(err);
+  }
 });
 
 // PUT /api/staff/targets/:id
@@ -127,7 +134,7 @@ router.get('/:id', auth, async (req, res, next) => {
 });
 
 // POST /api/staff
-router.post('/', auth, adminOnly, async (req, res, next) => {
+router.post('/', auth, adminOnly, validate(staffSchemas.create), async (req, res, next) => {
   try {
     const { name, email, phone, role, status = 'active' } = req.body;
     if (!name || !role) return res.status(400).json({ error: 'name and role are required' });

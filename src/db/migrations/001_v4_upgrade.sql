@@ -190,16 +190,34 @@ ON CONFLICT (key) DO NOTHING;
 -- leave_requests
 CREATE TABLE IF NOT EXISTS leave_requests (
   id          TEXT    PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  trainer_id  TEXT    NOT NULL,
+  trainer_id  TEXT    NOT NULL REFERENCES trainers(id) ON DELETE CASCADE,
+  leave_type  TEXT    NOT NULL DEFAULT 'other'
+              CHECK (leave_type IN ('sick','casual','earned','emergency','unpaid','other')),
   from_date   DATE    NOT NULL,
   to_date     DATE    NOT NULL,
   reason      TEXT,
+  admin_note  TEXT,
   status      TEXT    NOT NULL DEFAULT 'pending'
               CHECK (status IN ('pending','approved','rejected')),
-  approved_by TEXT,
+  approved_by TEXT    REFERENCES users(id) ON DELETE SET NULL,
+  approved_at TIMESTAMPTZ,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Safe migration for existing leave_requests tables (add new columns)
+DO $$ BEGIN
+  ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS leave_type TEXT NOT NULL DEFAULT 'other';
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS admin_note TEXT;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
 
 -- weight_logs (if not already present from v3)
 CREATE TABLE IF NOT EXISTS weight_logs (

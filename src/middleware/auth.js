@@ -1,6 +1,7 @@
 // src/middleware/auth.js
 const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
+const logger = require('../lib/logger');
 
 // In-memory user cache. The token only carries `id`; we re-load the row
 // on every request so role / trainer_id / is_active changes propagate

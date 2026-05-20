@@ -373,18 +373,44 @@ SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM receipt_counter);
 CREATE TABLE IF NOT EXISTS leave_requests (
   id          TEXT    PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   trainer_id  TEXT    NOT NULL REFERENCES trainers(id) ON DELETE CASCADE,
+  leave_type  TEXT    NOT NULL DEFAULT 'other'
+              CHECK (leave_type IN ('sick','casual','earned','emergency','unpaid','other')),
   from_date   DATE    NOT NULL,
   to_date     DATE    NOT NULL,
   reason      TEXT,
+  admin_note  TEXT,
   status      TEXT    NOT NULL DEFAULT 'pending'
               CHECK (status IN ('pending','approved','rejected')),
   approved_by TEXT    REFERENCES users(id) ON DELETE SET NULL,
+  approved_at TIMESTAMPTZ,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS leave_trainer_idx ON leave_requests (trainer_id);
 CREATE INDEX IF NOT EXISTS leave_status_idx  ON leave_requests (status);
+
+
+-- ─── Expenses table ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS expenses (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  category        TEXT NOT NULL DEFAULT 'other',
+  description     TEXT NOT NULL DEFAULT '',
+  amount          DECIMAL(12,2) NOT NULL CHECK (amount >= 0),
+  expense_date    DATE NOT NULL DEFAULT CURRENT_DATE,
+  payment_method  TEXT NOT NULL DEFAULT 'cash',
+  receipt_url     TEXT,
+  notes           TEXT,
+  created_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+  status          TEXT NOT NULL DEFAULT 'approved'
+                    CHECK (status IN ('pending','approved','rejected')),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS expenses_date_idx    ON expenses (expense_date);
+CREATE INDEX IF NOT EXISTS expenses_category_idx ON expenses (category);
+CREATE INDEX IF NOT EXISTS expenses_status_idx  ON expenses (status);
 
 
 -- ─── HELPER FUNCTION — updated_at trigger ────────────────────
@@ -399,7 +425,7 @@ $$;
 DO $$ DECLARE
   t TEXT;
 BEGIN
-  FOR t IN SELECT unnest(ARRAY['users','trainers','clients','subscriptions','system_settings','leave_requests'])
+  FOR t IN SELECT unnest(ARRAY['users','trainers','clients','subscriptions','system_settings','leave_requests','expenses'])
   LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_trigger

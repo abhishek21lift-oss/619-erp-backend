@@ -3,6 +3,8 @@ const router = require('express').Router();
 const { v4: uuid } = require('uuid');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { validate } = require('../middleware/validate');
+const { trainerSchemas } = require('../lib/validation');
 
 // Fields a non-admin (trainer) is allowed to see about other trainers.
 // Salary, incentive_rate, address, dob, certifications etc. are scrubbed.
@@ -119,7 +121,7 @@ router.get('/:id', auth, async (req, res, next) => {
 });
 
 // POST /api/trainers (admin only)
-router.post('/', auth, adminOnly, async (req, res, next) => {
+router.post('/', auth, adminOnly, validate(trainerSchemas.create), async (req, res, next) => {
   try {
     const d = req.body;
     if (!d.name?.trim()) return res.status(400).json({ error: 'Name required' });

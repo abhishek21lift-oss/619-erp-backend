@@ -4,6 +4,8 @@ const { v4: uuid } = require('uuid');
 const pool = require('../db/pool');
 const { genReceiptNo } = require('../db/receipts');
 const { auth, adminOnly } = require('../middleware/auth');
+const { validate } = require('../middleware/validate');
+const { paymentSchemas } = require('../lib/validation');
 
 // GET /api/payments
 router.get('/', auth, async (req, res, next) => {
@@ -45,7 +47,7 @@ router.get('/', auth, async (req, res, next) => {
 });
 
 // POST /api/payments
-router.post('/', auth, async (req, res, next) => {
+router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) => {
   const tx = await pool.connect();
   try {
     const d = req.body;
