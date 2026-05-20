@@ -488,7 +488,7 @@ router.post('/:id/add-subscription', auth, async (req, res, next) => {
   const tx = await pool.connect();
   try {
     const d = req.body;
-    const planRows = Array.isArray(d.plan_rows) ? d.plan_rows : [];
+    const planRows = Array.isArray(d.plan_rows) ? d.plan_rows.filter(r => r && typeof r === 'object') : [];
 
     await tx.query('BEGIN');
     const { rows } = await tx.query('SELECT * FROM clients WHERE id=$1 FOR UPDATE', [req.params.id]);
@@ -548,7 +548,7 @@ router.post('/:id/renew-subscription', auth, async (req, res, next) => {
   const tx = await pool.connect();
   try {
     const d = req.body;
-    const planRows = Array.isArray(d.plan_rows) ? d.plan_rows : [];
+    const planRows = Array.isArray(d.plan_rows) ? d.plan_rows.filter(r => r && typeof r === 'object') : [];
     const primaryRow = planRows[0] || {};
 
     const pkg = d.renew_plan || primaryRow.plan || d.package_type;

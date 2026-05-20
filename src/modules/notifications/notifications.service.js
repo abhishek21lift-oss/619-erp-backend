@@ -115,18 +115,23 @@ async function send(type, recipient, data, via = ['inapp']) {
       res = { status: 'failed', error: err.message };
     }
     // Log the attempt
-    await pool.query(
-      `INSERT INTO notification_log (recipient_user_id, recipient_member_id, channel, template, payload, status, provider_id, error, sent_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8, CASE WHEN $6='sent' OR $6='delivered' THEN NOW() END)`,
-      [
-        recipient.user_id || null,
-        recipient.member_id || null,
-        ch, type, data,
-        res.status,
-        res.provider_id || null,
-        res.error || null,
-      ]
-    );
+    try {
+      await pool.query(
+        `INSERT INTO notification_log (recipient_user_id, recipient_member_id, channel, template, payload, status, provider_id, error, sent_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8, CASE WHEN $6='sent' OR $6='delivered' THEN NOW() END)`,
+        [
+          recipient.user_id || null,
+          recipient.member_id || null,
+          ch, type, data,
+          res.status,
+          res.provider_id || null,
+          res.error || null,
+        ]
+      );
+    } catch {
+      // notification_log table may not exist yet
+      console.warn('[notifications] failed to log notification (table may not exist)');
+    }
     results[ch] = res;
   }
   return results;
@@ -136,13 +141,21 @@ async function send(type, recipient, data, via = ['inapp']) {
  * Resolve a member into a recipient object with all contact info.
  */
 async function recipientFromMember(memberId) {
-  const { rows } = await pool.query(
-    `SELECT m.id AS member_id, m.name, m.email, m.phone, m.user_id
-     FROM members m WHERE m.id = $1`,
-    [memberId]
-  );
-  if (rows.length === 0) throw new Error('Member not found');
-  return rows[0];
+  // Try the clients table first (619 ERP schema), fall back to members
+  for (const table of ['clients', 'members']) {
+    try {
+      const col = table === 'clients' ? 'id' : 'id';
+      const { rows } = await pool.query(
+        `SELECT c.id AS member_id, c.name, c.email, c.mobile AS phone, NULL AS user_id
+         FROM ${table} c WHERE c.id = $1`,
+        [memberId]
+      );
+      if (rows.length > 0) return rows[0];
+    } catch {
+      // table may not exist, try next
+    }
+  }
+  throw new Error('Recipient not found');
 }
 
 /**

@@ -102,7 +102,7 @@ router.post('/import-excel', auth, upload.single('file'), async (req, res) => {
       mobile:           mobile || null,
       email:            get(row, 'email') || null,
       dob:              fmt_date(get(row, 'dob')) || null,
-      gender:           get(row, 'gender').toLowerCase() || null,
+      gender:           (get(row, 'gender') || '').toLowerCase() || null,
       address:          get(row, 'address') || null,
       joining_date:     fmt_date(get(row, 'joining_date')) || new Date().toISOString().slice(0, 10),
       expiry_date:      fmt_date(get(row, 'expiry_date')) || null,

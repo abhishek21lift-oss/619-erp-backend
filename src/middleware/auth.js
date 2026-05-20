@@ -40,18 +40,30 @@ async function auth(req, res, next) {
 
     let user = _cacheGet(decoded.id);
     if (!user) {
-      const { rows } = await pool.query(
-        // member_id is needed by requireSelfOrRole (v3 RBAC) — without it,
-        // members can never access /me-style routes scoped to their own id.
-        // SECURITY: also filter out soft-deleted users (deleted_at IS NOT NULL)
-        // so a user that an admin removed via the v3 soft-delete path can
-        // never authenticate again with their old token.
-        `SELECT id, name, email, role, trainer_id, member_id, branch_id, is_active
-           FROM users
-          WHERE id = $1
-            AND COALESCE(deleted_at::text, '') = ''`,
-        [decoded.id]
-      );
+      let rows;
+      try {
+        const result = await pool.query(
+          // member_id is needed by requireSelfOrRole (v3 RBAC) — without it,
+          // members can never access /me-style routes scoped to their own id.
+          // SECURITY: also filter out soft-deleted users (deleted_at IS NOT NULL)
+          // so a user that an admin removed via the v3 soft-delete path can
+          // never authenticate again with their old token.
+          `SELECT id, name, email, role, trainer_id, member_id, branch_id, is_active
+             FROM users
+            WHERE id = $1
+              AND (deleted_at IS NULL)`,
+          [decoded.id]
+        );
+        rows = result.rows;
+      } catch {
+        // Fallback if deleted_at column doesn't exist (pre-migration)
+        const result = await pool.query(
+          `SELECT id, name, email, role, trainer_id, member_id, branch_id, is_active
+             FROM users WHERE id = $1`,
+          [decoded.id]
+        );
+        rows = result.rows;
+      }
       user = rows[0];
       if (!user || !user.is_active) {
         return res.status(401).json({ error: 'Account not found or disabled' });

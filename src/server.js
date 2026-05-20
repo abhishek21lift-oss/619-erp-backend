@@ -7,7 +7,7 @@ require('dotenv').config();
 
 const logger = require('./lib/logger');
 
-const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET'];
+const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET', 'FRONTEND_URL'];
 const missing = REQUIRED_ENV.filter(function(k) { return !process.env[k]; });
 if (missing.length) {
   logger.fatal({ missing }, 'Missing required environment variables');
@@ -15,8 +15,8 @@ if (missing.length) {
   process.exit(1);
 }
 
-if (process.env.JWT_SECRET.length < 16) {
-  logger.fatal('JWT_SECRET is too short (minimum 16 characters). Use a strong random secret.');
+if (process.env.JWT_SECRET.length < 32) {
+  logger.fatal('JWT_SECRET is too short (minimum 32 characters). Use a strong random secret (96 hex chars recommended).');
   process.exit(1);
 }
 

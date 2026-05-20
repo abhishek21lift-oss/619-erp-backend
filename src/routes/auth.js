@@ -86,10 +86,12 @@ router.get('/me', auth, (req, res) => {
 async function changePasswordHandler(req, res) {
   try {
     // Accept both new and legacy field names so a stale frontend still works
-    const currentPassword =
-      req.body.currentPassword ?? req.body.current ?? req.body.oldPassword;
-    const newPassword =
-      req.body.newPassword ?? req.body.newPw ?? req.body.password;
+    const currentPassword = (
+      req.body.currentPassword ?? req.body.current ?? req.body.oldPassword ?? ''
+    ).trim();
+    const newPassword = (
+      req.body.newPassword ?? req.body.newPw ?? req.body.password ?? ''
+    ).trim();
 
     if (!currentPassword || !newPassword)
       return res.status(400).json({ error: 'Both current and new password are required' });

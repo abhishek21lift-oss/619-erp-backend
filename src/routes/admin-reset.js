@@ -5,8 +5,22 @@ const { auth, adminOnly } = require('../middleware/auth');
 const logger  = require('../lib/logger');
 const { escapeIdentifier } = require('pg');
 
+const ALLOWED_TABLES = new Set([
+  'attendance', 'payments', 'subscriptions', 'invoices', 'outstanding_dues',
+  'client_goals', 'transformations', 'face_embeddings', 'notifications', 'message_logs',
+  'clients', 'clients_id_seq', 'payments_id_seq', 'attendance_id_seq',
+  'subscriptions_id_seq', 'invoices_id_seq',
+]);
+
+function validateTableName(tableName) {
+  if (!ALLOWED_TABLES.has(tableName)) {
+    throw new Error(`Invalid table name: ${tableName}`);
+  }
+  return tableName;
+}
+
 async function deleteIfExists(client, tableName) {
-  const safe = escapeIdentifier(tableName);
+  const safe = escapeIdentifier(validateTableName(tableName));
   await client.query(`
     DO $$
     BEGIN
@@ -19,7 +33,7 @@ async function deleteIfExists(client, tableName) {
 }
 
 async function dropIfExists(client, tableName) {
-  await client.query(`DROP TABLE IF EXISTS ${escapeIdentifier(tableName)} CASCADE`);
+  await client.query(`DROP TABLE IF EXISTS ${escapeIdentifier(validateTableName(tableName))} CASCADE`);
 }
 
 /* ══════════════════════════════════════════════════════════════════════

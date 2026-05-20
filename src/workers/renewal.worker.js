@@ -68,8 +68,8 @@ async function runAutoRenew() {
       // 4. Record payment
       await pool.query(
         `INSERT INTO payments (member_id, amount, method, date, gateway, gateway_txn_id, gateway_status, branch_id)
-         VALUES ($1,$2,'RAZORPAY', CURRENT_DATE, 'razorpay', $3, $4, 'br-main')`,
-        [m.member_id, m.price, charge.id, charge.status]
+         VALUES ($1,$2,'RAZORPAY', CURRENT_DATE, 'razorpay', $3, $4, COALESCE($5, 'br-main'))`,
+        [m.member_id, m.price, charge.id, charge.status, process.env.BRANCH_ID || null]
       );
 
       // 5. Notify member

@@ -18,13 +18,10 @@
 
 const pool = require('./pool');
 
-let ensured = false;
 async function ensureSequence(client) {
-  if (ensured) return;
   // CREATE SEQUENCE IF NOT EXISTS is safe to call repeatedly. Postgres ignores
   // the CREATE if the sequence already exists.
   await client.query(`CREATE SEQUENCE IF NOT EXISTS receipt_no_seq START 100001`);
-  ensured = true;
 }
 
 function pad(n, w) {

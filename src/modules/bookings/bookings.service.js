@@ -203,9 +203,9 @@ async function checkIn(bookingId, { method = 'manual' }, ctx) {
   const b = r.rows[0];
   await pool.query(
     `INSERT INTO attendance (type, ref_id, member_id, booking_id, branch_id, date, check_in, status, check_in_method)
-     VALUES ('client', $1, $1, $2, 'br-main', CURRENT_DATE, NOW()::time, 'present', $3)
+     VALUES ('client', $1, $1, $2, COALESCE($4, 'br-main'), CURRENT_DATE, NOW()::time, 'present', $3)
      ON CONFLICT (type, ref_id, date) DO UPDATE SET check_in = EXCLUDED.check_in, status = 'present'`,
-    [b.member_id, b.id, method]
+    [b.member_id, b.id, method, process.env.BRANCH_ID || null]
   );
   return b;
 }

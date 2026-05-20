@@ -92,7 +92,7 @@ router.get('/', auth, async (req, res, next) => {
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
     // Auto-expire is rate-limited to once an hour, off the hot read path.
-    maybeAutoExpire();
+    maybeAutoExpire().catch(err => console.error('Auto-expire error:', err));
 
     const { rows } = await pool.query(
       `SELECT c.*, t.name as computed_trainer_name
