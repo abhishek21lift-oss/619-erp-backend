@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS users (
   password      TEXT        NOT NULL,            -- bcrypt hash
   role          TEXT        NOT NULL DEFAULT 'trainer'
                             CHECK (role IN ('admin','manager','trainer','reception','member')),
-  trainer_id    TEXT,                            -- FK → trainers.id (nullable)
-  member_id     TEXT,                            -- FK → clients.id  (nullable)
+  trainer_id    TEXT        REFERENCES trainers(id) ON DELETE SET NULL,
+  member_id     TEXT        REFERENCES clients(id)  ON DELETE SET NULL,
   branch_id     TEXT,
   is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
   last_login    TIMESTAMPTZ,
