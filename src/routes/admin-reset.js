@@ -36,10 +36,10 @@ async function dropIfExists(client, tableName) {
   await client.query(`DROP TABLE IF EXISTS ${escapeIdentifier(validateTableName(tableName))} CASCADE`);
 }
 
-/* ══════════════════════════════════════════════════════════════════════
+/* ════════════════════════════════════════════════════════════════════
    POST /admin/reset-all-data
    Body: { confirm: "DELETE_ALL_619_DATA" }
-══════════════════════════════════════════════════════════════════════ */
+════════════════════════════════════════════════════════════════════ */
 router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
   if (req.body?.confirm !== 'DELETE_ALL_619_DATA') {
     return res.status(400).json({ error: 'Missing confirmation token. Send { confirm: "DELETE_ALL_619_DATA" } in request body.' });
@@ -88,31 +88,57 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
   }
 });
 
-/* ══════════════════════════════════════════════════════════════════════
+/* ════════════════════════════════════════════════════════════════════
    POST /admin/reset-outstanding-dues
-══════════════════════════════════════════════════════════════════════ */
+════════════════════════════════════════════════════════════════════ */
 router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
   if (req.body?.confirm !== 'CLEAR_DUES_619') {
     return res.status(400).json({ error: 'Missing confirmation token. Send { confirm: "CLEAR_DUES_619" }' });
   }
+  const client = await pool.connect();
   try {
-    await dropIfExists(pool, 'outstanding_dues');
-    await deleteIfExists(pool, 'payments');
-    const hasClients = (await pool.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists;
+    await client.query('BEGIN');
+    await dropIfExists(client, 'outstanding_dues');
+    await deleteIfExists(client, 'payments');
+    const hasClients = (await client.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists;
     if (hasClients) {
-      await pool.query(`UPDATE clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`).catch(() => {});
+      await client.query(`UPDATE clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`);
     }
+    await client.query('COMMIT');
     res.json({ success: true, message: 'Payments and dues-related data cleared safely, and client balances were reset to zero.' });
   } catch (err) {
+    await client.query('ROLLBACK');
     logger.error({ err: err.message }, 'Reset dues error');
     res.status(500).json({ error: 'Operation failed. Check server logs.' });
+  } finally {
+    client.release();
   }
 });
 
 
+// Alias for /reset-outstanding-dues — requires the same explicit confirmation token.
 router.post('/clear-dues-and-payments', auth, adminOnly, async (req, res) => {
-  req.body = { ...req.body, confirm: req.body?.confirm || 'CLEAR_DUES_619' };
-  return router.handle({ ...req, url: '/reset-outstanding-dues', method: 'POST' }, res, () => {});
+  if (req.body?.confirm !== 'CLEAR_DUES_619') {
+    return res.status(400).json({ error: 'Missing confirmation token. Send { confirm: "CLEAR_DUES_619" }' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await dropIfExists(client, 'outstanding_dues');
+    await deleteIfExists(client, 'payments');
+    const hasClients = (await client.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists;
+    if (hasClients) {
+      await client.query(`UPDATE clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`);
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'Payments and dues-related data cleared safely, and client balances were reset to zero.' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    logger.error({ err: err.message }, 'Clear dues error');
+    res.status(500).json({ error: 'Operation failed. Check server logs.' });
+  } finally {
+    client.release();
+  }
 });
 
 module.exports = router;

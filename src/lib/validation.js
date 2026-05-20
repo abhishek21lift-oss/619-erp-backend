@@ -54,7 +54,7 @@ const clientSchemas = {
       photo_url: z.string().optional().nullable(),
       biometric_code: z.string().optional().nullable(),
       plan_id: z.string().optional().nullable(),
-    }).passthrough(),
+    }),
   },
   update: {
     body: z.object({
@@ -73,7 +73,7 @@ const clientSchemas = {
       status: z.string().optional().nullable(),
       notes: z.string().max(1000).optional().nullable(),
       is_active: z.boolean().optional(),
-    }).passthrough(),
+    }),
   },
 };
 
@@ -88,7 +88,7 @@ const paymentSchemas = {
       notes: z.string().max(500).optional().nullable(),
       plan_id: z.string().optional().nullable(),
       trainer_id: z.string().optional().nullable(),
-    }).passthrough(),
+    }),
   },
 };
 
@@ -110,7 +110,7 @@ const planSchemas = {
       color: z.string().optional(),
       is_active: z.boolean().optional(),
       status: z.string().optional(),
-    }).passthrough(),
+    }),
   },
   update: {
     body: z.object({
@@ -129,7 +129,7 @@ const planSchemas = {
       color: z.string().optional(),
       is_active: z.boolean().optional(),
       status: z.string().optional(),
-    }).passthrough(),
+    }),
   },
 };
 
@@ -141,7 +141,7 @@ const staffSchemas = {
       phone: z.string().max(20).optional().nullable(),
       role: z.string().min(1, 'Role is required'),
       status: z.string().optional(),
-    }).passthrough(),
+    }),
   },
 };
 
@@ -163,7 +163,7 @@ const trainerSchemas = {
       status: z.string().optional(),
       notes: z.string().max(1000).optional().nullable(),
       biometric_code: z.string().optional().nullable(),
-    }).passthrough(),
+    }),
   },
 };
 

@@ -81,6 +81,14 @@ router.get('/me', auth, (req, res) => {
   res.json({ user: req.user });
 });
 
+// POST /api/auth/logout
+// Client is responsible for discarding the token. This endpoint exists so the
+// frontend can call it and clear any server-side state in the future (e.g. a
+// token blacklist). For now it just acknowledges the request.
+router.post('/logout', (req, res) => {
+  res.json({ message: 'Logged out' });
+});
+
 // PUT /api/auth/change-password
 // Also accepts POST for backwards compatibility with older frontend builds
 async function changePasswordHandler(req, res) {
