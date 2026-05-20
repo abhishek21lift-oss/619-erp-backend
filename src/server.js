@@ -205,6 +205,11 @@ app.use('/api/v1/notifications',  require('./modules/notifications/notifications
 app.use('/api/v1/reports',        require('./modules/reports/reports.routes'));
 
 // ────────────────────────
+// PT OPERATING SYSTEM (pt-os)
+// ────────────────────────
+app.use('/api/pt-os',             require('./modules/pt-os/pt-os.routes'));
+
+// ────────────────────────
 // 404 + GLOBAL ERROR HANDLER
 // ────────────────────────
 app.use(notFound);
