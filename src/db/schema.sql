@@ -158,6 +158,12 @@ CREATE INDEX IF NOT EXISTS clients_trainer_idx ON clients (trainer_id);
 CREATE INDEX IF NOT EXISTS clients_expiry_idx  ON clients (pt_end_date) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS clients_dob_idx     ON clients (EXTRACT(DOY FROM dob));
 
+-- UNIQUE email indexes (partial — only non-empty emails)
+CREATE UNIQUE INDEX IF NOT EXISTS clients_email_uniq  ON clients (LOWER(email))
+  WHERE email IS NOT NULL AND email != '';
+CREATE UNIQUE INDEX IF NOT EXISTS trainers_email_uniq ON trainers (LOWER(email))
+  WHERE email IS NOT NULL AND email != '';
+
 
 -- ─── PAYMENTS ────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS payments (
@@ -269,6 +275,24 @@ CREATE TABLE IF NOT EXISTS face_descriptors (
 );
 
 CREATE INDEX IF NOT EXISTS face_desc_client_idx ON face_descriptors (client_id) WHERE is_active;
+
+
+-- ─── FACE CHECKIN LOGS ───────────────────────────────────────
+-- Audit log of every face recognition check-in attempt.
+CREATE TABLE IF NOT EXISTS face_checkin_logs (
+  id          TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
+  client_id   TEXT        REFERENCES clients(id) ON DELETE SET NULL,
+  status      TEXT        NOT NULL DEFAULT 'unknown'
+              CHECK (status IN ('success','failed','unknown','expired','denied','frozen','error')),
+  distance    FLOAT8,
+  ip          TEXT,
+  user_agent  TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS face_log_client_idx ON face_checkin_logs (client_id);
+CREATE INDEX IF NOT EXISTS face_log_date_idx   ON face_checkin_logs (created_at DESC);
+CREATE INDEX IF NOT EXISTS face_log_status_idx ON face_checkin_logs (status);
 
 
 -- ─── WEIGHT LOGS ─────────────────────────────────────────────
