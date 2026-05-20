@@ -188,6 +188,15 @@ app.use('/api/admin',             require('./routes/admin-reset'));
 app.use('/api/modules',           require('./modules/operations/operations.routes'));
 
 // ────────────────────────
+// PREMIUM FEATURE ROUTES (v4)
+// ────────────────────────
+app.use('/api/settings',          require('./routes/settings'));
+app.use('/api/invoices',          require('./routes/invoices'));
+app.use('/api/workouts',          require('./routes/workouts'));
+app.use('/api/diet',              require('./routes/diet'));
+app.use('/api/renewals',          require('./routes/renewals'));
+
+// ────────────────────────
 // v3 MODULE ROUTES
 // ────────────────────────
 app.use('/api/v1/members',        require('./modules/members/members.routes'));
