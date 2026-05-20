@@ -264,9 +264,13 @@ router.post('/enroll', auth, async (req, res, next) => {
       }
     }
 
-    // FIX: was JSON.stringify(descriptor) with $1::jsonb cast, but face_descriptor
-    // column is FLOAT8[]. Pass the JS array directly — pg driver serialises it as
-    // a PostgreSQL array literal, and ::float8[] makes the cast explicit.
+    // FIX: pg driver serialises JS Arrays as PostgreSQL array literals, but
+    // uses `.toString()` on each element, which produces scientific notation
+    // like "1e-8" for very small floats. PostgreSQL's float8[] parser does NOT
+    // accept scientific notation. Format the array manually with toFixed(8) to
+    // ensure plain decimal format.
+    const pgArray = `{${descriptor.map(v => v.toFixed(8)).join(',')}}`;
+
     const clientResult = await pool.query(
       `UPDATE clients
           SET face_descriptor  = $1::float8[],
@@ -274,18 +278,17 @@ router.post('/enroll', auth, async (req, res, next) => {
               face_enrolled_at = NOW()
         WHERE id = $2
       RETURNING id`,
-      [descriptor, client_id]
+      [pgArray, client_id]
     );
 
     if (clientResult.rowCount === 0) return res.status(404).json({ error: 'Client not found' });
 
-    // FIX: removed non-existent created_at / updated_at columns from the INSERT.
     // face_descriptors has enrolled_at (DEFAULT NOW()) and no updated_at.
     await pool.query(
       `INSERT INTO face_descriptors (client_id, descriptor, is_active)
        VALUES ($1, $2::float8[], TRUE)
        ON CONFLICT DO NOTHING`,
-      [client_id, descriptor]
+      [client_id, pgArray]
     ).catch(() => null);
 
     return res.status(200).json({ message: 'Face enrolled', client_id });
