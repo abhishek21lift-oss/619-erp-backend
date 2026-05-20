@@ -1,6 +1,5 @@
 -- 006_premium_features.sql
 -- New tables for premium enterprise pages.
--- Uses DO blocks so individual failures are logged but don't abort the migration.
 
 -- ─── INVOICES ─────────────────────────────────────────────────
 DO $$ BEGIN
@@ -27,14 +26,14 @@ DO $$ BEGIN
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'invoices table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'invoices table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS invoices_client_idx ON invoices (client_id);
   CREATE INDEX IF NOT EXISTS invoices_status_idx ON invoices (status);
   CREATE INDEX IF NOT EXISTS invoices_date_idx   ON invoices (issue_date DESC);
   CREATE INDEX IF NOT EXISTS invoices_due_idx    ON invoices (due_date);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'invoices indexes: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'invoices indexes: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE TABLE IF NOT EXISTS invoice_items (
@@ -48,11 +47,11 @@ DO $$ BEGIN
                     CHECK (type IN ('membership','pt','addon','diet','other')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'invoice_items table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'invoice_items table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS inv_items_inv_idx ON invoice_items (invoice_id);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'invoice_items index: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'invoice_items index: %', SQLERRM; END $$;
 
 
 -- ─── EXERCISES / WORKOUT PLANS ────────────────────────────────
@@ -75,12 +74,12 @@ DO $$ BEGIN
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'exercises table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'exercises table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS exercises_muscle_idx ON exercises (muscle_group);
   CREATE INDEX IF NOT EXISTS exercises_active_idx ON exercises (is_active);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'exercises indexes: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'exercises indexes: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE TABLE IF NOT EXISTS workout_plans (
@@ -99,12 +98,12 @@ DO $$ BEGIN
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'workout_plans table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'workout_plans table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS wp_goal_idx   ON workout_plans (goal);
   CREATE INDEX IF NOT EXISTS wp_active_idx ON workout_plans (is_active);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'workout_plans indexes: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'workout_plans indexes: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE TABLE IF NOT EXISTS workout_exercises (
@@ -119,12 +118,12 @@ DO $$ BEGIN
     notes           TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'workout_exercises table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'workout_exercises table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS we_plan_idx ON workout_exercises (workout_plan_id);
   CREATE INDEX IF NOT EXISTS we_day_idx  ON workout_exercises (workout_plan_id, day_of_week);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'workout_exercises indexes: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'workout_exercises indexes: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE TABLE IF NOT EXISTS workout_assignments (
@@ -142,12 +141,12 @@ DO $$ BEGIN
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (workout_plan_id, client_id, status)
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'workout_assignments table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'workout_assignments table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS wa_client_idx ON workout_assignments (client_id);
   CREATE INDEX IF NOT EXISTS wa_status_idx ON workout_assignments (status);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'workout_assignments indexes: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'workout_assignments indexes: %', SQLERRM; END $$;
 
 
 -- ─── DIET / NUTRITION PLANS ───────────────────────────────────
@@ -168,12 +167,12 @@ DO $$ BEGIN
     created_by      TEXT        REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'meals table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'meals table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS meals_type_idx   ON meals (meal_type);
   CREATE INDEX IF NOT EXISTS meals_active_idx ON meals (is_active);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'meals indexes: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'meals indexes: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE TABLE IF NOT EXISTS diet_templates (
@@ -190,12 +189,12 @@ DO $$ BEGIN
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'diet_templates table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'diet_templates table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS dt_goal_idx   ON diet_templates (goal);
   CREATE INDEX IF NOT EXISTS dt_active_idx ON diet_templates (is_active);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'diet_templates indexes: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'diet_templates indexes: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE TABLE IF NOT EXISTS diet_plan_meals (
@@ -206,11 +205,11 @@ DO $$ BEGIN
     sort_order      INT         NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'diet_plan_meals table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'diet_plan_meals table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS dpm_template_idx ON diet_plan_meals (diet_template_id);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'diet_plan_meals index: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'diet_plan_meals index: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE TABLE IF NOT EXISTS diet_assignments (
@@ -227,11 +226,11 @@ DO $$ BEGIN
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (diet_template_id, client_id, status)
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'diet_assignments table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'diet_assignments table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS da_client_idx ON diet_assignments (client_id);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'diet_assignments index: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'diet_assignments index: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE TABLE IF NOT EXISTS nutrition_logs (
@@ -248,11 +247,11 @@ DO $$ BEGIN
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (client_id, log_date)
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'nutrition_logs table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'nutrition_logs table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS nl_client_idx ON nutrition_logs (client_id, log_date DESC);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'nutrition_logs index: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'nutrition_logs index: %', SQLERRM; END $$;
 
 
 -- ─── CLIENT FITNESS PROFILE EXTENSIONS ────────────────────────
@@ -275,11 +274,11 @@ DO $$ BEGIN
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'client_fitness_profiles table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'client_fitness_profiles table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS cfp_client_idx ON client_fitness_profiles (client_id);
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'client_fitness_profiles index: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'client_fitness_profiles index: %', SQLERRM; END $$;
 
 
 -- ─── CHURN RISK LOG ───────────────────────────────────────────
@@ -296,13 +295,13 @@ DO $$ BEGIN
     resolved_by     TEXT        REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'churn_risk_log table: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'churn_risk_log table: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   CREATE INDEX IF NOT EXISTS crl_client_idx ON churn_risk_log (client_id);
   CREATE INDEX IF NOT EXISTS crl_risk_idx   ON churn_risk_log (risk_score DESC);
   CREATE INDEX IF NOT EXISTS crl_active_idx ON churn_risk_log (resolved_at) WHERE resolved_at IS NULL;
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'churn_risk_log indexes: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'churn_risk_log indexes: %', SQLERRM; END $$;
 
 
 -- ─── SEED DATA (exercises and diet templates) ─────────────────
@@ -361,7 +360,7 @@ DO $$ BEGIN
     SELECT gen_random_uuid()::TEXT, 'Jump Rope', 'Jump rope for cardiovascular conditioning', 'Cardio', 'intermediate', 3, 60
     WHERE NOT EXISTS (SELECT 1 FROM exercises WHERE name = 'Jump Rope');
   END IF;
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'exercise seed data: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'exercise seed data: %', SQLERRM; END $$;
 
 DO $$ BEGIN
   IF EXISTS (SELECT FROM pg_tables WHERE tablename = 'diet_templates') THEN
@@ -381,4 +380,4 @@ DO $$ BEGIN
     SELECT gen_random_uuid()::TEXT, 'Vegan Plan', 'Plant-based protein-rich meal plan for vegans', 'vegan', 2200, 130, 260, 55
     WHERE NOT EXISTS (SELECT 1 FROM diet_templates WHERE name = 'Vegan Plan');
   END IF;
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'diet template seed data: %', SQLERRM; END $$;
+EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'diet template seed data: %', SQLERRM; END $$;
