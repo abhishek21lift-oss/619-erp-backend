@@ -12,10 +12,8 @@ function ctx(req) {
 
 async function dashboard(userCtx) {
   const { role, trainer_id } = userCtx;
-  const isTrainer = role === 'trainer';
-  const trainerFilter = isTrainer && trainer_id
-    ? (sql) => sql.replace('/*tf*/', `AND t.id = '${trainer_id}'`)
-    : (sql) => sql.replace('/*tf*/', '');
+  const isTrainer = role === 'trainer' && trainer_id;
+  const tf = (col) => isTrainer ? ` AND ${col} = '${trainer_id}'` : '';
 
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
@@ -23,13 +21,13 @@ async function dashboard(userCtx) {
   const queries = {
     overview: pool.query(`
       SELECT
-        (SELECT COUNT(*) FROM pt_os_assignments WHERE status = 'active' /*tf*/) AS active_clients,
+        (SELECT COUNT(*) FROM pt_os_assignments WHERE status = 'active'${tf('trainer_id')}) AS active_clients,
         (SELECT COUNT(*) FROM pt_os_sessions WHERE status = 'scheduled' AND scheduled_at >= $1::timestamptz) AS upcoming_sessions,
-        (SELECT COUNT(*) FROM pt_os_sessions WHERE status = 'completed' AND created_at >= $1::timestamptz) AS completed_sessions_month,
+        (SELECT COUNT(*) FROM pt_os_sessions WHERE status = 'completed' AND created_at >= $1::timestamptz${tf('trainer_id')}) AS completed_sessions_month,
         (SELECT COALESCE(SUM(amount),0) FROM pt_os_payments WHERE status = 'completed' AND created_at >= $1::timestamptz) AS revenue_month,
         (SELECT COALESCE(SUM(amount),0) FROM pt_os_payments WHERE status = 'completed') AS revenue_total,
-        (SELECT COUNT(*) FROM pt_os_assignments WHERE status IN ('active','completed') /*tf*/) AS total_assignments
-    `.replace('/*tf*/', isTrainer ? `AND trainer_id = '${trainer_id}' AND trainer_id = '${trainer_id}'` : ''),
+        (SELECT COUNT(*) FROM pt_os_assignments WHERE status IN ('active','completed')${tf('trainer_id')}) AS total_assignments
+    `,
       [monthStart]
     ),
     revenue_trend: pool.query(`
@@ -49,7 +47,7 @@ async function dashboard(userCtx) {
       SELECT p.type, COUNT(*) AS count, COALESCE(SUM(a.final_amount),0) AS revenue
       FROM pt_os_assignments a
       JOIN pt_os_packages p ON p.id = a.package_id
-      WHERE a.status = 'active'
+      WHERE a.status = 'active'${tf('a.trainer_id')}
       GROUP BY p.type ORDER BY count DESC
     `),
     session_stats: pool.query(`
@@ -60,7 +58,7 @@ async function dashboard(userCtx) {
         COUNT(*) FILTER (WHERE status = 'scheduled') AS scheduled,
         COUNT(*) AS total
       FROM pt_os_sessions
-      WHERE created_at >= date_trunc('month', NOW())
+      WHERE created_at >= date_trunc('month', NOW())${tf('trainer_id')}
     `),
     trainer_leaderboard: pool.query(`
       SELECT
@@ -74,7 +72,7 @@ async function dashboard(userCtx) {
       LEFT JOIN pt_os_assignments a ON a.trainer_id = t.id
       LEFT JOIN pt_os_sessions s ON s.trainer_id = t.id
       LEFT JOIN pt_os_earnings e ON e.trainer_id = t.id
-      WHERE t.deleted_at IS NULL
+      WHERE t.deleted_at IS NULL${isTrainer ? ` AND t.id = '${trainer_id}'` : ''}
       GROUP BY t.id, t.name, t.photo_url
       ORDER BY sessions_month DESC NULLS LAST
       LIMIT 10
@@ -84,6 +82,7 @@ async function dashboard(userCtx) {
       FROM pt_os_coaching_events e
       LEFT JOIN clients c ON c.id = e.client_id
       LEFT JOIN trainers t ON t.id = e.trainer_id
+      WHERE 1=1${tf('e.trainer_id')}
       ORDER BY e.occurred_at DESC LIMIT 20
     `),
     alerts: pool.query(`
@@ -93,21 +92,21 @@ async function dashboard(userCtx) {
       JOIN clients c ON c.id = a.client_id
       LEFT JOIN trainers t ON t.id = a.trainer_id
       WHERE a.status = 'active' AND a.end_date IS NOT NULL
-        AND a.end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+        AND a.end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'${tf('a.trainer_id')}
       UNION ALL
       SELECT 'overdue' AS type, p.id, c.name AS client_name, NULL AS trainer_name,
              p.due_date AS end_date, (CURRENT_DATE - p.due_date) AS days_left
       FROM pt_os_payments p
       JOIN pt_os_assignments a ON a.id = p.assignment_id
       JOIN clients c ON c.id = p.client_id
-      WHERE p.status = 'pending' AND p.due_date < CURRENT_DATE
+      WHERE p.status = 'pending' AND p.due_date < CURRENT_DATE${tf('a.trainer_id')}
       ORDER BY days_left LIMIT 10
     `),
     insights: pool.query(`
       SELECT i.*, c.name AS client_name
       FROM pt_os_ai_insights i
       LEFT JOIN clients c ON c.id = i.client_id
-      WHERE NOT dismissed
+      WHERE NOT dismissed${tf('i.trainer_id')}
       ORDER BY i.severity DESC, i.confidence DESC NULLS LAST, i.created_at DESC
       LIMIT 10
     `),
@@ -118,6 +117,7 @@ async function dashboard(userCtx) {
         COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,
         COUNT(*) FILTER (WHERE status = 'expired') AS expired
       FROM pt_os_assignments
+      WHERE 1=1${tf('trainer_id')}
     `),
   };
 
