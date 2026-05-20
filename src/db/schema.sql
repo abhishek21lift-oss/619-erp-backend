@@ -4,7 +4,7 @@
 --
 -- Run order:
 --   1. extensions
---   2. core tables (users, trainers, clients)
+--   2. core tables (trainers, clients, users)
 --   3. membership & finance (subscriptions, payments, renewals)
 --   4. attendance
 --   5. face recognition
@@ -13,13 +13,13 @@
 --   8. indexes
 -- ============================================================
 
--- ─── Extensions ─────────────────────────────────────────────
+-- ─── Extensions ───────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";   -- gen_random_uuid()
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";    -- ILIKE trigram indexes
 CREATE EXTENSION IF NOT EXISTS "unaccent";   -- accent-insensitive search
 
 
--- ─── ENUM types ──────────────────────────────────────────────
+-- ─── ENUM types ────────────────────────────────────────────
 DO $$ BEGIN
   CREATE TYPE user_role    AS ENUM ('admin','manager','trainer','reception','member');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -43,28 +43,7 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 
--- ─── USERS ───────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS users (
-  id            TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  name          TEXT        NOT NULL,
-  email         TEXT        NOT NULL UNIQUE,
-  password      TEXT        NOT NULL,            -- bcrypt hash
-  role          TEXT        NOT NULL DEFAULT 'trainer'
-                            CHECK (role IN ('admin','manager','trainer','reception','member')),
-  trainer_id    TEXT        REFERENCES trainers(id) ON DELETE SET NULL,
-  member_id     TEXT        REFERENCES clients(id)  ON DELETE SET NULL,
-  branch_id     TEXT,
-  is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
-  last_login    TIMESTAMPTZ,
-  deleted_at    TIMESTAMPTZ,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON users (LOWER(email));
-
-
--- ─── TRAINERS ────────────────────────────────────────────────
+-- ─── TRAINERS ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS trainers (
   id               TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   name             TEXT        NOT NULL,
@@ -88,10 +67,6 @@ CREATE TABLE IF NOT EXISTS trainers (
 
 
 -- ─── CLIENTS (Members) ───────────────────────────────────────
--- Single source of truth for a gym member.
--- Fields use both modern names (expiry_date, phone) and the legacy
--- column names (pt_end_date, mobile) that the existing API relies on.
--- New columns shadow the old ones via GENERATED or defaults.
 CREATE TABLE IF NOT EXISTS clients (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id       TEXT        UNIQUE,      -- legacy FS#### code
@@ -165,7 +140,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS trainers_email_uniq ON trainers (LOWER(email))
   WHERE email IS NOT NULL AND email != '';
 
 
--- ─── PAYMENTS ────────────────────────────────────────────────
+-- ─── USERS ───────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS users (
+  id            TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
+  name          TEXT        NOT NULL,
+  email         TEXT        NOT NULL UNIQUE,
+  password      TEXT        NOT NULL,            -- bcrypt hash
+  role          TEXT        NOT NULL DEFAULT 'trainer'
+                            CHECK (role IN ('admin','manager','trainer','reception','member')),
+  trainer_id    TEXT        REFERENCES trainers(id) ON DELETE SET NULL,
+  member_id     TEXT        REFERENCES clients(id)  ON DELETE SET NULL,
+  branch_id     TEXT,
+  is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
+  last_login    TIMESTAMPTZ,
+  deleted_at    TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON users (LOWER(email));
+
+
+-- ─── PAYMENTS ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS payments (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   receipt_no      TEXT        UNIQUE,
@@ -188,8 +184,7 @@ CREATE INDEX IF NOT EXISTS payments_date_idx   ON payments (date DESC);
 CREATE INDEX IF NOT EXISTS payments_trainer_idx ON payments (trainer_id);
 
 
--- ─── RENEWALS ────────────────────────────────────────────────
--- Audit trail of every membership renewal.
+-- ─── RENEWALS ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS renewals (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id       TEXT        NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
@@ -212,7 +207,7 @@ CREATE INDEX IF NOT EXISTS renewals_client_idx ON renewals (client_id);
 CREATE INDEX IF NOT EXISTS renewals_date_idx   ON renewals (renewed_on DESC);
 
 
--- ─── SUBSCRIPTIONS ───────────────────────────────────────────
+-- ─── SUBSCRIPTIONS ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS subscriptions (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id       TEXT        NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
@@ -233,10 +228,7 @@ CREATE INDEX IF NOT EXISTS subscriptions_status_idx  ON subscriptions (status);
 CREATE INDEX IF NOT EXISTS subscriptions_end_idx     ON subscriptions (end_date);
 
 
--- ─── ATTENDANCE LOGS ─────────────────────────────────────────
--- Unified table for both client and trainer/staff attendance.
--- ref_type = 'client'  → ref_id = clients.id
--- ref_type = 'trainer' → ref_id = trainers.id
+-- ─── ATTENDANCE LOGS ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS attendance_logs (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   ref_id          TEXT        NOT NULL,
@@ -262,8 +254,6 @@ CREATE INDEX IF NOT EXISTS atlog_type_idx ON attendance_logs (ref_type, date DES
 
 
 -- ─── FACE DESCRIPTORS ────────────────────────────────────────
--- Separate table keeps the heavy 128-float arrays out of the main
--- clients row, speeding up list queries.
 CREATE TABLE IF NOT EXISTS face_descriptors (
   id            TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id     TEXT        NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
@@ -277,8 +267,7 @@ CREATE TABLE IF NOT EXISTS face_descriptors (
 CREATE INDEX IF NOT EXISTS face_desc_client_idx ON face_descriptors (client_id) WHERE is_active;
 
 
--- ─── FACE CHECKIN LOGS ───────────────────────────────────────
--- Audit log of every face recognition check-in attempt.
+-- ─── FACE CHECKIN LOGS ──────────────────────────────────────
 CREATE TABLE IF NOT EXISTS face_checkin_logs (
   id          TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id   TEXT        REFERENCES clients(id) ON DELETE SET NULL,
@@ -295,7 +284,7 @@ CREATE INDEX IF NOT EXISTS face_log_date_idx   ON face_checkin_logs (created_at 
 CREATE INDEX IF NOT EXISTS face_log_status_idx ON face_checkin_logs (status);
 
 
--- ─── WEIGHT LOGS ─────────────────────────────────────────────
+-- ─── WEIGHT LOGS ───────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS weight_logs (
   id          TEXT    PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id   TEXT    NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
@@ -308,7 +297,7 @@ CREATE TABLE IF NOT EXISTS weight_logs (
 CREATE INDEX IF NOT EXISTS wlog_client_idx ON weight_logs (client_id, date DESC);
 
 
--- ─── NOTIFICATIONS ───────────────────────────────────────────
+-- ─── NOTIFICATIONS ────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS notifications (
   id          TEXT    PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   user_id     TEXT    REFERENCES users(id) ON DELETE CASCADE,
@@ -323,8 +312,7 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS notif_user_idx ON notifications (user_id, is_read, created_at DESC);
 
 
--- ─── ACTIVITY LOG ────────────────────────────────────────────
--- Immutable audit trail for all write operations.
+-- ─── ACTIVITY LOG ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS activity_log (
   id          TEXT    PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   user_id     TEXT    REFERENCES users(id) ON DELETE SET NULL,
@@ -344,7 +332,7 @@ CREATE INDEX IF NOT EXISTS actlog_entity_idx ON activity_log (entity_type, entit
 CREATE INDEX IF NOT EXISTS actlog_date_idx   ON activity_log (created_at DESC);
 
 
--- ─── FEATURE FLAGS ───────────────────────────────────────────
+-- ─── FEATURE FLAGS ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS feature_flags (
   key         TEXT    PRIMARY KEY,
   value       BOOLEAN NOT NULL DEFAULT TRUE,
@@ -360,7 +348,7 @@ INSERT INTO feature_flags (key, value, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 
--- ─── SYSTEM SETTINGS ─────────────────────────────────────────
+-- ─── SYSTEM SETTINGS ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS system_settings (
   key         TEXT    PRIMARY KEY,
   value       TEXT,
@@ -382,8 +370,7 @@ INSERT INTO system_settings (key, value, type, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 
--- ─── RECEIPT COUNTER ─────────────────────────────────────────
--- Used by genReceiptNo() in db/receipts.js — a single-row atomic counter.
+-- ─── RECEIPT COUNTER ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS receipt_counter (
   id           SERIAL  PRIMARY KEY,
   last_receipt INT     NOT NULL DEFAULT 0
@@ -393,7 +380,7 @@ INSERT INTO receipt_counter (last_receipt)
 SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM receipt_counter);
 
 
--- ─── LEAVE REQUESTS ──────────────────────────────────────────
+-- ─── LEAVE REQUESTS ────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS leave_requests (
   id          TEXT    PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   trainer_id  TEXT    NOT NULL REFERENCES trainers(id) ON DELETE CASCADE,
@@ -415,7 +402,7 @@ CREATE INDEX IF NOT EXISTS leave_trainer_idx ON leave_requests (trainer_id);
 CREATE INDEX IF NOT EXISTS leave_status_idx  ON leave_requests (status);
 
 
--- ─── Expenses table ──────────────────────────────────────────
+-- ─── Expenses table ────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS expenses (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   category        TEXT NOT NULL DEFAULT 'other',
