@@ -114,28 +114,26 @@ DO $$ BEGIN
 EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'pt_os_sessions indexes: %', SQLERRM; END $$;
 
 -- Conflict prevention: no two sessions for the same trainer at the same time
-DO $$ BEGIN
-  CREATE OR REPLACE FUNCTION pt_os_no_overlap()
-  RETURNS TRIGGER LANGUAGE plpgsql AS $$
-  BEGIN
-    IF EXISTS (
-      SELECT 1 FROM pt_os_sessions
-      WHERE trainer_id = NEW.trainer_id
-        AND status NOT IN ('cancelled','missed')
-        AND id <> COALESCE(NEW.id, '')
-        AND tstzrange(NEW.scheduled_at, NEW.scheduled_at + interval '1 hour') && tstzrange(scheduled_at, scheduled_at + interval '1 hour')
-    ) THEN
-      RAISE EXCEPTION 'conflicting session — trainer already has a session within this hour';
-    END IF;
-    RETURN NEW;
-  END;
-  $$;
+CREATE OR REPLACE FUNCTION pt_os_no_overlap()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pt_os_sessions
+    WHERE trainer_id = NEW.trainer_id
+      AND status NOT IN ('cancelled','missed')
+      AND id <> COALESCE(NEW.id, '')
+      AND tstzrange(NEW.scheduled_at, NEW.scheduled_at + interval '1 hour') && tstzrange(scheduled_at, scheduled_at + interval '1 hour')
+  ) THEN
+    RAISE EXCEPTION 'conflicting session — trainer already has a session within this hour';
+  END IF;
+  RETURN NEW;
+END;
+$$;
 
-  DROP TRIGGER IF EXISTS trg_pt_os_no_overlap ON pt_os_sessions;
-  CREATE TRIGGER trg_pt_os_no_overlap
-    BEFORE INSERT OR UPDATE ON pt_os_sessions
-    FOR EACH ROW EXECUTE FUNCTION pt_os_no_overlap();
-EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'pt_os_sessions trigger: %', SQLERRM; END $$;
+DROP TRIGGER IF EXISTS trg_pt_os_no_overlap ON pt_os_sessions;
+CREATE TRIGGER trg_pt_os_no_overlap
+  BEFORE INSERT OR UPDATE ON pt_os_sessions
+  FOR EACH ROW EXECUTE FUNCTION pt_os_no_overlap();
 
 
 -- ─── PT PAYMENTS ───────────────────────────────────────────────
@@ -386,88 +384,82 @@ END $$;
 
 
 -- ─── HELPER VIEW: active PT assignments ────────────────────────
-DO $$ BEGIN
-  CREATE OR REPLACE VIEW pt_os_active_assignments AS
-  SELECT
-    a.id,
-    a.client_id,
-    c.name      AS client_name,
-    c.mobile    AS client_mobile,
-    a.trainer_id,
-    t.name      AS trainer_name,
-    a.package_id,
-    p.name      AS package_name,
-    p.type      AS package_type,
-    a.sessions_total,
-    a.sessions_used,
-    (a.sessions_total - a.sessions_used) AS sessions_remaining,
-    a.start_date,
-    a.end_date,
-    a.amount,
-    a.discount,
-    a.final_amount,
-    a.health_score,
-    a.adherence_pct,
-    a.status,
-    a.created_at
-  FROM pt_os_assignments a
-  JOIN clients  c ON c.id = a.client_id
-  JOIN trainers t ON t.id = a.trainer_id
-  LEFT JOIN pt_os_packages p ON p.id = a.package_id
-  WHERE a.status = 'active';
-EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'pt_os_active_assignments view: %', SQLERRM; END $$;
+CREATE OR REPLACE VIEW pt_os_active_assignments AS
+SELECT
+  a.id,
+  a.client_id,
+  c.name      AS client_name,
+  c.mobile    AS client_mobile,
+  a.trainer_id,
+  t.name      AS trainer_name,
+  a.package_id,
+  p.name      AS package_name,
+  p.type      AS package_type,
+  a.sessions_total,
+  a.sessions_used,
+  (a.sessions_total - a.sessions_used) AS sessions_remaining,
+  a.start_date,
+  a.end_date,
+  a.amount,
+  a.discount,
+  a.final_amount,
+  a.health_score,
+  a.adherence_pct,
+  a.status,
+  a.created_at
+FROM pt_os_assignments a
+JOIN clients  c ON c.id = a.client_id
+JOIN trainers t ON t.id = a.trainer_id
+LEFT JOIN pt_os_packages p ON p.id = a.package_id
+WHERE a.status = 'active';
 
 
 -- ─── HELPER VIEW: trainer monthly earnings ─────────────────────
-DO $$ BEGIN
-  CREATE OR REPLACE VIEW pt_os_trainer_monthly_earnings AS
-  SELECT
-    e.trainer_id,
-    t.name AS trainer_name,
-    DATE_TRUNC('month', e.created_at) AS month,
-    COUNT(DISTINCT e.id) AS earnings_count,
-    SUM(e.amount) FILTER (WHERE e.type = 'commission') AS commission_total,
-    SUM(e.amount) FILTER (WHERE e.type = 'incentive') AS incentive_total,
-    SUM(e.amount) FILTER (WHERE e.type = 'bonus') AS bonus_total,
-    SUM(e.amount) FILTER (WHERE e.type = 'penalty') AS penalty_total,
-    SUM(e.amount) AS grand_total,
-    COUNT(DISTINCT a.client_id) AS active_clients
-  FROM pt_os_earnings e
-  JOIN trainers t ON t.id = e.trainer_id
-  LEFT JOIN pt_os_assignments a ON a.trainer_id = e.trainer_id AND a.status = 'active'
-  GROUP BY e.trainer_id, t.name, DATE_TRUNC('month', e.created_at);
-EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'pt_os_trainer_monthly_earnings view: %', SQLERRM; END $$;
+CREATE OR REPLACE VIEW pt_os_trainer_monthly_earnings AS
+SELECT
+  e.trainer_id,
+  t.name AS trainer_name,
+  DATE_TRUNC('month', e.created_at) AS month,
+  COUNT(DISTINCT e.id) AS earnings_count,
+  SUM(e.amount) FILTER (WHERE e.type = 'commission') AS commission_total,
+  SUM(e.amount) FILTER (WHERE e.type = 'incentive') AS incentive_total,
+  SUM(e.amount) FILTER (WHERE e.type = 'bonus') AS bonus_total,
+  SUM(e.amount) FILTER (WHERE e.type = 'penalty') AS penalty_total,
+  SUM(e.amount) AS grand_total,
+  COUNT(DISTINCT a.client_id) AS active_clients
+FROM pt_os_earnings e
+JOIN trainers t ON t.id = e.trainer_id
+LEFT JOIN pt_os_assignments a ON a.trainer_id = e.trainer_id AND a.status = 'active'
+GROUP BY e.trainer_id, t.name, DATE_TRUNC('month', e.created_at);
 
 
 -- ─── HELPER VIEW: client health snapshot ───────────────────────
-DO $$ BEGIN
-  CREATE OR REPLACE VIEW pt_os_client_health AS
-  SELECT
-    a.client_id,
-    c.name AS client_name,
-    a.id AS assignment_id,
-    a.health_score,
-    a.adherence_pct,
-    a.sessions_total,
-    a.sessions_used,
-    (a.sessions_total - a.sessions_used) AS sessions_remaining,
-    a.end_date,
-    CASE
-      WHEN a.health_score >= 80 THEN 'excellent'
-      WHEN a.health_score >= 60 THEN 'good'
-      WHEN a.health_score >= 40 THEN 'fair'
-      WHEN a.health_score >= 20 THEN 'poor'
-      ELSE 'critical'
-    END AS health_label,
-    CASE
-      WHEN a.end_date IS NOT NULL AND a.end_date <= CURRENT_DATE + INTERVAL '7 days' THEN 'expiring_soon'
-      WHEN a.end_date IS NOT NULL AND a.end_date <= CURRENT_DATE THEN 'expired'
-      ELSE 'active'
-    END AS renewal_status,
-    (SELECT COUNT(*) FROM pt_os_sessions s
-     WHERE s.assignment_id = a.id AND s.status = 'missed'
-       AND s.scheduled_at >= CURRENT_DATE - INTERVAL '30 days') AS missed_last_30d
-  FROM pt_os_assignments a
-  JOIN clients c ON c.id = a.client_id
-  WHERE a.status = 'active';
-EXCEPTION WHEN OTHERS THEN RAISE EXCEPTION 'pt_os_client_health view: %', SQLERRM; END $$;
+CREATE OR REPLACE VIEW pt_os_client_health AS
+SELECT
+  a.client_id,
+  c.name AS client_name,
+  a.id AS assignment_id,
+  a.health_score,
+  a.adherence_pct,
+  a.sessions_total,
+  a.sessions_used,
+  (a.sessions_total - a.sessions_used) AS sessions_remaining,
+  a.end_date,
+  CASE
+    WHEN a.health_score >= 80 THEN 'excellent'
+    WHEN a.health_score >= 60 THEN 'good'
+    WHEN a.health_score >= 40 THEN 'fair'
+    WHEN a.health_score >= 20 THEN 'poor'
+    ELSE 'critical'
+  END AS health_label,
+  CASE
+    WHEN a.end_date IS NOT NULL AND a.end_date <= CURRENT_DATE + INTERVAL '7 days' THEN 'expiring_soon'
+    WHEN a.end_date IS NOT NULL AND a.end_date <= CURRENT_DATE THEN 'expired'
+    ELSE 'active'
+  END AS renewal_status,
+  (SELECT COUNT(*) FROM pt_os_sessions s
+   WHERE s.assignment_id = a.id AND s.status = 'missed'
+     AND s.scheduled_at >= CURRENT_DATE - INTERVAL '30 days') AS missed_last_30d
+FROM pt_os_assignments a
+JOIN clients c ON c.id = a.client_id
+WHERE a.status = 'active';
