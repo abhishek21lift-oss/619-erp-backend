@@ -8,15 +8,11 @@
 -- ─── 1. UNIQUE constraints on email columns ────────────────────────────
 -- Only enforce where email is actually provided (not null, not empty)
 DO $$ BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_index WHERE indexrelid = 'clients_email_uniq'::regclass
-  ) THEN
+  IF to_regclass('clients_email_uniq') IS NULL THEN
     CREATE UNIQUE INDEX clients_email_uniq ON clients (LOWER(email))
       WHERE email IS NOT NULL AND email != '';
   END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_index WHERE indexrelid = 'trainers_email_uniq'::regclass
-  ) THEN
+  IF to_regclass('trainers_email_uniq') IS NULL THEN
     CREATE UNIQUE INDEX trainers_email_uniq ON trainers (LOWER(email))
       WHERE email IS NOT NULL AND email != '';
   END IF;
