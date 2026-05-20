@@ -401,7 +401,7 @@ CREATE TABLE IF NOT EXISTS expenses (
   payment_method  TEXT NOT NULL DEFAULT 'cash',
   receipt_url     TEXT,
   notes           TEXT,
-  created_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_by      TEXT REFERENCES users(id) ON DELETE SET NULL,
   status          TEXT NOT NULL DEFAULT 'approved'
                     CHECK (status IN ('pending','approved','rejected')),
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
