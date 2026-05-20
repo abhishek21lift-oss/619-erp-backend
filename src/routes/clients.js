@@ -6,6 +6,7 @@ const { genReceiptNo } = require('../db/receipts');
 const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { clientSchemas } = require('../lib/validation');
+const logger = require('../lib/logger');
 
 // Helper: parse a value as a finite number, or return fallback.
 // parseFloat('') is NaN — `??` does NOT catch that. Use this guard instead.
@@ -28,7 +29,7 @@ async function maybeAutoExpire() {
        WHERE status='active' AND pt_end_date < CURRENT_DATE`
     );
   } catch (err) {
-    console.error('Auto-expire error:', err.message);
+    logger.warn({ err: err.message }, 'Auto-expire error');
   }
 }
 

@@ -17,9 +17,13 @@
 
 const router = require('express').Router();
 const { v4: uuid } = require('uuid');
+const rateLimit = require('express-rate-limit');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
+const logger = require('../lib/logger');
 const { kioskTokenMiddleware } = require('../middleware/kiosk-token');
+
+const faceLimiter = rateLimit({ windowMs: 60 * 1000, max: 15, standardHeaders: true, legacyHeaders: false });
 function kioskOrAuth(req, res, next) {
   if (req.user && req.user.role === 'kiosk') return next();
   return auth(req, res, next);
@@ -75,7 +79,7 @@ async function logCheckIn({ clientId, status, distance, ip, userAgent }) {
 // POST /api/checkin/face
 // Body: { descriptor: number[128] }
 // ──────────────────────────────────────────────────────────────────
-router.post('/face', kioskTokenMiddleware, kioskOrAuth, async (req, res, next) => {
+router.post('/face', kioskTokenMiddleware, faceLimiter, kioskOrAuth, async (req, res, next) => {
   try {
     const descriptor = req.body?.descriptor;
     if (!isValidDescriptor(descriptor)) {
@@ -224,7 +228,7 @@ router.post('/face', kioskTokenMiddleware, kioskOrAuth, async (req, res, next) =
       log_id: logId,
     });
   } catch (err) {
-    console.error('[checkin/face]', err);
+    logger.error({ err: err.message }, '[checkin/face] error');
     return next(err);
   }
 });
@@ -235,7 +239,7 @@ router.post('/face', kioskTokenMiddleware, kioskOrAuth, async (req, res, next) =
 // Stores the face descriptor for an existing client.
 // Admin or reception only.
 // ──────────────────────────────────────────────────────────────────
-router.post('/enroll', auth, async (req, res, next) => {
+router.post('/enroll', auth, faceLimiter, async (req, res, next) => {
   try {
     // Owners and managers can also enroll faces — same trust level as admin
     // for a single-gym deployment. Trainers can enroll only their own
@@ -293,7 +297,7 @@ router.post('/enroll', auth, async (req, res, next) => {
 
     return res.status(200).json({ message: 'Face enrolled', client_id });
   } catch (err) {
-    console.error('[checkin/enroll]', err);
+    logger.error({ err: err.message }, '[checkin/enroll] error');
     return next(err);
   }
 });
@@ -330,7 +334,7 @@ router.get('/logs', auth, async (req, res, next) => {
     );
     return res.json(rows);
   } catch (err) {
-    console.error('[checkin/logs]', err);
+    logger.error({ err: err.message }, '[checkin/logs] error');
     return next(err);
   }
 });

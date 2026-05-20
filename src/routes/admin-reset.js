@@ -2,13 +2,16 @@ const express = require('express');
 const router  = express.Router();
 const pool    = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const logger  = require('../lib/logger');
+const { escapeIdentifier } = require('pg');
 
 async function deleteIfExists(client, tableName) {
+  const safe = escapeIdentifier(tableName);
   await client.query(`
     DO $$
     BEGIN
-      IF to_regclass('public.${tableName}') IS NOT NULL THEN
-        EXECUTE 'DELETE FROM ${tableName}';
+      IF to_regclass('public.${safe}') IS NOT NULL THEN
+        EXECUTE 'DELETE FROM ${safe}';
       END IF;
     END
     $$;
@@ -16,7 +19,7 @@ async function deleteIfExists(client, tableName) {
 }
 
 async function dropIfExists(client, tableName) {
-  await client.query(`DROP TABLE IF EXISTS ${tableName} CASCADE`);
+  await client.query(`DROP TABLE IF EXISTS ${escapeIdentifier(tableName)} CASCADE`);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -64,8 +67,8 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
     res.json({ success: true, message: 'All member data, payments, attendance, and related records have been cleared safely. Missing legacy tables were skipped automatically.' });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Reset error:', err);
-    res.status(500).json({ error: err.message });
+    logger.error({ err: err.message }, 'Reset all data error');
+    res.status(500).json({ error: 'Reset failed. Check server logs.' });
   } finally {
     client.release();
   }
@@ -87,7 +90,8 @@ router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
     }
     res.json({ success: true, message: 'Payments and dues-related data cleared safely, and client balances were reset to zero.' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    logger.error({ err: err.message }, 'Reset dues error');
+    res.status(500).json({ error: 'Operation failed. Check server logs.' });
   }
 });
 

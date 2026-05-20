@@ -6,6 +6,7 @@ const { genReceiptNo } = require('../db/receipts');
 const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { paymentSchemas } = require('../lib/validation');
+const logger = require('../lib/logger');
 
 // GET /api/payments
 router.get('/', auth, async (req, res, next) => {
@@ -115,7 +116,7 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
     res.status(201).json({ message: 'Payment recorded', payment: rows[0] });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
-    console.error('Payment error:', err.message);
+    logger.error({ err: err.message }, 'Payment error');
     next(err);
   } finally {
     tx.release();
