@@ -612,7 +612,7 @@ module.exports = router;
 // POST /api/clients/:id/unfreeze
 router.post('/:id/unfreeze', auth, async (req, res, next) => {
   try {
-    await requireAdmin(req);
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
     const { rows } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
     const c = rows[0];
