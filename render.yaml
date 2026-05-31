@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: 619-erp-backend
+    runtime: node
+    plan: free
+    repo: https://github.com/abhishek21lift-oss/619-erp-backend
+    branch: main
+    buildCommand: npm install
+    startCommand: node src/server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
