@@ -440,4 +440,116 @@ router.get('/logs', auth, async (req, res, next) => {
   }
 });
 
+// ──────────────────────────────────────────────────────────────────
+// POST /api/checkin/qr-mark
+// Body: { client_id }
+// Quick QR-based attendance — no face matching needed.
+// ──────────────────────────────────────────────────────────────────
+router.post('/qr-mark', auth, async (req, res, next) => {
+  try {
+    const { client_id } = req.body || {};
+    if (!client_id) return res.status(400).json({ error: 'client_id required' });
+
+    const { rows: member } = await pool.query(
+      `SELECT id, name, status, pt_end_date, expiry_date, subscription_end_date
+         FROM clients WHERE id = $1 LIMIT 1`,
+      [client_id]
+    );
+    if (!member[0]) return res.status(404).json({ error: 'Member not found' });
+
+    const memberStatus = membershipStatusFor(member[0]);
+    const date = new Date().toISOString().slice(0, 10);
+
+    if (memberStatus !== 'active') {
+      return res.status(200).json({
+        success: false,
+        message: `Membership ${memberStatus}`,
+        member: { id: member[0].id, name: member[0].name, status: memberStatus },
+      });
+    }
+
+    const { rows: att } = await pool.query(
+      `INSERT INTO attendance_logs
+         (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes)
+       VALUES ($1, 'client', $2, $3::date, NOW(), 'qr', 'present', 'QR check-in')
+       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
+         SET check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
+             method = CASE WHEN attendance_logs.method = 'manual' THEN EXCLUDED.method
+                           ELSE attendance_logs.method END,
+             status = 'present',
+             notes = 'QR check-in'
+       RETURNING id`,
+      [member[0].id, member[0].name, date]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: `Welcome ${member[0].name}`,
+      member: { id: member[0].id, name: member[0].name, status: 'active' },
+      attendance_id: att[0]?.id,
+    });
+  } catch (err) {
+    logger.error({ err: err.message }, '[checkin/qr-mark] error');
+    return next(err);
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────
+// POST /api/checkin/mobile-mark
+// Body: { mobile }
+// Mark attendance by mobile number lookup.
+// ──────────────────────────────────────────────────────────────────
+router.post('/mobile-mark', auth, async (req, res, next) => {
+  try {
+    const { mobile } = req.body || {};
+    if (!mobile) return res.status(400).json({ error: 'mobile required' });
+
+    const { rows: members } = await pool.query(
+      `SELECT id, name, status, pt_end_date, expiry_date, subscription_end_date
+         FROM clients
+        WHERE mobile = $1
+           OR REPLACE(mobile, '-', '') = REPLACE($1, '-', '')
+           OR REPLACE(mobile, ' ', '') = REPLACE($1, ' ', '')
+        LIMIT 1`,
+      [mobile]
+    );
+
+    if (!members[0]) return res.status(404).json({ error: 'No member found with that mobile number' });
+
+    const member = members[0];
+    const memberStatus = membershipStatusFor(member);
+    const date = new Date().toISOString().slice(0, 10);
+
+    if (memberStatus !== 'active') {
+      return res.status(200).json({
+        success: false,
+        message: `Membership ${memberStatus}`,
+        member: { id: member.id, name: member.name, status: memberStatus },
+      });
+    }
+
+    const { rows: att } = await pool.query(
+      `INSERT INTO attendance_logs
+         (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes)
+       VALUES ($1, 'client', $2, $3::date, NOW(), 'manual', 'present', 'Mobile check-in')
+       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
+         SET check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
+             status = 'present',
+             notes = 'Mobile check-in'
+       RETURNING id`,
+      [member.id, member.name, date]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: `Welcome ${member.name}`,
+      member: { id: member.id, name: member.name, status: 'active' },
+      attendance_id: att[0]?.id,
+    });
+  } catch (err) {
+    logger.error({ err: err.message }, '[checkin/mobile-mark] error');
+    return next(err);
+  }
+});
+
 module.exports = router;
