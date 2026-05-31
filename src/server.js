@@ -179,10 +179,14 @@ const registerLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-app.use('/api/auth/login',    loginLimiter);
-app.use('/api/v1/auth/login', loginLimiter);
+app.use('/api/auth/login',        loginLimiter);
+app.use('/api/v1/auth/login',     loginLimiter);
+app.use('/api/v1/auth/forgot-password', registerLimiter);
+app.use('/api/v1/auth/reset-password',  registerLimiter);
 app.use('/api/auth/create-user', registerLimiter);
 app.use('/api/auth/users',      registerLimiter);
+app.use('/api/auth/forgot-password', registerLimiter);
+app.use('/api/auth/reset-password',  registerLimiter);
 
 // ────────────────────────
 // v2 ROUTES (production)

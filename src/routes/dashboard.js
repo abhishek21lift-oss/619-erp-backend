@@ -82,8 +82,8 @@ router.get('/summary', auth, async (req, res, next) => {
       pool.query(`
         SELECT COALESCE(SUM(amount), 0) AS revenue
         FROM payments
-        WHERE date >= CURRENT_DATE - INTERVAL '${intervalText}'
-          ${tFilter}`, params),
+        WHERE date >= CURRENT_DATE - $${params.length + 1}::interval
+          ${tFilter}`, params.concat(intervalText)),
 
       /* ── 5. Expiring subscriptions (next 7 days) ────────────────── */
       pool.query(`

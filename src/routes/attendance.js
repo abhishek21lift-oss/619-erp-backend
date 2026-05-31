@@ -43,8 +43,8 @@ router.get('/', auth, async (req, res, next) => {
          FROM attendance_logs a
        WHERE ${conditions.join(' AND ')}
        ORDER BY a.date DESC, a.check_in_time DESC NULLS LAST
-       LIMIT ${limit}`,
-      params
+       LIMIT $${p}`,
+      params.concat(limit)
     );
     res.json(rows);
   } catch (err) {
@@ -329,10 +329,8 @@ router.get('/stats', auth, async function(req, res, next) {
     const to = req.query.to || new Date().toISOString().split('T')[0];
     const granularity = req.query.granularity || 'day';
 
-    let dateTrunc;
-    if (granularity === 'week') dateTrunc = 'DATE_TRUNC(\'week\', a.date)';
-    else if (granularity === 'month') dateTrunc = 'DATE_TRUNC(\'month\', a.date)';
-    else dateTrunc = 'a.date';
+    const granularityVal = ['day', 'week', 'month'].includes(granularity) ? granularity : 'day';
+    const dateTrunc = granularityVal === 'day' ? 'a.date' : `DATE_TRUNC('${granularityVal}', a.date)`;
 
     const params = [from, to];
     let trainerFilter = '';

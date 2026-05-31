@@ -219,9 +219,9 @@ router.post('/branding/upload-logo', auth, adminOnly, async (req, res, next) => 
     if (!image || !key)
       return res.status(400).json({ error: 'image (base64) and key are required' });
 
-    const matches = image.match(/^data:image\/(\w+);base64,(.+)$/);
+    const matches = image.match(/^data:image\/(jpeg|png|webp|gif);base64,(.+)$/);
     if (!matches)
-      return res.status(400).json({ error: 'Invalid base64 image format' });
+      return res.status(400).json({ error: 'Invalid base64 image format. Allowed types: jpeg, png, webp, gif' });
 
     const ext = matches[1];
     const data = Buffer.from(matches[2], 'base64');

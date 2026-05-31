@@ -3,15 +3,20 @@
 //   node src/db/seed.js
 //
 // This sets the correct bcrypt hashes for the demo accounts.
+// Pass passwords via environment variables for security:
+//   ADMIN_PASSWORD=securepass123 TRAINER_PASSWORD=securepass456 node src/db/seed.js
 require('dotenv').config();
 const bcrypt = require('bcryptjs');
 const pool   = require('./pool');
 
 async function seed() {
-  console.log('\n🔐 Setting up demo account passwords...\n');
+  console.log('\nSetting up demo account passwords...\n');
 
-  const adminHash   = await bcrypt.hash('admin@619',   10);
-  const trainerHash = await bcrypt.hash('trainer@619', 10);
+  const adminPassword = process.env.ADMIN_PASSWORD || 'admin@619';
+  const trainerPassword = process.env.TRAINER_PASSWORD || 'trainer@619';
+
+  const adminHash   = await bcrypt.hash(adminPassword, 10);
+  const trainerHash = await bcrypt.hash(trainerPassword, 10);
 
   // Upsert admin
   await pool.query(`
@@ -20,7 +25,7 @@ async function seed() {
     ON CONFLICT (email) DO UPDATE SET password=$1, updated_at=NOW()`,
     [adminHash]
   );
-  console.log('✅ admin@619fitness.com  /  admin@619');
+  console.log('admin@619fitness.com  /  (password from ADMIN_PASSWORD env or default)');
 
   // Upsert demo trainers
   for (const [name, email, tid] of [
@@ -34,16 +39,13 @@ async function seed() {
       ON CONFLICT (email) DO UPDATE SET password=$3, trainer_id=$4, updated_at=NOW()`,
       [name, email, trainerHash, tid]
     );
-    console.log(`✅ ${email}  /  trainer@619`);
+    console.log(`${email}  /  (password from TRAINER_PASSWORD env or default)`);
   }
 
-  console.log('\n✅ Seed complete! You can now log in.\n');
+  console.log('\nSeed complete! You can now log in.\n');
   await pool.end();
 }
 
-// Only auto-run when invoked directly (`node src/db/seed.js`).
-// Without this guard, ANY `require('./db/seed')` triggers the seed —
-// a dangerous footgun in production.
 if (require.main === module) {
   seed().catch(err => {
     console.error('Seed failed:', err.message);

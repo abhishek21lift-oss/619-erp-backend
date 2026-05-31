@@ -111,7 +111,9 @@ router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
 
 
 router.post('/clear-dues-and-payments', auth, adminOnly, async (req, res) => {
-  req.body = { ...req.body, confirm: req.body?.confirm || 'CLEAR_DUES_619' };
+  if (req.body?.confirm !== 'CLEAR_DUES_619') {
+    return res.status(400).json({ error: 'Missing confirmation token. Send { confirm: "CLEAR_DUES_619" }' });
+  }
   return router.handle({ ...req, url: '/reset-outstanding-dues', method: 'POST' }, res, () => {});
 });
 

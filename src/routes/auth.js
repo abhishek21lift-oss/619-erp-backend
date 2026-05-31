@@ -208,7 +208,7 @@ async function changePasswordHandler(req, res) {
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
     setTokenCookie(res, newToken);
-    res.json({ message: 'Password changed successfully', token: newToken });
+    res.json({ message: 'Password changed successfully' });
   } catch (err) {
     logger.error({ err: err.message }, 'Change password error');
     res.status(500).json({ error: 'Server error' });

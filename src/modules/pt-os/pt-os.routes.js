@@ -99,9 +99,13 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
 
 // â”€â”€â”€ Update PT client â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
-  const allowed = ['package_type','base_amount','discount','final_amount','paid_amount',
-    'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
-    'duration_months','status','notes'];
+  const isTrainer = req.user.role === 'trainer';
+  const allowed = isTrainer
+    ? ['package_type','trainer_id','trainer_name','pt_start_date','pt_end_date',
+       'duration_months','status','notes','monthly_pt_amount']
+    : ['package_type','base_amount','discount','final_amount','paid_amount',
+       'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
+       'duration_months','status','notes'];
   const sets = [];
   const params = [req.params.id];
   for (const key of allowed) {

@@ -144,9 +144,16 @@ router.get('/:id', auth, async (req, res, next) => {
     // Trainer can only see their own clients.
     if (req.user.role === 'trainer' &&
         (!req.user.trainer_id || rows[0].trainer_id !== req.user.trainer_id)) {
-      // Return 404 not 403 so we don't leak existence.
       return res.status(404).json({ error: 'Client not found' });
     }
+
+    // Member role can only see their own record.
+    if (req.user.role === 'member' && rows[0].id !== req.user.member_id) {
+      return res.status(404).json({ error: 'Client not found' });
+    }
+
+    // Reception can see basic info but not financial details.
+    const isReception = req.user.role === 'reception' || req.user.role === 'receptionist';
 
     const [payments, weightLogs, renewals] = await Promise.all([
       pool.query(
@@ -162,6 +169,11 @@ router.get('/:id', auth, async (req, res, next) => {
         [req.params.id]
       ),
     ]);
+
+    if (isReception) {
+      const { payments: _, weight_logs: wl, renewals: rn, ...basic } = rows[0];
+      return res.json(basic);
+    }
 
     res.json({
       ...rows[0],
@@ -596,15 +608,6 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
     if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
     res.json({ message: 'Client deleted' });
   } catch (err) {
-    // If deleted_at column hasn't been migrated yet, fall back to hard delete
-    if (err.code === '42703') {
-      const { rows } = await pool.query(
-        'DELETE FROM clients WHERE id=$1 RETURNING id',
-        [req.params.id]
-      );
-      if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
-      return res.json({ message: 'Client deleted' });
-    }
     next(err);
   }
 });
@@ -622,6 +625,11 @@ router.post('/:id/photo', auth, async (req, res, next) => {
     // Validate it's a data URI
     if (!photo_url.startsWith('data:image/')) {
       return res.status(400).json({ error: 'photo_url must be a base64 data URI (data:image/...)' });
+    }
+
+    // Check total size of base64 data (approximate: length * 0.75)
+    if (photo_url.length > 2 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Image too large. Maximum 2MB.' });
     }
 
     // Check client exists and trainer access
