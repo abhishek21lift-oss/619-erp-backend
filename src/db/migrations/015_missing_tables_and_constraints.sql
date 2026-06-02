@@ -19,14 +19,11 @@ CREATE TABLE IF NOT EXISTS branches (
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Insert a default branch so existing FK references have a target.
--- Use ON CONFLICT on code so it's idempotent even if a row with
--- code='MAIN' already exists under a different id.
 INSERT INTO branches (id, name, code)
 VALUES ('main', 'Main Studio', 'MAIN')
 ON CONFLICT (code) DO NOTHING;
 
--- ─── BOOKINGS / CLASS SCHEDULING ─────────────────────────────
+-- ─── ALL TABLES (CREATE IF NOT EXISTS) ───────────────────────
 CREATE TABLE IF NOT EXISTS class_templates (
   id            TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   name          TEXT        NOT NULL,
@@ -59,21 +56,6 @@ CREATE TABLE IF NOT EXISTS class_sessions (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- If class_sessions already existed without the 'date' column, add it.
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'class_sessions' AND column_name = 'date'
-  ) THEN
-    ALTER TABLE class_sessions ADD COLUMN date DATE NOT NULL DEFAULT CURRENT_DATE;
-  END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS cs_date_idx ON class_sessions (date);
-CREATE INDEX IF NOT EXISTS cs_instructor_idx ON class_sessions (instructor_id);
-CREATE INDEX IF NOT EXISTS cs_status_idx ON class_sessions (status);
-
 CREATE TABLE IF NOT EXISTS bookings (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   session_id      TEXT        NOT NULL REFERENCES class_sessions(id) ON DELETE CASCADE,
@@ -87,12 +69,6 @@ CREATE TABLE IF NOT EXISTS bookings (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS bookings_session_idx ON bookings (session_id);
-CREATE INDEX IF NOT EXISTS bookings_client_idx ON bookings (client_id);
-CREATE UNIQUE INDEX IF NOT EXISTS bookings_session_client_uniq ON bookings (session_id, COALESCE(client_id, member_id))
-  WHERE status IN ('confirmed','checked_in');
-
--- ─── MEMBER PORTAL TABLES ────────────────────────────────────
 CREATE TABLE IF NOT EXISTS members (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id       TEXT        NOT NULL UNIQUE REFERENCES clients(id) ON DELETE CASCADE,
@@ -121,9 +97,6 @@ CREATE TABLE IF NOT EXISTS member_memberships (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS mm_member_idx ON member_memberships (member_id);
-CREATE INDEX IF NOT EXISTS mm_status_idx ON member_memberships (status);
-
 CREATE TABLE IF NOT EXISTS holds_freezes (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id       TEXT        NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
@@ -137,9 +110,6 @@ CREATE TABLE IF NOT EXISTS holds_freezes (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS hf_client_idx ON holds_freezes (client_id);
-
--- ─── BODY METRICS ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS body_metrics (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id       TEXT        NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
@@ -157,9 +127,6 @@ CREATE TABLE IF NOT EXISTS body_metrics (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS bm_client_idx ON body_metrics (client_id, measured_at DESC);
-
--- ─── PT SESSIONS ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS pt_sessions (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id       TEXT        NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
@@ -175,11 +142,6 @@ CREATE TABLE IF NOT EXISTS pt_sessions (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS pts_client_idx ON pt_sessions (client_id, session_date DESC);
-CREATE INDEX IF NOT EXISTS pts_trainer_idx ON pt_sessions (trainer_id, session_date DESC);
-CREATE INDEX IF NOT EXISTS pts_date_idx ON pt_sessions (session_date);
-
--- ─── AUDIT LOG (separate from activity_log) ──────────────────
 CREATE TABLE IF NOT EXISTS audit_log (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   table_name      TEXT        NOT NULL,
@@ -192,18 +154,134 @@ CREATE TABLE IF NOT EXISTS audit_log (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS audit_table_idx ON audit_log (table_name, record_id);
-CREATE INDEX IF NOT EXISTS audit_date_idx ON audit_log (created_at DESC);
+-- ─── ENSURE ALL COLUMNS EXIST (pre-existing tables may lack them) ─
+-- If any table was created by the original DB schema, its columns may
+-- differ from what this migration expects.  ADD COLUMN IF NOT EXISTS
+-- guarantees every column is present before indexes are created below.
+DO $$ BEGIN
+  -- class_sessions
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS template_id     TEXT;
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS title           TEXT NOT NULL DEFAULT '';
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS description     TEXT;
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS instructor_id   TEXT;
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS instructor_name TEXT;
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS date            DATE NOT NULL DEFAULT CURRENT_DATE;
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS start_time      TIME NOT NULL DEFAULT '00:00:00';
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS end_time        TIME NOT NULL DEFAULT '00:00:00';
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS capacity        INT NOT NULL DEFAULT 20;
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS booked_count    INT NOT NULL DEFAULT 0;
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS location        TEXT;
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'scheduled';
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  -- bookings
+  ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS session_id      TEXT NOT NULL DEFAULT '';
+  ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS client_id       TEXT;
+  ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS member_id       TEXT;
+  ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS client_name     TEXT;
+  ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'confirmed';
+  ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS checked_in_at   TIMESTAMPTZ;
+  ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS booked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  -- members
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS client_id       TEXT NOT NULL DEFAULT '';
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS user_id         TEXT;
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS email           TEXT;
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS phone           TEXT;
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS profile_pic     TEXT;
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS date_of_birth   DATE;
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS emergency_contact TEXT;
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS preferences     JSONB DEFAULT '{}';
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS is_active       BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE members       ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  -- member_memberships
+  ALTER TABLE member_memberships ADD COLUMN IF NOT EXISTS member_id       TEXT NOT NULL DEFAULT '';
+  ALTER TABLE member_memberships ADD COLUMN IF NOT EXISTS subscription_id TEXT;
+  ALTER TABLE member_memberships ADD COLUMN IF NOT EXISTS plan_name       TEXT NOT NULL DEFAULT '';
+  ALTER TABLE member_memberships ADD COLUMN IF NOT EXISTS start_date      DATE NOT NULL DEFAULT CURRENT_DATE;
+  ALTER TABLE member_memberships ADD COLUMN IF NOT EXISTS end_date        DATE NOT NULL DEFAULT CURRENT_DATE;
+  ALTER TABLE member_memberships ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'active';
+  ALTER TABLE member_memberships ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE member_memberships ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  -- holds_freezes
+  ALTER TABLE holds_freezes ADD COLUMN IF NOT EXISTS client_id       TEXT NOT NULL DEFAULT '';
+  ALTER TABLE holds_freezes ADD COLUMN IF NOT EXISTS subscription_id TEXT;
+  ALTER TABLE holds_freezes ADD COLUMN IF NOT EXISTS reason          TEXT;
+  ALTER TABLE holds_freezes ADD COLUMN IF NOT EXISTS freeze_from     DATE NOT NULL DEFAULT CURRENT_DATE;
+  ALTER TABLE holds_freezes ADD COLUMN IF NOT EXISTS freeze_until    DATE NOT NULL DEFAULT CURRENT_DATE;
+  ALTER TABLE holds_freezes ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'active';
+  ALTER TABLE holds_freezes ADD COLUMN IF NOT EXISTS created_by      TEXT;
+  ALTER TABLE holds_freezes ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  -- body_metrics
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS client_id       TEXT NOT NULL DEFAULT '';
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS weight          NUMERIC(6,2);
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS body_fat_pct    NUMERIC(5,2);
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS muscle_mass     NUMERIC(6,2);
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS bmi             NUMERIC(5,2);
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS chest           NUMERIC(6,2);
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS waist           NUMERIC(6,2);
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS hips            NUMERIC(6,2);
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS arms            NUMERIC(6,2);
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS thighs          NUMERIC(6,2);
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS notes           TEXT;
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS measured_at     DATE NOT NULL DEFAULT CURRENT_DATE;
+  ALTER TABLE body_metrics  ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  -- pt_sessions
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS client_id       TEXT NOT NULL DEFAULT '';
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS trainer_id      TEXT;
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS session_date    DATE NOT NULL DEFAULT CURRENT_DATE;
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS start_time      TIME;
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS end_time        TIME;
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'scheduled';
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS notes           TEXT;
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS created_by      TEXT;
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE pt_sessions   ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  -- audit_log
+  ALTER TABLE audit_log     ADD COLUMN IF NOT EXISTS table_name      TEXT NOT NULL DEFAULT '';
+  ALTER TABLE audit_log     ADD COLUMN IF NOT EXISTS record_id       TEXT;
+  ALTER TABLE audit_log     ADD COLUMN IF NOT EXISTS action          TEXT NOT NULL DEFAULT '';
+  ALTER TABLE audit_log     ADD COLUMN IF NOT EXISTS old_data        JSONB;
+  ALTER TABLE audit_log     ADD COLUMN IF NOT EXISTS new_data        JSONB;
+  ALTER TABLE audit_log     ADD COLUMN IF NOT EXISTS changed_by      TEXT;
+  ALTER TABLE audit_log     ADD COLUMN IF NOT EXISTS ip_address      TEXT;
+  ALTER TABLE audit_log     ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  -- class_templates
+  ALTER TABLE class_templates ADD COLUMN IF NOT EXISTS name          TEXT NOT NULL DEFAULT '';
+  ALTER TABLE class_templates ADD COLUMN IF NOT EXISTS description   TEXT;
+  ALTER TABLE class_templates ADD COLUMN IF NOT EXISTS category      TEXT;
+  ALTER TABLE class_templates ADD COLUMN IF NOT EXISTS duration_min  INT NOT NULL DEFAULT 60;
+  ALTER TABLE class_templates ADD COLUMN IF NOT EXISTS capacity      INT NOT NULL DEFAULT 20;
+  ALTER TABLE class_templates ADD COLUMN IF NOT EXISTS color         TEXT;
+  ALTER TABLE class_templates ADD COLUMN IF NOT EXISTS is_active     BOOLEAN NOT NULL DEFAULT TRUE;
+  ALTER TABLE class_templates ADD COLUMN IF NOT EXISTS created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  ALTER TABLE class_templates ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW();
+EXCEPTION WHEN undefined_table THEN NULL; END $$;
 
--- ─── MISSING CONSTRAINTS ─────────────────────────────────────
--- Unique constraint on clients phone (non-empty only)
+-- ─── INDEXES ─────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS cs_date_idx         ON class_sessions (date);
+CREATE INDEX IF NOT EXISTS cs_instructor_idx   ON class_sessions (instructor_id);
+CREATE INDEX IF NOT EXISTS cs_status_idx       ON class_sessions (status);
+CREATE INDEX IF NOT EXISTS bookings_session_idx ON bookings (session_id);
+CREATE INDEX IF NOT EXISTS bookings_client_idx  ON bookings (client_id);
+CREATE UNIQUE INDEX IF NOT EXISTS bookings_session_client_uniq
+  ON bookings (session_id, COALESCE(client_id, member_id))
+  WHERE status IN ('confirmed','checked_in');
+CREATE INDEX IF NOT EXISTS mm_member_idx       ON member_memberships (member_id);
+CREATE INDEX IF NOT EXISTS mm_status_idx       ON member_memberships (status);
+CREATE INDEX IF NOT EXISTS hf_client_idx       ON holds_freezes (client_id);
+CREATE INDEX IF NOT EXISTS bm_client_idx       ON body_metrics (client_id, measured_at DESC);
+CREATE INDEX IF NOT EXISTS pts_client_idx      ON pt_sessions (client_id, session_date DESC);
+CREATE INDEX IF NOT EXISTS pts_trainer_idx     ON pt_sessions (trainer_id, session_date DESC);
+CREATE INDEX IF NOT EXISTS pts_date_idx        ON pt_sessions (session_date);
+CREATE INDEX IF NOT EXISTS audit_table_idx     ON audit_log (table_name, record_id);
+CREATE INDEX IF NOT EXISTS audit_date_idx      ON audit_log (created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS clients_mobile_uniq ON clients (mobile)
   WHERE mobile IS NOT NULL AND mobile != '';
+CREATE INDEX IF NOT EXISTS st_staff_idx        ON staff_targets (staff_id);
 
--- Index on staff_targets(staff_id) for FK join performance
-CREATE INDEX IF NOT EXISTS st_staff_idx ON staff_targets (staff_id);
-
--- Add updated_at triggers to tables that don't have them
+-- ─── UPDATED-AT TRIGGERS ─────────────────────────────────────
 DO $$ DECLARE
   t TEXT;
 BEGIN
