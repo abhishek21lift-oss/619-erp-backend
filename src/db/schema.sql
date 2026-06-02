@@ -227,8 +227,8 @@ CREATE TABLE IF NOT EXISTS branches (
 );
 
 INSERT INTO branches (id, name, code)
-SELECT 'main', 'Main Studio', 'MAIN'
-WHERE NOT EXISTS (SELECT 1 FROM branches WHERE id = 'main');
+VALUES ('main', 'Main Studio', 'MAIN')
+ON CONFLICT (code) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS subscriptions (
   id                TEXT          PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,

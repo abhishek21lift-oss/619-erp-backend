@@ -19,10 +19,12 @@ CREATE TABLE IF NOT EXISTS branches (
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Insert a default branch so existing FK references have a target
+-- Insert a default branch so existing FK references have a target.
+-- Use ON CONFLICT on code so it's idempotent even if a row with
+-- code='MAIN' already exists under a different id.
 INSERT INTO branches (id, name, code)
-SELECT 'main', 'Main Studio', 'MAIN'
-WHERE NOT EXISTS (SELECT 1 FROM branches WHERE id = 'main');
+VALUES ('main', 'Main Studio', 'MAIN')
+ON CONFLICT (code) DO NOTHING;
 
 -- ─── BOOKINGS / CLASS SCHEDULING ─────────────────────────────
 CREATE TABLE IF NOT EXISTS class_templates (
