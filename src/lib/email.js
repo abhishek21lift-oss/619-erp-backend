@@ -1,6 +1,11 @@
 const nodemailer = require('nodemailer');
 const logger = require('./logger');
 
+const FRONTEND_URL = process.env.FRONTEND_URL;
+if (!FRONTEND_URL) {
+  throw new Error('FRONTEND_URL env var is required');
+}
+
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
 const SMTP_USER = process.env.SMTP_USER || '';
@@ -30,7 +35,7 @@ async function sendPasswordReset(email, rawToken) {
     return;
   }
 
-  const resetUrl = `${process.env.FRONTEND_URL || 'https://619-erp-frontend.vercel.app'}/reset-password?token=${rawToken}`;
+  const resetUrl = `${FRONTEND_URL}/reset-password?token=${rawToken}`;
 
   try {
     await getTransport().sendMail({

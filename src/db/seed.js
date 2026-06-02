@@ -12,8 +12,12 @@ const pool   = require('./pool');
 async function seed() {
   console.log('\nSetting up demo account passwords...\n');
 
-  const adminPassword = process.env.ADMIN_PASSWORD || 'admin@619';
-  const trainerPassword = process.env.TRAINER_PASSWORD || 'trainer@619';
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  const trainerPassword = process.env.TRAINER_PASSWORD;
+  if (!adminPassword || !trainerPassword) {
+    console.error('ADMIN_PASSWORD and TRAINER_PASSWORD env vars are required to seed.');
+    process.exit(1);
+  }
 
   const adminHash   = await bcrypt.hash(adminPassword, 10);
   const trainerHash = await bcrypt.hash(trainerPassword, 10);

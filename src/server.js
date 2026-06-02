@@ -110,6 +110,12 @@ app.use(sanitizeBody);
 app.use(sanitizeQuery);
 
 // ────────────────────────
+// REQUEST ID
+// ────────────────────────
+const requestId = require('./middleware/requestId');
+app.use(requestId);
+
+// ────────────────────────
 // STRUCTURED REQUEST LOGGER
 // ────────────────────────
 app.use(function(req, res, next) {
@@ -122,6 +128,7 @@ app.use(function(req, res, next) {
         url: req.originalUrl,
         status: res.statusCode,
         ms: ms,
+        req_id: req.id,
         query: Object.keys(req.query).length ? req.query : undefined,
       }, '%s %s %d %dms', req.method, req.originalUrl, res.statusCode, ms);
     }
@@ -316,5 +323,13 @@ runMigrations()
     logger.fatal({ err: err.message }, 'Startup migration failed');
     process.exit(1);
   });
+
+process.on('unhandledRejection', (reason) => {
+  logger.error({ reason }, 'unhandledRejection');
+});
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaughtException — exiting');
+  process.exit(1);
+});
 
 module.exports = app;

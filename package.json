@@ -29,6 +29,7 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.1",
     "nodemailer": "^8.0.7",
+    "otplib": "^13.4.1",
     "pg": "^8.13.0",
     "pino": "^10.3.1",
     "razorpay": "^2.9.6",

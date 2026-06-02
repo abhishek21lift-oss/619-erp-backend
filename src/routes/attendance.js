@@ -336,13 +336,14 @@ router.get('/stats', auth, async function(req, res, next) {
     let trainerFilter = '';
     if (req.user.role === 'trainer' && req.user.trainer_id) {
       params.push(req.user.trainer_id);
-      trainerFilter = 'AND a.trainer_id = $' + params.length + ' ';
+      trainerFilter = 'AND u.trainer_id = $' + params.length + ' ';
     }
 
     const { rows } = await pool.query(
       'SELECT ' + dateTrunc + ' AS period, ' +
       'a.status, COUNT(*) AS count ' +
       'FROM attendance_logs a ' +
+      'JOIN users u ON u.id = a.marked_by ' +
       'WHERE a.date >= $1 AND a.date <= $2 ' + trainerFilter +
       'AND a.ref_type = \'client\' ' +
       'GROUP BY period, a.status ' +

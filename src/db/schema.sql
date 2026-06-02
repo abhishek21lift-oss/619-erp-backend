@@ -213,6 +213,23 @@ CREATE INDEX IF NOT EXISTS renewals_date_idx   ON renewals (renewed_on DESC);
 
 
 -- ─── SUBSCRIPTIONS ───────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS branches (
+  id          TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
+  name        TEXT        NOT NULL,
+  code        TEXT        UNIQUE,
+  address     TEXT,
+  phone       TEXT,
+  email       TEXT,
+  manager     TEXT,
+  is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO branches (id, name, code)
+SELECT 'main', 'Main Studio', 'MAIN'
+WHERE NOT EXISTS (SELECT 1 FROM branches WHERE id = 'main');
+
 CREATE TABLE IF NOT EXISTS subscriptions (
   id                TEXT          PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id         TEXT          NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
@@ -469,7 +486,7 @@ $$;
 DO $$ DECLARE
   t TEXT;
 BEGIN
-  FOR t IN SELECT unnest(ARRAY['users','trainers','clients','subscriptions','system_settings','leave_requests','expenses'])
+    FOR t IN SELECT unnest(ARRAY['users','trainers','clients','subscriptions','branches','system_settings','leave_requests','expenses'])
   LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_trigger

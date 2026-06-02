@@ -32,7 +32,7 @@ function buildSslConfig() {
 
 const POOL_MAX = (() => {
   const n = parseInt(process.env.DATABASE_POOL_SIZE || '', 10);
-  return Number.isFinite(n) && n > 0 ? n : 10;
+  return Number.isFinite(n) && n > 0 ? n : 20;
 })();
 
 const pool = new Pool({

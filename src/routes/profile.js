@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 const jwt = require('jsonwebtoken');
+const { authenticator } = require('otplib');
 const pool = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, invalidateUserCache } = require('../middleware/auth');
@@ -248,7 +249,7 @@ router.put('/password', async (req, res, next) => {
 router.post('/mfa/setup', async (req, res, next) => {
   try {
     await ensureSchema();
-    const secret = crypto.randomBytes(20).toString('hex');
+    const secret = authenticator.generateSecret();
     await pool.query(
       `INSERT INTO user_profiles (user_id, mfa_secret, updated_at)
        VALUES ($1,$2,NOW())
@@ -268,14 +269,18 @@ router.post('/mfa/setup', async (req, res, next) => {
 router.post('/mfa/verify', async (req, res, next) => {
   try {
     const code = String(req.body.code || '').trim();
-    const secret = String(req.body.secret || '').trim();
-    if (!/^\d{6}$/.test(code) || !secret) return res.status(400).json({ error: 'Valid MFA code and secret are required' });
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Valid MFA code is required' });
     await ensureSchema();
+    const { rows } = await pool.query('SELECT mfa_secret FROM user_profiles WHERE user_id = $1', [req.user.id]);
+    const storedSecret = rows[0] && rows[0].mfa_secret;
+    if (!storedSecret) return res.status(400).json({ error: 'MFA setup required before verification' });
+    const valid = authenticator.check(code, storedSecret, { window: 1 });
+    if (!valid) return res.status(400).json({ error: 'Invalid MFA code' });
     await pool.query(
       `UPDATE user_profiles
-          SET mfa_enabled = TRUE, mfa_secret = $2, updated_at = NOW()
+          SET mfa_enabled = TRUE, updated_at = NOW()
         WHERE user_id = $1`,
-      [req.user.id, secret]
+      [req.user.id]
     );
     const recoveryCodes = Array.from({ length: 8 }, () => crypto.randomBytes(4).toString('hex').toUpperCase());
     await logActivity(req, 'profile.mfa.enable', 'user', req.user.id);

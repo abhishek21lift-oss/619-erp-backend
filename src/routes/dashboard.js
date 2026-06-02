@@ -143,11 +143,12 @@ router.get('/summary', auth, async (req, res, next) => {
       /* ── 10. Attendance today ───────────────────────────────────── */
       pool.query(`
         SELECT COUNT(*) AS present
-        FROM   attendance_logs
-        WHERE  date     = CURRENT_DATE
-          AND  status   = 'present'
-          AND  ref_type = 'client'
-          ${tFilter}`, params),
+        FROM   attendance_logs a
+        JOIN   users u ON u.id = a.marked_by
+        WHERE  a.date     = CURRENT_DATE
+          AND  a.status   = 'present'
+          AND  a.ref_type = 'client'
+          ${tid ? 'AND u.trainer_id = $1' : ''}`, params),
 
 
       /* ── 11. Birthdays today ────────────────────────────────────── */

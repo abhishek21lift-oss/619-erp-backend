@@ -2,6 +2,7 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
+const { genReceiptNo } = require('../db/receipts');
 const { auth } = require('../middleware/auth');
 const logger = require('../lib/logger');
 
@@ -274,13 +275,14 @@ router.post('/:id/renew', auth, async (req, res, next) => {
 
     // If paid, record payment
     if (parseFloat(d.paid_amount) > 0) {
+      const receiptNo = await genReceiptNo(client);
       await client.query(`
         INSERT INTO payments (id, client_id, client_name, trainer_id, trainer_name,
           amount, method, date, receipt_no, package_type, incentive_amt, notes)
         VALUES ($1,$2,$3,$4,$5,$6,$7,CURRENT_DATE,$8,$9,$10,$11)`,
         [randomUUID(), cl[0].id, cl[0].name, cl[0].trainer_id, cl[0].trainer_name,
          parseFloat(d.paid_amount), d.payment_method || 'CASH',
-         'REN-' + Date.now(), d.new_package || cl[0].package_type, 0,
+         receiptNo, d.new_package || cl[0].package_type, 0,
          'Renewal payment for ' + cl[0].name]
       );
     }

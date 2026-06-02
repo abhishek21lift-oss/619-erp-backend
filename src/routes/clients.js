@@ -613,38 +613,3 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
 });
 
 module.exports = router;
-
-// POST /api/clients/:id/photo
-// Accept a base64-encoded image, store it in clients.photo_url
-// For a production deployment, swap this for Supabase Storage upload.
-router.post('/:id/photo', auth, async (req, res, next) => {
-  try {
-    const { photo_url } = req.body;
-    if (!photo_url) return res.status(400).json({ error: 'photo_url is required' });
-    
-    // Validate it's a data URI
-    if (!photo_url.startsWith('data:image/')) {
-      return res.status(400).json({ error: 'photo_url must be a base64 data URI (data:image/...)' });
-    }
-
-    // Check total size of base64 data (approximate: length * 0.75)
-    if (photo_url.length > 2 * 1024 * 1024) {
-      return res.status(400).json({ error: 'Image too large. Maximum 2MB.' });
-    }
-
-    // Check client exists and trainer access
-    const { rows: existing } = await pool.query('SELECT id, trainer_id FROM clients WHERE id=$1', [req.params.id]);
-    if (!existing[0]) return res.status(404).json({ error: 'Client not found' });
-    if (req.user.role === 'trainer' && existing[0].trainer_id !== req.user.trainer_id) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    await pool.query(
-      'UPDATE clients SET photo_url=$1, updated_at=NOW() WHERE id=$2',
-      [photo_url, req.params.id]
-    );
-    res.json({ message: 'Photo updated', photo_url });
-  } catch (err) {
-    next(err);
-  }
-});
