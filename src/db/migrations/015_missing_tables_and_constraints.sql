@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS class_sessions (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- If class_sessions already existed without the 'date' column, add it.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'class_sessions' AND column_name = 'date'
+  ) THEN
+    ALTER TABLE class_sessions ADD COLUMN date DATE NOT NULL DEFAULT CURRENT_DATE;
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS cs_date_idx ON class_sessions (date);
 CREATE INDEX IF NOT EXISTS cs_instructor_idx ON class_sessions (instructor_id);
 CREATE INDEX IF NOT EXISTS cs_status_idx ON class_sessions (status);
