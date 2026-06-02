@@ -24,8 +24,7 @@ function buildSslConfig() {
     }
   }
   if (process.env.NODE_ENV === 'production') {
-    console.error('❌ DATABASE_SSL_CA is required in production. Set it to the Supabase CA bundle path for full cert verification.');
-    process.exit(1);
+    console.warn('⚠️  DATABASE_SSL_CA not set — skipping cert verification. Set it to the Supabase CA bundle path for full cert verification.');
   }
   return { rejectUnauthorized: false };
 }
