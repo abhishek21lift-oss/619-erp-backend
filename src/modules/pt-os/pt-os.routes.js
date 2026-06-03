@@ -34,7 +34,7 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
              WHEN c.balance_amount > 0 THEN 'DUE'
              ELSE 'CLEAR'
            END AS due_status
-    FROM clients c
+    FROM pt_clients c
     WHERE c.id = $1 AND c.deleted_at IS NULL
   `, [req.params.id]);
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
@@ -54,7 +54,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
   let cid = client_id;
   if (!cid) {
     const { rows: [newCli] } = await pool.query(`
-      INSERT INTO clients (name, gender, mobile, email, dob, status, joining_date)
+      INSERT INTO pt_clients (name, gender, mobile, email, dob, status, joining_date)
       VALUES ($1,$2,$3,$4,$5,'active',$6)
       RETURNING id
     `, [name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date()]);
@@ -74,7 +74,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
   }
 
   const { rows } = await pool.query(`
-    UPDATE clients SET
+    UPDATE pt_clients SET
       trainer_id = COALESCE($2, trainer_id),
       trainer_name = $3,
       package_type = COALESCE($4, package_type),
@@ -122,7 +122,7 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
   sets.push('updated_at = NOW()');
 
   const { rows } = await pool.query(
-    `UPDATE clients SET ${sets.join(', ')} WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
+    `UPDATE pt_clients SET ${sets.join(', ')} WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
     params
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
@@ -214,7 +214,7 @@ router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) =
       COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_payment_revenue,
       COALESCE(SUM(p.incentive_amt) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_incentives
     FROM trainers t
-    LEFT JOIN clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL
+    LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL
     LEFT JOIN payments p ON p.trainer_id = t.id AND p.deleted_at IS NULL
     WHERE t.deleted_at IS NULL AND t.status = 'active'
     GROUP BY t.id, t.name, t.incentive_rate

@@ -7,7 +7,7 @@ const pool = require('../../db/pool');
 // Calculate + upsert monthly commission for all active PT clients
 async function calculateMonthlyCommissions(month) {
   const monthStart = `${month}-01`;
-  const client = await pool.connect();
+  const conn = await pool.connect();
   try {
     // Get the first and last day of the target month
     const mStart = new Date(monthStart + 'T00:00:00Z');
@@ -19,7 +19,7 @@ async function calculateMonthlyCommissions(month) {
       SELECT c.id, c.name, c.trainer_id, c.trainer_name,
              c.monthly_pt_amount, c.trainer_commission,
              t.incentive_rate
-      FROM clients c
+      FROM pt_clients c
       JOIN trainers t ON t.id = c.trainer_id
       WHERE c.deleted_at IS NULL
         AND c.status IN ('active','frozen')
@@ -53,7 +53,7 @@ async function calculateMonthlyCommissions(month) {
     }
     return { count: results.length, total: results.reduce((s, r) => s + Number(r.commission_amt), 0) };
   } finally {
-    client.release();
+    conn.release();
   }
 }
 
@@ -99,7 +99,7 @@ async function getBalanceSheet(trainerId) {
              ELSE 'CLEAR'
            END AS due_status,
            c.monthly_pt_amount, c.trainer_commission
-    FROM clients c
+    FROM pt_clients c
     WHERE c.deleted_at IS NULL AND c.balance_amount > 0
       ${whereSql}
     ORDER BY c.balance_amount DESC
@@ -123,7 +123,7 @@ async function getActiveClients(trainerId) {
            c.duration_months, c.pt_start_date, c.pt_end_date,
            (c.pt_end_date - CURRENT_DATE) AS days_left,
            c.status, c.monthly_pt_amount, c.trainer_commission
-    FROM clients c
+    FROM pt_clients c
     WHERE ${where.join(' AND ')}
     ORDER BY c.name
   `, params);
@@ -140,7 +140,7 @@ async function getDashboardStats() {
       COALESCE(SUM(monthly_pt_amount) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL), 0) AS total_monthly_pt_revenue,
       COALESCE(SUM(trainer_commission) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL), 0) AS total_monthly_commission,
       COALESCE(SUM(balance_amount), 0) AS total_outstanding
-    FROM clients
+    FROM pt_clients
     WHERE deleted_at IS NULL
   `);
 
@@ -152,13 +152,13 @@ async function getDashboardStats() {
       COALESCE(SUM(c.monthly_pt_amount) FILTER (WHERE c.status = 'active'), 0) AS monthly_revenue,
       COALESCE(SUM(c.trainer_commission) FILTER (WHERE c.status = 'active'), 0) AS monthly_commission
     FROM trainers t
-    LEFT JOIN clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL
+    LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL
     WHERE t.deleted_at IS NULL AND t.status = 'active'
     GROUP BY t.id, t.name
     ORDER BY active_clients DESC
   `);
 
-  // Monthly revenue trend (last 6 months)
+  // Monthly revenue trend (last 6 months) — pt_payments migration pending
   const { rows: revenueTrend } = await pool.query(`
     SELECT
       TO_CHAR(DATE_TRUNC('month', date), 'Mon YYYY') AS label,
@@ -187,7 +187,7 @@ async function getCommissionHistory(trainerId) {
   const { rows } = await pool.query(`
     SELECT pc.*, c.name AS client_name
     FROM pt_commissions pc
-    JOIN clients c ON c.id = pc.client_id
+    JOIN pt_clients c ON c.id = pc.client_id
     ${whereSql}
     ORDER BY pc.month DESC, pc.client_name
     LIMIT 200
