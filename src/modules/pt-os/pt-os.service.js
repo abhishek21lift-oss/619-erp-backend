@@ -1,26 +1,19 @@
-// src/modules/pt-os/pt-os.service.js
-// PT OS business logic â€” commission engine, calculations, aggregations
-
 const pool = require('../../db/pool');
 
-// â”€â”€â”€ Commission Engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Calculate + upsert monthly commission for all active PT clients
 async function calculateMonthlyCommissions(month) {
   const monthStart = `${month}-01`;
   const conn = await pool.connect();
   try {
-    // Get the first and last day of the target month
     const mStart = new Date(monthStart + 'T00:00:00Z');
     const mEnd = new Date(mStart.getFullYear(), mStart.getMonth() + 1, 1);
     const mEndStr = mEnd.toISOString().slice(0, 10);
 
-    // Get all active PT clients with trainers whose PT period covers this month
     const { rows: clients } = await pool.query(`
       SELECT c.id, c.name, c.trainer_id, c.trainer_name,
              c.monthly_pt_amount, c.trainer_commission,
              t.incentive_rate
       FROM pt_clients c
-      JOIN trainers t ON t.id = c.trainer_id
+      JOIN pt_trainers t ON t.id = c.trainer_id
       WHERE c.deleted_at IS NULL
         AND c.status IN ('active','frozen')
         AND c.trainer_id IS NOT NULL
@@ -33,7 +26,6 @@ async function calculateMonthlyCommissions(month) {
     const results = [];
     for (const cl of clients) {
       const commission = Number(cl.trainer_commission);
-      // Upsert commission record
       const { rows } = await pool.query(`
         INSERT INTO pt_commissions
           (trainer_id, trainer_name, client_id, client_name,
@@ -57,7 +49,6 @@ async function calculateMonthlyCommissions(month) {
   }
 }
 
-// â”€â”€â”€ Get trainer payout summary for a month â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function getTrainerPayouts(month) {
   const monthStart = `${month}-01`;
   const { rows } = await pool.query(`
@@ -69,7 +60,7 @@ async function getTrainerPayouts(month) {
       COALESCE(pp.net_amount, 0) AS paid_amount,
       COALESCE(pp.status, 'pending') AS payout_status,
       pp.id AS payout_id
-    FROM trainers t
+    FROM pt_trainers t
     LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
     LEFT JOIN pt_payouts pp ON pp.trainer_id = t.id AND pp.month = $1
     WHERE t.deleted_at IS NULL AND t.status = 'active'
@@ -79,7 +70,6 @@ async function getTrainerPayouts(month) {
   return rows;
 }
 
-// â”€â”€â”€ Balance sheet â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function getBalanceSheet(trainerId) {
   const where = [];
   const params = [];
@@ -107,7 +97,6 @@ async function getBalanceSheet(trainerId) {
   return rows;
 }
 
-// â”€â”€â”€ Active clients (optionally filtered by trainer) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function getActiveClients(trainerId) {
   const where = ['c.deleted_at IS NULL', "c.status IN ('active','frozen')", 'c.pt_start_date IS NOT NULL'];
   const params = [];
@@ -130,7 +119,6 @@ async function getActiveClients(trainerId) {
   return rows;
 }
 
-// â”€â”€â”€ PT Dashboard stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function getDashboardStats() {
   const { rows: [totals] } = await pool.query(`
     SELECT
@@ -144,28 +132,26 @@ async function getDashboardStats() {
     WHERE deleted_at IS NULL
   `);
 
-  // Trainer counts
   const { rows: trainerStats } = await pool.query(`
     SELECT
       t.id, t.name,
       COUNT(c.id) FILTER (WHERE c.status = 'active')::INT AS active_clients,
       COALESCE(SUM(c.monthly_pt_amount) FILTER (WHERE c.status = 'active'), 0) AS monthly_revenue,
       COALESCE(SUM(c.trainer_commission) FILTER (WHERE c.status = 'active'), 0) AS monthly_commission
-    FROM trainers t
+    FROM pt_trainers t
     LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL
     WHERE t.deleted_at IS NULL AND t.status = 'active'
     GROUP BY t.id, t.name
     ORDER BY active_clients DESC
   `);
 
-  // Monthly revenue trend (last 6 months) — pt_payments migration pending
   const { rows: revenueTrend } = await pool.query(`
     SELECT
       TO_CHAR(DATE_TRUNC('month', date), 'Mon YYYY') AS label,
       DATE_TRUNC('month', date)::DATE AS month,
       COALESCE(SUM(amount), 0) AS revenue,
       COALESCE(SUM(incentive_amt), 0) AS incentives
-    FROM payments
+    FROM pt_payments
     WHERE date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '5 months')
       AND deleted_at IS NULL
     GROUP BY DATE_TRUNC('month', date)
@@ -175,7 +161,6 @@ async function getDashboardStats() {
   return { ...totals, trainers: trainerStats, revenueTrend };
 }
 
-// â”€â”€â”€ Commission history for a trainer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function getCommissionHistory(trainerId) {
   const where = [];
   const params = [];
@@ -195,14 +180,13 @@ async function getCommissionHistory(trainerId) {
   return rows;
 }
 
-// â”€â”€â”€ Create payout for a trainer for a given month â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function createPayout(trainerId, month, deductions, processedBy) {
   const monthStart = `${month}-01`;
   const { rows: [commData] } = await pool.query(`
     SELECT
       t.name AS trainer_name,
       COALESCE(SUM(pc.commission_amt), 0) AS total_commission
-    FROM trainers t
+    FROM pt_trainers t
     LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
     WHERE t.id = $2 AND t.deleted_at IS NULL
     GROUP BY t.name
@@ -229,7 +213,6 @@ async function createPayout(trainerId, month, deductions, processedBy) {
   return rows[0];
 }
 
-// â”€â”€â”€ Mark payout as paid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) {
   const { rows } = await pool.query(`
     UPDATE pt_payouts
@@ -243,7 +226,6 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) 
     RETURNING *
   `, [payoutId, paymentMethod, paymentRef, processedBy]);
 
-  // Mark related commissions as paid
   if (rows.length > 0) {
     const payout = rows[0];
     await pool.query(`
