@@ -25,11 +25,9 @@ function errorHandler(err, req, res, next) {
     });
   }
 
-  logger.error({ err: err, method: req.method, url: req.originalUrl }, 'Unhandled error');
-  const isDev = process.env.NODE_ENV !== 'production';
+  logger.error({ err: err.message, stack: err.stack, method: req.method, url: req.originalUrl }, 'Unhandled error');
   res.status(500).json({
-    error: isDev ? err.message : 'Something went wrong',
-    ...(isDev && err.stack && { stack: err.stack.split('\n').slice(0, 4).join('\n') }),
+    error: err.message || 'Internal server error',
   });
 }
 

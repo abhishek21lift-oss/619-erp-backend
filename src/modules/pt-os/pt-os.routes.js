@@ -5,6 +5,7 @@ const router = require('express').Router();
 const pool = require('../../db/pool');
 const { auth, adminOnly, adminOrManager } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
+const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -43,62 +44,67 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
 
 // â”€â”€â”€ Create / enroll client in PT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
-  const {
-    client_id, name, gender, mobile, email, dob,
-    trainer_id, package_type, base_amount, discount,
-    pt_start_date, duration_months, monthly_pt_amount,
-    notes, weight,
-  } = req.body;
+  try {
+    const {
+      client_id, name, gender, mobile, email, dob,
+      trainer_id, package_type, base_amount, discount,
+      pt_start_date, duration_months, monthly_pt_amount,
+      notes, weight,
+    } = req.body;
 
-  // If no existing client_id, create new client
-  let cid = client_id;
-  if (!cid) {
-    const { rows: [newCli] } = await pool.query(`
-      INSERT INTO pt_clients (name, gender, mobile, email, dob, status, joining_date)
-      VALUES ($1,$2,$3,$4,$5,'active',$6)
-      RETURNING id
-    `, [name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date()]);
-    cid = newCli.id;
+    // If no existing client_id, create new client
+    let cid = client_id;
+    if (!cid) {
+      const { rows: [newCli] } = await pool.query(`
+        INSERT INTO pt_clients (name, gender, mobile, email, dob, status, joining_date)
+        VALUES ($1,$2,$3,$4,$5,'active',$6)
+        RETURNING id
+      `, [name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date()]);
+      cid = newCli.id;
+    }
+
+    const finalAmt = (base_amount || 0) - (discount || 0);
+    const trainer = trainer_id ? (await pool.query('SELECT name FROM trainers WHERE id=$1', [trainer_id])).rows[0] : null;
+
+    // Compute end date
+    const startDate = pt_start_date || new Date().toISOString().slice(0, 10);
+    let endDate = null;
+    if (duration_months && duration_months > 0) {
+      const d = new Date(startDate);
+      d.setMonth(d.getMonth() + Number(duration_months));
+      endDate = d.toISOString().slice(0, 10);
+    }
+
+    const { rows } = await pool.query(`
+      UPDATE pt_clients SET
+        trainer_id = COALESCE($2, trainer_id),
+        trainer_name = COALESCE($3, trainer_name),
+        package_type = COALESCE($4, package_type),
+        base_amount = COALESCE($5, base_amount),
+        discount = COALESCE($6, discount),
+        final_amount = COALESCE($7, final_amount),
+        monthly_pt_amount = COALESCE($8, monthly_pt_amount),
+        pt_start_date = COALESCE($9, pt_start_date),
+        pt_end_date = COALESCE($10, pt_end_date),
+        duration_months = COALESCE($11, duration_months),
+        notes = COALESCE($12, notes),
+        weight = COALESCE($13, weight),
+        status = 'active',
+        updated_at = NOW()
+      WHERE id = $1 AND deleted_at IS NULL
+      RETURNING *
+    `, [
+      cid, trainer_id, trainer?.name || null, package_type,
+      base_amount, discount, finalAmt, monthly_pt_amount,
+      startDate, endDate, duration_months,
+      notes || null, weight != null ? Number(weight) : null,
+    ]);
+
+    res.status(201).json({ data: rows[0] });
+  } catch (err) {
+    logger.error({ err: err.message, body: req.body, user: req.user?.id }, 'PT OS create client failed');
+    throw err;
   }
-
-  const finalAmt = (base_amount || 0) - (discount || 0);
-  const trainer = trainer_id ? (await pool.query('SELECT name FROM trainers WHERE id=$1', [trainer_id])).rows[0] : null;
-
-  // Compute end date
-  const startDate = pt_start_date || new Date().toISOString().slice(0, 10);
-  let endDate = null;
-  if (duration_months && duration_months > 0) {
-    const d = new Date(startDate);
-    d.setMonth(d.getMonth() + Number(duration_months));
-    endDate = d.toISOString().slice(0, 10);
-  }
-
-  const { rows } = await pool.query(`
-    UPDATE pt_clients SET
-      trainer_id = COALESCE($2, trainer_id),
-      trainer_name = $3,
-      package_type = COALESCE($4, package_type),
-      base_amount = COALESCE($5, base_amount),
-      discount = COALESCE($6, discount),
-      final_amount = COALESCE($7, final_amount),
-      monthly_pt_amount = COALESCE($8, monthly_pt_amount),
-      pt_start_date = COALESCE($9, pt_start_date),
-      pt_end_date = COALESCE($10, pt_end_date),
-      duration_months = COALESCE($11, duration_months),
-      notes = COALESCE($12, notes),
-      weight = COALESCE($13, weight),
-      status = 'active',
-      updated_at = NOW()
-    WHERE id = $1 AND deleted_at IS NULL
-    RETURNING *
-  `, [
-    cid, trainer_id, trainer?.name || null, package_type,
-    base_amount, discount, finalAmt, monthly_pt_amount,
-    startDate, endDate, duration_months,
-    notes || null, weight != null ? Number(weight) : null,
-  ]);
-
-  res.status(201).json({ data: rows[0] });
 }));
 
 // â”€â”€â”€ Update PT client â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
