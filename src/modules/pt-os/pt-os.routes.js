@@ -44,19 +44,20 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
 // â”€â”€â”€ Create / enroll client in PT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
   const {
-    client_id, name, gender, mobile, email,
+    client_id, name, gender, mobile, email, dob,
     trainer_id, package_type, base_amount, discount,
     pt_start_date, duration_months, monthly_pt_amount,
+    notes, weight,
   } = req.body;
 
   // If no existing client_id, create new client
   let cid = client_id;
   if (!cid) {
     const { rows: [newCli] } = await pool.query(`
-      INSERT INTO clients (name, gender, mobile, email, status, joining_date)
-      VALUES ($1,$2,$3,$4,'active',$5)
+      INSERT INTO clients (name, gender, mobile, email, dob, status, joining_date)
+      VALUES ($1,$2,$3,$4,$5,'active',$6)
       RETURNING id
-    `, [name, gender || null, mobile || null, email || null, pt_start_date || new Date()]);
+    `, [name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date()]);
     cid = newCli.id;
   }
 
@@ -84,6 +85,8 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
       pt_start_date = COALESCE($9, pt_start_date),
       pt_end_date = COALESCE($10, pt_end_date),
       duration_months = COALESCE($11, duration_months),
+      notes = COALESCE($12, notes),
+      weight = COALESCE($13, weight),
       status = 'active',
       updated_at = NOW()
     WHERE id = $1 AND deleted_at IS NULL
@@ -92,6 +95,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
     cid, trainer_id, trainer?.name || null, package_type,
     base_amount, discount, finalAmt, monthly_pt_amount,
     startDate, endDate, duration_months,
+    notes || null, weight != null ? Number(weight) : null,
   ]);
 
   res.status(201).json({ data: rows[0] });
