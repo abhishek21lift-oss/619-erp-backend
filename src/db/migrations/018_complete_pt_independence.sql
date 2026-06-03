@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS pt_trainers (
   specialization   TEXT,
   bio              TEXT,
   schedule         TEXT,
-  certifications   TEXT[],
+  certifications   TEXT,
   incentive_rate   NUMERIC(5,4) NOT NULL DEFAULT 0.5
                                CHECK (incentive_rate BETWEEN 0 AND 1),
   status           TEXT        NOT NULL DEFAULT 'active'
