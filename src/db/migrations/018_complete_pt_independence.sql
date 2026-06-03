@@ -60,7 +60,7 @@ CREATE INDEX IF NOT EXISTS pt_payments_date_idx ON pt_payments (date);
 
 -- Migrate existing PT-related payments
 INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes, created_at, updated_at)
-SELECT p.client_id, p.trainer_id, p.amount, COALESCE(p.incentive_amt, 0), p.method, p.receipt, p.date, 'Migrated from gym payments', p.created_at, p.updated_at
+SELECT p.client_id, p.trainer_id, p.amount, COALESCE(p.incentive_amt, 0), p.method, p.receipt_no, p.date, 'Migrated from gym payments', p.created_at, p.updated_at
 FROM payments p
 WHERE p.trainer_id IS NOT NULL
   AND p.deleted_at IS NULL;
