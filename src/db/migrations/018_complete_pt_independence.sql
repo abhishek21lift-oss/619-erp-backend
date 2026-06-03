@@ -65,27 +65,30 @@ FROM payments p
 WHERE p.trainer_id IS NOT NULL
   AND p.deleted_at IS NULL;
 
--- ── 3. pt_sessions ───────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS pt_sessions (
-  id              TEXT         PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  client_id       TEXT         REFERENCES pt_clients(id) ON DELETE CASCADE,
-  trainer_id      TEXT         REFERENCES pt_trainers(id) ON DELETE SET NULL,
-  title           TEXT,
-  date            DATE         NOT NULL,
-  start_time      TIME,
-  end_time        TIME,
-  status          TEXT         NOT NULL DEFAULT 'scheduled'
-                               CHECK (status IN ('scheduled','completed','cancelled','no-show')),
-  notes           TEXT,
-  created_by      TEXT,
-  deleted_at      TIMESTAMPTZ,
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+-- ── 3. pt_sessions (already exists from 015, alter FKs & add columns) ─
+ALTER TABLE pt_sessions ADD COLUMN IF NOT EXISTS title       TEXT;
+ALTER TABLE pt_sessions ADD COLUMN IF NOT EXISTS deleted_at  TIMESTAMPTZ;
 
+DO $$ BEGIN
+  -- Drop FK referencing shared clients
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pt_sessions_client_id_fkey') THEN
+    ALTER TABLE pt_sessions DROP CONSTRAINT pt_sessions_client_id_fkey;
+  END IF;
+  -- Drop FK referencing shared trainers
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pt_sessions_trainer_id_fkey') THEN
+    ALTER TABLE pt_sessions DROP CONSTRAINT pt_sessions_trainer_id_fkey;
+  END IF;
+END $$;
+
+ALTER TABLE pt_sessions ADD CONSTRAINT pt_sessions_client_id_fkey
+  FOREIGN KEY (client_id) REFERENCES pt_clients(id) ON DELETE CASCADE;
+ALTER TABLE pt_sessions ADD CONSTRAINT pt_sessions_trainer_id_fkey
+  FOREIGN KEY (trainer_id) REFERENCES pt_trainers(id) ON DELETE SET NULL;
+
+DROP INDEX IF EXISTS pt_sessions_date_idx;
 CREATE INDEX IF NOT EXISTS pt_sessions_client_idx ON pt_sessions (client_id);
 CREATE INDEX IF NOT EXISTS pt_sessions_trainer_idx ON pt_sessions (trainer_id);
-CREATE INDEX IF NOT EXISTS pt_sessions_date_idx ON pt_sessions (date);
+CREATE INDEX IF NOT EXISTS pt_sessions_date_idx ON pt_sessions (session_date);
 
 -- ── 4. Fix trigger on pt_clients to use pt_trainers ──────────────
 CREATE OR REPLACE FUNCTION fn_pt_update_trainer_commission()

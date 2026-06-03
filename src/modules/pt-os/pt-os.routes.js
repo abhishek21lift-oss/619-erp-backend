@@ -257,13 +257,13 @@ router.get('/sessions', auth, wrap(async (req, res) => {
   const where = ['s.deleted_at IS NULL'];
   const params = [];
   if (trainer_id) { params.push(trainer_id); where.push(`s.trainer_id = $${params.length}`); }
-  if (date) { params.push(date); where.push(`s.date = $${params.length}`); }
+  if (date) { params.push(date); where.push(`s.session_date = $${params.length}`); }
   const { rows } = await pool.query(`
     SELECT s.*, c.name AS client_name
     FROM pt_sessions s
     LEFT JOIN pt_clients c ON c.id = s.client_id
     WHERE ${where.join(' AND ')}
-    ORDER BY s.date DESC, s.start_time
+    ORDER BY s.session_date DESC, s.start_time
   `, params);
   res.json({ data: rows });
 }));
@@ -276,7 +276,7 @@ router.post('/sessions', auth, wrap(async (req, res) => {
     if (rows.length > 0) cid = rows[0].id;
   }
   const { rows } = await pool.query(
-    `INSERT INTO pt_sessions (client_id, trainer_id, title, date, start_time, end_time, notes, created_by)
+    `INSERT INTO pt_sessions (client_id, trainer_id, title, session_date, start_time, end_time, notes, created_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
     [cid, trainer_id, title || 'PT Session', date, start_time, end_time, notes, req.user.id]
   );
