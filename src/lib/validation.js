@@ -2,6 +2,7 @@ const { z } = require('zod');
 
 const passwordSchema = z.string().min(8, 'Password must be at least 8 characters').max(128);
 const emailSchema = z.string().email('Invalid email').max(255).transform(function(v) { return v.toLowerCase().trim(); });
+const emailOptional = emailSchema.optional().nullable().or(z.literal('').transform(function() { return undefined; }));
 
 const authSchemas = {
   login: {
@@ -33,7 +34,7 @@ const clientSchemas = {
     body: z.object({
       name: z.string().min(1, 'Name is required').max(255).transform(function(v) { return v.trim(); }),
       mobile: z.string().max(20).optional().nullable(),
-      email: emailSchema.optional().nullable(),
+      email: emailOptional,
       gender: z.string().max(20).optional().nullable(),
       dob: z.string().optional().nullable(),
       address: z.string().max(500).optional().nullable(),
@@ -60,7 +61,7 @@ const clientSchemas = {
     body: z.object({
       name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }).optional(),
       mobile: z.string().max(20).optional().nullable(),
-      email: emailSchema.optional().nullable(),
+      email: emailOptional,
       gender: z.string().max(20).optional().nullable(),
       dob: z.string().optional().nullable(),
       address: z.string().max(500).optional().nullable(),
@@ -137,7 +138,7 @@ const staffSchemas = {
   create: {
     body: z.object({
       name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }),
-      email: emailSchema.optional().nullable(),
+      email: emailOptional,
       phone: z.string().max(20).optional().nullable(),
       role: z.string().min(1, 'Role is required'),
       status: z.string().optional(),
@@ -150,7 +151,7 @@ const trainerSchemas = {
     body: z.object({
       name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }),
       mobile: z.string().max(20).optional().nullable(),
-      email: emailSchema.optional().nullable(),
+      email: emailOptional,
       dob: z.string().optional().nullable(),
       gender: z.string().max(20).optional().nullable(),
       address: z.string().max(500).optional().nullable(),
