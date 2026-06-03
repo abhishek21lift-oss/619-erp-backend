@@ -110,7 +110,7 @@ CREATE OR REPLACE VIEW v_pt_trainer_earnings AS
 SELECT
   t.id AS trainer_id,
   t.name AS trainer_name,
-  DATE_TRUNC('month', c.pt_start_date)::DATE AS month,
+  DATE_TRUNC('month', c.pt_start_date::DATE)::DATE AS month,
   COUNT(DISTINCT c.id) AS active_clients,
   COALESCE(SUM(c.monthly_pt_amount), 0) AS total_monthly_pt_revenue,
   COALESCE(SUM(c.trainer_commission), 0) AS total_commission_earned,
@@ -122,7 +122,7 @@ JOIN pt_clients c ON c.trainer_id = t.id
   AND c.pt_start_date IS NOT NULL
 WHERE t.deleted_at IS NULL
   AND t.status = 'active'
-GROUP BY t.id, t.name, DATE_TRUNC('month', c.pt_start_date), t.incentive_rate;
+GROUP BY t.id, t.name, DATE_TRUNC('month', c.pt_start_date::DATE), t.incentive_rate;
 
 -- ── Indexes ────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS pt_clients_trainer_idx ON pt_clients (trainer_id);
