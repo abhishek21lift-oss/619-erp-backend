@@ -49,15 +49,18 @@ SELECT id, client_id, name, email, mobile, gender, dob, address, photo_url,
 FROM clients
 WHERE pt_start_date IS NOT NULL OR trainer_id IS NOT NULL;
 
+-- ── Drop old PT views + trigger that depend on clients.duration_months ──
+DROP VIEW IF EXISTS v_pt_active_clients;
+DROP VIEW IF EXISTS v_pt_balance_sheet;
+DROP VIEW IF EXISTS v_pt_trainer_earnings;
+DROP TRIGGER IF EXISTS trg_clients_trainer_commission ON clients;
+DROP FUNCTION IF EXISTS fn_update_trainer_commission();
+
 -- ── Remove PT columns from shared clients table ────────────────────
 ALTER TABLE clients
   DROP COLUMN IF EXISTS duration_months,
   DROP COLUMN IF EXISTS monthly_pt_amount,
   DROP COLUMN IF EXISTS trainer_commission;
-
--- ── Drop old PT triggers on clients table ──────────────────────────
-DROP TRIGGER IF EXISTS trg_clients_trainer_commission ON clients;
-DROP FUNCTION IF EXISTS fn_update_trainer_commission();
 
 -- ── Create trigger on pt_clients ──────────────────────────────────
 CREATE OR REPLACE FUNCTION fn_pt_update_trainer_commission()
@@ -91,21 +94,18 @@ ALTER TABLE pt_commissions ADD CONSTRAINT pt_commissions_client_id_fkey
   FOREIGN KEY (client_id) REFERENCES pt_clients(id) ON DELETE CASCADE;
 
 -- ── Recreate views on pt_clients ──────────────────────────────────
-DROP VIEW IF EXISTS v_pt_active_clients;
 CREATE OR REPLACE VIEW v_pt_active_clients AS
 SELECT * FROM pt_clients
 WHERE deleted_at IS NULL
   AND status IN ('active','frozen')
   AND pt_start_date IS NOT NULL;
 
-DROP VIEW IF EXISTS v_pt_balance_sheet;
 CREATE OR REPLACE VIEW v_pt_balance_sheet AS
 SELECT * FROM pt_clients
 WHERE deleted_at IS NULL
   AND balance_amount > 0
 ORDER BY balance_amount DESC;
 
-DROP VIEW IF EXISTS v_pt_trainer_earnings;
 CREATE OR REPLACE VIEW v_pt_trainer_earnings AS
 SELECT
   t.id AS trainer_id,
