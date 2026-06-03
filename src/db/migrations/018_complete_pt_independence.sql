@@ -28,10 +28,10 @@ CREATE TABLE IF NOT EXISTS pt_trainers (
 );
 
 INSERT INTO pt_trainers (id, name, email, mobile, specialization, bio, schedule,
-  certifications, incentive_rate, status, joining_date, photo_url,
+  certifications, incentive_rate, status, joining_date,
   deleted_at, created_at, updated_at)
 SELECT id, name, email, mobile, specialization, bio, schedule,
-  certifications, incentive_rate, status, joining_date, photo_url,
+  certifications, incentive_rate, status, joining_date,
   deleted_at, created_at, updated_at
 FROM trainers
 WHERE deleted_at IS NULL;
