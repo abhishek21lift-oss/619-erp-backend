@@ -304,10 +304,20 @@ router.get('/payments', auth, wrap(async (req, res) => {
 
 router.post('/payments', auth, wrap(async (req, res) => {
   const { client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes } = req.body;
+  const numAmount = Number(amount) || 0;
   const { rows } = await pool.query(
     `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [client_id, trainer_id, amount, incentive_amt ?? 0, payment_method, payment_ref, date || new Date(), notes]
+    [client_id, trainer_id, numAmount, incentive_amt ?? 0, payment_method, payment_ref, date || new Date(), notes]
+  );
+  // update client paid_amount and balance_amount
+  await pool.query(
+    `UPDATE pt_clients SET
+       paid_amount = paid_amount + $1,
+       balance_amount = GREATEST(balance_amount - $1, 0),
+       updated_at = NOW()
+     WHERE id = $2 AND deleted_at IS NULL`,
+    [numAmount, client_id]
   );
   res.status(201).json({ data: rows[0] });
 }));
