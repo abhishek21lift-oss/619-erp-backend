@@ -58,13 +58,14 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
 
 // ─── Create / enroll client in PT ───────────────────────────
 router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
-  try {
-    const {
-      client_id, name, gender, mobile, email, dob,
-      trainer_id, package_type, base_amount, discount,
-      pt_start_date, duration_months, monthly_pt_amount,
-      notes, weight,
-    } = req.body;
+      try {
+        const {
+          client_id, name, gender, mobile, email, dob,
+          trainer_id, package_type, base_amount, discount,
+          pt_start_date, duration_months, monthly_pt_amount,
+          notes, weight,
+          pt_package_id, base_price, selling_price,
+        } = req.body;
 
     let cid = client_id;
     if (!cid) {
