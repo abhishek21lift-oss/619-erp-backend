@@ -18,7 +18,7 @@ async function calculateMonthlyCommissions(month) {
         AND c.status IN ('active','frozen')
         AND c.trainer_id IS NOT NULL
         AND c.pt_start_date IS NOT NULL
-        AND (c.pt_end_date IS NULL OR c.pt_end_date >= $1)
+        AND (c.pt_end_date IS NULL OR NULLIF(c.pt_end_date, '')::DATE >= $1::DATE)
         AND c.pt_start_date <= $2
         AND c.monthly_pt_amount > 0
     `, [mStart.toISOString().slice(0, 10), mEndStr]);
@@ -81,10 +81,10 @@ async function getBalanceSheet(trainerId) {
   const { rows } = await pool.query(`
     SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name,
            c.package_type, c.final_amount, c.paid_amount, c.balance_amount,
-           c.pt_end_date, (c.pt_end_date - CURRENT_DATE) AS days_left,
+           c.pt_end_date, (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
            c.status,
            CASE
-             WHEN c.balance_amount > 0 AND c.pt_end_date < CURRENT_DATE THEN 'OVERDUE'
+              WHEN c.balance_amount > 0 AND NULLIF(c.pt_end_date, '')::DATE < CURRENT_DATE THEN 'OVERDUE'
              WHEN c.balance_amount > 0 THEN 'DUE'
              ELSE 'CLEAR'
            END AS due_status,
@@ -110,7 +110,7 @@ async function getActiveClients(trainerId) {
            c.package_type, c.base_amount, c.discount, c.final_amount,
            c.paid_amount, c.balance_amount, c.joining_date,
            c.duration_months, c.pt_start_date, c.pt_end_date,
-           (c.pt_end_date - CURRENT_DATE) AS days_left,
+           (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
            c.status, c.monthly_pt_amount, c.trainer_commission
     FROM pt_clients c
     WHERE ${where.join(' AND ')}

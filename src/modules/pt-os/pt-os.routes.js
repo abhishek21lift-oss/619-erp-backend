@@ -43,9 +43,9 @@ router.get('/clients', auth, wrap(async (req, res) => {
 router.get('/clients/:id', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(`
     SELECT c.*,
-           (c.pt_end_date - CURRENT_DATE) AS days_left,
+           (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
            CASE
-             WHEN c.balance_amount > 0 AND c.pt_end_date < CURRENT_DATE THEN 'OVERDUE'
+             WHEN c.balance_amount > 0 AND NULLIF(c.pt_end_date, '')::DATE < CURRENT_DATE THEN 'OVERDUE'
              WHEN c.balance_amount > 0 THEN 'DUE'
              ELSE 'CLEAR'
            END AS due_status
