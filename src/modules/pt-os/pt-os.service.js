@@ -231,7 +231,7 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) 
     await pool.query(`
       UPDATE pt_commissions
       SET status = 'paid', updated_at = NOW()
-      WHERE trainer_id = $1 AND month = $2 AND status = 'approved'
+      WHERE trainer_id = $1 AND month = $2 AND status IN ('pending', 'approved')
     `, [payout.trainer_id, payout.month]);
   }
   return rows[0];
