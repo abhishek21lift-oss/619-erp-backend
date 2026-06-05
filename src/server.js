@@ -216,7 +216,6 @@ app.use('/api/clients',           require('./routes/client-actions'));
 
 app.use('/api/trainers',          require('./routes/trainers'));
 app.use('/api/payments',          require('./routes/payments'));
-app.use('/api/dashboard',         require('./routes/dashboard'));
 app.use('/api/attendance',        require('./routes/attendance'));
 app.use('/api/checkin',           require('./routes/checkin'));
 
