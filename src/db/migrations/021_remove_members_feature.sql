@@ -13,7 +13,7 @@ DROP INDEX IF EXISTS renewals_date_idx;
 
 -- Drop member-specific tables
 DROP TABLE IF EXISTS renewals;
-DROP TABLE IF EXISTS subscriptions;
+DROP TABLE IF EXISTS subscriptions CASCADE;
 
 -- NOTE: The `clients` table is intentionally kept because it is
 -- shared with PT OS, Attendance, Check-in, Finance, and other
