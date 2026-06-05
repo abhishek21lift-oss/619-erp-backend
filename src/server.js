@@ -232,7 +232,6 @@ app.use('/api/staff',             require('./routes/staff'));
 app.use('/api/leave',             require('./routes/leave'));
 app.use('/api/expenses',          require('./routes/expenses'));
 app.use('/api/import',            require('./routes/import'));  // FIX: was never mounted
-app.use('/api/subscriptions',     require('./modules/subscriptions/subscriptions.routes'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.
@@ -257,7 +256,6 @@ app.use('/api/settings',          require('./routes/settings'));
 app.use('/api/invoices',          require('./routes/invoices'));
 app.use('/api/workouts',          require('./routes/workouts'));
 app.use('/api/diet',              require('./routes/diet'));
-app.use('/api/renewals',          require('./routes/renewals'));
 
 // ────────────────────────
 // MEMBER PORTAL ROUTES
