@@ -270,9 +270,8 @@ app.use('/api/classes',           require('./routes/classes'));
 app.use('/api/pt-os',            require('./modules/pt-os/pt-os.routes'));
 
 // ────────────────────────
-// BUSINESS FLOW ROUTES (v4 — Lead CRM, Progress, Automation)
+// BUSINESS FLOW ROUTES (v4 — Progress, Automation)
 // ────────────────────────
-app.use('/api/leads',            require('./modules/leads/leads.routes'));
 app.use('/api/progress',         require('./modules/progress/progress.routes'));
 app.use('/api/automation',       require('./modules/automation/automation.routes'));
 

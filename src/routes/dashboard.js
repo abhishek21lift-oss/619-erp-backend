@@ -247,7 +247,7 @@ function numOrZero(v) {
 //
 // Response shape (all keys optional, integers, never null):
 //   {
-//     leadsCount, followupsToday, expiringCount,
+//     expiringCount,
 //     birthdaysToday, duesCount, pendingLeaves
 //   }
 router.get('/badges', auth, async (req, res, next) => {
@@ -257,19 +257,7 @@ router.get('/badges', auth, async (req, res, next) => {
     const params    = tid ? [tid] : [];
     const tFilter   = tid ? 'AND trainer_id = $1' : '';
 
-    const [leads, followupsToday, expiring, birthdays, dues] = await Promise.all([
-      pool.query(
-        `SELECT COUNT(*) AS count FROM clients
-          WHERE status = 'lead' ${tFilter}`,
-        params,
-      ),
-      pool.query(
-        `SELECT COUNT(*) AS count FROM clients
-          WHERE status = 'lead'
-            AND COALESCE(next_followup_date::date, CURRENT_DATE) <= CURRENT_DATE
-            ${tFilter}`,
-        params,
-      ).catch(() => ({ rows: [{ count: 0 }] })),  // table column may be absent
+    const [expiring, birthdays, dues] = await Promise.all([
       pool.query(
         `SELECT COUNT(*) AS count FROM clients
           WHERE status = 'active'
@@ -305,8 +293,6 @@ router.get('/badges', auth, async (req, res, next) => {
     }
 
     res.json({
-      leadsCount:      intOrZero(leads.rows[0].count),
-      followupsToday:  intOrZero(followupsToday.rows[0].count),
       expiringCount:   intOrZero(expiring.rows[0].count),
       birthdaysToday:  intOrZero(birthdays.rows[0].count),
       duesCount:       intOrZero(dues.rows[0].count),
