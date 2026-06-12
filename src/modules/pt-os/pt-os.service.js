@@ -79,7 +79,9 @@ async function getBalanceSheet(trainerId) {
   }
   const whereSql = where.length ? `AND ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(`
-    SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name,
+    SELECT c.id, c.client_id, c.name, c.mobile, c.email, c.photo_url,
+           c.weight, c.emergency_contact,
+           c.trainer_name,
            c.package_type, c.final_amount, c.paid_amount, c.balance_amount,
            c.pt_end_date, (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
            c.status,
@@ -105,7 +107,8 @@ async function getActiveClients(trainerId) {
     where.push(`c.trainer_id = $${params.length}`);
   }
   const { rows } = await pool.query(`
-    SELECT c.id, c.client_id, c.name, c.gender, c.mobile,
+    SELECT c.id, c.client_id, c.name, c.gender, c.mobile, c.email,
+           c.photo_url, c.dob, c.weight, c.notes, c.address, c.emergency_contact,
            c.trainer_id, c.trainer_name,
            c.package_type, c.base_amount, c.discount, c.final_amount,
            c.paid_amount, c.balance_amount, c.joining_date,

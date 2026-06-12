@@ -128,7 +128,8 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
        'duration_months','status','notes','monthly_pt_amount']
     : ['package_type','base_amount','discount','final_amount','paid_amount',
        'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
-       'duration_months','status','notes'];
+       'duration_months','status','notes',
+       'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact'];
   const sets = [];
   const params = [req.params.id];
   for (const key of allowed) {
@@ -158,6 +159,31 @@ router.post('/clients/:id/photo', auth, wrap(async (req, res) => {
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   res.json({ data: rows[0] });
+}));
+
+// ─── Save client notes ──────────────────────────────────────
+router.put('/clients/:id/notes', auth, wrap(async (req, res) => {
+  const { notes } = req.body;
+  if (notes === undefined) return res.status(400).json({ error: { code: 'NO_NOTES', message: 'Missing notes' } });
+  const { rows } = await pool.query(
+    'UPDATE pt_clients SET notes = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL RETURNING id, notes',
+    [notes, req.params.id]
+  );
+  if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  res.json({ data: rows[0] });
+}));
+
+// ─── Client communication history ───────────────────────────
+router.get('/clients/:id/communication', auth, wrap(async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT cl.*, c.name AS client_name
+    FROM communication_logs cl
+    LEFT JOIN pt_clients c ON c.id = cl.recipient_id
+    WHERE cl.recipient_type = 'client' AND cl.recipient_id = $1
+    ORDER BY cl.created_at DESC
+    LIMIT 100
+  `, [req.params.id]);
+  res.json({ data: rows, total: rows.length });
 }));
 
 // ─── Balance sheet ──────────────────────────────────────────
