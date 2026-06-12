@@ -173,6 +173,18 @@ router.put('/clients/:id/notes', auth, wrap(async (req, res) => {
   res.json({ data: rows[0] });
 }));
 
+// ─── Delete PT client (soft-delete) ─────────────────────────
+router.delete('/clients/:id', auth, requireRole('admin','manager'), wrap(async (req, res) => {
+  const { rows } = await pool.query(`
+    UPDATE pt_clients
+    SET deleted_at = NOW(), updated_at = NOW(), status = 'inactive'
+    WHERE id = $1 AND deleted_at IS NULL
+    RETURNING id
+  `, [req.params.id]);
+  if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  res.json({ message: 'Client deleted' });
+}));
+
 // ─── Client communication history ───────────────────────────
 router.get('/clients/:id/communication', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(`
