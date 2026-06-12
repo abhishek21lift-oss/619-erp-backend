@@ -207,7 +207,7 @@ router.get('/balance-sheet', auth, wrap(async (req, res) => {
 
 // ─── PT Plans ───────────────────────────────────────────────
 router.get('/plans', auth, wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM pt_plans WHERE is_active = TRUE ORDER BY base_amount');
+  const { rows } = await pool.query('SELECT * FROM pt_plans ORDER BY base_amount');
   res.json({ data: rows });
 }));
 
@@ -218,6 +218,28 @@ router.post('/plans', auth, adminOnly, wrap(async (req, res) => {
     [name, duration_months, base_amount, description]
   );
   res.status(201).json({ data: rows[0] });
+}));
+
+router.put('/plans/:id', auth, adminOnly, wrap(async (req, res) => {
+  const { name, duration_months, base_amount, description, is_active } = req.body;
+  const { rows } = await pool.query(`
+    UPDATE pt_plans SET
+      name = COALESCE($2, name),
+      duration_months = COALESCE($3, duration_months),
+      base_amount = COALESCE($4, base_amount),
+      description = COALESCE($5, description),
+      is_active = COALESCE($6, is_active),
+      updated_at = NOW()
+    WHERE id = $1 RETURNING *
+  `, [req.params.id, name, duration_months, base_amount, description, is_active]);
+  if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  res.json({ data: rows[0] });
+}));
+
+router.delete('/plans/:id', auth, adminOnly, wrap(async (req, res) => {
+  const { rows } = await pool.query('DELETE FROM pt_plans WHERE id = $1 RETURNING id', [req.params.id]);
+  if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  res.json({ message: 'Plan deleted' });
 }));
 
 // ─── Commissions ────────────────────────────────────────────
