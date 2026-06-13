@@ -4,6 +4,7 @@ const { auth, adminOnly, adminOrManager } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
 const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
+const { generateClientId, generateMemberCode } = require('../../db/id-gen');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -68,13 +69,29 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
         } = req.body;
 
     let cid = client_id;
+    let memberCode = null;
     if (!cid) {
-      const { rows: [newCli] } = await pool.query(`
-        INSERT INTO pt_clients (name, gender, mobile, email, dob, status, joining_date)
-        VALUES ($1,$2,$3,$4,$5,'active',$6)
-        RETURNING id
-      `, [name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date()]);
-      cid = newCli.id;
+      const pgClient = await pool.connect();
+      try {
+        await pgClient.query('BEGIN');
+        await pgClient.query("SELECT pg_advisory_xact_lock(1937456102)");
+        memberCode = await generateMemberCode(pgClient);
+        const { rows: [newCli] } = await pgClient.query(`
+          INSERT INTO pt_clients (name, gender, mobile, email, dob, status, joining_date)
+          VALUES ($1,$2,$3,$4,$5,'active',$6)
+          RETURNING id
+        `, [name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date()]);
+        await pgClient.query('COMMIT');
+        cid = newCli.id;
+      } catch (txErr) {
+        await pgClient.query('ROLLBACK');
+        throw txErr;
+      } finally {
+        pgClient.release();
+      }
+    } else {
+      const { rows: [row] } = await pool.query('SELECT member_code FROM pt_clients WHERE id=$1', [cid]);
+      memberCode = row?.member_code || null;
     }
 
     const finalAmt = (base_amount || 0) - (discount || 0);
@@ -102,6 +119,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
         duration_months = COALESCE($11, duration_months),
         notes = COALESCE($12, notes),
         weight = COALESCE($13, weight),
+        member_code = COALESCE($14, member_code),
         status = 'active',
         updated_at = NOW()
       WHERE id = $1 AND deleted_at IS NULL
@@ -111,6 +129,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
       base_amount, discount, finalAmt, monthly_pt_amount,
       startDate, endDate, duration_months,
       notes || null, weight != null ? Number(weight) : null,
+      memberCode,
     ]);
 
     res.status(201).json({ data: rows[0] });
