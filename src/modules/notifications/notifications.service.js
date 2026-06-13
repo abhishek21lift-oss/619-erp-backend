@@ -5,6 +5,7 @@
 // them inline. Each adapter is pluggable.
 
 const pool = require('../../db/pool');
+const logger = require('../../lib/logger');
 
 // ─── Channel adapters (stubs — wire to your providers) ──────────────────────
 const channels = {
@@ -22,7 +23,7 @@ const channels = {
     // Example with Resend:
     //   await resend.emails.send({ from: 'no-reply@619fitness.com', to, subject, html });
     if (!to) return { status: 'failed', error: 'no recipient' };
-    console.log('[email]', to, subject);
+    logger.info({ to, subject }, 'notification email stub');
     return { status: 'sent', provider_id: `email_${Date.now()}` };
   },
 
@@ -30,21 +31,21 @@ const channels = {
     // TODO: integrate Meta Cloud API or Gupshup.
     // Templates must be pre-approved in WhatsApp Business.
     if (!to) return { status: 'failed', error: 'no recipient' };
-    console.log('[wa]', to, template, variables);
+    logger.info({ to, template, variables }, 'notification whatsapp stub');
     return { status: 'sent', provider_id: `wa_${Date.now()}` };
   },
 
   sms: async ({ to, body }) => {
     // TODO: integrate MSG91 / Twilio.
     if (!to) return { status: 'failed', error: 'no recipient' };
-    console.log('[sms]', to, body);
+    logger.info({ to }, 'notification sms stub');
     return { status: 'sent', provider_id: `sms_${Date.now()}` };
   },
 
   push: async ({ device_token, title, body }) => {
     // TODO: integrate FCM.
     if (!device_token) return { status: 'failed', error: 'no token' };
-    console.log('[push]', title);
+    logger.info({ title }, 'notification push stub');
     return { status: 'sent', provider_id: `push_${Date.now()}` };
   },
 };
@@ -129,8 +130,7 @@ async function send(type, recipient, data, via = ['inapp']) {
         ]
       );
     } catch {
-      // notification_log table may not exist yet
-      console.warn('[notifications] failed to log notification (table may not exist)');
+      logger.warn('notification_log table may not exist yet');
     }
     results[ch] = res;
   }

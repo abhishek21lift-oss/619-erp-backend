@@ -2,9 +2,10 @@
 require('dotenv').config();
 const fs = require('fs');
 const { Pool } = require('pg');
+const logger = require('../lib/logger');
 
 if (!process.env.DATABASE_URL) {
-  console.error('❌ DATABASE_URL is not set. Check your .env file.');
+  logger.fatal('DATABASE_URL is not set. Check your .env file.');
   process.exit(1);
 }
 
@@ -19,12 +20,12 @@ function buildSslConfig() {
     try {
       return { ca: fs.readFileSync(caPath, 'utf8'), rejectUnauthorized: true };
     } catch (err) {
-      console.error(`❌ DATABASE_SSL_CA points to "${caPath}" but the file could not be read:`, err.message);
+      logger.fatal({ caPath, err: err.message }, 'DATABASE_SSL_CA file could not be read');
       process.exit(1);
     }
   }
   if (process.env.NODE_ENV === 'production') {
-    console.warn('⚠️  DATABASE_SSL_CA not set — skipping cert verification. Set it to the Supabase CA bundle path for full cert verification.');
+    logger.warn('DATABASE_SSL_CA not set — skipping cert verification. Set it to the Supabase CA bundle path for full cert verification.');
   }
   return { rejectUnauthorized: false };
 }
@@ -48,7 +49,7 @@ const pool = new Pool({
 });
 
 pool.on('error', (err) => {
-  console.error('Unexpected DB pool error:', err.message);
+  logger.error({ err: err.message }, 'Unexpected DB pool error');
 });
 
 // Test connection on startup. Don't crash here — Render's healthcheck will
@@ -56,14 +57,14 @@ pool.on('error', (err) => {
 // recovering when Supabase has a brief connectivity blip.
 pool.connect()
   .then(client => {
-    console.log('✅ Connected to Supabase PostgreSQL');
+    logger.info('Connected to Supabase PostgreSQL');
     client.release();
   })
   .catch(err => {
-    console.error('❌ Database connection failed on startup:', err.message);
-    console.error('   1. Check DATABASE_URL is set in your .env / Render env');
-    console.error('   2. Check the Supabase project is not paused');
-    console.error('   3. Check the password in the URI matches your DB password');
+    logger.error({ err: err.message }, 'Database connection failed on startup');
+    logger.error('  1. Check DATABASE_URL is set in your .env / Render env');
+    logger.error('  2. Check the Supabase project is not paused');
+    logger.error('  3. Check the password in the URI matches your DB password');
   });
 
 module.exports = pool;

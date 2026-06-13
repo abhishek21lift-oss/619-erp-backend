@@ -7,6 +7,7 @@
 const pool = require('../db/pool');
 const notifier = require('../modules/notifications/notifications.service');
 const razorpay = require('../lib/razorpay');
+const logger = require('../lib/logger');
 
 const REMINDER_DAYS = [7, 3, 1];   // send reminder when this many days remain
 
@@ -28,13 +29,13 @@ async function runReminders() {
       await notifier.send('membership_expiring', m, { days, plan: m.plan_name },
         ['inapp', 'email', 'whatsapp']);
     }
-    console.log(`[reminders] sent ${rows.length} reminders for ${days}-day expiry`);
+    logger.info({ count: rows.length, days }, 'sent expiry reminders');
   }
 }
 
 async function runAutoRenew() {
   if (!razorpay.isConfigured()) {
-    console.log('[auto-renew] Razorpay not configured — skipping auto-renew. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to enable.');
+    logger.warn('Razorpay not configured — skipping auto-renew. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to enable.');
     return;
   }
 
@@ -89,10 +90,10 @@ async function runAutoRenew() {
       await notifier.send('payment_received', m,
         { amount: m.price, plan: m.plan_name }, ['inapp', 'email', 'whatsapp']);
 
-      console.log(`[auto-renew] ✓ ${m.name} renewed`);
+      logger.info({ member: m.name }, 'auto-renew completed');
     } catch (err) {
       await client.query('ROLLBACK');
-      console.error(`[auto-renew] ✗ ${m.name}:`, err.message);
+      logger.error({ member: m.name, err: err.message }, 'auto-renew failed');
       try {
         await notifier.send('payment_failed', m,
           { amount: m.price, error: err.message }, ['inapp', 'email']);
@@ -101,7 +102,7 @@ async function runAutoRenew() {
       client.release();
     }
   }
-  console.log(`[auto-renew] processed ${rows.length} renewals`);
+  logger.info({ count: rows.length }, 'auto-renew processed');
 }
 
 async function runClassReminders() {
@@ -124,13 +125,13 @@ async function runClassReminders() {
 }
 
 async function main() {
-  console.log('--- 619 worker run', new Date().toISOString());
+  logger.info('worker run starting');
   try {
     await runReminders();
     await runAutoRenew();
     await runClassReminders();
   } catch (err) {
-    console.error('worker error:', err);
+    logger.error({ err: err.message }, 'worker run failed');
     process.exitCode = 1;
   }
   process.exit(0);

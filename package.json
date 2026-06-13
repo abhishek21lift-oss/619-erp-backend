@@ -13,7 +13,7 @@
     "start:v3": "node src/server.js",
     "dev:v3": "nodemon src/server.js",
     "worker": "node src/workers/renewal.worker.js",
-    "lint:syntax": "node --check src/server.js",
+    "lint": "eslint .",
     "migrate": "node src/db/migrate.js",
     "test": "jest --forceExit --detectOpenHandles",
     "test:watch": "jest --watch --forceExit"
@@ -37,6 +37,9 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "eslint": "^9.39.4",
+    "globals": "^16.0.0",
     "jest": "^30.4.2",
     "nodemon": "^3.1.7",
     "supertest": "^7.2.2"

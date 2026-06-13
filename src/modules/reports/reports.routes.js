@@ -137,8 +137,7 @@ router.get('/export', auth, requireRole('admin','manager'), wrap(async (req, res
     return res.send(csv);
   }
 
-  // PDF: TODO — install puppeteer/pdfkit. For now, return JSON.
-  res.json({ data: rows, note: 'PDF export TODO; CSV implemented' });
+  res.json({ data: rows, note: 'PDF export not implemented; use format=csv' });
 }));
 
 module.exports = router;

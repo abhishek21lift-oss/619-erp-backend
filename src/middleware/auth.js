@@ -27,6 +27,14 @@ function invalidateUserCache(userId) {
   else userCache.delete(userId);
 }
 
+// Periodic cleanup of expired entries (runs every 60s, never prevents exit)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of userCache) {
+    if (entry.expiresAt < now) userCache.delete(id);
+  }
+}, 60_000).unref();
+
 async function auth(req, res, next) {
   let token = null;
   const header = req.headers.authorization;
