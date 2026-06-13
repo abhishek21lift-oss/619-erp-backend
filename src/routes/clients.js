@@ -7,6 +7,7 @@ const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { clientSchemas } = require('../lib/validation');
 const logger = require('../lib/logger');
+const { generateClientId, generateMemberCode } = require('../db/id-gen');
 
 // Helper: parse a value as a finite number, or return fallback.
 // parseFloat('') is NaN — `??` does NOT catch that. Use this guard instead.
@@ -371,36 +372,11 @@ router.post('/', auth, validate(clientSchemas.create), async (req, res, next) =>
 
     await client.query('BEGIN');
 
-    // Serialise concurrent client creates so two requests never produce the same FS####.
-    // FOR UPDATE on a single SELECT does NOT block other readers; an advisory lock does.
+    // Serialise concurrent client creates so two requests never produce the same code.
     await client.query("SELECT pg_advisory_xact_lock(hashtext('clients_seq'))");
 
-    // Generate next sequential client ID inside the transaction
-    const { rows: last } = await client.query(
-      `SELECT client_id FROM clients
-        WHERE client_id ~ '^FS[0-9]+$'
-        ORDER BY CAST(SUBSTRING(client_id FROM 3) AS INTEGER) DESC
-        LIMIT 1`
-    );
-    let clientId = 'FS0001';
-    if (last[0]?.client_id) {
-      const n = parseInt((last[0].client_id || 'FS0000').replace('FS', '')) + 1;
-      clientId = 'FS' + String(n).padStart(4, '0');
-    }
-
-    // Generate next sequential SIX19-#### member code in the same transaction
-    // (advisory lock above already serialises concurrent inserts).
-    const { rows: lastMc } = await client.query(
-      `SELECT member_code FROM clients
-        WHERE member_code ~ '^SIX19-[0-9]+$'
-        ORDER BY CAST(SUBSTRING(member_code FROM 7) AS INTEGER) DESC
-        LIMIT 1`
-    );
-    let memberCode = 'SIX19-0001';
-    if (lastMc[0]?.member_code) {
-      const n = parseInt(lastMc[0].member_code.replace('SIX19-', ''), 10) + 1;
-      memberCode = 'SIX19-' + String(n).padStart(4, '0');
-    }
+    const clientId = await generateClientId(client);
+    const memberCode = await generateMemberCode(client);
 
     const id = randomUUID();
     const base    = num(d.base_amount,  0);

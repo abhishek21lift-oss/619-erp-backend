@@ -4,6 +4,7 @@ const multer  = require('multer');
 const { readSheet } = require('read-excel-file/node');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { generateClientId, generateMemberCode } = require('../db/id-gen');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -150,71 +151,103 @@ router.post('/import-excel', auth, adminOnly, upload.single('file'), async (req,
   let imported = 0, skipped = 0;
   const errors = [];
 
-  for (let i = 0; i < rawRows.length; i++) {
-    const row = rawRows[i];
-    const name   = get(row, 'name');
-    const mobile = get(row, 'mobile').replace(/\D/g, '').slice(-10);
+  // Pre-generate codes for new rows in a single batch with advisory lock
+  const lockClient = await pool.connect();
+  try {
+    await lockClient.query('BEGIN');
+    await lockClient.query("SELECT pg_advisory_xact_lock(hashtext('clients_seq'))");
 
-    if (!name) { skipped++; errors.push({ row: i + 2, issue: 'Missing name' }); continue; }
+    for (let i = 0; i < rawRows.length; i++) {
+      const row = rawRows[i];
+      const name   = get(row, 'name');
+      const mobile = get(row, 'mobile').replace(/\D/g, '').slice(-10);
 
-    const client = {
-      name,
-      mobile:           mobile || null,
-      email:            get(row, 'email') || null,
-      dob:              fmt_date(get(row, 'dob')) || null,
-      gender:           (get(row, 'gender') || '').toLowerCase() || null,
-      address:          get(row, 'address') || null,
-      joining_date:     fmt_date(get(row, 'joining_date')) || new Date().toISOString().slice(0, 10),
-      expiry_date:      fmt_date(get(row, 'expiry_date')) || null,
-      plan:             get(row, 'plan') || null,
-      amount_paid:      parseFloat(get(row, 'amount_paid')) || null,
-      payment_method:   get(row, 'payment_method') || null,
-      trainer_name:     get(row, 'trainer') || null,
-      status:           get(row, 'status') || 'active',
-      height:           parseFloat(get(row, 'height')) || null,
-      weight:           parseFloat(get(row, 'weight')) || null,
-      blood_group:      get(row, 'blood_group') || null,
-      emergency_contact:get(row, 'emergency_contact') || null,
-      notes:            get(row, 'notes') || null,
-    };
+      if (!name) { skipped++; errors.push({ row: i + 2, issue: 'Missing name' }); continue; }
 
-    try {
-      await pool.query(`
-        INSERT INTO clients
-          (name, mobile, email, dob, gender, address, joining_date, expiry_date,
-           plan, amount_paid, payment_method, trainer_name, status,
-           height, weight, blood_group, emergency_contact, notes)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-        ON CONFLICT (mobile) DO UPDATE SET
-          name            = EXCLUDED.name,
-          email           = COALESCE(EXCLUDED.email, clients.email),
-          dob             = COALESCE(EXCLUDED.dob, clients.dob),
-          gender          = COALESCE(EXCLUDED.gender, clients.gender),
-          address         = COALESCE(EXCLUDED.address, clients.address),
-          joining_date    = COALESCE(EXCLUDED.joining_date, clients.joining_date),
-          expiry_date     = COALESCE(EXCLUDED.expiry_date, clients.expiry_date),
-          plan            = COALESCE(EXCLUDED.plan, clients.plan),
-          amount_paid     = COALESCE(EXCLUDED.amount_paid, clients.amount_paid),
-          payment_method  = COALESCE(EXCLUDED.payment_method, clients.payment_method),
-          trainer_name    = COALESCE(EXCLUDED.trainer_name, clients.trainer_name),
-          status          = COALESCE(EXCLUDED.status, clients.status),
-          height          = COALESCE(EXCLUDED.height, clients.height),
-          weight          = COALESCE(EXCLUDED.weight, clients.weight),
-          blood_group     = COALESCE(EXCLUDED.blood_group, clients.blood_group),
-          emergency_contact = COALESCE(EXCLUDED.emergency_contact, clients.emergency_contact),
-          notes           = COALESCE(EXCLUDED.notes, clients.notes),
-          updated_at      = NOW()
-      `, [
-        client.name, client.mobile, client.email, client.dob, client.gender, client.address,
-        client.joining_date, client.expiry_date, client.plan, client.amount_paid, client.payment_method,
-        client.trainer_name, client.status, client.height, client.weight, client.blood_group,
-        client.emergency_contact, client.notes
-      ]);
-      imported++;
-    } catch (err) {
-      skipped++;
-      errors.push({ row: i + 2, name, issue: err.message });
+      const client = {
+        name,
+        mobile:           mobile || null,
+        email:            get(row, 'email') || null,
+        dob:              fmt_date(get(row, 'dob')) || null,
+        gender:           (get(row, 'gender') || '').toLowerCase() || null,
+        address:          get(row, 'address') || null,
+        joining_date:     fmt_date(get(row, 'joining_date')) || new Date().toISOString().slice(0, 10),
+        expiry_date:      fmt_date(get(row, 'expiry_date')) || null,
+        plan:             get(row, 'plan') || null,
+        amount_paid:      parseFloat(get(row, 'amount_paid')) || null,
+        payment_method:   get(row, 'payment_method') || null,
+        trainer_name:     get(row, 'trainer') || null,
+        status:           get(row, 'status') || 'active',
+        height:           parseFloat(get(row, 'height')) || null,
+        weight:           parseFloat(get(row, 'weight')) || null,
+        blood_group:      get(row, 'blood_group') || null,
+        emergency_contact:get(row, 'emergency_contact') || null,
+        notes:            get(row, 'notes') || null,
+      };
+
+      // Generate codes only for rows that will actually insert (no existing mobile)
+      let clientCode = null, memberCode = null;
+      if (client.mobile) {
+        const { rows: existing } = await lockClient.query(
+          'SELECT id FROM clients WHERE mobile = $1 LIMIT 1', [client.mobile]
+        );
+        if (existing.length === 0) {
+          clientCode = await generateClientId(lockClient);
+          memberCode = await generateMemberCode(lockClient);
+        }
+      } else {
+        clientCode = await generateClientId(lockClient);
+        memberCode = await generateMemberCode(lockClient);
+      }
+
+      try {
+        await lockClient.query(`
+          INSERT INTO clients
+            (id, client_id, member_code, name, mobile, email, dob, gender, address,
+             joining_date, expiry_date, plan, amount_paid, payment_method, trainer_name,
+             status, height, weight, blood_group, emergency_contact, notes)
+          VALUES (gen_random_uuid()::TEXT, $1, $2, $3, $4, $5, $6, $7, $8,
+                  $9, $10, $11, $12, $13, $14,
+                  $15, $16, $17, $18, $19, $20)
+          ON CONFLICT (mobile) DO UPDATE SET
+            name            = EXCLUDED.name,
+            email           = COALESCE(EXCLUDED.email, clients.email),
+            dob             = COALESCE(EXCLUDED.dob, clients.dob),
+            gender          = COALESCE(EXCLUDED.gender, clients.gender),
+            address         = COALESCE(EXCLUDED.address, clients.address),
+            joining_date    = COALESCE(EXCLUDED.joining_date, clients.joining_date),
+            expiry_date     = COALESCE(EXCLUDED.expiry_date, clients.expiry_date),
+            plan            = COALESCE(EXCLUDED.plan, clients.plan),
+            amount_paid     = COALESCE(EXCLUDED.amount_paid, clients.amount_paid),
+            payment_method  = COALESCE(EXCLUDED.payment_method, clients.payment_method),
+            trainer_name    = COALESCE(EXCLUDED.trainer_name, clients.trainer_name),
+            status          = COALESCE(EXCLUDED.status, clients.status),
+            height          = COALESCE(EXCLUDED.height, clients.height),
+            weight          = COALESCE(EXCLUDED.weight, clients.weight),
+            blood_group     = COALESCE(EXCLUDED.blood_group, clients.blood_group),
+            emergency_contact = COALESCE(EXCLUDED.emergency_contact, clients.emergency_contact),
+            notes           = COALESCE(EXCLUDED.notes, clients.notes),
+            updated_at      = NOW()
+        `, [
+          clientCode, memberCode, client.name, client.mobile, client.email, client.dob,
+          client.gender, client.address, client.joining_date, client.expiry_date,
+          client.plan, client.amount_paid, client.payment_method, client.trainer_name,
+          client.status, client.height, client.weight, client.blood_group,
+          client.emergency_contact, client.notes
+        ]);
+        imported++;
+      } catch (err) {
+        skipped++;
+        errors.push({ row: i + 2, name, issue: err.message });
+      }
     }
+
+    await lockClient.query('COMMIT');
+  } catch (err) {
+    await lockClient.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    lockClient.release();
   }
 
   res.json({ imported, skipped, total: rawRows.length, errors: errors.slice(0, 50) });
