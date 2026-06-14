@@ -292,6 +292,9 @@ app.use('/api/settings',          require('./routes/settings'));
 app.use('/api/invoices',          require('./routes/invoices'));
 app.use('/api/workouts',          require('./routes/workouts'));
 app.use('/api/diet',              require('./routes/diet'));
+app.use('/api/biometric-attend',  require('./routes/biometric-attend'));
+app.use('/api/webauthn',          require('./routes/webauthn'));
+app.use('/api/integrations',      require('./routes/integrations'));
 
 // ────────────────────────
 // MEMBER PORTAL ROUTES
