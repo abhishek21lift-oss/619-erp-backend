@@ -12,6 +12,26 @@ const { buildMemberContext, buildSystemPrompt } = require('./openai');
 // passed by ai-router (which reads the value from ai_provider_settings).
 const DEFAULT_MODEL = 'gemini-2.0-flash';
 
+// Translate raw Gemini API errors into user-readable messages
+function geminiUserMessage(err) {
+  const msg = err?.message || '';
+  if (msg.includes('[429') || msg.includes('RESOURCE_EXHAUSTED')) {
+    if (msg.includes('limit: 0') || msg.includes('free_tier')) {
+      return 'Gemini API quota exceeded: your project has no free-tier allowance. Enable billing at console.cloud.google.com or create a new API key from aistudio.google.com.';
+    }
+    const retryMatch = msg.match(/retry in ([\d.]+)s/i);
+    const wait = retryMatch ? ` Retry in ~${Math.ceil(parseFloat(retryMatch[1]))}s.` : '';
+    return `Gemini rate limit reached.${wait} Upgrade to a paid plan or wait before retrying.`;
+  }
+  if (msg.includes('[403') || msg.includes('API_KEY_INVALID')) {
+    return 'Gemini API key is invalid or has been revoked. Check GEMINI_API_KEY in your environment.';
+  }
+  if (msg.includes('[404')) {
+    return `Gemini model not found. Try selecting a different model in Settings → Integrations.`;
+  }
+  return 'Gemini AI service error. Please try again.';
+}
+
 function getClient() {
   if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set');
   const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -115,10 +135,12 @@ async function streamChat({ userId, userRole, conversationId, message, clientId,
 
   } catch (err) {
     logger.error({ err: err.message, userId, modelId }, 'Gemini streaming error');
+    const userMsg = geminiUserMessage(err);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'AI service error. Please try again.' });
+      const status = err.message?.includes('[429') ? 429 : 500;
+      res.status(status).json({ error: userMsg });
     } else {
-      res.write(`data: ${JSON.stringify({ error: 'AI response interrupted. Please try again.' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ error: userMsg })}\n\n`);
       res.end();
     }
   }

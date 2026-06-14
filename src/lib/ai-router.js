@@ -204,7 +204,23 @@ async function testProvider(provider) {
       await model.generateContent('Reply with exactly one word: ok');
       return { success: true, message: `Gemini connected — ${modelId} available` };
     } catch (err) {
-      return { success: false, message: err.message || 'Gemini connection failed' };
+      const msg = err?.message || '';
+      if (msg.includes('[429') || msg.includes('RESOURCE_EXHAUSTED')) {
+        const hasZeroLimit = msg.includes('limit: 0') || msg.includes('free_tier');
+        return {
+          success: false,
+          message: hasZeroLimit
+            ? 'API key valid but quota is zero — enable billing at console.cloud.google.com or get a fresh key from aistudio.google.com'
+            : 'API key valid but rate-limited (quota exceeded). Wait and retry, or upgrade your plan.',
+        };
+      }
+      if (msg.includes('[403') || msg.includes('API_KEY_INVALID')) {
+        return { success: false, message: 'Invalid API key — check GEMINI_API_KEY in your environment variables.' };
+      }
+      if (msg.includes('[404')) {
+        return { success: false, message: `Model "${modelId}" not found. Try selecting a different model.` };
+      }
+      return { success: false, message: msg || 'Gemini connection failed' };
     }
   }
 
