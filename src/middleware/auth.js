@@ -8,6 +8,7 @@ const logger = require('../lib/logger');
 // instantly. To avoid hitting Postgres on every API call, cache the
 // resolved user for a short TTL.
 const USER_CACHE_TTL_MS = 30000;
+const USER_CACHE_MAX    = 500;
 const userCache = new Map(); // id -> { user, expiresAt }
 function _cacheGet(id) {
   const hit = userCache.get(id);
@@ -16,10 +17,12 @@ function _cacheGet(id) {
   return hit.user;
 }
 function _cacheSet(id, user) {
+  // M-03: proper LRU — delete+re-insert moves the key to the end of insertion order.
+  // Then evict oldest entries until within the cap.
+  userCache.delete(id);
   userCache.set(id, { user, expiresAt: Date.now() + USER_CACHE_TTL_MS });
-  if (userCache.size > 500) {
-    const oldest = userCache.keys().next().value;
-    if (oldest !== undefined) userCache.delete(oldest);
+  while (userCache.size > USER_CACHE_MAX) {
+    userCache.delete(userCache.keys().next().value);
   }
 }
 function invalidateUserCache(userId) {

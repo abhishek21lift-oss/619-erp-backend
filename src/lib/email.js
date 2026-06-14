@@ -57,4 +57,23 @@ async function sendPasswordReset(email, rawToken) {
   }
 }
 
-module.exports = { sendPasswordReset, isConfigured };
+async function sendAdminResetOtp(email, otp) {
+  if (!isConfigured()) {
+    logger.warn({ email }, 'SMTP not configured — admin reset OTP not sent');
+    return;
+  }
+  try {
+    const t = getTransporter();
+    await t.sendMail({
+      from: FROM_ADDR,
+      to: email,
+      subject: '619 ERP — Admin Data Reset OTP',
+      text: `Your one-time code to confirm the data reset is: ${otp}\n\nThis code expires in 10 minutes. If you did not request this, ignore this email.`,
+      html: `<p>Your one-time code to confirm the data reset is:</p><h2>${otp}</h2><p>This code expires in <strong>10 minutes</strong>. If you did not request this, ignore this email.</p>`,
+    });
+  } catch (err) {
+    logger.error({ err: err.message, email }, 'Failed to send admin reset OTP email');
+  }
+}
+
+module.exports = { sendPasswordReset, sendAdminResetOtp, isConfigured };

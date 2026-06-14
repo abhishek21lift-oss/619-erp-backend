@@ -16,7 +16,9 @@ function setTokenCookie(res, token) {
   res.cookie('token', token, {
     httpOnly: true,
     secure: isProd,
-    sameSite: isProd ? 'none' : 'lax',
+    // C-05: 'strict' prevents the cookie from being sent on cross-site requests,
+    // which eliminates CSRF without requiring a separate CSRF token.
+    sameSite: 'strict',
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: '/',
   });
@@ -117,7 +119,8 @@ router.post('/forgot-password', async (req, res) => {
 
     if (rows.length) {
       await pool.query(
-        'UPDATE users SET password_reset_token = $1, password_reset_expires = NOW() + INTERVAL \'1 hour\' WHERE id = $2',
+        // M-07: 15-minute window — was 1 hour, which gave too large an interception window
+      'UPDATE users SET password_reset_token = $1, password_reset_expires = NOW() + INTERVAL \'15 minutes\' WHERE id = $2',
         [hashedToken, rows[0].id]
       );
       // FIX: await + .catch so email failures are logged instead of silently swallowed
@@ -182,8 +185,9 @@ async function changePasswordHandler(req, res) {
 
     if (!currentPassword || !newPassword)
       return res.status(400).json({ error: 'Both current and new password are required' });
-    if (typeof newPassword !== 'string' || newPassword.length < 6)
-      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    // L-03: standardise to 8 chars minimum across all password flows
+    if (typeof newPassword !== 'string' || newPassword.length < 8)
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
 
     const { rows } = await pool.query(
       'SELECT password FROM users WHERE id = $1', [req.user.id]

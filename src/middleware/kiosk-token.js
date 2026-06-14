@@ -16,8 +16,14 @@
 const crypto = require('crypto');
 const pool   = require('../db/pool');
 
-function sha256Hex(s) {
-  return crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+// H-05: HMAC-SHA256 prevents length-extension attacks on the token hash.
+// KIOSK_HMAC_SECRET must be set in env (minimum 32 chars).
+function hmacHex(s) {
+  const secret = process.env.KIOSK_HMAC_SECRET;
+  if (!secret || secret.length < 32) {
+    throw new Error('KIOSK_HMAC_SECRET must be set and at least 32 characters');
+  }
+  return crypto.createHmac('sha256', secret).update(s, 'utf8').digest('hex');
 }
 
 /**
@@ -42,7 +48,7 @@ async function kioskTokenMiddleware(req, res, next) {
   if (!raw.startsWith('k_') || raw.includes('.')) return next();
 
   try {
-    const hash = sha256Hex(raw);
+    const hash = hmacHex(raw);
     const { rows } = await pool.query(
       `SELECT id, branch_id, name, token_prefix
          FROM kiosk_devices
@@ -91,7 +97,7 @@ async function kioskTokenMiddleware(req, res, next) {
  */
 async function issueKioskToken({ branchId, name, createdBy }) {
   const raw    = 'k_' + crypto.randomBytes(32).toString('hex'); // 64 hex chars after prefix
-  const hash   = sha256Hex(raw);
+  const hash   = hmacHex(raw);
   const prefix = raw.slice(0, 10);
   const { rows } = await pool.query(
     `INSERT INTO kiosk_devices
@@ -114,5 +120,5 @@ module.exports = {
   kioskTokenMiddleware,
   issueKioskToken,
   revokeKioskToken,
-  _internal: { sha256Hex },
+  _internal: { hmacHex },
 };

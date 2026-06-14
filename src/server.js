@@ -44,8 +44,19 @@ app.disable('x-powered-by');
 // SECURITY
 // ────────────────────────
 app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  // H-01: strict CSP for a JSON API (no scripts/styles served here)
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc:     ["'none'"],
+      scriptSrc:      ["'none'"],
+      styleSrc:       ["'none'"],
+      imgSrc:         ["'self'"],
+      connectSrc:     ["'self'"],
+      frameAncestors: ["'none'"],
+      formAction:     ["'none'"],
+    },
+  },
+  crossOriginResourcePolicy: { policy: 'same-origin' },
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: false },
 }));
@@ -69,8 +80,8 @@ function validOrigin(origin) {
 const allowedOrigins = [
   ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(validOrigin) : []),
   validOrigin(process.env.FRONTEND_URL),
-  'http://localhost:3000',
-  'http://127.0.0.1:3000',
+  // M-04: localhost only allowed in development — not in production builds
+  ...(!isProd ? ['http://localhost:3000', 'http://127.0.0.1:3000'] : []),
 ].filter(Boolean);
 
 app.use(cors({
@@ -86,10 +97,17 @@ app.use(cors({
 }));
 
 // ────────────────────────
+// RAZORPAY WEBHOOK (raw body — must be before json middleware)
+// ────────────────────────
+// H-06: route registers its own express.raw() parser so signature can be verified
+app.use('/api/webhooks/razorpay', require('./routes/razorpay-webhook'));
+
+// ────────────────────────
 // BODY PARSING
 // ────────────────────────
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+// L-06: 100kb default — checkin routes get a higher limit for face descriptors
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use(cookieParser());
 app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads'), {
   maxAge: isProd ? '7d' : 0,
@@ -162,11 +180,23 @@ app.get('/api/health', function(req, res) {
 // ────────────────────────
 // RATE LIMITING
 // ────────────────────────
+// Global IP-based limiter (catches unauthenticated traffic)
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: isProd ? 2000 : 5000,
   standardHeaders: true,
   legacyHeaders: false,
+});
+
+// M-05: per-user limiter applied after auth so shared IPs don't block each other
+const userApiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id ?? req.ip,
+  skip: (req) => !req.user,
+  message: { error: 'Too many requests. Please slow down.' },
 });
 
 const loginLimiter = rateLimit({
@@ -211,20 +241,20 @@ app.use('/api/profile',           require('./routes/profile'));
 // /api/clients mounts two separate routers. Express resolves in registration
 // order — if both files define the same METHOD+PATH, client-actions.js will
 // be shadowed. Audit both files for overlapping routes before adding new ones.
-app.use('/api/clients',           require('./routes/clients'));
-app.use('/api/clients',           require('./routes/client-actions'));
+app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
+app.use('/api/clients',           userApiLimiter, require('./routes/client-actions'));
 
 app.use('/api/trainers',          require('./routes/trainers'));
-app.use('/api/payments',          require('./routes/payments'));
+app.use('/api/payments',          userApiLimiter, require('./routes/payments'));
 app.use('/api/attendance',        require('./routes/attendance'));
-app.use('/api/checkin',           require('./routes/checkin'));
+app.use('/api/checkin',           express.json({ limit: '50kb' }), require('./routes/checkin'));
 
 // ROUTE INTEGRITY NOTE (R-03):
 // Legacy /api/reports (routes/reports.js) and v3 /api/v1/reports
 // (modules/reports) coexist. Frontend pages must call the correct version.
 // New pages should use /api/v1/reports. Do not add endpoints to the legacy
 // router — it will be removed once all consumers are migrated.
-app.use('/api/reports',           require('./routes/reports'));
+app.use('/api/reports',           userApiLimiter, require('./routes/reports'));
 
 app.use('/api/plans',             require('./routes/plans'));
 app.use('/api/staff',             require('./routes/staff'));

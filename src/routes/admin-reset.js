@@ -1,9 +1,11 @@
 const express = require('express');
 const router  = express.Router();
+const crypto  = require('crypto');
 const pool    = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
 const logger  = require('../lib/logger');
 const { escapeIdentifier } = require('pg');
+const { sendAdminResetOtp } = require('../lib/email');
 
 const ALLOWED_TABLES = new Set([
   'attendance_logs', 'payments', 'subscriptions', 'invoices', 'outstanding_dues',
@@ -37,12 +39,61 @@ async function dropIfExists(client, tableName) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+   H-04: Two-step OTP flow for destructive admin operations.
+   Step 1 — POST /admin/initiate-reset  → emails a 6-digit OTP
+   Step 2 — POST /admin/reset-all-data  → Body: { otp: "123456" }
+══════════════════════════════════════════════════════════════════════ */
+router.post('/initiate-reset', auth, adminOnly, async (req, res) => {
+  try {
+    const action = String(req.body?.action || 'reset-all');
+    const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit
+    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    await pool.query(
+      `INSERT INTO admin_reset_intents (admin_id, action, otp_hash, expires_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (admin_id, action) DO UPDATE
+         SET otp_hash = EXCLUDED.otp_hash,
+             expires_at = EXCLUDED.expires_at,
+             created_at = NOW()`,
+      [req.user.id, action, otpHash, expiresAt],
+    );
+
+    const { rows } = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    const email = rows[0]?.email;
+    if (email) {
+      await sendAdminResetOtp(email, otp);
+    } else {
+      logger.warn({ adminId: req.user.id }, 'Admin reset OTP could not be sent — email not found');
+    }
+
+    res.json({ message: 'OTP sent to your registered email address. It expires in 10 minutes.' });
+  } catch (err) {
+    logger.error({ err: err.message }, 'initiate-reset error');
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════════════
    POST /admin/reset-all-data
-   Body: { confirm: "DELETE_ALL_619_DATA" }
+   Body: { otp: "123456" }
 ══════════════════════════════════════════════════════════════════════ */
 router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
-  if (req.body?.confirm !== 'DELETE_ALL_619_DATA') {
-    return res.status(400).json({ error: 'Missing confirmation token. Send { confirm: "DELETE_ALL_619_DATA" } in request body.' });
+  const otp = String(req.body?.otp || '');
+  if (!otp) {
+    return res.status(400).json({ error: 'OTP required. Call /admin/initiate-reset first to receive a code.' });
+  }
+  const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+  const { rows: intent } = await pool.query(
+    `DELETE FROM admin_reset_intents
+      WHERE admin_id = $1 AND action = 'reset-all'
+        AND otp_hash = $2 AND expires_at > NOW()
+      RETURNING id`,
+    [req.user.id, otpHash],
+  );
+  if (!intent.length) {
+    return res.status(400).json({ error: 'Invalid or expired OTP.' });
   }
 
   const client = await pool.connect();
@@ -90,10 +141,23 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
 
 /* ══════════════════════════════════════════════════════════════════════
    POST /admin/reset-outstanding-dues
+   Body: { otp: "123456" }  (OTP from /initiate-reset?action=reset-dues)
 ══════════════════════════════════════════════════════════════════════ */
 router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
-  if (req.body?.confirm !== 'CLEAR_DUES_619') {
-    return res.status(400).json({ error: 'Missing confirmation token. Send { confirm: "CLEAR_DUES_619" }' });
+  const otp = String(req.body?.otp || '');
+  if (!otp) {
+    return res.status(400).json({ error: 'OTP required. Call /admin/initiate-reset with action=reset-dues first.' });
+  }
+  const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+  const { rows: intent } = await pool.query(
+    `DELETE FROM admin_reset_intents
+      WHERE admin_id = $1 AND action = 'reset-dues'
+        AND otp_hash = $2 AND expires_at > NOW()
+      RETURNING id`,
+    [req.user.id, otpHash],
+  );
+  if (!intent.length) {
+    return res.status(400).json({ error: 'Invalid or expired OTP.' });
   }
   try {
     await dropIfExists(pool, 'outstanding_dues');
@@ -110,11 +174,10 @@ router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
 });
 
 
-router.post('/clear-dues-and-payments', auth, adminOnly, async (req, res) => {
-  if (req.body?.confirm !== 'CLEAR_DUES_619') {
-    return res.status(400).json({ error: 'Missing confirmation token. Send { confirm: "CLEAR_DUES_619" }' });
-  }
-  return router.handle({ ...req, url: '/reset-outstanding-dues', method: 'POST' }, res, () => {});
+// Legacy alias — delegates to reset-outstanding-dues (same OTP required)
+router.post('/clear-dues-and-payments', (req, res, next) => {
+  req.url = '/reset-outstanding-dues';
+  router.handle(req, res, next);
 });
 
 module.exports = router;

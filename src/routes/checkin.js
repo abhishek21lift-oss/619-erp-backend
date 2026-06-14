@@ -46,7 +46,8 @@ function authOrKioskForEnroll(req, res, next) {
 // ──────────────────────────────────────────────────────────────────
 // Constants
 // ──────────────────────────────────────────────────────────────────
-const RECOGNITION_THRESHOLD = 0.50;
+// M-08: tightened from 0.50 to 0.40 — reduces false-positive matches
+const RECOGNITION_THRESHOLD = 0.40;
 const DESCRIPTOR_LENGTH     = 128;
 
 // ──────────────────────────────────────────────────────────────────
@@ -430,8 +431,8 @@ router.get('/logs', auth, async (req, res, next) => {
     LEFT JOIN clients c ON c.id = l.client_id
         WHERE ${conds.join(' AND ')}
         ORDER BY l.created_at DESC
-        LIMIT ${limit}`,
-      params
+        LIMIT $${params.length + 1}`,
+      [...params, limit]
     );
     return res.json(rows);
   } catch (err) {
