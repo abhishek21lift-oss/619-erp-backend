@@ -238,6 +238,73 @@ router.post('/branding/upload-logo', auth, adminOnly, async (req, res, next) => 
   }
 });
 
+// ── GYM / BIOMETRIC SETTINGS ─────────────────────────────────────────────────
+const GYM_KEYS = [
+  'geofence_lat', 'geofence_lng', 'geofence_radius',
+  'enable_face_id', 'enable_touch_id', 'enable_gps',
+  'duplicate_window_minutes', 'auto_checkout', 'auto_checkout_minutes',
+];
+
+const GYM_DEFAULTS = {
+  geofence_lat: 19.076,
+  geofence_lng: 72.8777,
+  geofence_radius: 100,
+  enable_face_id: true,
+  enable_touch_id: true,
+  enable_gps: true,
+  duplicate_window_minutes: 60,
+  auto_checkout: false,
+  auto_checkout_minutes: 120,
+};
+
+// GET /api/settings/gym
+router.get('/gym', auth, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT key, value, type FROM system_settings WHERE key = ANY($1::text[])`,
+      [GYM_KEYS]
+    );
+    const result = { ...GYM_DEFAULTS };
+    for (const r of rows) {
+      if (r.type === 'boolean') result[r.key] = r.value === 'true';
+      else if (r.type === 'number') result[r.key] = parseFloat(r.value);
+      else result[r.key] = r.value;
+    }
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/settings/gym
+router.put('/gym', auth, adminOnly, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const allowedKeys = GYM_KEYS.filter(k => body[k] !== undefined);
+    if (!allowedKeys.length) return res.status(400).json({ error: 'No valid gym settings provided' });
+
+    for (const key of allowedKeys) {
+      const raw = body[key];
+      let strVal, type;
+      if (typeof raw === 'boolean') { strVal = raw ? 'true' : 'false'; type = 'boolean'; }
+      else if (typeof raw === 'number') { strVal = String(raw); type = 'number'; }
+      else { strVal = String(raw); type = 'string'; }
+
+      await pool.query(
+        `INSERT INTO system_settings (key, value, type, updated_by, updated_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (key) DO UPDATE SET value=$2, type=$3, updated_by=$4, updated_at=NOW()`,
+        [key, strVal, type, req.user.id]
+      );
+    }
+
+    logger.info({ userId: req.user.id, keys: allowedKeys }, 'Gym settings updated');
+    res.json({ success: true, message: 'Gym settings saved', count: allowedKeys.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/settings/feature-flags
 router.get('/feature-flags', auth, async (req, res, next) => {
   try {
