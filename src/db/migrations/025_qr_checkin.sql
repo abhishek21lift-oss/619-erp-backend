@@ -15,10 +15,18 @@ CREATE TABLE IF NOT EXISTS qr_tokens (
   last_used_at TIMESTAMPTZ
 );
 
--- Defensive: if the table existed before this migration without is_active, add it now.
-ALTER TABLE qr_tokens ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+-- Defensive: if qr_tokens existed before this migration with an incomplete schema,
+-- add any missing columns so the indexes below succeed.
+ALTER TABLE qr_tokens ADD COLUMN IF NOT EXISTS user_id     TEXT;
+ALTER TABLE qr_tokens ADD COLUMN IF NOT EXISTS user_type   TEXT NOT NULL DEFAULT 'client';
+ALTER TABLE qr_tokens ADD COLUMN IF NOT EXISTS secret      TEXT;
+ALTER TABLE qr_tokens ADD COLUMN IF NOT EXISTS is_active   BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE qr_tokens ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE qr_tokens ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
 
-CREATE UNIQUE INDEX IF NOT EXISTS qr_tokens_user_idx ON qr_tokens(user_id, user_type) WHERE is_active = TRUE;
+-- Drop+recreate the partial index in case a prior failed run left it half-built.
+DROP INDEX IF EXISTS qr_tokens_user_idx;
+CREATE UNIQUE INDEX qr_tokens_user_idx ON qr_tokens(user_id, user_type) WHERE is_active = TRUE;
 
 -- ── Expand attendance_logs ref_type ─────────────────────────────────────────
 -- Add 'staff' and 'user' as valid ref_types for non-client users.
