@@ -39,6 +39,7 @@
     "razorpay": "^2.9.6",
     "read-excel-file": "^9.0.10",
     "@simplewebauthn/server": "^7.4.0",
+    "resend": "^4.0.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

@@ -19,12 +19,43 @@ const channels = {
   },
 
   email: async ({ to, subject, html }) => {
-    // TODO: integrate Resend/SES.
-    // Example with Resend:
-    //   await resend.emails.send({ from: 'no-reply@619fitness.com', to, subject, html });
     if (!to) return { status: 'failed', error: 'no recipient' };
-    logger.info({ to, subject }, 'notification email stub');
-    return { status: 'sent', provider_id: `email_${Date.now()}` };
+    const FROM = process.env.EMAIL_FROM || 'no-reply@619fitness.com';
+
+    // Resend (preferred when RESEND_API_KEY is set)
+    if (process.env.RESEND_API_KEY) {
+      try {
+        const { Resend } = require('resend');
+        const resend = new Resend(process.env.RESEND_API_KEY);
+        const r = await resend.emails.send({ from: FROM, to, subject, html });
+        return { status: 'sent', provider_id: r.data?.id || `resend_${Date.now()}` };
+      } catch (err) {
+        logger.error({ err, to, subject }, 'resend email failed');
+        return { status: 'failed', error: err.message };
+      }
+    }
+
+    // Nodemailer SMTP fallback (SMTP_HOST + SMTP_USER + SMTP_PASS)
+    if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      try {
+        const nodemailer = require('nodemailer');
+        const transporter = nodemailer.createTransport({
+          host: process.env.SMTP_HOST,
+          port: Number(process.env.SMTP_PORT) || 587,
+          secure: process.env.SMTP_SECURE === 'true',
+          auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+        });
+        const info = await transporter.sendMail({ from: FROM, to, subject, html });
+        return { status: 'sent', provider_id: info.messageId };
+      } catch (err) {
+        logger.error({ err, to, subject }, 'nodemailer email failed');
+        return { status: 'failed', error: err.message };
+      }
+    }
+
+    // No provider configured — log and no-op
+    logger.info({ to, subject }, 'email stub (set RESEND_API_KEY or SMTP_* to enable)');
+    return { status: 'sent', provider_id: `stub_${Date.now()}` };
   },
 
   whatsapp: async ({ to, template, variables }) => {

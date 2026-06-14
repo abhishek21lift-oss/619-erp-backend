@@ -295,6 +295,10 @@ app.use('/api/diet',              require('./routes/diet'));
 app.use('/api/biometric-attend',  require('./routes/biometric-attend'));
 app.use('/api/webauthn',          require('./routes/webauthn'));
 app.use('/api/integrations',      require('./routes/integrations'));
+app.use('/api/campaigns',         require('./routes/campaigns'));
+app.use('/api/offers',            require('./routes/offers'));
+app.use('/api/feedback',          require('./routes/feedback'));
+app.use('/api/communication',     require('./routes/communication'));
 
 // ────────────────────────
 // MEMBER PORTAL ROUTES
