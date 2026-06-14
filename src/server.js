@@ -287,6 +287,7 @@ app.use('/api/modules',           require('./modules/operations/operations.route
 // ────────────────────────
 app.use('/api/calendar',          require('./routes/calendar'));
 app.use('/api/ai',               require('./routes/ai'));
+app.use('/api/qr',               require('./routes/qr-checkin'));
 app.use('/api/settings',          require('./routes/settings'));
 app.use('/api/invoices',          require('./routes/invoices'));
 app.use('/api/workouts',          require('./routes/workouts'));
