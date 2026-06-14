@@ -6,14 +6,18 @@
 -- secret without DB writes. Single-use QR burns the token on use.
 CREATE TABLE IF NOT EXISTS qr_tokens (
   id          TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  user_id     TEXT        NOT NULL,          -- users.id (members, trainers, staff)
+  user_id     TEXT        NOT NULL,
   user_type   TEXT        NOT NULL DEFAULT 'client'
               CHECK (user_type IN ('client', 'trainer', 'staff', 'user')),
-  secret      TEXT        NOT NULL,          -- random hex secret for HMAC
+  secret      TEXT        NOT NULL,
   is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_used_at TIMESTAMPTZ
 );
+
+-- Defensive: if the table existed before this migration without is_active, add it now.
+ALTER TABLE qr_tokens ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+
 CREATE UNIQUE INDEX IF NOT EXISTS qr_tokens_user_idx ON qr_tokens(user_id, user_type) WHERE is_active = TRUE;
 
 -- ── Expand attendance_logs ref_type ─────────────────────────────────────────
