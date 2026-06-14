@@ -8,7 +8,9 @@ const logger = require('./logger');
 // Reuse context-building logic from openai.js — no duplication
 const { buildMemberContext, buildSystemPrompt } = require('./openai');
 
-const MODEL = 'gemini-1.5-pro';
+// Default model — can be overridden per-request via the gemini_model param
+// passed by ai-router (which reads the value from ai_provider_settings).
+const DEFAULT_MODEL = 'gemini-2.0-flash';
 
 function getClient() {
   if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set');
@@ -20,8 +22,9 @@ function isConfigured() {
   return !!process.env.GEMINI_API_KEY;
 }
 
-async function streamChat({ userId, userRole, conversationId, message, clientId }, res) {
-  const genAI = getClient();
+async function streamChat({ userId, userRole, conversationId, message, clientId, gemini_model }, res) {
+  const modelId = gemini_model || DEFAULT_MODEL;
+  const genAI   = getClient();
 
   // Build member context and system prompt (shared logic with OpenAI)
   const ctx          = await buildMemberContext(userId, userRole, clientId);
@@ -54,7 +57,7 @@ async function streamChat({ userId, userRole, conversationId, message, clientId 
 
   try {
     const model = genAI.getGenerativeModel({
-      model: MODEL,
+      model: modelId,
       systemInstruction: systemPrompt,
     });
 
@@ -101,7 +104,7 @@ async function streamChat({ userId, userRole, conversationId, message, clientId 
              (user_id, conversation_id, model, tokens_prompt, tokens_completion, tokens_total, provider)
            VALUES ($1, $2, $3, $4, $5, $6, 'gemini')`,
           [
-            userId, conversationId, MODEL,
+            userId, conversationId, modelId,
             usage.promptTokenCount      || 0,
             usage.candidatesTokenCount  || 0,
             usage.totalTokenCount       || 0,
@@ -111,7 +114,7 @@ async function streamChat({ userId, userRole, conversationId, message, clientId 
     } catch (_) { /* usage logging is non-critical */ }
 
   } catch (err) {
-    logger.error({ err: err.message, userId }, 'Gemini streaming error');
+    logger.error({ err: err.message, userId, modelId }, 'Gemini streaming error');
     if (!res.headersSent) {
       res.status(500).json({ error: 'AI service error. Please try again.' });
     } else {
@@ -121,4 +124,4 @@ async function streamChat({ userId, userRole, conversationId, message, clientId 
   }
 }
 
-module.exports = { isConfigured, streamChat };
+module.exports = { isConfigured, streamChat, DEFAULT_MODEL };

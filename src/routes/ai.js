@@ -143,10 +143,10 @@ router.get('/provider-settings', auth, adminOnly, async (req, res) => {
 // ── PUT /api/ai/provider-settings  (admin only) ───────────────────────────────
 router.put('/provider-settings', auth, adminOnly, async (req, res) => {
   try {
-    const { mode } = req.body;
-    if (!mode) return res.status(400).json({ error: 'mode is required' });
-    await aiRouter.updateSettings(mode);
-    res.json({ message: 'Provider settings updated', mode });
+    const { mode, gemini_model } = req.body;
+    if (!mode && !gemini_model) return res.status(400).json({ error: 'mode or gemini_model is required' });
+    await aiRouter.updateSettings({ mode, gemini_model });
+    res.json({ message: 'Provider settings updated', mode, gemini_model });
   } catch (err) {
     if (err.status === 400) return res.status(400).json({ error: err.message });
     logger.error({ err: err.message }, 'Update provider settings error');
