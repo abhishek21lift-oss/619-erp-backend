@@ -40,7 +40,8 @@
     "read-excel-file": "^9.0.10",
     "@simplewebauthn/server": "^7.4.0",
     "resend": "^4.0.0",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "@google/generative-ai": "^0.24.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
