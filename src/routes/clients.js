@@ -29,6 +29,10 @@ async function maybeAutoExpire() {
       `UPDATE clients SET status='expired', updated_at=NOW()
        WHERE status='active' AND pt_end_date < CURRENT_DATE`
     );
+    await pool.query(
+      `UPDATE pt_clients SET status='expired', updated_at=NOW()
+       WHERE status='active' AND pt_end_date < CURRENT_DATE AND deleted_at IS NULL`
+    );
   } catch (err) {
     logger.warn({ err: err.message }, 'Auto-expire error');
   }

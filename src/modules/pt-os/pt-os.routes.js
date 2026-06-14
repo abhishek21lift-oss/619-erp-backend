@@ -45,12 +45,19 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(`
     SELECT c.*,
            (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
+           COALESCE(pp.total_incentives, 0) AS total_earned_commission,
            CASE
              WHEN c.balance_amount > 0 AND NULLIF(c.pt_end_date, '')::DATE < CURRENT_DATE THEN 'OVERDUE'
              WHEN c.balance_amount > 0 THEN 'DUE'
              ELSE 'CLEAR'
            END AS due_status
     FROM pt_clients c
+    LEFT JOIN (
+      SELECT client_id, SUM(incentive_amt) AS total_incentives
+      FROM pt_payments
+      WHERE deleted_at IS NULL
+      GROUP BY client_id
+    ) pp ON pp.client_id = c.id
     WHERE c.id = $1 AND c.deleted_at IS NULL
   `, [req.params.id]);
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
@@ -137,6 +144,58 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
     logger.error({ err: err.message, body: req.body, user: req.user?.id }, 'PT OS create client failed');
     throw err;
   }
+}));
+
+// ─── Renew PT client ────────────────────────────────────────
+router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
+  const d = req.body;
+  if (!d.pt_start_date || !d.duration_months)
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'pt_start_date and duration_months are required' } });
+
+  const endDate = new Date(d.pt_start_date);
+  endDate.setMonth(endDate.getMonth() + Number(d.duration_months));
+  const ptEndDate = endDate.toISOString().slice(0, 10);
+
+  const baseAmt = Number(d.base_amount) || 0;
+  const disc = Number(d.discount) || 0;
+  const finalAmt = baseAmt - disc;
+  const monthlyAmt = Number(d.monthly_pt_amount) || 0;
+
+  const { rows: existing } = await pool.query(
+    'SELECT * FROM pt_clients WHERE id = $1 AND deleted_at IS NULL FOR UPDATE',
+    [req.params.id]
+  );
+  if (existing.length === 0)
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  const c = existing[0];
+
+  const { rows } = await pool.query(`
+    UPDATE pt_clients SET
+      base_amount = $2,
+      discount = $3,
+      final_amount = $4,
+      monthly_pt_amount = $5,
+      pt_start_date = $6,
+      pt_end_date = $7,
+      duration_months = $8,
+      balance_amount = GREATEST($4 - paid_amount, 0),
+      status = 'active',
+      updated_at = NOW()
+    WHERE id = $1 AND deleted_at IS NULL
+    RETURNING *
+  `, [req.params.id, baseAmt, disc, finalAmt, monthlyAmt, d.pt_start_date, ptEndDate, d.duration_months]);
+
+  // record renewal in renewals table for audit trail
+  await pool.query(`
+    INSERT INTO renewals (id, client_id, client_name, trainer_id, trainer_name,
+      old_package, new_package, old_end_date, new_end_date, amount, paid_amount,
+      payment_method, renewed_on, notes, action_type)
+    VALUES (gen_random_uuid()::TEXT, $1, $2, $3, $4, $5, $6, $7, $8, $9, 0, 'PT_RENEWAL', CURRENT_DATE, $10, 'pt_renew')
+  `, [req.params.id, c.name, c.trainer_id, c.trainer_name,
+       c.package_type, c.package_type, c.pt_end_date, ptEndDate,
+       finalAmt, d.notes || null]);
+
+  res.json({ data: rows[0] });
 }));
 
 // ─── Update PT client ───────────────────────────────────────

@@ -90,8 +90,15 @@ async function getBalanceSheet(trainerId) {
              WHEN c.balance_amount > 0 THEN 'DUE'
              ELSE 'CLEAR'
            END AS due_status,
-           c.monthly_pt_amount, c.trainer_commission
+            c.monthly_pt_amount, c.trainer_commission,
+            COALESCE(pp.total_incentives, 0) AS total_earned_commission
     FROM pt_clients c
+    LEFT JOIN (
+      SELECT client_id, SUM(incentive_amt) AS total_incentives
+      FROM pt_payments
+      WHERE deleted_at IS NULL
+      GROUP BY client_id
+    ) pp ON pp.client_id = c.id
     WHERE c.deleted_at IS NULL AND c.balance_amount > 0
       ${whereSql}
     ORDER BY c.balance_amount DESC
@@ -114,8 +121,15 @@ async function getActiveClients(trainerId) {
            c.paid_amount, c.balance_amount, c.joining_date,
            c.duration_months, c.pt_start_date, c.pt_end_date,
            (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
-           c.status, c.monthly_pt_amount, c.trainer_commission
+           c.status, c.monthly_pt_amount, c.trainer_commission,
+           COALESCE(pp.total_incentives, 0) AS total_earned_commission
     FROM pt_clients c
+    LEFT JOIN (
+      SELECT client_id, SUM(incentive_amt) AS total_incentives
+      FROM pt_payments
+      WHERE deleted_at IS NULL
+      GROUP BY client_id
+    ) pp ON pp.client_id = c.id
     WHERE ${where.join(' AND ')}
     ORDER BY c.name
   `, params);
