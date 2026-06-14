@@ -216,8 +216,10 @@ const registerLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-app.use('/api/auth/login',        loginLimiter);
-app.use('/api/v1/auth/login',     loginLimiter);
+app.use('/api/auth/login',          loginLimiter);
+app.use('/api/v1/auth/login',       loginLimiter);
+app.use('/api/auth/google-login',   loginLimiter);
+app.use('/api/v1/auth/google-login',loginLimiter);
 app.use('/api/v1/auth/forgot-password', registerLimiter);
 app.use('/api/v1/auth/reset-password',  registerLimiter);
 app.use('/api/auth/create-user', registerLimiter);
@@ -234,7 +236,9 @@ app.use('/api/auth/reset-password',  registerLimiter);
 // /api/v1/auth exists for legacy mobile app callers. Any changes to auth
 // behaviour must be tested against both URL prefixes.
 app.use('/api/auth',              require('./routes/auth'));
+app.use('/api/auth',              require('./routes/auth-google'));
 app.use('/api/v1/auth',           require('./routes/auth'));
+app.use('/api/v1/auth',           require('./routes/auth-google'));
 app.use('/api/profile',           require('./routes/profile'));
 
 // ROUTE INTEGRITY NOTE (R-02):
