@@ -1,7 +1,7 @@
 'use strict';
 const express = require('express');
 const crypto  = require('crypto');
-const { pool } = require('../db');
+const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 
 const router = express.Router();
