@@ -37,7 +37,10 @@ router.get('/auth-url', auth, (req, res) => {
   );
 
   const url = cal.generateAuthUrl(stateToken);
-  res.json({ url });
+  // Log the redirect_uri so mismatches are easy to diagnose in Render logs
+  const redirectUri = process.env.GOOGLE_CALENDAR_REDIRECT_URI;
+  logger.info({ redirectUri }, 'Google Calendar: generated auth URL');
+  res.json({ url, _debug_redirect_uri: redirectUri });
 });
 
 // ── GET /api/calendar/callback ────────────────────────────────────────────────
