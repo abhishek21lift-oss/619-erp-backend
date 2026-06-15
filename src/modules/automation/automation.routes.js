@@ -154,4 +154,10 @@ router.patch('/pt-packages/:id', auth, requireRole('admin'), wrap(async (req, re
   res.json({ data: rows[0] });
 }));
 
+router.delete('/pt-packages/:id', auth, requireRole('admin'), wrap(async (req, res) => {
+  const { rows } = await pool.query('DELETE FROM pt_packages WHERE id = $1 RETURNING id', [req.params.id]);
+  if (!rows.length) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  res.json({ data: { id: rows[0].id } });
+}));
+
 module.exports = router;

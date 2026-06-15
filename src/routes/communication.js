@@ -46,8 +46,21 @@ router.post('/send', async (req, res, next) => {
       if (audience === 'all' || !audience) {
         const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'active'");
         recipientCount = Number(r.rows[0].count);
+      } else if (audience === 'expiring') {
+        const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'active' AND expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'");
+        recipientCount = Number(r.rows[0].count);
+      } else if (audience === 'dues') {
+        const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'active' AND balance_due > 0");
+        recipientCount = Number(r.rows[0].count);
+      } else if (audience === 'pt') {
+        const r = await pool.query("SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active'");
+        recipientCount = Number(r.rows[0].count);
+      } else if (audience === 'expired') {
+        const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'expired'");
+        recipientCount = Number(r.rows[0].count);
       } else {
-        recipientCount = 0;
+        const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'active'");
+        recipientCount = Number(r.rows[0].count);
       }
     }
 

@@ -61,16 +61,16 @@ router.get('/:id', async (req, res, next) => {
 // POST /api/campaigns — accepts frontend field names (channel/goal/start) or backend names (type/subject/scheduled_at)
 router.post('/', async (req, res, next) => {
   try {
-    const { name, type, channel, audience, subject, goal, body, scheduled_at, start, status } = req.body;
+    const { name, type, channel, audience, subject, goal, body, scheduled_at, start, end, sent_at, status } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
     const result = await pool.query(
-      `INSERT INTO campaigns (name, type, audience, subject, body, scheduled_at, status, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO campaigns (name, type, audience, subject, body, scheduled_at, sent_at, status, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING id, name, status, audience,
                  type AS channel, subject AS goal, scheduled_at AS start,
                  sent_at AS end, sent_count AS sent, open_count AS opened,
                  conversions AS converted, created_at`,
-      [name, type || channel || 'email', audience || 'all', subject || goal || null, body || null, scheduled_at || start || null, status || 'draft', req.user?.id]
+      [name, type || channel || 'email', audience || 'all', subject || goal || null, body || null, scheduled_at || start || null, sent_at || end || null, status || 'draft', req.user?.id]
     );
     res.status(201).json({ campaign: result.rows[0] });
   } catch (err) { next(err); }
