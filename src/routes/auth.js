@@ -278,6 +278,35 @@ router.get('/users', auth, adminOnly, async (req, res) => {
   }
 });
 
+// PUT /api/auth/users/:id (admin only) — update name, email, role, status
+router.put('/users/:id', auth, adminOnly, async (req, res) => {
+  if (req.params.id === req.user.id && req.body.role && req.body.role !== req.user.role)
+    return res.status(400).json({ error: 'Cannot change your own role' });
+  try {
+    const allowed = ['name', 'email', 'role', 'status'];
+    const updates = [];
+    const vals = [];
+    let idx = 1;
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) {
+        updates.push(`${key} = $${idx++}`);
+        vals.push(req.body[key]);
+      }
+    }
+    if (!updates.length) return res.status(400).json({ error: 'No fields to update' });
+    vals.push(req.params.id);
+    const { rows } = await pool.query(
+      `UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${idx} AND deleted_at IS NULL RETURNING id, name, email, role`,
+      vals
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    invalidateUserCache(req.params.id);
+    res.json({ message: 'Updated', user: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // PUT /api/auth/users/:id/toggle  (admin only)
 router.put('/users/:id/toggle', auth, adminOnly, async (req, res) => {
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot disable yourself' });

@@ -394,6 +394,18 @@ router.post('/commissions/calculate', auth, adminOnly, wrap(async (req, res) => 
   res.json({ data: result });
 }));
 
+// Update trainer commission rate
+router.put('/commissions/:trainerId', auth, adminOnly, wrap(async (req, res) => {
+  const { commission_pct } = req.body;
+  if (commission_pct !== undefined) {
+    await pool.query(
+      'UPDATE pt_trainers SET incentive_rate = $1, updated_at = NOW() WHERE id = $2',
+      [Number(commission_pct), req.params.trainerId]
+    );
+  }
+  res.json({ data: { success: true } });
+}));
+
 // ─── Payouts ────────────────────────────────────────────────
 router.get('/payouts', auth, wrap(async (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
@@ -405,6 +417,42 @@ router.post('/payouts', auth, adminOnly, wrap(async (req, res) => {
   const { trainer_id, month, deductions } = req.body;
   const payout = await svc.createPayout(trainer_id, month, deductions || 0, req.user.id);
   res.status(201).json({ data: payout });
+}));
+
+// Mark all pending payouts for a month as paid (MUST be before /:id/approve)
+router.post('/payouts/mark-all-paid', auth, adminOnly, wrap(async (req, res) => {
+  const month = req.body.month || new Date().toISOString().slice(0, 7);
+  const monthStart = `${month}-01`;
+  const { rowCount } = await pool.query(
+    `UPDATE pt_payouts SET status = 'paid', paid_at = NOW(), updated_at = NOW()
+     WHERE month = $1 AND status != 'paid'`,
+    [monthStart]
+  );
+  res.json({ data: { updated: rowCount } });
+}));
+
+// Update payout status/amount for a specific trainer
+router.put('/payouts/:trainerId', auth, adminOnly, wrap(async (req, res) => {
+  const { payout_status, paid_amount } = req.body;
+  const month = req.query.month || req.body.month || new Date().toISOString().slice(0, 7);
+  const monthStart = `${month}-01`;
+  const setParts = [];
+  const vals = [];
+  let idx = 1;
+  if (payout_status !== undefined) {
+    setParts.push(`status = $${idx++}`);
+    vals.push(payout_status);
+    if (payout_status === 'paid') setParts.push(`paid_at = NOW()`);
+  }
+  if (paid_amount !== undefined) { setParts.push(`net_amount = $${idx++}`); vals.push(Number(paid_amount)); }
+  if (setParts.length) {
+    vals.push(req.params.trainerId, monthStart);
+    await pool.query(
+      `UPDATE pt_payouts SET ${setParts.join(', ')}, updated_at = NOW() WHERE trainer_id = $${idx} AND month = $${idx + 1}`,
+      vals
+    );
+  }
+  res.json({ data: { success: true } });
 }));
 
 router.post('/payouts/:id/approve', auth, adminOnly, wrap(async (req, res) => {
