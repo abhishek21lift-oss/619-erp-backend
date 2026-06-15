@@ -466,4 +466,191 @@ router.post('/payments', auth, wrap(async (req, res) => {
   res.status(201).json({ data: rows[0] });
 }));
 
+// ─── Duplicate Client Audit ─────────────────────────────────
+router.get('/clients/duplicates', auth, adminOnly, wrap(async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT
+      TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g'))) AS normalized_name,
+      (ARRAY_AGG(name ORDER BY created_at ASC))[1] AS display_name,
+      COUNT(*)::int AS record_count,
+      MIN(created_at)::date AS first_seen,
+      ARRAY_AGG(pt_start_date ORDER BY pt_start_date NULLS LAST)
+        FILTER (WHERE pt_start_date IS NOT NULL) AS subscription_starts,
+      SUM(final_amount)::numeric AS total_final,
+      SUM(paid_amount)::numeric  AS total_paid,
+      GREATEST(0, SUM(final_amount) - SUM(paid_amount))::numeric AS balance,
+      (ARRAY_AGG(id ORDER BY created_at ASC))[1] AS master_id,
+      ARRAY_AGG(id ORDER BY created_at ASC) AS all_ids,
+      (ARRAY_AGG(mobile ORDER BY created_at ASC NULLS LAST)
+        FILTER (WHERE mobile IS NOT NULL AND mobile != ''))[1] AS mobile,
+      (ARRAY_AGG(package_type ORDER BY pt_start_date DESC NULLS LAST)
+        FILTER (WHERE package_type IS NOT NULL))[1] AS latest_plan,
+      (ARRAY_AGG(trainer_name ORDER BY pt_start_date DESC NULLS LAST)
+        FILTER (WHERE trainer_name IS NOT NULL))[1] AS trainer_name
+    FROM pt_clients
+    WHERE deleted_at IS NULL
+    GROUP BY TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
+    HAVING COUNT(*) > 1
+    ORDER BY COUNT(*) DESC, normalized_name
+  `);
+  res.json({
+    data: rows,
+    total_groups: rows.length,
+    total_records: rows.reduce((s, r) => s + r.record_count, 0),
+    total_duplicates: rows.reduce((s, r) => s + r.record_count - 1, 0),
+    total_financial_value: rows.reduce((s, r) => s + Number(r.total_final), 0),
+  });
+}));
+
+// ─── Execute Duplicate Merge ─────────────────────────────────
+router.post('/clients/merge-duplicates', auth, adminOnly, wrap(async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Ensure backup table exists and snapshot affected records
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pt_clients_merge_backup (
+        LIKE pt_clients INCLUDING ALL,
+        backed_up_at TIMESTAMPTZ DEFAULT NOW(),
+        merge_run TEXT
+      )
+    `);
+    const mergeRun = new Date().toISOString();
+    await client.query(`
+      INSERT INTO pt_clients_merge_backup
+        SELECT *, NOW(), $1 FROM pt_clients
+        WHERE deleted_at IS NULL
+          AND TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g'))) IN (
+            SELECT TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
+            FROM pt_clients WHERE deleted_at IS NULL
+            GROUP BY TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
+            HAVING COUNT(*) > 1
+          )
+    `, [mergeRun]);
+
+    // 2. Ensure merge log table exists
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pt_clients_merge_log (
+        id            SERIAL PRIMARY KEY,
+        run_id        TEXT,
+        run_at        TIMESTAMPTZ DEFAULT NOW(),
+        master_id     TEXT,
+        merged_ids    TEXT[],
+        normalized_name TEXT,
+        record_count  INT,
+        subs_merged   INT,
+        total_final   NUMERIC,
+        total_paid    NUMERIC,
+        balance       NUMERIC
+      )
+    `);
+
+    // 3. Fetch all duplicate groups in one shot
+    const { rows: groups } = await client.query(`
+      SELECT
+        TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g'))) AS norm,
+        ARRAY_AGG(id ORDER BY created_at ASC) AS all_ids,
+        COUNT(*)::int AS cnt,
+        SUM(final_amount)  AS total_final,
+        SUM(paid_amount)   AS total_paid,
+        SUM(base_amount)   AS total_base,
+        GREATEST(0, SUM(final_amount) - SUM(paid_amount)) AS balance
+      FROM pt_clients WHERE deleted_at IS NULL
+      GROUP BY TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
+      HAVING COUNT(*) > 1
+    `);
+
+    const results = [];
+
+    // Tables that may hold references to pt_clients.id via client_id
+    const refTables = [
+      'pt_payments','pt_sessions','pt_commissions',
+      'pt_assessments','pt_goals','weekly_checkins',
+      'workout_assignments','diet_assignments','session_balance',
+      'strength_logs','progress_photos','weight_logs',
+      'pt_os_measurements','pt_os_sessions','pt_os_payments',
+      'pt_os_assignments','pt_os_ai_insights','pt_os_coaching_events',
+      'trial_sessions','churn_risk_log','client_notifications','follow_ups',
+      'client_documents','client_fitness_profiles','nutrition_logs',
+      'face_checkin_logs','face_descriptors',
+    ];
+
+    for (const grp of groups) {
+      const masterId = grp.all_ids[0];
+      const dupIds   = grp.all_ids.slice(1);
+
+      // Update master: aggregate financials + latest subscription info
+      await client.query(`
+        UPDATE pt_clients SET
+          final_amount    = $1,
+          paid_amount     = $2,
+          base_amount     = $3,
+          balance_amount  = GREATEST(0, $1 - $2),
+          pt_start_date   = (SELECT pt_start_date  FROM pt_clients WHERE id = ANY($4) AND pt_start_date IS NOT NULL ORDER BY pt_start_date DESC NULLS LAST LIMIT 1),
+          pt_end_date     = (SELECT pt_end_date    FROM pt_clients WHERE id = ANY($4) AND pt_start_date IS NOT NULL ORDER BY pt_start_date DESC NULLS LAST LIMIT 1),
+          duration_months = (SELECT duration_months FROM pt_clients WHERE id = ANY($4) AND pt_start_date IS NOT NULL ORDER BY pt_start_date DESC NULLS LAST LIMIT 1),
+          package_type    = (SELECT package_type   FROM pt_clients WHERE id = ANY($4) AND package_type IS NOT NULL ORDER BY COALESCE(pt_start_date,'1970-01-01') DESC LIMIT 1),
+          monthly_pt_amount = (SELECT monthly_pt_amount FROM pt_clients WHERE id = ANY($4) AND pt_start_date IS NOT NULL ORDER BY pt_start_date DESC NULLS LAST LIMIT 1),
+          trainer_name    = (SELECT trainer_name   FROM pt_clients WHERE id = ANY($4) AND trainer_name IS NOT NULL ORDER BY COALESCE(pt_start_date,'1970-01-01') DESC LIMIT 1),
+          mobile          = COALESCE((SELECT mobile  FROM pt_clients WHERE id = ANY($4) AND mobile IS NOT NULL AND mobile != '' ORDER BY updated_at DESC LIMIT 1), mobile),
+          email           = COALESCE((SELECT email   FROM pt_clients WHERE id = ANY($4) AND email  IS NOT NULL ORDER BY updated_at DESC LIMIT 1), email),
+          address         = COALESCE((SELECT address FROM pt_clients WHERE id = ANY($4) AND address IS NOT NULL ORDER BY updated_at DESC LIMIT 1), address),
+          notes           = COALESCE((SELECT notes   FROM pt_clients WHERE id = ANY($4) AND notes  IS NOT NULL ORDER BY updated_at DESC LIMIT 1), notes),
+          joining_date    = (SELECT MIN(joining_date) FROM pt_clients WHERE id = ANY($4) AND joining_date IS NOT NULL),
+          updated_at      = NOW()
+        WHERE id = $5 AND deleted_at IS NULL
+      `, [grp.total_final, grp.total_paid, grp.total_base, grp.all_ids, masterId]);
+
+      // Re-point all related records to master
+      for (const tbl of refTables) {
+        await client.query(
+          `UPDATE ${tbl} SET client_id = $1 WHERE client_id = ANY($2)`,
+          [masterId, dupIds]
+        );
+      }
+
+      // Soft-delete duplicates
+      await client.query(
+        `UPDATE pt_clients SET deleted_at = NOW(), updated_at = NOW() WHERE id = ANY($1)`,
+        [dupIds]
+      );
+
+      // Log this merge
+      await client.query(`
+        INSERT INTO pt_clients_merge_log
+          (run_id, master_id, merged_ids, normalized_name, record_count, subs_merged, total_final, total_paid, balance)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `, [mergeRun, masterId, dupIds, grp.norm, grp.cnt, grp.cnt - 1,
+          grp.total_final, grp.total_paid, grp.balance]);
+
+      results.push({
+        name: grp.norm,
+        master_id: masterId,
+        merged_count: dupIds.length,
+        total_final: Number(grp.total_final),
+        total_paid: Number(grp.total_paid),
+        balance: Number(grp.balance),
+      });
+    }
+
+    await client.query('COMMIT');
+
+    logger.info(`[merge-duplicates] run_id=${mergeRun} groups=${results.length} records_removed=${results.reduce((s,r)=>s+r.merged_count,0)}`);
+    res.json({
+      success: true,
+      run_id: mergeRun,
+      merged_groups: results.length,
+      records_removed: results.reduce((s, r) => s + r.merged_count, 0),
+      results,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    logger.error('[merge-duplicates] error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+}));
+
 module.exports = router;
