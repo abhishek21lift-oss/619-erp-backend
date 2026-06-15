@@ -337,6 +337,18 @@ router.get('/clients/:id/communication', auth, wrap(async (req, res) => {
   res.json({ data: rows, total: rows.length });
 }));
 
+// ─── Subscription history ───────────────────────────────────
+router.get('/clients/:id/subscriptions', auth, wrap(async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT id, plan_name, start_date, end_date, duration_months,
+           selling_price, amount_paid, balance_amount, trainer_name, status, source, created_at
+    FROM pt_client_subscriptions
+    WHERE client_id = $1
+    ORDER BY start_date ASC NULLS LAST, created_at ASC
+  `, [req.params.id]);
+  res.json({ data: rows, total: rows.length });
+}));
+
 // ─── Balance sheet ──────────────────────────────────────────
 router.get('/balance-sheet', auth, wrap(async (req, res) => {
   const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : req.query.trainer_id;

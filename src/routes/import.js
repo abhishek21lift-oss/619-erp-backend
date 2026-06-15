@@ -286,4 +286,149 @@ async function _handleImport(req, res) {
   res.json({ imported, skipped, total: rawRows.length, errors: errors.slice(0, 50) });
 }
 
+/* ──────────────────────────────────────────────
+   POST /import/smart-import
+   Body: JSON { clients: [ { name, mobile, gender, trainer_name, joining_date,
+                              subscriptions: [ { plan_name, start_date, end_date,
+                                duration_months, selling_price, amount_paid,
+                                balance_amount, trainer_name, status } ] } ] }
+   Smart dedup: one pt_clients row per unique phone, all subs → pt_client_subscriptions.
+   Returns: { clients_created, clients_updated, subscriptions_created, review, errors }
+────────────────────────────────────────────── */
+router.post('/smart-import', auth, adminOnly, async (req, res) => {
+  try { return await _handleSmartImport(req, res); }
+  catch (err) { return res.status(500).json({ error: err?.message || 'Smart import failed' }); }
+});
+
+async function _handleSmartImport(req, res) {
+  const { clients } = req.body || {};
+  if (!Array.isArray(clients) || !clients.length)
+    return res.status(400).json({ error: 'No client data provided.' });
+
+  const { randomUUID } = require('crypto');
+  let clients_created = 0, clients_updated = 0, subscriptions_created = 0;
+  const errors = [];
+  const review = [];
+
+  for (const c of clients) {
+    try {
+      const mobile = c.mobile ? String(c.mobile).replace(/\D/g, '').slice(-10) : null;
+      const name   = (c.name || '').trim();
+      if (!name) { errors.push({ name: '(blank)', issue: 'Missing name' }); continue; }
+
+      // Determine earliest start date for joining_date
+      const allDates = (c.subscriptions || []).map(s => s.start_date).filter(Boolean).sort();
+      const joiningDate = c.joining_date || allDates[0] || new Date().toISOString().slice(0, 10);
+
+      // Latest subscription drives current profile fields
+      const subs = (c.subscriptions || []).slice().sort((a, b) =>
+        (b.start_date || '').localeCompare(a.start_date || ''));
+      const latest = subs[0] || {};
+
+      // Compute status from latest sub's end_date
+      const status = latest.end_date && new Date(latest.end_date) < new Date()
+        ? 'expired' : 'active';
+
+      let clientId;
+
+      // Try match by mobile first, then by name
+      let existing = null;
+      if (mobile) {
+        const { rows } = await pool.query(
+          'SELECT id FROM pt_clients WHERE mobile = $1 AND deleted_at IS NULL LIMIT 1',
+          [mobile]
+        );
+        existing = rows[0] || null;
+      }
+      if (!existing) {
+        const { rows } = await pool.query(
+          `SELECT id FROM pt_clients WHERE UPPER(TRIM(name)) = $1 AND deleted_at IS NULL LIMIT 1`,
+          [name.toUpperCase()]
+        );
+        existing = rows[0] || null;
+      }
+
+      if (existing) {
+        clientId = existing.id;
+        // Update master profile with latest info
+        await pool.query(`
+          UPDATE pt_clients SET
+            name          = $1,
+            mobile        = COALESCE($2, mobile),
+            gender        = COALESCE($3, gender),
+            trainer_name  = COALESCE($4, trainer_name),
+            pt_start_date = COALESCE($5, pt_start_date),
+            pt_end_date   = COALESCE($6, pt_end_date),
+            duration_months = COALESCE($7, duration_months),
+            package_type  = COALESCE($8, package_type),
+            base_amount   = CASE WHEN $9 > 0 THEN $9 ELSE base_amount END,
+            final_amount  = CASE WHEN $10 > 0 THEN $10 ELSE final_amount END,
+            paid_amount   = CASE WHEN $11 > 0 THEN $11 ELSE paid_amount END,
+            balance_amount= CASE WHEN $12 >= 0 THEN $12 ELSE balance_amount END,
+            status        = $13,
+            updated_at    = NOW()
+          WHERE id = $14`,
+          [name, mobile || null, c.gender || null, latest.trainer_name || null,
+           latest.start_date || null, latest.end_date || null,
+           latest.duration_months || null, latest.plan_name || null,
+           parseFloat(latest.selling_price) || 0, parseFloat(latest.selling_price) || 0,
+           parseFloat(latest.amount_paid) || 0, parseFloat(latest.balance_amount) || 0,
+           status, clientId]
+        );
+        clients_updated++;
+      } else {
+        clientId = randomUUID();
+        await pool.query(`
+          INSERT INTO pt_clients
+            (id, name, mobile, gender, trainer_name, joining_date,
+             pt_start_date, pt_end_date, duration_months, package_type,
+             base_amount, final_amount, paid_amount, balance_amount, status)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          [clientId, name, mobile || null, c.gender || null,
+           latest.trainer_name || null, joiningDate,
+           latest.start_date || null, latest.end_date || null,
+           latest.duration_months || null, latest.plan_name || null,
+           parseFloat(latest.selling_price) || 0, parseFloat(latest.selling_price) || 0,
+           parseFloat(latest.amount_paid) || 0, parseFloat(latest.balance_amount) || 0,
+           status]
+        );
+        clients_created++;
+      }
+
+      if (c.needs_review) review.push({ name, mobile, reason: c.review_reason || 'Name conflict' });
+
+      // Insert all subscriptions
+      for (const s of (c.subscriptions || [])) {
+        const sellingPrice = parseFloat(s.selling_price) || 0;
+        const amtPaid      = parseFloat(s.amount_paid) || 0;
+        const balance      = parseFloat(s.balance_amount) ?? Math.max(sellingPrice - amtPaid, 0);
+        const subStatus    = s.end_date && new Date(s.end_date) < new Date() ? 'expired' : 'active';
+
+        await pool.query(`
+          INSERT INTO pt_client_subscriptions
+            (id, client_id, plan_name, start_date, end_date, duration_months,
+             selling_price, amount_paid, balance_amount, trainer_name, status, source)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'import')`,
+          [randomUUID(), clientId,
+           s.plan_name || null, s.start_date || null, s.end_date || null,
+           s.duration_months || null, sellingPrice, amtPaid, balance,
+           s.trainer_name || null, subStatus]
+        );
+        subscriptions_created++;
+      }
+    } catch (err) {
+      errors.push({ name: c.name || '?', issue: err.message });
+    }
+  }
+
+  res.json({
+    clients_created,
+    clients_updated,
+    subscriptions_created,
+    total_clients: clients.length,
+    review,
+    errors: errors.slice(0, 50),
+  });
+}
+
 module.exports = router;
