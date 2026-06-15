@@ -145,18 +145,20 @@ router.post('/biometric', auth, biometricLimiter, async (req, res, next) => {
 
     const now = new Date();
     const date = now.toISOString().split('T')[0];
+    const isLate = now.getHours() >= 10;
+    const status = isLate ? 'late' : 'present';
     const id = randomUUID();
 
     await pool.query(`
       INSERT INTO attendance_logs
         (id, ref_id, ref_type, ref_name, date, check_in_time, status, notes, method, marked_by)
-      VALUES ($1,$2,$3,$4,$5,NOW(),'present','biometric','biometric',$6)
+      VALUES ($1,$2,$3,$4,$5,NOW(),$6,'biometric','biometric',$7)
       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
-        SET status='present',
+        SET status=$6,
             check_in_time=COALESCE(attendance_logs.check_in_time, NOW()),
             notes='biometric',
             method='biometric'`,
-      [id, person.id, type, person.name, req.user.id]
+      [id, person.id, type, person.name, date, status, req.user.id]
     );
 
     const { rows } = await pool.query(
