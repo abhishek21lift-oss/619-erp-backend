@@ -209,7 +209,7 @@ router.post('/import-excel', auth, adminOnly, upload.single('file'), async (req,
           VALUES (gen_random_uuid()::TEXT, $1, $2, $3, $4, $5, $6, $7, $8,
                   $9, $10, $11, $12, $13, $14,
                   $15, $16, $17, $18, $19, $20)
-          ON CONFLICT (mobile) DO UPDATE SET
+          ON CONFLICT (mobile) WHERE mobile IS NOT NULL AND mobile != '' DO UPDATE SET
             name            = EXCLUDED.name,
             email           = COALESCE(EXCLUDED.email, clients.email),
             dob             = COALESCE(EXCLUDED.dob, clients.dob),
