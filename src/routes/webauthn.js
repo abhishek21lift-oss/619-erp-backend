@@ -89,7 +89,7 @@ router.get('/register/begin', auth, async (req, res, next) => {
     const options = await generateRegistrationOptions({
       rpName: RP_NAME,
       rpID: RP_ID,
-      userID: member.id,
+      userID: Buffer.from(member.id, 'utf8'),
       userName: member.email || member.name,
       userDisplayName: member.name,
       attestationType: 'none',
