@@ -106,7 +106,8 @@ async function _handleImport(req, res) {
     address:      ['address','addr','location'],
     joining_date: ['joining_date','join_date','joined','start_date','enrollment_date','date_of_joining'],
     plan:         ['plan','package','membership','membership_plan','membership_type','plan_name','subscription_plan'],
-    amount_paid:  ['amount_paid','amount','fee','fees','payment','paid','selling_price','sale_price','final_amount','total_amount'],
+    final_amount: ['final_amount','total_amount','total','selling_price','sale_price','total_fee','total_fees'],
+    amount_paid:  ['amount_paid','amount','fee','fees','payment','paid','collected','amount_collected'],
     trainer:      ['trainer','trainer_name','coach','assigned_trainer','select_trainer'],
     notes:        ['notes','note','remarks','comment','primary_fitness_goal','fitness_goal','goal','interested_in'],
     weight:       ['weight','weight_kg'],
@@ -180,8 +181,10 @@ async function _handleImport(req, res) {
 
     if (!name) { skipped++; errors.push({ row: i + 2, issue: 'Missing name' }); continue; }
 
-    const startDate = fmt_date(get(row, 'joining_date'));
-    const paidAmt   = parseFloat(get(row, 'amount_paid')) || 0;
+    const startDate  = fmt_date(get(row, 'joining_date'));
+    const rawFinal   = parseFloat(get(row, 'final_amount')) || 0;
+    const paidAmt    = parseFloat(get(row, 'amount_paid')) || 0;
+    const finalAmt   = rawFinal || paidAmt; // if no separate final column, fall back to paid
 
     const c = {
       name,
@@ -194,7 +197,7 @@ async function _handleImport(req, res) {
       pt_start_date: startDate || null,
       package_type:  get(row, 'plan') || null,
       paid_amount:   paidAmt,
-      final_amount:  paidAmt,
+      final_amount:  finalAmt,
       trainer_name:  get(row, 'trainer') || null,
       weight:        parseFloat(get(row, 'weight')) || null,
       emergency_contact: get(row, 'emergency_contact') || null,
@@ -217,17 +220,17 @@ async function _handleImport(req, res) {
             pt_start_date = COALESCE($7, pt_start_date),
             package_type  = COALESCE($8, package_type),
             paid_amount   = CASE WHEN $9 > 0 THEN $9 ELSE paid_amount END,
-            final_amount  = CASE WHEN $9 > 0 THEN $9 ELSE final_amount END,
-            trainer_name  = COALESCE($10, trainer_name),
-            weight        = COALESCE($11, weight),
-            emergency_contact = COALESCE($12, emergency_contact),
-            notes         = COALESCE($13, notes),
+            final_amount  = CASE WHEN $10 > 0 THEN $10 ELSE final_amount END,
+            trainer_name  = COALESCE($11, trainer_name),
+            weight        = COALESCE($12, weight),
+            emergency_contact = COALESCE($13, emergency_contact),
+            notes         = COALESCE($14, notes),
             updated_at    = NOW()
-          WHERE id = $14
+          WHERE id = $15
         `, [
           c.name, c.email, c.dob, c.gender, c.address,
           c.joining_date, c.pt_start_date, c.package_type,
-          c.paid_amount, c.trainer_name, c.weight,
+          c.paid_amount, c.final_amount, c.trainer_name, c.weight,
           c.emergency_contact, c.notes, existingId,
         ]);
       } else {
