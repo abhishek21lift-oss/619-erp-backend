@@ -188,6 +188,15 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(asy
   }
 }));
 
+// ─── Renewal history for a client ───────────────────────────
+router.get('/clients/:id/renewals', auth, wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT * FROM pt_client_renewals WHERE client_id = $1 ORDER BY renewed_at DESC`,
+    [req.params.id]
+  );
+  res.json({ data: rows });
+}));
+
 // ─── Renew PT client ────────────────────────────────────────
 router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
   const d = req.body;
@@ -198,13 +207,15 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
   endDate.setMonth(endDate.getMonth() + Number(d.duration_months));
   const ptEndDate = endDate.toISOString().slice(0, 10);
 
-  const baseAmt = Number(d.base_amount) || 0;
-  const disc = Number(d.discount) || 0;
-  const finalAmt = baseAmt - disc;
-  const monthlyAmt = Number(d.monthly_pt_amount) || 0;
+  const baseAmt    = Number(d.base_amount)       || 0;
+  const disc       = Number(d.discount)           || 0;
+  const finalAmt   = d.final_amount !== undefined ? Number(d.final_amount) : Math.max(baseAmt - disc, 0);
+  const paidNow    = Number(d.paid_amount)        || 0;
+  const monthlyAmt = Number(d.monthly_pt_amount)  || 0;
+  const packageType = d.package_type || null;
 
   const { rows: existing } = await pool.query(
-    'SELECT * FROM pt_clients WHERE id = $1 AND deleted_at IS NULL FOR UPDATE',
+    'SELECT * FROM pt_clients WHERE id = $1 AND deleted_at IS NULL',
     [req.params.id]
   );
   if (existing.length === 0)
@@ -213,29 +224,37 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
 
   const { rows } = await pool.query(`
     UPDATE pt_clients SET
-      base_amount = $2,
-      discount = $3,
-      final_amount = $4,
-      monthly_pt_amount = $5,
-      pt_start_date = $6,
-      pt_end_date = $7,
-      duration_months = $8,
-      balance_amount = GREATEST($4 - paid_amount, 0),
-      status = 'active',
-      updated_at = NOW()
+      package_type      = COALESCE($2, package_type),
+      base_amount       = $3,
+      discount          = $4,
+      final_amount      = $5,
+      monthly_pt_amount = $6,
+      pt_start_date     = $7,
+      pt_end_date       = $8,
+      duration_months   = $9,
+      paid_amount       = paid_amount + $10,
+      balance_amount    = GREATEST($5 - (paid_amount + $10), 0),
+      status            = 'active',
+      updated_at        = NOW()
     WHERE id = $1 AND deleted_at IS NULL
     RETURNING *
-  `, [req.params.id, baseAmt, disc, finalAmt, monthlyAmt, d.pt_start_date, ptEndDate, d.duration_months]);
+  `, [req.params.id, packageType, baseAmt, disc, finalAmt, monthlyAmt,
+      d.pt_start_date, ptEndDate, d.duration_months, paidNow]);
 
-  // record renewal in renewals table for audit trail
+  // Log to renewal history
   await pool.query(`
-    INSERT INTO renewals (id, client_id, client_name, trainer_id, trainer_name,
-      old_package, new_package, old_end_date, new_end_date, amount, paid_amount,
-      payment_method, renewed_on, notes, action_type)
-    VALUES (gen_random_uuid()::TEXT, $1, $2, $3, $4, $5, $6, $7, $8, $9, 0, 'PT_RENEWAL', CURRENT_DATE, $10, 'pt_renew')
-  `, [req.params.id, c.name, c.trainer_id, c.trainer_name,
-       c.package_type, c.package_type, c.pt_end_date, ptEndDate,
-       finalAmt, d.notes || null]);
+    INSERT INTO pt_client_renewals
+      (client_id, client_name, trainer_name, old_package, new_package,
+       old_end_date, new_start_date, new_end_date, duration_months,
+       base_amount, discount, final_amount, paid_amount, balance_amount, notes)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+  `, [
+    req.params.id, c.name, c.trainer_name,
+    c.package_type, packageType || c.package_type,
+    c.pt_end_date, d.pt_start_date, ptEndDate, d.duration_months,
+    baseAmt, disc, finalAmt, paidNow, Math.max(finalAmt - paidNow, 0),
+    d.notes || null,
+  ]);
 
   res.json({ data: rows[0] });
 }));
