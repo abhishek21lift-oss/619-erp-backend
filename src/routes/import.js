@@ -76,6 +76,13 @@ async function parseUploadedRows(file) {
    Returns: { imported, skipped, errors[] }
 ────────────────────────────────────────────── */
 router.post('/import-excel', auth, adminOnly, upload.single('file'), async (req, res) => {
+  // Top-level catch: Express 4 does not catch async throws automatically.
+  // Without this, any unhandled throw hangs the request → Render timeout → 502.
+  try { return await _handleImport(req, res); }
+  catch (err) { return res.status(500).json({ error: err?.message || 'Import failed' }); }
+});
+
+async function _handleImport(req, res) {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
   let rawRows;
@@ -130,17 +137,30 @@ router.post('/import-excel', auth, adminOnly, upload.single('file'), async (req,
   }
 
   const fmt_date = (val) => {
-    if (!val) return null;
-    if (val instanceof Date) return val.toISOString().slice(0, 10);
-    const s = String(val).trim();
-    if (!s) return null;
-    const parts = s.split(/[\/\-\.]/);
-    if (parts.length === 3) {
-      if (parts[2].length === 4) return `${parts[2]}-${parts[1].padStart(2,'0')}-${parts[0].padStart(2,'0')}`;
-      return new Date(s).toISOString().slice(0, 10);
-    }
-    const d = new Date(s);
-    return isNaN(d) ? null : d.toISOString().slice(0, 10);
+    try {
+      if (!val) return null;
+      if (val instanceof Date) return isNaN(val) ? null : val.toISOString().slice(0, 10);
+      const s = String(val).trim();
+      if (!s) return null;
+      // Already ISO YYYY-MM-DD
+      if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+      const parts = s.split(/[\/\-\.]/);
+      if (parts.length === 3) {
+        const [p0, p1, p2] = parts;
+        if (p2.length === 4) {
+          // DD-MM-YYYY or MM-DD-YYYY — assume DD-MM-YYYY (Indian format)
+          return `${p2}-${p1.padStart(2,'0')}-${p0.padStart(2,'0')}`;
+        }
+        if (p2.length <= 2) {
+          // DD-MM-YY — expand 2-digit year: 00-49 → 2000s, 50-99 → 1900s
+          const yy = parseInt(p2, 10);
+          const yyyy = yy <= 49 ? 2000 + yy : 1900 + yy;
+          return `${yyyy}-${p1.padStart(2,'0')}-${p0.padStart(2,'0')}`;
+        }
+      }
+      const d = new Date(s);
+      return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+    } catch { return null; }
   };
 
   const get = (row, field) => {
@@ -267,6 +287,6 @@ router.post('/import-excel', auth, adminOnly, upload.single('file'), async (req,
   }
 
   res.json({ imported, skipped, total: rawRows.length, errors: errors.slice(0, 50) });
-});
+}
 
 module.exports = router;
