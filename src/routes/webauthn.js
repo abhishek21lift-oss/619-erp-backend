@@ -43,15 +43,42 @@ setInterval(async () => {
 }, 60_000);
 
 // ── Registration ──────────────────────────────────────────────────
+// GET /api/webauthn/member-search?q=name  — search members across all tables
+router.get('/member-search', auth, async (req, res, next) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (!q || q.length < 2) return res.json({ members: [] });
+    const like = `%${q}%`;
+    const { rows: regular } = await pool.query(
+      `SELECT id, name, email, 'member' AS source FROM clients
+       WHERE (name ILIKE $1 OR email ILIKE $1 OR client_id ILIKE $1) AND status != 'deleted'
+       ORDER BY name LIMIT 10`, [like]
+    );
+    const { rows: pt } = await pool.query(
+      `SELECT id, name, email, 'pt_client' AS source FROM pt_clients
+       WHERE (name ILIKE $1 OR email ILIKE $1 OR unique_id ILIKE $1) AND deleted_at IS NULL
+       ORDER BY name LIMIT 10`, [like]
+    );
+    res.json({ members: [...regular, ...pt].slice(0, 15) });
+  } catch (err) { next(err); }
+});
+
 // GET /api/webauthn/register/begin?member_id=xxx
 router.get('/register/begin', auth, async (req, res, next) => {
   try {
     const { member_id } = req.query;
     if (!member_id) return res.status(400).json({ error: 'member_id is required' });
 
-    const client = await pool.query('SELECT id, name, email FROM clients WHERE id = $1', [member_id]);
-    if (!client.rows.length) return res.status(404).json({ error: 'Member not found' });
-    const member = client.rows[0];
+    // Search both regular clients and PT clients
+    let memberRow = null;
+    const { rows: r1 } = await pool.query('SELECT id, name, email FROM clients WHERE id = $1', [member_id]);
+    if (r1.length) { memberRow = r1[0]; }
+    else {
+      const { rows: r2 } = await pool.query('SELECT id, name, email FROM pt_clients WHERE id = $1 AND deleted_at IS NULL', [member_id]);
+      if (r2.length) memberRow = r2[0];
+    }
+    if (!memberRow) return res.status(404).json({ error: 'Member not found' });
+    const member = memberRow;
 
     const existing = await pool.query(
       'SELECT credential_id FROM webauthn_credentials WHERE member_id = $1',
@@ -216,8 +243,13 @@ router.post('/authenticate/complete', async (req, res, next) => {
       [verification.authenticationInfo.newCounter, credentialId]
     );
 
-    const member = await pool.query('SELECT id, name FROM clients WHERE id = $1', [cred.member_id]);
-    const m = member.rows[0];
+    let m = null;
+    const { rows: mr1 } = await pool.query('SELECT id, name FROM clients WHERE id = $1', [cred.member_id]);
+    if (mr1.length) m = mr1[0];
+    else {
+      const { rows: mr2 } = await pool.query('SELECT id, name FROM pt_clients WHERE id = $1', [cred.member_id]);
+      if (mr2.length) m = mr2[0];
+    }
     res.json({ success: true, memberId: m?.id, memberName: m?.name });
   } catch (err) {
     next(err);
