@@ -107,7 +107,9 @@ async function getBalanceSheet(trainerId) {
 }
 
 async function getActiveClients(trainerId) {
-  const where = ['c.deleted_at IS NULL', "c.status IN ('active','frozen')", 'c.pt_start_date IS NOT NULL'];
+  // Returns ALL non-deleted PT clients so the "All Clients" page can show
+  // every status. The frontend applies its own status filter on top.
+  const where = ['c.deleted_at IS NULL'];
   const params = [];
   if (trainerId) {
     params.push(trainerId);
@@ -120,7 +122,11 @@ async function getActiveClients(trainerId) {
            c.package_type, c.base_amount, c.discount, c.final_amount,
            c.paid_amount, c.balance_amount, c.joining_date,
            c.duration_months, c.pt_start_date, c.pt_end_date,
-           (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
+           CASE
+             WHEN c.pt_end_date IS NOT NULL AND c.pt_end_date::TEXT != ''
+             THEN c.pt_end_date::DATE - CURRENT_DATE
+             ELSE NULL
+           END AS days_left,
            c.status, c.monthly_pt_amount, c.trainer_commission,
            COALESCE(pp.total_incentives, 0) AS total_earned_commission
     FROM pt_clients c
