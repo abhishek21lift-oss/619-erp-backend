@@ -4,7 +4,6 @@ const multer  = require('multer');
 const { readSheet } = require('read-excel-file/node');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
-const { generateClientId, generateMemberCode } = require('../db/id-gen');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -152,12 +151,35 @@ router.post('/import-excel', auth, adminOnly, upload.single('file'), async (req,
   let imported = 0, skipped = 0;
   const errors = [];
 
-  // Pre-generate codes for new rows in a single batch with advisory lock
   const lockClient = await pool.connect();
   try {
     await lockClient.query('BEGIN');
     await lockClient.query("SELECT pg_advisory_xact_lock(hashtext('clients_seq'))");
 
+    /* ── Pre-fetch ID counters ONCE (2 queries instead of 2 per row) ── */
+    const { rows: [lastCid] } = await lockClient.query(
+      `SELECT client_id FROM clients WHERE client_id ~ '^FS[0-9]+$'
+       ORDER BY CAST(SUBSTRING(client_id FROM 3) AS INTEGER) DESC LIMIT 1`
+    );
+    let clientIdCtr = lastCid?.client_id ? parseInt(lastCid.client_id.replace('FS', ''), 10) + 1 : 1;
+
+    const { rows: [lastMc] } = await lockClient.query(
+      `SELECT member_code FROM clients WHERE member_code ~ '^SIX19-[0-9]+$'
+       ORDER BY CAST(SUBSTRING(member_code FROM 7) AS INTEGER) DESC LIMIT 1`
+    );
+    let memberCodeCtr = lastMc?.member_code ? parseInt(lastMc.member_code.replace('SIX19-', ''), 10) + 1 : 1;
+
+    /* ── Batch mobile existence check (1 query instead of N queries) ── */
+    const allMobiles = rawRows.map(row => get(row, 'mobile').replace(/\D/g, '').slice(-10)).filter(Boolean);
+    const existingMobiles = new Set();
+    if (allMobiles.length) {
+      const { rows: existing } = await lockClient.query(
+        'SELECT mobile FROM clients WHERE mobile = ANY($1)', [allMobiles]
+      );
+      existing.forEach(r => existingMobiles.add(r.mobile));
+    }
+
+    /* ── Per-row insert loop (N INSERT queries only) ── */
     for (let i = 0; i < rawRows.length; i++) {
       const row = rawRows[i];
       const name   = get(row, 'name');
@@ -167,38 +189,31 @@ router.post('/import-excel', auth, adminOnly, upload.single('file'), async (req,
 
       const client = {
         name,
-        mobile:           mobile || null,
-        email:            get(row, 'email') || null,
-        dob:              fmt_date(get(row, 'dob')) || null,
-        gender:           (get(row, 'gender') || '').toLowerCase() || null,
-        address:          get(row, 'address') || null,
-        joining_date:     fmt_date(get(row, 'joining_date')) || new Date().toISOString().slice(0, 10),
-        expiry_date:      fmt_date(get(row, 'expiry_date')) || null,
-        plan:             get(row, 'plan') || null,
-        amount_paid:      parseFloat(get(row, 'amount_paid')) || null,
-        payment_method:   get(row, 'payment_method') || null,
-        trainer_name:     get(row, 'trainer') || null,
-        status:           get(row, 'status') || 'active',
-        height:           parseFloat(get(row, 'height')) || null,
-        weight:           parseFloat(get(row, 'weight')) || null,
-        blood_group:      get(row, 'blood_group') || null,
-        emergency_contact:get(row, 'emergency_contact') || null,
-        notes:            get(row, 'notes') || null,
+        mobile:            mobile || null,
+        email:             get(row, 'email') || null,
+        dob:               fmt_date(get(row, 'dob')) || null,
+        gender:            (get(row, 'gender') || '').toLowerCase() || null,
+        address:           get(row, 'address') || null,
+        joining_date:      fmt_date(get(row, 'joining_date')) || new Date().toISOString().slice(0, 10),
+        expiry_date:       fmt_date(get(row, 'expiry_date')) || null,
+        plan:              get(row, 'plan') || null,
+        amount_paid:       parseFloat(get(row, 'amount_paid')) || null,
+        payment_method:    get(row, 'payment_method') || null,
+        trainer_name:      get(row, 'trainer') || null,
+        status:            get(row, 'status') || 'active',
+        height:            parseFloat(get(row, 'height')) || null,
+        weight:            parseFloat(get(row, 'weight')) || null,
+        blood_group:       get(row, 'blood_group') || null,
+        emergency_contact: get(row, 'emergency_contact') || null,
+        notes:             get(row, 'notes') || null,
       };
 
-      // Generate codes only for rows that will actually insert (no existing mobile)
+      // Assign IDs in-memory — no extra DB round-trip per row
       let clientCode = null, memberCode = null;
-      if (client.mobile) {
-        const { rows: existing } = await lockClient.query(
-          'SELECT id FROM clients WHERE mobile = $1 LIMIT 1', [client.mobile]
-        );
-        if (existing.length === 0) {
-          clientCode = await generateClientId(lockClient);
-          memberCode = await generateMemberCode(lockClient);
-        }
-      } else {
-        clientCode = await generateClientId(lockClient);
-        memberCode = await generateMemberCode(lockClient);
+      const isNew = !client.mobile || !existingMobiles.has(client.mobile);
+      if (isNew) {
+        clientCode = 'FS' + String(clientIdCtr++).padStart(5, '0');
+        memberCode = 'SIX19-' + String(memberCodeCtr++).padStart(5, '0');
       }
 
       try {
@@ -211,30 +226,30 @@ router.post('/import-excel', auth, adminOnly, upload.single('file'), async (req,
                   $9, $10, $11, $12, $13, $14,
                   $15, $16, $17, $18, $19, $20)
           ON CONFLICT (mobile) WHERE mobile IS NOT NULL AND mobile != '' DO UPDATE SET
-            name            = EXCLUDED.name,
-            email           = COALESCE(EXCLUDED.email, clients.email),
-            dob             = COALESCE(EXCLUDED.dob, clients.dob),
-            gender          = COALESCE(EXCLUDED.gender, clients.gender),
-            address         = COALESCE(EXCLUDED.address, clients.address),
-            joining_date    = COALESCE(EXCLUDED.joining_date, clients.joining_date),
-            expiry_date     = COALESCE(EXCLUDED.expiry_date, clients.expiry_date),
-            plan            = COALESCE(EXCLUDED.plan, clients.plan),
-            amount_paid     = COALESCE(EXCLUDED.amount_paid, clients.amount_paid),
-            payment_method  = COALESCE(EXCLUDED.payment_method, clients.payment_method),
-            trainer_name    = COALESCE(EXCLUDED.trainer_name, clients.trainer_name),
-            status          = COALESCE(EXCLUDED.status, clients.status),
-            height          = COALESCE(EXCLUDED.height, clients.height),
-            weight          = COALESCE(EXCLUDED.weight, clients.weight),
-            blood_group     = COALESCE(EXCLUDED.blood_group, clients.blood_group),
+            name              = EXCLUDED.name,
+            email             = COALESCE(EXCLUDED.email, clients.email),
+            dob               = COALESCE(EXCLUDED.dob, clients.dob),
+            gender            = COALESCE(EXCLUDED.gender, clients.gender),
+            address           = COALESCE(EXCLUDED.address, clients.address),
+            joining_date      = COALESCE(EXCLUDED.joining_date, clients.joining_date),
+            expiry_date       = COALESCE(EXCLUDED.expiry_date, clients.expiry_date),
+            plan              = COALESCE(EXCLUDED.plan, clients.plan),
+            amount_paid       = COALESCE(EXCLUDED.amount_paid, clients.amount_paid),
+            payment_method    = COALESCE(EXCLUDED.payment_method, clients.payment_method),
+            trainer_name      = COALESCE(EXCLUDED.trainer_name, clients.trainer_name),
+            status            = COALESCE(EXCLUDED.status, clients.status),
+            height            = COALESCE(EXCLUDED.height, clients.height),
+            weight            = COALESCE(EXCLUDED.weight, clients.weight),
+            blood_group       = COALESCE(EXCLUDED.blood_group, clients.blood_group),
             emergency_contact = COALESCE(EXCLUDED.emergency_contact, clients.emergency_contact),
-            notes           = COALESCE(EXCLUDED.notes, clients.notes),
-            updated_at      = NOW()
+            notes             = COALESCE(EXCLUDED.notes, clients.notes),
+            updated_at        = NOW()
         `, [
           clientCode, memberCode, client.name, client.mobile, client.email, client.dob,
           client.gender, client.address, client.joining_date, client.expiry_date,
           client.plan, client.amount_paid, client.payment_method, client.trainer_name,
           client.status, client.height, client.weight, client.blood_group,
-          client.emergency_contact, client.notes
+          client.emergency_contact, client.notes,
         ]);
         imported++;
       } catch (err) {
