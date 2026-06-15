@@ -98,20 +98,23 @@ async function _handleImport(req, res) {
   const norm = (s) => String(s).trim().toLowerCase().replace(/[^a-z0-9]/g, '_');
 
   const FIELD_MAP = {
-    name:         ['name','full_name','member_name','client_name','member'],
-    mobile:       ['mobile','phone','contact','mobile_number','phone_number','contact_number','whatsapp'],
-    email:        ['email','email_id','email_address'],
-    dob:          ['dob','date_of_birth','birth_date','birthday'],
-    gender:       ['gender','sex'],
-    address:      ['address','addr','location'],
-    joining_date: ['joining_date','join_date','joined','start_date','enrollment_date','date_of_joining'],
-    plan:         ['plan','package','membership','membership_plan','membership_type','plan_name','subscription_plan'],
-    final_amount: ['final_amount','total_amount','total','selling_price','sale_price','total_fee','total_fees'],
-    amount_paid:  ['amount_paid','amount','fee','fees','payment','paid','collected','amount_collected'],
-    trainer:      ['trainer','trainer_name','coach','assigned_trainer','select_trainer'],
-    notes:        ['notes','note','remarks','comment','primary_fitness_goal','fitness_goal','goal','interested_in'],
-    weight:       ['weight','weight_kg'],
-    emergency_contact: ['emergency_contact','emergency_phone','emergency_number'],
+    name:             ['name','full_name','member_name','client_name','member'],
+    mobile:           ['mobile','phone','contact','mobile_number','phone_number','contact_number','whatsapp'],
+    email:            ['email','email_id','email_address'],
+    dob:              ['dob','date_of_birth','birth_date','birthday'],
+    gender:           ['gender','sex'],
+    address:          ['address','addr','location'],
+    joining_date:     ['joining_date','join_date','joined','start_date','enrollment_date','date_of_joining'],
+    pt_end_date:      ['pt_end_date','end_date','expiry_date','expiry','expires','validity_date'],
+    duration_months:  ['duration_months','duration','months','duration_month','plan_duration'],
+    plan:             ['plan','package','membership','membership_plan','membership_type','plan_name','subscription_plan'],
+    base_amount:      ['base_amount','base','original_amount','mrp','list_price'],
+    final_amount:     ['final_amount','total_amount','total','selling_price','sale_price','total_fee','total_fees'],
+    amount_paid:      ['amount_paid','amount','fee','fees','payment','paid','collected','amount_collected'],
+    trainer:          ['trainer','trainer_name','coach','assigned_trainer','select_trainer'],
+    notes:            ['notes','note','remarks','comment','primary_fitness_goal','fitness_goal','goal','interested_in'],
+    weight:           ['weight','weight_kg'],
+    emergency_contact:['emergency_contact','emergency_phone','emergency_number'],
   };
 
   const headers = Object.keys(rawRows[0]).map(norm);
@@ -181,71 +184,96 @@ async function _handleImport(req, res) {
 
     if (!name) { skipped++; errors.push({ row: i + 2, issue: 'Missing name' }); continue; }
 
-    const startDate  = fmt_date(get(row, 'joining_date'));
-    const rawFinal   = parseFloat(get(row, 'final_amount')) || 0;
-    const paidAmt    = parseFloat(get(row, 'amount_paid')) || 0;
-    const finalAmt   = rawFinal || paidAmt; // if no separate final column, fall back to paid
+    const startDate      = fmt_date(get(row, 'joining_date'));
+    const rawFinal       = parseFloat(get(row, 'final_amount')) || 0;
+    const rawBase        = parseFloat(get(row, 'base_amount')) || 0;
+    const paidAmt        = parseFloat(get(row, 'amount_paid')) || 0;
+    const finalAmt       = rawFinal || paidAmt; // fall back to paid if no final column
+    const baseAmt        = rawBase || finalAmt; // fall back to final if no base column
+    const balanceAmt     = Math.max(finalAmt - paidAmt, 0);
+    const durationMonths = parseInt(get(row, 'duration_months')) || null;
+
+    // Compute end date: explicit column wins, else start + duration
+    let ptEndDate = fmt_date(get(row, 'pt_end_date')) || null;
+    if (!ptEndDate && startDate && durationMonths) {
+      const d = new Date(startDate);
+      d.setMonth(d.getMonth() + durationMonths);
+      ptEndDate = d.toISOString().slice(0, 10);
+    }
+
+    // Status: expired if end date is in the past, otherwise active
+    const status = ptEndDate && new Date(ptEndDate) < new Date() ? 'expired' : 'active';
 
     const c = {
       name,
-      mobile:        mobile || null,
-      email:         get(row, 'email') || null,
-      dob:           fmt_date(get(row, 'dob')) || null,
-      gender:        get(row, 'gender') || null,
-      address:       get(row, 'address') || null,
-      joining_date:  startDate || new Date().toISOString().slice(0, 10),
-      pt_start_date: startDate || null,
-      package_type:  get(row, 'plan') || null,
-      paid_amount:   paidAmt,
-      final_amount:  finalAmt,
-      trainer_name:  get(row, 'trainer') || null,
-      weight:        parseFloat(get(row, 'weight')) || null,
+      mobile:            mobile || null,
+      email:             get(row, 'email') || null,
+      dob:               fmt_date(get(row, 'dob')) || null,
+      gender:            get(row, 'gender') || null,
+      address:           get(row, 'address') || null,
+      joining_date:      startDate || new Date().toISOString().slice(0, 10),
+      pt_start_date:     startDate || null,
+      pt_end_date:       ptEndDate,
+      duration_months:   durationMonths,
+      package_type:      get(row, 'plan') || null,
+      base_amount:       baseAmt,
+      final_amount:      finalAmt,
+      paid_amount:       paidAmt,
+      balance_amount:    balanceAmt,
+      trainer_name:      get(row, 'trainer') || null,
+      weight:            parseFloat(get(row, 'weight')) || null,
       emergency_contact: get(row, 'emergency_contact') || null,
-      notes:         get(row, 'notes') || null,
-      status:        'active',
+      notes:             get(row, 'notes') || null,
+      status,
     };
 
     try {
       const existingId = mobile ? existingMap.get(mobile) : null;
       if (existingId) {
-        // Update existing pt_client — don't overwrite non-null fields with null
+        // Update existing — don't overwrite non-null fields with null
         await pool.query(`
           UPDATE pt_clients SET
-            name          = $1,
-            email         = COALESCE($2, email),
-            dob           = COALESCE($3, dob),
-            gender        = COALESCE($4, gender),
-            address       = COALESCE($5, address),
-            joining_date  = COALESCE($6, joining_date),
-            pt_start_date = COALESCE($7, pt_start_date),
-            package_type  = COALESCE($8, package_type),
-            paid_amount   = CASE WHEN $9 > 0 THEN $9 ELSE paid_amount END,
-            final_amount  = CASE WHEN $10 > 0 THEN $10 ELSE final_amount END,
-            trainer_name  = COALESCE($11, trainer_name),
-            weight        = COALESCE($12, weight),
-            emergency_contact = COALESCE($13, emergency_contact),
-            notes         = COALESCE($14, notes),
-            updated_at    = NOW()
-          WHERE id = $15
+            name              = $1,
+            email             = COALESCE($2, email),
+            dob               = COALESCE($3, dob),
+            gender            = COALESCE($4, gender),
+            address           = COALESCE($5, address),
+            joining_date      = COALESCE($6, joining_date),
+            pt_start_date     = COALESCE($7, pt_start_date),
+            pt_end_date       = COALESCE($8, pt_end_date),
+            duration_months   = COALESCE($9, duration_months),
+            package_type      = COALESCE($10, package_type),
+            base_amount       = CASE WHEN $11 > 0 THEN $11 ELSE base_amount END,
+            final_amount      = CASE WHEN $12 > 0 THEN $12 ELSE final_amount END,
+            paid_amount       = CASE WHEN $13 > 0 THEN $13 ELSE paid_amount END,
+            balance_amount    = CASE WHEN $12 > 0 THEN $14 ELSE balance_amount END,
+            trainer_name      = COALESCE($15, trainer_name),
+            weight            = COALESCE($16, weight),
+            emergency_contact = COALESCE($17, emergency_contact),
+            notes             = COALESCE($18, notes),
+            status            = $19,
+            updated_at        = NOW()
+          WHERE id = $20
         `, [
           c.name, c.email, c.dob, c.gender, c.address,
-          c.joining_date, c.pt_start_date, c.package_type,
-          c.paid_amount, c.final_amount, c.trainer_name, c.weight,
-          c.emergency_contact, c.notes, existingId,
+          c.joining_date, c.pt_start_date, c.pt_end_date, c.duration_months,
+          c.package_type, c.base_amount, c.final_amount, c.paid_amount, c.balance_amount,
+          c.trainer_name, c.weight, c.emergency_contact, c.notes,
+          c.status, existingId,
         ]);
       } else {
         await pool.query(`
           INSERT INTO pt_clients
             (name, mobile, email, dob, gender, address,
-             joining_date, pt_start_date, package_type,
-             paid_amount, final_amount, trainer_name,
-             weight, emergency_contact, notes, status)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+             joining_date, pt_start_date, pt_end_date, duration_months,
+             package_type, base_amount, final_amount, paid_amount, balance_amount,
+             trainer_name, weight, emergency_contact, notes, status)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
         `, [
           c.name, c.mobile, c.email, c.dob, c.gender, c.address,
-          c.joining_date, c.pt_start_date, c.package_type,
-          c.paid_amount, c.final_amount, c.trainer_name,
-          c.weight, c.emergency_contact, c.notes, c.status,
+          c.joining_date, c.pt_start_date, c.pt_end_date, c.duration_months,
+          c.package_type, c.base_amount, c.final_amount, c.paid_amount, c.balance_amount,
+          c.trainer_name, c.weight, c.emergency_contact, c.notes, c.status,
         ]);
       }
       imported++;
