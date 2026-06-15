@@ -44,10 +44,16 @@ router.get('/clients', auth, wrap(async (req, res) => {
 router.get('/clients/:id', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(`
     SELECT c.*,
-           (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
+           CASE
+             WHEN c.pt_end_date IS NOT NULL AND c.pt_end_date::TEXT != ''
+             THEN c.pt_end_date::DATE - CURRENT_DATE
+             ELSE NULL
+           END AS days_left,
            COALESCE(pp.total_incentives, 0) AS total_earned_commission,
            CASE
-             WHEN c.balance_amount > 0 AND NULLIF(c.pt_end_date, '')::DATE < CURRENT_DATE THEN 'OVERDUE'
+             WHEN c.balance_amount > 0
+              AND c.pt_end_date IS NOT NULL AND c.pt_end_date::TEXT != ''
+              AND c.pt_end_date::DATE < CURRENT_DATE THEN 'OVERDUE'
              WHEN c.balance_amount > 0 THEN 'DUE'
              ELSE 'CLEAR'
            END AS due_status
