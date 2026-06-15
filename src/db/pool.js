@@ -41,11 +41,11 @@ const pool = new Pool({
   max: POOL_MAX,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
-  // FIX: statement_timeout prevents any single query from hanging the API.
-  // 15s is generous for all current queries; adjust down if needed.
-  // query_timeout is the node-postgres client-side hard stop.
-  statement_timeout: 15000,
-  query_timeout: 20000,
+  // statement_timeout (server-side): PostgreSQL cancels the query after 20s.
+  // query_timeout (client-side): node-postgres gives up waiting after 15s,
+  // freeing the connection before the DB-side cancel fires.
+  statement_timeout: 20000,
+  query_timeout: 15000,
 });
 
 pool.on('error', (err) => {

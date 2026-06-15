@@ -45,7 +45,7 @@ async function sendPasswordReset(email, rawToken) {
       html: `
         <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto">
           <h2 style="color:#e11d48">Password Reset Request</h2>
-          <p>Click the link below to reset your password. This link expires in 1 hour.</p>
+          <p>Click the link below to reset your password. This link expires in 15 minutes.</p>
           <a href="${resetUrl}" style="display:inline-block;padding:12px 24px;background:#e11d48;color:#fff;text-decoration:none;border-radius:6px;margin:16px 0">Reset Password</a>
           <p style="color:#666;font-size:13px">If you didn't request this, ignore this email.</p>
         </div>
@@ -63,7 +63,7 @@ async function sendAdminResetOtp(email, otp) {
     return;
   }
   try {
-    const t = getTransporter();
+    const t = getTransport();
     await t.sendMail({
       from: FROM_ADDR,
       to: email,
