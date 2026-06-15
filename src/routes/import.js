@@ -207,23 +207,26 @@ async function _handleImport(req, res) {
 
       if (!name) { skipped++; errors.push({ row: i + 2, issue: 'Missing name' }); continue; }
 
+      // Normalize gender to match DB check constraint: 'Male','Female','Other'
+      const rawGender = get(row, 'gender').trim().toLowerCase();
+      const genderMap = { male: 'Male', female: 'Female', other: 'Other', m: 'Male', f: 'Female' };
+      const gender = genderMap[rawGender] || null;
+
       const client = {
         name,
         mobile:            mobile || null,
         email:             get(row, 'email') || null,
         dob:               fmt_date(get(row, 'dob')) || null,
-        gender:            (get(row, 'gender') || '').toLowerCase() || null,
+        gender,
         address:           get(row, 'address') || null,
         joining_date:      fmt_date(get(row, 'joining_date')) || new Date().toISOString().slice(0, 10),
-        expiry_date:       fmt_date(get(row, 'expiry_date')) || null,
-        plan:              get(row, 'plan') || null,
-        amount_paid:       parseFloat(get(row, 'amount_paid')) || null,
+        pt_end_date:       fmt_date(get(row, 'expiry_date')) || null,
+        package_type:      get(row, 'plan') || null,
+        paid_amount:       parseFloat(get(row, 'amount_paid')) || null,
         payment_method:    get(row, 'payment_method') || null,
         trainer_name:      get(row, 'trainer') || null,
         status:            get(row, 'status') || 'active',
-        height:            parseFloat(get(row, 'height')) || null,
         weight:            parseFloat(get(row, 'weight')) || null,
-        blood_group:       get(row, 'blood_group') || null,
         emergency_contact: get(row, 'emergency_contact') || null,
         notes:             get(row, 'notes') || null,
       };
@@ -240,11 +243,11 @@ async function _handleImport(req, res) {
         await lockClient.query(`
           INSERT INTO clients
             (id, client_id, member_code, name, mobile, email, dob, gender, address,
-             joining_date, expiry_date, plan, amount_paid, payment_method, trainer_name,
-             status, height, weight, blood_group, emergency_contact, notes)
+             joining_date, pt_end_date, package_type, paid_amount, payment_method, trainer_name,
+             status, weight, emergency_contact, notes)
           VALUES (gen_random_uuid()::TEXT, $1, $2, $3, $4, $5, $6, $7, $8,
                   $9, $10, $11, $12, $13, $14,
-                  $15, $16, $17, $18, $19, $20)
+                  $15, $16, $17, $18)
           ON CONFLICT (mobile) WHERE mobile IS NOT NULL AND mobile != '' DO UPDATE SET
             name              = EXCLUDED.name,
             email             = COALESCE(EXCLUDED.email, clients.email),
@@ -252,24 +255,21 @@ async function _handleImport(req, res) {
             gender            = COALESCE(EXCLUDED.gender, clients.gender),
             address           = COALESCE(EXCLUDED.address, clients.address),
             joining_date      = COALESCE(EXCLUDED.joining_date, clients.joining_date),
-            expiry_date       = COALESCE(EXCLUDED.expiry_date, clients.expiry_date),
-            plan              = COALESCE(EXCLUDED.plan, clients.plan),
-            amount_paid       = COALESCE(EXCLUDED.amount_paid, clients.amount_paid),
+            pt_end_date       = COALESCE(EXCLUDED.pt_end_date, clients.pt_end_date),
+            package_type      = COALESCE(EXCLUDED.package_type, clients.package_type),
+            paid_amount       = COALESCE(EXCLUDED.paid_amount, clients.paid_amount),
             payment_method    = COALESCE(EXCLUDED.payment_method, clients.payment_method),
             trainer_name      = COALESCE(EXCLUDED.trainer_name, clients.trainer_name),
             status            = COALESCE(EXCLUDED.status, clients.status),
-            height            = COALESCE(EXCLUDED.height, clients.height),
             weight            = COALESCE(EXCLUDED.weight, clients.weight),
-            blood_group       = COALESCE(EXCLUDED.blood_group, clients.blood_group),
             emergency_contact = COALESCE(EXCLUDED.emergency_contact, clients.emergency_contact),
             notes             = COALESCE(EXCLUDED.notes, clients.notes),
             updated_at        = NOW()
         `, [
           clientCode, memberCode, client.name, client.mobile, client.email, client.dob,
-          client.gender, client.address, client.joining_date, client.expiry_date,
-          client.plan, client.amount_paid, client.payment_method, client.trainer_name,
-          client.status, client.height, client.weight, client.blood_group,
-          client.emergency_contact, client.notes,
+          client.gender, client.address, client.joining_date, client.pt_end_date,
+          client.package_type, client.paid_amount, client.payment_method, client.trainer_name,
+          client.status, client.weight, client.emergency_contact, client.notes,
         ]);
         imported++;
       } catch (err) {
