@@ -40,6 +40,42 @@ router.get('/clients', auth, wrap(async (req, res) => {
   res.json({ data: rows, total: rows.length });
 }));
 
+// ─── Duplicate Client Audit (MUST be before /clients/:id) ───
+router.get('/clients/duplicates', auth, adminOnly, wrap(async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT
+      TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g'))) AS normalized_name,
+      (ARRAY_AGG(name ORDER BY created_at ASC))[1] AS display_name,
+      COUNT(*)::int AS record_count,
+      MIN(created_at)::date AS first_seen,
+      ARRAY_AGG(pt_start_date ORDER BY pt_start_date NULLS LAST)
+        FILTER (WHERE pt_start_date IS NOT NULL) AS subscription_starts,
+      SUM(final_amount)::numeric AS total_final,
+      SUM(paid_amount)::numeric  AS total_paid,
+      GREATEST(0, SUM(final_amount) - SUM(paid_amount))::numeric AS balance,
+      (ARRAY_AGG(id ORDER BY created_at ASC))[1] AS master_id,
+      ARRAY_AGG(id ORDER BY created_at ASC) AS all_ids,
+      (ARRAY_AGG(mobile ORDER BY created_at ASC NULLS LAST)
+        FILTER (WHERE mobile IS NOT NULL AND mobile != ''))[1] AS mobile,
+      (ARRAY_AGG(package_type ORDER BY pt_start_date DESC NULLS LAST)
+        FILTER (WHERE package_type IS NOT NULL))[1] AS latest_plan,
+      (ARRAY_AGG(trainer_name ORDER BY pt_start_date DESC NULLS LAST)
+        FILTER (WHERE trainer_name IS NOT NULL))[1] AS trainer_name
+    FROM pt_clients
+    WHERE deleted_at IS NULL
+    GROUP BY TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
+    HAVING COUNT(*) > 1
+    ORDER BY COUNT(*) DESC, normalized_name
+  `);
+  res.json({
+    data: rows,
+    total_groups: rows.length,
+    total_records: rows.reduce((s, r) => s + r.record_count, 0),
+    total_duplicates: rows.reduce((s, r) => s + r.record_count - 1, 0),
+    total_financial_value: rows.reduce((s, r) => s + Number(r.total_final), 0),
+  });
+}));
+
 // ─── Single client details ──────────────────────────────────
 router.get('/clients/:id', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(`
@@ -464,42 +500,6 @@ router.post('/payments', auth, wrap(async (req, res) => {
     [numAmount, client_id]
   );
   res.status(201).json({ data: rows[0] });
-}));
-
-// ─── Duplicate Client Audit ─────────────────────────────────
-router.get('/clients/duplicates', auth, adminOnly, wrap(async (req, res) => {
-  const { rows } = await pool.query(`
-    SELECT
-      TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g'))) AS normalized_name,
-      (ARRAY_AGG(name ORDER BY created_at ASC))[1] AS display_name,
-      COUNT(*)::int AS record_count,
-      MIN(created_at)::date AS first_seen,
-      ARRAY_AGG(pt_start_date ORDER BY pt_start_date NULLS LAST)
-        FILTER (WHERE pt_start_date IS NOT NULL) AS subscription_starts,
-      SUM(final_amount)::numeric AS total_final,
-      SUM(paid_amount)::numeric  AS total_paid,
-      GREATEST(0, SUM(final_amount) - SUM(paid_amount))::numeric AS balance,
-      (ARRAY_AGG(id ORDER BY created_at ASC))[1] AS master_id,
-      ARRAY_AGG(id ORDER BY created_at ASC) AS all_ids,
-      (ARRAY_AGG(mobile ORDER BY created_at ASC NULLS LAST)
-        FILTER (WHERE mobile IS NOT NULL AND mobile != ''))[1] AS mobile,
-      (ARRAY_AGG(package_type ORDER BY pt_start_date DESC NULLS LAST)
-        FILTER (WHERE package_type IS NOT NULL))[1] AS latest_plan,
-      (ARRAY_AGG(trainer_name ORDER BY pt_start_date DESC NULLS LAST)
-        FILTER (WHERE trainer_name IS NOT NULL))[1] AS trainer_name
-    FROM pt_clients
-    WHERE deleted_at IS NULL
-    GROUP BY TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
-    HAVING COUNT(*) > 1
-    ORDER BY COUNT(*) DESC, normalized_name
-  `);
-  res.json({
-    data: rows,
-    total_groups: rows.length,
-    total_records: rows.reduce((s, r) => s + r.record_count, 0),
-    total_duplicates: rows.reduce((s, r) => s + r.record_count - 1, 0),
-    total_financial_value: rows.reduce((s, r) => s + Number(r.total_final), 0),
-  });
 }));
 
 // ─── Execute Duplicate Merge ─────────────────────────────────
