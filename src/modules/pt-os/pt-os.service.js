@@ -83,10 +83,10 @@ async function getBalanceSheet(trainerId) {
            c.weight, c.emergency_contact,
            c.trainer_name,
            c.package_type, c.final_amount, c.paid_amount, c.balance_amount,
-           c.pt_end_date, (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
+           c.pt_end_date, (c.pt_end_date - CURRENT_DATE) AS days_left,
            c.status,
            CASE
-             WHEN c.balance_amount > 0 AND NULLIF(c.pt_end_date, '')::DATE < CURRENT_DATE THEN 'OVERDUE'
+             WHEN c.balance_amount > 0 AND c.pt_end_date < CURRENT_DATE THEN 'OVERDUE'
              WHEN c.balance_amount > 0 THEN 'DUE'
              ELSE 'CLEAR'
            END AS due_status,
