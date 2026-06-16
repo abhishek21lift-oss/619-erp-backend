@@ -16,10 +16,10 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 router.get('/revenue', auth, requireRole('admin','manager'), wrap(async (req, res) => {
   const { from, to, group_by = 'month' } = req.query;
   const params = [];
-  const where = [];
+  const where = ['p.deleted_at IS NULL'];
   if (from) { params.push(from); where.push(`p.date >= $${params.length}`); }
   if (to)   { params.push(to);   where.push(`p.date <= $${params.length}`); }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const whereSql = `WHERE ${where.join(' AND ')}`;
 
   let sql;
   if (group_by === 'trainer') {
@@ -115,7 +115,7 @@ router.get('/export', auth, requireRole('admin','manager'), wrap(async (req, res
   } else if (type === 'payments') {
     rows = (await pool.query(`
       SELECT p.receipt_no, p.date, p.amount, p.method, p.client_name, p.trainer_name, p.notes
-      FROM payments p ORDER BY p.date DESC LIMIT 5000`)).rows;
+      FROM payments p WHERE p.deleted_at IS NULL ORDER BY p.date DESC LIMIT 5000`)).rows;
   } else if (type === 'trainer-payouts') {
     rows = (await pool.query(`SELECT * FROM v_trainer_monthly_earnings ORDER BY month DESC, total_payout DESC`)).rows;
   }

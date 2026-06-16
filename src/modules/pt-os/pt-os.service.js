@@ -185,18 +185,17 @@ async function getDashboardStats() {
 }
 
 async function getCommissionHistory(trainerId) {
-  const where = [];
+  const where = ['c.deleted_at IS NULL'];
   const params = [];
   if (trainerId) {
     params.push(trainerId);
     where.push(`pc.trainer_id = $${params.length}`);
   }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(`
     SELECT pc.*, c.name AS client_name
     FROM pt_commissions pc
     JOIN pt_clients c ON c.id = pc.client_id
-    ${whereSql}
+    WHERE ${where.join(' AND ')}
     ORDER BY pc.month DESC, pc.client_name
     LIMIT 200
   `, params);
