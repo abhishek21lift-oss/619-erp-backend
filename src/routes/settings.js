@@ -96,8 +96,10 @@ router.get('/studio', auth, async (req, res, next) => {
 router.get('/branches', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT key AS id, value->>'name' AS name, value->>'location' AS location,
-              value->>'status' AS status,
+      `SELECT key AS id,
+              (value::jsonb)->>'name' AS name,
+              (value::jsonb)->>'location' AS location,
+              (value::jsonb)->>'status' AS status,
               COALESCE((SELECT COUNT(*) FROM clients WHERE branch_id = s.key AND deleted_at IS NULL), 0)::int AS member_count
        FROM system_settings s
        WHERE s.key LIKE 'branch_%' AND s.type = 'json'
@@ -300,6 +302,76 @@ router.put('/gym', auth, adminOnly, async (req, res, next) => {
 
     logger.info({ userId: req.user.id, keys: allowedKeys }, 'Gym settings updated');
     res.json({ success: true, message: 'Gym settings saved', count: allowedKeys.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── ROLE PERMISSIONS ─────────────────────────────────────────────────────────
+
+const PERM_KEYS = [
+  'perm_trainer_pt_module', 'perm_trainer_finance', 'perm_trainer_reports',
+  'perm_trainer_insights', 'perm_trainer_staff_view', 'perm_trainer_settings',
+  'perm_trainer_all_pt_clients', 'perm_trainer_commissions', 'perm_trainer_record_payment',
+  'perm_reception_pt_module', 'perm_reception_finance', 'perm_reception_reports',
+  'perm_reception_insights', 'perm_reception_settings', 'perm_reception_staff_view',
+  'perm_reception_record_payment',
+];
+
+const PERM_DEFAULTS = {
+  perm_trainer_pt_module: true,
+  perm_trainer_finance: false,
+  perm_trainer_reports: false,
+  perm_trainer_insights: false,
+  perm_trainer_staff_view: true,
+  perm_trainer_settings: false,
+  perm_trainer_all_pt_clients: false,
+  perm_trainer_commissions: true,
+  perm_trainer_record_payment: false,
+  perm_reception_pt_module: false,
+  perm_reception_finance: false,
+  perm_reception_reports: false,
+  perm_reception_insights: false,
+  perm_reception_settings: false,
+  perm_reception_staff_view: true,
+  perm_reception_record_payment: true,
+};
+
+// GET /api/settings/permissions
+router.get('/permissions', auth, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT key, value FROM system_settings WHERE key = ANY($1::text[])`,
+      [PERM_KEYS]
+    );
+    const perms = { ...PERM_DEFAULTS };
+    for (const r of rows) {
+      perms[r.key] = r.value === 'true';
+    }
+    res.json({ permissions: perms, role: req.user.role });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/settings/permissions
+router.put('/permissions', auth, adminOnly, async (req, res, next) => {
+  try {
+    const updates = req.body;
+    if (!updates || typeof updates !== 'object')
+      return res.status(400).json({ error: 'Body must be a key-value object' });
+
+    for (const key of PERM_KEYS) {
+      if (updates[key] === undefined) continue;
+      const strVal = updates[key] ? 'true' : 'false';
+      await pool.query(
+        `INSERT INTO system_settings (key, value, type, updated_by, updated_at)
+         VALUES ($1, $2, 'boolean', $3, NOW())
+         ON CONFLICT (key) DO UPDATE SET value=$2, type='boolean', updated_by=$3, updated_at=NOW()`,
+        [key, strVal, req.user.id]
+      );
+    }
+    res.json({ message: 'Permissions updated' });
   } catch (err) {
     next(err);
   }
