@@ -256,6 +256,21 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
     d.notes || null,
   ]);
 
+  // Also write to pt_client_subscriptions (canonical term history used by the profile page)
+  await pool.query(`
+    INSERT INTO pt_client_subscriptions
+      (client_id, plan_name, start_date, end_date, duration_months,
+       selling_price, amount_paid, balance_amount, trainer_name, status, source)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','renewal')
+    ON CONFLICT DO NOTHING
+  `, [
+    req.params.id,
+    packageType || c.package_type,
+    d.pt_start_date, ptEndDate, d.duration_months,
+    finalAmt, paidNow, Math.max(finalAmt - paidNow, 0),
+    c.trainer_name,
+  ]);
+
   res.json({ data: rows[0] });
 }));
 
