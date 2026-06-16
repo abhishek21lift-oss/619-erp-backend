@@ -79,19 +79,19 @@ async function getBalanceSheet(trainerId) {
   }
   const whereSql = where.length ? `AND ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(`
-    SELECT c.id, c.client_id, c.name, c.mobile, c.email, c.photo_url,
+    SELECT c.id, c.client_id, c.unique_id, c.name, c.mobile, c.email, c.photo_url,
            c.weight, c.emergency_contact,
            c.trainer_name,
            c.package_type, c.final_amount, c.paid_amount, c.balance_amount,
            c.pt_end_date, (NULLIF(c.pt_end_date, '')::DATE - CURRENT_DATE) AS days_left,
            c.status,
            CASE
-              WHEN c.balance_amount > 0 AND NULLIF(c.pt_end_date, '')::DATE < CURRENT_DATE THEN 'OVERDUE'
+             WHEN c.balance_amount > 0 AND NULLIF(c.pt_end_date, '')::DATE < CURRENT_DATE THEN 'OVERDUE'
              WHEN c.balance_amount > 0 THEN 'DUE'
              ELSE 'CLEAR'
            END AS due_status,
-            c.monthly_pt_amount, c.trainer_commission,
-            COALESCE(pp.total_incentives, 0) AS total_earned_commission
+           c.monthly_pt_amount, c.trainer_commission,
+           COALESCE(pp.total_incentives, 0) AS total_earned_commission
     FROM pt_clients c
     LEFT JOIN (
       SELECT client_id, SUM(incentive_amt) AS total_incentives
@@ -99,9 +99,9 @@ async function getBalanceSheet(trainerId) {
       WHERE deleted_at IS NULL
       GROUP BY client_id
     ) pp ON pp.client_id = c.id
-    WHERE c.deleted_at IS NULL AND c.balance_amount > 0
+    WHERE c.deleted_at IS NULL
       ${whereSql}
-    ORDER BY c.balance_amount DESC
+    ORDER BY c.balance_amount DESC NULLS LAST
   `, params);
   return rows;
 }
