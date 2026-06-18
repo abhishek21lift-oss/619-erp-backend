@@ -3,14 +3,16 @@
 --   1. Make face_descriptors.angle nullable with a default
 --   2. Add missing status values to face_checkin_logs CHECK constraint
 --   3. Add missing default for face_checkin_logs.status
---   4. Fix orphaned enrollment data
---   5. Ensure indexes exist on attendance_id
+--   4. Index on attendance_id (guarded — column added in migration 034)
+--   5. Fix orphaned enrollment data
 
 -- ─── 1. Make angle nullable with default 'front' ─────────────────
+-- 013b adds the column; this step only tweaks nullability if it was
+-- somehow created NOT NULL by another path.
 DO $$ BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'face_descriptors'
+    WHERE table_name  = 'face_descriptors'
       AND column_name = 'angle'
       AND is_nullable = 'NO'
   ) THEN
@@ -34,7 +36,9 @@ DO $$ BEGIN
   ) THEN
     ALTER TABLE face_checkin_logs DROP CONSTRAINT face_checkin_logs_status_check;
     ALTER TABLE face_checkin_logs ADD CONSTRAINT face_checkin_logs_status_check
-      CHECK (status = ANY (ARRAY['success'::text, 'failed'::text, 'unknown'::text, 'expired'::text, 'denied'::text, 'frozen'::text, 'error'::text, 'enrolled'::text, 'revoked'::text]));
+      CHECK (status = ANY (ARRAY['success'::text, 'failed'::text, 'unknown'::text,
+                                 'expired'::text, 'denied'::text, 'frozen'::text,
+                                 'error'::text, 'enrolled'::text, 'revoked'::text]));
   END IF;
 END $$;
 
@@ -42,7 +46,7 @@ END $$;
 DO $$ BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'face_checkin_logs'
+    WHERE table_name  = 'face_checkin_logs'
       AND column_name = 'status'
       AND column_default IS NULL
   ) THEN
@@ -51,23 +55,47 @@ DO $$ BEGIN
 END $$;
 
 -- ─── 4. Index on attendance_id for faster joins ────────────────────
-CREATE INDEX IF NOT EXISTS face_log_attendance_idx ON face_checkin_logs (attendance_id)
-  WHERE attendance_id IS NOT NULL;
+-- attendance_id is added by migration 034. Skip index creation here if
+-- the column does not yet exist — migration 034 will create it.
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name  = 'face_checkin_logs'
+      AND column_name = 'attendance_id'
+  ) THEN
+    CREATE INDEX IF NOT EXISTS face_log_attendance_idx
+      ON face_checkin_logs (attendance_id)
+      WHERE attendance_id IS NOT NULL;
+  END IF;
+END $$;
 
--- ─── 5. Fix orphaned clients that have face_descriptor jsonb but no active face_descriptors row ──
+-- ─── 5. Fix orphaned clients: sync face_enrolled flag ──────────────
 UPDATE clients c
    SET face_enrolled = TRUE
  WHERE c.face_descriptor IS NOT NULL
    AND c.face_enrolled = FALSE
-   AND EXISTS (SELECT 1 FROM face_checkin_logs l WHERE l.client_id = c.id AND l.status = 'success');
+   AND EXISTS (
+     SELECT 1 FROM face_checkin_logs l
+      WHERE l.client_id = c.id AND l.status = 'success'
+   );
 
--- For each orphaned client, restore a face_descriptors row from the jsonb
+-- Restore a face_descriptors row for any orphaned client.
+-- 013b has already converted both columns to JSONB, so this INSERT
+-- works correctly on all fresh and upgraded databases.
 INSERT INTO face_descriptors (id, client_id, angle, descriptor, is_active, enrolled_at)
-SELECT gen_random_uuid()::TEXT, c.id, 'front', c.face_descriptor, TRUE, COALESCE(c.face_enrolled_at, NOW())
+SELECT gen_random_uuid()::TEXT,
+       c.id,
+       'front',
+       c.face_descriptor,
+       TRUE,
+       COALESCE(c.face_enrolled_at, NOW())
 FROM clients c
 WHERE c.face_descriptor IS NOT NULL
   AND c.face_enrolled = TRUE
-  AND NOT EXISTS (SELECT 1 FROM face_descriptors d WHERE d.client_id = c.id AND d.is_active = TRUE)
+  AND NOT EXISTS (
+    SELECT 1 FROM face_descriptors d
+     WHERE d.client_id = c.id AND d.is_active = TRUE
+  )
 ON CONFLICT DO NOTHING;
 
 SELECT 'Migration 014 complete — face system fixes applied' AS status;
