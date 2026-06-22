@@ -57,7 +57,8 @@ router.post('/google-login', async (req, res) => {
     let user;
     try {
       const { rows } = await pool.query(
-        'SELECT * FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true AND deleted_at IS NULL',
+        `SELECT id, name, email, role, token_version, trainer_id, member_id, is_active
+           FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true AND deleted_at IS NULL`,
         [email]
       );
       user = rows[0];

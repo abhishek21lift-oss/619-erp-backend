@@ -207,7 +207,7 @@ router.post('/authenticate/complete', authnLimiter, async (req, res, next) => {
     if (!credentialId) return res.status(400).json({ error: 'credentialId is required' });
 
     const credRow = await pool.query(
-      'SELECT * FROM webauthn_credentials WHERE credential_id = $1',
+      'SELECT credential_id, public_key, counter, member_id FROM webauthn_credentials WHERE credential_id = $1',
       [credentialId]
     );
     if (!credRow.rows.length) return res.status(404).json({ error: 'Credential not found' });

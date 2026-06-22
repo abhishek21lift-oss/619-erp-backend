@@ -33,7 +33,9 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     let rows;
     try {
       const result = await pool.query(
-        'SELECT * FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true',
+        `SELECT id, name, email, role, password, token_version,
+                trainer_id, member_id, is_active
+           FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true`,
         [email]
       );
       rows = result.rows;
