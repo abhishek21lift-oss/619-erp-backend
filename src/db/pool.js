@@ -52,6 +52,27 @@ pool.on('error', (err) => {
   logger.error({ err: err.message }, 'Unexpected DB pool error');
 });
 
+// Instrument pool.query to log slow queries (> 1 second).
+const _origQuery = pool.query.bind(pool);
+pool.query = function slowQueryInstrument(...args) {
+  const start = Date.now();
+  const result = _origQuery(...args);
+  if (result && typeof result.then === 'function') {
+    return result.then(
+      (r) => {
+        const ms = Date.now() - start;
+        if (ms > 1000) {
+          const sql = (typeof args[0] === 'string' ? args[0] : (args[0]?.text ?? '[object]')).slice(0, 200);
+          logger.warn({ sql, ms }, 'slow_query');
+        }
+        return r;
+      },
+      (err) => { throw err; }
+    );
+  }
+  return result;
+};
+
 // Test connection on startup. Don't crash here — Render's healthcheck will
 // surface a 5xx and you can read the log. Crashing prevents redeploys from
 // recovering when Supabase has a brief connectivity blip.

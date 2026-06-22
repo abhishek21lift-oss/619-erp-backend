@@ -35,7 +35,7 @@ router.get('/', auth, async (req, res, next) => {
       FROM trainers t
       LEFT JOIN clients  c ON c.trainer_id = t.id
       LEFT JOIN payments p ON p.trainer_id = t.id
-      WHERE COALESCE(t.status, 'active') = 'active'
+      WHERE t.deleted_at IS NULL
       GROUP BY t.id
       ORDER BY t.name
       LIMIT $1 OFFSET $2`, [limit, offset]);
@@ -46,7 +46,7 @@ router.get('/', auth, async (req, res, next) => {
       total_clients:   parseInt(t.total_clients),
       month_revenue:   parseFloat(t.month_revenue),
       all_time_revenue:parseFloat(t.all_time_revenue),
-      month_incentive: Math.round(parseFloat(t.month_revenue) * parseFloat(t.incentive_rate ?? 0.5))
+      month_incentive: Math.round(parseFloat(t.month_revenue) * parseFloat(t.incentive_rate ?? 0.5) * 100) / 100
     }));
 
     // Admin/manager see everything. Other roles get the safe view EXCEPT

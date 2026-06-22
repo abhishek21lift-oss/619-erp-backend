@@ -31,7 +31,7 @@ function hmacSecret() {
 function buildQrPayload(userId, userType, dynamic = false) {
   const ts = dynamic ? Math.floor(Date.now() / 1000).toString() : '0';
   const msg = `${userId}|${userType}|${ts}`;
-  const sig = crypto.createHmac('sha256', hmacSecret()).update(msg).digest('hex').slice(0, 16);
+  const sig = crypto.createHmac('sha256', hmacSecret()).update(msg).digest('hex');
   return Buffer.from(`${msg}|${sig}`).toString('base64url');
 }
 
@@ -46,7 +46,10 @@ function verifyQrPayload(payload, dynamicWindowSec = 300) {
   const [userId, userType, ts, sig] = parts;
 
   const msg = `${userId}|${userType}|${ts}`;
-  const expected = crypto.createHmac('sha256', hmacSecret()).update(msg).digest('hex').slice(0, 16);
+  const expected = crypto.createHmac('sha256', hmacSecret()).update(msg).digest('hex');
+  if (sig.length !== expected.length) {
+    throw new Error('QR signature invalid');
+  }
   if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
     throw new Error('QR signature invalid');
   }

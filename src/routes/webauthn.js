@@ -6,6 +6,9 @@ const { auth } = require('../middleware/auth');
 
 const router = express.Router();
 
+const rateLimit = require('express-rate-limit');
+const authnLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many authentication attempts' } });
+
 const RP_ID   = process.env.RP_ID   || 'localhost';
 const RP_NAME = process.env.RP_NAME || '619 Fitness';
 const ORIGIN  = process.env.WEBAUTHN_ORIGIN || `https://${RP_ID}`;
@@ -40,7 +43,7 @@ async function consumeChallenge(challenge, type) {
 // Clean up expired challenges periodically
 setInterval(async () => {
   try { await pool.query("DELETE FROM webauthn_challenges WHERE expires_at < NOW()"); } catch {}
-}, 60_000);
+}, 60_000).unref();
 
 // ── Registration ──────────────────────────────────────────────────
 // GET /api/webauthn/member-search?q=name  — search members across all tables
@@ -166,7 +169,7 @@ router.post('/register/complete', auth, async (req, res, next) => {
 
 // ── Authentication ────────────────────────────────────────────────
 // GET /api/webauthn/authenticate/begin?member_id=xxx
-router.get('/authenticate/begin', async (req, res, next) => {
+router.get('/authenticate/begin', authnLimiter, async (req, res, next) => {
   try {
     const { member_id } = req.query;
 
@@ -198,7 +201,7 @@ router.get('/authenticate/begin', async (req, res, next) => {
 });
 
 // POST /api/webauthn/authenticate/complete
-router.post('/authenticate/complete', async (req, res, next) => {
+router.post('/authenticate/complete', authnLimiter, async (req, res, next) => {
   try {
     const { credentialId, rawId, authenticatorData, signature, clientDataJSON, userHandle } = req.body;
     if (!credentialId) return res.status(400).json({ error: 'credentialId is required' });

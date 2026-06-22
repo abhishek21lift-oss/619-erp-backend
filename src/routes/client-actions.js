@@ -163,7 +163,7 @@ router.post('/:id/upgrade', auth, async (req, res, next) => {
         VALUES (gen_random_uuid()::TEXT,$1,$2,$3,$4,$5,$6,CURRENT_DATE,$7,$8,$9,$10)`,
         [c.id, c.name, c.trainer_id, c.trainer_name, amount,
          d.payment_method || 'CASH', rcp, d.package_type,
-         Math.round(amount * iRate), `Upgrade to ${d.package_type}`]);
+         Math.round(amount * iRate * 100) / 100, `Upgrade to ${d.package_type}`]);
     }
 
     await logAction(tx, c.id, c.name, c.trainer_id, 'upgrade',
@@ -304,7 +304,7 @@ router.post('/:id/combo', auth, async (req, res, next) => {
         VALUES (gen_random_uuid()::TEXT,$1,$2,$3,$4,$5,$6,CURRENT_DATE,$7,$8,$9,$10)`,
         [c.id, c.name, trainerId, c.trainer_name, amount,
          d.payment_method || 'CASH', await genReceiptNo(tx), d.combo_plan,
-         Math.round(amount * iRate), `Combo: ${d.combo_plan}`]);
+         Math.round(amount * iRate * 100) / 100, `Combo: ${d.combo_plan}`]);
     }
 
     await logAction(tx, c.id, c.name, c.trainer_id, 'combo',
@@ -429,7 +429,7 @@ router.post('/:id/assign-pt', auth, async (req, res, next) => {
          VALUES (gen_random_uuid()::TEXT, $1,$2,$3,$4, $5,$6,CURRENT_DATE,$7,$8, $9,$10)`,
         [c.id, c.name, d.trainer_id, tr[0].name,
          paidAmt, payMethod, receipt, d.membership_plan || 'PT',
-         Math.round(paidAmt * (tr[0].incentive_rate ?? 0.5)),
+         Math.round(paidAmt * (tr[0].incentive_rate ?? 0.5) * 100) / 100,
          `PT Assignment — ${d.membership_plan || 'PT'}`],
       );
     }
@@ -507,7 +507,7 @@ router.post('/:id/renew-pt', auth, async (req, res, next) => {
         [c.id, c.name, trainerId, c.trainer_name, amount,
          d.payment_method || 'CASH', await genReceiptNo(tx),
          d.membership_plan || 'PT',
-         Math.round(amount * iRate), 'PT Renewal']);
+         Math.round(amount * iRate * 100) / 100, 'PT Renewal']);
     }
 
     await tx.query('COMMIT');
@@ -550,7 +550,7 @@ router.post('/:id/add-subscription', auth, async (req, res, next) => {
       const basePrice = parseFloat(r.basePrice) || 0;
       const sellPrice = parseFloat(r.sellingPrice) || 0;
       const disc      = Math.max(0, basePrice - sellPrice);
-      const gstPct    = parseFloat(d.gst_percent) || 0;
+      const gstPct    = Math.min(Math.max(parseFloat(d.gst_percent) || 0, 0), 28);
       const gstAmt    = Math.round(sellPrice * (gstPct / 100) * 100) / 100;
       const signupFee = parseFloat(d.signup_fee) || 0;
       const finalAmt  = sellPrice + gstAmt + signupFee;
@@ -607,7 +607,7 @@ router.post('/:id/add-subscription', auth, async (req, res, next) => {
          RETURNING *`,
         [c.id, c.name, c.trainer_id, c.trainer_name,
          paidAmt, payMethod, receipt, primaryRow.plan || c.package_type,
-         Math.round(paidAmt * iRate), 'Subscription: ' + (primaryRow.plan || ''), d.branch_id || null],
+         Math.round(paidAmt * iRate * 100) / 100, 'Subscription: ' + (primaryRow.plan || ''), d.branch_id || null],
       );
     }
 
@@ -679,7 +679,7 @@ router.post('/:id/renew-subscription', auth, async (req, res, next) => {
         VALUES (gen_random_uuid()::TEXT,$1,$2,$3,$4,$5,$6,CURRENT_DATE,$7,$8,$9,$10)`,
         [c.id, c.name, c.trainer_id, c.trainer_name, totalAmount,
          d.payment_method || 'CASH', await genReceiptNo(tx), pkg,
-         Math.round(totalAmount * iRate), `Renewal — ${pkg}`]);
+         Math.round(totalAmount * iRate * 100) / 100, `Renewal — ${pkg}`]);
     }
 
     await tx.query('COMMIT');

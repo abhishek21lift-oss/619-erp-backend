@@ -20,6 +20,13 @@ if (process.env.JWT_SECRET.length < 32) {
   process.exit(1);
 }
 
+// Warn about missing recommended (non-fatal) vars so ops teams notice early
+const RECOMMENDED_ENV = ['KIOSK_HMAC_SECRET', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'RP_ID', 'WEBAUTHN_ORIGIN'];
+const missingRecommended = RECOMMENDED_ENV.filter(function(k) { return !process.env[k]; });
+if (missingRecommended.length) {
+  logger.warn({ missing: missingRecommended }, 'Recommended env vars not set — some features may be degraded');
+}
+
 const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
@@ -161,18 +168,14 @@ app.get('/', function(req, res) {
   res.json({ status: 'ok', app: '619 ERP API', version: '3.0.0' });
 });
 
-app.get('/api/health', function(req, res) {
-  res.json({
-    status: 'ok',
-    version: 'v3',
-    time: new Date().toISOString(),
-    env: {
-      mode: NODE_ENV,
-      database: !!process.env.DATABASE_URL,
-      jwt: !!process.env.JWT_SECRET,
-      frontend: allowedOrigins.filter(function(o) { return !o.includes('localhost') && !o.includes('127.0.0.1'); }),
-    },
-  });
+app.get('/api/health', async function(req, res) {
+  try {
+    const pool = require('./db/pool');
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', version: 'v3', time: new Date().toISOString(), db: 'connected' });
+  } catch (err) {
+    res.status(503).json({ status: 'error', db: 'disconnected', error: err.message });
+  }
 });
 
 

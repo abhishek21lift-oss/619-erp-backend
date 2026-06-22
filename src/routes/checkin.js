@@ -14,7 +14,7 @@
 //
 // Recognition:
 //   * Euclidean distance between query and stored 128-D descriptors
-//   * Threshold of 0.50 — lower = stricter (face-api.js default 0.6)
+//   * Threshold of 0.40 — tightened from 0.50 to reduce false-positives (face-api.js default 0.6)
 //
 // All routes require auth except where noted.
 
@@ -288,33 +288,44 @@ router.post('/enroll', kioskTokenMiddleware, authOrKioskForEnroll, enrollLimiter
 
     const jsonDescriptor = formatDescriptorToJson(descriptor);
 
-    // Update clients table for backwards compat.
-    const clientResult = await pool.query(
-      `UPDATE clients
-          SET face_descriptor  = $1::jsonb,
-              face_enrolled    = TRUE,
-              face_enrolled_at = NOW()
-        WHERE id = $2
-      RETURNING id`,
-      [jsonDescriptor, client_id]
-    );
+    // Advisory lock prevents concurrent enrollment for the same client
+    // creating duplicate active face descriptors (race condition fix).
+    const lockKey = Buffer.from(client_id).reduce((a, b) => ((a << 5) - a + b) | 0, 0);
+    await pool.query('SELECT pg_advisory_lock($1)', [lockKey]);
+    let descriptorId;
+    try {
+      // Update clients table for backwards compat.
+      const clientResult = await pool.query(
+        `UPDATE clients
+            SET face_descriptor  = $1::jsonb,
+                face_enrolled    = TRUE,
+                face_enrolled_at = NOW()
+          WHERE id = $2
+        RETURNING id`,
+        [jsonDescriptor, client_id]
+      );
 
-    if (clientResult.rowCount === 0) return res.status(404).json({ error: 'Client not found' });
+      if (clientResult.rowCount === 0) {
+        return res.status(404).json({ error: 'Client not found' });
+      }
 
-    // Deactivate old descriptors for this client, then insert new one.
-    await pool.query(
-      `UPDATE face_descriptors SET is_active = FALSE, updated_at = NOW()
-        WHERE client_id = $1 AND is_active = TRUE`,
-      [client_id]
-    );
+      // Deactivate old descriptors for this client, then insert new one.
+      await pool.query(
+        `UPDATE face_descriptors SET is_active = FALSE, updated_at = NOW()
+          WHERE client_id = $1 AND is_active = TRUE`,
+        [client_id]
+      );
 
-    const descriptorId = randomUUID();
-    const enrolledBy = req.user && req.user.role !== 'kiosk' ? req.user.id : null;
-    await pool.query(
-      `INSERT INTO face_descriptors (id, client_id, angle, descriptor, is_active, enrolled_by, updated_at)
-       VALUES ($1, $2, 'front', $3::jsonb, TRUE, $4, NOW())`,
-      [descriptorId, client_id, jsonDescriptor, enrolledBy]
-    );
+      descriptorId = randomUUID();
+      const enrolledBy = req.user && req.user.role !== 'kiosk' ? req.user.id : null;
+      await pool.query(
+        `INSERT INTO face_descriptors (id, client_id, angle, descriptor, is_active, enrolled_by, updated_at)
+         VALUES ($1, $2, 'front', $3::jsonb, TRUE, $4, NOW())`,
+        [descriptorId, client_id, jsonDescriptor, enrolledBy]
+      );
+    } finally {
+      await pool.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(() => {});
+    }
 
     // Log the enrollment event.
     await logCheckIn({

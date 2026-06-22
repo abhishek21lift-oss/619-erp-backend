@@ -83,6 +83,34 @@ router.patch('/:id', auth, requireRole('admin','manager','trainer'), wrap(async 
 
 // POST /api/v1/pt-sessions/:id/complete
 router.post('/:id/complete', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
+  // Fetch the session first so we can check membership balance
+  const { rows: sessionRows } = await pool.query(
+    `SELECT id, status, trainer_id, member_id, membership_id FROM pt_sessions WHERE id = $1`,
+    [req.params.id]
+  );
+  if (sessionRows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  const session = sessionRows[0];
+
+  if (session.status !== 'scheduled') {
+    return res.status(400).json({ error: { code: 'BAD_STATE', message: `Session is already ${session.status}` } });
+  }
+
+  // If linked to a membership, verify there are sessions remaining
+  if (session.membership_id) {
+    const { rows: memRows } = await pool.query(
+      `SELECT pt_sessions_total, pt_sessions_used FROM member_memberships WHERE id = $1`,
+      [session.membership_id]
+    );
+    if (memRows.length > 0) {
+      const remaining = (memRows[0].pt_sessions_total || 0) - (memRows[0].pt_sessions_used || 0);
+      if (remaining <= 0) {
+        return res.status(402).json({
+          error: { code: 'NO_SESSIONS_REMAINING', message: 'No PT sessions remaining in this membership' },
+        });
+      }
+    }
+  }
+
   const { rows } = await pool.query(
     `UPDATE pt_sessions SET status='completed', updated_at = NOW()
      WHERE id = $1 AND status='scheduled' RETURNING *`,
