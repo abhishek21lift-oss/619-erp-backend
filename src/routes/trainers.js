@@ -183,10 +183,14 @@ router.put('/:id', auth, adminOnly, async (req, res, next) => {
   }
 });
 
-// DELETE /api/trainers/:id (admin only)
+// DELETE /api/trainers/:id (admin only) — soft-delete to preserve payment/client history
 router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   try {
-    const { rows } = await pool.query('DELETE FROM trainers WHERE id=$1 RETURNING id', [req.params.id]);
+    const { rows } = await pool.query(
+      `UPDATE trainers SET deleted_at = NOW(), status = 'inactive', updated_at = NOW()
+       WHERE id = $1 AND deleted_at IS NULL RETURNING id`,
+      [req.params.id]
+    );
     if (!rows[0]) return res.status(404).json({ error: 'Not found' });
     res.json({ message: 'Deleted' });
   } catch (err) {
