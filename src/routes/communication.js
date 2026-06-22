@@ -16,7 +16,8 @@ router.get('/history', async (req, res, next) => {
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     values.push(Number(limit), Number(offset));
     const result = await pool.query(
-      `SELECT * FROM communication_history ${where}
+      `SELECT id, title, body, type, audience, recipients, status, sent_by, sent_at
+       FROM communication_history ${where}
        ORDER BY sent_at DESC
        LIMIT $${values.length - 1} OFFSET $${values.length}`,
       values
@@ -28,7 +29,10 @@ router.get('/history', async (req, res, next) => {
 // GET /api/communication/history/:id
 router.get('/history/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('SELECT * FROM communication_history WHERE id = $1', [req.params.id]);
+    const result = await pool.query(
+      'SELECT id, title, body, type, audience, recipients, status, sent_by, sent_at FROM communication_history WHERE id = $1',
+      [req.params.id]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Message not found' });
     res.json(result.rows[0]);
   } catch (err) { next(err); }
