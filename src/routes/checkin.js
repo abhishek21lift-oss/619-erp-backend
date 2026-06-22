@@ -25,6 +25,7 @@ const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 const logger = require('../lib/logger');
 const { kioskTokenMiddleware } = require('../middleware/kiosk-token');
+const { encryptDescriptor, decryptDescriptor, isEncryptionEnabled } = require('../lib/faceEncryption');
 
 // Separate rate limiters so a burst of enrollment attempts doesn't block
 // the check-in kiosk and vice versa.
@@ -116,11 +117,19 @@ router.post('/face', kioskTokenMiddleware, faceLimiter, kioskOrAuth, async (req,
     const { rows: clients } = await pool.query(
       `SELECT c.id, c.name, c.status, c.photo_url, c.member_code, c.client_id,
               c.package_type, c.pt_end_date, c.expiry_date, c.subscription_end_date, c.trainer_id,
-              d.descriptor AS face_descriptor, d.id AS descriptor_id
+              d.descriptor AS face_descriptor, d.descriptor_enc, d.id AS descriptor_id
          FROM face_descriptors d
          JOIN clients c ON c.id = d.client_id
         WHERE d.is_active = TRUE`
     );
+
+    // Resolve descriptor: prefer encrypted column, fall back to plaintext for old rows.
+    for (const c of clients) {
+      if (c.descriptor_enc && isEncryptionEnabled()) {
+        c.face_descriptor = decryptDescriptor(c.descriptor_enc);
+      }
+      // c.face_descriptor may already be set from the plaintext column if no enc present.
+    }
 
     if (clients.length === 0) {
       const logId = await logCheckIn({
@@ -288,6 +297,15 @@ router.post('/enroll', kioskTokenMiddleware, authOrKioskForEnroll, enrollLimiter
 
     const jsonDescriptor = formatDescriptorToJson(descriptor);
 
+    // Encrypt descriptor if key is configured; otherwise fall back to plaintext.
+    let descriptorEnc = null;
+    let plaintextForLegacy = jsonDescriptor;
+    if (isEncryptionEnabled()) {
+      descriptorEnc = encryptDescriptor(descriptor);
+      // Null out the plaintext column for new enrollments once encryption is active.
+      plaintextForLegacy = null;
+    }
+
     // Advisory lock prevents concurrent enrollment for the same client
     // creating duplicate active face descriptors (race condition fix).
     const lockKey = Buffer.from(client_id).reduce((a, b) => ((a << 5) - a + b) | 0, 0);
@@ -319,9 +337,9 @@ router.post('/enroll', kioskTokenMiddleware, authOrKioskForEnroll, enrollLimiter
       descriptorId = randomUUID();
       const enrolledBy = req.user && req.user.role !== 'kiosk' ? req.user.id : null;
       await pool.query(
-        `INSERT INTO face_descriptors (id, client_id, angle, descriptor, is_active, enrolled_by, updated_at)
-         VALUES ($1, $2, 'front', $3::jsonb, TRUE, $4, NOW())`,
-        [descriptorId, client_id, jsonDescriptor, enrolledBy]
+        `INSERT INTO face_descriptors (id, client_id, angle, descriptor, descriptor_enc, is_active, enrolled_by, updated_at)
+         VALUES ($1, $2, 'front', $3::jsonb, $4, TRUE, $5, NOW())`,
+        [descriptorId, client_id, plaintextForLegacy, descriptorEnc, enrolledBy]
       );
     } finally {
       await pool.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(() => {});
@@ -350,13 +368,21 @@ router.post('/enroll', kioskTokenMiddleware, authOrKioskForEnroll, enrollLimiter
 router.get('/descriptors', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT d.client_id, c.name, d.descriptor
+      `SELECT d.client_id, c.name, d.descriptor, d.descriptor_enc
          FROM face_descriptors d
          JOIN clients c ON c.id = d.client_id
         WHERE d.is_active = TRUE
         ORDER BY c.name`
     );
-    return res.json(rows);
+    // Resolve descriptor: prefer encrypted column, strip internal enc field from response.
+    const resolved = rows.map(r => {
+      let descriptor = r.descriptor;
+      if (r.descriptor_enc && isEncryptionEnabled()) {
+        descriptor = decryptDescriptor(r.descriptor_enc) ?? descriptor;
+      }
+      return { client_id: r.client_id, name: r.name, descriptor };
+    });
+    return res.json(resolved);
   } catch (err) {
     logger.error({ err: err.message }, '[checkin/descriptors] error');
     return next(err);
