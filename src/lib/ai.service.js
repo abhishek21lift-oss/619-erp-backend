@@ -459,11 +459,20 @@ async function testConnection() {
   if (!isConfigured()) {
     return { success: false, message: 'TOKEN_ROUTER_API_KEY is not set' };
   }
+
+  // Use a direct fetch (no retries) with a tight 15 s timeout — this is a
+  // health check, not a production call. Node.js native fetch wraps the real
+  // network error inside err.cause, so we surface that instead of the generic
+  // "fetch failed" TypeError message.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+
   try {
-    const res = await fetchWithRetry(
+    const res = await fetch(
       `${BASE_URL()}/chat/completions`,
       {
         method:  'POST',
+        signal:  controller.signal,
         headers: {
           'Content-Type':  'application/json',
           'Authorization': `Bearer ${process.env.TOKEN_ROUTER_API_KEY}`,
@@ -476,15 +485,24 @@ async function testConnection() {
         }),
       }
     );
+    clearTimeout(timer);
+
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      return { success: false, message: `Connection failed (${res.status}): ${body.slice(0, 150)}` };
+      return { success: false, message: `HTTP ${res.status}: ${body.slice(0, 200)}` };
     }
     const data  = await res.json();
     const reply = data.choices?.[0]?.message?.content?.trim() || '(no response)';
     return { success: true, message: `MiniMax-M3 connected via Token Router — model responded: "${reply}"` };
   } catch (err) {
-    return { success: false, message: err.message || 'Connection test failed' };
+    clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      return { success: false, message: `Connection timed out (15 s). Verify TOKEN_ROUTER_BASE_URL is set correctly (currently: ${BASE_URL()})` };
+    }
+    // err.cause holds the underlying OS/TLS/DNS error on Node.js native fetch
+    const cause  = err.cause?.message ?? err.cause?.code ?? '';
+    const detail = cause ? `${err.message}: ${cause}` : (err.message || 'Connection test failed');
+    return { success: false, message: detail };
   }
 }
 
