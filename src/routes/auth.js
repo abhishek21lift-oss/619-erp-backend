@@ -99,7 +99,7 @@ router.post('/logout', function(req, res) {
   res.clearCookie('token', {
     httpOnly: true,
     secure: isProd,
-    sameSite: isProd ? 'none' : 'lax',
+    sameSite: 'strict',
     path: '/',
   });
   res.json({ message: 'Logged out' });

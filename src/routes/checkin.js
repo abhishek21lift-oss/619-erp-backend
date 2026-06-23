@@ -48,7 +48,8 @@ function authOrKioskForEnroll(req, res, next) {
 // Constants
 // ──────────────────────────────────────────────────────────────────
 // M-08: tightened from 0.50 to 0.40 — reduces false-positive matches
-const RECOGNITION_THRESHOLD = 0.40;
+// ISSUE-047: default is 0.40 but can be overridden via system_settings key 'face_match_threshold'
+const DEFAULT_RECOGNITION_THRESHOLD = 0.40;
 const DESCRIPTOR_LENGTH     = 128;
 
 // ──────────────────────────────────────────────────────────────────
@@ -109,6 +110,10 @@ router.post('/face', kioskTokenMiddleware, faceLimiter, kioskOrAuth, async (req,
         error: `descriptor must be a length-${DESCRIPTOR_LENGTH} array of finite numbers`,
       });
     }
+
+    // Fetch configurable face match threshold from system_settings (ISSUE-047)
+    const thresholdRow = await pool.query("SELECT value FROM system_settings WHERE key = 'face_match_threshold' LIMIT 1");
+    const RECOGNITION_THRESHOLD = thresholdRow.rows[0] ? parseFloat(thresholdRow.rows[0].value) || DEFAULT_RECOGNITION_THRESHOLD : DEFAULT_RECOGNITION_THRESHOLD;
 
     // Pull active descriptors from the normalized face_descriptors table,
     // joined with client info for membership checks.

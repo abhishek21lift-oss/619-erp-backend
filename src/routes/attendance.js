@@ -17,7 +17,7 @@ const { auth } = require('../middleware/auth');
 
 const biometricLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
 
-// GET /api/attendance?date=YYYY-MM-DD&type=client
+// GET /api/attendance?date=YYYY-MM-DD&type=client&page=1&limit=100
 router.get('/', auth, async (req, res, next) => {
   try {
     const { date, from, to, type = 'client', ref_id } = req.query;
@@ -34,14 +34,42 @@ router.get('/', auth, async (req, res, next) => {
     if (type)   { conditions.push(`a.ref_type = $${p++}`); params.push(type); }
     if (ref_id) { conditions.push(`a.ref_id = $${p++}`);   params.push(ref_id); }
 
-    const limit = (from || to) ? 5000 : 200;
+    const whereClause = conditions.join(' AND ');
+
+    // Pagination: if page is provided use paginated response, otherwise fall back to legacy limit
+    if (req.query.page !== undefined) {
+      const page = parseInt(req.query.page) || 1;
+      const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+      const offset = (page - 1) * limit;
+
+      const { rows: countRows } = await pool.query(
+        `SELECT COUNT(*) AS total FROM attendance_logs a WHERE ${whereClause}`,
+        params
+      );
+      const total = parseInt(countRows[0].total);
+
+      const { rows } = await pool.query(
+        `SELECT a.id, a.ref_id, a.ref_type AS type, a.ref_name,
+                a.date, a.check_in_time AS check_in, a.check_out_time AS check_out,
+                a.status, a.notes, a.method AS check_in_method, a.created_at
+           FROM attendance_logs a
+         WHERE ${whereClause}
+         ORDER BY a.date DESC, a.check_in_time DESC NULLS LAST
+         LIMIT $${p} OFFSET $${p + 1}`,
+        params.concat(limit, offset)
+      );
+      return res.json({ data: rows, total, page, limit, pages: Math.ceil(total / limit) });
+    }
+
+    // Legacy: no page param — use default limit (200 for no date range, 500 cap for date range)
+    const limit = (from || to) ? Math.min(5000, 500) : 200;
 
     const { rows } = await pool.query(
       `SELECT a.id, a.ref_id, a.ref_type AS type, a.ref_name,
               a.date, a.check_in_time AS check_in, a.check_out_time AS check_out,
               a.status, a.notes, a.method AS check_in_method, a.created_at
          FROM attendance_logs a
-       WHERE ${conditions.join(' AND ')}
+       WHERE ${whereClause}
        ORDER BY a.date DESC, a.check_in_time DESC NULLS LAST
        LIMIT $${p}`,
       params.concat(limit)
@@ -61,11 +89,15 @@ router.post('/', auth, async (req, res, next) => {
 
     const type = d.type || 'client';
 
-    // RBAC: trainers can only mark attendance for their own clients
+    // RBAC: trainers can only mark attendance for their own clients (gym and PT)
     if (req.user.role === 'trainer') {
       if (type === 'client') {
         const { rows: own } = await pool.query(
-          'SELECT trainer_id FROM clients WHERE id=$1', [d.ref_id]
+          `SELECT trainer_id FROM clients WHERE id = $1 AND deleted_at IS NULL
+           UNION
+           SELECT trainer_id FROM pt_clients WHERE id = $1 AND deleted_at IS NULL
+           LIMIT 1`,
+          [d.ref_id]
         );
         if (!own[0]) return res.status(404).json({ error: 'Client not found' });
         if (own[0].trainer_id !== req.user.trainer_id)
@@ -143,9 +175,12 @@ router.post('/biometric', auth, biometricLimiter, async (req, res, next) => {
         return res.status(403).json({ error: 'Access denied' });
     }
 
+    const settingRow = await pool.query("SELECT value FROM system_settings WHERE key = 'late_threshold_hour' LIMIT 1");
+    const lateHour = settingRow.rows[0] ? parseInt(settingRow.rows[0].value) : 10;
+
     const now = new Date();
     const date = now.toISOString().split('T')[0];
-    const isLate = now.getHours() >= 10;
+    const isLate = now.getHours() >= lateHour;
     const status = isLate ? 'late' : 'present';
     const id = randomUUID();
 
@@ -182,7 +217,7 @@ router.get('/today-summary', auth, async (req, res, next) => {
     let trainerFilter = '';
     if (req.user.role === 'trainer' && req.user.trainer_id) {
       params.push(req.user.trainer_id);
-      trainerFilter = 'AND a.marked_by = $' + params.length + ' ';
+      trainerFilter = 'AND a.ref_id IN (SELECT id FROM clients WHERE trainer_id = $' + params.length + ' UNION SELECT id FROM pt_clients WHERE trainer_id = $' + params.length + ') ';
     }
 
     const { rows } = await pool.query(`
@@ -281,12 +316,16 @@ router.post('/bulk', auth, async function(req, res, next) {
         const type = d.type || 'client';
         const id = randomUUID();
 
-        // RBAC: trainers scoped to own clients
+        // RBAC: trainers scoped to own clients (gym and PT)
         if (req.user.role === 'trainer') {
           const { rows: own } = await pool.query(
-            'SELECT trainer_id FROM clients WHERE id=$1', [d.ref_id]
+            `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
+             UNION
+             SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
+             LIMIT 1`,
+            [d.ref_id, req.user.trainer_id]
           );
-          if (!own[0] || own[0].trainer_id !== req.user.trainer_id) {
+          if (!own[0]) {
             errors.push({ index: i, ref_id: d.ref_id, error: 'Access denied' });
             continue;
           }

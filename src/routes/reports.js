@@ -116,17 +116,27 @@ router.get('/dues', auth, async (req, res, next) => {
   try {
     const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
     const params = [];
-    let where = 'c.balance_amount > 0 AND c.deleted_at IS NULL';
+    let trainerFilter = '';
     if (tid) {
       params.push(tid);
-      where += ` AND c.trainer_id = $${params.length}`;
+      trainerFilter = ` AND trainer_id = $${params.length}`;
     }
     const { rows } = await pool.query(`
-      SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name,
-             c.balance_amount, c.pt_end_date, c.status
-      FROM clients c
-      WHERE ${where}
-      ORDER BY c.balance_amount DESC LIMIT 100`,
+      SELECT id, client_id, name, mobile, trainer_name,
+             balance_amount, pt_end_date, status
+      FROM (
+        SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name,
+               c.balance_amount, c.pt_end_date, c.status, c.trainer_id
+        FROM clients c
+        WHERE c.balance_amount > 0 AND c.deleted_at IS NULL
+        UNION ALL
+        SELECT ptc.id, NULL AS client_id, ptc.name, ptc.mobile, ptc.trainer_name,
+               ptc.balance_amount, ptc.pt_end_date, ptc.status, ptc.trainer_id
+        FROM pt_clients ptc
+        WHERE ptc.balance_amount > 0 AND ptc.deleted_at IS NULL
+      ) combined
+      WHERE 1=1${trainerFilter}
+      ORDER BY balance_amount DESC LIMIT 100`,
       params
     );
     res.json(rows);
