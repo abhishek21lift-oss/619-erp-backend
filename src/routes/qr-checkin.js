@@ -169,10 +169,13 @@ router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
     const isTrainer = req.user.role === 'trainer';
     if (!isAdmin && !isTrainer) return res.status(403).json({ error: 'Not authorized' });
 
-    // Trainers can only generate for their own clients
+    // Trainers can only generate for their own clients (gym and PT)
     if (isTrainer && type === 'client') {
       const { rows } = await pool.query(
-        'SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2',
+        `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
+         UNION
+         SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
+         LIMIT 1`,
         [id, req.user.trainer_id]
       );
       if (!rows[0]) return res.status(403).json({ error: 'Client not assigned to you' });

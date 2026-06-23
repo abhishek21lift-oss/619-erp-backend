@@ -12,7 +12,10 @@ const { randomUUID } = require('crypto');
 const router = express.Router();
 router.use(auth);
 
-const LATE_HOUR = 10; // 10:00 AM — consistent with attendance.js
+async function getLateHour() {
+  const { rows } = await pool.query("SELECT value FROM system_settings WHERE key = 'late_threshold_hour' LIMIT 1");
+  return rows[0] ? parseInt(rows[0].value) : 10;
+}
 
 function verificationMethodToLogMethod(vm) {
   if (!vm) return 'passkey';
@@ -33,7 +36,8 @@ router.post('/mark', async (req, res, next) => {
 
     const today = new Date().toISOString().split('T')[0];
     const now   = new Date();
-    const isLate = now.getHours() >= LATE_HOUR;
+    const lateHour = await getLateHour();
+    const isLate = now.getHours() >= lateHour;
     const status = isLate ? 'late' : 'present';
     const method = verificationMethodToLogMethod(verificationMethod);
     const location = (latitude != null && longitude != null) ? `${latitude},${longitude}` : null;
@@ -126,16 +130,12 @@ router.get('/today', async (req, res, next) => {
        LIMIT 200`
     );
 
-    const lateThreshold = new Date();
-    lateThreshold.setHours(LATE_HOUR, 0, 0, 0);
-
     const present = rows.filter(r => r.check_out_at).length;
     const active  = rows.filter(r => !r.check_out_at).length;
     const late    = rows.filter(r => r.status === 'late').length;
 
     res.json({
       present,
-      absent: 0,
       late,
       active,
       feed: rows.slice(0, 50).map(r => ({
