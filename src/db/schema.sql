@@ -70,10 +70,15 @@ CREATE TABLE IF NOT EXISTS trainers (
   name             TEXT        NOT NULL,
   email            TEXT,
   mobile           TEXT,
+  dob              DATE,
+  gender           TEXT        CHECK (gender IN ('Male','Female','Other') OR gender IS NULL),
+  address          TEXT,
+  role             TEXT        NOT NULL DEFAULT 'Personal Trainer',
   specialization   TEXT,
   bio              TEXT,
   schedule         TEXT,
-  certifications   TEXT[],
+  certifications   TEXT,        -- comma-separated string (e.g. "K11 Fitness, ACE Certified")
+  salary           NUMERIC(12,2) NOT NULL DEFAULT 0,
   incentive_rate   NUMERIC(5,4) NOT NULL DEFAULT 0.5
                                CHECK (incentive_rate BETWEEN 0 AND 1),
   status           TEXT        NOT NULL DEFAULT 'active'
@@ -81,6 +86,9 @@ CREATE TABLE IF NOT EXISTS trainers (
   joining_date     DATE,
   photo_url        TEXT,
   branch_id        TEXT,
+  notes            TEXT,
+  biometric_code   TEXT,
+  biometric_added  BOOLEAN     NOT NULL DEFAULT FALSE,
   deleted_at       TIMESTAMPTZ,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
