@@ -345,7 +345,7 @@ router.get('/stats', auth, async function(req, res, next) {
       'SELECT ' + dateTrunc + ' AS period, ' +
       'a.status, COUNT(*) AS count ' +
       'FROM attendance_logs a ' +
-      'JOIN users u ON u.id = a.marked_by ' +
+      'LEFT JOIN users u ON u.id = a.marked_by ' +
       'WHERE a.date >= $1 AND a.date <= $2 ' + trainerFilter +
       'AND a.ref_type = \'client\' ' +
       'GROUP BY period, a.status ' +

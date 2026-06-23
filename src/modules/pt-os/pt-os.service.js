@@ -2,51 +2,46 @@ const pool = require('../../db/pool');
 
 async function calculateMonthlyCommissions(month) {
   const monthStart = `${month}-01`;
-  const conn = await pool.connect();
-  try {
-    const mStart = new Date(monthStart + 'T00:00:00Z');
-    const mEnd = new Date(mStart.getFullYear(), mStart.getMonth() + 1, 1);
-    const mEndStr = mEnd.toISOString().slice(0, 10);
+  const mStart = new Date(monthStart + 'T00:00:00Z');
+  const mEnd = new Date(mStart.getFullYear(), mStart.getMonth() + 1, 1);
+  const mEndStr = mEnd.toISOString().slice(0, 10);
 
-    const { rows: clients } = await pool.query(`
-      SELECT c.id, c.name, c.trainer_id, c.trainer_name,
-             c.monthly_pt_amount, c.trainer_commission,
-             t.incentive_rate
-      FROM pt_clients c
-      JOIN pt_trainers t ON t.id = c.trainer_id
-      WHERE c.deleted_at IS NULL
-        AND c.status IN ('active','frozen')
-        AND c.trainer_id IS NOT NULL
-        AND c.pt_start_date IS NOT NULL
-        AND (c.pt_end_date IS NULL OR NULLIF(c.pt_end_date, '')::DATE >= $1::DATE)
-        AND c.pt_start_date <= $2
-        AND c.monthly_pt_amount > 0
-    `, [mStart.toISOString().slice(0, 10), mEndStr]);
+  const { rows: clients } = await pool.query(`
+    SELECT c.id, c.name, c.trainer_id, c.trainer_name,
+           c.monthly_pt_amount, c.trainer_commission,
+           t.incentive_rate
+    FROM pt_clients c
+    JOIN pt_trainers t ON t.id = c.trainer_id
+    WHERE c.deleted_at IS NULL
+      AND c.status IN ('active','frozen')
+      AND c.trainer_id IS NOT NULL
+      AND c.pt_start_date IS NOT NULL
+      AND (c.pt_end_date IS NULL OR NULLIF(c.pt_end_date, '')::DATE >= $1::DATE)
+      AND c.pt_start_date <= $2
+      AND c.monthly_pt_amount > 0
+  `, [mStart.toISOString().slice(0, 10), mEndStr]);
 
-    const results = [];
-    for (const cl of clients) {
-      const commission = Number(cl.trainer_commission);
-      const { rows } = await pool.query(`
-        INSERT INTO pt_commissions
-          (trainer_id, trainer_name, client_id, client_name,
-           month, commission_amt, incentive_rate, status)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
-        ON CONFLICT (trainer_id, client_id, month)
-        DO UPDATE SET commission_amt = EXCLUDED.commission_amt,
-                      incentive_rate = EXCLUDED.incentive_rate,
-                      updated_at = NOW()
-        RETURNING *
-      `, [
-        cl.trainer_id, cl.trainer_name,
-        cl.id, cl.name,
-        monthStart, commission, cl.incentive_rate,
-      ]);
-      results.push(rows[0]);
-    }
-    return { count: results.length, total: results.reduce((s, r) => s + Number(r.commission_amt), 0) };
-  } finally {
-    conn.release();
+  const results = [];
+  for (const cl of clients) {
+    const commission = Number(cl.trainer_commission);
+    const { rows } = await pool.query(`
+      INSERT INTO pt_commissions
+        (trainer_id, trainer_name, client_id, client_name,
+         month, commission_amt, incentive_rate, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
+      ON CONFLICT (trainer_id, client_id, month)
+      DO UPDATE SET commission_amt = EXCLUDED.commission_amt,
+                    incentive_rate = EXCLUDED.incentive_rate,
+                    updated_at = NOW()
+      RETURNING *
+    `, [
+      cl.trainer_id, cl.trainer_name,
+      cl.id, cl.name,
+      monthStart, commission, cl.incentive_rate,
+    ]);
+    results.push(rows[0]);
   }
+  return { count: results.length, total: results.reduce((s, r) => s + Number(r.commission_amt), 0) };
 }
 
 async function getTrainerPayouts(month) {

@@ -226,12 +226,24 @@ router.post('/branding/upload-logo', auth, adminOnly, async (req, res, next) => 
       return res.status(400).json({ error: 'Invalid base64 image format. Allowed types: jpeg, png, webp, gif' });
 
     const ext = matches[1];
-    const data = Buffer.from(matches[2], 'base64');
+    const decoded = Buffer.from(matches[2], 'base64');
+    if (decoded.length > 512 * 1024) {
+      return res.status(413).json({ error: 'Image too large. Maximum size is 512 KB.' });
+    }
+
     const uploadsDir = path.join(__dirname, '..', '..', 'uploads', 'branding');
     if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
+    // Clean up old file for this key if it exists
+    try {
+      const existing = fs.readdirSync(uploadsDir).filter(f => f.startsWith(key + '-'));
+      for (const oldFile of existing) {
+        fs.unlinkSync(path.join(uploadsDir, oldFile));
+      }
+    } catch (_) { /* ignore cleanup errors */ }
+
     const filename = `${key}-${Date.now()}.${ext}`;
-    fs.writeFileSync(path.join(uploadsDir, filename), data);
+    fs.writeFileSync(path.join(uploadsDir, filename), decoded);
 
     const url = `/uploads/branding/${filename}`;
     res.json({ message: 'Uploaded', url });

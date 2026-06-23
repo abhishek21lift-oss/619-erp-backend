@@ -29,11 +29,13 @@ const authSchemas = {
   },
 };
 
+const mobileSchema = z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable();
+
 const clientSchemas = {
   create: {
     body: z.object({
       name: z.string().min(1, 'Name is required').max(255).transform(function(v) { return v.trim(); }),
-      mobile: z.string().max(20).optional().nullable(),
+      mobile: mobileSchema,
       email: emailOptional,
       gender: z.string().max(20).optional().nullable(),
       dob: z.string().optional().nullable(),
@@ -60,7 +62,7 @@ const clientSchemas = {
   update: {
     body: z.object({
       name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }).optional(),
-      mobile: z.string().max(20).optional().nullable(),
+      mobile: mobileSchema,
       email: emailOptional,
       gender: z.string().max(20).optional().nullable(),
       dob: z.string().optional().nullable(),
@@ -139,7 +141,7 @@ const staffSchemas = {
     body: z.object({
       name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }),
       email: emailOptional,
-      phone: z.string().max(20).optional().nullable(),
+      phone: mobileSchema,
       role: z.string().min(1, 'Role is required'),
       status: z.string().optional(),
     }),
@@ -150,7 +152,7 @@ const trainerSchemas = {
   create: {
     body: z.object({
       name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }),
-      mobile: z.string().max(20).optional().nullable(),
+      mobile: mobileSchema,
       email: emailOptional,
       dob: z.string().optional().nullable(),
       gender: z.string().max(20).optional().nullable(),
