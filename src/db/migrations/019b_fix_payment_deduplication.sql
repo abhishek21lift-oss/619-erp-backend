@@ -8,5 +8,5 @@ WHERE EXISTS (
   WHERE pp.amount = p.amount
     AND pp.client_id = p.client_id
     AND pp.date = p.date
-    AND pp.method = p.method
+    AND pp.payment_method = p.method
 );
