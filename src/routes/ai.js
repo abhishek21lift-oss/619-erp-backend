@@ -1,18 +1,18 @@
 // src/routes/ai.js
-// 619 Fitness AI Coach — chat, conversation management, usage, and provider settings.
+// 619 Fitness AI Coach — chat, conversations, usage, and provider status.
+// All AI calls route through Token Router → MiniMax-M3 (ai.service.js).
 'use strict';
 
 const router    = require('express').Router();
 const pool      = require('../db/pool');
 const logger    = require('../lib/logger');
-const aiRouter  = require('../lib/ai-router');
+const ai        = require('../lib/ai.service');
 const { auth, adminOnly } = require('../middleware/auth');
 
 // ── POST /api/ai/chat ─────────────────────────────────────────────────────────
-// Creates or continues a conversation. Streams the response as SSE.
 router.post('/chat', auth, async (req, res) => {
-  if (!aiRouter.isConfigured()) {
-    return res.status(501).json({ error: 'AI Coach is not configured. Set OPENAI_API_KEY or GEMINI_API_KEY.' });
+  if (!ai.isConfigured()) {
+    return res.status(501).json({ error: 'AI Coach is not configured. Set TOKEN_ROUTER_API_KEY.' });
   }
 
   try {
@@ -20,8 +20,7 @@ router.post('/chat', auth, async (req, res) => {
     if (!message?.trim()) return res.status(400).json({ error: 'Message is required' });
     if (message.length > 4000) return res.status(400).json({ error: 'Message too long (max 4000 chars)' });
 
-    // Rate limit check (shared — counts messages regardless of provider)
-    await aiRouter.checkRateLimit(req.user.id, req.user.role);
+    await ai.checkRateLimit(req.user.id, req.user.role);
 
     // Resolve or create conversation
     let convId = conversation_id;
@@ -35,7 +34,6 @@ router.post('/chat', auth, async (req, res) => {
       convId = rows[0].id;
       res.setHeader('X-Conversation-Id', convId);
     } else {
-      // Verify ownership
       const { rows } = await pool.query(
         'SELECT id FROM ai_conversations WHERE id = $1 AND user_id = $2',
         [convId, req.user.id]
@@ -43,7 +41,7 @@ router.post('/chat', auth, async (req, res) => {
       if (!rows[0]) return res.status(403).json({ error: 'Conversation not found' });
     }
 
-    await aiRouter.streamChat({
+    await ai.streamChat({
       userId:         req.user.id,
       userRole:       req.user.role,
       conversationId: convId,
@@ -61,7 +59,7 @@ router.post('/chat', auth, async (req, res) => {
 // ── GET /api/ai/conversations ─────────────────────────────────────────────────
 router.get('/conversations', auth, async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit) || 30, 100);
+    const limit = Math.min(parseInt(req.query.limit) || 30, 100);
     const { rows } = await pool.query(
       `SELECT id, title, client_id, created_at, updated_at,
               (SELECT content FROM ai_messages WHERE conversation_id = ai_conversations.id
@@ -117,7 +115,7 @@ router.get('/usage', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT
-         COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS messages_this_hour,
+         COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour')  AS messages_this_hour,
          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS messages_today,
          COALESCE(SUM(tokens_total) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours'), 0) AS tokens_today
        FROM ai_usage_log WHERE user_id = $1`,
@@ -131,33 +129,19 @@ router.get('/usage', auth, async (req, res) => {
 
 // ── GET /api/ai/provider-settings  (admin only) ───────────────────────────────
 router.get('/provider-settings', auth, adminOnly, async (req, res) => {
-  try {
-    const settings = await aiRouter.getSettings();
-    res.json({ data: settings });
-  } catch (err) {
-    logger.error({ err: err.message }, 'Get provider settings error');
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ── PUT /api/ai/provider-settings  (admin only) ───────────────────────────────
-router.put('/provider-settings', auth, adminOnly, async (req, res) => {
-  try {
-    const { mode, gemini_model } = req.body;
-    if (!mode && !gemini_model) return res.status(400).json({ error: 'mode or gemini_model is required' });
-    await aiRouter.updateSettings({ mode, gemini_model });
-    res.json({ message: 'Provider settings updated', mode, gemini_model });
-  } catch (err) {
-    if (err.status === 400) return res.status(400).json({ error: err.message });
-    logger.error({ err: err.message }, 'Update provider settings error');
-    res.status(500).json({ error: 'Server error' });
-  }
+  res.json({
+    data: {
+      provider:   'Token Router',
+      model:      ai.MODEL,
+      configured: ai.isConfigured(),
+    },
+  });
 });
 
 // ── GET /api/ai/provider-stats  (admin only) ──────────────────────────────────
 router.get('/provider-stats', auth, adminOnly, async (req, res) => {
   try {
-    const stats = await aiRouter.getStats();
+    const stats = await ai.getStats();
     res.json({ data: stats });
   } catch (err) {
     logger.error({ err: err.message }, 'Get provider stats error');
@@ -168,9 +152,7 @@ router.get('/provider-stats', auth, adminOnly, async (req, res) => {
 // ── POST /api/ai/test-provider  (admin only) ──────────────────────────────────
 router.post('/test-provider', auth, adminOnly, async (req, res) => {
   try {
-    const { provider } = req.body;
-    if (!provider) return res.status(400).json({ error: 'provider is required' });
-    const result = await aiRouter.testProvider(provider);
+    const result = await ai.testConnection();
     res.json(result);
   } catch (err) {
     logger.error({ err: err.message }, 'Test provider error');
