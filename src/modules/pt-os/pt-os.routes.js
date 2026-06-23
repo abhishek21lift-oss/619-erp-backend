@@ -747,4 +747,10 @@ router.post('/clients/merge-duplicates', auth, adminOnly, wrap(async (req, res) 
   }
 }));
 
+// ─── Operations Summary (today's sessions, renewals, dues) ──────────────────
+router.get('/dashboard/ops', auth, wrap(async (req, res) => {
+  const data = await svc.getOpsSummary();
+  res.json({ data });
+}));
+
 module.exports = router;
