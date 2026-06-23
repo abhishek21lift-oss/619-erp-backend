@@ -1,8 +1,10 @@
 'use strict';
 const express = require('express');
 const crypto  = require('crypto');
+const jwt     = require('jsonwebtoken');
 const pool = require('../db/pool');
-const { auth } = require('../middleware/auth');
+const { auth, adminOnly } = require('../middleware/auth');
+const logger = require('../lib/logger');
 
 const router = express.Router();
 
@@ -12,12 +14,87 @@ const authnLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHead
 const RP_ID   = process.env.RP_ID   || 'localhost';
 const RP_NAME = process.env.RP_NAME || '619 Fitness';
 const ORIGIN  = process.env.WEBAUTHN_ORIGIN || `https://${RP_ID}`;
+const isProd = process.env.NODE_ENV === 'production';
+
+function setTokenCookie(res, token) {
+  res.cookie('token', token, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: 'strict',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: '/',
+  });
+}
 
 // Lazy-load @simplewebauthn/server so missing package fails at call-time, not startup
 let _wauthn = null;
 function wauthn() {
   if (!_wauthn) _wauthn = require('@simplewebauthn/server');
   return _wauthn;
+}
+
+function pickPayload(body, key) {
+  if (body && body[key] && typeof body[key] === 'object') return body[key];
+  return body || {};
+}
+
+async function findUserByMemberId(memberId) {
+  if (!memberId) return null;
+  const { rows } = await pool.query(
+    `SELECT id, name, email, role, trainer_id, member_id, token_version
+       FROM users
+      WHERE member_id = $1 AND is_active = true
+      ORDER BY updated_at DESC
+      LIMIT 1`,
+    [memberId]
+  );
+  return rows[0] || null;
+}
+
+async function findUserByEmail(email) {
+  if (!email) return null;
+  const { rows } = await pool.query(
+    `SELECT id, name, email, role, trainer_id, member_id, token_version
+       FROM users
+      WHERE LOWER(email) = LOWER($1) AND is_active = true
+      ORDER BY updated_at DESC
+      LIMIT 1`,
+    [email]
+  );
+  return rows[0] || null;
+}
+
+function memberIdFromRequest(req, fallback) {
+  return req.user?.member_id || fallback || null;
+}
+
+function issueActionToken(user) {
+  return jwt.sign(
+    { id: user.id, purpose: 'webauthn_action' },
+    process.env.JWT_SECRET,
+    { expiresIn: '5m' }
+  );
+}
+
+async function logWebauthnEvent(req, action, detail) {
+  try {
+    await pool.query(
+      `INSERT INTO activity_log
+         (user_id, user_name, action, entity_type, entity_id, new_data, ip_address, user_agent)
+       VALUES ($1, $2, $3, 'webauthn', $4, $5, $6, $7)`,
+      [
+        req.user?.id || null,
+        req.user?.name || null,
+        action,
+        detail?.entity_id || null,
+        detail || {},
+        req.ip || null,
+        req.get('user-agent') || null,
+      ]
+    );
+  } catch (err) {
+    logger.warn({ err: err.message, action }, 'Failed to write webauthn activity log');
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -69,7 +146,8 @@ router.get('/member-search', auth, async (req, res, next) => {
 // GET /api/webauthn/register/begin?member_id=xxx
 router.get('/register/begin', auth, async (req, res, next) => {
   try {
-    const { member_id } = req.query;
+    const requestedMemberId = req.query.member_id || req.query.memberId || null;
+    const member_id = memberIdFromRequest(req, requestedMemberId);
     if (!member_id) return res.status(400).json({ error: 'member_id is required' });
 
     // Search both regular clients and PT clients
@@ -116,7 +194,16 @@ router.get('/register/begin', auth, async (req, res, next) => {
 // POST /api/webauthn/register/complete
 router.post('/register/complete', auth, async (req, res, next) => {
   try {
-    const { memberId, deviceName, credentialId, rawId, transports, deviceType, attestationObject, clientDataJSON } = req.body;
+    const registration = pickPayload(req.body, 'registration');
+    const memberId = memberIdFromRequest(req, req.body?.memberId || req.body?.member_id);
+    const deviceName = req.body?.deviceName || req.body?.device_name || 'Passkey';
+    const credentialId = registration?.id || req.body?.credentialId;
+    const rawId = registration?.rawId || req.body?.rawId;
+    const transports = registration?.response?.transports || req.body?.transports || [];
+    const deviceType = req.body?.deviceType || req.body?.device_type || 'unknown';
+    const attestationObject = registration?.response?.attestationObject || req.body?.attestationObject;
+    const clientDataJSON = registration?.response?.clientDataJSON || req.body?.clientDataJSON;
+
     if (!memberId || !credentialId) return res.status(400).json({ error: 'memberId and credentialId are required' });
 
     const challenge = await pool.query(
@@ -158,8 +245,15 @@ router.post('/register/complete', auth, async (req, res, next) => {
        RETURNING id`,
       [memberId, credIdB64, publicKeyB64, counter,
        deviceName || 'Passkey', deviceType || 'unknown',
-       transports ? `{${transports.join(',')}}` : null]
+       Array.isArray(transports) ? transports : null]
     );
+
+    await logWebauthnEvent(req, 'webauthn_registered', {
+      entity_id: cred.rows[0].id,
+      member_id: memberId,
+      credential_id: credIdB64,
+      device_name: deviceName || 'Passkey',
+    });
 
     res.json({ success: true, credential: { id: cred.rows[0].id } });
   } catch (err) {
@@ -171,7 +265,14 @@ router.post('/register/complete', auth, async (req, res, next) => {
 // GET /api/webauthn/authenticate/begin?member_id=xxx
 router.get('/authenticate/begin', authnLimiter, async (req, res, next) => {
   try {
-    const { member_id } = req.query;
+    const email = String(req.query.email || req.body?.email || '').trim();
+    const requestedMemberId = req.query.member_id || req.query.memberId || req.body?.memberId || req.body?.member_id || null;
+    let member_id = memberIdFromRequest(req, requestedMemberId);
+
+    if (!member_id && email) {
+      const user = await findUserByEmail(email);
+      member_id = user?.member_id || null;
+    }
 
     let allowCredentials = [];
     if (member_id) {
@@ -203,7 +304,13 @@ router.get('/authenticate/begin', authnLimiter, async (req, res, next) => {
 // POST /api/webauthn/authenticate/complete
 router.post('/authenticate/complete', authnLimiter, async (req, res, next) => {
   try {
-    const { credentialId, rawId, authenticatorData, signature, clientDataJSON, userHandle } = req.body;
+    const authentication = pickPayload(req.body, 'authentication');
+    const credentialId = authentication?.id || req.body?.credentialId || req.body?.credential_id;
+    const rawId = authentication?.rawId || req.body?.rawId;
+    const authenticatorData = authentication?.response?.authenticatorData || req.body?.authenticatorData;
+    const signature = authentication?.response?.signature || req.body?.signature;
+    const clientDataJSON = authentication?.response?.clientDataJSON || req.body?.clientDataJSON;
+    const userHandle = authentication?.response?.userHandle || req.body?.userHandle;
     if (!credentialId) return res.status(400).json({ error: 'credentialId is required' });
 
     const credRow = await pool.query(
@@ -215,8 +322,11 @@ router.post('/authenticate/complete', authnLimiter, async (req, res, next) => {
 
     const challengeRow = await pool.query(
       `SELECT challenge FROM webauthn_challenges
-       WHERE type = 'authentication' AND expires_at > NOW()
-       ORDER BY created_at DESC LIMIT 1`
+       WHERE type = 'authentication'
+         AND expires_at > NOW()
+         AND ($1::text IS NULL OR member_id = $1)
+       ORDER BY created_at DESC LIMIT 1`,
+      [cred.member_id]
     );
     if (!challengeRow.rows.length) return res.status(400).json({ error: 'No valid challenge. Please restart authentication.' });
 
@@ -253,7 +363,36 @@ router.post('/authenticate/complete', authnLimiter, async (req, res, next) => {
       const { rows: mr2 } = await pool.query('SELECT id, name FROM pt_clients WHERE id = $1', [cred.member_id]);
       if (mr2.length) m = mr2[0];
     }
-    res.json({ success: true, memberId: m?.id, memberName: m?.name });
+    const user = await findUserByMemberId(cred.member_id);
+    if (!user) return res.status(404).json({ error: 'No user account is linked to this passkey' });
+
+    const token = jwt.sign(
+      { id: user.id, token_version: user.token_version ?? 0 },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+    setTokenCookie(res, token);
+
+    await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]).catch(() => {});
+    await logWebauthnEvent(req, 'webauthn_login_success', {
+      entity_id: cred.member_id,
+      credential_id: credentialId,
+      member_id: cred.member_id,
+    });
+
+    res.json({
+      success: true,
+      memberId: m?.id,
+      memberName: m?.name,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        trainer_id: user.trainer_id,
+        member_id: user.member_id,
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -263,7 +402,7 @@ router.post('/authenticate/complete', authnLimiter, async (req, res, next) => {
 // GET /api/webauthn/credentials?member_id=xxx
 router.get('/credentials', auth, async (req, res, next) => {
   try {
-    const { member_id } = req.query;
+    const member_id = memberIdFromRequest(req, req.query.member_id || req.query.memberId || null);
     if (!member_id) return res.status(400).json({ error: 'member_id is required' });
     const result = await pool.query(
       `SELECT id, device_name, device_type, created_at, last_used_at
@@ -279,11 +418,19 @@ router.get('/credentials', auth, async (req, res, next) => {
 // DELETE /api/webauthn/credentials/:id
 router.delete('/credentials/:id', auth, async (req, res, next) => {
   try {
+    const existing = await pool.query(
+      'SELECT id, member_id FROM webauthn_credentials WHERE id = $1',
+      [req.params.id]
+    );
+    if (!existing.rows.length) return res.status(404).json({ error: 'Credential not found' });
+    const member_id = memberIdFromRequest(req, null);
+    if (req.user?.role !== 'admin' && member_id !== existing.rows[0].member_id) {
+      return res.status(403).json({ error: 'Not authorized to remove this credential' });
+    }
     const result = await pool.query(
       'DELETE FROM webauthn_credentials WHERE id = $1 RETURNING id',
       [req.params.id]
     );
-    if (!result.rows.length) return res.status(404).json({ error: 'Credential not found' });
     res.json({ success: true });
   } catch (err) {
     next(err);
