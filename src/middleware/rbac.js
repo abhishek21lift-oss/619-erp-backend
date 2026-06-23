@@ -49,7 +49,10 @@ function requireTrainerOwnership(pool, paramName = 'id') {
     const memberId = req.params[paramName];
     try {
       const { rows } = await pool.query(
-        `SELECT 1 FROM members WHERE id = $1 AND primary_trainer_id = $2 LIMIT 1`,
+        `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
+         UNION
+         SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
+         LIMIT 1`,
         [memberId, req.user.trainer_id]
       );
       if (rows.length === 0) {

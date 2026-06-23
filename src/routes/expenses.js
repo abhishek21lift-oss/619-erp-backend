@@ -3,10 +3,11 @@ const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 
 // GET /api/expenses — list expenses with optional filters
+// ISSUE-030: excludes soft-deleted rows (deleted_at IS NULL).
 router.get('/', auth, async (req, res, next) => {
   try {
     const { from, to, category, status, limit: qLimit, offset } = req.query;
-    const conditions = ['1=1'];
+    const conditions = ['1=1', 'e.deleted_at IS NULL'];
     const params = [];
     let p = 1;
 
@@ -45,10 +46,11 @@ router.get('/', auth, async (req, res, next) => {
 });
 
 // GET /api/expenses/stats — aggregated expense stats
+// ISSUE-030: excludes soft-deleted rows.
 router.get('/stats', auth, async (req, res, next) => {
   try {
     const { from, to } = req.query;
-    const conditions = ['1=1'];
+    const conditions = ['1=1', 'e.deleted_at IS NULL'];
     const params = [];
     let p = 1;
 
@@ -111,13 +113,14 @@ router.post('/', auth, async (req, res, next) => {
 });
 
 // GET /api/expenses/:id — get a single expense
+// ISSUE-030: excludes soft-deleted rows.
 router.get('/:id', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       `SELECT e.*, u.name AS created_by_name
        FROM expenses e
        LEFT JOIN users u ON u.id = e.created_by
-       WHERE e.id = $1`,
+       WHERE e.id = $1 AND e.deleted_at IS NULL`,
       [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Expense not found' });
@@ -128,10 +131,11 @@ router.get('/:id', auth, async (req, res, next) => {
 });
 
 // PUT /api/expenses/:id — update an expense
+// ISSUE-030: also checks deleted_at IS NULL so soft-deleted expenses cannot be updated.
 router.put('/:id', auth, async (req, res, next) => {
   try {
     const { rows: existing } = await pool.query(
-      'SELECT * FROM expenses WHERE id = $1', [req.params.id]
+      'SELECT * FROM expenses WHERE id = $1 AND deleted_at IS NULL', [req.params.id]
     );
     if (!existing[0]) return res.status(404).json({ error: 'Expense not found' });
 
@@ -164,11 +168,12 @@ router.put('/:id', auth, async (req, res, next) => {
   }
 });
 
-// DELETE /api/expenses/:id — delete an expense
+// DELETE /api/expenses/:id — soft-delete an expense
+// ISSUE-030: changed from hard DELETE to soft delete via deleted_at timestamp.
 router.delete('/:id', auth, async (req, res, next) => {
   try {
     const { rows: existing } = await pool.query(
-      'SELECT * FROM expenses WHERE id = $1', [req.params.id]
+      'SELECT * FROM expenses WHERE id = $1 AND deleted_at IS NULL', [req.params.id]
     );
     if (!existing[0]) return res.status(404).json({ error: 'Expense not found' });
 
@@ -176,7 +181,7 @@ router.delete('/:id', auth, async (req, res, next) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    await pool.query('DELETE FROM expenses WHERE id = $1', [req.params.id]);
+    await pool.query('UPDATE expenses SET deleted_at = NOW() WHERE id = $1', [req.params.id]);
     res.json({ message: 'Expense deleted' });
   } catch (err) {
     next(err);

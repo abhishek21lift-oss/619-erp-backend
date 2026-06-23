@@ -2,9 +2,41 @@ const router = require('express').Router();
 const pool = require('../../db/pool');
 const { auth, adminOnly, adminOrManager } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
+const { validate } = require('../../middleware/validate');
+const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
 const { generateClientId, generateMemberCode } = require('../../db/id-gen');
+
+const ptClientCreateSchema = {
+  body: z.object({
+    name: z.string().min(1).max(255),
+    mobile: z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable(),
+    email: z.string().email().optional().nullable(),
+    dob: z.string().optional().nullable(),
+    gender: z.string().max(20).optional().nullable(),
+    trainer_id: z.string().uuid().optional().nullable(),
+    goal: z.string().max(100).optional().nullable(),
+    height: z.number().optional().nullable(),
+    weight: z.number().optional().nullable(),
+    body_fat: z.number().optional().nullable(),
+    health_conditions: z.string().max(500).optional().nullable(),
+    injuries: z.string().max(500).optional().nullable(),
+    frequency: z.string().max(50).optional().nullable(),
+    notes: z.string().max(2000).optional().nullable(),
+    monthly_pt_amount: z.number().optional().nullable(),
+    base_amount: z.number().optional().nullable(),
+    discount: z.number().optional().nullable(),
+    pt_start_date: z.string().optional().nullable(),
+    pt_end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(d => !isNaN(Date.parse(d)), 'Invalid date'),
+    pt_package_id: z.string().optional().nullable(),
+    client_id: z.string().optional().nullable(),
+    package_type: z.string().optional().nullable(),
+    duration_months: z.number().optional().nullable(),
+    base_price: z.number().optional().nullable(),
+    selling_price: z.number().optional().nullable(),
+  }),
+};
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -107,7 +139,7 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
 }));
 
 // ─── Create / enroll client in PT ───────────────────────────
-router.post('/clients', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
+router.post('/clients', auth, requireRole('admin','manager','trainer'), validate(ptClientCreateSchema), wrap(async (req, res) => {
       try {
         const {
           client_id, name, gender, mobile, email, dob,
@@ -745,6 +777,12 @@ router.post('/clients/merge-duplicates', auth, adminOnly, wrap(async (req, res) 
   } finally {
     client.release();
   }
+}));
+
+// ─── Operations Summary (today's sessions, renewals, dues) ──────────────────
+router.get('/dashboard/ops', auth, wrap(async (req, res) => {
+  const data = await svc.getOpsSummary();
+  res.json({ data });
 }));
 
 module.exports = router;

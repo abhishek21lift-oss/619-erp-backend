@@ -4,6 +4,8 @@ const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
 
 // GET /api/reports/monthly
+// ISSUE-029: UNIONs gym payments with PT payments so the monthly
+// revenue figures include both revenue streams.
 router.get('/monthly', auth, async (req, res, next) => {
   try {
     const { year = new Date().getFullYear() } = req.query;
@@ -14,15 +16,32 @@ router.get('/monthly', auth, async (req, res, next) => {
 
     const { rows } = await pool.query(`
       SELECT
-        EXTRACT(MONTH FROM p.date::date) AS month_num,
-        TO_CHAR(DATE_TRUNC('month', p.date::date), 'Month') AS month_name,
+        month_num,
+        month_name,
         COUNT(*) AS payment_count,
-        COALESCE(SUM(p.amount),0) AS revenue,
-        COALESCE(SUM(p.incentive_amt),0) AS incentives
-      FROM payments p
-      WHERE EXTRACT(YEAR FROM p.date::date) = $1
-        AND p.deleted_at IS NULL
-        ${trainerWhere}
+        COALESCE(SUM(revenue), 0) AS revenue,
+        COALESCE(SUM(incentives), 0) AS incentives
+      FROM (
+        SELECT
+          EXTRACT(MONTH FROM p.date::date) AS month_num,
+          TO_CHAR(DATE_TRUNC('month', p.date::date), 'Month') AS month_name,
+          p.amount AS revenue,
+          p.incentive_amt AS incentives
+        FROM payments p
+        WHERE EXTRACT(YEAR FROM p.date::date) = $1
+          AND p.deleted_at IS NULL
+          ${trainerWhere}
+        UNION ALL
+        SELECT
+          EXTRACT(MONTH FROM p.date::date) AS month_num,
+          TO_CHAR(DATE_TRUNC('month', p.date::date), 'Month') AS month_name,
+          p.amount AS revenue,
+          p.incentive_amt AS incentives
+        FROM pt_payments p
+        WHERE EXTRACT(YEAR FROM p.date::date) = $1
+          AND p.deleted_at IS NULL
+          ${trainerWhere}
+      ) combined
       GROUP BY month_num, month_name
       ORDER BY month_num`, params
     );
@@ -33,17 +52,26 @@ router.get('/monthly', auth, async (req, res, next) => {
 });
 
 // GET /api/reports/trainer-summary (admin only)
+// ISSUE-021: after migration 017/018, PT clients live in pt_clients and PT
+// payments live in pt_payments. Both tables are joined so the summary
+// includes gym clients + PT clients and gym payments + PT payments.
 router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
   try {
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
-        COUNT(DISTINCT c.id) FILTER (WHERE c.status='active' AND c.deleted_at IS NULL) AS active_clients,
-        COUNT(DISTINCT c.id) FILTER (WHERE c.deleted_at IS NULL) AS total_clients,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.date >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),0) AS month_revenue,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL),0) AS total_revenue
+        COUNT(DISTINCT c.id)   FILTER (WHERE c.status='active'   AND c.deleted_at IS NULL)   +
+        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
+        COUNT(DISTINCT c.id)   FILTER (WHERE c.deleted_at IS NULL)   +
+        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
+        COALESCE(SUM(p.amount)   FILTER (WHERE p.date   >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),   0) +
+        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.date >= DATE_TRUNC('month',NOW()) AND ptp.deleted_at IS NULL), 0) AS month_revenue,
+        COALESCE(SUM(p.amount)   FILTER (WHERE p.deleted_at IS NULL),   0) +
+        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.deleted_at IS NULL), 0) AS total_revenue
       FROM trainers t
-      LEFT JOIN clients  c ON c.trainer_id = t.id
-      LEFT JOIN payments p ON p.trainer_id = t.id
+      LEFT JOIN clients     c   ON c.trainer_id   = t.id
+      LEFT JOIN pt_clients  ptc ON ptc.trainer_id = t.id
+      LEFT JOIN payments    p   ON p.trainer_id   = t.id
+      LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
       WHERE t.status = 'active'
       GROUP BY t.id, t.name, t.specialization
       ORDER BY total_revenue DESC`
@@ -55,17 +83,24 @@ router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
 });
 
 // GET /api/reports/trainers — alias for /trainer-summary (used by frontend Reports page)
+// ISSUE-021: mirrors the fix above — includes pt_clients + pt_payments.
 router.get('/trainers', auth, adminOnly, async (req, res, next) => {
   try {
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
-        COUNT(DISTINCT c.id) FILTER (WHERE c.status='active' AND c.deleted_at IS NULL) AS active_clients,
-        COUNT(DISTINCT c.id) FILTER (WHERE c.deleted_at IS NULL) AS total_clients,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.date >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),0) AS month_revenue,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL),0) AS total_revenue
+        COUNT(DISTINCT c.id)   FILTER (WHERE c.status='active'   AND c.deleted_at IS NULL)   +
+        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
+        COUNT(DISTINCT c.id)   FILTER (WHERE c.deleted_at IS NULL)   +
+        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
+        COALESCE(SUM(p.amount)   FILTER (WHERE p.date   >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),   0) +
+        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.date >= DATE_TRUNC('month',NOW()) AND ptp.deleted_at IS NULL), 0) AS month_revenue,
+        COALESCE(SUM(p.amount)   FILTER (WHERE p.deleted_at IS NULL),   0) +
+        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.deleted_at IS NULL), 0) AS total_revenue
       FROM trainers t
-      LEFT JOIN clients  c ON c.trainer_id = t.id
-      LEFT JOIN payments p ON p.trainer_id = t.id
+      LEFT JOIN clients     c   ON c.trainer_id   = t.id
+      LEFT JOIN pt_clients  ptc ON ptc.trainer_id = t.id
+      LEFT JOIN payments    p   ON p.trainer_id   = t.id
+      LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
       WHERE t.status = 'active'
       GROUP BY t.id, t.name, t.specialization
       ORDER BY total_revenue DESC`
@@ -81,17 +116,27 @@ router.get('/dues', auth, async (req, res, next) => {
   try {
     const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
     const params = [];
-    let where = 'c.balance_amount > 0 AND c.deleted_at IS NULL';
+    let trainerFilter = '';
     if (tid) {
       params.push(tid);
-      where += ` AND c.trainer_id = $${params.length}`;
+      trainerFilter = ` AND trainer_id = $${params.length}`;
     }
     const { rows } = await pool.query(`
-      SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name,
-             c.balance_amount, c.pt_end_date, c.status
-      FROM clients c
-      WHERE ${where}
-      ORDER BY c.balance_amount DESC LIMIT 100`,
+      SELECT id, client_id, name, mobile, trainer_name,
+             balance_amount, pt_end_date, status
+      FROM (
+        SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name,
+               c.balance_amount, c.pt_end_date, c.status, c.trainer_id
+        FROM clients c
+        WHERE c.balance_amount > 0 AND c.deleted_at IS NULL
+        UNION ALL
+        SELECT ptc.id, NULL AS client_id, ptc.name, ptc.mobile, ptc.trainer_name,
+               ptc.balance_amount, ptc.pt_end_date, ptc.status, ptc.trainer_id
+        FROM pt_clients ptc
+        WHERE ptc.balance_amount > 0 AND ptc.deleted_at IS NULL
+      ) combined
+      WHERE 1=1${trainerFilter}
+      ORDER BY balance_amount DESC LIMIT 100`,
       params
     );
     res.json(rows);

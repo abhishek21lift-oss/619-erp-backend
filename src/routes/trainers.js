@@ -64,7 +64,7 @@ router.get('/', auth, async (req, res, next) => {
 // GET /api/trainers/:id  — full profile incl. clients + recent payments + KPIs
 router.get('/:id', auth, async (req, res, next) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM trainers WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT * FROM trainers WHERE id=$1 AND deleted_at IS NULL', [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Trainer not found' });
 
     const isAdmin = req.user.role === 'admin';
@@ -202,9 +202,14 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
 router.get('/:id/sessions', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT s.*, c.name AS client_name, c.mobile AS client_mobile
+      `WITH all_clients AS (
+         SELECT id, name, mobile FROM clients WHERE deleted_at IS NULL
+         UNION ALL
+         SELECT id, name, mobile FROM pt_clients WHERE deleted_at IS NULL
+       )
+       SELECT s.*, ac.name AS client_name, ac.mobile AS client_mobile
        FROM pt_sessions s
-       JOIN clients c ON c.id = s.client_id
+       LEFT JOIN all_clients ac ON ac.id = s.client_id
        WHERE s.trainer_id = $1
        ORDER BY s.session_date DESC, s.session_time DESC
        LIMIT 50`,

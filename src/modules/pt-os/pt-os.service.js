@@ -2,51 +2,46 @@ const pool = require('../../db/pool');
 
 async function calculateMonthlyCommissions(month) {
   const monthStart = `${month}-01`;
-  const conn = await pool.connect();
-  try {
-    const mStart = new Date(monthStart + 'T00:00:00Z');
-    const mEnd = new Date(mStart.getFullYear(), mStart.getMonth() + 1, 1);
-    const mEndStr = mEnd.toISOString().slice(0, 10);
+  const mStart = new Date(monthStart + 'T00:00:00Z');
+  const mEnd = new Date(mStart.getFullYear(), mStart.getMonth() + 1, 1);
+  const mEndStr = mEnd.toISOString().slice(0, 10);
 
-    const { rows: clients } = await pool.query(`
-      SELECT c.id, c.name, c.trainer_id, c.trainer_name,
-             c.monthly_pt_amount, c.trainer_commission,
-             t.incentive_rate
-      FROM pt_clients c
-      JOIN pt_trainers t ON t.id = c.trainer_id
-      WHERE c.deleted_at IS NULL
-        AND c.status IN ('active','frozen')
-        AND c.trainer_id IS NOT NULL
-        AND c.pt_start_date IS NOT NULL
-        AND (c.pt_end_date IS NULL OR NULLIF(c.pt_end_date, '')::DATE >= $1::DATE)
-        AND c.pt_start_date <= $2
-        AND c.monthly_pt_amount > 0
-    `, [mStart.toISOString().slice(0, 10), mEndStr]);
+  const { rows: clients } = await pool.query(`
+    SELECT c.id, c.name, c.trainer_id, c.trainer_name,
+           c.monthly_pt_amount, c.trainer_commission,
+           t.incentive_rate
+    FROM pt_clients c
+    JOIN pt_trainers t ON t.id = c.trainer_id
+    WHERE c.deleted_at IS NULL
+      AND c.status IN ('active','frozen')
+      AND c.trainer_id IS NOT NULL
+      AND c.pt_start_date IS NOT NULL
+      AND (c.pt_end_date IS NULL OR NULLIF(c.pt_end_date, '')::DATE >= $1::DATE)
+      AND c.pt_start_date <= $2
+      AND c.monthly_pt_amount > 0
+  `, [mStart.toISOString().slice(0, 10), mEndStr]);
 
-    const results = [];
-    for (const cl of clients) {
-      const commission = Number(cl.trainer_commission);
-      const { rows } = await pool.query(`
-        INSERT INTO pt_commissions
-          (trainer_id, trainer_name, client_id, client_name,
-           month, commission_amt, incentive_rate, status)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
-        ON CONFLICT (trainer_id, client_id, month)
-        DO UPDATE SET commission_amt = EXCLUDED.commission_amt,
-                      incentive_rate = EXCLUDED.incentive_rate,
-                      updated_at = NOW()
-        RETURNING *
-      `, [
-        cl.trainer_id, cl.trainer_name,
-        cl.id, cl.name,
-        monthStart, commission, cl.incentive_rate,
-      ]);
-      results.push(rows[0]);
-    }
-    return { count: results.length, total: results.reduce((s, r) => s + Number(r.commission_amt), 0) };
-  } finally {
-    conn.release();
+  const results = [];
+  for (const cl of clients) {
+    const commission = Number(cl.trainer_commission);
+    const { rows } = await pool.query(`
+      INSERT INTO pt_commissions
+        (trainer_id, trainer_name, client_id, client_name,
+         month, commission_amt, incentive_rate, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
+      ON CONFLICT (trainer_id, client_id, month)
+      DO UPDATE SET commission_amt = EXCLUDED.commission_amt,
+                    incentive_rate = EXCLUDED.incentive_rate,
+                    updated_at = NOW()
+      RETURNING *
+    `, [
+      cl.trainer_id, cl.trainer_name,
+      cl.id, cl.name,
+      monthStart, commission, cl.incentive_rate,
+    ]);
+    results.push(rows[0]);
   }
+  return { count: results.length, total: results.reduce((s, r) => s + Number(r.commission_amt), 0) };
 }
 
 async function getTrainerPayouts(month) {
@@ -148,12 +143,22 @@ async function getDashboardStats() {
       COUNT(*) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL)::INT AS active_pt_clients,
       COUNT(*) FILTER (WHERE status = 'expired')::INT AS expired_clients,
       COUNT(*) FILTER (WHERE balance_amount > 0)::INT AS clients_with_balance,
-      COALESCE(SUM(monthly_pt_amount) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL), 0) AS total_monthly_pt_revenue,
       COALESCE(SUM(trainer_commission) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL), 0) AS total_monthly_commission,
       COALESCE(SUM(balance_amount), 0) AS total_outstanding
     FROM pt_clients
     WHERE deleted_at IS NULL
   `);
+
+  // ISSUE-005: use actual collected payments (pt_payments) for current-month
+  // revenue, not the contracted monthly_pt_amount from pt_clients.
+  const { rows: [revenueRow] } = await pool.query(`
+    SELECT COALESCE(SUM(amount), 0) AS total_monthly_pt_revenue
+    FROM pt_payments
+    WHERE date >= date_trunc('month', CURRENT_DATE)
+      AND date < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+      AND deleted_at IS NULL
+  `);
+  totals.total_monthly_pt_revenue = revenueRow.total_monthly_pt_revenue;
 
   const { rows: trainerStats } = await pool.query(`
     SELECT
@@ -259,6 +264,98 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) 
   return rows[0];
 }
 
+/**
+ * getOpsSummary — powers the "Today's Operations" and "Session Activity"
+ * dashboard sections.  Returns:
+ *   today_sessions   — all pt_sessions scheduled/completed today
+ *   renewals_due     — active clients whose pt_end_date is within 7 days
+ *   top_dues         — up to 5 clients with the highest outstanding balance
+ *   session_stats    — this-month vs last-month completed session counts
+ *   trainer_sessions — per-trainer session totals this month
+ */
+async function getOpsSummary() {
+  const today = new Date().toISOString().slice(0, 10);
+
+  const { rows: today_sessions } = await pool.query(`
+    SELECT
+      s.id, s.title, s.session_date::TEXT, s.start_time::TEXT, s.end_time::TEXT,
+      s.status, s.notes,
+      c.name  AS client_name,  c.photo_url AS client_photo,
+      t.name  AS trainer_name
+    FROM pt_sessions s
+    LEFT JOIN pt_clients c  ON c.id = s.client_id
+    LEFT JOIN pt_trainers t ON t.id = s.trainer_id
+    WHERE s.session_date = $1 AND s.deleted_at IS NULL
+    ORDER BY COALESCE(s.start_time, '00:00'::TIME)
+  `, [today]);
+
+  const { rows: renewals_due } = await pool.query(`
+    SELECT
+      id, name, mobile, trainer_name, package_type,
+      pt_end_date::TEXT,
+      (pt_end_date::DATE - CURRENT_DATE)::INT AS days_left,
+      balance_amount,
+      monthly_pt_amount
+    FROM pt_clients
+    WHERE deleted_at IS NULL
+      AND status = 'active'
+      AND pt_end_date IS NOT NULL
+      AND pt_end_date::DATE BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+    ORDER BY pt_end_date ASC
+    LIMIT 15
+  `);
+
+  const { rows: top_dues } = await pool.query(`
+    SELECT
+      id, name, mobile, trainer_name, balance_amount,
+      pt_end_date::TEXT,
+      CASE WHEN pt_end_date IS NOT NULL AND pt_end_date::DATE < CURRENT_DATE THEN 'overdue' ELSE 'due' END AS due_status
+    FROM pt_clients
+    WHERE deleted_at IS NULL AND balance_amount > 0
+    ORDER BY balance_amount DESC
+    LIMIT 5
+  `);
+
+  const { rows: [session_stats] } = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (
+        WHERE session_date >= DATE_TRUNC('month', CURRENT_DATE)
+          AND session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+      )::INT AS this_month_total,
+      COUNT(*) FILTER (
+        WHERE session_date >= DATE_TRUNC('month', CURRENT_DATE)
+          AND session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+          AND status = 'completed'
+      )::INT AS this_month_completed,
+      COUNT(*) FILTER (
+        WHERE session_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+          AND session_date <  DATE_TRUNC('month', CURRENT_DATE)
+          AND status = 'completed'
+      )::INT AS last_month_completed
+    FROM pt_sessions
+    WHERE deleted_at IS NULL
+  `);
+
+  const { rows: trainer_sessions } = await pool.query(`
+    SELECT
+      t.name AS trainer_name,
+      COUNT(s.id) FILTER (WHERE s.status = 'completed')::INT AS completed,
+      COUNT(s.id) FILTER (WHERE s.status = 'scheduled')::INT AS scheduled,
+      COUNT(s.id) FILTER (WHERE s.status IN ('cancelled','no_show'))::INT AS missed
+    FROM pt_trainers t
+    LEFT JOIN pt_sessions s
+      ON s.trainer_id = t.id
+      AND s.session_date >= DATE_TRUNC('month', CURRENT_DATE)
+      AND s.session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+      AND s.deleted_at IS NULL
+    WHERE t.deleted_at IS NULL AND t.status = 'active'
+    GROUP BY t.id, t.name
+    ORDER BY completed DESC
+  `);
+
+  return { today_sessions, renewals_due, top_dues, session_stats, trainer_sessions };
+}
+
 module.exports = {
   calculateMonthlyCommissions,
   getTrainerPayouts,
@@ -268,4 +365,5 @@ module.exports = {
   getCommissionHistory,
   createPayout,
   markPayoutPaid,
+  getOpsSummary,
 };

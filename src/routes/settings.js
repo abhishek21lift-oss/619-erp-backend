@@ -6,18 +6,27 @@ const { auth, adminOnly } = require('../middleware/auth');
 const logger = require('../lib/logger');
 
 // GET /api/settings — List all settings
+// ISSUE-028: Non-admin users receive a filtered view that excludes
+// internal_, geo_, biometric_, and feature_ prefixed keys.
 router.get('/', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       'SELECT key, value, type, description, updated_at FROM system_settings ORDER BY key'
     );
+
+    const isAdminLevel = ['admin', 'super_admin'].includes(req.user.role);
+    const RESTRICTED_PREFIXES = ['internal_', 'geo_', 'biometric_', 'feature_'];
+    const visibleRows = isAdminLevel
+      ? rows
+      : rows.filter(r => !RESTRICTED_PREFIXES.some(prefix => r.key.startsWith(prefix)));
+
     const obj = {};
-    for (const r of rows) {
+    for (const r of visibleRows) {
       if (r.type === 'boolean') obj[r.key] = r.value === 'true';
       else if (r.type === 'number') obj[r.key] = parseFloat(r.value);
       else obj[r.key] = r.value;
     }
-    res.json({ settings: obj, raw: rows });
+    res.json({ settings: obj, raw: visibleRows });
   } catch (err) {
     next(err);
   }
@@ -34,30 +43,19 @@ router.put('/', auth, adminOnly, async (req, res, next) => {
     if (!keys.length)
       return res.status(400).json({ error: 'No settings provided' });
 
-    for (const key of keys) {
+    const strVals = keys.map(key => {
       const val = updates[key];
-      let strVal;
-      if (typeof val === 'boolean') strVal = val ? 'true' : 'false';
-      else if (typeof val === 'number') strVal = String(val);
-      else strVal = val;
+      if (typeof val === 'boolean') return val ? 'true' : 'false';
+      if (typeof val === 'number') return String(val);
+      return val;
+    });
 
-      await pool.query(
-        `INSERT INTO system_settings (key, value, type, updated_by, updated_at)
-         VALUES ($1, $2,
-           CASE
-             WHEN $2 IN ('true','false') THEN 'boolean'
-             WHEN $2 ~ '^\\d+(\\.\\d+)?$' THEN 'number'
-             ELSE 'string'
-           END,
-           $3, NOW())
-         ON CONFLICT (key) DO UPDATE SET
-           value = EXCLUDED.value,
-           type = EXCLUDED.type,
-           updated_by = $3,
-           updated_at = NOW()`,
-        [key, strVal, req.user.id]
-      );
-    }
+    await pool.query(
+      `INSERT INTO system_settings (key, value, updated_at)
+       SELECT unnest($1::text[]), unnest($2::text[]), NOW()
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [keys, strVals]
+    );
 
     logger.info({ userId: req.user.id, keys }, 'Settings updated');
     res.json({ message: 'Settings updated', count: keys.length });
@@ -191,17 +189,14 @@ router.put('/branding', auth, adminOnly, async (req, res, next) => {
     if (!updates || typeof updates !== 'object')
       return res.status(400).json({ error: 'Body must be a key-value object' });
 
-    for (const key of allowed) {
-      if (updates[key] === undefined) continue;
-      const val = String(updates[key]);
+    const keys = allowed.filter(k => updates[k] !== undefined);
+    if (keys.length) {
+      const strVals = keys.map(k => String(updates[k]));
       await pool.query(
-        `INSERT INTO system_settings (key, value, type, updated_by, updated_at)
-         VALUES ($1, $2, 'string', $3, NOW())
-         ON CONFLICT (key) DO UPDATE SET
-           value = EXCLUDED.value,
-           updated_by = $3,
-           updated_at = NOW()`,
-        [key, val, req.user.id]
+        `INSERT INTO system_settings (key, value, updated_at)
+         SELECT unnest($1::text[]), unnest($2::text[]), NOW()
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [keys, strVals]
       );
     }
 
@@ -226,12 +221,24 @@ router.post('/branding/upload-logo', auth, adminOnly, async (req, res, next) => 
       return res.status(400).json({ error: 'Invalid base64 image format. Allowed types: jpeg, png, webp, gif' });
 
     const ext = matches[1];
-    const data = Buffer.from(matches[2], 'base64');
+    const decoded = Buffer.from(matches[2], 'base64');
+    if (decoded.length > 512 * 1024) {
+      return res.status(413).json({ error: 'Image too large. Maximum size is 512 KB.' });
+    }
+
     const uploadsDir = path.join(__dirname, '..', '..', 'uploads', 'branding');
     if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
+    // Clean up old file for this key if it exists
+    try {
+      const existing = fs.readdirSync(uploadsDir).filter(f => f.startsWith(key + '-'));
+      for (const oldFile of existing) {
+        fs.unlinkSync(path.join(uploadsDir, oldFile));
+      }
+    } catch (_) { /* ignore cleanup errors */ }
+
     const filename = `${key}-${Date.now()}.${ext}`;
-    fs.writeFileSync(path.join(uploadsDir, filename), data);
+    fs.writeFileSync(path.join(uploadsDir, filename), decoded);
 
     const url = `/uploads/branding/${filename}`;
     res.json({ message: 'Uploaded', url });
@@ -285,20 +292,19 @@ router.put('/gym', auth, adminOnly, async (req, res, next) => {
     const allowedKeys = GYM_KEYS.filter(k => body[k] !== undefined);
     if (!allowedKeys.length) return res.status(400).json({ error: 'No valid gym settings provided' });
 
-    for (const key of allowedKeys) {
+    const strVals = allowedKeys.map(key => {
       const raw = body[key];
-      let strVal, type;
-      if (typeof raw === 'boolean') { strVal = raw ? 'true' : 'false'; type = 'boolean'; }
-      else if (typeof raw === 'number') { strVal = String(raw); type = 'number'; }
-      else { strVal = String(raw); type = 'string'; }
+      if (typeof raw === 'boolean') return raw ? 'true' : 'false';
+      if (typeof raw === 'number') return String(raw);
+      return String(raw);
+    });
 
-      await pool.query(
-        `INSERT INTO system_settings (key, value, type, updated_by, updated_at)
-         VALUES ($1, $2, $3, $4, NOW())
-         ON CONFLICT (key) DO UPDATE SET value=$2, type=$3, updated_by=$4, updated_at=NOW()`,
-        [key, strVal, type, req.user.id]
-      );
-    }
+    await pool.query(
+      `INSERT INTO system_settings (key, value, updated_at)
+       SELECT unnest($1::text[]), unnest($2::text[]), NOW()
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [allowedKeys, strVals]
+    );
 
     logger.info({ userId: req.user.id, keys: allowedKeys }, 'Gym settings updated');
     res.json({ success: true, message: 'Gym settings saved', count: allowedKeys.length });
@@ -361,14 +367,14 @@ router.put('/permissions', auth, adminOnly, async (req, res, next) => {
     if (!updates || typeof updates !== 'object')
       return res.status(400).json({ error: 'Body must be a key-value object' });
 
-    for (const key of PERM_KEYS) {
-      if (updates[key] === undefined) continue;
-      const strVal = updates[key] ? 'true' : 'false';
+    const keys = PERM_KEYS.filter(k => updates[k] !== undefined);
+    if (keys.length) {
+      const strVals = keys.map(k => updates[k] ? 'true' : 'false');
       await pool.query(
-        `INSERT INTO system_settings (key, value, type, updated_by, updated_at)
-         VALUES ($1, $2, 'boolean', $3, NOW())
-         ON CONFLICT (key) DO UPDATE SET value=$2, type='boolean', updated_by=$3, updated_at=NOW()`,
-        [key, strVal, req.user.id]
+        `INSERT INTO system_settings (key, value, updated_at)
+         SELECT unnest($1::text[]), unnest($2::text[]), NOW()
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [keys, strVals]
       );
     }
     res.json({ message: 'Permissions updated' });

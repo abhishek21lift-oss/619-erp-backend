@@ -36,6 +36,7 @@ const path = require('path');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { auth, adminOnly }        = require('./middleware/auth');
+const { branchScope }            = require('./middleware/branch-scope');
 
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -65,7 +66,7 @@ app.use(helmet({
   },
   crossOriginResourcePolicy: { policy: 'same-origin' },
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
-  hsts: { maxAge: 31536000, includeSubDomains: true, preload: false },
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
 }));
 
 // ────────────────────────
@@ -229,6 +230,16 @@ app.use('/api/auth/create-user', registerLimiter);
 app.use('/api/auth/users',      registerLimiter);
 app.use('/api/auth/forgot-password', registerLimiter);
 app.use('/api/auth/reset-password',  registerLimiter);
+
+// ────────────────────────
+// BRANCH SCOPE (ISSUE-004)
+// Must run AFTER auth middleware (so req.user is set) but BEFORE route handlers.
+// branchScope is safe to apply globally — it is a no-op when req.user is absent
+// or when the user has no branch_id (single-branch / legacy installs).
+// TODO: downstream route handlers should append req.branchScope.sql / params to
+//       multi-branch-aware queries once branch_id columns are fully populated.
+// ────────────────────────
+app.use('/api/', branchScope);
 
 // ────────────────────────
 // v2 ROUTES (production)
