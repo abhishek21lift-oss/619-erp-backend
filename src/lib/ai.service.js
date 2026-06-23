@@ -7,7 +7,7 @@ const pool   = require('../db/pool');
 const logger = require('./logger');
 
 const MODEL       = 'minimax-m3';
-const BASE_URL    = () => (process.env.TOKEN_ROUTER_BASE_URL || 'https://api.token-router.ai/v1').replace(/\/+$/, '');
+const BASE_URL    = () => (process.env.TOKEN_ROUTER_BASE_URL || 'https://api.tokenrouter.com/v1').replace(/\/+$/, '');
 const MAX_TOKENS  = 2000;
 const TEMPERATURE = 0.7;
 const TIMEOUT_MS  = 60_000;    // 60 s per request
