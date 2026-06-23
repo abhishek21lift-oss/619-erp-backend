@@ -11,6 +11,11 @@ ALTER TABLE ai_messages
 ALTER TABLE ai_usage_log
   ALTER COLUMN provider SET DEFAULT 'minimax';
 
+-- Drop the NOT NULL constraint on gemini_model (added by migration 030)
+-- so we can null it out now that Gemini is no longer used.
+ALTER TABLE ai_provider_settings
+  ALTER COLUMN gemini_model DROP NOT NULL;
+
 -- Reset the singleton provider settings row to reflect Token Router / MiniMax-M3.
 -- If the row doesn't exist yet, insert it.
 INSERT INTO ai_provider_settings (id, mode, gemini_model, updated_at)
