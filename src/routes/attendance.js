@@ -385,7 +385,7 @@ router.get('/gaps', auth, async function(req, res, next) {
 
     // Find members with consecutive absent days >= minStreak
     const { rows } = await pool.query(
-      'SELECT c.id, c.name, c.mobile, c.primary_trainer_id, ' +
+      'SELECT c.id, c.name, c.mobile, c.trainer_id, ' +
       'COALESCE(t.name, \'—\') AS trainer_name, ' +
       'COUNT(a.id) FILTER (WHERE a.date >= $1::DATE) AS absent_days, ' +
       'MAX(a.date) AS last_absent_date, ' +
@@ -394,10 +394,10 @@ router.get('/gaps', auth, async function(req, res, next) {
       '  AND a2.date >= $1::DATE AND a2.date <= $2::DATE) AS total_entries ' +
       'FROM clients c ' +
       'LEFT JOIN attendance_logs a ON a.ref_id = c.id AND a.ref_type = \'client\' AND a.status = \'absent\' ' +
-      'LEFT JOIN trainers t ON t.id = c.primary_trainer_id ' +
+      'LEFT JOIN trainers t ON t.id = c.trainer_id ' +
       'WHERE c.deleted_at IS NULL ' +
       'AND c.status = \'active\' ' + trainerFilter +
-      'GROUP BY c.id, c.name, c.mobile, c.primary_trainer_id, t.name ' +
+      'GROUP BY c.id, c.name, c.mobile, c.trainer_id, t.name ' +
       'HAVING COUNT(a.id) >= $3 ' +
       'ORDER BY absent_days DESC',
       params

@@ -148,12 +148,22 @@ async function getDashboardStats() {
       COUNT(*) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL)::INT AS active_pt_clients,
       COUNT(*) FILTER (WHERE status = 'expired')::INT AS expired_clients,
       COUNT(*) FILTER (WHERE balance_amount > 0)::INT AS clients_with_balance,
-      COALESCE(SUM(monthly_pt_amount) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL), 0) AS total_monthly_pt_revenue,
       COALESCE(SUM(trainer_commission) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL), 0) AS total_monthly_commission,
       COALESCE(SUM(balance_amount), 0) AS total_outstanding
     FROM pt_clients
     WHERE deleted_at IS NULL
   `);
+
+  // ISSUE-005: use actual collected payments (pt_payments) for current-month
+  // revenue, not the contracted monthly_pt_amount from pt_clients.
+  const { rows: [revenueRow] } = await pool.query(`
+    SELECT COALESCE(SUM(amount), 0) AS total_monthly_pt_revenue
+    FROM pt_payments
+    WHERE date >= date_trunc('month', CURRENT_DATE)
+      AND date < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+      AND deleted_at IS NULL
+  `);
+  totals.total_monthly_pt_revenue = revenueRow.total_monthly_pt_revenue;
 
   const { rows: trainerStats } = await pool.query(`
     SELECT

@@ -285,9 +285,14 @@ router.post('/enroll', kioskTokenMiddleware, authOrKioskForEnroll, enrollLimiter
     }
 
     // Trainers can only enroll their own assigned clients.
+    // ISSUE-022: check both clients (gym) and pt_clients (PT OS) so PT clients
+    // don't incorrectly receive a 403 during face enrollment.
     if (req.user && req.user.role === 'trainer') {
       const { rows: own } = await pool.query(
-        'SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2 LIMIT 1',
+        `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
+         UNION
+         SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
+         LIMIT 1`,
         [client_id, req.user.trainer_id]
       );
       if (own.length === 0) {

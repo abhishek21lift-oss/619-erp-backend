@@ -33,17 +33,26 @@ router.get('/monthly', auth, async (req, res, next) => {
 });
 
 // GET /api/reports/trainer-summary (admin only)
+// ISSUE-021: after migration 017/018, PT clients live in pt_clients and PT
+// payments live in pt_payments. Both tables are joined so the summary
+// includes gym clients + PT clients and gym payments + PT payments.
 router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
   try {
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
-        COUNT(DISTINCT c.id) FILTER (WHERE c.status='active' AND c.deleted_at IS NULL) AS active_clients,
-        COUNT(DISTINCT c.id) FILTER (WHERE c.deleted_at IS NULL) AS total_clients,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.date >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),0) AS month_revenue,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL),0) AS total_revenue
+        COUNT(DISTINCT c.id)   FILTER (WHERE c.status='active'   AND c.deleted_at IS NULL)   +
+        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
+        COUNT(DISTINCT c.id)   FILTER (WHERE c.deleted_at IS NULL)   +
+        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
+        COALESCE(SUM(p.amount)   FILTER (WHERE p.date   >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),   0) +
+        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.date >= DATE_TRUNC('month',NOW()) AND ptp.deleted_at IS NULL), 0) AS month_revenue,
+        COALESCE(SUM(p.amount)   FILTER (WHERE p.deleted_at IS NULL),   0) +
+        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.deleted_at IS NULL), 0) AS total_revenue
       FROM trainers t
-      LEFT JOIN clients  c ON c.trainer_id = t.id
-      LEFT JOIN payments p ON p.trainer_id = t.id
+      LEFT JOIN clients     c   ON c.trainer_id   = t.id
+      LEFT JOIN pt_clients  ptc ON ptc.trainer_id = t.id
+      LEFT JOIN payments    p   ON p.trainer_id   = t.id
+      LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
       WHERE t.status = 'active'
       GROUP BY t.id, t.name, t.specialization
       ORDER BY total_revenue DESC`
@@ -55,17 +64,24 @@ router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
 });
 
 // GET /api/reports/trainers — alias for /trainer-summary (used by frontend Reports page)
+// ISSUE-021: mirrors the fix above — includes pt_clients + pt_payments.
 router.get('/trainers', auth, adminOnly, async (req, res, next) => {
   try {
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
-        COUNT(DISTINCT c.id) FILTER (WHERE c.status='active' AND c.deleted_at IS NULL) AS active_clients,
-        COUNT(DISTINCT c.id) FILTER (WHERE c.deleted_at IS NULL) AS total_clients,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.date >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),0) AS month_revenue,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL),0) AS total_revenue
+        COUNT(DISTINCT c.id)   FILTER (WHERE c.status='active'   AND c.deleted_at IS NULL)   +
+        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
+        COUNT(DISTINCT c.id)   FILTER (WHERE c.deleted_at IS NULL)   +
+        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
+        COALESCE(SUM(p.amount)   FILTER (WHERE p.date   >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),   0) +
+        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.date >= DATE_TRUNC('month',NOW()) AND ptp.deleted_at IS NULL), 0) AS month_revenue,
+        COALESCE(SUM(p.amount)   FILTER (WHERE p.deleted_at IS NULL),   0) +
+        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.deleted_at IS NULL), 0) AS total_revenue
       FROM trainers t
-      LEFT JOIN clients  c ON c.trainer_id = t.id
-      LEFT JOIN payments p ON p.trainer_id = t.id
+      LEFT JOIN clients     c   ON c.trainer_id   = t.id
+      LEFT JOIN pt_clients  ptc ON ptc.trainer_id = t.id
+      LEFT JOIN payments    p   ON p.trainer_id   = t.id
+      LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
       WHERE t.status = 'active'
       GROUP BY t.id, t.name, t.specialization
       ORDER BY total_revenue DESC`
