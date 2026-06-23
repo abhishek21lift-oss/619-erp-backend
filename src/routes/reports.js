@@ -4,6 +4,8 @@ const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
 
 // GET /api/reports/monthly
+// ISSUE-029: UNIONs gym payments with PT payments so the monthly
+// revenue figures include both revenue streams.
 router.get('/monthly', auth, async (req, res, next) => {
   try {
     const { year = new Date().getFullYear() } = req.query;
@@ -14,15 +16,32 @@ router.get('/monthly', auth, async (req, res, next) => {
 
     const { rows } = await pool.query(`
       SELECT
-        EXTRACT(MONTH FROM p.date::date) AS month_num,
-        TO_CHAR(DATE_TRUNC('month', p.date::date), 'Month') AS month_name,
+        month_num,
+        month_name,
         COUNT(*) AS payment_count,
-        COALESCE(SUM(p.amount),0) AS revenue,
-        COALESCE(SUM(p.incentive_amt),0) AS incentives
-      FROM payments p
-      WHERE EXTRACT(YEAR FROM p.date::date) = $1
-        AND p.deleted_at IS NULL
-        ${trainerWhere}
+        COALESCE(SUM(revenue), 0) AS revenue,
+        COALESCE(SUM(incentives), 0) AS incentives
+      FROM (
+        SELECT
+          EXTRACT(MONTH FROM p.date::date) AS month_num,
+          TO_CHAR(DATE_TRUNC('month', p.date::date), 'Month') AS month_name,
+          p.amount AS revenue,
+          p.incentive_amt AS incentives
+        FROM payments p
+        WHERE EXTRACT(YEAR FROM p.date::date) = $1
+          AND p.deleted_at IS NULL
+          ${trainerWhere}
+        UNION ALL
+        SELECT
+          EXTRACT(MONTH FROM p.date::date) AS month_num,
+          TO_CHAR(DATE_TRUNC('month', p.date::date), 'Month') AS month_name,
+          p.amount AS revenue,
+          p.incentive_amt AS incentives
+        FROM pt_payments p
+        WHERE EXTRACT(YEAR FROM p.date::date) = $1
+          AND p.deleted_at IS NULL
+          ${trainerWhere}
+      ) combined
       GROUP BY month_num, month_name
       ORDER BY month_num`, params
     );

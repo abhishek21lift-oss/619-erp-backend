@@ -6,18 +6,27 @@ const { auth, adminOnly } = require('../middleware/auth');
 const logger = require('../lib/logger');
 
 // GET /api/settings — List all settings
+// ISSUE-028: Non-admin users receive a filtered view that excludes
+// internal_, geo_, biometric_, and feature_ prefixed keys.
 router.get('/', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       'SELECT key, value, type, description, updated_at FROM system_settings ORDER BY key'
     );
+
+    const isAdminLevel = ['admin', 'super_admin'].includes(req.user.role);
+    const RESTRICTED_PREFIXES = ['internal_', 'geo_', 'biometric_', 'feature_'];
+    const visibleRows = isAdminLevel
+      ? rows
+      : rows.filter(r => !RESTRICTED_PREFIXES.some(prefix => r.key.startsWith(prefix)));
+
     const obj = {};
-    for (const r of rows) {
+    for (const r of visibleRows) {
       if (r.type === 'boolean') obj[r.key] = r.value === 'true';
       else if (r.type === 'number') obj[r.key] = parseFloat(r.value);
       else obj[r.key] = r.value;
     }
-    res.json({ settings: obj, raw: rows });
+    res.json({ settings: obj, raw: visibleRows });
   } catch (err) {
     next(err);
   }

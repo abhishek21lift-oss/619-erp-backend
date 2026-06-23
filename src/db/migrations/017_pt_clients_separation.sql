@@ -3,6 +3,25 @@
 -- Complete separation of PT OS data from gym management.
 -- Creates pt_clients table, migrates data, updates FKs & views.
 -- ============================================================
+--
+-- ORDERING DEPENDENCY NOTICE
+-- ------------------------------------------------------------------
+-- This migration (017) MUST run before 018_complete_pt_independence.sql.
+--
+-- Dependency detail:
+--   The trigger function fn_pt_update_trainer_commission() defined
+--   below (lines ~66-89) queries the `trainers` table (shared gym
+--   management table) to look up `incentive_rate`.  This is a
+--   KNOWN TEMPORARY REFERENCE to the old `trainers` table.
+--
+--   Migration 018 replaces this function with an updated version
+--   that queries `pt_trainers` instead, completing the separation.
+--   Until 018 runs, the trigger will fall back to the default 0.5
+--   rate for any trainer whose id does not exist in `trainers`.
+--
+--   Do NOT run these two migrations out of order or independently;
+--   always apply 017 → 018 as a pair.
+-- ------------------------------------------------------------------
 
 -- ── Create pt_clients table ────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS pt_clients (

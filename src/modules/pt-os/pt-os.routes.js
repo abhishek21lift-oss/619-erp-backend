@@ -28,7 +28,7 @@ const ptClientCreateSchema = {
     base_amount: z.number().optional().nullable(),
     discount: z.number().optional().nullable(),
     pt_start_date: z.string().optional().nullable(),
-    pt_end_date: z.string().optional().nullable(),
+    pt_end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(d => !isNaN(Date.parse(d)), 'Invalid date'),
     pt_package_id: z.string().optional().nullable(),
     client_id: z.string().optional().nullable(),
     package_type: z.string().optional().nullable(),
