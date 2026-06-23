@@ -260,7 +260,8 @@ async function fetchWithRetry(url, options, attemptsLeft = MAX_RETRIES) {
     }
     if (attemptsLeft > 0) {
       const delay = (MAX_RETRIES - attemptsLeft + 1) * RETRY_BASE_MS;
-      logger.warn({ attempt: MAX_RETRIES - attemptsLeft + 1, delay }, 'AI request failed — retrying');
+      const cause = err.cause?.message ?? err.cause?.code ?? err.message;
+      logger.warn({ attempt: MAX_RETRIES - attemptsLeft + 1, delay, cause }, 'AI request failed — retrying');
       await new Promise(r => setTimeout(r, delay));
       return fetchWithRetry(url, options, attemptsLeft - 1);
     }

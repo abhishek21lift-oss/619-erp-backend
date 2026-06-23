@@ -134,6 +134,7 @@ router.get('/provider-settings', auth, adminOnly, async (req, res) => {
       provider:   'Token Router',
       model:      ai.MODEL,
       configured: ai.isConfigured(),
+      base_url:   (process.env.TOKEN_ROUTER_BASE_URL || 'https://api.token-router.ai/v1').replace(/\/+$/, ''),
     },
   });
 });
