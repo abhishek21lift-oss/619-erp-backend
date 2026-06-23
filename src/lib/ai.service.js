@@ -6,7 +6,7 @@
 const pool   = require('../db/pool');
 const logger = require('./logger');
 
-const MODEL       = 'minimax-m3';
+const MODEL       = () => process.env.TOKEN_ROUTER_MODEL || 'minimax-m3';
 const BASE_URL    = () => (process.env.TOKEN_ROUTER_BASE_URL || 'https://api.tokenrouter.com/v1').replace(/\/+$/, '');
 const MAX_TOKENS  = 2000;
 const TEMPERATURE = 0.7;
@@ -292,7 +292,7 @@ async function generateAIResponse({ systemPrompt, userMessage, history = [], max
         'Authorization': `Bearer ${process.env.TOKEN_ROUTER_API_KEY}`,
       },
       body: JSON.stringify({
-        model:       MODEL,
+        model:       MODEL(),
         messages,
         stream:      false,
         max_tokens:  maxTokens,
@@ -313,7 +313,7 @@ async function generateAIResponse({ systemPrompt, userMessage, history = [], max
   const content = data.choices?.[0]?.message?.content || '';
   const usage   = data.usage || null;
 
-  return { content, usage, model: MODEL, provider: 'minimax' };
+  return { content, usage, model: MODEL(), provider: 'minimax' };
 }
 
 // ── Core: streamChat (SSE streaming) ─────────────────────────────────────────
@@ -364,7 +364,7 @@ async function streamChat({ userId, userRole, conversationId, message, clientId 
           'Authorization': `Bearer ${process.env.TOKEN_ROUTER_API_KEY}`,
         },
         body: JSON.stringify({
-          model:       MODEL,
+          model:       MODEL(),
           messages,
           stream:      true,
           max_tokens:  MAX_TOKENS,
@@ -435,7 +435,7 @@ async function streamChat({ userId, userRole, conversationId, message, clientId 
            (user_id, conversation_id, model, tokens_prompt, tokens_completion, tokens_total, provider)
          VALUES ($1, $2, $3, $4, $5, $6, 'minimax')`,
         [
-          userId, conversationId, MODEL,
+          userId, conversationId, MODEL(),
           usage.prompt_tokens     || 0,
           usage.completion_tokens || 0,
           usage.total_tokens      || 0,
@@ -479,7 +479,7 @@ async function testConnection() {
           'Authorization': `Bearer ${process.env.TOKEN_ROUTER_API_KEY}`,
         },
         body: JSON.stringify({
-          model:      MODEL,
+          model:      MODEL(),
           messages:   [{ role: 'user', content: 'Reply with exactly one word: ok' }],
           max_tokens: 5,
           stream:     false,
@@ -490,11 +490,34 @@ async function testConnection() {
 
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      return { success: false, message: `HTTP ${res.status}: ${body.slice(0, 200)}` };
+      const base = `HTTP ${res.status}: ${body.slice(0, 200)}`;
+
+      // On 403 / 404 model-not-found errors, also fetch /v1/models so the
+      // admin can see which models this API key actually has access to.
+      if (res.status === 403 || res.status === 404) {
+        try {
+          const modelsRes = await fetch(`${BASE_URL()}/models`, {
+            headers: { 'Authorization': `Bearer ${process.env.TOKEN_ROUTER_API_KEY}` },
+          });
+          if (modelsRes.ok) {
+            const modelsData = await modelsRes.json();
+            const names = (modelsData.data ?? modelsData.models ?? modelsData ?? [])
+              .slice(0, 20)
+              .map(m => m.id ?? m.name ?? m)
+              .filter(Boolean)
+              .join(', ');
+            if (names) {
+              return { success: false, message: `${base} — Set TOKEN_ROUTER_MODEL to one of: ${names}` };
+            }
+          }
+        } catch (_) { /* ignore secondary fetch errors */ }
+      }
+
+      return { success: false, message: base };
     }
     const data  = await res.json();
     const reply = data.choices?.[0]?.message?.content?.trim() || '(no response)';
-    return { success: true, message: `MiniMax-M3 connected via Token Router — model responded: "${reply}"` };
+    return { success: true, message: `Connected via Token Router (${MODEL()}) — responded: "${reply}"` };
   } catch (err) {
     clearTimeout(timer);
     if (err.name === 'AbortError') {
@@ -528,7 +551,7 @@ async function getStats() {
   return {
     minimax: {
       configured: isConfigured(),
-      model:      MODEL,
+      model:      MODEL(),
       provider:   'Token Router',
       ...rows[0],
     },
@@ -536,7 +559,7 @@ async function getStats() {
 }
 
 module.exports = {
-  MODEL,
+  get MODEL() { return MODEL(); },
   isConfigured,
   checkRateLimit,
   buildMemberContext,
