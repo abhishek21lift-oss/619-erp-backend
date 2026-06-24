@@ -3,9 +3,9 @@
 // No hardcoded model names anywhere in the application.
 
 const models = {
-  get primary()   { return process.env.AI_PRIMARY_MODEL   || 'openai/gpt-4o'; },
-  get secondary() { return process.env.AI_SECONDARY_MODEL || 'poolside/laguna-m1'; },
-  get fallback()  { return process.env.AI_FALLBACK_MODEL  || 'nvidia/nemotron-3-ultra'; },
+  get primary()   { return process.env.AI_PRIMARY_MODEL   || 'openai/gpt-oss-120b:free'; },
+  get secondary() { return process.env.AI_SECONDARY_MODEL || 'poolside/laguna-m.1:free'; },
+  get fallback()  { return process.env.AI_FALLBACK_MODEL  || 'nvidia/nemotron-3-ultra-550b-a55b:free'; },
 };
 
 // Intent → tier routing table
