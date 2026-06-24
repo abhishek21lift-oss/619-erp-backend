@@ -614,7 +614,7 @@ router.post('/test', auth, requireConfigured, async (req, res) => {
 /* ═══════════════════════════════════════════════════════════════════════════
    10. PROVIDER SETTINGS  (admin — for integrations page)
    ═══════════════════════════════════════════════════════════════════════════ */
-router.get('/provider-settings', auth, async (req, res) => {
+router.get('/provider-settings', async (req, res) => {
   res.json({
     data: {
       provider:   'openrouter',
