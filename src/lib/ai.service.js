@@ -6,7 +6,7 @@
 const pool   = require('../db/pool');
 const logger = require('./logger');
 
-const MODEL       = () => process.env.TOKEN_ROUTER_MODEL || 'minimax-m3';
+const MODEL       = () => process.env.TOKEN_ROUTER_MODEL || 'MiniMax-M3';
 const BASE_URL    = () => (process.env.TOKEN_ROUTER_BASE_URL || 'https://api.tokenrouter.com/v1').replace(/\/+$/, '');
 const MAX_TOKENS  = 2000;
 const TEMPERATURE = 0.7;
