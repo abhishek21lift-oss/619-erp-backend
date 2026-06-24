@@ -185,7 +185,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   2. WORKOUT PLAN GENERATOR
+   2. WORKOUT PLAN GENERATOR  (SSE streaming — bypasses Render 30s timeout)
    POST /api/ai/workout/generate
    ═══════════════════════════════════════════════════════════════════════════ */
 router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
@@ -212,46 +212,65 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
 
 Create a complete progressive programme with warm-up, cool-down, and progression strategy.`;
 
+  res.setHeader('Content-Type',      'text/event-stream');
+  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
   try {
     const trainerName = req.user?.name || '';
-    const result = await routedChat({
+    let fullContent = '';
+    let streamMeta  = { model: models.primary, tier: 'primary', used_fallback: false };
+
+    const it = routedStream({
       intent:      'workout',
       messages:    [
         { role: 'system', content: buildWorkoutSystemPrompt(trainerName) },
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.6,
-      max_tokens:  3000,
-    });
+      max_tokens:  2048,
+    })[Symbol.asyncIterator]();
 
-    const plan = extractJson(result.content);
+    let step;
+    while (!(step = await it.next()).done) {
+      if (typeof step.value === 'string' && !step.value.startsWith('\n\n[Retrying')) {
+        fullContent += step.value;
+      }
+      res.write(': ping\n\n'); // keeps Render connection alive
+    }
+    if (step.value && typeof step.value === 'object') streamMeta = step.value;
+
+    const plan = extractJson(fullContent);
     if (!plan) {
-      return res.status(422).json({
-        error:   'Could not parse AI response as JSON',
-        raw:     result.content.slice(0, 500),
-      });
+      send({ type: 'error', message: 'Could not parse AI response as JSON' });
+      res.end();
+      return;
     }
 
-    await logUsage({
-      user_id:          req.user.id,
-      model:            result.model,
-      intent_type:      'workout',
-      tokens_prompt:    result.usage?.prompt_tokens    || 0,
-      tokens_completion:result.usage?.completion_tokens|| 0,
-      latency_ms:       result.latency_ms,
-      used_fallback:    result.used_fallback,
-    });
+    logUsage({
+      user_id:           req.user.id,
+      model:             streamMeta.model,
+      intent_type:       'workout',
+      tokens_prompt:     0,
+      tokens_completion: Math.ceil(fullContent.length / 4),
+      used_fallback:     streamMeta.used_fallback,
+    }).catch(() => {});
 
-    res.json({ data: plan, model: result.model, tier: result.tier, used_fallback: result.used_fallback });
+    send({ type: 'done', data: plan, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_generate_error');
-    if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-    res.status(503).json({ error: 'AI workout generation failed', message: err.message });
+    send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI workout generation failed. Please try again.' });
+  } finally {
+    res.end();
   }
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   3. DIET / NUTRITION PLAN GENERATOR
+   3. DIET / NUTRITION PLAN GENERATOR  (SSE streaming)
    POST /api/ai/diet/generate
    ═══════════════════════════════════════════════════════════════════════════ */
 router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
@@ -279,41 +298,60 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
 
 Calculate accurate TDEE, set appropriate calorie and macro targets, then create a practical meal plan with grocery list and supplement stack.`;
 
+  res.setHeader('Content-Type',      'text/event-stream');
+  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
   try {
     const trainerName = req.user?.name || '';
-    const result = await routedChat({
+    let fullContent = '';
+    let streamMeta  = { model: models.primary, tier: 'primary', used_fallback: false };
+
+    const it = routedStream({
       intent:      'diet',
       messages:    [
         { role: 'system', content: buildDietSystemPrompt(trainerName) },
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.5,
-      max_tokens:  3500,
-    });
+      max_tokens:  2500,
+    })[Symbol.asyncIterator]();
 
-    const plan = extractJson(result.content);
+    let step;
+    while (!(step = await it.next()).done) {
+      if (typeof step.value === 'string' && !step.value.startsWith('\n\n[Retrying')) {
+        fullContent += step.value;
+      }
+      res.write(': ping\n\n');
+    }
+    if (step.value && typeof step.value === 'object') streamMeta = step.value;
+
+    const plan = extractJson(fullContent);
     if (!plan) {
-      return res.status(422).json({
-        error: 'Could not parse AI response as JSON',
-        raw:   result.content.slice(0, 500),
-      });
+      send({ type: 'error', message: 'Could not parse AI response as JSON' });
+      res.end();
+      return;
     }
 
-    await logUsage({
+    logUsage({
       user_id:           req.user.id,
-      model:             result.model,
+      model:             streamMeta.model,
       intent_type:       'diet',
-      tokens_prompt:     result.usage?.prompt_tokens     || 0,
-      tokens_completion: result.usage?.completion_tokens || 0,
-      latency_ms:        result.latency_ms,
-      used_fallback:     result.used_fallback,
-    });
+      tokens_prompt:     0,
+      tokens_completion: Math.ceil(fullContent.length / 4),
+      used_fallback:     streamMeta.used_fallback,
+    }).catch(() => {});
 
-    res.json({ data: plan, model: result.model, tier: result.tier, used_fallback: result.used_fallback });
+    send({ type: 'done', data: plan, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_diet_generate_error');
-    if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-    res.status(503).json({ error: 'AI diet generation failed', message: err.message });
+    send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI diet generation failed. Please try again.' });
+  } finally {
+    res.end();
   }
 });
 
@@ -360,36 +398,66 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
 
     const userPrompt = `Analyse the following client progress data and generate a comprehensive report:\n\n${JSON.stringify(contextData, null, 2)}`;
 
-    const result = await routedChat({
+    // Switch to SSE before the slow AI call
+    res.setHeader('Content-Type',      'text/event-stream');
+    res.setHeader('Cache-Control',     'no-cache');
+    res.setHeader('Connection',        'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
+    let fullContent = '';
+    let streamMeta  = { model: models.primary, tier: 'primary', used_fallback: false };
+
+    const it = routedStream({
       intent:      'progress',
       messages:    [
         { role: 'system', content: buildProgressSystemPrompt() },
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.4,
-      max_tokens:  2500,
-    });
+      max_tokens:  2000,
+    })[Symbol.asyncIterator]();
 
-    const analysis = extractJson(result.content);
+    let step;
+    while (!(step = await it.next()).done) {
+      if (typeof step.value === 'string' && !step.value.startsWith('\n\n[Retrying')) {
+        fullContent += step.value;
+      }
+      res.write(': ping\n\n');
+    }
+    if (step.value && typeof step.value === 'object') streamMeta = step.value;
+
+    const analysis = extractJson(fullContent);
     if (!analysis) {
-      return res.status(422).json({ error: 'Could not parse AI response', raw: result.content.slice(0, 500) });
+      send({ type: 'error', message: 'Could not parse AI response' });
+      res.end();
+      return;
     }
 
-    await logUsage({
+    logUsage({
       user_id:           req.user.id,
-      model:             result.model,
+      model:             streamMeta.model,
       intent_type:       'progress',
-      tokens_prompt:     result.usage?.prompt_tokens     || 0,
-      tokens_completion: result.usage?.completion_tokens || 0,
-      latency_ms:        result.latency_ms,
-      used_fallback:     result.used_fallback,
-    });
+      tokens_prompt:     0,
+      tokens_completion: Math.ceil(fullContent.length / 4),
+      used_fallback:     streamMeta.used_fallback,
+    }).catch(() => {});
 
-    res.json({ data: analysis, model: result.model, tier: result.tier, used_fallback: result.used_fallback });
+    send({ type: 'done', data: analysis, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_progress_analyze_error');
-    if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-    res.status(503).json({ error: 'Progress analysis failed', message: err.message });
+    // Headers may or may not have been sent yet depending on where the error occurred
+    if (!res.headersSent) {
+      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+      return res.status(503).json({ error: 'Progress analysis failed', message: err.message });
+    }
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Progress analysis failed. Please try again.' })}\n\n`);
+    } catch { /* ignore write errors on closed connection */ }
+  } finally {
+    try { if (!res.writableEnded) res.end(); } catch { /* ignore */ }
   }
 });
 
