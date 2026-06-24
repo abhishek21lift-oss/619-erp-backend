@@ -151,7 +151,7 @@ async function pingModel(model) {
       model,
       messages: [{ role: 'user', content: 'ping' }],
       max_tokens: 1,
-      timeout: 10_000,
+      timeout: 30_000,
     });
     return { model, status: 'ok', latency_ms: Date.now() - start };
   } catch (err) {
