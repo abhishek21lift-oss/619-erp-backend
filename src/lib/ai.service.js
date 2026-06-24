@@ -492,9 +492,12 @@ async function testConnection() {
       const body = await res.text().catch(() => '');
       const base = `HTTP ${res.status}: ${body.slice(0, 200)}`;
 
-      // On 403 / 404 model-not-found errors, also fetch /v1/models so the
-      // admin can see which models this API key actually has access to.
-      if (res.status === 403 || res.status === 404) {
+      // Only fetch /v1/models when the error is specifically about model access
+      // (not quota, auth, or other 403 reasons).
+      const isModelAccessError = (res.status === 403 || res.status === 404)
+        && body.includes('model') && !body.includes('quota') && !body.includes('credit') && !body.includes('billing');
+
+      if (isModelAccessError) {
         try {
           const modelsRes = await fetch(`${BASE_URL()}/models`, {
             headers: { 'Authorization': `Bearer ${process.env.TOKEN_ROUTER_API_KEY}` },
