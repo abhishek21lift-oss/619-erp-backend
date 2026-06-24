@@ -130,18 +130,22 @@ router.post('/', auth, adminOnly, validate(trainerSchemas.create), async (req, r
     if (!d.name?.trim()) return res.status(400).json({ error: 'Name required' });
     const id = randomUUID();
     const rate = (parseFloat(d.incentive_rate) || 50) / 100; // convert % to decimal
+    const metadata = (d.metadata && typeof d.metadata === 'object') ? d.metadata : {};
 
     await pool.query(`
       INSERT INTO trainers (id,name,mobile,email,dob,gender,address,role,
-        joining_date,salary,incentive_rate,specialization,certifications,status,notes,biometric_code,biometric_added)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+        joining_date,salary,incentive_rate,specialization,certifications,
+        status,notes,bio,schedule,biometric_code,biometric_added,metadata)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
       [id, d.name.trim(), d.mobile||null, d.email?.toLowerCase()||null,
        d.dob||null, d.gender||null, d.address||null,
        d.role||'Personal Trainer', d.joining_date||null,
        parseFloat(d.salary)||0, rate,
        d.specialization||null, d.certifications||null,
        d.status||'active', d.notes||null,
-       d.biometric_code || `STF-${Date.now()}`, true]
+       d.bio||null, d.schedule||null,
+       d.biometric_code || `STF-${Date.now()}`, true,
+       JSON.stringify(metadata)]
     );
     const { rows } = await pool.query('SELECT * FROM trainers WHERE id=$1', [id]);
     res.status(201).json({ message: 'Trainer created', trainer: rows[0] });
@@ -151,7 +155,7 @@ router.post('/', auth, adminOnly, validate(trainerSchemas.create), async (req, r
 });
 
 // PUT /api/trainers/:id (admin only)
-router.put('/:id', auth, adminOnly, async (req, res, next) => {
+router.put('/:id', auth, adminOnly, validate(trainerSchemas.update), async (req, res, next) => {
   try {
     const d = req.body;
     const rate = d.incentive_rate !== undefined ? (parseFloat(d.incentive_rate)/100) : undefined;
@@ -159,21 +163,28 @@ router.put('/:id', auth, adminOnly, async (req, res, next) => {
     const { rows: ex } = await pool.query('SELECT * FROM trainers WHERE id=$1', [req.params.id]);
     if (!ex[0]) return res.status(404).json({ error: 'Not found' });
 
+    // Merge metadata — avoids wiping unrelated keys on partial updates
+    const existingMeta = (ex[0].metadata && typeof ex[0].metadata === 'object') ? ex[0].metadata : {};
+    const incomingMeta = (d.metadata && typeof d.metadata === 'object') ? d.metadata : {};
+    const mergedMeta = { ...existingMeta, ...incomingMeta };
+
     await pool.query(`
       UPDATE trainers SET
         name=$1,mobile=$2,email=$3,dob=$4,gender=$5,address=$6,role=$7,
         joining_date=$8,salary=$9,incentive_rate=$10,specialization=$11,
-        certifications=$12,status=$13,notes=$14,biometric_code=$15,
-        biometric_added=$16,updated_at=NOW()
-      WHERE id=$17`,
+        certifications=$12,status=$13,notes=$14,bio=$15,schedule=$16,
+        biometric_code=$17,biometric_added=$18,metadata=$19,updated_at=NOW()
+      WHERE id=$20`,
       [d.name?.trim()||ex[0].name, d.mobile||null, d.email?.toLowerCase()||null,
        d.dob||null, d.gender||null, d.address||null,
        d.role||ex[0].role, d.joining_date||null,
        parseFloat(d.salary)||0, rate??ex[0].incentive_rate,
        d.specialization||null, d.certifications||null,
        d.status||ex[0].status, d.notes||null,
+       d.bio||null, d.schedule||null,
        d.biometric_code || ex[0].biometric_code || `STF-${req.params.id.slice(0, 8)}`,
        Boolean(d.biometric_code || ex[0].biometric_code),
+       JSON.stringify(mergedMeta),
        req.params.id]
     );
     const { rows } = await pool.query('SELECT * FROM trainers WHERE id=$1', [req.params.id]);

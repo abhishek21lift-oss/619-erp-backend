@@ -148,30 +148,61 @@ const staffSchemas = {
   },
 };
 
+const trainerBaseFields = {
+  name: z.string().min(1, 'Name is required').max(255).transform(function(v) { return v.trim(); }),
+  mobile: mobileSchema,
+  email: emailOptional,
+  dob: z.string().optional().nullable(),
+  // Accept 'Male'|'Female'|'Other' or empty/null
+  gender: z.enum(['Male', 'Female', 'Other']).optional().nullable()
+    .or(z.literal('').transform(function() { return null; })),
+  address: z.string().max(500).optional().nullable(),
+  role: z.string().optional(),
+  joining_date: z.string().optional().nullable(),
+  // salary is a plain number (rupees) — not divided by 100
+  salary: z.number().nonnegative().optional().nullable(),
+  // incentive_rate is sent as a percentage (e.g. 50 for 50%);
+  // the route divides by 100 before storing as a decimal in the DB.
+  incentive_rate: z.number().min(0).max(100).optional().nullable(),
+  specialization: z.string().max(500).optional().nullable(),
+  // certifications stored as a comma-separated TEXT (not TEXT[])
+  certifications: z.string().max(1000).optional().nullable(),
+  status: z.enum(['active', 'inactive']).optional().default('active'),
+  notes: z.string().max(2000).optional().nullable(),
+  bio: z.string().max(2000).optional().nullable(),
+  // schedule stores working days as comma-separated TEXT (e.g. "Mon, Tue, Wed")
+  schedule: z.string().max(200).optional().nullable(),
+  biometric_code: z.string().optional().nullable(),
+  // metadata holds extended fields that have no dedicated DB column
+  metadata: z.record(z.unknown()).optional().default({}),
+};
+
 const trainerSchemas = {
   create: {
+    body: z.object(trainerBaseFields),
+  },
+  update: {
     body: z.object({
-      name: z.string().min(1, 'Name is required').max(255).transform(function(v) { return v.trim(); }),
+      // name is optional on update
+      name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }).optional(),
       mobile: mobileSchema,
       email: emailOptional,
       dob: z.string().optional().nullable(),
-      // Accept 'Male'|'Female'|'Other' or empty/null
       gender: z.enum(['Male', 'Female', 'Other']).optional().nullable()
         .or(z.literal('').transform(function() { return null; })),
       address: z.string().max(500).optional().nullable(),
       role: z.string().optional(),
       joining_date: z.string().optional().nullable(),
-      // salary is a plain number (rupees) — not divided by 100
       salary: z.number().nonnegative().optional().nullable(),
-      // incentive_rate is sent as a percentage (e.g. 50 for 50%);
-      // the route divides by 100 before storing as a decimal in the DB.
       incentive_rate: z.number().min(0).max(100).optional().nullable(),
       specialization: z.string().max(500).optional().nullable(),
-      // certifications stored as a comma-separated TEXT (not TEXT[])
       certifications: z.string().max(1000).optional().nullable(),
-      status: z.enum(['active', 'inactive']).optional().default('active'),
-      notes: z.string().max(1000).optional().nullable(),
+      status: z.enum(['active', 'inactive']).optional(),
+      notes: z.string().max(2000).optional().nullable(),
+      bio: z.string().max(2000).optional().nullable(),
+      schedule: z.string().max(200).optional().nullable(),
       biometric_code: z.string().optional().nullable(),
+      metadata: z.record(z.unknown()).optional(),
     }),
   },
 };
