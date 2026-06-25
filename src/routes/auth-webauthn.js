@@ -22,10 +22,33 @@ const authnLimiter = rateLimit({
   message: { error: 'Too many authentication attempts. Please wait 15 minutes.' },
 });
 
-const RP_ID   = process.env.RP_ID   || 'localhost';
 const RP_NAME = process.env.RP_NAME || '619 Fitness';
-const ORIGIN  = process.env.WEBAUTHN_ORIGIN || `https://${RP_ID}`;
 const isProd  = process.env.NODE_ENV === 'production';
+
+// Derive rpId and expectedOrigin from the request's Origin header when env vars
+// are not set. The browser enforces that rpId equals (or is a registrable-domain
+// suffix of) the hostname of the page that called navigator.credentials.create/get.
+// Hardcoding 'localhost' in production causes "An internal error occurred".
+function getEffectiveRpId(req) {
+  if (process.env.RP_ID) return process.env.RP_ID;
+  const origin = req.headers.origin;
+  if (origin) {
+    try {
+      const hostname = new URL(origin).hostname;
+      logger.warn({ hostname }, 'RP_ID env var not set — derived from request Origin');
+      return hostname;
+    } catch { /* ignore */ }
+  }
+  return 'localhost';
+}
+
+function getExpectedOrigin(req) {
+  if (process.env.WEBAUTHN_ORIGIN) return process.env.WEBAUTHN_ORIGIN;
+  const origin = req.headers.origin;
+  if (origin) return origin;
+  const rpId = getEffectiveRpId(req);
+  return rpId === 'localhost' ? 'http://localhost:3000' : `https://${rpId}`;
+}
 
 // Lazy-load @simplewebauthn/server so a missing module only fails at call-time
 let _wauthn = null;
@@ -93,6 +116,7 @@ async function logEvent(req, action, detail) {
 router.post('/register/options', auth, async (req, res, next) => {
   try {
     const user = req.user;
+    const rpId = getEffectiveRpId(req);
 
     const { rows: existing } = await pool.query(
       `SELECT credential_id, transports FROM user_webauthn_credentials
@@ -103,7 +127,7 @@ router.post('/register/options', auth, async (req, res, next) => {
     const { generateRegistrationOptions } = wauthn();
     const options = await generateRegistrationOptions({
       rpName: RP_NAME,
-      rpID: RP_ID,
+      rpID: rpId,
       userID: userIdToWebAuthn(user.id),
       userName: user.email,
       userDisplayName: user.name || user.email,
@@ -147,8 +171,8 @@ router.post('/register/verify', auth, async (req, res, next) => {
       verification = await verifyRegistrationResponse({
         response: registration,
         expectedChallenge: chs[0].challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
+        expectedOrigin: getExpectedOrigin(req),
+        expectedRPID: getEffectiveRpId(req),
         requireUserVerification: false,
       });
     } catch (err) {
@@ -226,7 +250,7 @@ router.post('/login/options', authnLimiter, async (req, res, next) => {
 
     const { generateAuthenticationOptions } = wauthn();
     const options = await generateAuthenticationOptions({
-      rpID: RP_ID,
+      rpID: getEffectiveRpId(req),
       allowCredentials,
       userVerification: 'preferred',
     });
@@ -272,8 +296,8 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
       verification = await verifyAuthenticationResponse({
         response: authentication,
         expectedChallenge: chs[0].challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
+        expectedOrigin: getExpectedOrigin(req),
+        expectedRPID: getEffectiveRpId(req),
         credential: {
           id: cred.credential_id,
           publicKey: new Uint8Array(Buffer.from(cred.public_key, 'base64url')),
@@ -350,7 +374,7 @@ router.post('/action/options', auth, async (req, res, next) => {
 
     const { generateAuthenticationOptions } = wauthn();
     const options = await generateAuthenticationOptions({
-      rpID: RP_ID,
+      rpID: getEffectiveRpId(req),
       allowCredentials: creds.map(r => ({
         id: r.credential_id,
         transports: r.transports || [],
@@ -394,8 +418,8 @@ router.post('/action/verify', auth, async (req, res, next) => {
       verification = await verifyAuthenticationResponse({
         response: authentication,
         expectedChallenge: chs[0].challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
+        expectedOrigin: getExpectedOrigin(req),
+        expectedRPID: getEffectiveRpId(req),
         credential: {
           id: cred.credential_id,
           publicKey: new Uint8Array(Buffer.from(cred.public_key, 'base64url')),

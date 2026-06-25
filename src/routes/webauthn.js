@@ -11,10 +11,25 @@ const router = express.Router();
 const rateLimit = require('express-rate-limit');
 const authnLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many authentication attempts' } });
 
-const RP_ID   = process.env.RP_ID   || 'localhost';
 const RP_NAME = process.env.RP_NAME || '619 Fitness';
-const ORIGIN  = process.env.WEBAUTHN_ORIGIN || `https://${RP_ID}`;
 const isProd = process.env.NODE_ENV === 'production';
+
+function getEffectiveRpId(req) {
+  if (process.env.RP_ID) return process.env.RP_ID;
+  const origin = req.headers.origin;
+  if (origin) {
+    try { return new URL(origin).hostname; } catch { /* ignore */ }
+  }
+  return 'localhost';
+}
+
+function getExpectedOrigin(req) {
+  if (process.env.WEBAUTHN_ORIGIN) return process.env.WEBAUTHN_ORIGIN;
+  const origin = req.headers.origin;
+  if (origin) return origin;
+  const rpId = getEffectiveRpId(req);
+  return rpId === 'localhost' ? 'http://localhost:3000' : `https://${rpId}`;
+}
 
 function setTokenCookie(res, token) {
   res.cookie('token', token, {
@@ -169,7 +184,7 @@ router.get('/register/begin', auth, async (req, res, next) => {
     const { generateRegistrationOptions } = wauthn();
     const options = await generateRegistrationOptions({
       rpName: RP_NAME,
-      rpID: RP_ID,
+      rpID: getEffectiveRpId(req),
       userID: Buffer.from(member.id, 'utf8').toString('base64url'),
       userName: member.email || member.name,
       userDisplayName: member.name,
@@ -220,8 +235,8 @@ router.post('/register/complete', auth, async (req, res, next) => {
       verification = await verifyRegistrationResponse({
         response: { id: credentialId, rawId, type: 'public-key', response: { attestationObject, clientDataJSON }, clientExtensionResults: {} },
         expectedChallenge: challenge.rows[0].challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
+        expectedOrigin: getExpectedOrigin(req),
+        expectedRPID: getEffectiveRpId(req),
       });
     } catch {
       return res.status(400).json({ error: 'Credential verification failed' });
@@ -288,7 +303,7 @@ router.get('/authenticate/begin', authnLimiter, async (req, res, next) => {
 
     const { generateAuthenticationOptions } = wauthn();
     const options = await generateAuthenticationOptions({
-      rpID: RP_ID,
+      rpID: getEffectiveRpId(req),
       allowCredentials,
       userVerification: 'preferred',
     });
@@ -335,8 +350,8 @@ router.post('/authenticate/complete', authnLimiter, async (req, res, next) => {
       verification = await verifyAuthenticationResponse({
         response: { id: credentialId, rawId, type: 'public-key', response: { authenticatorData, signature, clientDataJSON, userHandle }, clientExtensionResults: {} },
         expectedChallenge: challengeRow.rows[0].challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
+        expectedOrigin: getExpectedOrigin(req),
+        expectedRPID: getEffectiveRpId(req),
         credential: {
           id: cred.credential_id,
           publicKey: new Uint8Array(Buffer.from(cred.public_key, 'base64url')),
