@@ -18,7 +18,16 @@ function getEffectiveRpId(req) {
   if (process.env.RP_ID) return process.env.RP_ID;
   const origin = req.headers.origin;
   if (origin) {
-    try { return new URL(origin).hostname; } catch { /* ignore */ }
+    try {
+      const hostname = new URL(origin).hostname;
+      if (hostname && hostname !== 'localhost' && !hostname.startsWith('127.')) return hostname;
+    } catch { /* ignore */ }
+  }
+  // x-forwarded-host: set by Vercel/nginx when proxying — the client-facing hostname
+  const fwdHost = req.headers['x-forwarded-host'];
+  if (fwdHost) {
+    const host = String(fwdHost).split(',')[0].trim();
+    if (host && host !== 'localhost' && !host.startsWith('127.')) return host;
   }
   return 'localhost';
 }
@@ -27,6 +36,12 @@ function getExpectedOrigin(req) {
   if (process.env.WEBAUTHN_ORIGIN) return process.env.WEBAUTHN_ORIGIN;
   const origin = req.headers.origin;
   if (origin) return origin;
+  const fwdHost = req.headers['x-forwarded-host'];
+  if (fwdHost) {
+    const host = String(fwdHost).split(',')[0].trim();
+    const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+    if (host && host !== 'localhost') return `${proto}://${host}`;
+  }
   const rpId = getEffectiveRpId(req);
   return rpId === 'localhost' ? 'http://localhost:3000' : `https://${rpId}`;
 }
@@ -185,7 +200,7 @@ router.get('/register/begin', auth, async (req, res, next) => {
     const options = await generateRegistrationOptions({
       rpName: RP_NAME,
       rpID: getEffectiveRpId(req),
-      userID: Buffer.from(member.id, 'utf8').toString('base64url'),
+      userID: Buffer.from(member.id, 'utf8'), // must be Uint8Array in v13+
       userName: member.email || member.name,
       userDisplayName: member.name,
       attestationType: 'none',
