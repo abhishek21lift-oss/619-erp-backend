@@ -7,6 +7,9 @@ require('dotenv').config();
 
 const logger = require('./lib/logger');
 
+// Define isProd early — used in env checks below and throughout the file
+const isProd = (process.env.NODE_ENV || 'development') === 'production';
+
 const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET', 'FRONTEND_URL'];
 const missing = REQUIRED_ENV.filter(function(k) { return !process.env[k]; });
 if (missing.length) {
@@ -57,7 +60,6 @@ const { branchScope }            = require('./middleware/branch-scope');
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
-const isProd = NODE_ENV === 'production';
 
 // Behind Render / Vercel / Cloudflare — trust the first proxy so
 // req.ip is real and rate-limit keys aren’t bucketed to one IP.
@@ -246,6 +248,8 @@ app.use('/api/auth/create-user', registerLimiter);
 app.use('/api/auth/users',      registerLimiter);
 app.use('/api/auth/forgot-password', registerLimiter);
 app.use('/api/auth/reset-password',  registerLimiter);
+app.use('/api/v1/auth/refresh',      loginLimiter);
+app.use('/api/auth/refresh',         loginLimiter);
 
 // ────────────────────────
 // BRANCH SCOPE (ISSUE-004)
@@ -377,6 +381,17 @@ runMigrations()
         corsOrigins: allowedOrigins.length ? allowedOrigins : '(server-to-server only)',
       }, '619 ERP API listening on port %d (%s)', PORT, NODE_ENV);
     });
+
+    // Render free tier sleeps after 15 min of inactivity — ping every 14 min.
+    // Self-ping keeps the service warm without external dependencies.
+    if (isProd) {
+      const PING_INTERVAL_MS = 14 * 60 * 1000;
+      const selfPingUrl = `http://localhost:${PORT}/api/health`;
+      setInterval(() => {
+        fetch(selfPingUrl).catch(() => {});
+      }, PING_INTERVAL_MS).unref();
+      logger.info({ interval: '14min' }, 'Uptime self-ping enabled');
+    }
 
     const pool = require('./db/pool');
     function shutdown(sig) {

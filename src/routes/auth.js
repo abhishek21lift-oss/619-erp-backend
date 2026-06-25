@@ -12,16 +12,45 @@ const { sendPasswordReset } = require('../lib/email');
 
 const isProd = process.env.NODE_ENV === 'production';
 
+const ACCESS_TOKEN_TTL_MS  = 15 * 60 * 1000;          // 15 minutes
+const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 function setTokenCookie(res, token) {
   res.cookie('token', token, {
     httpOnly: true,
     secure: isProd,
-    // C-05: 'strict' prevents the cookie from being sent on cross-site requests,
-    // which eliminates CSRF without requiring a separate CSRF token.
     sameSite: 'strict',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    maxAge: ACCESS_TOKEN_TTL_MS,
     path: '/',
   });
+}
+
+function setRefreshCookie(res, rawToken) {
+  res.cookie('refresh_token', rawToken, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: 'strict',
+    maxAge: REFRESH_TOKEN_TTL_MS,
+    path: '/api/auth',
+  });
+}
+
+async function issueRefreshToken(res, userId) {
+  const rawToken = crypto.randomBytes(48).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
+  await pool.query(
+    'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+    [userId, tokenHash, expiresAt]
+  );
+  setRefreshCookie(res, rawToken);
+}
+
+async function revokeRefreshToken(rawToken) {
+  if (!rawToken) return;
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  await pool.query('UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1', [tokenHash])
+    .catch(() => {});
 }
 
 // POST /api/auth/login
@@ -68,7 +97,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
       token = jwt.sign(
         { id: user.id, token_version: user.token_version },
         process.env.JWT_SECRET,
-        { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+        { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
       );
     } catch (jwtErr) {
       logger.error({ err: jwtErr.message }, 'JWT sign error');
@@ -76,6 +105,11 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     }
 
     setTokenCookie(res, token);
+    try {
+      await issueRefreshToken(res, user.id);
+    } catch (rfErr) {
+      logger.warn({ err: rfErr.message }, 'refresh_token issue failed (non-critical, table may not exist yet)');
+    }
 
     res.json({
       user: {
@@ -95,14 +129,53 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
 });
 
 // POST /api/auth/logout
-router.post('/logout', function(req, res) {
-  res.clearCookie('token', {
-    httpOnly: true,
-    secure: isProd,
-    sameSite: 'strict',
-    path: '/',
-  });
+router.post('/logout', async function(req, res) {
+  await revokeRefreshToken(req.cookies?.refresh_token);
+  res.clearCookie('token', { httpOnly: true, secure: isProd, sameSite: 'strict', path: '/' });
+  res.clearCookie('refresh_token', { httpOnly: true, secure: isProd, sameSite: 'strict', path: '/api/auth' });
   res.json({ message: 'Logged out' });
+});
+
+// POST /api/auth/refresh — exchange a valid refresh token for a new access token (token rotation)
+router.post('/refresh', async (req, res) => {
+  const rawToken = req.cookies?.refresh_token;
+  if (!rawToken) return res.status(401).json({ error: 'No refresh token' });
+
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  try {
+    const { rows } = await pool.query(
+      `SELECT rt.user_id, u.token_version, u.is_active, u.deleted_at
+         FROM refresh_tokens rt
+         JOIN users u ON u.id = rt.user_id
+        WHERE rt.token_hash = $1
+          AND rt.expires_at > NOW()
+          AND rt.revoked_at IS NULL`,
+      [tokenHash]
+    );
+
+    if (!rows[0] || !rows[0].is_active || rows[0].deleted_at) {
+      res.clearCookie('refresh_token', { httpOnly: true, secure: isProd, sameSite: 'strict', path: '/api/auth' });
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
+
+    const { user_id, token_version } = rows[0];
+
+    // Rotate: revoke old token, issue new ones
+    await pool.query('UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1', [tokenHash]);
+
+    const newAccessToken = jwt.sign(
+      { id: user_id, token_version },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
+    );
+    setTokenCookie(res, newAccessToken);
+    await issueRefreshToken(res, user_id);
+
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error({ err: err.message }, 'Token refresh error');
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // POST /api/auth/forgot-password
@@ -211,9 +284,11 @@ async function changePasswordHandler(req, res) {
     const newToken = jwt.sign(
       { id: req.user.id, token_version: updated[0].token_version },
       process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+      { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
     );
     setTokenCookie(res, newToken);
+    await revokeRefreshToken(req.cookies?.refresh_token);
+    try { await issueRefreshToken(res, req.user.id); } catch { /* non-critical */ }
     res.json({ message: 'Password changed successfully' });
   } catch (err) {
     logger.error({ err: err.message }, 'Change password error');
