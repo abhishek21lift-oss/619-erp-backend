@@ -25,27 +25,54 @@ const authnLimiter = rateLimit({
 const RP_NAME = process.env.RP_NAME || '619 Fitness';
 const isProd  = process.env.NODE_ENV === 'production';
 
-// Derive rpId and expectedOrigin from the request's Origin header when env vars
-// are not set. The browser enforces that rpId equals (or is a registrable-domain
-// suffix of) the hostname of the page that called navigator.credentials.create/get.
-// Hardcoding 'localhost' in production causes "An internal error occurred".
+// Derive rpId and expectedOrigin when env vars are not set.
+// Priority: RP_ID env var > Origin header > x-forwarded-host (Vercel proxy) > localhost.
+// When the frontend is on Vercel and rewrites /api/* to this backend, the browser
+// makes a same-origin request to Vercel; Vercel proxies it server-side and may not
+// forward the Origin header, but always sets x-forwarded-host to the client's hostname.
 function getEffectiveRpId(req) {
   if (process.env.RP_ID) return process.env.RP_ID;
+
   const origin = req.headers.origin;
   if (origin) {
     try {
       const hostname = new URL(origin).hostname;
-      logger.warn({ hostname }, 'RP_ID env var not set — derived from request Origin');
-      return hostname;
+      if (hostname && hostname !== 'localhost' && !hostname.startsWith('127.')) {
+        logger.warn({ hostname }, 'WebAuthn rpId derived from Origin header (set RP_ID env var)');
+        return hostname;
+      }
     } catch { /* ignore */ }
   }
+
+  // x-forwarded-host is set by Vercel/nginx reverse proxies to the original
+  // client-facing hostname — exactly what WebAuthn rpId must match.
+  const fwdHost = req.headers['x-forwarded-host'];
+  if (fwdHost) {
+    const host = String(fwdHost).split(',')[0].trim();
+    if (host && host !== 'localhost' && !host.startsWith('127.')) {
+      logger.warn({ host }, 'WebAuthn rpId derived from x-forwarded-host (set RP_ID env var)');
+      return host;
+    }
+  }
+
+  logger.warn('RP_ID env var not set and no usable origin header — falling back to localhost');
   return 'localhost';
 }
 
 function getExpectedOrigin(req) {
   if (process.env.WEBAUTHN_ORIGIN) return process.env.WEBAUTHN_ORIGIN;
+
   const origin = req.headers.origin;
   if (origin) return origin;
+
+  // Reconstruct from x-forwarded-host + x-forwarded-proto (Vercel proxy)
+  const fwdHost = req.headers['x-forwarded-host'];
+  if (fwdHost) {
+    const host = String(fwdHost).split(',')[0].trim();
+    const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+    if (host && host !== 'localhost') return `${proto}://${host}`;
+  }
+
   const rpId = getEffectiveRpId(req);
   return rpId === 'localhost' ? 'http://localhost:3000' : `https://${rpId}`;
 }
