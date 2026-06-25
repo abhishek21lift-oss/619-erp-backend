@@ -209,6 +209,34 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   }
 });
 
+// POST /api/trainers/sessions — create a PT session
+router.post('/sessions', auth, async (req, res, next) => {
+  try {
+    const { trainer_id, client_id, date, time, duration, type, notes, recurring } = req.body;
+    if (!trainer_id || !client_id || !date) {
+      return res.status(400).json({ error: 'trainer_id, client_id, and date are required' });
+    }
+    const startTime = time || null;
+    const endTime = (time && duration)
+      ? (() => {
+          const [h, m] = time.split(':').map(Number);
+          const end = new Date(0, 0, 0, h, m + Math.round(duration));
+          return `${String(end.getHours()).padStart(2, '0')}:${String(end.getMinutes()).padStart(2, '0')}`;
+        })()
+      : null;
+
+    const { rows } = await pool.query(
+      `INSERT INTO pt_sessions (client_id, trainer_id, title, session_date, start_time, end_time, notes, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [client_id, trainer_id, type || 'PT Session', date, startTime, endTime, notes || null, req.user.id]
+    );
+    res.status(201).json({ data: rows[0] });
+  } catch (err) {
+    if (err.message?.includes('does not exist')) return res.status(400).json({ error: 'Sessions table not ready. Run migrations.' });
+    next(err);
+  }
+});
+
 // GET /api/trainers/:id/sessions — upcoming/past sessions for a trainer
 router.get('/:id/sessions', auth, async (req, res, next) => {
   try {

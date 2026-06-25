@@ -130,7 +130,7 @@ router.post('/', auth, async function(req, res) {
       return res.status(400).json({ error: 'trainer_id, from_date, to_date are required' });
     }
 
-    const VALID_LEAVE_TYPES = ['sick', 'casual', 'personal', 'emergency', 'other'];
+    const VALID_LEAVE_TYPES = ['sick', 'casual', 'personal', 'earned', 'unpaid', 'emergency', 'other'];
     if (leave_type && !VALID_LEAVE_TYPES.includes(leave_type)) {
       return res.status(400).json({ error: 'Invalid leave_type' });
     }
