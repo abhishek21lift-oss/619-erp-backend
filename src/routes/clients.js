@@ -94,6 +94,13 @@ router.get('/', auth, async (req, res, next) => {
 
     if (dues === 'yes') conditions.push('c.balance_amount > 0');
 
+    // Branch scope: restrict to the caller's branch for non-admin users.
+    // appendTo() returns corrected SQL and the full param list with branch_id appended.
+    const { sql: bsql, params: bparams } = req.branchScope.appendTo(params);
+    if (bsql !== 'TRUE') conditions.push(`c.${bsql}`);
+    // Recalculate p to reflect any added parameters from branch scope.
+    p = bparams.length + 1;
+
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
     // Auto-expire is rate-limited to once an hour, off the hot read path.
@@ -106,7 +113,7 @@ router.get('/', auth, async (req, res, next) => {
        ${where}
        ORDER BY c.created_at DESC
        LIMIT $${p++} OFFSET $${p++}`,
-      [...params, limit, offset]
+      [...bparams, limit, offset]
     );
     res.json(rows);
   } catch (err) {
@@ -120,13 +127,16 @@ router.get('/search', auth, async (req, res, next) => {
     const q = String(req.query.q || '').trim();
     if (!q) return res.json([]);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const searchParam = `%${q}%`;
+    const { sql: bsql, params: bparams } = req.branchScope.appendTo([searchParam]);
     const { rows } = await pool.query(
       `SELECT c.*, t.name as computed_trainer_name
        FROM clients c LEFT JOIN trainers t ON t.id = c.trainer_id
        WHERE COALESCE(c.deleted_at, NULL) IS NULL
          AND (c.name ILIKE $1 OR c.mobile ILIKE $1 OR c.client_id ILIKE $1 OR c.email ILIKE $1)
-       ORDER BY c.created_at DESC LIMIT $2`,
-      [`%${q}%`, limit]
+         AND c.${bsql}
+       ORDER BY c.created_at DESC LIMIT $${bparams.length + 1}`,
+      [...bparams, limit]
     );
     res.json(rows);
   } catch (err) {

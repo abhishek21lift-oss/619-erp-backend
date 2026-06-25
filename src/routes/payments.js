@@ -29,6 +29,11 @@ router.get('/', auth, async (req, res, next) => {
       conditions.push(`p.deleted_at IS NULL`);
     }
 
+    // Branch scope: restrict to the caller's branch for non-admin users.
+    const { sql: bsql, params: bparams } = req.branchScope.appendTo(params);
+    if (bsql !== 'TRUE') conditions.push(`p.${bsql}`);
+    p = bparams.length + 1;
+
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
     const { rows } = await pool.query(`
@@ -39,7 +44,7 @@ router.get('/', auth, async (req, res, next) => {
       ${where}
       ORDER BY p.date DESC, p.created_at DESC
       LIMIT $${p++} OFFSET $${p++}`,
-      [...params, parseInt(limit), parseInt(offset)]
+      [...bparams, parseInt(limit), parseInt(offset)]
     );
     res.json(rows);
   } catch (err) {

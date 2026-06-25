@@ -37,6 +37,10 @@ router.get('/', auth, async (req, res, next) => {
     if (type)   { conditions.push(`a.ref_type = $${p++}`); params.push(type); }
     if (ref_id) { conditions.push(`a.ref_id = $${p++}`);   params.push(ref_id); }
 
+    const { sql: bsql, params: bparams } = req.branchScope.appendTo(params);
+    if (bsql !== 'TRUE') conditions.push(`a.${bsql}`);
+    p = bparams.length + 1;
+
     const whereClause = conditions.join(' AND ');
 
     // Pagination: if page is provided use paginated response, otherwise fall back to legacy limit
@@ -47,7 +51,7 @@ router.get('/', auth, async (req, res, next) => {
 
       const { rows: countRows } = await pool.query(
         `SELECT COUNT(*) AS total FROM attendance_logs a WHERE ${whereClause}`,
-        params
+        bparams
       );
       const total = parseInt(countRows[0].total);
 
@@ -59,7 +63,7 @@ router.get('/', auth, async (req, res, next) => {
          WHERE ${whereClause}
          ORDER BY a.date DESC, a.check_in_time DESC NULLS LAST
          LIMIT $${p} OFFSET $${p + 1}`,
-        params.concat(limit, offset)
+        bparams.concat(limit, offset)
       );
       return res.json({ data: rows, total, page, limit, pages: Math.ceil(total / limit) });
     }
@@ -75,7 +79,7 @@ router.get('/', auth, async (req, res, next) => {
        WHERE ${whereClause}
        ORDER BY a.date DESC, a.check_in_time DESC NULLS LAST
        LIMIT $${p}`,
-      params.concat(limit)
+      bparams.concat(limit)
     );
     res.json(rows);
   } catch (err) {
