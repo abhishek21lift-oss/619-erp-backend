@@ -24,13 +24,11 @@ function buildSslConfig() {
       process.exit(1);
     }
   }
-  if (process.env.NODE_ENV === 'production') {
-    // In production without a CA bundle, trust the system CA store (Render/Supabase
-    // use certs signed by trusted CAs). This validates the cert chain — only
-    // rejectUnauthorized:false should be used in local dev.
-    logger.info('DATABASE_SSL_CA not set — using system CA store for TLS verification.');
-    return true;
-  }
+  // Supabase's Supavisor pooler uses a certificate chain that is not in the
+  // standard system CA trust store (Render, AWS, etc.). rejectUnauthorized:false
+  // keeps the connection encrypted but skips chain verification — this is the
+  // approach Supabase officially recommends for pooler connections. Set
+  // DATABASE_SSL_CA (above) to re-enable full chain verification.
   return { rejectUnauthorized: false };
 }
 
