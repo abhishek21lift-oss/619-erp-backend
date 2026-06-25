@@ -20,3 +20,9 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
+      - key: RP_ID
+        value: 619fitnessstudio.com
+      - key: WEBAUTHN_ORIGIN
+        value: https://619fitnessstudio.com,https://www.619fitnessstudio.com,https://619-erp-frontend.vercel.app
+      - key: CORS_ORIGIN
+        value: https://619fitnessstudio.com,https://www.619fitnessstudio.com,https://619-erp-frontend.vercel.app

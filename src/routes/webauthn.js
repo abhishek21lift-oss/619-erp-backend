@@ -33,7 +33,10 @@ function getEffectiveRpId(req) {
 }
 
 function getExpectedOrigin(req) {
-  if (process.env.WEBAUTHN_ORIGIN) return process.env.WEBAUTHN_ORIGIN;
+  if (process.env.WEBAUTHN_ORIGIN) {
+    const list = process.env.WEBAUTHN_ORIGIN.split(',').map(o => o.trim()).filter(Boolean);
+    return list.length === 1 ? list[0] : list;
+  }
   const origin = req.headers.origin;
   if (origin) return origin;
   const fwdHost = req.headers['x-forwarded-host'];
