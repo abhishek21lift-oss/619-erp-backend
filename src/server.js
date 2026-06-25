@@ -251,8 +251,10 @@ app.use('/api/', branchScope);
 // behaviour must be tested against both URL prefixes.
 app.use('/api/auth',              require('./routes/auth'));
 app.use('/api/auth',              require('./routes/auth-google'));
+app.use('/api/auth/webauthn',     require('./routes/auth-webauthn'));
 app.use('/api/v1/auth',           require('./routes/auth'));
 app.use('/api/v1/auth',           require('./routes/auth-google'));
+app.use('/api/v1/auth/webauthn',  require('./routes/auth-webauthn'));
 app.use('/api/profile',           require('./routes/profile'));
 
 // ROUTE INTEGRITY NOTE (R-02):

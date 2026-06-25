@@ -170,13 +170,13 @@ router.get('/register/begin', auth, async (req, res, next) => {
     const options = await generateRegistrationOptions({
       rpName: RP_NAME,
       rpID: RP_ID,
-      userID: Buffer.from(member.id, 'utf8'),
+      userID: Buffer.from(member.id, 'utf8').toString('base64url'),
       userName: member.email || member.name,
       userDisplayName: member.name,
       attestationType: 'none',
       excludeCredentials: existing.rows.map(r => ({
-        id: Buffer.from(r.credential_id, 'base64url'),
-        type: 'public-key',
+        id: r.credential_id,
+        transports: [],
       })),
       authenticatorSelection: {
         residentKey: 'preferred',
@@ -233,9 +233,9 @@ router.post('/register/complete', auth, async (req, res, next) => {
 
     await consumeChallenge(challenge.rows[0].challenge, 'registration');
 
-    const { credentialPublicKey, credentialID, counter } = verification.registrationInfo;
-    const publicKeyB64 = Buffer.from(credentialPublicKey).toString('base64url');
-    const credIdB64    = Buffer.from(credentialID).toString('base64url');
+    const { credential } = verification.registrationInfo;
+    const publicKeyB64 = Buffer.from(credential.publicKey).toString('base64url');
+    const credIdB64    = credential.id;
 
     const cred = await pool.query(
       `INSERT INTO webauthn_credentials
@@ -243,7 +243,7 @@ router.post('/register/complete', auth, async (req, res, next) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (credential_id) DO UPDATE SET last_used_at = NOW()
        RETURNING id`,
-      [memberId, credIdB64, publicKeyB64, counter,
+      [memberId, credIdB64, publicKeyB64, credential.counter,
        deviceName || 'Passkey', deviceType || 'unknown',
        Array.isArray(transports) ? transports : null]
     );
@@ -281,8 +281,7 @@ router.get('/authenticate/begin', authnLimiter, async (req, res, next) => {
         [member_id]
       );
       allowCredentials = creds.rows.map(r => ({
-        id: Buffer.from(r.credential_id, 'base64url'),
-        type: 'public-key',
+        id: r.credential_id,
         transports: r.transports || [],
       }));
     }
@@ -314,7 +313,7 @@ router.post('/authenticate/complete', authnLimiter, async (req, res, next) => {
     if (!credentialId) return res.status(400).json({ error: 'credentialId is required' });
 
     const credRow = await pool.query(
-      'SELECT credential_id, public_key, counter, member_id FROM webauthn_credentials WHERE credential_id = $1',
+      'SELECT credential_id, public_key, counter, transports, member_id FROM webauthn_credentials WHERE credential_id = $1',
       [credentialId]
     );
     if (!credRow.rows.length) return res.status(404).json({ error: 'Credential not found' });
@@ -338,11 +337,13 @@ router.post('/authenticate/complete', authnLimiter, async (req, res, next) => {
         expectedChallenge: challengeRow.rows[0].challenge,
         expectedOrigin: ORIGIN,
         expectedRPID: RP_ID,
-        authenticator: {
-          credentialID: Buffer.from(cred.credential_id, 'base64url'),
-          credentialPublicKey: Buffer.from(cred.public_key, 'base64url'),
+        credential: {
+          id: cred.credential_id,
+          publicKey: new Uint8Array(Buffer.from(cred.public_key, 'base64url')),
           counter: Number(cred.counter),
+          transports: cred.transports || [],
         },
+        requireUserVerification: false,
       });
     } catch {
       return res.status(400).json({ error: 'Authentication verification failed' });
