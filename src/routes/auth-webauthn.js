@@ -67,9 +67,10 @@ function setTokenCookie(res, token) {
   });
 }
 
-// userID for WebAuthn must be an opaque base64url string
+// userID for WebAuthn must be a Uint8Array in @simplewebauthn/server v13+.
+// Passing a string throws "String values for `userID` are no longer supported".
 function userIdToWebAuthn(uuid) {
-  return Buffer.from(uuid, 'utf8').toString('base64url');
+  return Buffer.from(uuid, 'utf8'); // Buffer extends Uint8Array — v13 compatible
 }
 
 async function saveChallenge(challenge, userId, type) {
