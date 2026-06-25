@@ -1,0 +1,580 @@
+// src/routes/auth-webauthn.js
+// WebAuthn / Passkey authentication for staff (admin, manager, trainer, reception).
+// Mounted at /api/auth/webauthn by server.js
+// Uses @simplewebauthn/server v13 API.
+//
+// Separate from /api/webauthn (member biometric check-in via webauthn.js).
+// This route uses user_webauthn_credentials (user_id FK to users table).
+
+'use strict';
+const express  = require('express');
+const jwt      = require('jsonwebtoken');
+const pool     = require('../db/pool');
+const { auth } = require('../middleware/auth');
+const logger   = require('../lib/logger');
+const rateLimit = require('express-rate-limit');
+
+const router = express.Router();
+
+const authnLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 20,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Please wait 15 minutes.' },
+});
+
+const RP_ID   = process.env.RP_ID   || 'localhost';
+const RP_NAME = process.env.RP_NAME || '619 Fitness';
+const ORIGIN  = process.env.WEBAUTHN_ORIGIN || `https://${RP_ID}`;
+const isProd  = process.env.NODE_ENV === 'production';
+
+// Lazy-load @simplewebauthn/server so a missing module only fails at call-time
+let _wauthn = null;
+function wauthn() {
+  if (!_wauthn) _wauthn = require('@simplewebauthn/server');
+  return _wauthn;
+}
+
+function setTokenCookie(res, token) {
+  res.cookie('token', token, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: 'strict',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: '/',
+  });
+}
+
+// userID for WebAuthn must be an opaque base64url string
+function userIdToWebAuthn(uuid) {
+  return Buffer.from(uuid, 'utf8').toString('base64url');
+}
+
+async function saveChallenge(challenge, userId, type) {
+  await pool.query(
+    `INSERT INTO webauthn_challenges (challenge, user_id, type, expires_at)
+     VALUES ($1, $2, $3, NOW() + INTERVAL '5 minutes')
+     ON CONFLICT (challenge) DO NOTHING`,
+    [challenge, userId || null, type]
+  );
+}
+
+async function consumeChallenge(challenge, type, userId) {
+  const params = userId ? [challenge, type, userId] : [challenge, type];
+  const userCond = userId ? 'AND (user_id = $3 OR user_id IS NULL)' : '';
+  const r = await pool.query(
+    `DELETE FROM webauthn_challenges
+     WHERE challenge = $1 AND type = $2 AND expires_at > NOW() ${userCond}
+     RETURNING user_id`,
+    params
+  );
+  return r.rows[0] || null;
+}
+
+async function logEvent(req, action, detail) {
+  try {
+    await pool.query(
+      `INSERT INTO activity_log
+         (user_id, user_name, action, entity_type, entity_id, new_data, ip_address, user_agent)
+       VALUES ($1, $2, $3, 'webauthn', $4, $5, $6, $7)`,
+      [req.user?.id || null, req.user?.name || null, action,
+       detail?.entity_id || null, detail || {},
+       req.ip || null, req.get('user-agent') || null]
+    );
+  } catch (err) {
+    logger.warn({ err: err.message, action }, 'webauthn activity log failed');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REGISTRATION — logged-in user enrolling a new passkey
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /register/options
+router.post('/register/options', auth, async (req, res, next) => {
+  try {
+    const user = req.user;
+
+    const { rows: existing } = await pool.query(
+      `SELECT credential_id, transports FROM user_webauthn_credentials
+       WHERE user_id = $1 AND deleted_at IS NULL`,
+      [user.id]
+    );
+
+    const { generateRegistrationOptions } = wauthn();
+    const options = await generateRegistrationOptions({
+      rpName: RP_NAME,
+      rpID: RP_ID,
+      userID: userIdToWebAuthn(user.id),
+      userName: user.email,
+      userDisplayName: user.name || user.email,
+      attestationType: 'none',
+      excludeCredentials: existing.map(r => ({
+        id: r.credential_id,
+        transports: r.transports || [],
+      })),
+      authenticatorSelection: {
+        residentKey: 'preferred',
+        userVerification: 'preferred',
+        authenticatorAttachment: 'platform',
+      },
+    });
+
+    await saveChallenge(options.challenge, user.id, 'registration');
+    res.json(options);
+  } catch (err) { next(err); }
+});
+
+// POST /register/verify
+router.post('/register/verify', auth, async (req, res, next) => {
+  try {
+    const user = req.user;
+    const { registration, deviceName, deviceType: clientDeviceType } = req.body;
+    if (!registration) return res.status(400).json({ error: 'registration payload is required' });
+
+    const { rows: chs } = await pool.query(
+      `SELECT challenge FROM webauthn_challenges
+       WHERE user_id = $1 AND type = 'registration' AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      [user.id]
+    );
+    if (!chs.length) {
+      return res.status(400).json({ error: 'No valid challenge. Please restart registration.' });
+    }
+
+    const { verifyRegistrationResponse } = wauthn();
+    let verification;
+    try {
+      verification = await verifyRegistrationResponse({
+        response: registration,
+        expectedChallenge: chs[0].challenge,
+        expectedOrigin: ORIGIN,
+        expectedRPID: RP_ID,
+        requireUserVerification: false,
+      });
+    } catch (err) {
+      logger.warn({ err: err.message, userId: user.id }, 'Registration verify failed');
+      return res.status(400).json({ error: 'Credential verification failed: ' + err.message });
+    }
+
+    if (!verification.verified || !verification.registrationInfo) {
+      return res.status(400).json({ error: 'Verification failed' });
+    }
+
+    await consumeChallenge(chs[0].challenge, 'registration', user.id);
+
+    const { credential } = verification.registrationInfo;
+    const publicKeyB64 = Buffer.from(credential.publicKey).toString('base64url');
+
+    const transports = credential.transports || registration?.response?.transports || [];
+    let deviceType = 'unknown';
+    if (transports.includes('internal')) deviceType = 'platform';
+    else if (transports.some(t => ['usb', 'nfc', 'ble', 'smart-card'].includes(t))) deviceType = 'cross-platform';
+    if (clientDeviceType) deviceType = clientDeviceType;
+
+    const { rows } = await pool.query(
+      `INSERT INTO user_webauthn_credentials
+         (user_id, credential_id, public_key, counter, transports, device_name, device_type, backed_up)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (credential_id) DO UPDATE
+         SET last_used_at = NOW(), updated_at = NOW()
+       RETURNING id`,
+      [user.id, credential.id, publicKeyB64, credential.counter,
+       transports, (deviceName || 'Passkey').trim(),
+       deviceType, credential.backedUp ?? false]
+    );
+
+    await logEvent(req, 'webauthn_staff_registered', {
+      entity_id: rows[0].id,
+      user_id: user.id,
+      credential_id: credential.id,
+      device_name: deviceName || 'Passkey',
+    });
+
+    res.json({ success: true, credential: { id: rows[0].id } });
+  } catch (err) { next(err); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTHENTICATION — login with passkey (no session required)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /login/options
+router.post('/login/options', authnLimiter, async (req, res, next) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    let userId = null;
+    let allowCredentials = [];
+
+    if (email) {
+      const { rows: users } = await pool.query(
+        `SELECT id FROM users WHERE LOWER(email) = $1 AND is_active = true AND deleted_at IS NULL`,
+        [email]
+      );
+      if (users.length) {
+        userId = users[0].id;
+        const { rows: creds } = await pool.query(
+          `SELECT credential_id, transports FROM user_webauthn_credentials
+           WHERE user_id = $1 AND is_active = true AND deleted_at IS NULL`,
+          [userId]
+        );
+        allowCredentials = creds.map(r => ({
+          id: r.credential_id,
+          transports: r.transports || [],
+        }));
+      }
+    }
+
+    const { generateAuthenticationOptions } = wauthn();
+    const options = await generateAuthenticationOptions({
+      rpID: RP_ID,
+      allowCredentials,
+      userVerification: 'preferred',
+    });
+
+    await saveChallenge(options.challenge, userId, 'authentication');
+    res.json(options);
+  } catch (err) { next(err); }
+});
+
+// POST /login/verify
+router.post('/login/verify', authnLimiter, async (req, res, next) => {
+  try {
+    const { authentication } = req.body;
+    if (!authentication) return res.status(400).json({ error: 'authentication payload is required' });
+
+    const credentialId = authentication?.id;
+    if (!credentialId) return res.status(400).json({ error: 'credentialId is required' });
+
+    const { rows: credRows } = await pool.query(
+      `SELECT credential_id, public_key, counter, transports, user_id, is_active
+       FROM user_webauthn_credentials
+       WHERE credential_id = $1 AND deleted_at IS NULL`,
+      [credentialId]
+    );
+    if (!credRows.length) return res.status(404).json({ error: 'Credential not found' });
+    const cred = credRows[0];
+    if (!cred.is_active) return res.status(403).json({ error: 'This passkey has been disabled' });
+
+    const { rows: chs } = await pool.query(
+      `SELECT challenge FROM webauthn_challenges
+       WHERE type = 'authentication' AND expires_at > NOW()
+         AND (user_id = $1 OR user_id IS NULL)
+       ORDER BY created_at DESC LIMIT 1`,
+      [cred.user_id]
+    );
+    if (!chs.length) {
+      return res.status(400).json({ error: 'No valid challenge. Please restart authentication.' });
+    }
+
+    const { verifyAuthenticationResponse } = wauthn();
+    let verification;
+    try {
+      verification = await verifyAuthenticationResponse({
+        response: authentication,
+        expectedChallenge: chs[0].challenge,
+        expectedOrigin: ORIGIN,
+        expectedRPID: RP_ID,
+        credential: {
+          id: cred.credential_id,
+          publicKey: new Uint8Array(Buffer.from(cred.public_key, 'base64url')),
+          counter: Number(cred.counter),
+          transports: cred.transports || [],
+        },
+        requireUserVerification: false,
+      });
+    } catch (err) {
+      logger.warn({ err: err.message }, 'Staff auth verify failed');
+      return res.status(400).json({ error: 'Authentication verification failed' });
+    }
+
+    if (!verification.verified) return res.status(401).json({ error: 'Verification failed' });
+
+    await consumeChallenge(chs[0].challenge, 'authentication', cred.user_id);
+    await pool.query(
+      `UPDATE user_webauthn_credentials
+       SET counter = $1, last_used_at = NOW(), updated_at = NOW()
+       WHERE credential_id = $2`,
+      [verification.authenticationInfo.newCounter, credentialId]
+    );
+
+    const { rows: users } = await pool.query(
+      `SELECT id, name, email, role, trainer_id, member_id, token_version
+       FROM users WHERE id = $1 AND is_active = true AND deleted_at IS NULL`,
+      [cred.user_id]
+    );
+    if (!users.length) {
+      return res.status(404).json({ error: 'User account not found or has been disabled' });
+    }
+    const user = users[0];
+
+    const token = jwt.sign(
+      { id: user.id, token_version: user.token_version ?? 0 },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+    setTokenCookie(res, token);
+
+    pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]).catch(() => {});
+    await logEvent(req, 'webauthn_staff_login', {
+      entity_id: user.id,
+      credential_id: credentialId,
+    });
+
+    res.json({
+      success: true,
+      user: {
+        id: user.id, name: user.name, email: user.email,
+        role: user.role, trainer_id: user.trainer_id, member_id: user.member_id,
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACTION VERIFICATION — logged-in user re-verifying for a sensitive action
+// Returns a short-lived (5 min) JWT with purpose=webauthn_action
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /action/options
+router.post('/action/options', auth, async (req, res, next) => {
+  try {
+    const user = req.user;
+    const { rows: creds } = await pool.query(
+      `SELECT credential_id, transports FROM user_webauthn_credentials
+       WHERE user_id = $1 AND is_active = true AND deleted_at IS NULL`,
+      [user.id]
+    );
+    if (!creds.length) {
+      return res.status(404).json({ error: 'No passkeys registered for this account' });
+    }
+
+    const { generateAuthenticationOptions } = wauthn();
+    const options = await generateAuthenticationOptions({
+      rpID: RP_ID,
+      allowCredentials: creds.map(r => ({
+        id: r.credential_id,
+        transports: r.transports || [],
+      })),
+      userVerification: 'required',
+    });
+
+    await saveChallenge(options.challenge, user.id, 'action');
+    res.json(options);
+  } catch (err) { next(err); }
+});
+
+// POST /action/verify
+router.post('/action/verify', auth, async (req, res, next) => {
+  try {
+    const user = req.user;
+    const { authentication } = req.body;
+    if (!authentication) return res.status(400).json({ error: 'authentication payload is required' });
+
+    const credentialId = authentication?.id;
+    const { rows: credRows } = await pool.query(
+      `SELECT credential_id, public_key, counter, transports
+       FROM user_webauthn_credentials
+       WHERE credential_id = $1 AND user_id = $2 AND is_active = true AND deleted_at IS NULL`,
+      [credentialId, user.id]
+    );
+    if (!credRows.length) return res.status(404).json({ error: 'Credential not found' });
+    const cred = credRows[0];
+
+    const { rows: chs } = await pool.query(
+      `SELECT challenge FROM webauthn_challenges
+       WHERE user_id = $1 AND type = 'action' AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      [user.id]
+    );
+    if (!chs.length) return res.status(400).json({ error: 'No valid challenge. Please restart.' });
+
+    const { verifyAuthenticationResponse } = wauthn();
+    let verification;
+    try {
+      verification = await verifyAuthenticationResponse({
+        response: authentication,
+        expectedChallenge: chs[0].challenge,
+        expectedOrigin: ORIGIN,
+        expectedRPID: RP_ID,
+        credential: {
+          id: cred.credential_id,
+          publicKey: new Uint8Array(Buffer.from(cred.public_key, 'base64url')),
+          counter: Number(cred.counter),
+          transports: cred.transports || [],
+        },
+        requireUserVerification: true,
+      });
+    } catch (err) {
+      return res.status(400).json({ error: 'Action verification failed' });
+    }
+
+    if (!verification.verified) return res.status(401).json({ error: 'Verification failed' });
+
+    await consumeChallenge(chs[0].challenge, 'action', user.id);
+    await pool.query(
+      `UPDATE user_webauthn_credentials
+       SET counter = $1, last_used_at = NOW(), updated_at = NOW()
+       WHERE credential_id = $2`,
+      [verification.authenticationInfo.newCounter, credentialId]
+    );
+
+    const actionToken = jwt.sign(
+      { id: user.id, purpose: 'webauthn_action' },
+      process.env.JWT_SECRET,
+      { expiresIn: '5m' }
+    );
+
+    res.json({ actionToken });
+  } catch (err) { next(err); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CREDENTIAL MANAGEMENT — user's own passkeys
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /credentials
+router.get('/credentials', auth, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, device_name, device_type, backed_up, is_active,
+              created_at, last_used_at
+       FROM user_webauthn_credentials
+       WHERE user_id = $1 AND deleted_at IS NULL
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ credentials: rows });
+  } catch (err) { next(err); }
+});
+
+// DELETE /credentials/:id
+router.delete('/credentials/:id', auth, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE user_webauthn_credentials
+       SET deleted_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+       RETURNING id`,
+      [req.params.id, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Credential not found' });
+    await logEvent(req, 'webauthn_credential_deleted', { entity_id: req.params.id });
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
+
+// PATCH /credentials/:id — rename device
+router.patch('/credentials/:id', auth, async (req, res, next) => {
+  try {
+    const { deviceName } = req.body;
+    if (!deviceName?.trim()) return res.status(400).json({ error: 'deviceName is required' });
+    const { rows } = await pool.query(
+      `UPDATE user_webauthn_credentials
+       SET device_name = $1, updated_at = NOW()
+       WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL
+       RETURNING id, device_name`,
+      [deviceName.trim(), req.params.id, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Credential not found' });
+    res.json({ success: true, credential: rows[0] });
+  } catch (err) { next(err); }
+});
+
+// PUT /credentials/:id/toggle — enable / disable
+router.put('/credentials/:id/toggle', auth, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE user_webauthn_credentials
+       SET is_active = NOT is_active, updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+       RETURNING id, is_active`,
+      [req.params.id, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Credential not found' });
+    await logEvent(req, rows[0].is_active ? 'webauthn_credential_enabled' : 'webauthn_credential_disabled', {
+      entity_id: req.params.id,
+    });
+    res.json({ success: true, is_active: rows[0].is_active });
+  } catch (err) { next(err); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN endpoints — require admin or manager role
+// ─────────────────────────────────────────────────────────────────────────────
+
+function requireAdminOrManager(req, res, next) {
+  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
+    return res.status(403).json({ error: 'Admin or manager access required' });
+  }
+  next();
+}
+
+// GET /admin/stats
+router.get('/admin/stats', auth, requireAdminOrManager, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE deleted_at IS NULL)::int                         AS total_credentials,
+        COUNT(*) FILTER (WHERE deleted_at IS NULL AND is_active = true)::int    AS active_credentials,
+        COUNT(DISTINCT user_id) FILTER (WHERE deleted_at IS NULL)::int          AS users_with_passkeys,
+        COUNT(*) FILTER (WHERE last_used_at > NOW() - INTERVAL '7 days')::int  AS used_last_7_days
+      FROM user_webauthn_credentials
+    `);
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+// GET /admin/credentials
+router.get('/admin/credentials', auth, requireAdminOrManager, async (req, res, next) => {
+  try {
+    const limit  = Math.min(parseInt(req.query.limit,  10) || 100, 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0,   0);
+    const { rows } = await pool.query(
+      `SELECT uc.id, uc.user_id, u.name AS user_name, u.email AS user_email,
+              uc.device_name, uc.device_type, uc.backed_up, uc.is_active,
+              uc.created_at, uc.last_used_at
+       FROM user_webauthn_credentials uc
+       JOIN users u ON u.id = uc.user_id
+       WHERE uc.deleted_at IS NULL
+       ORDER BY uc.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    res.json({ credentials: rows });
+  } catch (err) { next(err); }
+});
+
+// DELETE /admin/credentials/:id — admin revoke any credential
+router.delete('/admin/credentials/:id', auth, async (req, res, next) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE user_webauthn_credentials
+       SET deleted_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND deleted_at IS NULL
+       RETURNING id`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Credential not found' });
+    await logEvent(req, 'webauthn_admin_revoke', { entity_id: req.params.id });
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
+
+// GET /admin/audit-logs
+router.get('/admin/audit-logs', auth, requireAdminOrManager, async (req, res, next) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const { rows } = await pool.query(
+      `SELECT id, user_id, user_name, action, entity_id, new_data, ip_address, user_agent, created_at
+       FROM activity_log
+       WHERE entity_type = 'webauthn'
+       ORDER BY created_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json({ logs: rows });
+  } catch (err) { next(err); }
+});
+
+module.exports = router;
