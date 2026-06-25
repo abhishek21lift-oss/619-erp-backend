@@ -148,6 +148,7 @@ router.post('/register/options', auth, async (req, res, next) => {
   try {
     const user = req.user;
     const rpId = getEffectiveRpId(req);
+    logger.info({ rpId, userId: user.id }, 'webauthn register/options called');
 
     const { rows: existing } = await pool.query(
       `SELECT credential_id, transports FROM user_webauthn_credentials
@@ -156,27 +157,37 @@ router.post('/register/options', auth, async (req, res, next) => {
     );
 
     const { generateRegistrationOptions } = wauthn();
-    const options = await generateRegistrationOptions({
-      rpName: RP_NAME,
-      rpID: rpId,
-      userID: userIdToWebAuthn(user.id),
-      userName: user.email,
-      userDisplayName: user.name || user.email,
-      attestationType: 'none',
-      excludeCredentials: existing.map(r => ({
-        id: r.credential_id,
-        transports: r.transports || [],
-      })),
-      authenticatorSelection: {
-        residentKey: 'preferred',
-        userVerification: 'preferred',
-        authenticatorAttachment: 'platform',
-      },
-    });
+    let options;
+    try {
+      options = await generateRegistrationOptions({
+        rpName: RP_NAME,
+        rpID: rpId,
+        userID: userIdToWebAuthn(user.id),
+        userName: user.email,
+        userDisplayName: user.name || user.email,
+        attestationType: 'none',
+        excludeCredentials: existing.map(r => ({
+          id: r.credential_id,
+          transports: r.transports || [],
+        })),
+        authenticatorSelection: {
+          residentKey: 'preferred',
+          userVerification: 'preferred',
+          authenticatorAttachment: 'platform',
+        },
+      });
+    } catch (err) {
+      // Surface the actual error — production mask would hide it completely
+      logger.error({ err: err.message, rpId, userId: user.id }, 'generateRegistrationOptions failed');
+      return res.status(400).json({ error: `WebAuthn config error: ${err.message}` });
+    }
 
     await saveChallenge(options.challenge, user.id, 'registration');
     res.json(options);
-  } catch (err) { next(err); }
+  } catch (err) {
+    logger.error({ err: err.message }, 'register/options unexpected error');
+    next(err);
+  }
 });
 
 // POST /register/verify
