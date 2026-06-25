@@ -52,6 +52,10 @@ function authOrKioskForEnroll(req, res, next) {
 const DEFAULT_RECOGNITION_THRESHOLD = 0.40;
 const DESCRIPTOR_LENGTH     = 128;
 
+// In-memory cache for the face match threshold from system_settings.
+// Avoids a DB round-trip on every checkin; refreshes every 60s.
+let _thresholdCache = null;
+
 // ──────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────
@@ -111,32 +115,92 @@ router.post('/face', kioskTokenMiddleware, faceLimiter, kioskOrAuth, async (req,
       });
     }
 
-    // Fetch configurable face match threshold from system_settings (ISSUE-047)
-    const thresholdRow = await pool.query("SELECT value FROM system_settings WHERE key = 'face_match_threshold' LIMIT 1");
-    const RECOGNITION_THRESHOLD = thresholdRow.rows[0] ? parseFloat(thresholdRow.rows[0].value) || DEFAULT_RECOGNITION_THRESHOLD : DEFAULT_RECOGNITION_THRESHOLD;
+    // Fetch configurable face match threshold from system_settings (ISSUE-047).
+    // Cache result for 60s to avoid a DB round-trip on every checkin.
+    if (!_thresholdCache || Date.now() > _thresholdCache.expiresAt) {
+      const row = await pool.query("SELECT value FROM system_settings WHERE key = 'face_match_threshold' LIMIT 1");
+      _thresholdCache = {
+        value: row.rows[0] ? parseFloat(row.rows[0].value) || DEFAULT_RECOGNITION_THRESHOLD : DEFAULT_RECOGNITION_THRESHOLD,
+        expiresAt: Date.now() + 60_000,
+      };
+    }
+    const RECOGNITION_THRESHOLD = _thresholdCache.value;
 
-    // Pull active descriptors from the normalized face_descriptors table,
-    // joined with client info for membership checks.
-    // This is the canonical source — clients.face_descriptor is kept for
-    // backwards compat only.
-    const { rows: clients } = await pool.query(
-      `SELECT c.id, c.name, c.status, c.photo_url, c.member_code, c.client_id,
-              c.package_type, c.pt_end_date, c.expiry_date, c.subscription_end_date, c.trainer_id,
-              d.descriptor AS face_descriptor, d.descriptor_enc, d.id AS descriptor_id
-         FROM face_descriptors d
-         JOIN clients c ON c.id = d.client_id
-        WHERE d.is_active = TRUE`
-    );
+    // Try pgvector ANN matching first (O(log N)) — falls back to O(N) JS loop if
+    // the descriptor_vec column doesn't exist yet (pre-migration 046 databases).
+    let best = { distance: Infinity, client: null };
 
-    // Resolve descriptor: prefer encrypted column, fall back to plaintext for old rows.
-    for (const c of clients) {
-      if (c.descriptor_enc && isEncryptionEnabled()) {
-        c.face_descriptor = decryptDescriptor(c.descriptor_enc);
+    try {
+      // Format the query descriptor as a Postgres vector literal.
+      const vecLiteral = '[' + descriptor.map(v => v.toFixed(8)).join(',') + ']';
+      const { rows: vecRows } = await pool.query(
+        `SELECT c.id, c.name, c.status, c.photo_url, c.member_code, c.client_id,
+                c.package_type, c.pt_end_date, c.expiry_date, c.subscription_end_date, c.trainer_id,
+                d.descriptor_enc, d.id AS descriptor_id,
+                (d.descriptor_vec <-> $1::vector) AS distance
+           FROM face_descriptors d
+           JOIN clients c ON c.id = d.client_id
+          WHERE d.is_active = TRUE
+            AND d.descriptor_vec IS NOT NULL
+          ORDER BY d.descriptor_vec <-> $1::vector
+          LIMIT 1`,
+        [vecLiteral]
+      );
+
+      if (vecRows.length > 0) {
+        const row = vecRows[0];
+        const distance = parseFloat(row.distance);
+        // For pgvector result, descriptor is already matched server-side.
+        // Decrypt enc column for membership check if needed.
+        if (row.descriptor_enc && isEncryptionEnabled()) {
+          row.face_descriptor = decryptDescriptor(row.descriptor_enc);
+        }
+        best = { distance, client: row };
+      } else {
+        // No vector rows — fall through to O(N) JS scan below.
+        throw new Error('no_vector_rows');
       }
-      // c.face_descriptor may already be set from the plaintext column if no enc present.
+    } catch (_vecErr) {
+      // pgvector not installed or descriptor_vec not populated — use O(N) JS fallback.
+      const { rows: clients } = await pool.query(
+        `SELECT c.id, c.name, c.status, c.photo_url, c.member_code, c.client_id,
+                c.package_type, c.pt_end_date, c.expiry_date, c.subscription_end_date, c.trainer_id,
+                d.descriptor AS face_descriptor, d.descriptor_enc, d.id AS descriptor_id
+           FROM face_descriptors d
+           JOIN clients c ON c.id = d.client_id
+          WHERE d.is_active = TRUE`
+      );
+
+      for (const c of clients) {
+        if (c.descriptor_enc && isEncryptionEnabled()) {
+          c.face_descriptor = decryptDescriptor(c.descriptor_enc);
+        }
+      }
+
+      if (clients.length === 0) {
+        const logId = await logCheckIn({
+          clientId: null, status: 'unknown', distance: null,
+          ip: req.ip, userAgent: req.headers['user-agent'],
+        });
+        return res.status(404).json({
+          success: false,
+          error: 'No enrolled members. Ask reception to enroll faces first.',
+          log_id: logId,
+        });
+      }
+
+      const CONFIDENT_THRESHOLD = 0.30;
+      for (const c of clients) {
+        if (!isValidDescriptor(c.face_descriptor)) continue;
+        const d = euclideanDistance(descriptor, c.face_descriptor);
+        if (d < best.distance) {
+          best = { distance: d, client: c };
+          if (d < CONFIDENT_THRESHOLD) break;
+        }
+      }
     }
 
-    if (clients.length === 0) {
+    if (best.distance === Infinity || !best.client) {
       const logId = await logCheckIn({
         clientId: null, status: 'unknown', distance: null,
         ip: req.ip, userAgent: req.headers['user-agent'],
@@ -146,21 +210,6 @@ router.post('/face', kioskTokenMiddleware, faceLimiter, kioskOrAuth, async (req,
         error: 'No enrolled members. Ask reception to enroll faces first.',
         log_id: logId,
       });
-    }
-
-    // Find the closest match.
-    // PERF: early-exit when we already have a confident match (< 0.30).
-    // For real scale install pgvector and switch to ORDER BY descriptor <-> $1 LIMIT 1.
-    const CONFIDENT_THRESHOLD = 0.30;
-    let best = { distance: Infinity, client: null };
-    for (const c of clients) {
-      const stored = c.face_descriptor;
-      if (!isValidDescriptor(stored)) continue;
-      const d = euclideanDistance(descriptor, stored);
-      if (d < best.distance) {
-        best = { distance: d, client: c };
-        if (d < CONFIDENT_THRESHOLD) break;
-      }
     }
 
     if (best.distance > RECOGNITION_THRESHOLD || !best.client) {
@@ -346,11 +395,26 @@ router.post('/enroll', kioskTokenMiddleware, authOrKioskForEnroll, enrollLimiter
 
       descriptorId = randomUUID();
       const enrolledBy = req.user && req.user.role !== 'kiosk' ? req.user.id : null;
-      await pool.query(
-        `INSERT INTO face_descriptors (id, client_id, angle, descriptor, descriptor_enc, is_active, enrolled_by, updated_at)
-         VALUES ($1, $2, 'front', $3::jsonb, $4, TRUE, $5, NOW())`,
-        [descriptorId, client_id, plaintextForLegacy, descriptorEnc, enrolledBy]
-      );
+      // Attempt to populate the pgvector column (descriptor_vec) alongside the
+      // legacy JSONB column. If pgvector isn't installed yet (pre-migration 046),
+      // the INSERT falls back gracefully by omitting the column.
+      const vecLiteral = '[' + descriptor.map(v => v.toFixed(8)).join(',') + ']';
+      let insertResult;
+      try {
+        insertResult = await pool.query(
+          `INSERT INTO face_descriptors
+             (id, client_id, angle, descriptor, descriptor_enc, descriptor_vec, is_active, enrolled_by, updated_at)
+           VALUES ($1, $2, 'front', $3::jsonb, $4, $5::vector, TRUE, $6, NOW())`,
+          [descriptorId, client_id, plaintextForLegacy, descriptorEnc, vecLiteral, enrolledBy]
+        );
+      } catch (_vecErr) {
+        // pgvector not available yet — insert without vector column
+        insertResult = await pool.query(
+          `INSERT INTO face_descriptors (id, client_id, angle, descriptor, descriptor_enc, is_active, enrolled_by, updated_at)
+           VALUES ($1, $2, 'front', $3::jsonb, $4, TRUE, $5, NOW())`,
+          [descriptorId, client_id, plaintextForLegacy, descriptorEnc, enrolledBy]
+        );
+      }
     } finally {
       await pool.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(() => {});
     }
@@ -373,10 +437,26 @@ router.post('/enroll', kioskTokenMiddleware, authOrKioskForEnroll, enrollLimiter
 
 // ──────────────────────────────────────────────────────────────────
 // GET /api/checkin/descriptors
-// Returns all active face descriptors (for kiosk-side matching).
+// Admin-only export of all active face descriptors.
+//
+// DEPRECATED: client-side matching is no longer supported. All kiosks
+// must POST descriptors to /api/checkin/face for server-side matching.
+// This endpoint exists only for admin backup/export purposes and is
+// restricted to admin/owner roles.
 // ──────────────────────────────────────────────────────────────────
 router.get('/descriptors', auth, async (req, res, next) => {
   try {
+    // Restrict to admin/owner — biometric data must not be bulk-exported to regular staff
+    const allowedRoles = new Set(['admin', 'owner']);
+    if (!req.user || !allowedRoles.has(req.user.role)) {
+      return res.status(403).json({
+        error: 'Admin or owner role required to export face descriptor data',
+      });
+    }
+
+    res.set('Deprecation', 'true');
+    res.set('Sunset', 'Client-side matching is removed. Use POST /api/checkin/face instead.');
+
     const { rows } = await pool.query(
       `SELECT d.client_id, c.name, d.descriptor, d.descriptor_enc
          FROM face_descriptors d
@@ -384,7 +464,6 @@ router.get('/descriptors', auth, async (req, res, next) => {
         WHERE d.is_active = TRUE
         ORDER BY c.name`
     );
-    // Resolve descriptor: prefer encrypted column, strip internal enc field from response.
     const resolved = rows.map(r => {
       let descriptor = r.descriptor;
       if (r.descriptor_enc && isEncryptionEnabled()) {

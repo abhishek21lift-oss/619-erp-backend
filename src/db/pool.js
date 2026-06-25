@@ -25,7 +25,11 @@ function buildSslConfig() {
     }
   }
   if (process.env.NODE_ENV === 'production') {
-    logger.warn('DATABASE_SSL_CA not set — skipping cert verification. Set it to the Supabase CA bundle path for full cert verification.');
+    // In production without a CA bundle, trust the system CA store (Render/Supabase
+    // use certs signed by trusted CAs). This validates the cert chain — only
+    // rejectUnauthorized:false should be used in local dev.
+    logger.info('DATABASE_SSL_CA not set — using system CA store for TLS verification.');
+    return true;
   }
   return { rejectUnauthorized: false };
 }

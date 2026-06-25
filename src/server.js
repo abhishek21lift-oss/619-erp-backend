@@ -21,10 +21,26 @@ if (process.env.JWT_SECRET.length < 32) {
 }
 
 // Warn about missing recommended (non-fatal) vars so ops teams notice early
-const RECOMMENDED_ENV = ['KIOSK_HMAC_SECRET', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'RP_ID', 'WEBAUTHN_ORIGIN'];
+const RECOMMENDED_ENV = [
+  'KIOSK_HMAC_SECRET',
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_KEY',
+  'RP_ID',
+  'WEBAUTHN_ORIGIN',
+  'FACE_ENCRYPTION_KEY',
+];
 const missingRecommended = RECOMMENDED_ENV.filter(function(k) { return !process.env[k]; });
 if (missingRecommended.length) {
   logger.warn({ missing: missingRecommended }, 'Recommended env vars not set — some features may be degraded');
+}
+
+// Hard warn on missing face encryption key in production — biometric data
+// would be stored as plaintext JSONB, which violates GDPR Art. 9.
+if (isProd && !process.env.FACE_ENCRYPTION_KEY) {
+  logger.warn(
+    'FACE_ENCRYPTION_KEY is not set — face descriptors will be stored as plaintext. ' +
+    'Generate a 64-char hex key and set FACE_ENCRYPTION_KEY to enable AES-256-GCM encryption.'
+  );
 }
 
 const express   = require('express');

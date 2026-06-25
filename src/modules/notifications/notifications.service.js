@@ -59,25 +59,113 @@ const channels = {
   },
 
   whatsapp: async ({ to, template, variables }) => {
-    // TODO: integrate Meta Cloud API or Gupshup.
-    // Templates must be pre-approved in WhatsApp Business.
     if (!to) return { status: 'failed', error: 'no recipient' };
-    logger.info({ to, template, variables }, 'notification whatsapp stub');
-    return { status: 'sent', provider_id: `wa_${Date.now()}` };
+
+    const sid    = process.env.TWILIO_ACCOUNT_SID;
+    const token  = process.env.TWILIO_AUTH_TOKEN;
+    const from   = process.env.TWILIO_WHATSAPP_FROM; // e.g. whatsapp:+14155238886
+    if (sid && token && from) {
+      try {
+        // Build a human-readable message from template variables when a
+        // pre-approved template isn't configured — replace with your
+        // approved template name and component parameters for production.
+        const text = variables ? variables.join(' — ') : template;
+        const body = new URLSearchParams({
+          From: from,
+          To:   to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+          Body: text,
+        });
+        const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Authorization': 'Basic ' + Buffer.from(`${sid}:${token}`).toString('base64'),
+          },
+          body: body.toString(),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          logger.error({ status: res.status, data }, 'twilio whatsapp failed');
+          return { status: 'failed', error: data.message || 'twilio error' };
+        }
+        return { status: 'sent', provider_id: data.sid };
+      } catch (err) {
+        logger.error({ err: err.message }, 'twilio whatsapp exception');
+        return { status: 'failed', error: err.message };
+      }
+    }
+
+    // No provider configured — surface as not_configured so logs show real state
+    logger.warn({ to, template }, 'whatsapp not_configured (set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN + TWILIO_WHATSAPP_FROM)');
+    return { status: 'not_configured', provider_id: null };
   },
 
   sms: async ({ to, body }) => {
-    // TODO: integrate MSG91 / Twilio.
     if (!to) return { status: 'failed', error: 'no recipient' };
-    logger.info({ to }, 'notification sms stub');
-    return { status: 'sent', provider_id: `sms_${Date.now()}` };
+
+    const sid   = process.env.TWILIO_ACCOUNT_SID;
+    const token = process.env.TWILIO_AUTH_TOKEN;
+    const from  = process.env.TWILIO_SMS_FROM;
+    if (sid && token && from) {
+      try {
+        const params = new URLSearchParams({ From: from, To: to, Body: body });
+        const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Authorization': 'Basic ' + Buffer.from(`${sid}:${token}`).toString('base64'),
+          },
+          body: params.toString(),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          logger.error({ status: res.status, data }, 'twilio sms failed');
+          return { status: 'failed', error: data.message || 'twilio error' };
+        }
+        return { status: 'sent', provider_id: data.sid };
+      } catch (err) {
+        logger.error({ err: err.message }, 'twilio sms exception');
+        return { status: 'failed', error: err.message };
+      }
+    }
+
+    logger.warn({ to }, 'sms not_configured (set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN + TWILIO_SMS_FROM)');
+    return { status: 'not_configured', provider_id: null };
   },
 
   push: async ({ device_token, title, body }) => {
-    // TODO: integrate FCM.
     if (!device_token) return { status: 'failed', error: 'no token' };
-    logger.info({ title }, 'notification push stub');
-    return { status: 'sent', provider_id: `push_${Date.now()}` };
+
+    const serverKey = process.env.FCM_SERVER_KEY;
+    if (serverKey) {
+      try {
+        const res = await fetch('https://fcm.googleapis.com/fcm/send', {
+          method: 'POST',
+          headers: {
+            'Content-Type':  'application/json',
+            'Authorization': `key=${serverKey}`,
+          },
+          body: JSON.stringify({
+            to: device_token,
+            notification: { title, body },
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.failure) {
+          logger.error({ data }, 'fcm push failed');
+          return { status: 'failed', error: data.results?.[0]?.error || 'fcm error' };
+        }
+        return { status: 'sent', provider_id: data.multicast_id?.toString() };
+      } catch (err) {
+        logger.error({ err: err.message }, 'fcm push exception');
+        return { status: 'failed', error: err.message };
+      }
+    }
+
+    logger.warn({ title }, 'push not_configured (set FCM_SERVER_KEY)');
+    return { status: 'not_configured', provider_id: null };
   },
 };
 
