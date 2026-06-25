@@ -691,8 +691,6 @@ router.post('/:id/renew-subscription', auth, async (req, res, next) => {
   } finally { tx.release(); }
 });
 
-module.exports = router;
-
 // POST /api/clients/:id/unfreeze
 router.post('/:id/unfreeze', auth, async (req, res, next) => {
   try {
@@ -701,8 +699,7 @@ router.post('/:id/unfreeze', auth, async (req, res, next) => {
     if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
     const c = rows[0];
 
-    const tx = pool;
-    await tx.query(
+    await pool.query(
       `UPDATE clients
          SET status='active', is_frozen=FALSE,
              freeze_from=NULL, freeze_until=NULL, freeze_reason=NULL,
@@ -710,7 +707,7 @@ router.post('/:id/unfreeze', auth, async (req, res, next) => {
        WHERE id=$1`,
       [c.id]
     );
-    await logAction(tx, c.id, c.name, c.trainer_id, 'unfreeze',
+    await logAction(pool, c.id, c.name, c.trainer_id, 'unfreeze',
       { status: c.status, is_frozen: c.is_frozen },
       { status: 'active', is_frozen: false },
       0, null, req.body?.notes || null, req.user?.name
@@ -719,3 +716,19 @@ router.post('/:id/unfreeze', auth, async (req, res, next) => {
     res.json({ message: 'Membership unfrozen successfully', client: updated[0] });
   } catch (err) { next(err); }
 });
+
+// POST /api/clients/:id/photo
+router.post('/:id/photo', auth, async (req, res, next) => {
+  try {
+    const { photo } = req.body;
+    if (!photo) return res.status(400).json({ error: 'No photo data provided' });
+    const { rows } = await pool.query(
+      'UPDATE clients SET photo_url=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL RETURNING id, photo_url',
+      [photo, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
+    res.json({ message: 'Photo updated', photo_url: rows[0].photo_url });
+  } catch (err) { next(err); }
+});
+
+module.exports = router;
