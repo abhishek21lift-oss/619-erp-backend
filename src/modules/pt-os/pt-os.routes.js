@@ -42,9 +42,18 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 
 // ─── Trainers ───────────────────────────────────────────────
 router.get('/trainers', auth, wrap(async (req, res) => {
-  const { rows } = await pool.query(
-    "SELECT id, name, email, mobile, specialization, incentive_rate, status, photo_url FROM pt_trainers WHERE deleted_at IS NULL AND status = 'active' ORDER BY name"
-  );
+  // Include trainers from both the main trainers table and the PT-OS-specific
+  // pt_trainers table so adding a trainer in either place makes them available here.
+  const { rows } = await pool.query(`
+    SELECT id, name, email, mobile, specialization, incentive_rate, status, NULL::text AS photo_url
+    FROM trainers
+    WHERE deleted_at IS NULL AND status = 'active'
+    UNION
+    SELECT id, name, email, mobile, specialization, incentive_rate, status, photo_url
+    FROM pt_trainers
+    WHERE deleted_at IS NULL AND status = 'active'
+    ORDER BY name
+  `);
   res.json({ data: rows });
 }));
 
