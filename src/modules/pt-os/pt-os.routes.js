@@ -153,7 +153,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
         const {
           client_id, name, gender, mobile, email, dob,
           trainer_id, package_type, base_amount, discount,
-          pt_start_date, duration_months, monthly_pt_amount,
+          pt_start_date, pt_end_date, duration_months, monthly_pt_amount,
           notes, weight,
           pt_package_id, base_price, selling_price,
         } = req.body;
@@ -169,13 +169,33 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
     }
 
     const finalAmt = (base_amount || 0) - (discount || 0);
-    const trainer = trainer_id ? (await pool.query('SELECT name FROM pt_trainers WHERE id=$1', [trainer_id])).rows[0] : null;
+
+    // Trainer can be selected from either the main staff table or the PT-OS-specific table
+    const trainer = trainer_id ? (await pool.query(
+      `SELECT name FROM trainers WHERE id = $1
+       UNION
+       SELECT name FROM pt_trainers WHERE id = $1
+       LIMIT 1`, [trainer_id]
+    )).rows[0] : null;
+
+    // Resolve plan name / duration from the selected package when not sent directly
+    let resolvedPackageType = package_type || null;
+    let resolvedDurationMonths = duration_months || null;
+    if (pt_package_id && (!resolvedPackageType || !resolvedDurationMonths)) {
+      const { rows: [plan] } = await pool.query(
+        'SELECT name, duration_months FROM pt_plans WHERE id = $1', [pt_package_id]
+      );
+      if (plan) {
+        resolvedPackageType = resolvedPackageType || plan.name;
+        resolvedDurationMonths = resolvedDurationMonths || plan.duration_months;
+      }
+    }
 
     const startDate = pt_start_date || new Date().toISOString().slice(0, 10);
-    let endDate = null;
-    if (duration_months && duration_months > 0) {
+    let endDate = pt_end_date || null;
+    if (!endDate && resolvedDurationMonths && resolvedDurationMonths > 0) {
       const d = new Date(startDate);
-      d.setMonth(d.getMonth() + Number(duration_months));
+      d.setMonth(d.getMonth() + Number(resolvedDurationMonths));
       endDate = d.toISOString().slice(0, 10);
     }
 
@@ -187,6 +207,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
         base_amount = COALESCE($5, base_amount),
         discount = COALESCE($6, discount),
         final_amount = COALESCE($7, final_amount),
+        balance_amount = GREATEST(COALESCE($7, final_amount) - paid_amount, 0),
         monthly_pt_amount = COALESCE($8, monthly_pt_amount),
         pt_start_date = COALESCE($9, pt_start_date),
         pt_end_date = COALESCE($10, pt_end_date),
@@ -198,9 +219,9 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
       WHERE id = $1 AND deleted_at IS NULL
       RETURNING *
     `, [
-      cid, trainer_id, trainer?.name || null, package_type,
+      cid, trainer_id, trainer?.name || null, resolvedPackageType,
       base_amount, discount, finalAmt, monthly_pt_amount,
-      startDate, endDate, duration_months,
+      startDate, endDate, resolvedDurationMonths,
       notes || null, weight != null ? Number(weight) : null,
     ]);
 
