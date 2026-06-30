@@ -6,7 +6,7 @@ const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
-const { generateClientId, generateMemberCode } = require('../../db/id-gen');
+const { generateClientId } = require('../../db/id-gen');
 
 const ptClientCreateSchema = {
   body: z.object({
@@ -159,29 +159,13 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
         } = req.body;
 
     let cid = client_id;
-    let memberCode = null;
     if (!cid) {
-      const pgClient = await pool.connect();
-      try {
-        await pgClient.query('BEGIN');
-        await pgClient.query("SELECT pg_advisory_xact_lock(1937456102)");
-        memberCode = await generateMemberCode(pgClient);
-        const { rows: [newCli] } = await pgClient.query(`
-          INSERT INTO pt_clients (name, gender, mobile, email, dob, status, joining_date)
-          VALUES ($1,$2,$3,$4,$5,'active',$6)
-          RETURNING id
-        `, [name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date()]);
-        await pgClient.query('COMMIT');
-        cid = newCli.id;
-      } catch (txErr) {
-        await pgClient.query('ROLLBACK');
-        throw txErr;
-      } finally {
-        pgClient.release();
-      }
-    } else {
-      const { rows: [row] } = await pool.query('SELECT member_code FROM pt_clients WHERE id=$1', [cid]);
-      memberCode = row?.member_code || null;
+      const { rows: [newCli] } = await pool.query(`
+        INSERT INTO pt_clients (name, gender, mobile, email, dob, status, joining_date)
+        VALUES ($1,$2,$3,$4,$5,'active',$6)
+        RETURNING id
+      `, [name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date()]);
+      cid = newCli.id;
     }
 
     const finalAmt = (base_amount || 0) - (discount || 0);
@@ -209,7 +193,6 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
         duration_months = COALESCE($11, duration_months),
         notes = COALESCE($12, notes),
         weight = COALESCE($13, weight),
-        member_code = COALESCE($14, member_code),
         status = 'active',
         updated_at = NOW()
       WHERE id = $1 AND deleted_at IS NULL
@@ -219,7 +202,6 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
       base_amount, discount, finalAmt, monthly_pt_amount,
       startDate, endDate, duration_months,
       notes || null, weight != null ? Number(weight) : null,
-      memberCode,
     ]);
 
     res.status(201).json({ data: rows[0] });
