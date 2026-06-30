@@ -83,13 +83,23 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
       return res.status(403).json({ error: 'Access denied: client is not assigned to you' });
     }
 
-    // Get trainer incentive rate — use ?? not || so a legitimate 0 doesn't fall back to 0.5
+    // Resolve trainer — verify the FK target exists; if the trainer was deleted
+    // without the cascade clearing the client's trainer_id, the INSERT would fail
+    // with a FK violation (23503). Fall back to NULL in that case.
+    let resolvedTrainerId = null;
+    let resolvedTrainerName = null;
     let incentiveRate = 0.5;
     if (cl[0].trainer_id) {
       const { rows: tr } = await tx.query(
-        'SELECT incentive_rate FROM trainers WHERE id=$1', [cl[0].trainer_id]
+        'SELECT id, name, incentive_rate FROM trainers WHERE id=$1', [cl[0].trainer_id]
       );
-      incentiveRate = tr[0]?.incentive_rate ?? 0.5;
+      if (tr[0]) {
+        resolvedTrainerId   = tr[0].id;
+        resolvedTrainerName = tr[0].name ?? cl[0].trainer_name;
+        incentiveRate       = tr[0].incentive_rate ?? 0.5;
+      }
+      // If trainer row is missing (deleted without cascade), keep everything NULL
+      // so the payment still records and the balance still updates correctly.
     }
 
     const id = randomUUID();
@@ -100,7 +110,7 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
         amount,method,date,receipt_no,package_type,incentive_amt,notes)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [id, d.client_id, cl[0].name,
-       cl[0].trainer_id, cl[0].trainer_name,
+       resolvedTrainerId, resolvedTrainerName,
        amount, d.method||'CASH', d.date, receiptNo,
        cl[0].package_type, Math.round(amount * incentiveRate),
        d.notes||null]
