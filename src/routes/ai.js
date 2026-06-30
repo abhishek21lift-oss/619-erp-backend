@@ -509,7 +509,7 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
       ),
       pool.query(
         `SELECT COUNT(*) AS total_renewals,
-                COALESCE(SUM(amount_paid),0) AS renewal_revenue
+                COALESCE(SUM(paid_amount),0) AS renewal_revenue
          FROM pt_client_renewals WHERE renewed_at BETWEEN $1 AND $2`,
         [fromDate, toDate]
       ),

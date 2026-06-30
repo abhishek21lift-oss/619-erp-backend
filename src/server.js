@@ -335,6 +335,7 @@ app.use('/api/offers',            require('./routes/offers'));
 app.use('/api/feedback',          require('./routes/feedback'));
 app.use('/api/communication',     require('./routes/communication'));
 app.use('/api/ai',               require('./routes/ai'));
+app.use('/api/agent',            require('./routes/agent'));
 
 // ────────────────────────
 // MEMBER PORTAL ROUTES
