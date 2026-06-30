@@ -40,6 +40,30 @@ const INTENT_ROUTES = {
   report:       'fallback',
   analytics:    'fallback',
   summary:      'fallback',
+
+  // Agent domain intents — mapped to appropriate model tiers
+  attendance:   'secondary',
+  checkin:      'secondary',
+  absent:       'secondary',
+  client:       'secondary',
+  member:       'secondary',
+  trainer:      'secondary',
+  session:      'secondary',
+  booking:      'secondary',
+  pt:           'secondary',
+  finance:      'fallback',
+  payment:      'fallback',
+  invoice:      'fallback',
+  dues:         'fallback',
+  subscription: 'fallback',
+  renew:        'secondary',
+  whatsapp:     'secondary',
+  notify:       'secondary',
+  communication:'secondary',
+  coach:        'primary',
+  retention:    'fallback',
+  revenue:      'fallback',
+  trend:        'fallback',
 };
 
 function resolveModel(intent) {
