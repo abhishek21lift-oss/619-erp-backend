@@ -641,10 +641,34 @@ router.get('/payments', auth, wrap(async (req, res) => {
 router.post('/payments', auth, wrap(async (req, res) => {
   const { client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes } = req.body;
   const numAmount = Number(amount) || 0;
+
+  // Validate trainer_id FK — fall back to null if trainer no longer exists
+  let resolvedTrainerId = trainer_id || null;
+  if (resolvedTrainerId) {
+    const { rows: tr } = await pool.query(
+      'SELECT id FROM pt_trainers WHERE id = $1 AND deleted_at IS NULL', [resolvedTrainerId]
+    );
+    if (!tr.length) {
+      // Also try looking up by the client's current trainer
+      const { rows: cl } = await pool.query(
+        'SELECT trainer_id FROM pt_clients WHERE id = $1 AND deleted_at IS NULL', [client_id]
+      );
+      const fallback = cl[0]?.trainer_id;
+      if (fallback && fallback !== resolvedTrainerId) {
+        const { rows: tr2 } = await pool.query(
+          'SELECT id FROM pt_trainers WHERE id = $1 AND deleted_at IS NULL', [fallback]
+        );
+        resolvedTrainerId = tr2.length ? fallback : null;
+      } else {
+        resolvedTrainerId = null;
+      }
+    }
+  }
+
   const { rows } = await pool.query(
     `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [client_id, trainer_id, numAmount, incentive_amt ?? 0, payment_method, payment_ref, date || new Date(), notes]
+    [client_id, resolvedTrainerId, numAmount, incentive_amt ?? 0, payment_method, payment_ref, date || new Date(), notes]
   );
   // update client paid_amount and balance_amount
   await pool.query(
