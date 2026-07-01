@@ -16,6 +16,7 @@ const ptClientCreateSchema = {
     dob: z.string().optional().nullable(),
     gender: z.string().max(20).optional().nullable(),
     trainer_id: z.string().uuid().optional().nullable(),
+    trainer_name: z.string().max(255).optional().nullable(),
     goal: z.string().max(100).optional().nullable(),
     height: z.coerce.number().optional().nullable(),
     weight: z.coerce.number().optional().nullable(),
@@ -152,9 +153,10 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
       try {
         const {
           client_id, name, gender, mobile, email, dob,
-          trainer_id, package_type, base_amount, discount,
+          trainer_id, trainer_name: reqTrainerName, package_type, base_amount, discount,
           pt_start_date, pt_end_date, duration_months, monthly_pt_amount,
           notes, weight,
+          goal, height, body_fat, health_conditions, injuries, frequency,
           pt_package_id, base_price, selling_price,
         } = req.body;
 
@@ -170,13 +172,17 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
 
     const finalAmt = (base_amount || 0) - (discount || 0);
 
-    // Trainer can be selected from either the main staff table or the PT-OS-specific table
-    const trainer = trainer_id ? (await pool.query(
-      `SELECT name FROM trainers WHERE id = $1
-       UNION
-       SELECT name FROM pt_trainers WHERE id = $1
-       LIMIT 1`, [trainer_id]
-    )).rows[0] : null;
+    // Trainer name: use value sent directly by frontend first, then fall back to DB lookup
+    let resolvedTrainerName = reqTrainerName || null;
+    if (!resolvedTrainerName && trainer_id) {
+      const { rows: tRows } = await pool.query(
+        `SELECT name FROM trainers WHERE id = $1
+         UNION
+         SELECT name FROM pt_trainers WHERE id = $1
+         LIMIT 1`, [trainer_id]
+      );
+      resolvedTrainerName = tRows[0]?.name || null;
+    }
 
     // Resolve plan name / duration from the selected package when not sent directly
     let resolvedPackageType = package_type || null;
@@ -201,28 +207,38 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
 
     const { rows } = await pool.query(`
       UPDATE pt_clients SET
-        trainer_id = COALESCE($2, trainer_id),
-        trainer_name = COALESCE($3, trainer_name),
-        package_type = COALESCE($4, package_type),
-        base_amount = COALESCE($5, base_amount),
-        discount = COALESCE($6, discount),
-        final_amount = COALESCE($7, final_amount),
-        balance_amount = GREATEST(COALESCE($7, final_amount) - paid_amount, 0),
-        monthly_pt_amount = COALESCE($8, monthly_pt_amount),
-        pt_start_date = COALESCE($9, pt_start_date),
-        pt_end_date = COALESCE($10, pt_end_date),
-        duration_months = COALESCE($11, duration_months),
-        notes = COALESCE($12, notes),
-        weight = COALESCE($13, weight),
+        trainer_id        = COALESCE($2,  trainer_id),
+        trainer_name      = COALESCE($3,  trainer_name),
+        package_type      = COALESCE($4,  package_type),
+        base_amount       = COALESCE($5,  base_amount),
+        discount          = COALESCE($6,  discount),
+        final_amount      = COALESCE($7,  final_amount),
+        balance_amount    = GREATEST(COALESCE($7, final_amount) - paid_amount, 0),
+        monthly_pt_amount = COALESCE($8,  monthly_pt_amount),
+        pt_start_date     = COALESCE($9,  pt_start_date),
+        pt_end_date       = COALESCE($10, pt_end_date),
+        duration_months   = COALESCE($11, duration_months),
+        notes             = COALESCE($12, notes),
+        weight            = COALESCE($13, weight),
+        goal              = COALESCE($14, goal),
+        height            = COALESCE($15, height),
+        body_fat          = COALESCE($16, body_fat),
+        health_conditions = COALESCE($17, health_conditions),
+        injuries          = COALESCE($18, injuries),
+        frequency         = COALESCE($19, frequency),
         status = 'active',
         updated_at = NOW()
       WHERE id = $1 AND deleted_at IS NULL
       RETURNING *
     `, [
-      cid, trainer_id, trainer?.name || null, resolvedPackageType,
+      cid,
+      trainer_id, resolvedTrainerName, resolvedPackageType,
       base_amount, discount, finalAmt, monthly_pt_amount,
       startDate, endDate, resolvedDurationMonths,
       notes || null, weight != null ? Number(weight) : null,
+      goal || null, height != null ? Number(height) : null,
+      body_fat != null ? Number(body_fat) : null,
+      health_conditions || null, injuries || null, frequency || null,
     ]);
 
     res.status(201).json({ data: rows[0] });
@@ -323,11 +339,13 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
   const isTrainer = req.user.role === 'trainer';
   const allowed = isTrainer
     ? ['package_type','trainer_id','trainer_name','pt_start_date','pt_end_date',
-       'duration_months','status','notes','monthly_pt_amount']
+       'duration_months','status','notes','monthly_pt_amount',
+       'goal','height','body_fat','health_conditions','injuries','frequency']
     : ['package_type','base_amount','discount','final_amount','paid_amount',
        'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes',
-       'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact'];
+       'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact',
+       'goal','height','body_fat','health_conditions','injuries','frequency'];
   const sets = [];
   const params = [req.params.id];
   for (const key of allowed) {
