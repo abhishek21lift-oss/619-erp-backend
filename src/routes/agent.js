@@ -115,7 +115,9 @@ router.post('/execute', auth, requireConfigured, async (req, res) => {
     }
 
     if (!res.writableEnded) {
-      sseWrite(res, 'done', result);
+      if (result.status !== 'requires_confirmation') {
+        sseWrite(res, 'done', result);
+      }
       res.end();
     }
   } catch (err) {
@@ -131,10 +133,15 @@ router.post('/execute', auth, requireConfigured, async (req, res) => {
 /* ═══════════════════════════════════════════════════════════════════════════
    2. CONFIRM  —  POST /api/agent/confirm
    ═══════════════════════════════════════════════════════════════════════════ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 router.post('/confirm', auth, requireConfigured, async (req, res) => {
   const { task_id, confirmation_token, approved } = req.body || {};
   if (!task_id)            return res.status(400).json({ error: 'task_id is required' });
   if (!confirmation_token) return res.status(400).json({ error: 'confirmation_token is required' });
+  // Guard against non-UUID task_id before it hits the UUID-typed Postgres column
+  // (Safari throws "The string did not match the expected pattern" on JSON.parse of SSE)
+  if (!UUID_RE.test(task_id)) return res.status(400).json({ error: 'task_id must be a valid UUID' });
 
   // Load pending task
   let taskRow;
@@ -159,44 +166,31 @@ router.post('/confirm', auth, requireConfigured, async (req, res) => {
     return res.json({ status: 'cancelled', message: 'Action cancelled.' });
   }
 
-  // Start SSE for the execution phase
-  startSSE(res);
-
-  const keepalive = setInterval(() => {
-    if (!res.writableEnded) res.write(': keepalive\n\n');
-  }, 5000);
-
-  const emit = (event, data) => sseWrite(res, event, data || {});
-
+  // Execute synchronously and return JSON.
+  // Previously this used SSE, but the frontend's api.agent.confirm() uses the JSON http()
+  // wrapper — calling res.json() on an SSE body throws a SyntaxError in Safari
+  // ("The string did not match the expected pattern").
   try {
     await pool.query(`UPDATE agent_tasks SET status='executing' WHERE id=$1`, [task_id]);
 
     const context = await buildContext(req, {
-      originalMessage: taskRow.input_text,
-      conversationId:  taskRow.conversation_id,
-      sessionId:       taskRow.session_id,
-      taskId:          task_id,
-      entities:        taskRow.parsed_entities || {},
-      plan:            taskRow.plan,
+      originalMessage:   taskRow.input_text,
+      conversationId:    taskRow.conversation_id,
+      sessionId:         taskRow.session_id,
+      taskId:            task_id,
+      entities:          taskRow.parsed_entities || {},
+      plan:              taskRow.plan,
       confirmationToken: confirmation_token,
     });
 
-    emit('start', { taskId: task_id, phase: 'executing' });
-
-    const result = await ceoAgent.perform(context, emit);
+    const result = await ceoAgent.perform(context, () => {});
     await updateTask(task_id, 'completed', result, null);
 
-    if (!res.writableEnded) {
-      sseWrite(res, 'done', result);
-      res.end();
-    }
+    return res.json({ status: 'completed', summary: result.summary || 'Actions completed.', result });
   } catch (err) {
     logger.error({ err: err.message, taskId: task_id }, 'agent_confirm_execute_error');
     await updateTask(task_id, 'failed', null, err.message);
-    sseWrite(res, 'error', { message: err.message, code: err.code });
-    if (!res.writableEnded) res.end();
-  } finally {
-    clearInterval(keepalive);
+    return res.status(500).json({ error: err.message, code: err.code });
   }
 });
 
@@ -225,6 +219,7 @@ router.get('/tasks', auth, async (req, res) => {
    4. TASK DETAIL  —  GET /api/agent/tasks/:id
    ═══════════════════════════════════════════════════════════════════════════ */
 router.get('/tasks/:id', auth, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'id must be a valid UUID' });
   try {
     const [taskRes, auditRes] = await Promise.all([
       pool.query(
