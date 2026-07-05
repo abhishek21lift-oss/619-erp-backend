@@ -87,24 +87,40 @@ router.post('/', auth, async (req, res, next) => {
   const tx = await pool.connect();
   try {
     const d = req.body;
-    if (!d.client_id || !d.items?.length)
+
+    // Accept both the structured form {client_id, items[]} and the simplified
+    // form {member_name, amount, description, due_date} that the frontend sends.
+    const isSimplified = !d.client_id && !d.items?.length && (d.member_name || d.amount);
+    if (!isSimplified && !d.client_id && !d.items?.length)
       return res.status(400).json({ error: 'client_id and items[] required' });
 
     await tx.query('BEGIN');
 
-    // Get client info
-    const { rows: cl } = await tx.query(
-      'SELECT id, name FROM clients WHERE id=$1', [d.client_id]
-    );
-    if (!cl[0]) { await tx.query('ROLLBACK'); return res.status(404).json({ error: 'Client not found' }); }
+    let clientId = d.client_id || null;
+    let clientName = d.client_name || d.member_name || '';
+
+    // Structured form: look up the client
+    if (!isSimplified) {
+      const { rows: cl } = await tx.query(
+        'SELECT id, name FROM clients WHERE id=$1', [d.client_id]
+      );
+      if (!cl[0]) { await tx.query('ROLLBACK'); return res.status(404).json({ error: 'Client not found' }); }
+      clientName = cl[0].name;
+    }
 
     const id = randomUUID();
     const invNo = 'INV-' + Date.now();
     let subtotal = 0;
-    for (const item of d.items) {
-      const amt = (parseFloat(item.unit_price) || 0) * (parseInt(item.quantity) || 1);
-      subtotal += amt;
+
+    if (isSimplified) {
+      subtotal = parseFloat(d.amount) || 0;
+    } else {
+      for (const item of d.items) {
+        const amt = (parseFloat(item.unit_price) || 0) * (parseInt(item.quantity) || 1);
+        subtotal += amt;
+      }
     }
+
     const taxPct = parseFloat(d.tax_pct) || 0;
     const taxAmt = subtotal * (taxPct / 100);
     const total = subtotal + taxAmt;
@@ -113,18 +129,27 @@ router.post('/', auth, async (req, res, next) => {
       INSERT INTO invoices (id, invoice_no, client_id, client_name, amount, tax_amount, total_amount,
         status, due_date, issue_date, payment_method, notes, created_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-      [id, invNo, d.client_id, cl[0].name, subtotal, taxAmt, total,
+      [id, invNo, clientId, clientName, subtotal, taxAmt, total,
        d.status || 'draft', d.due_date || null, d.issue_date || new Date().toISOString().split('T')[0],
-       d.payment_method || null, d.notes || null, req.user.id]
+       d.payment_method || null, d.notes || d.description || null, req.user.id]
     );
 
-    for (const item of d.items) {
-      const amt = (parseFloat(item.unit_price) || 0) * (parseInt(item.quantity) || 1);
+    if (!isSimplified) {
+      for (const item of d.items) {
+        const amt = (parseFloat(item.unit_price) || 0) * (parseInt(item.quantity) || 1);
+        await tx.query(`
+          INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, amount, type)
+          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [randomUUID(), id, item.description, parseInt(item.quantity) || 1,
+           parseFloat(item.unit_price) || 0, amt, item.type || 'other']
+        );
+      }
+    } else if (d.description) {
+      // Create a single line item from the simplified form
       await tx.query(`
         INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, amount, type)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [randomUUID(), id, item.description, parseInt(item.quantity) || 1,
-         parseFloat(item.unit_price) || 0, amt, item.type || 'other']
+        VALUES ($1,$2,$3,1,$4,$5,'other')`,
+        [randomUUID(), id, d.description, subtotal, subtotal]
       );
     }
 
@@ -205,6 +230,18 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
       [randomUUID(), inv[0].client_id, inv[0].client_name, inv[0].total_amount,
        req.body.payment_method || 'CASH', receiptNo, 'Payment for invoice ' + inv[0].invoice_no]
     );
+
+    // Update the linked client's paid/balance fields so their financial record stays correct
+    if (inv[0].client_id) {
+      await tx.query(`
+        UPDATE clients
+        SET paid_amount    = paid_amount + $1,
+            balance_amount = GREATEST(0, balance_amount - $1),
+            updated_at     = NOW()
+        WHERE id = $2`,
+        [inv[0].total_amount, inv[0].client_id]
+      );
+    }
 
     await tx.query('COMMIT');
     res.json({ message: 'Invoice marked as paid', invoice: inv[0] });

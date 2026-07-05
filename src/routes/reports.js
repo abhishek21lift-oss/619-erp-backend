@@ -111,6 +111,43 @@ router.get('/trainers', auth, adminOnly, async (req, res, next) => {
   }
 });
 
+// GET /api/reports/revenue — total collected revenue for a date range
+// Unions gym payments + PT payments so the figure includes both streams.
+// Called by api.reports.revenue() in the frontend.
+router.get('/revenue', auth, async (req, res, next) => {
+  try {
+    const { from, to, year } = req.query;
+    const conditions = ['p.deleted_at IS NULL'];
+    const params = [];
+    let p = 1;
+
+    if (from) { conditions.push(`p.date >= $${p++}`); params.push(from); }
+    if (to)   { conditions.push(`p.date <= $${p++}`); params.push(to); }
+    if (year && !from && !to) {
+      conditions.push(`EXTRACT(YEAR FROM p.date::date) = $${p++}`);
+      params.push(parseInt(year));
+    }
+
+    const where = 'WHERE ' + conditions.join(' AND ');
+
+    const { rows } = await pool.query(`
+      SELECT
+        COUNT(*)::int                AS count,
+        COALESCE(SUM(p.amount), 0)   AS total,
+        COALESCE(SUM(p.incentive_amt), 0) AS total_incentives
+      FROM (
+        SELECT amount, incentive_amt, date, deleted_at FROM payments
+        UNION ALL
+        SELECT amount, incentive_amt, date, deleted_at FROM pt_payments
+      ) p
+      ${where}
+    `, params);
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/reports/dues
 router.get('/dues', auth, async (req, res, next) => {
   try {

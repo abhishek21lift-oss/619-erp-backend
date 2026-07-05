@@ -138,6 +138,46 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
   }
 });
 
+// GET /api/payments/stats — server-side aggregation for KPI cards
+// Avoids the 200-row paginated list being used for totals.
+router.get('/stats', auth, async (req, res, next) => {
+  try {
+    const { from, to, trainer_id } = req.query;
+    const conditions = ['p.deleted_at IS NULL'];
+    const params = [];
+    let p = 1;
+
+    if (req.user.role === 'trainer' && req.user.trainer_id) {
+      conditions.push(`p.trainer_id = $${p++}`); params.push(req.user.trainer_id);
+    } else if (trainer_id) {
+      conditions.push(`p.trainer_id = $${p++}`); params.push(trainer_id);
+    }
+    if (from) { conditions.push(`p.date >= $${p++}`); params.push(from); }
+    if (to)   { conditions.push(`p.date <= $${p++}`); params.push(to); }
+
+    const { sql: bsql, params: bparams } = req.branchScope.appendTo(params);
+    if (bsql !== 'TRUE') conditions.push(`p.${bsql}`);
+
+    const where = 'WHERE ' + conditions.join(' AND ');
+
+    const { rows } = await pool.query(`
+      SELECT
+        COUNT(*)::int                                                          AS count,
+        COALESCE(SUM(p.amount), 0)                                            AS total,
+        COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'CASH'),  0)          AS cash,
+        COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'UPI'),   0)          AS upi,
+        COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'CARD'),  0)          AS card,
+        COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'NEFT' OR p.method = 'BANK'), 0) AS bank,
+        COALESCE(SUM(p.incentive_amt), 0)                                     AS total_incentives
+      FROM payments p
+      ${where}
+    `, bparams);
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // DELETE /api/payments/:id (admin only)
 //
 // Soft delete by default (sets deleted_at). The balance reversal still runs
