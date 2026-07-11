@@ -15,6 +15,7 @@ const {
   buildWorkoutSystemPrompt,
   buildDietSystemPrompt,
   buildProgressSystemPrompt,
+  buildFitnessTestingSystemPrompt,
   buildBusinessSystemPrompt,
 } = require('../lib/ai/prompts/system');
 
@@ -462,7 +463,103 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   5. BUSINESS INSIGHTS  (admin only)
+   5. FITNESS TESTING ANALYSER
+   POST /api/ai/fitness-testing/analyze
+   ═══════════════════════════════════════════════════════════════════════════ */
+router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res) => {
+  const { assessment_id } = req.body || {};
+  if (!assessment_id) return res.status(400).json({ error: 'assessment_id is required' });
+
+  try {
+    const { rows: assessRows } = await pool.query('SELECT * FROM pt_assessments WHERE id = $1', [assessment_id]);
+    const assessment = assessRows[0];
+    if (!assessment) return res.status(404).json({ error: 'Assessment not found' });
+
+    const [clientRes, previousRes] = await Promise.all([
+      pool.query('SELECT name, dob, gender FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [assessment.client_id]),
+      pool.query(
+        'SELECT * FROM pt_assessments WHERE client_id=$1 AND assessment_date < $2 ORDER BY assessment_date DESC LIMIT 1',
+        [assessment.client_id, assessment.assessment_date]
+      ),
+    ]);
+
+    const client = clientRes.rows[0];
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+    const age = client.dob ? Math.floor((Date.now() - new Date(client.dob).getTime()) / 31557600000) : null;
+
+    const contextData = {
+      client: { name: client.name, age, gender: client.gender },
+      current_assessment: assessment,
+      previous_assessment: previousRes.rows[0] || null,
+    };
+
+    const userPrompt = `Analyse the following fitness assessment and generate a structured report:\n\n${JSON.stringify(contextData, null, 2)}`;
+
+    // Switch to SSE before the slow AI call
+    res.setHeader('Content-Type',      'text/event-stream');
+    res.setHeader('Cache-Control',     'no-cache');
+    res.setHeader('Connection',        'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
+    let fullContent = '';
+    let streamMeta  = { model: models.primary, tier: 'primary', used_fallback: false };
+
+    const it = routedStream({
+      intent:      'assessment',
+      messages:    [
+        { role: 'system', content: buildFitnessTestingSystemPrompt() },
+        { role: 'user',   content: userPrompt },
+      ],
+      temperature: 0.4,
+      max_tokens:  2000,
+    })[Symbol.asyncIterator]();
+
+    let step;
+    while (!(step = await it.next()).done) {
+      if (typeof step.value === 'string' && !step.value.startsWith('\n\n[Retrying')) {
+        fullContent += step.value;
+      }
+      res.write(': ping\n\n');
+    }
+    if (step.value && typeof step.value === 'object') streamMeta = step.value;
+
+    const analysis = extractJson(fullContent);
+    if (!analysis) {
+      send({ type: 'error', message: 'Could not parse AI response' });
+      res.end();
+      return;
+    }
+
+    logUsage({
+      user_id:           req.user.id,
+      model:             streamMeta.model,
+      intent_type:       'fitness_testing',
+      tokens_prompt:     0,
+      tokens_completion: Math.ceil(fullContent.length / 4),
+      used_fallback:     streamMeta.used_fallback,
+    }).catch(() => {});
+
+    send({ type: 'done', data: analysis, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
+  } catch (err) {
+    logger.error({ err: err.message }, 'ai_fitness_testing_analyze_error');
+    // Headers may or may not have been sent yet depending on where the error occurred
+    if (!res.headersSent) {
+      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+      return res.status(503).json({ error: 'Fitness testing analysis failed', message: err.message });
+    }
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Fitness testing analysis failed. Please try again.' })}\n\n`);
+    } catch { /* ignore write errors on closed connection */ }
+  } finally {
+    try { if (!res.writableEnded) res.end(); } catch { /* ignore */ }
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   6. BUSINESS INSIGHTS  (admin only)
    POST /api/ai/business/insights
    ═══════════════════════════════════════════════════════════════════════════ */
 router.post('/business/insights', auth, requireConfigured, async (req, res) => {
