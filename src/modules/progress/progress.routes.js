@@ -6,6 +6,7 @@ const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const scoring = require('./fitness-scoring');
 const goalScoring = require('./goal-scoring');
+const lifestyleScoring = require('./lifestyle-scoring');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -463,6 +464,206 @@ router.post('/progress-photos', auth, wrap(async (req, res) => {
 router.delete('/progress-photos/:id', auth, wrap(async (req, res) => {
   await pool.query('DELETE FROM progress_photos WHERE id = $1', [req.params.id]);
   res.status(204).end();
+}));
+
+const LIFESTYLE_OCCUPATION_TYPES = [
+  'desk_job', 'active_job', 'physical_labor', 'student', 'homemaker',
+  'driver', 'healthcare', 'police', 'fitness_professional', 'retired', 'other',
+];
+
+const lifestyleAssessmentCreateSchema = {
+  body: z.object({
+    client_id: z.string(),
+    assessment_date: z.string().optional().nullable(),
+
+    sleep_duration_hours: numOpt(), bed_time: z.string().optional().nullable(), wake_time: z.string().optional().nullable(),
+    sleep_quality: numOpt(),
+
+    stress_level: numOpt(),
+
+    water_intake_liters: numOpt(),
+
+    occupation_type: z.enum(LIFESTYLE_OCCUPATION_TYPES).optional().nullable(),
+    daily_steps_bracket: z.enum(['<3000', '3000_5000', '5000_8000', '8000_10000', '10000_plus']).optional().nullable(),
+
+    workout_experience_level: z.enum(['beginner', 'intermediate', 'advanced', 'athlete']).optional().nullable(),
+    years_of_experience: numOpt(),
+
+    food_preferences: z.array(z.string()).optional().nullable(),
+
+    meal_frequency: numOpt(),
+    breakfast_habit: z.enum(['daily', 'sometimes', 'never']).optional().nullable(),
+    late_night_eating: z.boolean().optional().nullable(),
+
+    smoking_status: z.enum(['never', 'occasionally', 'daily', 'former']).optional().nullable(),
+    cigarettes_per_day: numOpt(), years_smoking: numOpt(),
+    alcohol_status: z.enum(['never', 'occasionally', 'weekly', 'frequently']).optional().nullable(),
+    drinks_per_week: numOpt(),
+
+    screen_time_bracket: z.enum(['<2', '2_4', '4_6', '6_8', '8_plus']).optional().nullable(),
+    travel_frequency: z.enum(['rarely', 'monthly', 'weekly', 'daily']).optional().nullable(),
+    energy_level: numOpt(), motivation_to_exercise: numOpt(),
+    recovery_quality: z.enum(['poor', 'average', 'good', 'excellent']).optional().nullable(),
+
+    coach_notes: z.record(z.string(), z.string()).optional().nullable(),
+  }),
+};
+
+// Shared by POST (create) and PATCH (update) so the Smart Lifestyle
+// Analysis columns never drift out of sync between the two write paths.
+function computeLifestyleAnalysis(b) {
+  const sleep = lifestyleScoring.classifySleep(b.sleep_duration_hours ?? null, b.sleep_quality ?? null);
+  const stressScore = lifestyleScoring.calcStressScore(b.stress_level ?? null);
+  const hydration = lifestyleScoring.classifyHydration(b.water_intake_liters ?? null);
+  const activity = lifestyleScoring.classifyActivity(b.daily_steps_bracket || null, b.occupation_type || null);
+  const nutritionScore = lifestyleScoring.calcNutritionScore(b.meal_frequency ?? null, b.breakfast_habit || null, b.late_night_eating ?? null);
+  const recoveryScore = lifestyleScoring.calcRecoveryScore(sleep.score, stressScore, b.energy_level ?? null, b.recovery_quality || null);
+  const sedentaryRisk = lifestyleScoring.classifyRisk(activity.score);
+  const recoveryRisk = lifestyleScoring.classifyRisk(recoveryScore);
+
+  const habitInputs = {
+    smokingStatus: b.smoking_status || null, alcoholStatus: b.alcohol_status || null,
+    sleepScore: sleep.score, stressScore, hydrationScore: hydration.score, activityScore: activity.score, nutritionScore,
+  };
+  const habitRiskScore = lifestyleScoring.calcHabitRiskScore(habitInputs);
+  const riskFactors = lifestyleScoring.buildLifestyleRiskFactors(habitInputs);
+
+  const lifestyleScoreVal = lifestyleScoring.calcLifestyleScore(
+    { sleep: sleep.score, stress: stressScore, hydration: hydration.score, activity: activity.score, nutrition: nutritionScore, recovery: recoveryScore },
+    habitRiskScore
+  );
+  const lifestyleReadiness = lifestyleScoring.classifyLifestyleReadiness(lifestyleScoreVal);
+
+  return {
+    sleepCategory: sleep.category, sleepScore: sleep.score,
+    stressScore,
+    hydrationCategory: hydration.category, hydrationScore: hydration.score,
+    activityLevel: activity.level, activityScore: activity.score,
+    nutritionScore,
+    recoveryScore,
+    sedentaryRisk, recoveryRisk,
+    habitRiskScore, riskFactors,
+    lifestyleScore: lifestyleScoreVal, lifestyleReadiness,
+  };
+}
+
+router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
+  const { client_id } = req.query;
+  const where = []; const params = [];
+  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const { rows } = await pool.query(
+    `SELECT * FROM pt_lifestyle_assessments ${whereSql} ORDER BY assessment_date DESC`, params
+  );
+  res.json({ data: rows });
+}));
+
+router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(lifestyleAssessmentCreateSchema), wrap(async (req, res) => {
+  const b = req.body;
+  const analysis = computeLifestyleAnalysis(b);
+
+  const { rows } = await pool.query(
+    `INSERT INTO pt_lifestyle_assessments (
+       client_id, assessment_number, assessment_date,
+       sleep_duration_hours, bed_time, wake_time, sleep_quality, sleep_category, sleep_score,
+       stress_level, stress_score,
+       water_intake_liters, hydration_category, hydration_score,
+       occupation_type, daily_steps_bracket, activity_level, activity_score,
+       workout_experience_level, years_of_experience,
+       food_preferences,
+       meal_frequency, breakfast_habit, late_night_eating, nutrition_score,
+       smoking_status, cigarettes_per_day, years_smoking, alcohol_status, drinks_per_week,
+       screen_time_bracket, travel_frequency, energy_level, motivation_to_exercise, recovery_quality, recovery_score,
+       sedentary_risk, recovery_risk, habit_risk_score, risk_factors, lifestyle_score, lifestyle_readiness,
+       coach_notes, created_by
+     ) VALUES (
+       $1,(SELECT COUNT(*)+1 FROM pt_lifestyle_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
+       $3,$4,$5,$6,$7,$8,
+       $9,$10,
+       $11,$12,$13,
+       $14,$15,$16,$17,
+       $18,$19,
+       $20,
+       $21,$22,$23,$24,
+       $25,$26,$27,$28,$29,
+       $30,$31,$32,$33,$34,$35,
+       $36,$37,$38,$39,$40,$41,
+       $42::jsonb,$43
+     ) RETURNING *`,
+    [
+      b.client_id, b.assessment_date || null,
+      b.sleep_duration_hours ?? null, b.bed_time || null, b.wake_time || null, b.sleep_quality ?? null, analysis.sleepCategory, analysis.sleepScore,
+      b.stress_level ?? null, analysis.stressScore,
+      b.water_intake_liters ?? null, analysis.hydrationCategory, analysis.hydrationScore,
+      b.occupation_type || null, b.daily_steps_bracket || null, analysis.activityLevel, analysis.activityScore,
+      b.workout_experience_level || null, b.years_of_experience ?? null,
+      b.food_preferences && b.food_preferences.length ? b.food_preferences : null,
+      b.meal_frequency ?? null, b.breakfast_habit || null, b.late_night_eating ?? null, analysis.nutritionScore,
+      b.smoking_status || null, b.cigarettes_per_day ?? null, b.years_smoking ?? null, b.alcohol_status || null, b.drinks_per_week ?? null,
+      b.screen_time_bracket || null, b.travel_frequency || null, b.energy_level ?? null, b.motivation_to_exercise ?? null, b.recovery_quality || null, analysis.recoveryScore,
+      analysis.sedentaryRisk, analysis.recoveryRisk, analysis.habitRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.lifestyleScore, analysis.lifestyleReadiness,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+    ]
+  );
+  res.status(201).json({ data: rows[0] });
+}));
+
+router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
+  const allowed = [
+    'assessment_date', 'sleep_duration_hours', 'bed_time', 'wake_time', 'sleep_quality', 'stress_level',
+    'water_intake_liters', 'occupation_type', 'daily_steps_bracket', 'workout_experience_level', 'years_of_experience',
+    'food_preferences', 'meal_frequency', 'breakfast_habit', 'late_night_eating',
+    'smoking_status', 'cigarettes_per_day', 'years_smoking', 'alcohol_status', 'drinks_per_week',
+    'screen_time_bracket', 'travel_frequency', 'energy_level', 'motivation_to_exercise', 'recovery_quality', 'coach_notes',
+  ];
+
+  const { rows: existingRows } = await pool.query('SELECT * FROM pt_lifestyle_assessments WHERE id = $1', [req.params.id]);
+  const existing = existingRows[0];
+  if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
+  const sets = []; const params = [req.params.id];
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      const val = key === 'coach_notes' && req.body[key] != null ? JSON.stringify(req.body[key]) : req.body[key];
+      params.push(val); sets.push(`${key} = $${params.length}`);
+    }
+  }
+  if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
+
+  const merged = { ...existing, ...req.body };
+  const analysis = computeLifestyleAnalysis({
+    sleep_duration_hours: merged.sleep_duration_hours != null ? parseFloat(merged.sleep_duration_hours) : null,
+    sleep_quality: merged.sleep_quality != null ? parseInt(merged.sleep_quality, 10) : null,
+    stress_level: merged.stress_level != null ? parseInt(merged.stress_level, 10) : null,
+    water_intake_liters: merged.water_intake_liters != null ? parseFloat(merged.water_intake_liters) : null,
+    occupation_type: merged.occupation_type || null,
+    daily_steps_bracket: merged.daily_steps_bracket || null,
+    meal_frequency: merged.meal_frequency != null ? parseInt(merged.meal_frequency, 10) : null,
+    breakfast_habit: merged.breakfast_habit || null,
+    late_night_eating: merged.late_night_eating,
+    energy_level: merged.energy_level != null ? parseInt(merged.energy_level, 10) : null,
+    recovery_quality: merged.recovery_quality || null,
+    smoking_status: merged.smoking_status || null,
+    alcohol_status: merged.alcohol_status || null,
+  });
+
+  for (const [col, val] of Object.entries({
+    sleep_category: analysis.sleepCategory, sleep_score: analysis.sleepScore,
+    stress_score: analysis.stressScore,
+    hydration_category: analysis.hydrationCategory, hydration_score: analysis.hydrationScore,
+    activity_level: analysis.activityLevel, activity_score: analysis.activityScore,
+    nutrition_score: analysis.nutritionScore,
+    recovery_score: analysis.recoveryScore,
+    sedentary_risk: analysis.sedentaryRisk, recovery_risk: analysis.recoveryRisk,
+    habit_risk_score: analysis.habitRiskScore, risk_factors: analysis.riskFactors.length ? analysis.riskFactors : null,
+    lifestyle_score: analysis.lifestyleScore, lifestyle_readiness: analysis.lifestyleReadiness,
+  })) {
+    params.push(val); sets.push(`${col} = $${params.length}`);
+  }
+
+  sets.push('updated_at = NOW()');
+  const { rows } = await pool.query(`UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  res.json({ data: rows[0] });
 }));
 
 module.exports = router;
