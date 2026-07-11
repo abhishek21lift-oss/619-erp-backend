@@ -5,6 +5,7 @@ const { requireRole } = require('../../middleware/rbac');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const scoring = require('./fitness-scoring');
+const goalScoring = require('./goal-scoring');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -214,6 +215,49 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
   res.status(201).json({ data: { ...rows[0], bp_unsafe: bp.isUnsafe } });
 }));
 
+const GOAL_TYPES = [
+  'fat_loss', 'muscle_gain', 'body_recomposition', 'strength_gain', 'powerlifting',
+  'endurance', 'general_fitness', 'mobility', 'marathon_prep', 'wedding_transformation',
+  'medical_fitness', 'senior_fitness', 'athletic_performance', 'custom',
+];
+
+const goalCreateSchema = {
+  body: z.object({
+    client_id: z.string(),
+    goal_type: z.enum(GOAL_TYPES),
+    goal_other: z.string().max(200).optional().nullable(),
+    goal_description: z.string().max(2000).optional().nullable(),
+    target_weight: numOpt(), target_body_fat: numOpt(),
+    target_date: z.string().optional().nullable(),
+    priority_goal: z.string().max(50).optional().nullable(),
+    motivation_reason: z.string().max(2000).optional().nullable(),
+    motivation_level: numOpt(), commitment_level: numOpt(),
+    biggest_challenges: z.array(z.string()).optional().nullable(),
+    lifestyle_readiness: z.record(z.string(), z.boolean()).optional().nullable(),
+    starting_weight: numOpt(), starting_body_fat_pct: numOpt(),
+    notes: z.string().max(2000).optional().nullable(),
+  }),
+};
+
+// Shared by POST (create) and PATCH (update) so the Smart Goal Analysis
+// columns never drift out of sync between the two write paths.
+function computeGoalAnalysis({ startingWeight, targetWeight, targetDate, lifestyleReadiness, motivationLevel, commitmentLevel }) {
+  const daysRemaining = targetDate ? Math.ceil((new Date(targetDate).getTime() - Date.now()) / 86400000) : null;
+  const direction = goalScoring.goalDirection(startingWeight, targetWeight);
+  const requiredRate = goalScoring.calcRequiredWeeklyRate(startingWeight, targetWeight, daysRemaining);
+  const safeRate = goalScoring.calcSafeWeeklyRate(startingWeight, direction);
+  const lifestyleScore = goalScoring.calcLifestyleReadinessScore(lifestyleReadiness || null);
+  const difficulty = goalScoring.classifyGoalDifficulty(requiredRate, safeRate, lifestyleScore, motivationLevel, commitmentLevel);
+  const estimatedWeeks = goalScoring.calcEstimatedDurationWeeks(startingWeight, targetWeight, safeRate);
+  const recommendedMonths = goalScoring.recommendPtDurationMonths(estimatedWeeks);
+  const riskFactors = goalScoring.buildRiskFactors({
+    requiredRate, safeRate, lifestyleReadinessScore: lifestyleScore,
+    medicalRestrictions: lifestyleReadiness ? lifestyleReadiness.medical_restrictions === true : null,
+    daysRemaining, motivationLevel, commitmentLevel,
+  });
+  return { lifestyleScore, difficulty, estimatedWeeks, recommendedMonths, requiredRate, safeRate, riskFactors };
+}
+
 router.get('/goals', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
@@ -225,24 +269,105 @@ router.get('/goals', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/goals', auth, wrap(async (req, res) => {
-  const { client_id, goal_type, goal_other, target_weight, target_body_fat, target_date, notes } = req.body;
+router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) => {
+  const b = req.body;
+
+  // Starting weight/body-fat: prefer client-submitted (manual entry when no
+  // assessment exists yet), else snapshot the client's latest assessment.
+  let startingWeight = b.starting_weight ?? null;
+  let startingBodyFat = b.starting_body_fat_pct ?? null;
+  if (startingWeight == null || startingBodyFat == null) {
+    const { rows: aRows } = await pool.query(
+      'SELECT weight, body_fat_pct FROM pt_assessments WHERE client_id = $1 ORDER BY assessment_date DESC LIMIT 1',
+      [b.client_id]
+    );
+    const latest = aRows[0];
+    if (latest) {
+      if (startingWeight == null && latest.weight != null) startingWeight = parseFloat(latest.weight);
+      if (startingBodyFat == null && latest.body_fat_pct != null) startingBodyFat = parseFloat(latest.body_fat_pct);
+    }
+  }
+
+  const analysis = computeGoalAnalysis({
+    startingWeight, targetWeight: b.target_weight ?? null, targetDate: b.target_date || null,
+    lifestyleReadiness: b.lifestyle_readiness || null, motivationLevel: b.motivation_level ?? null, commitmentLevel: b.commitment_level ?? null,
+  });
+
   const { rows } = await pool.query(
-    `INSERT INTO pt_goals (client_id, goal_type, goal_other, target_weight, target_body_fat, target_date, notes, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [client_id, goal_type, goal_other || null, num(target_weight, null), num(target_body_fat, null),
-     target_date || null, notes || null, req.user.id]
+    `INSERT INTO pt_goals (
+       client_id, goal_type, goal_other, goal_description, target_weight, target_body_fat, target_date, notes,
+       motivation_reason, priority_goal, motivation_level, commitment_level, biggest_challenges,
+       lifestyle_readiness, lifestyle_readiness_score,
+       starting_weight, starting_body_fat_pct,
+       goal_difficulty, estimated_duration_weeks, recommended_pt_duration_months,
+       estimated_weekly_rate_kg, safe_weekly_rate_kg, risk_factors,
+       created_by
+     ) VALUES (
+       $1,$2,$3,$4,$5,$6,$7,$8,
+       $9,$10,$11,$12,$13,
+       $14::jsonb,$15,
+       $16,$17,
+       $18,$19,$20,
+       $21,$22,$23,
+       $24
+     ) RETURNING *`,
+    [
+      b.client_id, b.goal_type, b.goal_other || null, b.goal_description || null,
+      b.target_weight ?? null, b.target_body_fat ?? null, b.target_date || null, b.notes || null,
+      b.motivation_reason || null, b.priority_goal || null, b.motivation_level ?? null, b.commitment_level ?? null,
+      b.biggest_challenges && b.biggest_challenges.length ? b.biggest_challenges : null,
+      b.lifestyle_readiness ? JSON.stringify(b.lifestyle_readiness) : null, analysis.lifestyleScore,
+      startingWeight, startingBodyFat,
+      analysis.difficulty, analysis.estimatedWeeks, analysis.recommendedMonths,
+      analysis.requiredRate, analysis.safeRate, analysis.riskFactors.length ? analysis.riskFactors : null,
+      req.user.id,
+    ]
   );
   res.status(201).json({ data: rows[0] });
 }));
 
 router.patch('/goals/:id', auth, wrap(async (req, res) => {
-  const allowed = ['goal_type','goal_other','target_weight','target_body_fat','target_date','notes','is_active'];
+  const allowed = [
+    'goal_type', 'goal_other', 'goal_description', 'target_weight', 'target_body_fat', 'target_date', 'notes', 'is_active',
+    'motivation_reason', 'priority_goal', 'motivation_level', 'commitment_level', 'biggest_challenges',
+    'lifestyle_readiness', 'starting_weight', 'starting_body_fat_pct',
+  ];
+
+  const { rows: existingRows } = await pool.query('SELECT * FROM pt_goals WHERE id = $1', [req.params.id]);
+  const existing = existingRows[0];
+  if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
   const sets = []; const params = [req.params.id];
   for (const key of allowed) {
-    if (req.body[key] !== undefined) { params.push(req.body[key]); sets.push(`${key} = $${params.length}`); }
+    if (req.body[key] !== undefined) {
+      const val = key === 'lifestyle_readiness' && req.body[key] != null ? JSON.stringify(req.body[key]) : req.body[key];
+      params.push(val); sets.push(`${key} = $${params.length}`);
+    }
   }
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
+
+  const merged = { ...existing, ...req.body };
+  const analysis = computeGoalAnalysis({
+    startingWeight: merged.starting_weight != null ? parseFloat(merged.starting_weight) : null,
+    targetWeight: merged.target_weight != null ? parseFloat(merged.target_weight) : null,
+    targetDate: merged.target_date || null,
+    lifestyleReadiness: merged.lifestyle_readiness || null,
+    motivationLevel: merged.motivation_level != null ? parseInt(merged.motivation_level, 10) : null,
+    commitmentLevel: merged.commitment_level != null ? parseInt(merged.commitment_level, 10) : null,
+  });
+
+  for (const [col, val] of Object.entries({
+    lifestyle_readiness_score: analysis.lifestyleScore,
+    goal_difficulty: analysis.difficulty,
+    estimated_duration_weeks: analysis.estimatedWeeks,
+    recommended_pt_duration_months: analysis.recommendedMonths,
+    estimated_weekly_rate_kg: analysis.requiredRate,
+    safe_weekly_rate_kg: analysis.safeRate,
+    risk_factors: analysis.riskFactors.length ? analysis.riskFactors : null,
+  })) {
+    params.push(val); sets.push(`${col} = $${params.length}`);
+  }
+
   sets.push('updated_at = NOW()');
   const { rows } = await pool.query(`UPDATE pt_goals SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
   res.json({ data: rows[0] });
