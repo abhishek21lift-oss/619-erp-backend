@@ -350,12 +350,14 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
   const allowed = isTrainer
     ? ['package_type','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes','monthly_pt_amount',
-       'goal','height','body_fat','health_conditions','injuries','frequency']
+       'goal','height','body_fat','health_conditions','injuries','frequency',
+       'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week']
     : ['package_type','base_amount','discount','final_amount','paid_amount',
        'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes',
        'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact',
-       'goal','height','body_fat','health_conditions','injuries','frequency'];
+       'goal','height','body_fat','health_conditions','injuries','frequency',
+       'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week'];
   const sets = [];
   const params = [req.params.id];
   for (const key of allowed) {
