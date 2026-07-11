@@ -36,6 +36,10 @@ const ptClientCreateSchema = {
     duration_months: z.coerce.number().optional().nullable(),
     base_price: z.coerce.number().optional().nullable(),
     selling_price: z.coerce.number().optional().nullable(),
+    whatsapp: z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable(),
+    occupation: z.string().max(100).optional().nullable(),
+    emergency_contact: z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable(),
+    address: z.string().max(1000).optional().nullable(),
   }),
 };
 
@@ -158,15 +162,21 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
           notes, weight,
           goal, height, body_fat, health_conditions, injuries, frequency,
           pt_package_id, base_price, selling_price,
+          whatsapp, occupation, emergency_contact, address,
         } = req.body;
 
     let cid = client_id;
     if (!cid) {
       const { rows: [newCli] } = await pool.query(`
-        INSERT INTO pt_clients (name, gender, mobile, email, dob, status, joining_date)
-        VALUES ($1,$2,$3,$4,$5,'active',$6)
+        INSERT INTO pt_clients
+          (name, gender, mobile, email, dob, status, joining_date,
+           whatsapp, occupation, emergency_contact, address)
+        VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$8,$9,$10)
         RETURNING id
-      `, [name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date()]);
+      `, [
+        name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date(),
+        whatsapp || null, occupation || null, emergency_contact || null, address || null,
+      ]);
       cid = newCli.id;
     }
 
