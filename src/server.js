@@ -3,6 +3,9 @@
 // ───────────────────────────────────────────────────
 // STARTUP ENV CHECKS — fail fast with clear messages
 // ───────────────────────────────────────────────────
+// Initialise error monitoring before anything else so Sentry can
+// auto-instrument Express/pg. No-op unless SENTRY_DSN is set.
+const Sentry = require('./instrument');
 require('dotenv').config();
 
 const logger = require('./lib/logger');
@@ -364,6 +367,9 @@ app.use('/api/v1/reports',        require('./modules/reports/reports.routes'));
 // 404 + GLOBAL ERROR HANDLER
 // ────────────────────────
 app.use(notFound);
+// Report unhandled route errors to Sentry (no-op unless SENTRY_DSN set) before
+// the JSON error handler formats the response.
+if (process.env.SENTRY_DSN) Sentry.setupExpressErrorHandler(app);
 app.use(errorHandler);
 
 // ────────────────────────

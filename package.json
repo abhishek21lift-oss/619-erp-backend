@@ -19,6 +19,7 @@
     "test:watch": "jest --watch --forceExit"
   },
   "dependencies": {
+    "@sentry/node": "^10.65.0",
     "@simplewebauthn/server": "^13.3.0",
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.7",
