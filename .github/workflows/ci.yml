@@ -28,7 +28,10 @@ jobs:
         run: npm ci
 
       - name: Lint
-        run: npm run lint
+        # Warning ceiling frozen at the current count so lint debt can only
+        # shrink — any *new* warning fails CI. Lower this number as warnings
+        # are cleaned up. (Lint errors always fail.)
+        run: npm run lint -- --max-warnings=193
 
   # ── Job 2: Unit tests ──────────────────────────────────────────────
   test:
