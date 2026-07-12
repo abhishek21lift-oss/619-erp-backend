@@ -111,7 +111,7 @@ async function getActiveClients(trainerId) {
     where.push(`c.trainer_id = $${params.length}`);
   }
   const { rows } = await pool.query(`
-    SELECT c.id, c.client_id, c.name, c.gender, c.mobile, c.email,
+    SELECT c.id, c.unique_id, c.client_id, c.name, c.gender, c.mobile, c.email,
            c.photo_url, c.dob, c.weight, c.notes, c.address, c.emergency_contact,
            c.trainer_id, c.trainer_name,
            c.package_type, c.base_amount, c.discount, c.final_amount,
