@@ -8,6 +8,8 @@ const scoring = require('./fitness-scoring');
 const goalScoring = require('./goal-scoring');
 const lifestyleScoring = require('./lifestyle-scoring');
 const nutritionScoring = require('./nutrition-scoring');
+const mobilityScoring = require('./mobility-scoring');
+const postureScoring = require('./posture-scoring');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -422,7 +424,21 @@ router.get('/strength-logs', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/strength-logs', auth, wrap(async (req, res) => {
+const strengthLogCreateSchema = {
+  body: z.object({
+    client_id: z.string(),
+    exercise_name: z.string().min(1).max(100),
+    weight_kg: z.coerce.number(),
+    sets_done: numOpt(), reps_done: numOpt(),
+    notes: z.string().max(1000).optional().nullable(),
+    assessment_id: z.string().optional().nullable(),
+    one_rm_formula: z.enum(['epley', 'brzycki']).optional(),
+    is_direct_1rm: z.boolean().optional(),
+    one_rm_estimate: numOpt(),
+  }),
+};
+
+router.post('/strength-logs', auth, requireRole('admin', 'manager', 'trainer'), validate(strengthLogCreateSchema), wrap(async (req, res) => {
   const { client_id, exercise_name, weight_kg, sets_done, reps_done, notes,
     assessment_id, one_rm_formula, is_direct_1rm, one_rm_estimate } = req.body;
   const formula = one_rm_formula === 'brzycki' ? 'brzycki' : 'epley';
@@ -451,7 +467,17 @@ router.get('/progress-photos', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/progress-photos', auth, wrap(async (req, res) => {
+const progressPhotoCreateSchema = {
+  body: z.object({
+    client_id: z.string(),
+    photo_url: z.string().min(1),
+    photo_type: z.enum(['front', 'side', 'back', 'flexed', 'full_body', 'other']).optional(),
+    taken_at: z.string().optional().nullable(),
+    notes: z.string().max(1000).optional().nullable(),
+  }),
+};
+
+router.post('/progress-photos', auth, requireRole('admin', 'manager', 'trainer'), validate(progressPhotoCreateSchema), wrap(async (req, res) => {
   const { client_id, photo_url, photo_type, taken_at, notes } = req.body;
   const { rows } = await pool.query(
     `INSERT INTO progress_photos (client_id, photo_url, photo_type, taken_at, notes, uploaded_by)
@@ -902,6 +928,190 @@ router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
 
   sets.push('updated_at = NOW()');
   const { rows } = await pool.query(`UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  res.json({ data: rows[0] });
+}));
+
+const bodyRegionSchema = z.object({
+  region: z.string(), score: numOpt(), pain: z.boolean().optional().nullable(), restriction: z.boolean().optional().nullable(),
+});
+const mobilityTestSchema = z.object({
+  test: z.string(), score: numOpt(), notes: z.string().optional().nullable(),
+  pain: z.boolean().optional().nullable(), restriction: z.boolean().optional().nullable(),
+});
+
+const mobilityPerformanceAssessmentCreateSchema = {
+  body: z.object({
+    client_id: z.string(),
+    assessment_date: z.string().optional().nullable(),
+
+    body_regions: z.array(bodyRegionSchema).optional().nullable(),
+    mobility_tests: z.array(mobilityTestSchema).optional().nullable(),
+
+    grip_strength_kg: numOpt(), vertical_jump_cm: numOpt(), sit_reach_cm: numOpt(),
+    balance_test_seconds: numOpt(), reaction_time_ms: numOpt(),
+    performance_notes: z.string().max(2000).optional().nullable(),
+  }),
+};
+
+function computeMobilityAnalysis(b) {
+  const mobilityScore = mobilityScoring.calcMobilityScore(b.body_regions ?? null, b.mobility_tests ?? null);
+  const mobilityCategory = mobilityScoring.classifyMobility(mobilityScore);
+  return { mobilityScore, mobilityCategory };
+}
+
+router.get('/mobility-performance-assessments', auth, wrap(async (req, res) => {
+  const { client_id } = req.query;
+  const where = []; const params = [];
+  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const { rows } = await pool.query(
+    `SELECT * FROM pt_mobility_performance_assessments ${whereSql} ORDER BY assessment_date DESC`, params
+  );
+  res.json({ data: rows });
+}));
+
+router.post('/mobility-performance-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(mobilityPerformanceAssessmentCreateSchema), wrap(async (req, res) => {
+  const b = req.body;
+  const analysis = computeMobilityAnalysis(b);
+
+  const { rows } = await pool.query(
+    `INSERT INTO pt_mobility_performance_assessments (
+       client_id, assessment_number, assessment_date,
+       body_regions, mobility_tests,
+       grip_strength_kg, vertical_jump_cm, sit_reach_cm, balance_test_seconds, reaction_time_ms, performance_notes,
+       mobility_score, mobility_category, created_by
+     ) VALUES (
+       $1,(SELECT COUNT(*)+1 FROM pt_mobility_performance_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
+       $3::jsonb,$4::jsonb,
+       $5,$6,$7,$8,$9,$10,
+       $11,$12,$13
+     ) RETURNING *`,
+    [
+      b.client_id, b.assessment_date || null,
+      b.body_regions ? JSON.stringify(b.body_regions) : null, b.mobility_tests ? JSON.stringify(b.mobility_tests) : null,
+      b.grip_strength_kg ?? null, b.vertical_jump_cm ?? null, b.sit_reach_cm ?? null, b.balance_test_seconds ?? null, b.reaction_time_ms ?? null, b.performance_notes || null,
+      analysis.mobilityScore, analysis.mobilityCategory, req.user.id,
+    ]
+  );
+  res.status(201).json({ data: rows[0] });
+}));
+
+router.patch('/mobility-performance-assessments/:id', auth, wrap(async (req, res) => {
+  const allowed = [
+    'assessment_date', 'body_regions', 'mobility_tests',
+    'grip_strength_kg', 'vertical_jump_cm', 'sit_reach_cm', 'balance_test_seconds', 'reaction_time_ms', 'performance_notes',
+  ];
+
+  const { rows: existingRows } = await pool.query('SELECT * FROM pt_mobility_performance_assessments WHERE id = $1', [req.params.id]);
+  const existing = existingRows[0];
+  if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
+  const sets = []; const params = [req.params.id];
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      const val = (key === 'body_regions' || key === 'mobility_tests') && req.body[key] != null ? JSON.stringify(req.body[key]) : req.body[key];
+      params.push(val); sets.push(`${key} = $${params.length}`);
+    }
+  }
+  if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
+
+  const merged = { ...existing, ...req.body };
+  const analysis = computeMobilityAnalysis({ body_regions: merged.body_regions, mobility_tests: merged.mobility_tests });
+
+  for (const [col, val] of Object.entries({ mobility_score: analysis.mobilityScore, mobility_category: analysis.mobilityCategory })) {
+    params.push(val); sets.push(`${col} = $${params.length}`);
+  }
+
+  sets.push('updated_at = NOW()');
+  const { rows } = await pool.query(`UPDATE pt_mobility_performance_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  res.json({ data: rows[0] });
+}));
+
+const postureAssessmentCreateSchema = {
+  body: z.object({
+    client_id: z.string(),
+    assessment_date: z.string().optional().nullable(),
+
+    front_issues: z.array(z.string()).optional().nullable(),
+    side_issues: z.array(z.string()).optional().nullable(),
+    back_issues: z.array(z.string()).optional().nullable(),
+    other_issue_notes: z.string().max(1000).optional().nullable(),
+
+    coach_notes: z.record(z.string(), z.string()).optional().nullable(),
+  }),
+};
+
+function computePostureAnalysis(b) {
+  const postureRiskScore = postureScoring.calcPostureRiskScore(b.front_issues ?? null, b.side_issues ?? null, b.back_issues ?? null);
+  const postureRiskLevel = postureScoring.classifyRisk(postureRiskScore);
+  return { postureRiskScore, postureRiskLevel };
+}
+
+router.get('/posture-assessments', auth, wrap(async (req, res) => {
+  const { client_id } = req.query;
+  const where = []; const params = [];
+  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const { rows } = await pool.query(
+    `SELECT * FROM pt_posture_assessments ${whereSql} ORDER BY assessment_date DESC`, params
+  );
+  res.json({ data: rows });
+}));
+
+router.post('/posture-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(postureAssessmentCreateSchema), wrap(async (req, res) => {
+  const b = req.body;
+  const analysis = computePostureAnalysis(b);
+
+  const { rows } = await pool.query(
+    `INSERT INTO pt_posture_assessments (
+       client_id, assessment_number, assessment_date,
+       front_issues, side_issues, back_issues, other_issue_notes,
+       posture_risk_score, posture_risk_level,
+       coach_notes, created_by
+     ) VALUES (
+       $1,(SELECT COUNT(*)+1 FROM pt_posture_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
+       $3,$4,$5,$6,
+       $7,$8,
+       $9::jsonb,$10
+     ) RETURNING *`,
+    [
+      b.client_id, b.assessment_date || null,
+      b.front_issues && b.front_issues.length ? b.front_issues : null,
+      b.side_issues && b.side_issues.length ? b.side_issues : null,
+      b.back_issues && b.back_issues.length ? b.back_issues : null,
+      b.other_issue_notes || null,
+      analysis.postureRiskScore, analysis.postureRiskLevel,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+    ]
+  );
+  res.status(201).json({ data: rows[0] });
+}));
+
+router.patch('/posture-assessments/:id', auth, wrap(async (req, res) => {
+  const allowed = ['assessment_date', 'front_issues', 'side_issues', 'back_issues', 'other_issue_notes', 'coach_notes'];
+
+  const { rows: existingRows } = await pool.query('SELECT * FROM pt_posture_assessments WHERE id = $1', [req.params.id]);
+  const existing = existingRows[0];
+  if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
+  const sets = []; const params = [req.params.id];
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      const val = key === 'coach_notes' && req.body[key] != null ? JSON.stringify(req.body[key]) : req.body[key];
+      params.push(val); sets.push(`${key} = $${params.length}`);
+    }
+  }
+  if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
+
+  const merged = { ...existing, ...req.body };
+  const analysis = computePostureAnalysis({ front_issues: merged.front_issues, side_issues: merged.side_issues, back_issues: merged.back_issues });
+
+  for (const [col, val] of Object.entries({ posture_risk_score: analysis.postureRiskScore, posture_risk_level: analysis.postureRiskLevel })) {
+    params.push(val); sets.push(`${col} = $${params.length}`);
+  }
+
+  sets.push('updated_at = NOW()');
+  const { rows } = await pool.query(`UPDATE pt_posture_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
   res.json({ data: rows[0] });
 }));
 
