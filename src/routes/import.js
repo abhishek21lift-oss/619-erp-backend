@@ -141,7 +141,7 @@ async function _handleImport(req, res) {
       const s = String(val).trim();
       if (!s) return null;
       if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
-      const parts = s.split(/[\/\-\.]/);
+      const parts = s.split(/[/.-]/);
       if (parts.length === 3) {
         const [p0, p1, p2] = parts;
         if (p2.length === 4) return `${p2}-${p1.padStart(2,'0')}-${p0.padStart(2,'0')}`;

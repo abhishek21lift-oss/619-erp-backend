@@ -152,7 +152,7 @@ async function consumeChallenge(challenge, type) {
 
 // Clean up expired challenges periodically
 setInterval(async () => {
-  try { await pool.query("DELETE FROM webauthn_challenges WHERE expires_at < NOW()"); } catch {}
+  try { await pool.query("DELETE FROM webauthn_challenges WHERE expires_at < NOW()"); } catch { /* best-effort cleanup */ }
 }, 60_000).unref();
 
 // ── Registration ──────────────────────────────────────────────────

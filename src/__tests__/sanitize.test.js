@@ -5,6 +5,7 @@ describe('sanitize middleware — null byte regression', () => {
     const req = { body: { name: 'a\x00b\x00c' } };
     sanitizeBody(req, {}, function() {});
     expect(req.body.name).toBe('abc');
+    // eslint-disable-next-line no-control-regex -- asserting NUL bytes are stripped
     expect(req.body.name).not.toMatch(/\x00/);
   });
 

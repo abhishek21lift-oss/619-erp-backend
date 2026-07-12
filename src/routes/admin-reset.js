@@ -125,7 +125,7 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
     for (const seq of seqs) {
       try {
         await client.query(`ALTER SEQUENCE ${seq} RESTART WITH 1`);
-      } catch {}
+      } catch { /* sequence may not exist in this schema — skip */ }
     }
 
     await client.query('COMMIT');

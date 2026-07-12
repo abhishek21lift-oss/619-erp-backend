@@ -12,7 +12,8 @@
  *  - Truncate strings over MAX_STRING_LENGTH
  */
 const MAX_STRING_LENGTH = 8000;
-const NULL_BYTE_RE      = /[\x00]/g;
+// eslint-disable-next-line no-control-regex -- intentionally strips NUL bytes
+const NULL_BYTE_RE      = /\x00/g;
 // Path-traversal pattern — reject bodies containing ../ or ..\
 const PATH_TRAVERSAL_RE = /\.\.[/\\]/;
 
