@@ -445,43 +445,6 @@ router.get('/balance-sheet', auth, wrap(async (req, res) => {
   res.json({ data: rows, total: rows.length, total_outstanding: rows.reduce((s, r) => s + Number(r.balance_amount), 0) });
 }));
 
-// ─── PT Plans ───────────────────────────────────────────────
-router.get('/plans', auth, wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM pt_plans ORDER BY base_amount');
-  res.json({ data: rows });
-}));
-
-router.post('/plans', auth, adminOnly, wrap(async (req, res) => {
-  const { name, duration_months, base_amount, description } = req.body;
-  const { rows } = await pool.query(
-    `INSERT INTO pt_plans (name, duration_months, base_amount, description) VALUES ($1,$2,$3,$4) RETURNING *`,
-    [name, duration_months, base_amount, description]
-  );
-  res.status(201).json({ data: rows[0] });
-}));
-
-router.put('/plans/:id', auth, adminOnly, wrap(async (req, res) => {
-  const { name, duration_months, base_amount, description, is_active } = req.body;
-  const { rows } = await pool.query(`
-    UPDATE pt_plans SET
-      name = COALESCE($2, name),
-      duration_months = COALESCE($3, duration_months),
-      base_amount = COALESCE($4, base_amount),
-      description = COALESCE($5, description),
-      is_active = COALESCE($6, is_active),
-      updated_at = NOW()
-    WHERE id = $1 RETURNING *
-  `, [req.params.id, name, duration_months, base_amount, description, is_active]);
-  if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-  res.json({ data: rows[0] });
-}));
-
-router.delete('/plans/:id', auth, adminOnly, wrap(async (req, res) => {
-  const { rows } = await pool.query('DELETE FROM pt_plans WHERE id = $1 RETURNING id', [req.params.id]);
-  if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-  res.json({ message: 'Plan deleted' });
-}));
-
 // ─── Commissions ────────────────────────────────────────────
 router.get('/commissions', auth, wrap(async (req, res) => {
   const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : req.query.trainer_id;
