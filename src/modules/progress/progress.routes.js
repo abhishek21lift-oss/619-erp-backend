@@ -7,6 +7,7 @@ const { z } = require('../../lib/validation');
 const scoring = require('./fitness-scoring');
 const goalScoring = require('./goal-scoring');
 const lifestyleScoring = require('./lifestyle-scoring');
+const nutritionScoring = require('./nutrition-scoring');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -663,6 +664,244 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
 
   sets.push('updated_at = NOW()');
   const { rows } = await pool.query(`UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  res.json({ data: rows[0] });
+}));
+
+const nutritionSupplementSchema = z.object({
+  name: z.string(), dose: z.string().optional().nullable(),
+  frequency: z.string().optional().nullable(), brand: z.string().optional().nullable(),
+});
+const nutritionDigestiveIssueSchema = z.object({
+  issue: z.string(), frequency: z.enum(['daily', 'weekly', 'rare']).optional().nullable(),
+  severity: numOpt(),
+});
+
+const nutritionAssessmentCreateSchema = {
+  body: z.object({
+    client_id: z.string(),
+    assessment_date: z.string().optional().nullable(),
+
+    diet_preferences: z.array(z.string()).optional().nullable(),
+
+    food_allergies: z.array(z.string()).optional().nullable(),
+    foods_to_avoid: z.array(z.string()).optional().nullable(),
+    foods_to_avoid_reason: z.enum(['medical', 'religious', 'personal_preference', 'taste', 'digestive_issue']).optional().nullable(),
+
+    favourite_foods: z.array(z.string()).optional().nullable(),
+
+    takes_supplements: z.boolean().optional().nullable(),
+    supplements: z.array(nutritionSupplementSchema).optional().nullable(),
+
+    digestive_issues: z.array(nutritionDigestiveIssueSchema).optional().nullable(),
+
+    meals_per_day: numOpt(),
+    breakfast_regularity: z.enum(['daily', 'sometimes', 'never']).optional().nullable(),
+    lunch_regularity: z.enum(['daily', 'sometimes', 'never']).optional().nullable(),
+    dinner_regularity: z.enum(['daily', 'sometimes', 'never']).optional().nullable(),
+    snacks_per_day: numOpt(),
+    late_night_eating: z.boolean().optional().nullable(),
+    meal_timing_consistency: z.enum(['consistent', 'somewhat_consistent', 'inconsistent']).optional().nullable(),
+    eating_out_frequency: z.enum(['rarely', 'weekly', 'frequently', 'daily']).optional().nullable(),
+    weekend_eating_habits: z.enum(['similar_to_weekday', 'somewhat_different', 'very_different_indulgent']).optional().nullable(),
+    eating_behaviours: z.array(z.string()).optional().nullable(),
+
+    water_intake_liters: numOpt(),
+    tea_cups_per_day: numOpt(), coffee_cups_per_day: numOpt(), soft_drinks_per_day: numOpt(), juices_per_day: numOpt(),
+    alcoholic_drinks_per_week: numOpt(),
+    cravings: z.array(z.string()).optional().nullable(),
+    craving_frequency: z.enum(['rare', 'sometimes', 'daily']).optional().nullable(),
+
+    meal_preparer: z.enum(['self', 'family', 'cook', 'restaurant', 'food_delivery', 'mess', 'hostel', 'office_cafeteria']).optional().nullable(),
+    nutrition_budget: z.enum(['low', 'medium', 'high', 'premium']).optional().nullable(),
+    medical_conditions: z.array(z.string()).optional().nullable(),
+    medical_notes: z.string().optional().nullable(),
+
+    coach_notes: z.record(z.string(), z.string()).optional().nullable(),
+  }),
+};
+
+// Shared by POST (create) and PATCH (update) so the Smart Nutrition
+// Analysis columns never drift out of sync between the two write paths.
+// Reads the client's latest Lifestyle Assessment (if any) for the
+// smoking/alcohol risk inputs — a plain read of an existing table, no
+// hard dependency: the two risk factors simply don't fire without it.
+async function computeNutritionAnalysis(clientId, b) {
+  const { rows: lifestyleRows } = await pool.query(
+    'SELECT smoking_status, alcohol_status FROM pt_lifestyle_assessments WHERE client_id = $1 ORDER BY assessment_date DESC LIMIT 1',
+    [clientId]
+  );
+  const lifestyle = lifestyleRows[0] || {};
+
+  const dietQualityScore = nutritionScoring.calcDietQualityScore(
+    b.foods_to_avoid ?? null, b.favourite_foods ?? null, b.cravings ?? null,
+    b.craving_frequency ?? null, b.eating_behaviours ?? null, b.breakfast_regularity ?? null, b.late_night_eating ?? null
+  );
+  const protein = nutritionScoring.assessProtein(b.favourite_foods ?? null, b.takes_supplements ?? null, b.supplements ?? null);
+  const dailyFluidIntake = nutritionScoring.calcDailyFluidIntake(
+    b.water_intake_liters ?? null, b.tea_cups_per_day ?? null, b.coffee_cups_per_day ?? null, b.soft_drinks_per_day ?? null, b.juices_per_day ?? null
+  );
+  const hydrationScore = nutritionScoring.calcHydrationScore(b.water_intake_liters ?? null, b.soft_drinks_per_day ?? null, b.alcoholic_drinks_per_week ?? null);
+  const digestiveHealthScore = nutritionScoring.calcDigestiveHealthScore(b.digestive_issues ?? null);
+  const supplementScore = nutritionScoring.calcSupplementScore(b.takes_supplements ?? null, b.supplements ?? null);
+
+  const riskInputs = {
+    proteinAssessment: protein.assessment, hydrationScore, digestiveHealthScore,
+    cravings: b.cravings ?? null, cravingFrequency: b.craving_frequency ?? null,
+    medicalConditions: b.medical_conditions ?? null, medicalNotes: b.medical_notes ?? null,
+    alcoholStatus: lifestyle.alcohol_status || null, smokingStatus: lifestyle.smoking_status || null,
+  };
+  const nutritionRiskScore = nutritionScoring.calcNutritionRiskScore(riskInputs);
+  const riskFactors = nutritionScoring.buildNutritionRiskFactors(riskInputs);
+
+  const nutritionScoreVal = nutritionScoring.calcNutritionScore(
+    { dietQuality: dietQualityScore, protein: protein.score, hydration: hydrationScore, digestive: digestiveHealthScore, supplement: supplementScore },
+    nutritionRiskScore
+  );
+  const nutritionReadiness = nutritionScoring.classifyNutritionReadiness(nutritionScoreVal);
+
+  return {
+    dietQualityScore,
+    proteinScore: protein.score, proteinAssessment: protein.assessment,
+    dailyFluidIntake,
+    hydrationScore,
+    digestiveHealthScore,
+    supplementScore,
+    nutritionRiskScore, riskFactors,
+    nutritionScore: nutritionScoreVal, nutritionReadiness,
+  };
+}
+
+router.get('/nutrition-assessments', auth, wrap(async (req, res) => {
+  const { client_id } = req.query;
+  const where = []; const params = [];
+  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const { rows } = await pool.query(
+    `SELECT * FROM pt_nutrition_assessments ${whereSql} ORDER BY assessment_date DESC`, params
+  );
+  res.json({ data: rows });
+}));
+
+router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(nutritionAssessmentCreateSchema), wrap(async (req, res) => {
+  const b = req.body;
+  const analysis = await computeNutritionAnalysis(b.client_id, b);
+
+  const { rows } = await pool.query(
+    `INSERT INTO pt_nutrition_assessments (
+       client_id, assessment_number, assessment_date,
+       diet_preferences,
+       food_allergies, foods_to_avoid, foods_to_avoid_reason,
+       favourite_foods,
+       takes_supplements, supplements,
+       digestive_issues,
+       meals_per_day, breakfast_regularity, lunch_regularity, dinner_regularity, snacks_per_day,
+       late_night_eating, meal_timing_consistency, eating_out_frequency, weekend_eating_habits, eating_behaviours,
+       water_intake_liters, tea_cups_per_day, coffee_cups_per_day, soft_drinks_per_day, juices_per_day,
+       alcoholic_drinks_per_week, daily_fluid_intake_liters, cravings, craving_frequency,
+       meal_preparer, nutrition_budget, medical_conditions, medical_notes,
+       diet_quality_score, protein_score, protein_assessment, hydration_score, digestive_health_score,
+       supplement_score, nutrition_risk_score, risk_factors, nutrition_score, nutrition_readiness,
+       coach_notes, created_by
+     ) VALUES (
+       $1,(SELECT COUNT(*)+1 FROM pt_nutrition_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
+       $3,
+       $4,$5,$6,
+       $7,
+       $8,$9::jsonb,
+       $10::jsonb,
+       $11,$12,$13,$14,$15,
+       $16,$17,$18,$19,$20,
+       $21,$22,$23,$24,$25,
+       $26,$27,$28,$29,
+       $30,$31,$32,$33,
+       $34,$35,$36,$37,$38,
+       $39,$40,$41,$42,$43,
+       $44::jsonb,$45
+     ) RETURNING *`,
+    [
+      b.client_id, b.assessment_date || null,
+      b.diet_preferences && b.diet_preferences.length ? b.diet_preferences : null,
+      b.food_allergies && b.food_allergies.length ? b.food_allergies : null,
+      b.foods_to_avoid && b.foods_to_avoid.length ? b.foods_to_avoid : null,
+      b.foods_to_avoid_reason || null,
+      b.favourite_foods && b.favourite_foods.length ? b.favourite_foods : null,
+      b.takes_supplements ?? null, b.supplements ? JSON.stringify(b.supplements) : null,
+      b.digestive_issues ? JSON.stringify(b.digestive_issues) : null,
+      b.meals_per_day ?? null, b.breakfast_regularity || null, b.lunch_regularity || null, b.dinner_regularity || null, b.snacks_per_day ?? null,
+      b.late_night_eating ?? null, b.meal_timing_consistency || null, b.eating_out_frequency || null, b.weekend_eating_habits || null,
+      b.eating_behaviours && b.eating_behaviours.length ? b.eating_behaviours : null,
+      b.water_intake_liters ?? null, b.tea_cups_per_day ?? null, b.coffee_cups_per_day ?? null, b.soft_drinks_per_day ?? null, b.juices_per_day ?? null,
+      b.alcoholic_drinks_per_week ?? null, analysis.dailyFluidIntake, b.cravings && b.cravings.length ? b.cravings : null, b.craving_frequency || null,
+      b.meal_preparer || null, b.nutrition_budget || null, b.medical_conditions && b.medical_conditions.length ? b.medical_conditions : null, b.medical_notes || null,
+      analysis.dietQualityScore, analysis.proteinScore, analysis.proteinAssessment, analysis.hydrationScore, analysis.digestiveHealthScore,
+      analysis.supplementScore, analysis.nutritionRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.nutritionScore, analysis.nutritionReadiness,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+    ]
+  );
+  res.status(201).json({ data: rows[0] });
+}));
+
+router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
+  const allowed = [
+    'assessment_date',
+    'diet_preferences',
+    'food_allergies', 'foods_to_avoid', 'foods_to_avoid_reason',
+    'favourite_foods',
+    'takes_supplements', 'supplements',
+    'digestive_issues',
+    'meals_per_day', 'breakfast_regularity', 'lunch_regularity', 'dinner_regularity', 'snacks_per_day',
+    'late_night_eating', 'meal_timing_consistency', 'eating_out_frequency', 'weekend_eating_habits', 'eating_behaviours',
+    'water_intake_liters', 'tea_cups_per_day', 'coffee_cups_per_day', 'soft_drinks_per_day', 'juices_per_day',
+    'alcoholic_drinks_per_week', 'cravings', 'craving_frequency',
+    'meal_preparer', 'nutrition_budget', 'medical_conditions', 'medical_notes', 'coach_notes',
+  ];
+
+  const { rows: existingRows } = await pool.query('SELECT * FROM pt_nutrition_assessments WHERE id = $1', [req.params.id]);
+  const existing = existingRows[0];
+  if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
+  const sets = []; const params = [req.params.id];
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      const val = (key === 'coach_notes' || key === 'supplements' || key === 'digestive_issues') && req.body[key] != null
+        ? JSON.stringify(req.body[key]) : req.body[key];
+      params.push(val); sets.push(`${key} = $${params.length}`);
+    }
+  }
+  if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
+
+  const merged = { ...existing, ...req.body };
+  const analysis = await computeNutritionAnalysis(existing.client_id, {
+    foods_to_avoid: merged.foods_to_avoid, favourite_foods: merged.favourite_foods,
+    cravings: merged.cravings, craving_frequency: merged.craving_frequency,
+    eating_behaviours: merged.eating_behaviours, breakfast_regularity: merged.breakfast_regularity,
+    late_night_eating: merged.late_night_eating,
+    takes_supplements: merged.takes_supplements, supplements: merged.supplements,
+    water_intake_liters: merged.water_intake_liters != null ? parseFloat(merged.water_intake_liters) : null,
+    tea_cups_per_day: merged.tea_cups_per_day != null ? parseInt(merged.tea_cups_per_day, 10) : null,
+    coffee_cups_per_day: merged.coffee_cups_per_day != null ? parseInt(merged.coffee_cups_per_day, 10) : null,
+    soft_drinks_per_day: merged.soft_drinks_per_day != null ? parseInt(merged.soft_drinks_per_day, 10) : null,
+    juices_per_day: merged.juices_per_day != null ? parseInt(merged.juices_per_day, 10) : null,
+    alcoholic_drinks_per_week: merged.alcoholic_drinks_per_week != null ? parseInt(merged.alcoholic_drinks_per_week, 10) : null,
+    digestive_issues: merged.digestive_issues,
+    medical_conditions: merged.medical_conditions, medical_notes: merged.medical_notes,
+  });
+
+  for (const [col, val] of Object.entries({
+    diet_quality_score: analysis.dietQualityScore,
+    protein_score: analysis.proteinScore, protein_assessment: analysis.proteinAssessment,
+    daily_fluid_intake_liters: analysis.dailyFluidIntake,
+    hydration_score: analysis.hydrationScore,
+    digestive_health_score: analysis.digestiveHealthScore,
+    supplement_score: analysis.supplementScore,
+    nutrition_risk_score: analysis.nutritionRiskScore, risk_factors: analysis.riskFactors.length ? analysis.riskFactors : null,
+    nutrition_score: analysis.nutritionScore, nutrition_readiness: analysis.nutritionReadiness,
+  })) {
+    params.push(val); sets.push(`${col} = $${params.length}`);
+  }
+
+  sets.push('updated_at = NOW()');
+  const { rows } = await pool.query(`UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
   res.json({ data: rows[0] });
 }));
 
