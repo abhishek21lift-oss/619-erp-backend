@@ -1,0 +1,141 @@
+// src/lib/parqPdf.js
+// Generates the PAR-Q + Health Screening + Digital Consent PDF.
+//
+// Phase 1 scope: legibility + completeness over pixel-perfect design.
+// pdfkit was chosen over a headless-browser/HTML-to-PDF approach because
+// it's a lightweight, dependency-light library — no Chromium binary to
+// ship/run, which matters on a constrained Render instance.
+const fs = require('fs');
+const path = require('path');
+const PDFDocument = require('pdfkit');
+
+const CONSENT_LABELS = {
+  info_true: 'I confirm that all the information provided above is true and accurate to the best of my knowledge.',
+  understands_risk: 'I understand that physical exercise carries inherent risks, including the risk of injury.',
+  will_inform_changes: 'I agree to inform my trainer of any changes to my health status before or during training.',
+  understands_incorrect_info_risk: 'I understand that providing incorrect or incomplete information may put my health at risk.',
+  voluntary_participation: 'I am participating in this training program voluntarily and of my own free will.',
+  consents_emergency_care: 'I consent to receive emergency medical care/first aid if required during a session.',
+  agrees_data_storage: 'I agree to my health data being securely stored and used for training purposes.',
+};
+
+function fmtDate(d) {
+  if (!d) return '—';
+  try { return new Date(d).toISOString().split('T')[0]; } catch { return String(d); }
+}
+
+function drawSectionHeading(doc, text) {
+  doc.moveDown(0.5);
+  doc.fontSize(13).fillColor('#111827').font('Helvetica-Bold').text(text);
+  doc.moveTo(doc.x, doc.y + 2).lineTo(doc.page.width - doc.page.margins.right, doc.y + 2)
+    .strokeColor('#E5E7EB').lineWidth(1).stroke();
+  doc.moveDown(0.5);
+  doc.font('Helvetica').fillColor('#111827');
+}
+
+function drawLabelValue(doc, label, value) {
+  doc.fontSize(10).fillColor('#6B7280').font('Helvetica').text(label, { continued: true });
+  doc.fillColor('#111827').font('Helvetica-Bold').text(`  ${value ?? '—'}`);
+  doc.font('Helvetica');
+}
+
+function embedSignature(doc, label, base64) {
+  doc.fontSize(10).fillColor('#6B7280').text(label);
+  if (base64 && typeof base64 === 'string' && base64.includes(',')) {
+    try {
+      const buf = Buffer.from(base64.split(',')[1], 'base64');
+      doc.image(buf, { fit: [220, 80] });
+    } catch {
+      doc.fontSize(9).fillColor('#DC2626').text('(signature image could not be rendered)');
+    }
+  } else {
+    doc.fontSize(9).fillColor('#DC2626').text('(not signed)');
+  }
+  doc.fillColor('#111827');
+  doc.moveDown(0.5);
+}
+
+/**
+ * Generates the consent PDF for a PAR-Q form and writes it to
+ * uploads/parq/pdf/<formId>.pdf. Returns the served URL
+ * (/uploads/parq/pdf/<formId>.pdf).
+ *
+ * @param {object} formData - joined form + clearance + consent data:
+ *   { form, clearance, consent }
+ */
+async function generateConsentPdf(formData) {
+  const { form, clearance, consent } = formData;
+
+  const dir = path.join(__dirname, '..', '..', 'uploads', 'parq', 'pdf');
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, `${form.id}.pdf`);
+
+  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+  const writeStream = fs.createWriteStream(filePath);
+  doc.pipe(writeStream);
+
+  // ── Header ──
+  doc.fontSize(18).font('Helvetica-Bold').fillColor('#111827')
+    .text('PAR-Q + Health Screening & Digital Consent', { align: 'center' });
+  doc.moveDown(0.3);
+  doc.fontSize(10).font('Helvetica').fillColor('#6B7280')
+    .text('Physical Activity Readiness Questionnaire', { align: 'center' });
+  doc.moveDown();
+
+  drawSectionHeading(doc, 'Client Details');
+  drawLabelValue(doc, 'Name:', form.full_name);
+  drawLabelValue(doc, 'Date of Birth:', fmtDate(form.dob));
+  drawLabelValue(doc, 'Gender:', form.gender);
+  drawLabelValue(doc, 'Assessment Date:', fmtDate(form.assessment_date));
+  drawLabelValue(doc, 'Trainer:', form.trainer_name);
+  drawLabelValue(doc, 'Mobile:', form.mobile);
+  drawLabelValue(doc, 'Emergency Contact:', form.emergency_contact ? `${form.emergency_contact} (${form.emergency_phone || '—'})` : '—');
+
+  drawSectionHeading(doc, 'Risk Summary');
+  drawLabelValue(doc, 'PAR-Q "Yes" Count:', `${form.parq_yes_count ?? 0} / 10`);
+  drawLabelValue(doc, 'Risk Level:', String(form.risk_level || '').toUpperCase());
+  drawLabelValue(doc, 'Risk Message:', form.risk_message);
+  drawLabelValue(doc, 'Workout Gate Status:', String(form.workout_gate_status || '').toUpperCase());
+
+  if (clearance) {
+    drawSectionHeading(doc, 'Medical Clearance');
+    drawLabelValue(doc, 'Doctor:', clearance.doctor_name);
+    drawLabelValue(doc, 'Hospital:', clearance.hospital);
+    drawLabelValue(doc, 'Clearance Date:', fmtDate(clearance.clearance_date));
+    drawLabelValue(doc, 'Expiry Date:', fmtDate(clearance.expiry_date));
+    drawLabelValue(doc, 'Approval Status:', String(clearance.approval_status || '').toUpperCase());
+  }
+
+  drawSectionHeading(doc, 'Consent Statements');
+  const checkboxes = consent.consent_checkboxes || {};
+  for (const [key, label] of Object.entries(CONSENT_LABELS)) {
+    const checked = checkboxes[key] === true;
+    doc.fontSize(10).fillColor(checked ? '#059669' : '#DC2626').font('Helvetica-Bold')
+      .text(checked ? '[x] ' : '[ ] ', { continued: true });
+    doc.fillColor('#111827').font('Helvetica').text(label);
+  }
+
+  doc.moveDown();
+  if (doc.y > doc.page.height - 220) doc.addPage();
+  drawSectionHeading(doc, 'Signatures');
+  embedSignature(doc, `Client Signature (signed ${fmtDate(consent.client_signed_at)}):`, consent.client_signature);
+  embedSignature(doc, `Trainer Signature (signed ${fmtDate(consent.trainer_signed_at)}):`, consent.trainer_signature);
+
+  drawSectionHeading(doc, 'Record Metadata');
+  doc.fontSize(8).fillColor('#6B7280').font('Helvetica');
+  doc.text(`IP Address: ${consent.ip_address || '—'}`);
+  doc.text(`Device: ${consent.device || '—'}    Browser: ${consent.browser || '—'}`);
+  doc.text(`Location: ${consent.location || '—'}`);
+  doc.text(`Generated: ${new Date().toISOString()}`);
+
+  doc.end();
+
+  await new Promise((resolve, reject) => {
+    writeStream.on('finish', resolve);
+    writeStream.on('error', reject);
+  });
+
+  return `/uploads/parq/pdf/${form.id}.pdf`;
+}
+
+module.exports = { generateConsentPdf };
