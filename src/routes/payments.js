@@ -21,7 +21,13 @@ router.get('/', auth, async (req, res, next) => {
     } else if (trainer_id) {
       conditions.push(`p.trainer_id = $${p++}`); params.push(trainer_id);
     }
-    if (client_id) { conditions.push(`p.client_id = $${p++}`); params.push(client_id); }
+    // Members can only ever see their own payments — ignore any client_id
+    // they pass and force it to their own member_id.
+    if (req.user.role === 'member') {
+      conditions.push(`p.client_id = $${p++}`); params.push(req.user.member_id);
+    } else if (client_id) {
+      conditions.push(`p.client_id = $${p++}`); params.push(client_id);
+    }
     if (from)      { conditions.push(`p.date >= $${p++}`);     params.push(from); }
     if (to)        { conditions.push(`p.date <= $${p++}`);     params.push(to); }
     // Hide soft-deleted payments unless caller explicitly asks for them.

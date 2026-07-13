@@ -360,7 +360,7 @@ router.put('/users/:id', auth, adminOnly, async (req, res) => {
   if (req.params.id === req.user.id && req.body.role && req.body.role !== req.user.role)
     return res.status(400).json({ error: 'Cannot change your own role' });
   try {
-    const allowed = ['name', 'email', 'role', 'status'];
+    const allowed = ['name', 'email', 'role'];
     const updates = [];
     const vals = [];
     let idx = 1;
