@@ -4,6 +4,7 @@ const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOrManager } = require('../middleware/auth');
 const logger = require('../lib/logger');
+const { logActivity } = require('../lib/activityLog');
 
 // ─── EXERCISES ────────────────────────────────────────────────
 
@@ -296,6 +297,29 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
     const d = req.body;
     if (!d.workout_plan_id || !d.client_id)
       return res.status(400).json({ error: 'workout_plan_id and client_id required' });
+
+    // PAR-Q gate: block workout assignment until the client's latest health
+    // screening is cleared (low/medium risk, or high risk with an approved,
+    // unexpired medical clearance). workout_gate_status is kept in sync by
+    // recomputeGateStatus in src/modules/pt-os/parq.routes.js — both on
+    // form submit and whenever a clearance is approved/rejected.
+    const { rows: gateRows } = await pool.query(
+      `SELECT workout_gate_status FROM pt_parq_forms
+        WHERE client_id = $1 AND deleted_at IS NULL
+        ORDER BY assessment_date DESC LIMIT 1`,
+      [d.client_id]
+    );
+    const gate = gateRows[0];
+    if (!gate || gate.workout_gate_status !== 'cleared') {
+      await logActivity(req, 'workout.assign.blocked', 'pt_client', d.client_id, {
+        reason: gate ? 'gate_not_cleared' : 'no_parq_form',
+        workout_plan_id: d.workout_plan_id,
+      });
+      return res.status(403).json({
+        error: 'PAR-Q health screening required before workout assignment',
+        code: 'PARQ_REQUIRED',
+      });
+    }
 
     const { rows } = await pool.query(`
       INSERT INTO workout_assignments (id, workout_plan_id, client_id, trainer_id,
