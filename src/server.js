@@ -348,6 +348,7 @@ app.use('/api/classes',           require('./routes/classes'));
 // PT OS — Personal Training Operating System
 // ────────────────────────
 app.use('/api/pt-os',            require('./modules/pt-os/pt-os.routes'));
+app.use('/api/pt-os',            require('./modules/pt-os/parq.routes'));
 
 // ────────────────────────
 // BUSINESS FLOW ROUTES (v4 — Progress, Automation)
