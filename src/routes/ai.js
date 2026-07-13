@@ -4,7 +4,7 @@
 
 const express    = require('express');
 const pool       = require('../db/pool');
-const { auth }   = require('../middleware/auth');
+const { auth, adminOnly } = require('../middleware/auth');
 const logger     = require('../lib/logger');
 const { routedChat, routedStream }     = require('../lib/ai/router');
 const { pingModel }                    = require('../lib/ai/openrouter');
@@ -779,7 +779,7 @@ router.post('/test', auth, requireConfigured, async (req, res) => {
 /* ═══════════════════════════════════════════════════════════════════════════
    10. PROVIDER SETTINGS  (admin — for integrations page)
    ═══════════════════════════════════════════════════════════════════════════ */
-router.get('/provider-settings', async (req, res) => {
+router.get('/provider-settings', auth, adminOnly, async (req, res) => {
   res.json({
     data: {
       provider:   'openrouter',
