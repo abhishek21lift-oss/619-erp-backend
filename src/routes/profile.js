@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 const { authenticator } = require('otplib');
 const pool = require('../db/pool');
 const logger = require('../lib/logger');
@@ -289,7 +290,17 @@ router.post('/mfa/setup', async (req, res, next) => {
   }
 });
 
-router.post('/mfa/verify', async (req, res, next) => {
+// A 6-digit TOTP code is a 1M-value space; throttle harder than the general
+// per-user API limit so it can't be brute-forced from a single account.
+const mfaVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many MFA verification attempts. Please wait 15 minutes.' },
+});
+
+router.post('/mfa/verify', mfaVerifyLimiter, async (req, res, next) => {
   try {
     const code = String(req.body.code || '').trim();
     if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Valid MFA code is required' });
