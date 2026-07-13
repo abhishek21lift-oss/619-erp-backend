@@ -2,11 +2,20 @@ services:
   - type: web
     name: 619-erp-backend
     runtime: node
+    # Free plan spins down after ~15 min idle (30-60s cold start on the next
+    # request) and has no zero-downtime deploy guarantee. Fine for
+    # development; upgrade to a paid plan before any real/commercial launch.
     plan: free
+    # India-facing app (Razorpay/INR billing, +91 support numbers) — closest
+    # Render region to cut latency.
+    region: singapore
     repo: https://github.com/abhishek21lift-oss/619-erp-backend
     branch: main
     buildCommand: npm install
     startCommand: node src/server.js
+    # Lets Render's deploy process verify the new instance is actually
+    # serving before routing traffic to it / marking the deploy healthy.
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
         value: 20.18.0
@@ -20,9 +29,14 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
+      # RP_ID / WEBAUTHN_ORIGIN / CORS_ORIGIN must match the actual domain(s)
+      # this instance serves. Previously hardcoded to the original vendor's
+      # own domain, which would silently break passkeys and block the
+      # frontend on every other deployment of this repo (e.g. a new client).
+      # Set these per-deployment in the Render dashboard instead.
       - key: RP_ID
-        value: 619fitnessstudio.com
+        sync: false
       - key: WEBAUTHN_ORIGIN
-        value: https://619fitnessstudio.com,https://www.619fitnessstudio.com,https://619-erp-frontend.vercel.app
+        sync: false
       - key: CORS_ORIGIN
-        value: https://619fitnessstudio.com,https://www.619fitnessstudio.com,https://619-erp-frontend.vercel.app
+        sync: false
