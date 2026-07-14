@@ -347,17 +347,56 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
 // ─── Update PT client ───────────────────────────────────────
 router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
   const isTrainer = req.user.role === 'trainer';
+  // Payment fields are handled separately below (validated + balance_amount
+  // auto-computed) rather than through the generic allowlist loop, and stay
+  // admin/manager-only — trainers were never allowed to set these, unchanged.
   const allowed = isTrainer
     ? ['package_type','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes','monthly_pt_amount',
        'goal','height','body_fat','health_conditions','injuries','frequency',
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week']
-    : ['package_type','base_amount','discount','final_amount','paid_amount',
+    : ['package_type','base_amount','discount',
        'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes',
        'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact',
        'goal','height','body_fat','health_conditions','injuries','frequency',
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week'];
+
+  const wantsFinalAmount = !isTrainer && req.body.final_amount !== undefined;
+  const wantsPaidAmount  = !isTrainer && req.body.paid_amount !== undefined;
+
+  let finalAmount = null;
+  let paidAmount = null;
+  if (wantsFinalAmount || wantsPaidAmount) {
+    // Validate the two fields together against whichever value isn't being
+    // changed in this request — never trust the client to have already
+    // enforced paid <= final; recompute and re-check server-side.
+    const { rows: existingRows } = await pool.query(
+      'SELECT final_amount, paid_amount FROM pt_clients WHERE id = $1 AND deleted_at IS NULL',
+      [req.params.id]
+    );
+    if (existingRows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+    const existing = existingRows[0];
+
+    if (wantsFinalAmount) {
+      finalAmount = Number(req.body.final_amount);
+      if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
+        return res.status(400).json({ error: { code: 'VALIDATION', message: 'Final Selling Price must be greater than zero.' } });
+      }
+    }
+    if (wantsPaidAmount) {
+      paidAmount = Number(req.body.paid_amount);
+      if (!Number.isFinite(paidAmount) || paidAmount < 0) {
+        return res.status(400).json({ error: { code: 'VALIDATION', message: 'Amount Paid cannot be negative.' } });
+      }
+    }
+    const effectiveFinal = finalAmount ?? (Number(existing.final_amount) || 0);
+    const effectivePaid  = paidAmount  ?? (Number(existing.paid_amount)  || 0);
+    if (effectivePaid > effectiveFinal) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Amount Paid cannot exceed Final Selling Price.' } });
+    }
+  }
+
   const sets = [];
   const params = [req.params.id];
   for (const key of allowed) {
@@ -365,6 +404,19 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
       params.push(req.body[key]);
       sets.push(`${key} = $${params.length}`);
     }
+  }
+  let finalAmountParamIdx = null;
+  let paidAmountParamIdx = null;
+  if (wantsFinalAmount) { params.push(finalAmount); finalAmountParamIdx = params.length; sets.push(`final_amount = $${finalAmountParamIdx}`); }
+  if (wantsPaidAmount)  { params.push(paidAmount);  paidAmountParamIdx = params.length;  sets.push(`paid_amount = $${paidAmountParamIdx}`); }
+  if (wantsFinalAmount || wantsPaidAmount) {
+    // Recompute from whichever of the two just landed in params, falling
+    // back to the column's current value for the one that didn't change.
+    sets.push(
+      `balance_amount = GREATEST(` +
+        `${finalAmountParamIdx ? `$${finalAmountParamIdx}` : 'final_amount'} - ` +
+        `${paidAmountParamIdx ? `$${paidAmountParamIdx}` : 'paid_amount'}, 0)`
+    );
   }
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS', message: 'No fields to update' } });
   sets.push('updated_at = NOW()');
