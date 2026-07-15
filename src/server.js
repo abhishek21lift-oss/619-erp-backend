@@ -302,7 +302,6 @@ app.use('/api/reports',           userApiLimiter, require('./routes/reports'));
 app.use('/api/plans',             require('./routes/plans'));
 app.use('/api/leave',             require('./routes/leave'));
 app.use('/api/expenses',          require('./routes/expenses'));
-app.use('/api/import',            require('./routes/import'));  // FIX: was never mounted
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.
