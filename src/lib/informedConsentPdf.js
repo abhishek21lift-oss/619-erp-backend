@@ -88,6 +88,21 @@ async function generateInformedConsentPdf(record) {
     doc.fillColor('#111827').font('Helvetica').text(label);
   }
 
+  if (record.exercise_consent_text) {
+    doc.moveDown();
+    if (doc.y > doc.page.height - 260) doc.addPage();
+    drawSectionHeading(doc, 'Exercise Programme Consent');
+    doc.fontSize(9.5).fillColor('#374151').font('Helvetica').text(record.exercise_consent_text);
+    doc.moveDown(0.5);
+    doc.fontSize(9.5).fillColor(record.exercise_consent_checked ? '#059669' : '#DC2626').font('Helvetica-Bold')
+      .text(record.exercise_consent_checked ? '[x] ' : '[ ] ', { continued: true });
+    doc.fillColor('#111827').font('Helvetica')
+      .text('I have read and understood the above consent and agree to participate in the exercise programme.');
+    doc.moveDown(0.5);
+    drawLabelValue(doc, 'Date:', fmtDate(record.exercise_consent_date));
+    embedSignature(doc, `Client signature (signed ${fmtDate(record.exercise_consent_signed_at)}):`, record.exercise_consent_signature);
+  }
+
   doc.moveDown();
   if (doc.y > doc.page.height - 220) doc.addPage();
   drawSectionHeading(doc, 'Signatures');
