@@ -44,6 +44,10 @@ async function issueRefreshToken(res, userId) {
     [userId, tokenHash, expiresAt]
   );
   setRefreshCookie(res, rawToken);
+  // Returned (not just cookied) so mobile/native clients — which don't share
+  // a browser cookie jar — can store it themselves and send it back via
+  // Authorization header / request body instead of a cookie.
+  return rawToken;
 }
 
 async function revokeRefreshToken(rawToken) {
@@ -105,12 +109,18 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     }
 
     setTokenCookie(res, token);
+    let refreshToken;
     try {
-      await issueRefreshToken(res, user.id);
+      refreshToken = await issueRefreshToken(res, user.id);
     } catch (rfErr) {
       logger.warn({ err: rfErr.message }, 'refresh_token issue failed (non-critical, table may not exist yet)');
     }
 
+    // Web keeps using the httpOnly cookies set above and can ignore these
+    // fields entirely. Mobile/native clients have no browser cookie jar, so
+    // they read the tokens here, store them in secure on-device storage,
+    // and send them back via `Authorization: Bearer <token>` (already
+    // supported by the auth middleware) and a `refresh_token` body field.
     res.json({
       user: {
         id:         user.id,
@@ -120,6 +130,8 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         trainer_id: user.trainer_id,
         member_id:  user.member_id,
       },
+      token,
+      refresh_token: refreshToken,
     });
 
   } catch (err) {
@@ -130,7 +142,9 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
 
 // POST /api/auth/logout
 router.post('/logout', async function(req, res) {
-  await revokeRefreshToken(req.cookies?.refresh_token);
+  // Mobile clients have no refresh_token cookie to read — accept it from
+  // the body as a fallback so they can revoke their session too.
+  await revokeRefreshToken(req.cookies?.refresh_token || req.body?.refresh_token);
   res.clearCookie('token', { httpOnly: true, secure: isProd, sameSite: 'strict', path: '/' });
   res.clearCookie('refresh_token', { httpOnly: true, secure: isProd, sameSite: 'strict', path: '/api/auth' });
   res.json({ message: 'Logged out' });
@@ -138,7 +152,8 @@ router.post('/logout', async function(req, res) {
 
 // POST /api/auth/refresh — exchange a valid refresh token for a new access token (token rotation)
 router.post('/refresh', async (req, res) => {
-  const rawToken = req.cookies?.refresh_token;
+  const rawToken = req.cookies?.refresh_token || req.body?.refresh_token;
+  const isMobile = !req.cookies?.refresh_token;
   if (!rawToken) return res.status(401).json({ error: 'No refresh token' });
 
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
@@ -169,9 +184,9 @@ router.post('/refresh', async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
     );
     setTokenCookie(res, newAccessToken);
-    await issueRefreshToken(res, user_id);
+    const newRefreshToken = await issueRefreshToken(res, user_id);
 
-    res.json({ ok: true });
+    res.json(isMobile ? { ok: true, token: newAccessToken, refresh_token: newRefreshToken } : { ok: true });
   } catch (err) {
     logger.error({ err: err.message }, 'Token refresh error');
     res.status(500).json({ error: 'Server error' });
