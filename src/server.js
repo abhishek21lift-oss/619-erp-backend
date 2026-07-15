@@ -348,6 +348,7 @@ app.use('/api/classes',           require('./routes/classes'));
 app.use('/api/pt-os',            require('./modules/pt-os/pt-os.routes'));
 app.use('/api/pt-os',            require('./modules/pt-os/parq.routes'));
 app.use('/api/pt-os',            require('./modules/pt-os/informed-consent.routes'));
+app.use('/api/pt-os',            require('./modules/pt-os/workout-log.routes'));
 
 // ────────────────────────
 // BUSINESS FLOW ROUTES (v4 — Progress, Automation)
