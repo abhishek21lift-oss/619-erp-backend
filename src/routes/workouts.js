@@ -321,6 +321,28 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
       });
     }
 
+    // Informed Consent gate: block until the client has a completed
+    // Personal Training Informed Consent on file. Mirrors the PAR-Q gate
+    // above — a targeted SELECT against the latest non-superseded record,
+    // never a cached/trusted client-submitted flag.
+    const { rows: consentRows } = await pool.query(
+      `SELECT status FROM pt_informed_consents
+        WHERE client_id = $1 AND status NOT IN ('archived')
+        ORDER BY created_at DESC LIMIT 1`,
+      [d.client_id]
+    );
+    const consent = consentRows[0];
+    if (!consent || consent.status !== 'completed') {
+      await logActivity(req, 'workout.assign.blocked', 'pt_client', d.client_id, {
+        reason: consent ? 'consent_not_completed' : 'no_informed_consent',
+        workout_plan_id: d.workout_plan_id,
+      });
+      return res.status(403).json({
+        error: 'Personal Training Informed Consent required before workout assignment',
+        code: 'CONSENT_REQUIRED',
+      });
+    }
+
     const { rows } = await pool.query(`
       INSERT INTO workout_assignments (id, workout_plan_id, client_id, trainer_id,
         start_date, end_date, status, notes)
