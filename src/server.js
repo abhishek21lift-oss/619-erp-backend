@@ -300,7 +300,6 @@ app.use('/api/checkin',           express.json({ limit: '50kb' }), require('./ro
 app.use('/api/reports',           userApiLimiter, require('./routes/reports'));
 
 app.use('/api/plans',             require('./routes/plans'));
-app.use('/api/staff',             require('./routes/staff'));
 app.use('/api/leave',             require('./routes/leave'));
 app.use('/api/expenses',          require('./routes/expenses'));
 app.use('/api/import',            require('./routes/import'));  // FIX: was never mounted
