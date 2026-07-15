@@ -69,6 +69,12 @@ const updateSchema = {
     physician_name: z.string().max(255).optional().nullable(),
     hospital: z.string().max(255).optional().nullable(),
     medical_condition: z.string().max(1000).optional().nullable(),
+    // Exercise Programme Consent — a distinct sub-section with its own
+    // text/checkbox/date/signature (see migration 067).
+    exercise_consent_text: z.string().max(8000).optional().nullable(),
+    exercise_consent_checked: z.boolean().optional(),
+    exercise_consent_date: z.string().optional().nullable(),
+    exercise_consent_signature: z.string().optional().nullable(),
   }),
 };
 
@@ -183,6 +189,7 @@ router.patch('/informed-consent/:id', auth, requireRole('admin', 'manager', 'tra
     'full_name', 'gender', 'dob', 'mobile', 'email', 'emergency_contact', 'emergency_phone',
     'address', 'occupation', 'acknowledgements', 'physician_advised_against',
     'physician_name', 'hospital', 'medical_condition',
+    'exercise_consent_text', 'exercise_consent_checked', 'exercise_consent_date', 'exercise_consent_signature',
   ];
   const jsonFields = new Set(['acknowledgements']);
 
@@ -231,6 +238,16 @@ router.patch('/informed-consent/:id', auth, requireRole('admin', 'manager', 'tra
         sets.push(`${key} = $${params.length}${isJson ? '::jsonb' : ''}`);
       }
     }
+
+    // Exercise Programme Consent completes in this same PATCH (it's not
+    // routed through /sign — that endpoint is for the overall document's
+    // client/trainer/witness roles). Stamp the timestamp server-side,
+    // never trust a client-supplied one, the moment both the checkbox and
+    // signature are present.
+    if (b.exercise_consent_checked === true && b.exercise_consent_signature) {
+      sets.push('exercise_consent_signed_at = NOW()');
+    }
+
     if (sets.length) {
       sets.push('updated_at = NOW()');
       await tx.query(`UPDATE pt_informed_consents SET ${sets.join(', ')} WHERE id = $1`, params);
