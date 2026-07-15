@@ -136,18 +136,6 @@ const planSchemas = {
   },
 };
 
-const staffSchemas = {
-  create: {
-    body: z.object({
-      name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }),
-      email: emailOptional,
-      phone: mobileSchema,
-      role: z.string().min(1, 'Role is required'),
-      status: z.string().optional(),
-    }),
-  },
-};
-
 const trainerBaseFields = {
   name: z.string().min(1, 'Name is required').max(255).transform(function(v) { return v.trim(); }),
   mobile: mobileSchema,
@@ -212,7 +200,6 @@ module.exports = {
   clientSchemas,
   paymentSchemas,
   planSchemas,
-  staffSchemas,
   trainerSchemas,
   z,
 };
