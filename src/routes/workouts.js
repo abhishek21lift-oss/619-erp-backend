@@ -3,8 +3,7 @@ const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOrManager } = require('../middleware/auth');
-const logger = require('../lib/logger');
-const { logActivity } = require('../lib/activityLog');
+const { checkScreeningGate } = require('../lib/screeningGate');
 
 // ─── EXERCISES ────────────────────────────────────────────────
 
@@ -212,6 +211,31 @@ router.get('/plans', auth, async (req, res, next) => {
   }
 });
 
+// GET /api/workouts/plans/:id — full detail, exercises grouped by day.
+router.get('/plans/:id', auth, async (req, res, next) => {
+  try {
+    const { rows: planRows } = await pool.query(
+      `SELECT * FROM workout_plans WHERE id = $1 AND deleted_at IS NULL`,
+      [req.params.id]
+    );
+    const plan = planRows[0];
+    if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
+
+    const { rows: exercises } = await pool.query(
+      `SELECT we.id, we.exercise_id, e.name, e.muscle_group, we.sets, we.reps,
+              we.rest_seconds, we.day_of_week, we.sort_order, we.notes
+         FROM workout_exercises we
+         LEFT JOIN exercises e ON e.id = we.exercise_id
+        WHERE we.workout_plan_id = $1
+        ORDER BY we.day_of_week, we.sort_order`,
+      [req.params.id]
+    );
+    res.json({ ...plan, exercises });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/workouts/plans
 router.post('/plans', auth, adminOrManager, async (req, res, next) => {
   const d = req.body;
@@ -251,10 +275,15 @@ router.post('/plans', auth, adminOrManager, async (req, res, next) => {
 });
 
 // PUT /api/workouts/plans/:id
+// Optionally accepts an exercises[] array (same shape as POST /plans) to
+// replace the plan's full workout_exercises list in one call — the only
+// way the Plan Builder's edit path needs to touch exercises.
 router.put('/plans/:id', auth, adminOrManager, async (req, res, next) => {
+  const client = await pool.connect();
   try {
     const d = req.body;
-    const { rows } = await pool.query(`
+    await client.query('BEGIN');
+    const { rows } = await client.query(`
       UPDATE workout_plans SET
         name = COALESCE($1, name),
         description = COALESCE($2, description),
@@ -268,10 +297,29 @@ router.put('/plans/:id', auth, adminOrManager, async (req, res, next) => {
        d.duration_weeks ? parseInt(d.duration_weeks) : null,
        d.sessions_per_week ? parseInt(d.sessions_per_week) : null, req.params.id]
     );
-    if (!rows[0]) return res.status(404).json({ error: 'Workout plan not found' });
+    if (!rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Workout plan not found' }); }
+
+    if (Array.isArray(d.exercises)) {
+      await client.query('DELETE FROM workout_exercises WHERE workout_plan_id = $1', [req.params.id]);
+      for (const ex of d.exercises) {
+        await client.query(`
+          INSERT INTO workout_exercises (id, workout_plan_id, exercise_id, day_of_week,
+            sort_order, sets, reps, rest_seconds, notes)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [randomUUID(), req.params.id, ex.exercise_id, parseInt(ex.day_of_week) || 1,
+           parseInt(ex.sort_order) || 0, parseInt(ex.sets) || 3, parseInt(ex.reps) || 12,
+           parseInt(ex.rest_seconds) || 60, ex.notes || null]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
     res.json({ message: 'Plan updated', plan: rows[0] });
   } catch (err) {
+    await client.query('ROLLBACK');
     next(err);
+  } finally {
+    client.release();
   }
 });
 
@@ -291,6 +339,62 @@ router.delete('/plans/:id', auth, adminOrManager, async (req, res, next) => {
 
 // ─── WORKOUT ASSIGNMENTS ──────────────────────────────────────
 
+// GET /api/workouts/assignments?client_id=&status=
+router.get('/assignments', auth, async (req, res, next) => {
+  try {
+    const { client_id, status } = req.query;
+    if (!client_id) return res.status(400).json({ error: 'client_id required' });
+    const conds = ['wa.client_id = $1'];
+    const params = [client_id];
+    let p = 2;
+    if (status) { conds.push(`wa.status = $${p++}`); params.push(status); }
+
+    const { rows } = await pool.query(`
+      SELECT wa.*, wp.name AS plan_name, wp.goal AS plan_goal,
+             wp.duration_weeks, wp.sessions_per_week
+        FROM workout_assignments wa
+        JOIN workout_plans wp ON wp.id = wa.workout_plan_id
+       WHERE ${conds.join(' AND ')}
+       ORDER BY wa.created_at DESC`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    if (err.message?.includes('does not exist')) return res.json([]);
+    next(err);
+  }
+});
+
+// GET /api/workouts/assignments/:id — single assignment + its plan's full
+// prescribed exercises (feeds "today's prescribed exercises" in the log).
+router.get('/assignments/:id', auth, async (req, res, next) => {
+  try {
+    const { rows: assignRows } = await pool.query(`
+      SELECT wa.*, wp.name AS plan_name, wp.goal AS plan_goal,
+             wp.duration_weeks, wp.sessions_per_week
+        FROM workout_assignments wa
+        JOIN workout_plans wp ON wp.id = wa.workout_plan_id
+       WHERE wa.id = $1`,
+      [req.params.id]
+    );
+    const assignment = assignRows[0];
+    if (!assignment) return res.status(404).json({ error: 'Assignment not found' });
+
+    const { rows: exercises } = await pool.query(
+      `SELECT we.id, we.exercise_id, e.name, e.muscle_group, we.sets, we.reps,
+              we.rest_seconds, we.day_of_week, we.sort_order, we.notes
+         FROM workout_exercises we
+         LEFT JOIN exercises e ON e.id = we.exercise_id
+        WHERE we.workout_plan_id = $1
+        ORDER BY we.day_of_week, we.sort_order`,
+      [assignment.workout_plan_id]
+    );
+    res.json({ ...assignment, exercises });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/workouts/assign
 router.post('/assign', auth, adminOrManager, async (req, res, next) => {
   try {
@@ -298,50 +402,11 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
     if (!d.workout_plan_id || !d.client_id)
       return res.status(400).json({ error: 'workout_plan_id and client_id required' });
 
-    // PAR-Q gate: block workout assignment until the client's latest health
-    // screening is cleared (low/medium risk, or high risk with an approved,
-    // unexpired medical clearance). workout_gate_status is kept in sync by
-    // recomputeGateStatus in src/modules/pt-os/parq.routes.js — both on
-    // form submit and whenever a clearance is approved/rejected.
-    const { rows: gateRows } = await pool.query(
-      `SELECT workout_gate_status FROM pt_parq_forms
-        WHERE client_id = $1 AND deleted_at IS NULL
-        ORDER BY assessment_date DESC LIMIT 1`,
-      [d.client_id]
-    );
-    const gate = gateRows[0];
-    if (!gate || gate.workout_gate_status !== 'cleared') {
-      await logActivity(req, 'workout.assign.blocked', 'pt_client', d.client_id, {
-        reason: gate ? 'gate_not_cleared' : 'no_parq_form',
-        workout_plan_id: d.workout_plan_id,
-      });
-      return res.status(403).json({
-        error: 'PAR-Q health screening required before workout assignment',
-        code: 'PARQ_REQUIRED',
-      });
-    }
-
-    // Informed Consent gate: block until the client has a completed
-    // Personal Training Informed Consent on file. Mirrors the PAR-Q gate
-    // above — a targeted SELECT against the latest non-superseded record,
-    // never a cached/trusted client-submitted flag.
-    const { rows: consentRows } = await pool.query(
-      `SELECT status FROM pt_informed_consents
-        WHERE client_id = $1 AND status NOT IN ('archived')
-        ORDER BY created_at DESC LIMIT 1`,
-      [d.client_id]
-    );
-    const consent = consentRows[0];
-    if (!consent || consent.status !== 'completed') {
-      await logActivity(req, 'workout.assign.blocked', 'pt_client', d.client_id, {
-        reason: consent ? 'consent_not_completed' : 'no_informed_consent',
-        workout_plan_id: d.workout_plan_id,
-      });
-      return res.status(403).json({
-        error: 'Personal Training Informed Consent required before workout assignment',
-        code: 'CONSENT_REQUIRED',
-      });
-    }
+    // PAR-Q + Informed Consent gate — shared with Workout Log session
+    // creation (src/lib/screeningGate.js) so both entry points enforce the
+    // exact same clearance requirement before a client can train.
+    const blocked = await checkScreeningGate(req, d.client_id);
+    if (blocked) return res.status(blocked.status).json(blocked.body);
 
     const { rows } = await pool.query(`
       INSERT INTO workout_assignments (id, workout_plan_id, client_id, trainer_id,

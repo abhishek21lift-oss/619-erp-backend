@@ -18,10 +18,35 @@ const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
 const { calc1RM } = require('../progress/fitness-scoring');
+const { checkScreeningGate } = require('../../lib/screeningGate');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 const numOpt = () => z.coerce.number().optional().nullable();
+
+const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+
+// Recomputes a linked assignment's progress_pct from how many distinct
+// completed sessions have been logged against it, relative to the plan's
+// target (sessions_per_week * duration_weeks). The only writer of
+// progress_pct outside the trainer's manual PUT /assignments/:id/progress.
+async function recomputeAssignmentProgress(assignmentId) {
+  if (!assignmentId) return;
+  const { rows } = await pool.query(
+    `SELECT wp.sessions_per_week, wp.duration_weeks,
+            (SELECT COUNT(DISTINCT ws.id) FROM workout_sessions ws
+              WHERE ws.workout_assignment_id = wa.id AND ws.status = 'completed') AS completed_count
+       FROM workout_assignments wa
+       JOIN workout_plans wp ON wp.id = wa.workout_plan_id
+      WHERE wa.id = $1`,
+    [assignmentId]
+  );
+  const row = rows[0];
+  if (!row) return;
+  const target = (row.sessions_per_week || 0) * (row.duration_weeks || 0);
+  const pct = target > 0 ? Math.min(100, Math.round((row.completed_count / target) * 100)) : 0;
+  await pool.query('UPDATE workout_assignments SET progress_pct = $1, updated_at = NOW() WHERE id = $2', [pct, assignmentId]);
+}
 
 // ─── Schemas ────────────────────────────────────────────────
 
@@ -159,6 +184,33 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   if (!session) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   const exercises = exercisesRes.rows;
 
+  // "Planned for today": when this session is linked to an active plan
+  // assignment, show what the plan prescribes for the matching day-of-week
+  // so the trainer can compare/load it in without re-typing the program.
+  let planned = null;
+  if (session.workout_assignment_id) {
+    const dayIndex = session.workout_day ? WEEKDAYS.indexOf(session.workout_day) : -1;
+    const { rows: planRows } = await pool.query(
+      `SELECT wp.id AS plan_id, wp.name AS plan_name
+         FROM workout_assignments wa
+         JOIN workout_plans wp ON wp.id = wa.workout_plan_id
+        WHERE wa.id = $1`,
+      [session.workout_assignment_id]
+    );
+    const plan = planRows[0];
+    if (plan && dayIndex >= 0) {
+      const { rows: plannedExercises } = await pool.query(
+        `SELECT we.exercise_id, e.name, we.sets, we.reps, we.rest_seconds, we.sort_order, we.notes
+           FROM workout_exercises we
+           LEFT JOIN exercises e ON e.id = we.exercise_id
+          WHERE we.workout_plan_id = $1 AND we.day_of_week = $2
+          ORDER BY we.sort_order`,
+        [plan.plan_id, dayIndex + 1]
+      );
+      planned = { plan_name: plan.plan_name, exercises: plannedExercises };
+    }
+  }
+
   let totalSets = 0, totalReps = 0, totalVolume = 0, rpeSum = 0, rpeCount = 0;
   for (const ex of exercises) {
     for (const s of ex.sets) {
@@ -174,6 +226,7 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
     data: {
       ...session,
       exercises,
+      planned,
       summary: {
         total_sets: totalSets,
         total_reps: totalReps,
@@ -189,15 +242,59 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
 // POST /workout-log/sessions
 router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trainer'), validate(sessionCreateSchema), wrap(async (req, res) => {
   const b = req.body;
+
+  // Same PAR-Q + Informed Consent gate as plan assignment — logging a
+  // session is training just as much as following an assigned plan, so it
+  // gets the same clearance requirement.
+  const blocked = await checkScreeningGate(req, b.client_id);
+  if (blocked) return res.status(blocked.status).json(blocked.body);
+
+  // Auto-link the client's single active plan assignment when the caller
+  // didn't explicitly pass one — left null if there are zero or several
+  // active assignments, rather than guessing which one.
+  let assignmentId = b.workout_assignment_id || null;
+  if (!assignmentId) {
+    const { rows: activeRows } = await pool.query(
+      `SELECT id FROM workout_assignments WHERE client_id = $1 AND status = 'active'`,
+      [b.client_id]
+    );
+    if (activeRows.length === 1) assignmentId = activeRows[0].id;
+  }
+
   const { rows } = await pool.query(
     `INSERT INTO workout_sessions (
        client_id, trainer_id, workout_assignment_id, session_date, program_name, workout_day, notes, created_by
      ) VALUES ($1, (SELECT trainer_id FROM pt_clients WHERE id = $1), $2, COALESCE($3, CURRENT_DATE), $4, $5, $6, $7)
      RETURNING *`,
-    [b.client_id, b.workout_assignment_id || null, b.session_date || null, b.program_name || null, b.workout_day || null, b.notes || null, req.user.id]
+    [b.client_id, assignmentId, b.session_date || null, b.program_name || null, b.workout_day || null, b.notes || null, req.user.id]
   );
   await logActivity(req, 'workout_log.session.create', 'workout_sessions', rows[0].id, { client_id: b.client_id });
   res.status(201).json({ data: rows[0] });
+}));
+
+// GET /workout-log/sessions/:sessionId/planned-day-options — the distinct
+// weekday names this session's linked plan prescribes exercises for, so
+// the frontend can render a constrained day picker instead of free text.
+router.get('/workout-log/sessions/:sessionId/planned-day-options', auth, wrap(async (req, res) => {
+  const { rows: sessionRows } = await pool.query(
+    'SELECT workout_assignment_id FROM workout_sessions WHERE id = $1',
+    [req.params.sessionId]
+  );
+  const session = sessionRows[0];
+  if (!session) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (!session.workout_assignment_id) return res.json({ data: [] });
+
+  const { rows: planRows } = await pool.query(
+    `SELECT wp.id FROM workout_assignments wa JOIN workout_plans wp ON wp.id = wa.workout_plan_id WHERE wa.id = $1`,
+    [session.workout_assignment_id]
+  );
+  if (!planRows[0]) return res.json({ data: [] });
+
+  const { rows: dayRows } = await pool.query(
+    'SELECT DISTINCT day_of_week FROM workout_exercises WHERE workout_plan_id = $1 ORDER BY day_of_week',
+    [planRows[0].id]
+  );
+  res.json({ data: dayRows.map((r) => WEEKDAYS[r.day_of_week - 1]).filter(Boolean) });
 }));
 
 // PATCH /workout-log/sessions/:id
@@ -214,13 +311,17 @@ router.patch('/workout-log/sessions/:id', auth, requireRole('admin', 'manager', 
   sets.push('updated_at = NOW()');
   const { rows } = await pool.query(`UPDATE workout_sessions SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (b.status !== undefined && rows[0].workout_assignment_id) {
+    await recomputeAssignmentProgress(rows[0].workout_assignment_id);
+  }
   res.json({ data: rows[0] });
 }));
 
 // DELETE /workout-log/sessions/:id
 router.delete('/workout-log/sessions/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
-  const { rows } = await pool.query('DELETE FROM workout_sessions WHERE id = $1 RETURNING id, client_id', [req.params.id]);
+  const { rows } = await pool.query('DELETE FROM workout_sessions WHERE id = $1 RETURNING id, client_id, workout_assignment_id', [req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (rows[0].workout_assignment_id) await recomputeAssignmentProgress(rows[0].workout_assignment_id);
   await logActivity(req, 'workout_log.session.delete', 'workout_sessions', req.params.id, { client_id: rows[0].client_id });
   res.json({ message: 'Session deleted' });
 }));
