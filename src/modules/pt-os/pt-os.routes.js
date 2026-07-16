@@ -1,4 +1,5 @@
 const router = require('express').Router();
+const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
 const { auth, adminOnly, adminOrManager } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
@@ -632,19 +633,88 @@ router.get('/sessions', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
+// Adds `minutes` to a 'HH:MM' or 'HH:MM:SS' time string, returning 'HH:MM:SS'.
+// Used to derive end_time from start_time + duration server-side rather
+// than trusting a client-computed value (or leaving it null, which is
+// what happened before this fix).
+function addMinutesToTime(timeStr, minutes) {
+  const [h, m, s] = timeStr.split(':').map(Number);
+  const total = h * 60 + m + minutes;
+  const hh = Math.floor((total % 1440) / 60);
+  const mm = total % 60;
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(s || 0).padStart(2, '0')}`;
+}
+
+// Adds `days` to a 'YYYY-MM-DD' date string, returning 'YYYY-MM-DD'.
+function addDaysToDate(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
 router.post('/sessions', auth, wrap(async (req, res) => {
-  const { client_id, client, trainer_id, title, date, start_time, end_time, notes } = req.body;
+  const { client_id, client, trainer_id, title, date, start_time, end_time, notes,
+    duration_minutes, session_type, recurring } = req.body;
   let cid = client_id;
   if (!cid && client) {
     const { rows } = await pool.query("SELECT id FROM pt_clients WHERE name = $1 AND deleted_at IS NULL LIMIT 1", [client]);
     if (rows.length > 0) cid = rows[0].id;
   }
-  const { rows } = await pool.query(
-    `INSERT INTO pt_sessions (client_id, trainer_id, title, session_date, start_time, end_time, notes, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [cid, trainer_id, title || 'PT Session', date, start_time, end_time, notes, req.user.id]
+
+  const duration = parseInt(duration_minutes, 10) || 60;
+  const computedEndTime = end_time || (start_time ? addMinutesToTime(start_time, duration) : null);
+
+  // Recurring: book this session plus 3 more at the same weekly slot,
+  // sharing one recurrence_id so they can be identified as a group later.
+  const occurrences = recurring ? 4 : 1;
+  const recurrenceId = recurring ? randomUUID() : null;
+  const created = [];
+  for (let i = 0; i < occurrences; i++) {
+    const occDate = i === 0 ? date : addDaysToDate(date, 7 * i);
+    const { rows } = await pool.query(
+      `INSERT INTO pt_sessions (client_id, trainer_id, title, session_date, start_time, end_time,
+         notes, created_by, duration_minutes, session_type, recurrence_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [cid, trainer_id, title || 'PT Session', occDate, start_time, computedEndTime, notes, req.user.id,
+       duration, session_type || '1-on-1', recurrenceId]
+    );
+    created.push(rows[0]);
+  }
+  res.status(201).json({ data: occurrences === 1 ? created[0] : created });
+}));
+
+// PATCH /sessions/:id
+router.patch('/sessions/:id', auth, wrap(async (req, res) => {
+  const { id } = req.params;
+  const b = req.body;
+  const { rows: existingRows } = await pool.query(
+    'SELECT start_time, duration_minutes FROM pt_sessions WHERE id = $1 AND deleted_at IS NULL',
+    [id]
   );
-  res.status(201).json({ data: rows[0] });
+  if (!existingRows[0]) return res.status(404).json({ error: 'Session not found' });
+
+  const allowed = ['status', 'notes', 'session_date', 'start_time', 'duration_minutes', 'session_type'];
+  const sets = [];
+  const params = [id];
+  for (const key of allowed) {
+    if (b[key] !== undefined) { params.push(b[key]); sets.push(`${key} = $${params.length}`); }
+  }
+  if (!sets.length) return res.status(400).json({ error: 'No fields to update' });
+
+  if (b.start_time !== undefined || b.duration_minutes !== undefined) {
+    const mergedStart = b.start_time ?? existingRows[0].start_time;
+    const mergedDuration = b.duration_minutes ?? existingRows[0].duration_minutes;
+    if (mergedStart) {
+      params.push(addMinutesToTime(mergedStart, mergedDuration));
+      sets.push(`end_time = $${params.length}`);
+    }
+  }
+  sets.push('updated_at = NOW()');
+  const { rows } = await pool.query(
+    `UPDATE pt_sessions SET ${sets.join(', ')} WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
+    params
+  );
+  res.json({ data: rows[0] });
 }));
 
 // ─── Payments ───────────────────────────────────────────────

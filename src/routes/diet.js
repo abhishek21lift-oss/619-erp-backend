@@ -130,6 +130,32 @@ router.post('/templates', auth, adminOrManager, async (req, res, next) => {
 
 // ─── DIET ASSIGNMENTS ────────────────────────────────────────
 
+// GET /api/diet/assignments?client_id=&status=
+router.get('/assignments', auth, async (req, res, next) => {
+  try {
+    const { client_id, status } = req.query;
+    if (!client_id) return res.status(400).json({ error: 'client_id required' });
+    const conds = ['da.client_id = $1'];
+    const params = [client_id];
+    let p = 2;
+    if (status) { conds.push(`da.status = $${p++}`); params.push(status); }
+
+    const { rows } = await pool.query(`
+      SELECT da.*, dt.name AS template_name, dt.goal AS template_goal,
+             dt.daily_calories, dt.daily_protein_g, dt.daily_carbs_g, dt.daily_fats_g
+        FROM diet_assignments da
+        JOIN diet_templates dt ON dt.id = da.diet_template_id
+       WHERE ${conds.join(' AND ')}
+       ORDER BY da.created_at DESC`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    if (err.message?.includes('does not exist')) return res.json([]);
+    next(err);
+  }
+});
+
 // POST /api/diet/assign
 router.post('/assign', auth, adminOrManager, async (req, res, next) => {
   try {
