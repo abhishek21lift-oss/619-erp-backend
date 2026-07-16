@@ -249,16 +249,17 @@ router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trai
   const blocked = await checkScreeningGate(req, b.client_id);
   if (blocked) return res.status(blocked.status).json(blocked.body);
 
-  // Auto-link the client's single active plan assignment when the caller
-  // didn't explicitly pass one — left null if there are zero or several
-  // active assignments, rather than guessing which one.
-  let assignmentId = b.workout_assignment_id || null;
-  if (!assignmentId) {
+  // Auto-link the client's single active plan assignment only when the
+  // field was omitted entirely — an explicit null (freestyle, opted out
+  // of the client's active plan) or an explicit id is left as-is, so the
+  // frontend can distinguish "didn't say" from "said no plan".
+  let assignmentId = b.workout_assignment_id;
+  if (assignmentId === undefined) {
     const { rows: activeRows } = await pool.query(
       `SELECT id FROM workout_assignments WHERE client_id = $1 AND status = 'active'`,
       [b.client_id]
     );
-    if (activeRows.length === 1) assignmentId = activeRows[0].id;
+    assignmentId = activeRows.length === 1 ? activeRows[0].id : null;
   }
 
   const { rows } = await pool.query(
