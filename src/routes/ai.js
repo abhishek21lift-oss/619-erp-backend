@@ -34,12 +34,33 @@ function requireConfigured(req, res, next) {
 
 /* ─── Helpers ───────────────────────────────────────────────────────────── */
 function extractJson(text) {
+  if (!text) return null;
+  // Strip markdown code fences — models add them despite the prompt's
+  // "no code fences" instruction often enough that raw parse fails.
+  const cleaned = text.replace(/```(?:json)?/gi, '').trim();
   // Try raw parse first
-  try { return JSON.parse(text); } catch { /* continue */ }
-  // Try to extract JSON object from prose / markdown
-  const match = text.match(/\{[\s\S]+\}/);
-  if (match) {
-    try { return JSON.parse(match[0]); } catch { /* continue */ }
+  try { return JSON.parse(cleaned); } catch { /* continue */ }
+  // Balanced-brace scan: parse from the first '{' to its matching close.
+  // The old greedy /\{[\s\S]+\}/ regex spanned first-{ to LAST-}, which
+  // breaks whenever prose or a second object follows the JSON.
+  const start = cleaned.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { if (inString) escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(cleaned.slice(start, i + 1)); } catch { return null; }
+      }
+    }
   }
   return null;
 }
@@ -233,13 +254,20 @@ Create a complete progressive programme with warm-up, cool-down, and progression
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.6,
-      max_tokens:  2048,
+      max_tokens:  8000,
     })[Symbol.asyncIterator]();
 
     let step;
     while (!(step = await it.next()).done) {
-      if (typeof step.value === 'string' && !step.value.startsWith('\n\n[Retrying')) {
-        fullContent += step.value;
+      if (typeof step.value === 'string') {
+        if (step.value.startsWith('\n\n[Retrying')) {
+          // Fallback retry: discard the failed primary model's partial
+          // output — keeping it left two half-responses concatenated,
+          // which could never parse as JSON.
+          fullContent = '';
+        } else {
+          fullContent += step.value;
+        }
       }
       res.write(': ping\n\n'); // keeps Render connection alive
     }
@@ -319,13 +347,20 @@ Calculate accurate TDEE, set appropriate calorie and macro targets, then create 
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.5,
-      max_tokens:  2500,
+      max_tokens:  8000,
     })[Symbol.asyncIterator]();
 
     let step;
     while (!(step = await it.next()).done) {
-      if (typeof step.value === 'string' && !step.value.startsWith('\n\n[Retrying')) {
-        fullContent += step.value;
+      if (typeof step.value === 'string') {
+        if (step.value.startsWith('\n\n[Retrying')) {
+          // Fallback retry: discard the failed primary model's partial
+          // output — keeping it left two half-responses concatenated,
+          // which could never parse as JSON.
+          fullContent = '';
+        } else {
+          fullContent += step.value;
+        }
       }
       res.write(': ping\n\n');
     }
@@ -418,13 +453,20 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.4,
-      max_tokens:  2000,
+      max_tokens:  4000,
     })[Symbol.asyncIterator]();
 
     let step;
     while (!(step = await it.next()).done) {
-      if (typeof step.value === 'string' && !step.value.startsWith('\n\n[Retrying')) {
-        fullContent += step.value;
+      if (typeof step.value === 'string') {
+        if (step.value.startsWith('\n\n[Retrying')) {
+          // Fallback retry: discard the failed primary model's partial
+          // output — keeping it left two half-responses concatenated,
+          // which could never parse as JSON.
+          fullContent = '';
+        } else {
+          fullContent += step.value;
+        }
       }
       res.write(': ping\n\n');
     }
@@ -514,13 +556,20 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.4,
-      max_tokens:  2000,
+      max_tokens:  4000,
     })[Symbol.asyncIterator]();
 
     let step;
     while (!(step = await it.next()).done) {
-      if (typeof step.value === 'string' && !step.value.startsWith('\n\n[Retrying')) {
-        fullContent += step.value;
+      if (typeof step.value === 'string') {
+        if (step.value.startsWith('\n\n[Retrying')) {
+          // Fallback retry: discard the failed primary model's partial
+          // output — keeping it left two half-responses concatenated,
+          // which could never parse as JSON.
+          fullContent = '';
+        } else {
+          fullContent += step.value;
+        }
       }
       res.write(': ping\n\n');
     }
@@ -636,7 +685,7 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.4,
-      max_tokens:  2500,
+      max_tokens:  8000,
     });
 
     const insights = extractJson(result.content);
