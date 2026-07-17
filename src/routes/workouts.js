@@ -404,8 +404,9 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
 
     // PAR-Q + Informed Consent gate — shared with Workout Log session
     // creation (src/lib/screeningGate.js) so both entry points enforce the
-    // exact same clearance requirement before a client can train.
-    const blocked = await checkScreeningGate(req, d.client_id);
+    // exact same clearance rule: explicit medical blocks stop the action,
+    // missing paperwork proceeds with warnings for the UI to surface.
+    const { blocked, warnings } = await checkScreeningGate(req, d.client_id);
     if (blocked) return res.status(blocked.status).json(blocked.body);
 
     const { rows } = await pool.query(`
@@ -419,7 +420,7 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
        d.start_date || new Date().toISOString().split('T')[0],
        d.end_date || null, 'active', d.notes || null]
     );
-    res.status(201).json({ message: 'Plan assigned', assignment: rows[0] });
+    res.status(201).json({ message: 'Plan assigned', assignment: rows[0], screening_warnings: warnings });
   } catch (err) {
     if (err.message?.includes('does not exist')) return res.status(400).json({ error: 'Tables not ready. Run migrations.' });
     next(err);

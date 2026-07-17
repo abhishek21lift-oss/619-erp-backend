@@ -245,8 +245,9 @@ router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trai
 
   // Same PAR-Q + Informed Consent gate as plan assignment — logging a
   // session is training just as much as following an assigned plan, so it
-  // gets the same clearance requirement.
-  const blocked = await checkScreeningGate(req, b.client_id);
+  // gets the same clearance rule: explicit medical blocks stop the action,
+  // missing paperwork proceeds with warnings for the UI to surface.
+  const { blocked, warnings } = await checkScreeningGate(req, b.client_id);
   if (blocked) return res.status(blocked.status).json(blocked.body);
 
   // Auto-link the client's single active plan assignment only when the
@@ -270,7 +271,7 @@ router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trai
     [b.client_id, assignmentId, b.session_date || null, b.program_name || null, b.workout_day || null, b.notes || null, req.user.id]
   );
   await logActivity(req, 'workout_log.session.create', 'workout_sessions', rows[0].id, { client_id: b.client_id });
-  res.status(201).json({ data: rows[0] });
+  res.status(201).json({ data: rows[0], screening_warnings: warnings });
 }));
 
 // GET /workout-log/sessions/:sessionId/planned-day-options — the distinct
