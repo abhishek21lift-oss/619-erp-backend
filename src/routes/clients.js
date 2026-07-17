@@ -106,9 +106,14 @@ router.get('/', auth, async (req, res, next) => {
     // Auto-expire is rate-limited to once an hour, off the hot read path.
     maybeAutoExpire().catch(err => console.error('Auto-expire error:', err));
 
+    // Clients live in pt_clients — the legacy `clients` table has been empty
+    // since the PT-OS enrolment flow shipped, so serving it here left every
+    // consumer of this endpoint (attendance, check-in, payment picker, …)
+    // with an empty list. branch_id is shimmed as NULL because pt_clients is
+    // single-branch; the branch-scope clause treats NULL as visible.
     const { rows } = await pool.query(
       `SELECT c.*, t.name as computed_trainer_name
-       FROM clients c
+       FROM (SELECT pc.*, NULL::text AS branch_id FROM pt_clients pc) c
        LEFT JOIN trainers t ON t.id = c.trainer_id
        ${where}
        ORDER BY c.created_at DESC
@@ -131,7 +136,8 @@ router.get('/search', auth, async (req, res, next) => {
     const { sql: bsql, params: bparams } = req.branchScope.appendTo([searchParam]);
     const { rows } = await pool.query(
       `SELECT c.*, t.name as computed_trainer_name
-       FROM clients c LEFT JOIN trainers t ON t.id = c.trainer_id
+       FROM (SELECT pc.*, NULL::text AS branch_id FROM pt_clients pc) c
+       LEFT JOIN trainers t ON t.id = c.trainer_id
        WHERE COALESCE(c.deleted_at, NULL) IS NULL
          AND (c.name ILIKE $1 OR c.mobile ILIKE $1 OR c.client_id ILIKE $1 OR c.email ILIKE $1)
          AND c.${bsql}
@@ -151,7 +157,7 @@ router.get('/:id', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       `SELECT c.*, t.name as trainer_full_name, t.mobile as trainer_mobile
-       FROM clients c LEFT JOIN trainers t ON t.id = c.trainer_id
+       FROM pt_clients c LEFT JOIN trainers t ON t.id = c.trainer_id
        WHERE c.id = $1`, [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
@@ -172,7 +178,11 @@ router.get('/:id', auth, async (req, res, next) => {
 
     const [payments, weightLogs, renewals] = await Promise.all([
       pool.query(
-        'SELECT * FROM payments WHERE client_id=$1 ORDER BY date DESC, created_at DESC LIMIT 50',
+        `SELECT id, client_id, trainer_id, amount, incentive_amt,
+                payment_method AS method, payment_ref AS receipt_no,
+                date, notes, created_at
+         FROM pt_payments WHERE client_id=$1 AND deleted_at IS NULL
+         ORDER BY date DESC, created_at DESC LIMIT 50`,
         [req.params.id]
       ),
       pool.query(
@@ -180,7 +190,7 @@ router.get('/:id', auth, async (req, res, next) => {
         [req.params.id]
       ),
       pool.query(
-        'SELECT * FROM renewals WHERE client_id=$1 ORDER BY renewed_on DESC, created_at DESC LIMIT 20',
+        'SELECT * FROM pt_client_renewals WHERE client_id=$1 ORDER BY created_at DESC LIMIT 20',
         [req.params.id]
       ),
     ]);

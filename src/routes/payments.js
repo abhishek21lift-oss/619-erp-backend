@@ -1,4 +1,20 @@
 // src/routes/payments.js
+//
+// Canonical payment API for the finance UI.
+//
+// History: the app originally kept clients in `clients` and payments in
+// `payments`. The PT-OS enrolment flow replaced that world with `pt_clients`
+// + `pt_payments`, leaving the legacy pair permanently empty — which meant
+// POST /api/payments could never find a real client (404 on every attempt)
+// and no payment was ever recordable through the finance UI.
+//
+// Now:
+//   • POST writes to pt_payments and updates pt_clients balances.
+//   • GET / and GET /stats read BOTH ledgers (legacy rows still surface if
+//     any old install has them) with pt_payments columns aliased to the
+//     legacy response shape (method, receipt_no).
+//   • DELETE handles rows from either ledger and reverses the balance on
+//     the owning client table.
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
@@ -7,6 +23,27 @@ const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { paymentSchemas } = require('../lib/validation');
 const logger = require('../lib/logger');
+
+// Both ledgers, aliased to one shape. pt_payments has no branch_id — shimmed
+// NULL so the branch-scope clause (branch_id = $n OR branch_id IS NULL) keeps
+// treating those rows as visible.
+const LEDGER_SQL = `
+  SELECT p.id, p.client_id, c.name AS client_name, p.trainer_id,
+         t.name AS trainer_name, p.amount, p.incentive_amt,
+         UPPER(p.payment_method) AS method, p.payment_ref AS receipt_no,
+         p.date, p.notes, p.deleted_at, p.created_at,
+         NULL::text AS branch_id, NULL::text AS package_type
+  FROM pt_payments p
+  LEFT JOIN pt_clients c ON c.id = p.client_id
+  LEFT JOIN trainers   t ON t.id = p.trainer_id
+  UNION ALL
+  SELECT lp.id, lp.client_id, lp.client_name, lp.trainer_id,
+         lp.trainer_name, lp.amount, lp.incentive_amt,
+         UPPER(lp.method) AS method, lp.receipt_no,
+         lp.date, lp.notes, lp.deleted_at, lp.created_at,
+         lp.branch_id::text, lp.package_type
+  FROM payments lp
+`;
 
 // GET /api/payments
 router.get('/', auth, async (req, res, next) => {
@@ -43,10 +80,8 @@ router.get('/', auth, async (req, res, next) => {
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
     const { rows } = await pool.query(`
-      SELECT p.*, c.name AS client_name, t.name AS trainer_name_full
-      FROM payments p
-      LEFT JOIN clients  c ON c.id = p.client_id
-      LEFT JOIN trainers t ON t.id = p.trainer_id
+      SELECT p.*, p.trainer_name AS trainer_name_full
+      FROM (${LEDGER_SQL}) p
       ${where}
       ORDER BY p.date DESC, p.created_at DESC
       LIMIT $${p++} OFFSET $${p++}`,
@@ -74,7 +109,7 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
 
     // Get client info (lock the row to prevent concurrent balance drift)
     const { rows: cl } = await tx.query(
-      'SELECT * FROM clients WHERE id=$1 FOR UPDATE', [d.client_id]
+      'SELECT * FROM pt_clients WHERE id=$1 AND deleted_at IS NULL FOR UPDATE', [d.client_id]
     );
     if (!cl[0]) {
       await tx.query('ROLLBACK');
@@ -82,8 +117,6 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
     }
 
     // ── RBAC: trainers can only record payments for THEIR OWN clients ──
-    // (Without this check, any trainer could post a payment against any client
-    // by guessing/pasting a client_id — breaking the data isolation guarantee.)
     if (req.user.role === 'trainer' && cl[0].trainer_id !== req.user.trainer_id) {
       await tx.query('ROLLBACK');
       return res.status(403).json({ error: 'Access denied: client is not assigned to you' });
@@ -93,38 +126,33 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
     // without the cascade clearing the client's trainer_id, the INSERT would fail
     // with a FK violation (23503). Fall back to NULL in that case.
     let resolvedTrainerId = null;
-    let resolvedTrainerName = null;
     let incentiveRate = 0.5;
     if (cl[0].trainer_id) {
       const { rows: tr } = await tx.query(
-        'SELECT id, name, incentive_rate FROM trainers WHERE id=$1', [cl[0].trainer_id]
+        'SELECT id, incentive_rate FROM trainers WHERE id=$1', [cl[0].trainer_id]
       );
       if (tr[0]) {
-        resolvedTrainerId   = tr[0].id;
-        resolvedTrainerName = tr[0].name ?? cl[0].trainer_name;
-        incentiveRate       = tr[0].incentive_rate ?? 0.5;
+        resolvedTrainerId = tr[0].id;
+        incentiveRate     = tr[0].incentive_rate ?? 0.5;
       }
-      // If trainer row is missing (deleted without cascade), keep everything NULL
-      // so the payment still records and the balance still updates correctly.
     }
 
     const id = randomUUID();
     const receiptNo = await genReceiptNo(tx);
 
     await tx.query(`
-      INSERT INTO payments (id,client_id,client_name,trainer_id,trainer_name,
-        amount,method,date,receipt_no,package_type,incentive_amt,notes)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-      [id, d.client_id, cl[0].name,
-       resolvedTrainerId, resolvedTrainerName,
-       amount, d.method||'CASH', d.date, receiptNo,
-       cl[0].package_type, Math.round(amount * incentiveRate),
-       d.notes||null]
+      INSERT INTO pt_payments (id, client_id, trainer_id, amount, incentive_amt,
+        payment_method, payment_ref, date, notes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [id, d.client_id, resolvedTrainerId,
+       amount, Math.round(amount * incentiveRate),
+       String(d.method || 'CASH').toUpperCase(), receiptNo, d.date,
+       d.notes || null]
     );
 
     // Update client balance
     await tx.query(`
-      UPDATE clients
+      UPDATE pt_clients
       SET paid_amount = paid_amount + $1,
           balance_amount = GREATEST(0, balance_amount - $1),
           updated_at = NOW()
@@ -133,7 +161,11 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
 
     await tx.query('COMMIT');
 
-    const { rows } = await pool.query('SELECT * FROM payments WHERE id=$1', [id]);
+    const { rows } = await pool.query(`
+      SELECT p.*, UPPER(p.payment_method) AS method, p.payment_ref AS receipt_no,
+             c.name AS client_name
+      FROM pt_payments p LEFT JOIN pt_clients c ON c.id = p.client_id
+      WHERE p.id=$1`, [id]);
     res.status(201).json({ message: 'Payment recorded', payment: rows[0] });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
@@ -175,7 +207,7 @@ router.get('/stats', auth, async (req, res, next) => {
         COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'CARD'),  0)          AS card,
         COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'NEFT' OR p.method = 'BANK'), 0) AS bank,
         COALESCE(SUM(p.incentive_amt), 0)                                     AS total_incentives
-      FROM payments p
+      FROM (${LEDGER_SQL}) p
       ${where}
     `, bparams);
     res.json(rows[0]);
@@ -187,17 +219,36 @@ router.get('/stats', auth, async (req, res, next) => {
 // DELETE /api/payments/:id (admin only)
 //
 // Soft delete by default (sets deleted_at). The balance reversal still runs
-// so the client's paid/balance figures stay correct. Pass ?hard=1 to fully
-// remove the row — only do this for tests.
+// so the client's paid/balance figures stay correct. Handles rows from either
+// ledger: tries pt_payments first (canonical), then the legacy payments table.
 router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   const tx = await pool.connect();
   try {
     await tx.query('BEGIN');
 
+    // ── Canonical ledger ──
+    const { rows: ptRows } = await tx.query(
+      `UPDATE pt_payments
+          SET deleted_at = NOW(), updated_at = NOW()
+        WHERE id = $1 AND deleted_at IS NULL
+        RETURNING *`, [req.params.id]
+    );
+    if (ptRows[0]) {
+      await tx.query(`
+        UPDATE pt_clients
+        SET paid_amount = GREATEST(0, paid_amount - $1),
+            balance_amount = balance_amount + $1,
+            updated_at = NOW()
+        WHERE id = $2`, [ptRows[0].amount, ptRows[0].client_id]
+      );
+      await tx.query('COMMIT');
+      return res.json({ message: 'Payment deleted' });
+    }
+
+    // ── Legacy ledger ──
     let payment;
     let alreadyReversed = false;
     if (req.query.hard === '1') {
-      // Don't double-reverse a balance that a prior soft-delete already reset.
       const { rows } = await tx.query(
         'DELETE FROM payments WHERE id=$1 RETURNING *', [req.params.id]
       );
@@ -218,8 +269,6 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
       return res.status(404).json({ error: 'Not found' });
     }
 
-    // Reverse the balance change atomically (only if not already done
-    // by a previous soft-delete of the same row).
     if (!alreadyReversed) {
       await tx.query(`
         UPDATE clients

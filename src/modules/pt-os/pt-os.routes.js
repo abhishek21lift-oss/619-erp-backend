@@ -65,9 +65,12 @@ router.get('/trainers', auth, wrap(async (req, res) => {
 
 router.post('/trainers', auth, adminOnly, wrap(async (req, res) => {
   const { name, email, mobile, specialization, incentive_rate } = req.body;
+  // Insert into the canonical trainers table (not pt_trainers): pt_clients
+  // assignments and the pt_payments.trainer_id FK both resolve against
+  // trainers, so a trainer created here must land there to be usable.
   const { rows } = await pool.query(
-    `INSERT INTO pt_trainers (name, email, mobile, specialization, incentive_rate)
-     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    `INSERT INTO trainers (name, email, mobile, specialization, incentive_rate, status)
+     VALUES ($1,$2,$3,$4,$5,'active') RETURNING *`,
     [name, email, mobile, specialization, incentive_rate ?? 0.5]
   );
   res.status(201).json({ data: rows[0] });
@@ -342,6 +345,26 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
     c.trainer_name,
   ]);
 
+  // Ledger: money collected at renewal must land in pt_payments — the revenue
+  // reports sum the payment ledgers, not pt_clients.paid_amount, so without
+  // this row renewal income was invisible to every financial report.
+  if (paidNow > 0) {
+    let ledgerTrainerId = null;
+    let incentiveRate = 0;
+    if (c.trainer_id) {
+      const { rows: tr } = await pool.query(
+        'SELECT id, incentive_rate FROM trainers WHERE id=$1', [c.trainer_id]
+      );
+      if (tr[0]) { ledgerTrainerId = tr[0].id; incentiveRate = tr[0].incentive_rate ?? 0.5; }
+    }
+    await pool.query(
+      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes)
+       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6)`,
+      [req.params.id, ledgerTrainerId, paidNow, Math.round(paidNow * incentiveRate),
+       String(d.payment_method || 'CASH').toUpperCase(), `Renewal — ${packageType || c.package_type || 'PT package'}`]
+    );
+  }
+
   res.json({ data: rows[0] });
 }));
 
@@ -368,6 +391,7 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
 
   let finalAmount = null;
   let paidAmount = null;
+  let previousPaid = null;
   if (wantsFinalAmount || wantsPaidAmount) {
     // Validate the two fields together against whichever value isn't being
     // changed in this request — never trust the client to have already
@@ -378,6 +402,7 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
     );
     if (existingRows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
     const existing = existingRows[0];
+    previousPaid = Number(existing.paid_amount) || 0;
 
     if (wantsFinalAmount) {
       finalAmount = Number(req.body.final_amount);
@@ -427,6 +452,29 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
     params
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+
+  // Ledger: an increase in paid_amount is collected money — record it in
+  // pt_payments so revenue reports (which sum the payment ledgers, not
+  // pt_clients.paid_amount) actually see it. Without this, money collected
+  // at enrolment never appeared in any revenue figure.
+  if (wantsPaidAmount && previousPaid !== null && paidAmount > previousPaid) {
+    const delta = paidAmount - previousPaid;
+    let ledgerTrainerId = null;
+    let incentiveRate = 0;
+    if (rows[0].trainer_id) {
+      const { rows: tr } = await pool.query(
+        'SELECT id, incentive_rate FROM trainers WHERE id=$1', [rows[0].trainer_id]
+      );
+      if (tr[0]) { ledgerTrainerId = tr[0].id; incentiveRate = tr[0].incentive_rate ?? 0.5; }
+    }
+    await pool.query(
+      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes)
+       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6)`,
+      [req.params.id, ledgerTrainerId, delta, Math.round(delta * incentiveRate),
+       String(req.body.payment_method || 'CASH').toUpperCase(), 'Collected via client profile / enrolment']
+    );
+  }
+
   res.json({ data: rows[0] });
 }));
 
@@ -725,10 +773,11 @@ router.get('/payments', auth, wrap(async (req, res) => {
   if (client_id) { params.push(client_id); where.push(`p.client_id = $${params.length}`); }
   if (trainer_id) { params.push(trainer_id); where.push(`p.trainer_id = $${params.length}`); }
   const { rows } = await pool.query(`
-    SELECT p.*, c.name AS client_name, t.name AS trainer_name
+    SELECT p.*, c.name AS client_name, COALESCE(t.name, ptt.name) AS trainer_name
     FROM pt_payments p
     LEFT JOIN pt_clients c ON c.id = p.client_id
-    LEFT JOIN pt_trainers t ON t.id = p.trainer_id
+    LEFT JOIN trainers t ON t.id = p.trainer_id
+    LEFT JOIN pt_trainers ptt ON ptt.id = p.trainer_id
     WHERE ${where.join(' AND ')}
     ORDER BY p.date DESC
   `, params);
@@ -739,11 +788,12 @@ router.post('/payments', auth, wrap(async (req, res) => {
   const { client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes } = req.body;
   const numAmount = Number(amount) || 0;
 
-  // Validate trainer_id FK — fall back to null if trainer no longer exists
+  // Validate trainer_id FK (pt_payments.trainer_id references trainers after
+  // migration 072) — fall back to null if the trainer no longer exists.
   let resolvedTrainerId = trainer_id || null;
   if (resolvedTrainerId) {
     const { rows: tr } = await pool.query(
-      'SELECT id FROM pt_trainers WHERE id = $1 AND deleted_at IS NULL', [resolvedTrainerId]
+      'SELECT id FROM trainers WHERE id = $1 AND deleted_at IS NULL', [resolvedTrainerId]
     );
     if (!tr.length) {
       // Also try looking up by the client's current trainer
@@ -753,7 +803,7 @@ router.post('/payments', auth, wrap(async (req, res) => {
       const fallback = cl[0]?.trainer_id;
       if (fallback && fallback !== resolvedTrainerId) {
         const { rows: tr2 } = await pool.query(
-          'SELECT id FROM pt_trainers WHERE id = $1 AND deleted_at IS NULL', [fallback]
+          'SELECT id FROM trainers WHERE id = $1 AND deleted_at IS NULL', [fallback]
         );
         resolvedTrainerId = tr2.length ? fallback : null;
       } else {

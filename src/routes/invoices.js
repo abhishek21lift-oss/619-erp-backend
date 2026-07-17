@@ -99,10 +99,11 @@ router.post('/', auth, async (req, res, next) => {
     let clientId = d.client_id || null;
     let clientName = d.client_name || d.member_name || '';
 
-    // Structured form: look up the client
+    // Structured form: look up the client (pt_clients is the live client
+    // table — the legacy `clients` table has been empty since PT-OS shipped)
     if (!isSimplified) {
       const { rows: cl } = await tx.query(
-        'SELECT id, name FROM clients WHERE id=$1', [d.client_id]
+        'SELECT id, name FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [d.client_id]
       );
       if (!cl[0]) { await tx.query('ROLLBACK'); return res.status(404).json({ error: 'Client not found' }); }
       clientName = cl[0].name;
