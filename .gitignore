@@ -10,3 +10,7 @@ coverage/
 *.key
 *.crt
 uploads/
+
+# python bytecode (from .claude skill scripts)
+__pycache__/
+*.pyc
