@@ -8,13 +8,6 @@ const PDFDocument = require('pdfkit');
 const { fmtDate, drawSectionHeading, drawLabelValue, embedSignature } = require('./pdfHelpers');
 
 const ACK_LABELS = {
-  understands_risk: 'I understand the possible risks of personal training (muscle soreness/strain, joint discomfort, elevated heart rate/blood pressure, fatigue, dizziness, falls, injury).',
-  accurate_medical_history: 'I provided accurate medical history.',
-  will_inform_pain: 'I will immediately inform my trainer if I feel pain.',
-  will_stop_if_dizzy: 'I understand I should stop exercise if I experience dizziness.',
-  will_stop_if_chest_pain: 'I understand I should stop if I have chest pain.',
-  will_communicate_changes: 'I understand I must communicate any health changes.',
-  will_follow_instructions: 'I agree to follow trainer instructions.',
   understands_confidentiality: 'I understand my personal and medical information will remain confidential and used only for my training program.',
   voluntary_participation: 'I understand participation is voluntary and I can withdraw at any time.',
   final_declaration: 'I confirm I have read this entire document, understand the risks and benefits, asked my questions, had them answered, and voluntarily agree to participate.',

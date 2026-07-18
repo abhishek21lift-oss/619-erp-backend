@@ -22,13 +22,11 @@ const { generateInformedConsentPdf } = require('../../lib/informedConsentPdf');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-// Section 4/6/7/8 acknowledgements — see migration 066 comment for the
-// exact same list. All 10 must be true before a signature can be captured.
+// Section 6/7/8 acknowledgements (Agreement step) — all 3 must be true
+// before a signature can be captured. The Section 2/4 risk-acknowledgement
+// items were dropped along with the Risks & Responsibilities wizard step.
 const ACK_KEYS = [
-  'understands_risk', 'accurate_medical_history', 'will_inform_pain',
-  'will_stop_if_dizzy', 'will_stop_if_chest_pain', 'will_communicate_changes',
-  'will_follow_instructions', 'understands_confidentiality',
-  'voluntary_participation', 'final_declaration',
+  'understands_confidentiality', 'voluntary_participation', 'final_declaration',
 ];
 
 const ACTIVE_STATUSES = ['draft', 'pending_client_signature', 'pending_trainer_signature', 'completed'];
