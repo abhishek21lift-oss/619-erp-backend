@@ -39,7 +39,8 @@ const ptClientCreateSchema = {
     selling_price: z.coerce.number().optional().nullable(),
     whatsapp: z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable(),
     occupation: z.string().max(100).optional().nullable(),
-    emergency_contact: z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable(),
+    emergency_contact: z.string().max(255).optional().nullable(),
+    emergency_phone: z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable(),
     address: z.string().max(1000).optional().nullable(),
   }),
 };
@@ -166,7 +167,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
           notes, weight,
           goal, height, body_fat, health_conditions, injuries, frequency,
           pt_package_id, base_price, selling_price,
-          whatsapp, occupation, emergency_contact, address,
+          whatsapp, occupation, emergency_contact, emergency_phone, address,
         } = req.body;
 
     let cid = client_id;
@@ -174,12 +175,12 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
       const { rows: [newCli] } = await pool.query(`
         INSERT INTO pt_clients
           (name, gender, mobile, email, dob, status, joining_date,
-           whatsapp, occupation, emergency_contact, address)
-        VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$8,$9,$10)
+           whatsapp, occupation, emergency_contact, emergency_phone, address)
+        VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$8,$9,$10,$11)
         RETURNING id
       `, [
         name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date(),
-        whatsapp || null, occupation || null, emergency_contact || null, address || null,
+        whatsapp || null, occupation || null, emergency_contact || null, emergency_phone || null, address || null,
       ]);
       cid = newCli.id;
     }
@@ -382,7 +383,7 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
     : ['package_type','base_amount','discount',
        'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes',
-       'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact',
+       'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact','emergency_phone',
        'goal','height','body_fat','health_conditions','injuries','frequency',
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week'];
 

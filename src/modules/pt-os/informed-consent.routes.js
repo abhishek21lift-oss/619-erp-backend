@@ -94,17 +94,13 @@ const SNAPSHOT_FIELDS = [
 // ─── Helpers ────────────────────────────────────────────────
 
 async function fetchClientSnapshot(clientId) {
-  // pt_clients has a single free-text emergency_contact field, no separate
-  // phone column — emergency_phone has no auto-fill source and is left for
-  // the trainer to fill in on the form itself.
   const { rows } = await pool.query(
     `SELECT name AS full_name, gender, dob, mobile, email, address, occupation,
-            emergency_contact, trainer_id
+            emergency_contact, emergency_phone, trainer_id
        FROM pt_clients WHERE id = $1`,
     [clientId]
   );
-  if (!rows[0]) return null;
-  return { ...rows[0], emergency_phone: null };
+  return rows[0] || null;
 }
 
 // ─── Informed Consents ──────────────────────────────────────
