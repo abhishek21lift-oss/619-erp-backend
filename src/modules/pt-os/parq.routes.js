@@ -112,7 +112,7 @@ async function replaceFamilyHistory(tx, formId, list) {
 
 const parqAnswerSchema = z.object({
   question_id: z.union([z.string(), z.number()]),
-  answer: z.enum(['yes', 'no', 'not_sure']),
+  answer: z.enum(['yes', 'no']),
   explanation: z.string().max(1000).optional().nullable(),
   diagnosis_date: z.string().optional().nullable(),
   treatment: z.string().max(500).optional().nullable(),
