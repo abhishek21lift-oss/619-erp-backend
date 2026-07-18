@@ -439,10 +439,18 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
   if (wantsFinalAmount || wantsPaidAmount) {
     // Recompute from whichever of the two just landed in params, falling
     // back to the column's current value for the one that didn't change.
+    // The two operands need an explicit ::numeric cast: when BOTH final_amount
+    // and paid_amount are being set in the same request (the normal case for
+    // a brand-new enrollment), both sides of the subtraction are bare
+    // parameter placeholders with nothing else to anchor their type, and
+    // Postgres can't resolve "-" between two "unknown"-typed params —
+    // it throws "operator is not unique: unknown - unknown" (a 500, not a
+    // validation error). A column reference (the single-param fallback path)
+    // happens to carry its own type and never hit this.
     sets.push(
       `balance_amount = GREATEST(` +
-        `${finalAmountParamIdx ? `$${finalAmountParamIdx}` : 'final_amount'} - ` +
-        `${paidAmountParamIdx ? `$${paidAmountParamIdx}` : 'paid_amount'}, 0)`
+        `${finalAmountParamIdx ? `$${finalAmountParamIdx}::numeric` : 'final_amount'} - ` +
+        `${paidAmountParamIdx ? `$${paidAmountParamIdx}::numeric` : 'paid_amount'}, 0)`
     );
   }
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS', message: 'No fields to update' } });
