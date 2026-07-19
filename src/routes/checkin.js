@@ -101,6 +101,21 @@ function formatDescriptorToJson(arr) {
   return JSON.stringify(arr.map(v => +v.toFixed(8)));
 }
 
+// This deployment's real client data lives in pt_clients, not the legacy
+// `clients` table — so every member lookup here is a UNION of both,
+// normalized to a common column shape. Neither table actually has
+// expiry_date/subscription_end_date columns (despite membershipStatusFor
+// below checking for them) — pt_end_date is the only real expiry signal.
+const MEMBER_UNION_SQL = `
+  SELECT id, name, status, photo_url, member_code, client_id,
+         package_type, pt_end_date, trainer_id
+    FROM clients
+  UNION ALL
+  SELECT id, name, status, photo_url, client_id AS member_code, client_id,
+         package_type, pt_end_date, trainer_id
+    FROM pt_clients WHERE deleted_at IS NULL
+`;
+
 // ──────────────────────────────────────────────────────────────────
 // POST /api/checkin/face
 // Body: { descriptor: number[128] }
@@ -135,11 +150,11 @@ router.post('/face', kioskTokenMiddleware, faceLimiter, kioskOrAuth, async (req,
       const vecLiteral = '[' + descriptor.map(v => v.toFixed(8)).join(',') + ']';
       const { rows: vecRows } = await pool.query(
         `SELECT c.id, c.name, c.status, c.photo_url, c.member_code, c.client_id,
-                c.package_type, c.pt_end_date, c.expiry_date, c.subscription_end_date, c.trainer_id,
+                c.package_type, c.pt_end_date, c.trainer_id,
                 d.descriptor_enc, d.id AS descriptor_id,
                 (d.descriptor_vec <-> $1::vector) AS distance
            FROM face_descriptors d
-           JOIN clients c ON c.id = d.client_id
+           JOIN (${MEMBER_UNION_SQL}) c ON c.id = d.client_id
           WHERE d.is_active = TRUE
             AND d.descriptor_vec IS NOT NULL
           ORDER BY d.descriptor_vec <-> $1::vector
@@ -164,10 +179,10 @@ router.post('/face', kioskTokenMiddleware, faceLimiter, kioskOrAuth, async (req,
       // pgvector not installed or descriptor_vec not populated — use O(N) JS fallback.
       const { rows: clients } = await pool.query(
         `SELECT c.id, c.name, c.status, c.photo_url, c.member_code, c.client_id,
-                c.package_type, c.pt_end_date, c.expiry_date, c.subscription_end_date, c.trainer_id,
+                c.package_type, c.pt_end_date, c.trainer_id,
                 d.descriptor AS face_descriptor, d.descriptor_enc, d.id AS descriptor_id
            FROM face_descriptors d
-           JOIN clients c ON c.id = d.client_id
+           JOIN (${MEMBER_UNION_SQL}) c ON c.id = d.client_id
           WHERE d.is_active = TRUE`
       );
 
@@ -371,8 +386,9 @@ router.post('/enroll', kioskTokenMiddleware, authOrKioskForEnroll, enrollLimiter
     await pool.query('SELECT pg_advisory_lock($1)', [lockKey]);
     let descriptorId;
     try {
-      // Update clients table for backwards compat.
-      const clientResult = await pool.query(
+      // Update whichever table this client actually lives in — real client
+      // data in this deployment is in pt_clients, `clients` is legacy.
+      let clientResult = await pool.query(
         `UPDATE clients
             SET face_descriptor  = $1::jsonb,
                 face_enrolled    = TRUE,
@@ -381,6 +397,18 @@ router.post('/enroll', kioskTokenMiddleware, authOrKioskForEnroll, enrollLimiter
         RETURNING id`,
         [jsonDescriptor, client_id]
       );
+
+      if (clientResult.rowCount === 0) {
+        clientResult = await pool.query(
+          `UPDATE pt_clients
+              SET face_descriptor  = $1::jsonb,
+                  face_enrolled    = TRUE,
+                  face_enrolled_at = NOW()
+            WHERE id = $2 AND deleted_at IS NULL
+          RETURNING id`,
+          [jsonDescriptor, client_id]
+        );
+      }
 
       if (clientResult.rowCount === 0) {
         return res.status(404).json({ error: 'Client not found' });
@@ -460,7 +488,7 @@ router.get('/descriptors', auth, async (req, res, next) => {
     const { rows } = await pool.query(
       `SELECT d.client_id, c.name, d.descriptor, d.descriptor_enc
          FROM face_descriptors d
-         JOIN clients c ON c.id = d.client_id
+         JOIN (${MEMBER_UNION_SQL}) c ON c.id = d.client_id
         WHERE d.is_active = TRUE
         ORDER BY c.name`
     );
@@ -498,9 +526,17 @@ router.delete('/enroll/:clientId', auth, async (req, res, next) => {
       [clientId]
     );
 
-    // Clear clients table.
+    // Clear whichever table this client lives in.
     await pool.query(
       `UPDATE clients
+          SET face_descriptor  = NULL::jsonb,
+              face_enrolled    = FALSE,
+              face_enrolled_at = NULL
+        WHERE id = $1`,
+      [clientId]
+    );
+    await pool.query(
+      `UPDATE pt_clients
           SET face_descriptor  = NULL::jsonb,
               face_enrolled    = FALSE,
               face_enrolled_at = NULL
@@ -554,7 +590,7 @@ router.get('/logs', auth, async (req, res, next) => {
       `SELECT l.id, l.client_id, l.status, l.distance, l.created_at,
               c.name AS client_name, c.photo_url, c.member_code
          FROM face_checkin_logs l
-    LEFT JOIN clients c ON c.id = l.client_id
+    LEFT JOIN (${MEMBER_UNION_SQL}) c ON c.id = l.client_id
         WHERE ${conds.join(' AND ')}
         ORDER BY l.created_at DESC
         LIMIT $${params.length + 1}`,
@@ -563,118 +599,6 @@ router.get('/logs', auth, async (req, res, next) => {
     return res.json(rows);
   } catch (err) {
     logger.error({ err: err.message }, '[checkin/logs] error');
-    return next(err);
-  }
-});
-
-// ──────────────────────────────────────────────────────────────────
-// POST /api/checkin/qr-mark
-// Body: { client_id }
-// Quick QR-based attendance — no face matching needed.
-// ──────────────────────────────────────────────────────────────────
-router.post('/qr-mark', auth, async (req, res, next) => {
-  try {
-    const { client_id } = req.body || {};
-    if (!client_id) return res.status(400).json({ error: 'client_id required' });
-
-    const { rows: member } = await pool.query(
-      `SELECT id, name, status, pt_end_date, expiry_date, subscription_end_date
-         FROM clients WHERE id = $1 LIMIT 1`,
-      [client_id]
-    );
-    if (!member[0]) return res.status(404).json({ error: 'Member not found' });
-
-    const memberStatus = membershipStatusFor(member[0]);
-    const date = new Date().toISOString().slice(0, 10);
-
-    if (memberStatus !== 'active') {
-      return res.status(200).json({
-        success: false,
-        message: `Membership ${memberStatus}`,
-        member: { id: member[0].id, name: member[0].name, status: memberStatus },
-      });
-    }
-
-    const { rows: att } = await pool.query(
-      `INSERT INTO attendance_logs
-         (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes)
-       VALUES ($1, 'client', $2, $3::date, NOW(), 'qr', 'present', 'QR check-in')
-       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
-         SET check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
-             method = CASE WHEN attendance_logs.method = 'manual' THEN EXCLUDED.method
-                           ELSE attendance_logs.method END,
-             status = 'present',
-             notes = 'QR check-in'
-       RETURNING id`,
-      [member[0].id, member[0].name, date]
-    );
-
-    return res.status(200).json({
-      success: true,
-      message: `Welcome ${member[0].name}`,
-      member: { id: member[0].id, name: member[0].name, status: 'active' },
-      attendance_id: att[0]?.id,
-    });
-  } catch (err) {
-    logger.error({ err: err.message }, '[checkin/qr-mark] error');
-    return next(err);
-  }
-});
-
-// ──────────────────────────────────────────────────────────────────
-// POST /api/checkin/mobile-mark
-// Body: { mobile }
-// Mark attendance by mobile number lookup.
-// ──────────────────────────────────────────────────────────────────
-router.post('/mobile-mark', auth, async (req, res, next) => {
-  try {
-    const { mobile } = req.body || {};
-    if (!mobile) return res.status(400).json({ error: 'mobile required' });
-
-    const { rows: members } = await pool.query(
-      `SELECT id, name, status, pt_end_date, expiry_date, subscription_end_date
-         FROM clients
-        WHERE mobile = $1
-           OR REPLACE(mobile, '-', '') = REPLACE($1, '-', '')
-           OR REPLACE(mobile, ' ', '') = REPLACE($1, ' ', '')
-        LIMIT 1`,
-      [mobile]
-    );
-
-    if (!members[0]) return res.status(404).json({ error: 'No member found with that mobile number' });
-
-    const member = members[0];
-    const memberStatus = membershipStatusFor(member);
-    const date = new Date().toISOString().slice(0, 10);
-
-    if (memberStatus !== 'active') {
-      return res.status(200).json({
-        success: false,
-        message: `Membership ${memberStatus}`,
-        member: { id: member.id, name: member.name, status: memberStatus },
-      });
-    }
-
-    const { rows: att } = await pool.query(
-      `INSERT INTO attendance_logs
-         (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes)
-       VALUES ($1, 'client', $2, $3::date, NOW(), 'manual', 'present', 'Mobile check-in')
-       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
-         SET check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
-             status = 'present',
-             notes = 'Mobile check-in'
-       RETURNING id`,
-      [member.id, member.name, date]
-    );
-
-    return res.status(200).json({
-      success: true,
-      message: `Welcome ${member.name}`,
-      member: { id: member.id, name: member.name, status: 'active' },
-      attendance_id: att[0]?.id,
-    });
-  } catch (err) {
-    logger.error({ err: err.message }, '[checkin/mobile-mark] error');
     return next(err);
   }
 });

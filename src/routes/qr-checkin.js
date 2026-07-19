@@ -73,16 +73,28 @@ async function generateQrDataUrl(userId, userType, dynamic = false) {
   });
 }
 
-// Resolve the display name + membership status for any user type
+// Real client data in this deployment lives in pt_clients — `clients` is
+// legacy and (in production) empty. Try clients first, fall back to
+// pt_clients (pt_clients has no member_code). Neither table actually has
+// expiry_date/subscription_end_date columns — pt_end_date is the only
+// real expiry signal membershipStatus() below can use.
 async function resolveUser(userId, userType) {
   if (userType === 'client') {
     const { rows } = await pool.query(
       `SELECT id, name, status, photo_url, member_code, client_id,
-              expiry_date, subscription_end_date, pt_end_date, package_type
+              pt_end_date, package_type
          FROM clients WHERE id = $1 LIMIT 1`,
       [userId]
     );
-    return rows[0] ? { ...rows[0], _type: 'client' } : null;
+    if (rows[0]) return { ...rows[0], _type: 'client' };
+
+    const { rows: ptRows } = await pool.query(
+      `SELECT id, name, status, photo_url, client_id AS member_code, client_id,
+              pt_end_date, package_type
+         FROM pt_clients WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
+      [userId]
+    );
+    return ptRows[0] ? { ...ptRows[0], _type: 'client' } : null;
   }
   if (userType === 'trainer') {
     const { rows } = await pool.query(
@@ -359,13 +371,17 @@ router.get('/dashboard', auth, async (req, res) => {
         ),
       ]);
 
-    // Recent check-ins (last 20) with user info
+    // Recent check-ins (last 20) with user info. `clients` is legacy/empty
+    // in this deployment — real client rows live in pt_clients.
     const { rows: recent } = await pool.query(
       `SELECT a.id, a.ref_id, a.ref_type, a.ref_name, a.check_in_time, a.check_out_time,
               a.method, a.status,
-              c.photo_url, c.member_code, c.status AS membership_status
+              COALESCE(c.photo_url, pc.photo_url) AS photo_url,
+              COALESCE(c.member_code, pc.client_id) AS member_code,
+              COALESCE(c.status, pc.status) AS membership_status
          FROM attendance_logs a
          LEFT JOIN clients c ON c.id = a.ref_id AND a.ref_type = 'client'
+         LEFT JOIN pt_clients pc ON pc.id = a.ref_id AND a.ref_type = 'client' AND pc.deleted_at IS NULL
         WHERE a.date = CURRENT_DATE AND a.status = 'present'
         ORDER BY a.check_in_time DESC NULLS LAST
         LIMIT 20`

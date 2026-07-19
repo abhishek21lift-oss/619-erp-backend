@@ -164,6 +164,18 @@ router.post('/biometric', auth, biometricLimiter, async (req, res, next) => {
             LIMIT 1`, [code]
         );
         if (rows[0]) { person = rows[0]; type = 'client'; break; }
+
+        // `clients` is legacy/empty in this deployment — real client rows
+        // live in pt_clients, which has no member_code but does have
+        // client_id/unique_id for card/badge codes.
+        const { rows: ptRows } = await pool.query(
+          `SELECT id, name, client_id, trainer_id, trainer_name
+             FROM pt_clients
+            WHERE (biometric_code = $1 OR client_id = $1 OR unique_id = $1)
+              AND deleted_at IS NULL
+            LIMIT 1`, [code]
+        );
+        if (ptRows[0]) { person = ptRows[0]; type = 'client'; break; }
       } else {
         const { rows } = await pool.query(
           `SELECT id, name, biometric_code FROM trainers WHERE biometric_code = $1 LIMIT 1`,
