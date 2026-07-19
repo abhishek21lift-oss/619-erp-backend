@@ -69,10 +69,10 @@ async function buildClientContext(client_id) {
   if (!client_id) return '';
   try {
     const [clientRes, goalsRes, assessRes, checkinsRes] = await Promise.all([
-      pool.query('SELECT first_name, last_name, dob, gender, mobile FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [client_id]),
-      pool.query('SELECT goal_type, target_value, unit, notes FROM pt_goals WHERE client_id=$1 AND status=\'active\' LIMIT 3', [client_id]),
-      pool.query('SELECT weight_kg, body_fat_pct, chest_cm, waist_cm, hips_cm, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 2', [client_id]),
-      pool.query('SELECT weight_kg, mood, energy_level, sleep_hours, notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at DESC LIMIT 4', [client_id]),
+      pool.query('SELECT name, dob, gender, mobile FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [client_id]),
+      pool.query('SELECT goal_type, target_weight, target_body_fat, notes FROM pt_goals WHERE client_id=$1 AND is_active=true LIMIT 3', [client_id]),
+      pool.query('SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 2', [client_id]),
+      pool.query('SELECT weight, mood, sleep_hours, client_notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at DESC LIMIT 4', [client_id]),
     ]);
 
     const c      = clientRes.rows[0];
@@ -81,19 +81,22 @@ async function buildClientContext(client_id) {
     const latest = assessRes.rows[0] || {};
 
     const lines = [
-      `Name: ${c.first_name} ${c.last_name}`,
+      `Name: ${c.name}`,
       age ? `Age: ${age}` : '',
       c.gender ? `Gender: ${c.gender}` : '',
-      latest.weight_kg ? `Current weight: ${latest.weight_kg} kg` : '',
+      latest.weight ? `Current weight: ${latest.weight} kg` : '',
       latest.body_fat_pct ? `Body fat: ${latest.body_fat_pct}%` : '',
     ];
 
     if (goalsRes.rows.length) {
-      lines.push(`Goals: ${goalsRes.rows.map(g => `${g.goal_type} — ${g.target_value} ${g.unit || ''}`).join(', ')}`);
+      lines.push(`Goals: ${goalsRes.rows.map(g => {
+        const target = g.target_weight ? `${g.target_weight} kg` : g.target_body_fat ? `${g.target_body_fat}% body fat` : 'no specific target';
+        return `${g.goal_type} — ${target}`;
+      }).join(', ')}`);
     }
     if (checkinsRes.rows.length) {
       const last = checkinsRes.rows[0];
-      lines.push(`Last weekly check-in: weight ${last.weight_kg || 'N/A'} kg, mood ${last.mood || 'N/A'}/5, energy ${last.energy_level || 'N/A'}/5`);
+      lines.push(`Last weekly check-in: weight ${last.weight || 'N/A'} kg, mood ${last.mood || 'N/A'}, sleep ${last.sleep_hours || 'N/A'}h`);
     }
 
     return lines.filter(Boolean).join('\n');
@@ -402,11 +405,11 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
   try {
     // Fetch all progress data for this client
     const [clientRes, assessRes, goalsRes, checkinsRes, strengthRes, attRes, photosRes] = await Promise.all([
-      pool.query('SELECT first_name, last_name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [client_id]),
-      pool.query('SELECT weight_kg, body_fat_pct, chest_cm, waist_cm, hips_cm, thigh_cm, arm_cm, bmi, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
-      pool.query('SELECT goal_type, target_value, unit, status, created_at FROM pt_goals WHERE client_id=$1 ORDER BY created_at DESC LIMIT 5', [client_id]),
-      pool.query('SELECT weight_kg, mood, energy_level, sleep_hours, water_ml, notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
-      pool.query('SELECT exercise_name, max_weight_kg, reps, created_at FROM strength_logs WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
+      pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [client_id]),
+      pool.query('SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, thigh_right_cm, thigh_left_cm, arm_right_cm, arm_left_cm, bmi, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
+      pool.query('SELECT goal_type, target_weight, target_body_fat, is_active, created_at FROM pt_goals WHERE client_id=$1 ORDER BY created_at DESC LIMIT 5', [client_id]),
+      pool.query('SELECT weight, mood, sleep_hours, water_glasses, client_notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
+      pool.query('SELECT exercise_name, weight_kg, reps_done, created_at FROM strength_logs WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
       pool.query(`SELECT COUNT(*) AS total_sessions, COUNT(*) FILTER (WHERE created_at >= NOW()-INTERVAL '30 days') AS sessions_30d FROM pt_sessions WHERE client_id=$1`, [client_id]),
       pool.query('SELECT COUNT(*) AS total_photos FROM progress_photos WHERE client_id=$1', [client_id]),
     ]);
@@ -419,7 +422,7 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
 
     const contextData = {
       client: {
-        name: `${client.first_name} ${client.last_name}`,
+        name: client.name,
         age,
         gender: client.gender,
         days_since_start: daysSinceStart,
@@ -622,10 +625,9 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
     const [revenueRes, membersRes, sessionsRes, trainersRes, renewalsRes, duesRes] = await Promise.all([
       pool.query(
         `SELECT
-           COALESCE(SUM(amount),0)                        AS total_revenue,
-           COALESCE(SUM(amount) FILTER (WHERE type='pt'),0) AS pt_revenue,
-           COUNT(*)                                        AS total_payments
-         FROM pt_payments WHERE date BETWEEN $1 AND $2`,
+           COALESCE(SUM(amount),0) AS total_revenue,
+           COUNT(*)                AS total_payments
+         FROM pt_payments WHERE date BETWEEN $1 AND $2 AND deleted_at IS NULL`,
         [fromDate, toDate]
       ),
       pool.query(
@@ -639,18 +641,18 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
       pool.query(
         `SELECT COUNT(*) AS total_sessions,
                 COUNT(DISTINCT client_id) AS active_clients
-         FROM pt_sessions WHERE date BETWEEN $1 AND $2`,
+         FROM pt_sessions WHERE session_date BETWEEN $1 AND $2`,
         [fromDate, toDate]
       ),
       pool.query(
-        `SELECT t.first_name||' '||t.last_name AS trainer_name,
+        `SELECT t.name AS trainer_name,
                 COUNT(s.id) AS sessions,
                 COALESCE(SUM(p.amount),0) AS revenue
-         FROM pt_trainers t
-         LEFT JOIN pt_sessions s ON s.trainer_id=t.id AND s.date BETWEEN $1 AND $2
-         LEFT JOIN pt_payments p ON p.trainer_id=t.id AND p.date BETWEEN $1 AND $2
+         FROM trainers t
+         LEFT JOIN pt_sessions s ON s.trainer_id=t.id AND s.session_date BETWEEN $1 AND $2
+         LEFT JOIN pt_payments p ON p.trainer_id=t.id AND p.date BETWEEN $1 AND $2 AND p.deleted_at IS NULL
          WHERE t.deleted_at IS NULL
-         GROUP BY t.id, trainer_name ORDER BY revenue DESC`,
+         GROUP BY t.id, t.name ORDER BY revenue DESC`,
         [fromDate, toDate]
       ),
       pool.query(
@@ -661,8 +663,8 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
       ),
       pool.query(
         `SELECT COUNT(*) AS clients_with_dues,
-                COALESCE(SUM(balance * -1) FILTER (WHERE balance < 0),0) AS total_dues
-         FROM pt_clients WHERE deleted_at IS NULL AND balance < 0`
+                COALESCE(SUM(balance_amount) FILTER (WHERE balance_amount > 0),0) AS total_dues
+         FROM pt_clients WHERE deleted_at IS NULL AND balance_amount > 0`
       ),
     ]);
 
