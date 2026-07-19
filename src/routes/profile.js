@@ -1,8 +1,6 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 const multer = require('multer');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
@@ -10,6 +8,7 @@ const { authenticator } = require('otplib');
 const pool = require('../db/pool');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const { logActivity } = require('../lib/activityLog');
+const { saveFile } = require('../lib/fileStorage');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -202,12 +201,8 @@ router.post('/avatar', upload.single('avatar'), async (req, res, next) => {
     if (!detected) {
       return res.status(400).json({ error: 'File content does not match an allowed image type (PNG, JPG, WEBP, GIF)' });
     }
-    const ext = detected.ext;
-    const dir = path.join(__dirname, '..', '..', 'uploads', 'profile');
-    fs.mkdirSync(dir, { recursive: true });
-    const filename = `${req.user.id}-${Date.now()}.${ext}`;
-    fs.writeFileSync(path.join(dir, filename), req.file.buffer);
-    const avatarUrl = `/uploads/profile/${filename}`;
+    const filename = `${req.user.id}-${Date.now()}.${detected.ext}`;
+    const avatarUrl = await saveFile('profile', filename, req.file.buffer, detected.mime);
 
     await pool.query(
       `INSERT INTO user_profiles (user_id, avatar_url, updated_at)

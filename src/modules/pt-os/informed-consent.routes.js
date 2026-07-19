@@ -8,8 +8,6 @@
 // person on a staff device during onboarding, there is no separate
 // PT-client login), and logActivity() for the audit trail.
 const router = require('express').Router();
-const fs = require('fs');
-const path = require('path');
 const multer = require('multer');
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
@@ -19,6 +17,7 @@ const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
 const { generateInformedConsentPdf } = require('../../lib/informedConsentPdf');
+const { saveFile } = require('../../lib/fileStorage');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -386,11 +385,8 @@ router.post('/informed-consent/:id/medical-clearance', auth, requireRole('admin'
     return res.status(400).json({ error: { code: 'INVALID_FILE_TYPE' } });
   }
 
-  const dir = path.join(__dirname, '..', '..', '..', 'uploads', 'informed-consent');
-  fs.mkdirSync(dir, { recursive: true });
   const filename = `${id}-${Date.now()}.${detected.ext}`;
-  fs.writeFileSync(path.join(dir, filename), req.file.buffer);
-  const fileUrl = `/uploads/informed-consent/${filename}`;
+  const fileUrl = await saveFile('informed-consent', filename, req.file.buffer, detected.mime);
 
   const { rows } = await pool.query(
     `UPDATE pt_informed_consents SET medical_clearance_file_url = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,

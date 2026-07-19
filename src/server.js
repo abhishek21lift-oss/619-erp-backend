@@ -54,7 +54,6 @@ const cors      = require('cors');
 const helmet    = require('helmet');
 const rateLimit     = require('express-rate-limit');
 const cookieParser  = require('cookie-parser');
-const path = require('path');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { auth, adminOnly }        = require('./middleware/auth');
@@ -138,10 +137,7 @@ app.use('/api/webhooks/razorpay', require('./routes/razorpay-webhook'));
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use(cookieParser());
-app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads'), {
-  maxAge: isProd ? '7d' : 0,
-  fallthrough: false,
-}));
+app.use('/uploads', require('./routes/uploads'));
 
 // ────────────────────────
 // ORIGIN / REFERER CHECK (defense-in-depth)

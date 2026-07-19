@@ -7,8 +7,6 @@
 // function re-run on both POST and PATCH so derived columns never drift
 // from raw inputs, and a shared wrap() for async error handling.
 const router = require('express').Router();
-const fs = require('fs');
-const path = require('path');
 const multer = require('multer');
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
@@ -18,6 +16,7 @@ const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
 const { generateConsentPdf } = require('../../lib/parqPdf');
+const { saveFile } = require('../../lib/fileStorage');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -593,11 +592,8 @@ router.post('/parq/forms/:formId/documents', auth, requireRole('admin', 'manager
 
   const docType = DOC_TYPES.includes(req.body.doc_type) ? req.body.doc_type : 'other';
 
-  const dir = path.join(__dirname, '..', '..', '..', 'uploads', 'parq');
-  fs.mkdirSync(dir, { recursive: true });
   const filename = `${formId}-${Date.now()}.${detected.ext}`;
-  fs.writeFileSync(path.join(dir, filename), req.file.buffer);
-  const fileUrl = `/uploads/parq/${filename}`;
+  const fileUrl = await saveFile('parq', filename, req.file.buffer, detected.mime);
 
   const { rows } = await pool.query(
     `INSERT INTO pt_parq_documents (parq_form_id, client_id, doc_type, file_name, file_url, mime_type, size_bytes, uploaded_by)

@@ -5,10 +5,9 @@
 // pdfkit was chosen over a headless-browser/HTML-to-PDF approach because
 // it's a lightweight, dependency-light library — no Chromium binary to
 // ship/run, which matters on a constrained Render instance.
-const fs = require('fs');
-const path = require('path');
 const PDFDocument = require('pdfkit');
 const { fmtDate, drawSectionHeading, drawLabelValue, embedSignature } = require('./pdfHelpers');
+const { saveFile } = require('./fileStorage');
 
 const CONSENT_LABELS = {
   info_true: 'I confirm that all the information provided above is true and accurate to the best of my knowledge.',
@@ -31,13 +30,9 @@ const CONSENT_LABELS = {
 async function generateConsentPdf(formData) {
   const { form, clearance, consent } = formData;
 
-  const dir = path.join(__dirname, '..', '..', 'uploads', 'parq', 'pdf');
-  fs.mkdirSync(dir, { recursive: true });
-  const filePath = path.join(dir, `${form.id}.pdf`);
-
   const doc = new PDFDocument({ size: 'A4', margin: 50 });
-  const writeStream = fs.createWriteStream(filePath);
-  doc.pipe(writeStream);
+  const chunks = [];
+  doc.on('data', (chunk) => chunks.push(chunk));
 
   // ── Header ──
   doc.fontSize(18).font('Helvetica-Bold').fillColor('#111827')
@@ -95,12 +90,12 @@ async function generateConsentPdf(formData) {
 
   doc.end();
 
-  await new Promise((resolve, reject) => {
-    writeStream.on('finish', resolve);
-    writeStream.on('error', reject);
+  const buffer = await new Promise((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
   });
 
-  return `/uploads/parq/pdf/${form.id}.pdf`;
+  return saveFile('parq/pdf', `${form.id}.pdf`, buffer, 'application/pdf');
 }
 
 module.exports = { generateConsentPdf };

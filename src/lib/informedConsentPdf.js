@@ -2,10 +2,9 @@
 // Generates the Personal Training Informed Consent PDF. Same pdfkit
 // approach as parqPdf.js (see that file for the rationale) — shares its
 // drawing helpers via pdfHelpers.js.
-const fs = require('fs');
-const path = require('path');
 const PDFDocument = require('pdfkit');
 const { fmtDate, drawSectionHeading, drawLabelValue, embedSignature } = require('./pdfHelpers');
+const { saveFile } = require('./fileStorage');
 
 const ACK_LABELS = {
   understands_confidentiality: 'I understand my personal and medical information will remain confidential and used only for my training program.',
@@ -20,13 +19,9 @@ const ACK_LABELS = {
  * @param {object} record - a pt_informed_consents row.
  */
 async function generateInformedConsentPdf(record) {
-  const dir = path.join(__dirname, '..', '..', 'uploads', 'informed-consent', 'pdf');
-  fs.mkdirSync(dir, { recursive: true });
-  const filePath = path.join(dir, `${record.id}.pdf`);
-
   const doc = new PDFDocument({ size: 'A4', margin: 50 });
-  const writeStream = fs.createWriteStream(filePath);
-  doc.pipe(writeStream);
+  const chunks = [];
+  doc.on('data', (chunk) => chunks.push(chunk));
 
   doc.fontSize(18).font('Helvetica-Bold').fillColor('#111827')
     .text('Personal Training Informed Consent', { align: 'center' });
@@ -115,12 +110,12 @@ async function generateInformedConsentPdf(record) {
 
   doc.end();
 
-  await new Promise((resolve, reject) => {
-    writeStream.on('finish', resolve);
-    writeStream.on('error', reject);
+  const buffer = await new Promise((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
   });
 
-  return `/uploads/informed-consent/pdf/${record.id}.pdf`;
+  return saveFile('informed-consent/pdf', `${record.id}.pdf`, buffer, 'application/pdf');
 }
 
 module.exports = { generateInformedConsentPdf };
