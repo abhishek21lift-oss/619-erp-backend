@@ -44,26 +44,50 @@ router.post('/send', async (req, res, next) => {
     const { title, body, type, audience, recipients } = req.body;
     if (!title || !body) return res.status(400).json({ error: 'title and body are required' });
 
-    // Count recipients if not explicitly provided
+    // Count recipients if not explicitly provided. `clients` is legacy and
+    // empty in this deployment — real client rows live in pt_clients, so
+    // every audience except 'pt' unions both. Neither table has an
+    // expiry_date/subscription_end_date/balance_due/user_id column despite
+    // the original queries here assuming they did (would hard-error on
+    // 'expiring'/'dues', and silently notify nobody on 'all'/'expired');
+    // pt_end_date and balance_amount are the real columns.
     let recipientCount = recipients;
     if (!recipientCount) {
-      if (audience === 'all' || !audience) {
-        const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'active'");
-        recipientCount = Number(r.rows[0].count);
-      } else if (audience === 'expiring') {
-        const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'active' AND expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'");
+      if (audience === 'expiring') {
+        const r = await pool.query(`
+          SELECT COUNT(*) FROM (
+            SELECT id FROM clients WHERE status = 'active' AND pt_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+            UNION ALL
+            SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND pt_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+          ) x`);
         recipientCount = Number(r.rows[0].count);
       } else if (audience === 'dues') {
-        const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'active' AND balance_due > 0");
+        const r = await pool.query(`
+          SELECT COUNT(*) FROM (
+            SELECT id FROM clients WHERE status = 'active' AND balance_amount > 0
+            UNION ALL
+            SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND balance_amount > 0
+          ) x`);
         recipientCount = Number(r.rows[0].count);
       } else if (audience === 'pt') {
         const r = await pool.query("SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active'");
         recipientCount = Number(r.rows[0].count);
       } else if (audience === 'expired') {
-        const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'expired'");
+        const r = await pool.query(`
+          SELECT COUNT(*) FROM (
+            SELECT id FROM clients WHERE status = 'expired'
+            UNION ALL
+            SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'expired'
+          ) x`);
         recipientCount = Number(r.rows[0].count);
       } else {
-        const r = await pool.query("SELECT COUNT(*) FROM clients WHERE status = 'active'");
+        // 'all' or unspecified
+        const r = await pool.query(`
+          SELECT COUNT(*) FROM (
+            SELECT id FROM clients WHERE status = 'active'
+            UNION ALL
+            SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'active'
+          ) x`);
         recipientCount = Number(r.rows[0].count);
       }
     }
@@ -75,13 +99,20 @@ router.post('/send', async (req, res, next) => {
       [title, body, type || 'announcement', audience || 'all', recipientCount, req.user?.id]
     );
 
-    // Broadcast in-app notification to all active members (fire-and-forget)
+    // Broadcast in-app notification to all active members with a login
+    // (fire-and-forget). `clients`/`pt_clients` have no user_id column —
+    // the link is users.member_id, same as the webauthn/passkey flows.
     pool.query(
       `INSERT INTO notifications (user_id, type, title, body)
-       SELECT user_id, 'announcement', $1, $2
-       FROM clients
-       WHERE status = 'active' AND user_id IS NOT NULL
-       LIMIT 500`,
+       SELECT u.id, 'announcement', $1, $2
+         FROM users u
+        WHERE u.is_active = true
+          AND u.member_id IN (
+            SELECT id FROM clients WHERE status = 'active'
+            UNION
+            SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'active'
+          )
+        LIMIT 500`,
       [title, body]
     ).catch(() => {});
 
