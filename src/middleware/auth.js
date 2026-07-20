@@ -61,9 +61,11 @@ async function auth(req, res, next) {
         const result = await pool.query(
           // FIX: token_version is now selected so revocation check below works.
           // member_id is needed by requireSelfOrRole (v3 RBAC).
+          // organization_id carries the tenant boundary onto req.user for the
+          // multi-tenant isolation layer (migration 078).
           // SECURITY: filter out soft-deleted users (deleted_at IS NOT NULL).
           `SELECT id, name, email, role, trainer_id, member_id, branch_id,
-                  is_active, token_version
+                  organization_id, is_active, token_version
              FROM users
             WHERE id = $1
               AND (deleted_at IS NULL)`,
@@ -74,7 +76,7 @@ async function auth(req, res, next) {
         // Fallback if deleted_at column doesn't exist (pre-migration)
         const result = await pool.query(
           `SELECT id, name, email, role, trainer_id, member_id, branch_id,
-                  is_active, token_version
+                  organization_id, is_active, token_version
              FROM users WHERE id = $1`,
           [decoded.id]
         );
