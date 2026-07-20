@@ -379,13 +379,15 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
     ? ['package_type','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes','monthly_pt_amount',
        'goal','height','body_fat','health_conditions','injuries','frequency',
-       'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week']
+       'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week',
+       'workout_experience_level']
     : ['package_type','base_amount','discount',
        'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes',
        'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact','emergency_phone',
        'goal','height','body_fat','health_conditions','injuries','frequency',
-       'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week'];
+       'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week',
+       'workout_experience_level'];
 
   const wantsFinalAmount = !isTrainer && req.body.final_amount !== undefined;
   const wantsPaidAmount  = !isTrainer && req.body.paid_amount !== undefined;
