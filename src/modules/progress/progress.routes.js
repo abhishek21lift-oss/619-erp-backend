@@ -54,8 +54,9 @@ const assessmentCreateSchema = {
     strength_formula: z.enum(['brzycki', 'epley']).optional(),
     strength_direct_1rm: numOpt(), strength_is_direct: z.boolean().optional(),
 
-    // Step 6 — Muscular Endurance
+    // Step 6 — Muscular Endurance (two distinct tests required)
     endurance_test_type: z.enum(['Push Up Test', 'Curl Up Test', 'Wall Sit', 'Plank', 'Bodyweight Squat', 'Custom']).optional().nullable(),
+    endurance_test_type_2: z.enum(['Push Up Test', 'Curl Up Test', 'Wall Sit', 'Plank', 'Bodyweight Squat', 'Custom']).optional().nullable(),
     endurance_test_data: z.record(z.string(), z.unknown()).optional().nullable(),
 
     // Step 7 — Flexibility
@@ -149,11 +150,18 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
   const strengthCategory = scoring.classifyStrength(strengthOneRm, b.weight ?? null, b.strength_exercise || 'Bench Press', gender);
   const strengthScore = scoring.scoreCategory(strengthCategory);
 
-  // ── Step 6: Endurance ──
+  // ── Step 6: Endurance (two tests, combined into one averaged score) ──
   const ed = b.endurance_test_data || {};
-  const enduranceValue = num(ed.reps, null) ?? num(ed.durationSec, null);
-  const enduranceCategory = scoring.classifyEndurance(b.endurance_test_type, enduranceValue, gender);
-  const enduranceScore = scoring.scoreCategory(enduranceCategory);
+  const t1 = ed.test1 || {};
+  const t2 = ed.test2 || {};
+  const enduranceValue1 = num(t1.reps, null) ?? num(t1.durationSec, null);
+  const enduranceValue2 = num(t2.reps, null) ?? num(t2.durationSec, null);
+  const enduranceCategory = scoring.classifyEndurance(b.endurance_test_type, enduranceValue1, gender);
+  const enduranceCategory2 = scoring.classifyEndurance(b.endurance_test_type_2, enduranceValue2, gender);
+  const enduranceScore = scoring.scoreEnduranceBattery(
+    scoring.scoreCategory(enduranceCategory),
+    scoring.scoreCategory(enduranceCategory2),
+  );
 
   // ── Step 7: Flexibility ──
   const fd = b.flexibility_test_data || {};
@@ -181,7 +189,7 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
        visceral_fat, subcutaneous_fat_pct, body_water_pct, bone_mass_kg, bmr, bmr_auto_suggested, metabolic_age,
        cardio_test_type, cardio_test_data, vo2_max, cardio_category, cardio_score_computed,
        strength_score_computed,
-       endurance_test_data, endurance_category, endurance_score_computed,
+       endurance_test_type, endurance_test_type_2, endurance_test_data, endurance_category, endurance_category_2, endurance_score_computed,
        flexibility_test_data, flexibility_category, has_asymmetry, mobility_score_computed,
        body_composition_score, health_risk_score, overall_fitness_score,
        posture_notes, health_notes, created_by
@@ -195,10 +203,10 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
        $31,$32,$33,$34,$35,$36,$37,
        $38,$39::jsonb,$40,$41,$42,
        $43,
-       $44::jsonb,$45,$46,
-       $47::jsonb,$48,$49,$50,
-       $51,$52,$53,
-       $54,$55,$56
+       $44,$45,$46::jsonb,$47,$48,$49,
+       $50::jsonb,$51,$52,$53,
+       $54,$55,$56,
+       $57,$58,$59
      ) RETURNING *`,
     [
       b.client_id, trainer_id, b.assessment_type || 'initial', b.assessment_date || null,
@@ -210,7 +218,7 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
       b.visceral_fat ?? null, b.subcutaneous_fat_pct ?? null, b.body_water_pct ?? null, b.bone_mass_kg ?? null, bmr, bmrAutoSuggested, b.metabolic_age ?? null,
       b.cardio_test_type || null, JSON.stringify(cd), vo2Max, cardioCategory, cardioScore,
       strengthScore,
-      JSON.stringify(ed), enduranceCategory, enduranceScore,
+      b.endurance_test_type || null, b.endurance_test_type_2 || null, JSON.stringify(ed), enduranceCategory, enduranceCategory2, enduranceScore,
       JSON.stringify(fd), flexibilityCategory, hasAsymmetry, mobilityScore,
       bodyCompositionScore, healthRiskScore, overallScore,
       b.posture_notes || null, b.health_notes || null, req.user.id,
