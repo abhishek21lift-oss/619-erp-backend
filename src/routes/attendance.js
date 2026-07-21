@@ -14,6 +14,7 @@ const { randomUUID } = require('crypto');
 const rateLimit = require('express-rate-limit');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 
 const biometricLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
 
@@ -36,6 +37,9 @@ router.get('/', auth, async (req, res, next) => {
     if (to)     { conditions.push(`a.date <= $${p++}`);    params.push(to); }
     if (type)   { conditions.push(`a.ref_type = $${p++}`); params.push(type); }
     if (ref_id) { conditions.push(`a.ref_id = $${p++}`);   params.push(ref_id); }
+
+    const scope = tenantScope(req);
+    if (scope.applyFilter) { conditions.push(`a.organization_id = $${p++}`); params.push(scope.orgId); }
 
     const { sql: bsql, params: bparams } = req.branchScope.appendTo(params);
     if (bsql !== 'TRUE') conditions.push(`a.${bsql}`);
@@ -122,18 +126,19 @@ router.post('/', auth, async (req, res, next) => {
     await pool.query(`
       INSERT INTO attendance_logs
         (id, ref_id, ref_type, ref_name, date, check_in_time, check_out_time,
-         status, notes, method, marked_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         status, notes, method, marked_by, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
         SET status=$8,
             check_in_time=COALESCE(attendance_logs.check_in_time, $6),
             check_out_time=$7,
             notes=$9,
-            method=$10`,
+            method=$10,
+            organization_id=COALESCE(attendance_logs.organization_id, $12)`,
       [id, d.ref_id, type, d.ref_name || null,
        d.date, checkIn, checkOut,
        d.status || 'present', d.notes || null,
-       'manual', req.user.id]
+       'manual', req.user.id, orgIdOf(req)]
     );
     res.status(201).json({ message: 'Attendance marked' });
   } catch (err) {
@@ -205,14 +210,15 @@ router.post('/biometric', auth, biometricLimiter, async (req, res, next) => {
 
     await pool.query(`
       INSERT INTO attendance_logs
-        (id, ref_id, ref_type, ref_name, date, check_in_time, status, notes, method, marked_by)
-      VALUES ($1,$2,$3,$4,$5,NOW(),$6,'biometric','biometric',$7)
+        (id, ref_id, ref_type, ref_name, date, check_in_time, status, notes, method, marked_by, organization_id)
+      VALUES ($1,$2,$3,$4,$5,NOW(),$6,'biometric','biometric',$7,$8)
       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
         SET status=$6,
             check_in_time=COALESCE(attendance_logs.check_in_time, NOW()),
             notes='biometric',
-            method='biometric'`,
-      [id, person.id, type, person.name, date, status, req.user.id]
+            method='biometric',
+            organization_id=COALESCE(attendance_logs.organization_id, $8)`,
+      [id, person.id, type, person.name, date, status, req.user.id, orgIdOf(req)]
     );
 
     const { rows } = await pool.query(
@@ -238,6 +244,9 @@ router.get('/today-summary', auth, async (req, res, next) => {
       params.push(req.user.trainer_id);
       trainerFilter = 'AND a.ref_id IN (SELECT id FROM clients WHERE trainer_id = $' + params.length + ' UNION SELECT id FROM pt_clients WHERE trainer_id = $' + params.length + ') ';
     }
+    const scope = tenantScope(req);
+    let orgFilter = '';
+    if (scope.applyFilter) { params.push(scope.orgId); orgFilter = 'AND a.organization_id = $' + params.length + ' '; }
 
     const { rows } = await pool.query(`
       SELECT
@@ -246,7 +255,7 @@ router.get('/today-summary', auth, async (req, res, next) => {
         COUNT(*) FILTER (WHERE a.status='late')    AS late,
         COUNT(*)                                    AS total
       FROM attendance_logs a
-      WHERE a.date = CURRENT_DATE AND a.ref_type = 'client' ${trainerFilter}`,
+      WHERE a.date = CURRENT_DATE AND a.ref_type = 'client' ${trainerFilter}${orgFilter}`,
       params
     );
     res.json(rows[0]);
@@ -258,8 +267,11 @@ router.get('/today-summary', auth, async (req, res, next) => {
 // PUT /api/attendance/:id — update a specific attendance record
 router.put('/:id', auth, async function(req, res, next) {
   try {
+    const scope = tenantScope(req);
+    const existGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
     const { rows: existing } = await pool.query(
-      'SELECT id, ref_id, ref_type FROM attendance_logs WHERE id = $1', [req.params.id]
+      'SELECT id, ref_id, ref_type FROM attendance_logs WHERE id = $1' + existGuard,
+      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
     );
     if (!existing[0]) return res.status(404).json({ error: 'Attendance record not found' });
 
@@ -300,8 +312,11 @@ router.put('/:id', auth, async function(req, res, next) {
 // DELETE /api/attendance/:id — delete a specific attendance record
 router.delete('/:id', auth, async function(req, res, next) {
   try {
+    const scope = tenantScope(req);
+    const existGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
     const { rows: existing } = await pool.query(
-      'SELECT id, ref_id, ref_type FROM attendance_logs WHERE id = $1', [req.params.id]
+      'SELECT id, ref_id, ref_type FROM attendance_logs WHERE id = $1' + existGuard,
+      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
     );
     if (!existing[0]) return res.status(404).json({ error: 'Attendance record not found' });
 
@@ -338,6 +353,7 @@ router.post('/bulk', auth, async function(req, res, next) {
 
     const results = [];
     const errors = [];
+    const bulkOrgId = orgIdOf(req);
 
     for (let i = 0; i < records.length; i++) {
       const d = records[i];
@@ -370,14 +386,15 @@ router.post('/bulk', auth, async function(req, res, next) {
         await pool.query(`
           INSERT INTO attendance_logs
             (id, ref_id, ref_type, ref_name, date,
-             check_in_time, check_out_time, status, notes, method, marked_by)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+             check_in_time, check_out_time, status, notes, method, marked_by, organization_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
           ON CONFLICT (ref_id, ref_type, date) DO UPDATE
-            SET status=$8, notes=$9`,
+            SET status=$8, notes=$9,
+                organization_id=COALESCE(attendance_logs.organization_id, $12)`,
           [id, d.ref_id, type, d.ref_name || null,
            d.date, bulkCheckIn, bulkCheckOut,
            d.status || 'present', d.notes || null,
-           'manual', req.user.id]
+           'manual', req.user.id, bulkOrgId]
         );
         results.push({ index: i, ref_id: d.ref_id, status: d.status });
       } catch (err) {
@@ -413,12 +430,15 @@ router.get('/stats', auth, async function(req, res, next) {
       params.push(req.user.trainer_id);
       trainerFilter = 'AND a.ref_id IN (SELECT id FROM clients WHERE trainer_id = $' + params.length + ' UNION SELECT id FROM pt_clients WHERE trainer_id = $' + params.length + ') ';
     }
+    const scope = tenantScope(req);
+    let orgFilter = '';
+    if (scope.applyFilter) { params.push(scope.orgId); orgFilter = 'AND a.organization_id = $' + params.length + ' '; }
 
     const { rows } = await pool.query(
       'SELECT ' + dateTrunc + ' AS period, ' +
       'a.status, COUNT(*) AS count ' +
       'FROM attendance_logs a ' +
-      'WHERE a.date >= $1 AND a.date <= $2 ' + trainerFilter +
+      'WHERE a.date >= $1 AND a.date <= $2 ' + trainerFilter + orgFilter +
       'AND a.ref_type = \'client\' ' +
       'GROUP BY period, a.status ' +
       'ORDER BY period ASC',
@@ -454,6 +474,19 @@ router.get('/gaps', auth, async function(req, res, next) {
       params.push(req.user.trainer_id);
       trainerFilter = 'AND c.trainer_id = $' + params.length + ' ';
     }
+    // Tenant scope: the client identity list must be limited to this org. The
+    // legacy `clients` table has no organization_id (it is empty in this
+    // deployment), so we scope the pt_clients branch plus the attendance
+    // references (a / a2). $orgIdx is reused in three places.
+    const scope = tenantScope(req);
+    let ptOrg = '', aOrg = '', a2Org = '';
+    if (scope.applyFilter) {
+      params.push(scope.orgId);
+      const orgIdx = params.length;
+      ptOrg = ' AND organization_id = $' + orgIdx;
+      aOrg = ' AND a.organization_id = $' + orgIdx;
+      a2Org = ' AND a2.organization_id = $' + orgIdx;
+    }
 
     // Find members (gym + PT) with absent streak >= minStreak
     const { rows } = await pool.query(
@@ -463,13 +496,13 @@ router.get('/gaps', auth, async function(req, res, next) {
       'MAX(a.date) AS last_absent_date, ' +
       '(SELECT COUNT(*) FROM attendance_logs a2 ' +
       '  WHERE a2.ref_id = c.id AND a2.ref_type = \'client\' ' +
-      '  AND a2.date >= $1::DATE AND a2.date <= $2::DATE) AS total_entries ' +
+      '  AND a2.date >= $1::DATE AND a2.date <= $2::DATE' + a2Org + ') AS total_entries ' +
       'FROM (' +
       '  SELECT id, name, mobile, trainer_id FROM clients WHERE deleted_at IS NULL AND status = \'active\' ' +
       '  UNION ALL ' +
-      '  SELECT id, name, mobile, trainer_id FROM pt_clients WHERE deleted_at IS NULL AND status = \'active\'' +
+      '  SELECT id, name, mobile, trainer_id FROM pt_clients WHERE deleted_at IS NULL AND status = \'active\'' + ptOrg +
       ') c ' +
-      'LEFT JOIN attendance_logs a ON a.ref_id = c.id AND a.ref_type = \'client\' AND a.status = \'absent\' ' +
+      'LEFT JOIN attendance_logs a ON a.ref_id = c.id AND a.ref_type = \'client\' AND a.status = \'absent\'' + aOrg + ' ' +
       'LEFT JOIN trainers t ON t.id = c.trainer_id ' +
       'WHERE 1=1 ' + trainerFilter +
       'GROUP BY c.id, c.name, c.mobile, c.trainer_id, t.name ' +

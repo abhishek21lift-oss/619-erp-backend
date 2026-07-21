@@ -7,6 +7,7 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
+const { tenantScope } = require('../lib/tenant-db');
 const { randomUUID } = require('crypto');
 
 const router = express.Router();
@@ -52,8 +53,9 @@ router.post('/mark', async (req, res, next) => {
     const id = randomUUID();
     await pool.query(`
       INSERT INTO attendance_logs
-        (id, ref_id, ref_type, ref_name, date, check_in_time, status, method, device_info, location)
-      VALUES ($1, $2, 'client', $3, $4, NOW(), $5, $6, $7, $8)
+        (id, ref_id, ref_type, ref_name, date, check_in_time, status, method, device_info, location, organization_id)
+      VALUES ($1, $2, 'client', $3, $4, NOW(), $5, $6, $7, $8,
+              (SELECT organization_id FROM pt_clients WHERE id = $2))
       ON CONFLICT (ref_id, ref_type, date) DO NOTHING`,
       [id, memberId, resolvedName, today, status, method, deviceName || null, location]
     );
@@ -113,6 +115,10 @@ router.post('/checkout', async (req, res, next) => {
 // Returns today's biometric/passkey/face_id/touch_id check-ins from attendance_logs
 router.get('/today', async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const tParams = [];
+    let tOrg = '';
+    if (scope.applyFilter) { tParams.push(scope.orgId); tOrg = ' AND a.organization_id = $' + tParams.length; }
     const { rows } = await pool.query(
       `SELECT
          a.id, a.ref_id AS member_id,
@@ -125,9 +131,10 @@ router.get('/today', async (req, res, next) => {
        FROM attendance_logs a
        WHERE a.date = CURRENT_DATE
          AND a.ref_type = 'client'
-         AND a.method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')
+         AND a.method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')${tOrg}
        ORDER BY a.check_in_time DESC
-       LIMIT 200`
+       LIMIT 200`,
+      tParams
     );
 
     const present = rows.filter(r => r.check_out_at).length;
@@ -160,6 +167,9 @@ router.get('/history', async (req, res, next) => {
     const to     = req.query.to   || new Date().toISOString().slice(0, 10);
     const offset = (page - 1) * limit;
 
+    const scope = tenantScope(req);
+    const hOrg = scope.applyFilter ? ' AND a.organization_id = $5' : '';
+    const hParams = scope.applyFilter ? [from, to, limit, offset, scope.orgId] : [from, to, limit, offset];
     const { rows } = await pool.query(
       `SELECT
          a.id, a.ref_id AS member_id,
@@ -173,18 +183,20 @@ router.get('/history', async (req, res, next) => {
        FROM attendance_logs a
        WHERE a.date BETWEEN $1 AND $2
          AND a.ref_type = 'client'
-         AND a.method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')
+         AND a.method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')${hOrg}
        ORDER BY a.check_in_time DESC
        LIMIT $3 OFFSET $4`,
-      [from, to, limit, offset]
+      hParams
     );
 
+    const cOrg = scope.applyFilter ? ' AND organization_id = $3' : '';
+    const cParams = scope.applyFilter ? [from, to, scope.orgId] : [from, to];
     const { rows: countRows } = await pool.query(
       `SELECT COUNT(*) FROM attendance_logs
        WHERE date BETWEEN $1 AND $2
          AND ref_type = 'client'
-         AND method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')`,
-      [from, to]
+         AND method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')${cOrg}`,
+      cParams
     );
 
     res.json({ records: rows, total: parseInt(countRows[0].count), page, limit });
@@ -200,6 +212,9 @@ router.get('/member/:memberId', async (req, res, next) => {
     const limit = Math.min(100, parseInt(req.query.limit) || 30);
     const from  = req.query.from || new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
 
+    const scope = tenantScope(req);
+    const mOrg = scope.applyFilter ? ' AND organization_id = $4' : '';
+    const mParams = scope.applyFilter ? [memberId, from, limit, scope.orgId] : [memberId, from, limit];
     const { rows } = await pool.query(
       `SELECT
          id,
@@ -211,9 +226,9 @@ router.get('/member/:memberId', async (req, res, next) => {
          status
        FROM attendance_logs
        WHERE ref_id = $1 AND ref_type = 'client' AND date >= $2
-         AND method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')
+         AND method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')${mOrg}
        ORDER BY check_in_time DESC LIMIT $3`,
-      [memberId, from, limit]
+      mParams
     );
     res.json({ records: rows });
   } catch (err) {
@@ -227,6 +242,9 @@ router.get('/report', async (req, res, next) => {
     const from = req.query.from || new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
     const to   = req.query.to   || new Date().toISOString().slice(0, 10);
 
+    const scope = tenantScope(req);
+    const rOrg = scope.applyFilter ? ' AND a.organization_id = $3' : '';
+    const rParams = scope.applyFilter ? [from, to, scope.orgId] : [from, to];
     const { rows } = await pool.query(
       `SELECT
          a.ref_id     AS member_id,
@@ -237,10 +255,10 @@ router.get('/report', async (req, res, next) => {
        FROM attendance_logs a
        WHERE a.date BETWEEN $1 AND $2
          AND a.ref_type = 'client'
-         AND a.method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')
+         AND a.method IN ('passkey', 'face_id', 'touch_id', 'fingerprint', 'biometric', 'face')${rOrg}
        GROUP BY a.ref_id, a.ref_name
        ORDER BY total_sessions DESC`,
-      [from, to]
+      rParams
     );
     res.json({ from, to, data: rows });
   } catch (err) {

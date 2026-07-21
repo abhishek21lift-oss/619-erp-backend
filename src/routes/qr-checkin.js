@@ -16,6 +16,7 @@ const QRCode   = require('qrcode');
 const pool     = require('../db/pool');
 const logger   = require('../lib/logger');
 const { auth } = require('../middleware/auth');
+const { tenantScope } = require('../lib/tenant-db');
 const rateLimit = require('express-rate-limit');
 
 const qrLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
@@ -127,14 +128,17 @@ async function markAttendance(userId, userType, userName, method, deviceInfo, lo
 
   const { rows } = await pool.query(
     `INSERT INTO attendance_logs
-       (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes, user_id, device_info, location)
-     VALUES ($1, $2, $3, $4::date, NOW(), $5, 'present', $6, $7, $8, $9)
+       (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes, user_id, device_info, location, organization_id)
+     VALUES ($1, $2, $3, $4::date, NOW(), $5, 'present', $6, $7, $8, $9,
+             COALESCE((SELECT organization_id FROM pt_clients WHERE id = $1),
+                      (SELECT organization_id FROM trainers WHERE id = $1)))
      ON CONFLICT (ref_id, ref_type, date) DO UPDATE
        SET check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
            status        = 'present',
            method        = CASE WHEN attendance_logs.method = 'manual' THEN EXCLUDED.method
                                 ELSE attendance_logs.method END,
-           notes         = EXCLUDED.notes
+           notes         = EXCLUDED.notes,
+           organization_id = COALESCE(attendance_logs.organization_id, EXCLUDED.organization_id)
      RETURNING id, check_in_time`,
     [userId, refType, userName, date, method,
      `${method.toUpperCase()} check-in`, userId, deviceInfo || null, location || null]
@@ -321,6 +325,12 @@ router.post('/checkout', auth, async (req, res) => {
 // Live attendance dashboard: currently inside, today's count, peak hours, breakdown.
 router.get('/dashboard', auth, async (req, res) => {
   try {
+    // Tenant scope: every aggregate below is limited to the caller's org.
+    const scope = tenantScope(req);
+    const oParams = scope.applyFilter ? [scope.orgId] : [];
+    const oc = scope.applyFilter ? ' AND organization_id = $1' : '';   // bare tables
+    const ocA = scope.applyFilter ? ' AND a.organization_id = $1' : ''; // aliased `a`
+
     const [todayStats, currentlyInside, hourlyBreakdown, weeklyTrend, methodBreakdown] =
       await Promise.all([
         // Today's totals by ref_type
@@ -331,8 +341,8 @@ router.get('/dashboard', auth, async (req, res) => {
                   COUNT(*) FILTER (WHERE status = 'absent')  AS absent,
                   COUNT(*)                                    AS total
              FROM attendance_logs
-            WHERE date = CURRENT_DATE
-            GROUP BY ref_type`
+            WHERE date = CURRENT_DATE${oc}
+            GROUP BY ref_type`, oParams
         ),
 
         // Currently inside (checked in today, not checked out)
@@ -342,32 +352,32 @@ router.get('/dashboard', auth, async (req, res) => {
             WHERE date = CURRENT_DATE
               AND check_in_time IS NOT NULL
               AND check_out_time IS NULL
-              AND status = 'present'
-            GROUP BY ref_type`
+              AND status = 'present'${oc}
+            GROUP BY ref_type`, oParams
         ),
 
         // Hourly check-in distribution for today
         pool.query(
           `SELECT EXTRACT(HOUR FROM check_in_time)::int AS hour, COUNT(*) AS count
              FROM attendance_logs
-            WHERE date = CURRENT_DATE AND check_in_time IS NOT NULL
-            GROUP BY hour ORDER BY hour`
+            WHERE date = CURRENT_DATE AND check_in_time IS NOT NULL${oc}
+            GROUP BY hour ORDER BY hour`, oParams
         ),
 
         // Past 7 days total check-ins (trend)
         pool.query(
           `SELECT date, COUNT(*) FILTER (WHERE status = 'present') AS present
              FROM attendance_logs
-            WHERE date >= CURRENT_DATE - INTERVAL '6 days'
-            GROUP BY date ORDER BY date`
+            WHERE date >= CURRENT_DATE - INTERVAL '6 days'${oc}
+            GROUP BY date ORDER BY date`, oParams
         ),
 
         // Check-in method breakdown today
         pool.query(
           `SELECT method, COUNT(*) AS count
              FROM attendance_logs
-            WHERE date = CURRENT_DATE AND status = 'present'
-            GROUP BY method`
+            WHERE date = CURRENT_DATE AND status = 'present'${oc}
+            GROUP BY method`, oParams
         ),
       ]);
 
@@ -382,9 +392,9 @@ router.get('/dashboard', auth, async (req, res) => {
          FROM attendance_logs a
          LEFT JOIN clients c ON c.id = a.ref_id AND a.ref_type = 'client'
          LEFT JOIN pt_clients pc ON pc.id = a.ref_id AND a.ref_type = 'client' AND pc.deleted_at IS NULL
-        WHERE a.date = CURRENT_DATE AND a.status = 'present'
+        WHERE a.date = CURRENT_DATE AND a.status = 'present'${ocA}
         ORDER BY a.check_in_time DESC NULLS LAST
-        LIMIT 20`
+        LIMIT 20`, oParams
     );
 
     const todayMap = {};
@@ -514,6 +524,8 @@ router.get('/staff-report', auth, async (req, res) => {
       params.push(type);
       conds.push(`ref_type = $${params.length}`);
     }
+    const scope = tenantScope(req);
+    if (scope.applyFilter) { params.push(scope.orgId); conds.push(`organization_id = $${params.length}`); }
 
     const { rows } = await pool.query(
       `SELECT ref_id, ref_name, ref_type,

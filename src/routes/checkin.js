@@ -290,13 +290,15 @@ router.post('/face', kioskTokenMiddleware, faceLimiter, kioskOrAuth, async (req,
 
     const { rows: attendanceRows } = await pool.query(
       `INSERT INTO attendance_logs
-         (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes)
-       VALUES ($1, 'client', $2, $3::date, NOW(), 'face', 'present', 'Face check-in')
+         (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes, organization_id)
+       VALUES ($1, 'client', $2, $3::date, NOW(), 'face', 'present', 'Face check-in',
+               (SELECT organization_id FROM pt_clients WHERE id = $1))
        ON CONFLICT (ref_id, ref_type, date) DO UPDATE
          SET status       = 'present',
              check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
              method        = 'face',
-             notes         = 'Face check-in'
+             notes         = 'Face check-in',
+             organization_id = COALESCE(attendance_logs.organization_id, EXCLUDED.organization_id)
        RETURNING id`,
       [member.id, member.name, date]
     );
