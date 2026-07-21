@@ -19,6 +19,7 @@ const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
 const { calc1RM } = require('../progress/fitness-scoring');
 const { checkScreeningGate } = require('../../lib/screeningGate');
+const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -148,6 +149,11 @@ router.get('/workout-log/sessions', auth, wrap(async (req, res) => {
   const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
   const off = Math.max(parseInt(offset, 10) || 0, 0);
 
+  const scope = tenantScope(req);
+  const params = [client_id];
+  let orgClause = '';
+  if (scope.applyFilter) { params.push(scope.orgId); orgClause = ` AND ws.organization_id = $${params.length}`; }
+  params.push(lim, off);
   const { rows } = await pool.query(
     `SELECT ws.*,
             (SELECT COUNT(*) FROM workout_session_exercises wse WHERE wse.session_id = ws.id) AS exercise_count,
@@ -155,10 +161,10 @@ router.get('/workout-log/sessions', auth, wrap(async (req, res) => {
                JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
               WHERE wse.session_id = ws.id AND s.completed = true) AS completed_set_count
        FROM workout_sessions ws
-      WHERE ws.client_id = $1
+      WHERE ws.client_id = $1${orgClause}
       ORDER BY ws.session_date DESC, ws.created_at DESC
-      LIMIT $2 OFFSET $3`,
-    [client_id, lim, off]
+      LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
   );
   res.json({ data: rows });
 }));
@@ -166,8 +172,11 @@ router.get('/workout-log/sessions', auth, wrap(async (req, res) => {
 // GET /workout-log/sessions/:id — full detail with exercises + sets + computed summary.
 router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   const { id } = req.params;
+  const scope = tenantScope(req);
+  const sessGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const sessParams = scope.applyFilter ? [id, scope.orgId] : [id];
   const [sessionRes, exercisesRes] = await Promise.all([
-    pool.query('SELECT * FROM workout_sessions WHERE id = $1', [id]),
+    pool.query(`SELECT * FROM workout_sessions WHERE id = $1${sessGuard}`, sessParams),
     pool.query(
       `SELECT wse.*, COALESCE(
                 (SELECT json_agg(s.* ORDER BY s.set_number)
@@ -254,6 +263,7 @@ router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trai
   // field was omitted entirely — an explicit null (freestyle, opted out
   // of the client's active plan) or an explicit id is left as-is, so the
   // frontend can distinguish "didn't say" from "said no plan".
+  const orgId = orgIdOf(req);
   let assignmentId = b.workout_assignment_id;
   if (assignmentId === undefined) {
     const { rows: activeRows } = await pool.query(
@@ -265,10 +275,10 @@ router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trai
 
   const { rows } = await pool.query(
     `INSERT INTO workout_sessions (
-       client_id, trainer_id, workout_assignment_id, session_date, program_name, workout_day, notes, created_by
-     ) VALUES ($1, (SELECT trainer_id FROM pt_clients WHERE id = $1), $2, COALESCE($3, CURRENT_DATE), $4, $5, $6, $7)
+       client_id, trainer_id, workout_assignment_id, session_date, program_name, workout_day, notes, created_by, organization_id
+     ) VALUES ($1, (SELECT trainer_id FROM pt_clients WHERE id = $1), $2, COALESCE($3, CURRENT_DATE), $4, $5, $6, $7, $8)
      RETURNING *`,
-    [b.client_id, assignmentId, b.session_date || null, b.program_name || null, b.workout_day || null, b.notes || null, req.user.id]
+    [b.client_id, assignmentId, b.session_date || null, b.program_name || null, b.workout_day || null, b.notes || null, req.user.id, orgId]
   );
   await logActivity(req, 'workout_log.session.create', 'workout_sessions', rows[0].id, { client_id: b.client_id });
   res.status(201).json({ data: rows[0], screening_warnings: warnings });
@@ -278,9 +288,11 @@ router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trai
 // weekday names this session's linked plan prescribes exercises for, so
 // the frontend can render a constrained day picker instead of free text.
 router.get('/workout-log/sessions/:sessionId/planned-day-options', auth, wrap(async (req, res) => {
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
   const { rows: sessionRows } = await pool.query(
-    'SELECT workout_assignment_id FROM workout_sessions WHERE id = $1',
-    [req.params.sessionId]
+    `SELECT workout_assignment_id FROM workout_sessions WHERE id = $1${guard}`,
+    scope.applyFilter ? [req.params.sessionId, scope.orgId] : [req.params.sessionId]
   );
   const session = sessionRows[0];
   if (!session) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -311,7 +323,10 @@ router.patch('/workout-log/sessions/:id', auth, requireRole('admin', 'manager', 
   }
   if (!sets.length) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
   sets.push('updated_at = NOW()');
-  const { rows } = await pool.query(`UPDATE workout_sessions SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  const scope = tenantScope(req);
+  let whereGuard = '';
+  if (scope.applyFilter) { params.push(scope.orgId); whereGuard = ` AND organization_id = $${params.length}`; }
+  const { rows } = await pool.query(`UPDATE workout_sessions SET ${sets.join(', ')} WHERE id = $1${whereGuard} RETURNING *`, params);
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   if (b.status !== undefined && rows[0].workout_assignment_id) {
     await recomputeAssignmentProgress(rows[0].workout_assignment_id);
@@ -321,7 +336,12 @@ router.patch('/workout-log/sessions/:id', auth, requireRole('admin', 'manager', 
 
 // DELETE /workout-log/sessions/:id
 router.delete('/workout-log/sessions/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
-  const { rows } = await pool.query('DELETE FROM workout_sessions WHERE id = $1 RETURNING id, client_id, workout_assignment_id', [req.params.id]);
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows } = await pool.query(
+    `DELETE FROM workout_sessions WHERE id = $1${guard} RETURNING id, client_id, workout_assignment_id`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+  );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   if (rows[0].workout_assignment_id) await recomputeAssignmentProgress(rows[0].workout_assignment_id);
   await logActivity(req, 'workout_log.session.delete', 'workout_sessions', req.params.id, { client_id: rows[0].client_id });
@@ -334,7 +354,12 @@ router.delete('/workout-log/sessions/:id', auth, requireRole('admin', 'manager',
 router.post('/workout-log/sessions/:sessionId/exercises', auth, requireRole('admin', 'manager', 'trainer'), validate(exerciseAddSchema), wrap(async (req, res) => {
   const { sessionId } = req.params;
   const b = req.body;
-  const { rows: sessionRows } = await pool.query('SELECT id FROM workout_sessions WHERE id = $1', [sessionId]);
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: sessionRows } = await pool.query(
+    `SELECT id FROM workout_sessions WHERE id = $1${guard}`,
+    scope.applyFilter ? [sessionId, scope.orgId] : [sessionId]
+  );
   if (!sessionRows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
   const { rows: orderRows } = await pool.query(
@@ -352,7 +377,18 @@ router.post('/workout-log/sessions/:sessionId/exercises', auth, requireRole('adm
 
 // DELETE /workout-log/exercises/:id
 router.delete('/workout-log/exercises/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
-  const { rows } = await pool.query('DELETE FROM workout_session_exercises WHERE id = $1 RETURNING id', [req.params.id]);
+  const scope = tenantScope(req);
+  let query = 'DELETE FROM workout_session_exercises WHERE id = $1 RETURNING id';
+  let params = [req.params.id];
+  if (scope.applyFilter) {
+    // Gate on the parent session's org — the leaf table has no org column.
+    query = `DELETE FROM workout_session_exercises wse
+               USING workout_sessions ws
+              WHERE wse.id = $1 AND ws.id = wse.session_id AND ws.organization_id = $2
+              RETURNING wse.id`;
+    params = [req.params.id, scope.orgId];
+  }
+  const { rows } = await pool.query(query, params);
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ message: 'Exercise removed' });
 }));
@@ -364,12 +400,14 @@ router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireRole(
   const { sessionExerciseId } = req.params;
   const b = req.body;
 
+  const scope = tenantScope(req);
+  const exGuard = scope.applyFilter ? ' AND ws.organization_id = $2' : '';
   const { rows: exRows } = await pool.query(
     `SELECT wse.exercise_id, wse.exercise_name, ws.client_id
        FROM workout_session_exercises wse
        JOIN workout_sessions ws ON ws.id = wse.session_id
-      WHERE wse.id = $1`,
-    [sessionExerciseId]
+      WHERE wse.id = $1${exGuard}`,
+    scope.applyFilter ? [sessionExerciseId, scope.orgId] : [sessionExerciseId]
   );
   const ex = exRows[0];
   if (!ex) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -398,13 +436,15 @@ router.patch('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'tra
   const { id } = req.params;
   const b = req.body;
 
+  const scope = tenantScope(req);
+  const setGuard = scope.applyFilter ? ' AND ws.organization_id = $2' : '';
   const { rows: existingRows } = await pool.query(
     `SELECT s.*, wse.exercise_id, wse.exercise_name, ws.client_id
        FROM workout_sets s
        JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
        JOIN workout_sessions ws ON ws.id = wse.session_id
-      WHERE s.id = $1`,
-    [id]
+      WHERE s.id = $1${setGuard}`,
+    scope.applyFilter ? [id, scope.orgId] : [id]
   );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -437,7 +477,19 @@ router.patch('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'tra
 
 // DELETE /workout-log/sets/:id
 router.delete('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
-  const { rows } = await pool.query('DELETE FROM workout_sets WHERE id = $1 RETURNING id', [req.params.id]);
+  const scope = tenantScope(req);
+  let query = 'DELETE FROM workout_sets WHERE id = $1 RETURNING id';
+  let params = [req.params.id];
+  if (scope.applyFilter) {
+    // Gate on the parent session's org — the leaf table has no org column.
+    query = `DELETE FROM workout_sets s
+               USING workout_session_exercises wse, workout_sessions ws
+              WHERE s.id = $1 AND wse.id = s.session_exercise_id AND ws.id = wse.session_id
+                AND ws.organization_id = $2
+              RETURNING s.id`;
+    params = [req.params.id, scope.orgId];
+  }
+  const { rows } = await pool.query(query, params);
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ message: 'Set deleted' });
 }));
@@ -456,12 +508,15 @@ router.get('/workout-log/previous', auth, wrap(async (req, res) => {
   const params = [client_id, matchParam];
   let excludeClause = '';
   if (exclude_session_id) { params.push(exclude_session_id); excludeClause = `AND ws.id != $${params.length}`; }
+  const scope = tenantScope(req);
+  let orgClause = '';
+  if (scope.applyFilter) { params.push(scope.orgId); orgClause = `AND ws.organization_id = $${params.length}`; }
 
   const { rows: exRows } = await pool.query(
     `SELECT wse.id AS session_exercise_id, ws.session_date
        FROM workout_session_exercises wse
        JOIN workout_sessions ws ON ws.id = wse.session_id
-      WHERE ws.client_id = $1 AND ${matchClause} ${excludeClause}
+      WHERE ws.client_id = $1 AND ${matchClause} ${excludeClause} ${orgClause}
       ORDER BY ws.session_date DESC, wse.created_at DESC
       LIMIT 1`,
     params
@@ -485,6 +540,10 @@ router.get('/workout-log/progress', auth, wrap(async (req, res) => {
   }
   const matchClause = exercise_id ? 'wse.exercise_id = $2' : 'wse.exercise_name = $2';
   const matchParam = exercise_id || exercise_name;
+  const scope = tenantScope(req);
+  const params = [client_id, matchParam];
+  let orgClause = '';
+  if (scope.applyFilter) { params.push(scope.orgId); orgClause = `AND ws.organization_id = $${params.length}`; }
 
   const { rows } = await pool.query(
     `SELECT ws.session_date, s.weight_kg, s.reps
@@ -492,9 +551,9 @@ router.get('/workout-log/progress', auth, wrap(async (req, res) => {
        JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
        JOIN workout_sessions ws ON ws.id = wse.session_id
       WHERE ws.client_id = $1 AND ${matchClause} AND s.completed = true
-        AND s.weight_kg IS NOT NULL AND s.reps IS NOT NULL
+        AND s.weight_kg IS NOT NULL AND s.reps IS NOT NULL ${orgClause}
       ORDER BY ws.session_date ASC`,
-    [client_id, matchParam]
+    params
   );
 
   const bySession = new Map();
@@ -523,6 +582,10 @@ router.get('/workout-log/volume-summary', auth, wrap(async (req, res) => {
   const { client_id, group_by } = req.query;
   if (!client_id) return res.status(400).json({ error: { code: 'MISSING_CLIENT_ID' } });
   const trunc = group_by === 'month' ? 'month' : 'week';
+  const scope = tenantScope(req);
+  const params = [client_id, trunc];
+  let orgClause = '';
+  if (scope.applyFilter) { params.push(scope.orgId); orgClause = `AND ws.organization_id = $${params.length}`; }
 
   const { rows } = await pool.query(
     `SELECT date_trunc($2, ws.session_date)::date AS period,
@@ -531,10 +594,10 @@ router.get('/workout-log/volume-summary', auth, wrap(async (req, res) => {
        FROM workout_sets s
        JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
        JOIN workout_sessions ws ON ws.id = wse.session_id
-      WHERE ws.client_id = $1 AND s.completed = true AND s.weight_kg IS NOT NULL AND s.reps IS NOT NULL
+      WHERE ws.client_id = $1 AND s.completed = true AND s.weight_kg IS NOT NULL AND s.reps IS NOT NULL ${orgClause}
       GROUP BY period
       ORDER BY period ASC`,
-    [client_id, trunc]
+    params
   );
   res.json({ data: rows });
 }));

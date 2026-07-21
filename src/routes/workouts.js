@@ -4,6 +4,7 @@ const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOrManager } = require('../middleware/auth');
 const { checkScreeningGate } = require('../lib/screeningGate');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 
 // ─── EXERCISES ────────────────────────────────────────────────
 
@@ -348,6 +349,8 @@ router.get('/assignments', auth, async (req, res, next) => {
     const params = [client_id];
     let p = 2;
     if (status) { conds.push(`wa.status = $${p++}`); params.push(status); }
+    const scope = tenantScope(req);
+    if (scope.applyFilter) { conds.push(`wa.organization_id = $${p++}`); params.push(scope.orgId); }
 
     const { rows } = await pool.query(`
       SELECT wa.*, wp.name AS plan_name, wp.goal AS plan_goal,
@@ -369,13 +372,15 @@ router.get('/assignments', auth, async (req, res, next) => {
 // prescribed exercises (feeds "today's prescribed exercises" in the log).
 router.get('/assignments/:id', auth, async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const guard = scope.applyFilter ? ' AND wa.organization_id = $2' : '';
     const { rows: assignRows } = await pool.query(`
       SELECT wa.*, wp.name AS plan_name, wp.goal AS plan_goal,
              wp.duration_weeks, wp.sessions_per_week
         FROM workout_assignments wa
         JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-       WHERE wa.id = $1`,
-      [req.params.id]
+       WHERE wa.id = $1${guard}`,
+      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
     );
     const assignment = assignRows[0];
     if (!assignment) return res.status(404).json({ error: 'Assignment not found' });
@@ -411,14 +416,15 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
 
     const { rows } = await pool.query(`
       INSERT INTO workout_assignments (id, workout_plan_id, client_id, trainer_id,
-        start_date, end_date, status, notes)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        start_date, end_date, status, notes, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       ON CONFLICT (workout_plan_id, client_id, status)
-      DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date, updated_at = NOW()
+      DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date,
+        organization_id = COALESCE(workout_assignments.organization_id, EXCLUDED.organization_id), updated_at = NOW()
       RETURNING *`,
       [randomUUID(), d.workout_plan_id, d.client_id, req.user.trainer_id || null,
        d.start_date || new Date().toISOString().split('T')[0],
-       d.end_date || null, 'active', d.notes || null]
+       d.end_date || null, 'active', d.notes || null, orgIdOf(req)]
     );
     res.status(201).json({ message: 'Plan assigned', assignment: rows[0], screening_warnings: warnings });
   } catch (err) {
@@ -434,10 +440,12 @@ router.put('/assignments/:id/progress', auth, async (req, res, next) => {
     if (isNaN(pct) || pct < 0 || pct > 100)
       return res.status(400).json({ error: 'progress_pct must be 0-100' });
 
+    const scope = tenantScope(req);
+    const guard = scope.applyFilter ? ' AND organization_id = $3' : '';
     const { rows } = await pool.query(`
       UPDATE workout_assignments SET progress_pct=$1, updated_at=NOW()
-      WHERE id=$2 RETURNING *`,
-      [pct, req.params.id]
+      WHERE id=$2${guard} RETURNING *`,
+      scope.applyFilter ? [pct, req.params.id, scope.orgId] : [pct, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Assignment not found' });
     res.json({ message: 'Progress updated', assignment: rows[0] });
