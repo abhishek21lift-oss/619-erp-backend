@@ -4,6 +4,7 @@ const { auth } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
+const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 const scoring = require('./fitness-scoring');
 const goalScoring = require('./goal-scoring');
 const lifestyleScoring = require('./lifestyle-scoring');
@@ -71,14 +72,19 @@ const assessmentCreateSchema = {
 router.get('/assessments', auth, wrap(async (req, res) => {
   const { client_id, limit, offset } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
+  // Multi-tenant isolation (Phase 1): only the caller's org's assessments.
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
   const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 200);
-  params.push(lim); params.push(Math.max(parseInt(offset, 10) || 0, 0));
+  const off = Math.max(parseInt(offset, 10) || 0, 0);
+  params.push(lim); const limIdx = params.length;
+  params.push(off); const offIdx = params.length;
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT pa.*, t.name AS trainer_name FROM pt_assessments pa
      LEFT JOIN trainers t ON t.id = pa.trainer_id ${whereSql}
-     ORDER BY assessment_date DESC LIMIT $${where.length + 1} OFFSET $${where.length + 2}`, params
+     ORDER BY assessment_date DESC LIMIT $${limIdx} OFFSET $${offIdx}`, params
   );
   res.json({ data: rows });
 }));
@@ -192,7 +198,7 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
        endurance_test_type, endurance_test_type_2, endurance_test_data, endurance_category, endurance_category_2, endurance_score_computed,
        flexibility_test_data, flexibility_category, has_asymmetry, mobility_score_computed,
        body_composition_score, health_risk_score, overall_fitness_score,
-       posture_notes, health_notes, created_by
+       posture_notes, health_notes, created_by, organization_id
      ) VALUES (
        $1,$2,$3,(SELECT COUNT(*)+1 FROM pt_assessments WHERE client_id = $1),COALESCE($4, NOW()),
        $5,
@@ -206,7 +212,7 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
        $44,$45,$46::jsonb,$47,$48,$49,
        $50::jsonb,$51,$52,$53,
        $54,$55,$56,
-       $57,$58,$59
+       $57,$58,$59,$60
      ) RETURNING *`,
     [
       b.client_id, trainer_id, b.assessment_type || 'initial', b.assessment_date || null,
@@ -222,6 +228,7 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
       JSON.stringify(fd), flexibilityCategory, hasAsymmetry, mobilityScore,
       bodyCompositionScore, healthRiskScore, overallScore,
       b.posture_notes || null, b.health_notes || null, req.user.id,
+      orgIdOf(req),
     ]
   );
   res.status(201).json({ data: { ...rows[0], bp_unsafe: bp.isUnsafe } });
