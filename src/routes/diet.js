@@ -3,6 +3,7 @@ const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOrManager } = require('../middleware/auth');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 
 // ─── MEALS ───────────────────────────────────────────────────
@@ -139,6 +140,8 @@ router.get('/assignments', auth, async (req, res, next) => {
     const params = [client_id];
     let p = 2;
     if (status) { conds.push(`da.status = $${p++}`); params.push(status); }
+    const scope = tenantScope(req);
+    if (scope.applyFilter) { conds.push(`da.organization_id = $${p++}`); params.push(scope.orgId); }
 
     const { rows } = await pool.query(`
       SELECT da.*, dt.name AS template_name, dt.goal AS template_goal,
@@ -165,14 +168,15 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
 
     const { rows } = await pool.query(`
       INSERT INTO diet_assignments (id, diet_template_id, client_id, trainer_id,
-        start_date, end_date, status, notes)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        start_date, end_date, status, notes, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       ON CONFLICT (diet_template_id, client_id, status)
-      DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date, updated_at = NOW()
+      DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date,
+        organization_id = COALESCE(diet_assignments.organization_id, EXCLUDED.organization_id), updated_at = NOW()
       RETURNING *`,
       [randomUUID(), d.diet_template_id, d.client_id, req.user.trainer_id || null,
        d.start_date || new Date().toISOString().split('T')[0],
-       d.end_date || null, 'active', d.notes || null]
+       d.end_date || null, 'active', d.notes || null, orgIdOf(req)]
     );
     res.status(201).json({ message: 'Diet plan assigned', assignment: rows[0] });
   } catch (err) {
@@ -189,18 +193,20 @@ router.get('/tracker', auth, async (req, res, next) => {
     if (!client_id) return res.status(400).json({ error: 'client_id required' });
 
     const logDate = date || new Date().toISOString().split('T')[0];
+    const scope = tenantScope(req);
+    const orgGuard = scope.applyFilter ? ' AND organization_id=$3' : '';
 
     const { rows } = await pool.query(
-      'SELECT * FROM nutrition_logs WHERE client_id=$1 AND log_date=$2',
-      [client_id, logDate]
+      `SELECT * FROM nutrition_logs WHERE client_id=$1 AND log_date=$2${orgGuard}`,
+      scope.applyFilter ? [client_id, logDate, scope.orgId] : [client_id, logDate]
     );
 
     // Also return the past 7 days for the weekly view
     const { rows: history } = await pool.query(`
       SELECT * FROM nutrition_logs
-      WHERE client_id=$1 AND log_date >= $2::date - 6
+      WHERE client_id=$1 AND log_date >= $2::date - 6${orgGuard}
       ORDER BY log_date DESC`,
-      [client_id, logDate]
+      scope.applyFilter ? [client_id, logDate, scope.orgId] : [client_id, logDate]
     );
 
     res.json({
@@ -226,8 +232,8 @@ router.put('/tracker', auth, async (req, res, next) => {
 
     const { rows } = await pool.query(`
       INSERT INTO nutrition_logs (id, client_id, log_date, calories_consumed,
-        protein_g, carbs_g, fats_g, water_glasses, notes)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        protein_g, carbs_g, fats_g, water_glasses, notes, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       ON CONFLICT (client_id, log_date) DO UPDATE SET
         calories_consumed = EXCLUDED.calories_consumed,
         protein_g = EXCLUDED.protein_g,
@@ -235,12 +241,13 @@ router.put('/tracker', auth, async (req, res, next) => {
         fats_g = EXCLUDED.fats_g,
         water_glasses = EXCLUDED.water_glasses,
         notes = EXCLUDED.notes,
+        organization_id = COALESCE(nutrition_logs.organization_id, EXCLUDED.organization_id),
         updated_at = NOW()
       RETURNING *`,
       [randomUUID(), d.client_id, logDate,
        parseInt(d.calories_consumed) || 0, parseFloat(d.protein_g) || 0,
        parseFloat(d.carbs_g) || 0, parseFloat(d.fats_g) || 0,
-       parseInt(d.water_glasses) || 0, d.notes || null]
+       parseInt(d.water_glasses) || 0, d.notes || null, orgIdOf(req)]
     );
     res.json({ message: 'Nutrition log updated', log: rows[0] });
   } catch (err) {
@@ -253,9 +260,11 @@ router.put('/tracker', auth, async (req, res, next) => {
 // GET /api/diet/fitness-profile/:clientId
 router.get('/fitness-profile/:clientId', auth, async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const orgGuard = scope.applyFilter ? ' AND organization_id=$2' : '';
     const { rows } = await pool.query(
-      'SELECT * FROM client_fitness_profiles WHERE client_id=$1',
-      [req.params.clientId]
+      `SELECT * FROM client_fitness_profiles WHERE client_id=$1${orgGuard}`,
+      scope.applyFilter ? [req.params.clientId, scope.orgId] : [req.params.clientId]
     );
     res.json(rows[0] || null);
   } catch (err) {
@@ -274,8 +283,8 @@ router.put('/fitness-profile/:clientId', auth, async (req, res, next) => {
       INSERT INTO client_fitness_profiles (id, client_id, goal, goal_other,
         height_cm, body_fat_pct, health_conditions, injuries,
         emergency_contact, emergency_phone, fitness_level,
-        sleep_hours, stress_level, diet_preference)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        sleep_hours, stress_level, diet_preference, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
       ON CONFLICT (client_id) DO UPDATE SET
         goal = EXCLUDED.goal,
         goal_other = EXCLUDED.goal_other,
@@ -289,6 +298,7 @@ router.put('/fitness-profile/:clientId', auth, async (req, res, next) => {
         sleep_hours = EXCLUDED.sleep_hours,
         stress_level = EXCLUDED.stress_level,
         diet_preference = EXCLUDED.diet_preference,
+        organization_id = COALESCE(client_fitness_profiles.organization_id, EXCLUDED.organization_id),
         updated_at = NOW()
       RETURNING *`,
       [randomUUID(), clientId, d.goal || null, d.goal_other || null,
@@ -297,7 +307,7 @@ router.put('/fitness-profile/:clientId', auth, async (req, res, next) => {
        Array.isArray(d.health_conditions) ? d.health_conditions : null,
        d.injuries || null, d.emergency_contact || null, d.emergency_phone || null,
        d.fitness_level || null, d.sleep_hours ? parseFloat(d.sleep_hours) : null,
-       d.stress_level || null, d.diet_preference || null]
+       d.stress_level || null, d.diet_preference || null, orgIdOf(req)]
     );
     res.json({ message: 'Fitness profile updated', profile: rows[0] });
   } catch (err) {
