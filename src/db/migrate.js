@@ -64,6 +64,36 @@ async function runMigrations() {
   }
 }
 
+/**
+ * Run migrations, retrying on transient connection/query failures.
+ *
+ * On a cold start (Render waking from hibernate, or the Supabase pooler
+ * spinning up) the first DB connection can take longer than the pool's
+ * connectionTimeoutMillis, so pool.connect() rejects with "Connection
+ * terminated due to connection timeout" or a "Query read timeout". A single
+ * failure used to exit(1) and crash-loop the whole service; retrying with
+ * backoff lets the boot ride out that initial blip. The migration runner is
+ * idempotent (already-applied files are skipped, each file is transactional),
+ * so re-running is always safe.
+ */
+async function runMigrationsWithRetry({ attempts = 5, baseDelayMs = 2000 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await runMigrations();
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.error(`  ⚠ migration attempt ${attempt}/${attempts} failed: ${err.message}`);
+      if (attempt === attempts) break;
+      const delay = baseDelayMs * 2 ** (attempt - 1); // 2s, 4s, 8s, 16s
+      console.error(`    retrying in ${delay / 1000}s…`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastErr;
+}
+
 // When executed directly as CLI, close the pool after finishing.
 if (require.main === module) {
   require('dotenv').config();
@@ -75,4 +105,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { runMigrations };
+module.exports = { runMigrations, runMigrationsWithRetry };

@@ -377,10 +377,10 @@ app.use(errorHandler);
 // ────────────────────────
 // START — run migrations first, then listen
 // ────────────────────────
-const { runMigrations } = require('./db/migrate');
+const { runMigrationsWithRetry } = require('./db/migrate');
 
 logger.info('Running database migrations…');
-runMigrations()
+runMigrationsWithRetry()
   .then(function() {
     const server = app.listen(PORT, '0.0.0.0', function() {
       logger.info({
