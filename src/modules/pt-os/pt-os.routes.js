@@ -363,10 +363,11 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
       if (tr[0]) { ledgerTrainerId = tr[0].id; incentiveRate = tr[0].incentive_rate ?? 0.5; }
     }
     await pool.query(
-      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes)
-       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6)`,
+      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes, organization_id)
+       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6,$7)`,
       [req.params.id, ledgerTrainerId, paidNow, Math.round(paidNow * incentiveRate),
-       String(d.payment_method || 'CASH').toUpperCase(), `Renewal — ${packageType || c.package_type || 'PT package'}`]
+       String(d.payment_method || 'CASH').toUpperCase(), `Renewal — ${packageType || c.package_type || 'PT package'}`,
+       orgIdOf(req)]
     );
   }
 
@@ -483,10 +484,11 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
       if (tr[0]) { ledgerTrainerId = tr[0].id; incentiveRate = tr[0].incentive_rate ?? 0.5; }
     }
     await pool.query(
-      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes)
-       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6)`,
+      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes, organization_id)
+       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6,$7)`,
       [req.params.id, ledgerTrainerId, delta, Math.round(delta * incentiveRate),
-       String(req.body.payment_method || 'CASH').toUpperCase(), 'Collected via client profile / enrolment']
+       String(req.body.payment_method || 'CASH').toUpperCase(), 'Collected via client profile / enrolment',
+       orgIdOf(req)]
     );
   }
 
@@ -828,9 +830,10 @@ router.post('/payments', auth, wrap(async (req, res) => {
   }
 
   const { rows } = await pool.query(
-    `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [client_id, resolvedTrainerId, numAmount, incentive_amt ?? 0, payment_method, payment_ref, date || new Date(), notes]
+    `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes, organization_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [client_id, resolvedTrainerId, numAmount, incentive_amt ?? 0, payment_method, payment_ref, date || new Date(), notes,
+     orgIdOf(req)]
   );
   // update client paid_amount and balance_amount
   await pool.query(

@@ -22,6 +22,7 @@ const { genReceiptNo } = require('../db/receipts');
 const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { paymentSchemas } = require('../lib/validation');
+const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 
 // Both ledgers, aliased to one shape. pt_payments has no branch_id — shimmed
@@ -32,7 +33,7 @@ const LEDGER_SQL = `
          t.name AS trainer_name, p.amount, p.incentive_amt,
          UPPER(p.payment_method) AS method, p.payment_ref AS receipt_no,
          p.date, p.notes, p.deleted_at, p.created_at,
-         NULL::text AS branch_id, NULL::text AS package_type
+         NULL::text AS branch_id, NULL::text AS package_type, p.organization_id
   FROM pt_payments p
   LEFT JOIN pt_clients c ON c.id = p.client_id
   LEFT JOIN trainers   t ON t.id = p.trainer_id
@@ -41,7 +42,7 @@ const LEDGER_SQL = `
          lp.trainer_name, lp.amount, lp.incentive_amt,
          UPPER(lp.method) AS method, lp.receipt_no,
          lp.date, lp.notes, lp.deleted_at, lp.created_at,
-         lp.branch_id::text, lp.package_type
+         lp.branch_id::text, lp.package_type, NULL::uuid AS organization_id
   FROM payments lp
 `;
 
@@ -70,6 +71,14 @@ router.get('/', auth, async (req, res, next) => {
     // Hide soft-deleted payments unless caller explicitly asks for them.
     if (req.query.include_deleted !== '1') {
       conditions.push(`p.deleted_at IS NULL`);
+    }
+
+    // Multi-tenant isolation (Phase 1): tenant users only see their org's
+    // payments; legacy-ledger rows carry NULL org and drop out for them.
+    const scope = tenantScope(req);
+    if (scope.applyFilter) {
+      conditions.push(`p.organization_id = $${p++}`);
+      params.push(scope.orgId);
     }
 
     // Branch scope: restrict to the caller's branch for non-admin users.
@@ -122,6 +131,15 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
       return res.status(403).json({ error: 'Access denied: client is not assigned to you' });
     }
 
+    // Multi-tenant isolation (Phase 1): the client must belong to the caller's
+    // organization — otherwise this is a cross-tenant write. 404 (not 403) so
+    // we don't confirm the id exists in another tenant.
+    const scope = tenantScope(req);
+    if (scope.applyFilter && cl[0].organization_id !== scope.orgId) {
+      await tx.query('ROLLBACK');
+      return res.status(404).json({ error: 'Client not found' });
+    }
+
     // Resolve trainer — verify the FK target exists; if the trainer was deleted
     // without the cascade clearing the client's trainer_id, the INSERT would fail
     // with a FK violation (23503). Fall back to NULL in that case.
@@ -142,12 +160,12 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
 
     await tx.query(`
       INSERT INTO pt_payments (id, client_id, trainer_id, amount, incentive_amt,
-        payment_method, payment_ref, date, notes)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        payment_method, payment_ref, date, notes, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [id, d.client_id, resolvedTrainerId,
        amount, Math.round(amount * incentiveRate),
        String(d.method || 'CASH').toUpperCase(), receiptNo, d.date,
-       d.notes || null]
+       d.notes || null, cl[0].organization_id]
     );
 
     // Update client balance
@@ -193,6 +211,13 @@ router.get('/stats', auth, async (req, res, next) => {
     if (from) { conditions.push(`p.date >= $${p++}`); params.push(from); }
     if (to)   { conditions.push(`p.date <= $${p++}`); params.push(to); }
 
+    // Multi-tenant isolation (Phase 1): scope KPI totals to the caller's org.
+    const scope = tenantScope(req);
+    if (scope.applyFilter) {
+      conditions.push(`p.organization_id = $${p++}`);
+      params.push(scope.orgId);
+    }
+
     const { sql: bsql, params: bparams } = req.branchScope.appendTo(params);
     if (bsql !== 'TRUE') conditions.push(`p.${bsql}`);
 
@@ -226,12 +251,22 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   try {
     await tx.query('BEGIN');
 
+    // Multi-tenant isolation (Phase 1): only delete payments in the caller's
+    // organization — a cross-tenant id simply won't match and 404s below.
+    const scope = tenantScope(req);
+    const dParams = [req.params.id];
+    let dOrgClause = '';
+    if (scope.applyFilter) {
+      dParams.push(scope.orgId);
+      dOrgClause = ` AND organization_id = $${dParams.length}`;
+    }
+
     // ── Canonical ledger ──
     const { rows: ptRows } = await tx.query(
       `UPDATE pt_payments
           SET deleted_at = NOW(), updated_at = NOW()
-        WHERE id = $1 AND deleted_at IS NULL
-        RETURNING *`, [req.params.id]
+        WHERE id = $1 AND deleted_at IS NULL${dOrgClause}
+        RETURNING *`, dParams
     );
     if (ptRows[0]) {
       await tx.query(`
