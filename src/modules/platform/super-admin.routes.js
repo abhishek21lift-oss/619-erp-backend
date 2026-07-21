@@ -19,9 +19,37 @@
 const router = require('express').Router();
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const multer = require('multer');
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
+const { saveFile } = require('../../lib/fileStorage');
 const { invalidateUserCache } = require('../../middleware/auth');
+
+// ── Logo upload (per-studio branding) ───────────────────────────────────────
+// memoryStorage + magic-byte sniff (MIME header alone can be spoofed), same
+// pattern as the PAR-Q/consent document uploads.
+const LOGO_MAX_BYTES = parseInt(process.env.ORG_LOGO_MAX_BYTES, 10) || 2 * 1024 * 1024; // 2MB
+const logoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: LOGO_MAX_BYTES },
+  fileFilter(_req, file, cb) {
+    if (!/^image\/(png|jpe?g|webp)$/i.test(file.mimetype || '')) {
+      return cb(new Error('Only PNG, JPG, or WEBP images are allowed'));
+    }
+    cb(null, true);
+  },
+});
+const LOGO_SIGNATURES = [
+  { mime: 'image/jpeg', ext: 'jpg',  magic: [0xFF, 0xD8, 0xFF] },
+  { mime: 'image/png',  ext: 'png',  magic: [0x89, 0x50, 0x4E, 0x47] },
+  { mime: 'image/webp', ext: 'webp', magic: [0x52, 0x49, 0x46, 0x46] }, // "RIFF" (WEBP container)
+];
+function detectLogoType(buf) {
+  for (const sig of LOGO_SIGNATURES) {
+    if (sig.magic.every((b, i) => buf[i] === b)) return sig;
+  }
+  return null;
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 function slugify(name) {
@@ -218,6 +246,28 @@ router.post('/users/:id/reset-password', async (req, res, next) => {
     invalidateUserCache(req.params.id);
     await audit(req, 'user_password_reset', 'user', req.params.id, {});
     res.json({ data: { id: rows[0].id, message: 'Password reset. Existing sessions revoked.' } });
+  } catch (err) { next(err); }
+});
+
+// POST /organizations/:id/logo — upload/replace a studio's logo image.
+router.post('/organizations/:id/logo', logoUpload.single('file'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Logo file is required' } });
+    const detected = detectLogoType(req.file.buffer);
+    if (!detected) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'File is not a valid PNG, JPG, or WEBP image' } });
+    }
+    const { rows: orgRows } = await pool.query('SELECT id FROM organizations WHERE id = $1', [req.params.id]);
+    if (!orgRows.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
+
+    const filename = `${req.params.id}-${Date.now()}.${detected.ext}`;
+    const url = await saveFile('org-logos', filename, req.file.buffer, detected.mime);
+    const { rows } = await pool.query(
+      'UPDATE organizations SET logo_url = $2, updated_at = now() WHERE id = $1 RETURNING *',
+      [req.params.id, url]
+    );
+    await audit(req, 'org_logo_updated', 'organization', req.params.id, { logo_url: url });
+    res.json({ data: rows[0] });
   } catch (err) { next(err); }
 });
 

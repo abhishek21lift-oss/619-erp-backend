@@ -65,7 +65,8 @@ async function auth(req, res, next) {
           // multi-tenant isolation layer (migration 078).
           // SECURITY: filter out soft-deleted users (deleted_at IS NOT NULL).
           `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
-                  u.organization_id, o.name AS organization_name, u.is_active, u.token_version
+                  u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
+                  u.is_active, u.token_version
              FROM users u
              LEFT JOIN organizations o ON o.id = u.organization_id
             WHERE u.id = $1
@@ -77,7 +78,8 @@ async function auth(req, res, next) {
         // Fallback if deleted_at column doesn't exist (pre-migration)
         const result = await pool.query(
           `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
-                  u.organization_id, o.name AS organization_name, u.is_active, u.token_version
+                  u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
+                  u.is_active, u.token_version
              FROM users u
              LEFT JOIN organizations o ON o.id = u.organization_id
             WHERE u.id = $1`,
