@@ -74,8 +74,10 @@ router.get('/assessments', auth, wrap(async (req, res) => {
   const where = []; const params = [];
   if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   // Multi-tenant isolation (Phase 1): only the caller's org's assessments.
+  // Qualify with the pa alias — this query joins `trainers`, which also has an
+  // organization_id column, so an unqualified reference is ambiguous.
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`pa.organization_id = $${params.length}`); }
   const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 200);
   const off = Math.max(parseInt(offset, 10) || 0, 0);
   params.push(lim); const limIdx = params.length;
