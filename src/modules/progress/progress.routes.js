@@ -280,7 +280,9 @@ function computeGoalAnalysis({ startingWeight, targetWeight, targetDate, lifesty
 router.get('/goals', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT * FROM pt_goals ${whereSql} ORDER BY is_active DESC, created_at DESC`, params
@@ -320,7 +322,7 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
        starting_weight, starting_body_fat_pct,
        goal_difficulty, estimated_duration_weeks, recommended_pt_duration_months,
        estimated_weekly_rate_kg, safe_weekly_rate_kg, risk_factors,
-       created_by
+       created_by, organization_id
      ) VALUES (
        $1,$2,$3,$4,$5,$6,$7,$8,
        $9,$10,$11,$12,$13,
@@ -328,7 +330,7 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
        $16,$17,
        $18,$19,$20,
        $21,$22,$23,
-       $24
+       $24,$25
      ) RETURNING *`,
     [
       b.client_id, b.goal_type, b.goal_other || null, b.goal_description || null,
@@ -339,7 +341,7 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
       startingWeight, startingBodyFat,
       analysis.difficulty, analysis.estimatedWeeks, analysis.recommendedMonths,
       analysis.requiredRate, analysis.safeRate, analysis.riskFactors.length ? analysis.riskFactors : null,
-      req.user.id,
+      req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -352,7 +354,12 @@ router.patch('/goals/:id', auth, wrap(async (req, res) => {
     'lifestyle_readiness', 'starting_weight', 'starting_body_fat_pct',
   ];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_goals WHERE id = $1', [req.params.id]);
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_goals WHERE id = $1${guard}`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
