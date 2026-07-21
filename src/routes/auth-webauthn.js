@@ -11,6 +11,7 @@ const express  = require('express');
 const jwt      = require('jsonwebtoken');
 const pool     = require('../db/pool');
 const { auth } = require('../middleware/auth');
+const { tenantScope } = require('../lib/tenant-db');
 const logger   = require('../lib/logger');
 const rateLimit = require('express-rate-limit');
 
@@ -228,7 +229,8 @@ router.post('/register/verify', auth, async (req, res, next) => {
 
     await consumeChallenge(chs[0].challenge, 'registration', user.id);
 
-    const { credential } = verification.registrationInfo;
+    const regInfo = verification.registrationInfo;
+    const { credential } = regInfo;
     const publicKeyB64 = Buffer.from(credential.publicKey).toString('base64url');
 
     const transports = credential.transports || registration?.response?.transports || [];
@@ -237,16 +239,26 @@ router.post('/register/verify', auth, async (req, res, next) => {
     else if (transports.some(t => ['usb', 'nfc', 'ble', 'smart-card'].includes(t))) deviceType = 'cross-platform';
     if (clientDeviceType) deviceType = clientDeviceType;
 
+    // FIDO2 backup flags. Backup-State (BS) = credential is currently synced;
+    // Backup-Eligible (BE) = credential *may* be synced (multi-device passkey).
+    // @simplewebauthn v13 exposes BS as credentialBackedUp and BE via
+    // credentialDeviceType ('multiDevice' ⇒ eligible); fall back defensively.
+    const backedUp = regInfo.credentialBackedUp ?? credential.backedUp ?? false;
+    const backupEligible = regInfo.credentialDeviceType
+      ? regInfo.credentialDeviceType === 'multiDevice'
+      : backedUp;
+
     const { rows } = await pool.query(
       `INSERT INTO user_webauthn_credentials
-         (user_id, credential_id, public_key, counter, transports, device_name, device_type, backed_up)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         (user_id, organization_id, credential_id, public_key, counter, transports,
+          device_name, device_type, backed_up, backup_eligible)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (credential_id) DO UPDATE
          SET last_used_at = NOW(), updated_at = NOW()
        RETURNING id`,
-      [user.id, credential.id, publicKeyB64, credential.counter,
+      [user.id, user.organization_id || null, credential.id, publicKeyB64, credential.counter,
        transports, (deviceName || 'Passkey').trim(),
-       deviceType, credential.backedUp ?? false]
+       deviceType, backedUp, backupEligible]
     );
 
     await logEvent(req, 'webauthn_staff_registered', {
@@ -569,57 +581,82 @@ router.put('/credentials/:id/toggle', auth, async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function requireAdminOrManager(req, res, next) {
-  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
+  const role = req.user.role;
+  if (role !== 'admin' && role !== 'manager' && role !== 'super_admin') {
     return res.status(403).json({ error: 'Admin or manager access required' });
   }
   next();
 }
 
-// GET /admin/stats
+// GET /admin/stats — tenant-scoped: platform super_admin sees all orgs;
+// a tenant admin/manager sees only their own organization's passkeys.
 router.get('/admin/stats', auth, requireAdminOrManager, async (req, res, next) => {
   try {
+    const { orgId, applyFilter } = tenantScope(req);
+    const where  = applyFilter ? 'WHERE u.organization_id = $1' : '';
+    const params = applyFilter ? [orgId] : [];
     const { rows } = await pool.query(`
       SELECT
-        COUNT(*) FILTER (WHERE deleted_at IS NULL)::int                         AS total_credentials,
-        COUNT(*) FILTER (WHERE deleted_at IS NULL AND is_active = true)::int    AS active_credentials,
-        COUNT(DISTINCT user_id) FILTER (WHERE deleted_at IS NULL)::int          AS users_with_passkeys,
-        COUNT(*) FILTER (WHERE last_used_at > NOW() - INTERVAL '7 days')::int  AS used_last_7_days
-      FROM user_webauthn_credentials
-    `);
+        COUNT(*) FILTER (WHERE uc.deleted_at IS NULL)::int                        AS total_credentials,
+        COUNT(*) FILTER (WHERE uc.deleted_at IS NULL AND uc.is_active = true)::int AS active_credentials,
+        COUNT(DISTINCT uc.user_id) FILTER (WHERE uc.deleted_at IS NULL)::int       AS users_with_passkeys,
+        COUNT(*) FILTER (WHERE uc.last_used_at > NOW() - INTERVAL '7 days')::int   AS used_last_7_days
+      FROM user_webauthn_credentials uc
+      JOIN users u ON u.id = uc.user_id
+      ${where}
+    `, params);
     res.json(rows[0]);
   } catch (err) { next(err); }
 });
 
-// GET /admin/credentials
+// GET /admin/credentials — tenant-scoped list.
 router.get('/admin/credentials', auth, requireAdminOrManager, async (req, res, next) => {
   try {
     const limit  = Math.min(parseInt(req.query.limit,  10) || 100, 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0,   0);
+    const { orgId, applyFilter } = tenantScope(req);
+
+    const conds  = ['uc.deleted_at IS NULL'];
+    const params = [];
+    if (applyFilter) { params.push(orgId); conds.push(`u.organization_id = $${params.length}`); }
+    params.push(limit);  const limIdx = params.length;
+    params.push(offset); const offIdx = params.length;
+
     const { rows } = await pool.query(
       `SELECT uc.id, uc.user_id, u.name AS user_name, u.email AS user_email,
-              uc.device_name, uc.device_type, uc.backed_up, uc.is_active,
+              uc.device_name, uc.device_type, uc.backed_up, uc.backup_eligible, uc.is_active,
               uc.created_at, uc.last_used_at
        FROM user_webauthn_credentials uc
        JOIN users u ON u.id = uc.user_id
-       WHERE uc.deleted_at IS NULL
+       WHERE ${conds.join(' AND ')}
        ORDER BY uc.created_at DESC
-       LIMIT $1 OFFSET $2`,
-      [limit, offset]
+       LIMIT $${limIdx} OFFSET $${offIdx}`,
+      params
     );
     res.json({ credentials: rows });
   } catch (err) { next(err); }
 });
 
-// DELETE /admin/credentials/:id — admin revoke any credential
+// DELETE /admin/credentials/:id — admin revoke, tenant-scoped so an org admin
+// can only revoke passkeys belonging to a user in their own organization.
 router.delete('/admin/credentials/:id', auth, async (req, res, next) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (req.user.role !== 'admin' && req.user.role !== 'super_admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
   try {
+    const { orgId, applyFilter } = tenantScope(req);
+    const params = [req.params.id];
+    let orgCond = '';
+    if (applyFilter) { params.push(orgId); orgCond = `AND u.organization_id = $${params.length}`; }
+
     const { rows } = await pool.query(
-      `UPDATE user_webauthn_credentials
+      `UPDATE user_webauthn_credentials uc
        SET deleted_at = NOW(), updated_at = NOW()
-       WHERE id = $1 AND deleted_at IS NULL
-       RETURNING id`,
-      [req.params.id]
+       FROM users u
+       WHERE uc.id = $1 AND u.id = uc.user_id AND uc.deleted_at IS NULL
+         ${orgCond}
+       RETURNING uc.id`,
+      params
     );
     if (!rows.length) return res.status(404).json({ error: 'Credential not found' });
     await logEvent(req, 'webauthn_admin_revoke', { entity_id: req.params.id });
@@ -627,17 +664,35 @@ router.delete('/admin/credentials/:id', auth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// GET /admin/audit-logs
+// GET /admin/audit-logs — tenant-scoped. A tenant admin sees webauthn events
+// performed by users in their org (registration/management, actor-based) plus
+// login events targeting a user in their org (target-based, since login has no
+// authenticated actor). Platform super_admin sees everything.
 router.get('/admin/audit-logs', auth, requireAdminOrManager, async (req, res, next) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const { orgId, applyFilter } = tenantScope(req);
+
+    const params = [];
+    let orgCond = '';
+    if (applyFilter) {
+      params.push(orgId);
+      orgCond = `AND (u.organization_id = $${params.length}
+                   OR al.entity_id IN (SELECT id FROM users WHERE organization_id = $${params.length}))`;
+    }
+    params.push(limit);
+    const limIdx = params.length;
+
     const { rows } = await pool.query(
-      `SELECT id, user_id, user_name, action, entity_id, new_data, ip_address, user_agent, created_at
-       FROM activity_log
-       WHERE entity_type = 'webauthn'
-       ORDER BY created_at DESC
-       LIMIT $1`,
-      [limit]
+      `SELECT al.id, al.user_id, al.user_name, al.action, al.entity_id,
+              al.new_data, al.ip_address, al.user_agent, al.created_at
+       FROM activity_log al
+       LEFT JOIN users u ON u.id = al.user_id
+       WHERE al.entity_type = 'webauthn'
+         ${orgCond}
+       ORDER BY al.created_at DESC
+       LIMIT $${limIdx}`,
+      params
     );
     res.json({ logs: rows });
   } catch (err) { next(err); }
