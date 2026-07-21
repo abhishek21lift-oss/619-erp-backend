@@ -19,10 +19,27 @@ const LOCK_ID = 619619619; // Unique advisory lock for 619 ERP migrations
 
 async function runMigrations() {
   const client = await pool.connect();
+  let holdsLock = false;
   try {
-    // Acquire advisory lock — prevents concurrent migration runs (e.g.
-    // during rapid container restarts or multiple replicas booting).
-    await client.query('SELECT pg_advisory_lock($1)', [LOCK_ID]);
+    // Acquire the advisory lock WITHOUT blocking. A blocking pg_advisory_lock()
+    // sits in the lock queue, where the pool's statement_timeout/query_timeout
+    // eventually kills it — and under crash-loop restarts that piles up waiters
+    // and orphans lock-holding sessions behind the Supavisor pooler (a boot
+    // grabs the lock, the container is SIGKILLed mid-migration, and the pooled
+    // backend lingers still holding it, blocking every later boot). Polling a
+    // non-blocking pg_try_advisory_lock never queues, so a stale holder just
+    // makes us retry rather than deadlock the whole service. lock_timeout is a
+    // belt-and-braces guard for any other lock this session waits on.
+    await client.query("SET lock_timeout = '5s'");
+    for (let attempt = 1; attempt <= 15; attempt++) {
+      const { rows } = await client.query('SELECT pg_try_advisory_lock($1) AS ok', [LOCK_ID]);
+      if (rows[0].ok) { holdsLock = true; break; }
+      console.log(`  … migration lock held by another instance, retry ${attempt}/15`);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    if (!holdsLock) {
+      throw new Error('Could not acquire migration advisory lock (another instance may be migrating or a stale lock is held)');
+    }
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS _migrations (
@@ -59,7 +76,9 @@ async function runMigrations() {
     }
     console.log('✅ All migrations complete.');
   } finally {
-    await client.query('SELECT pg_advisory_unlock($1)', [LOCK_ID]).catch(function() {});
+    if (holdsLock) {
+      await client.query('SELECT pg_advisory_unlock($1)', [LOCK_ID]).catch(function() {});
+    }
     client.release();
   }
 }
