@@ -66,9 +66,12 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     let rows;
     try {
       const result = await pool.query(
-        `SELECT id, name, email, role, password, token_version,
-                trainer_id, member_id, is_active
-           FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true`,
+        `SELECT u.id, u.name, u.email, u.role, u.password, u.token_version,
+                u.trainer_id, u.member_id, u.is_active,
+                u.organization_id, o.name AS organization_name
+           FROM users u
+           LEFT JOIN organizations o ON o.id = u.organization_id
+          WHERE LOWER(u.email) = LOWER($1) AND u.is_active = true`,
         [email]
       );
       rows = result.rows;
@@ -123,12 +126,14 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // supported by the auth middleware) and a `refresh_token` body field.
     res.json({
       user: {
-        id:         user.id,
-        name:       user.name,
-        email:      user.email,
-        role:       user.role,
-        trainer_id: user.trainer_id,
-        member_id:  user.member_id,
+        id:                user.id,
+        name:              user.name,
+        email:             user.email,
+        role:              user.role,
+        trainer_id:        user.trainer_id,
+        member_id:         user.member_id,
+        organization_id:   user.organization_id,
+        organization_name: user.organization_name,
       },
       token,
       refresh_token: refreshToken,

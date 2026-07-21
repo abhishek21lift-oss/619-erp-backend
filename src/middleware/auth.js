@@ -64,20 +64,23 @@ async function auth(req, res, next) {
           // organization_id carries the tenant boundary onto req.user for the
           // multi-tenant isolation layer (migration 078).
           // SECURITY: filter out soft-deleted users (deleted_at IS NOT NULL).
-          `SELECT id, name, email, role, trainer_id, member_id, branch_id,
-                  organization_id, is_active, token_version
-             FROM users
-            WHERE id = $1
-              AND (deleted_at IS NULL)`,
+          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
+                  u.organization_id, o.name AS organization_name, u.is_active, u.token_version
+             FROM users u
+             LEFT JOIN organizations o ON o.id = u.organization_id
+            WHERE u.id = $1
+              AND (u.deleted_at IS NULL)`,
           [decoded.id]
         );
         rows = result.rows;
       } catch {
         // Fallback if deleted_at column doesn't exist (pre-migration)
         const result = await pool.query(
-          `SELECT id, name, email, role, trainer_id, member_id, branch_id,
-                  organization_id, is_active, token_version
-             FROM users WHERE id = $1`,
+          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
+                  u.organization_id, o.name AS organization_name, u.is_active, u.token_version
+             FROM users u
+             LEFT JOIN organizations o ON o.id = u.organization_id
+            WHERE u.id = $1`,
           [decoded.id]
         );
         rows = result.rows;
