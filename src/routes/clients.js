@@ -6,6 +6,7 @@ const { genReceiptNo } = require('../db/receipts');
 const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { clientSchemas } = require('../lib/validation');
+const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 const { generateClientId, generateMemberCode } = require('../db/id-gen');
 
@@ -60,6 +61,16 @@ router.get('/', auth, async (req, res, next) => {
     // soft-deleted rows.
     if (req.query.include_deleted !== '1') {
       conditions.push('COALESCE(c.deleted_at, NULL) IS NULL');
+    }
+
+    // Multi-tenant isolation (Phase 1): tenant users only ever see their own
+    // organization's clients. Super admins see all, or a targeted org via the
+    // x-org-id header. A tenant user with no org resolves to NULL, which
+    // matches no rows — fail closed rather than leak.
+    const scope = tenantScope(req);
+    if (scope.applyFilter) {
+      conditions.push(`c.organization_id = $${p++}`);
+      params.push(scope.orgId);
     }
 
     // Scope trainer to own clients only
@@ -133,13 +144,23 @@ router.get('/search', auth, async (req, res, next) => {
     if (!q) return res.json([]);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
     const searchParam = `%${q}%`;
-    const { sql: bsql, params: bparams } = req.branchScope.appendTo([searchParam]);
+
+    // Multi-tenant isolation (Phase 1) — see GET / for the rules.
+    const scope = tenantScope(req);
+    const baseParams = [searchParam];
+    let orgClause = '';
+    if (scope.applyFilter) {
+      baseParams.push(scope.orgId);
+      orgClause = ` AND c.organization_id = $${baseParams.length}`;
+    }
+
+    const { sql: bsql, params: bparams } = req.branchScope.appendTo(baseParams);
     const { rows } = await pool.query(
       `SELECT c.*, t.name as computed_trainer_name
        FROM (SELECT pc.*, NULL::text AS branch_id FROM pt_clients pc) c
        LEFT JOIN trainers t ON t.id = c.trainer_id
        WHERE COALESCE(c.deleted_at, NULL) IS NULL
-         AND (c.name ILIKE $1 OR c.mobile ILIKE $1 OR c.client_id ILIKE $1 OR c.email ILIKE $1)
+         AND (c.name ILIKE $1 OR c.mobile ILIKE $1 OR c.client_id ILIKE $1 OR c.email ILIKE $1)${orgClause}
          AND c.${bsql}
        ORDER BY c.created_at DESC LIMIT $${bparams.length + 1}`,
       [...bparams, limit]
@@ -155,10 +176,20 @@ router.get('/search', auth, async (req, res, next) => {
 //   Fans the four queries out in parallel — was sequential before.
 router.get('/:id', auth, async (req, res, next) => {
   try {
+    // Multi-tenant isolation (Phase 1): a client from another organization is
+    // invisible — the query returns nothing, so it 404s exactly like a
+    // non-existent id (prevents cross-tenant IDOR).
+    const scope = tenantScope(req);
+    const idParams = [req.params.id];
+    let orgClause = '';
+    if (scope.applyFilter) {
+      idParams.push(scope.orgId);
+      orgClause = ` AND c.organization_id = $${idParams.length}`;
+    }
     const { rows } = await pool.query(
       `SELECT c.*, t.name as trainer_full_name, t.mobile as trainer_mobile
        FROM pt_clients c LEFT JOIN trainers t ON t.id = c.trainer_id
-       WHERE c.id = $1`, [req.params.id]
+       WHERE c.id = $1${orgClause}`, idParams
     );
     if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
 

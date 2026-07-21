@@ -8,6 +8,7 @@ const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
 const { generateClientId } = require('../../db/id-gen');
+const { orgIdOf } = require('../../lib/tenant-db');
 
 const ptClientCreateSchema = {
   body: z.object({
@@ -172,15 +173,18 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
 
     let cid = client_id;
     if (!cid) {
+      // Multi-tenant isolation (Phase 1): stamp the creator's organization so
+      // the new client is only ever visible within that tenant's workspace.
       const { rows: [newCli] } = await pool.query(`
         INSERT INTO pt_clients
           (name, gender, mobile, email, dob, status, joining_date,
-           whatsapp, occupation, emergency_contact, emergency_phone, address)
-        VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$8,$9,$10,$11)
+           whatsapp, occupation, emergency_contact, emergency_phone, address, organization_id)
+        VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$8,$9,$10,$11,$12)
         RETURNING id
       `, [
         name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date(),
         whatsapp || null, occupation || null, emergency_contact || null, emergency_phone || null, address || null,
+        orgIdOf(req),
       ]);
       cid = newCli.id;
     }
