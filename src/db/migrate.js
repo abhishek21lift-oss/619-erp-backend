@@ -17,6 +17,42 @@ const pool = require('./pool');
  */
 const LOCK_ID = 619619619; // Unique advisory lock for 619 ERP migrations
 
+/**
+ * Terminate any *orphaned* holder of the migration advisory lock.
+ *
+ * A session-level advisory lock survives a SIGKILL'd boot: the pooled backend
+ * behind Supavisor lingers, still holding the lock, and blocks every later
+ * boot until it's reaped (which can take minutes and fail the deploy). Such a
+ * holder is idle — it grabbed the lock and then its client vanished. We
+ * terminate ONLY holders that are idle (or idle-in-transaction) and have been
+ * so for a while, so a peer instance that is actively migrating (state
+ * 'active', or briefly between fast sub-second statements) is never touched.
+ * pg_advisory_lock(bigint) with a key < 2^32 stores classid=0, objid=key.
+ */
+async function clearStaleLock(client) {
+  try {
+    const { rows } = await client.query(
+      `SELECT a.pid
+         FROM pg_locks l
+         JOIN pg_stat_activity a ON a.pid = l.pid
+        WHERE l.locktype = 'advisory'
+          AND l.classid = 0 AND l.objid = $1 AND l.objsubid = 1
+          AND a.pid <> pg_backend_pid()
+          AND a.state IN ('idle', 'idle in transaction')
+          AND a.state_change < now() - interval '15 seconds'`,
+      [LOCK_ID]
+    );
+    for (const r of rows) {
+      const { rows: k } = await client.query('SELECT pg_terminate_backend($1) AS ok', [r.pid]);
+      if (k[0].ok) console.log(`  ⚠ terminated stale migration-lock holder (pid ${r.pid})`);
+    }
+    return rows.length;
+  } catch (err) {
+    console.warn(`  … could not check/clear stale migration lock: ${err.message}`);
+    return 0;
+  }
+}
+
 async function runMigrations() {
   const client = await pool.connect();
   let holdsLock = false;
@@ -35,6 +71,10 @@ async function runMigrations() {
       const { rows } = await client.query('SELECT pg_try_advisory_lock($1) AS ok', [LOCK_ID]);
       if (rows[0].ok) { holdsLock = true; break; }
       console.log(`  … migration lock held by another instance, retry ${attempt}/15`);
+      // After a few failed tries the holder is likely orphaned, not a live
+      // migrator — actively terminate it so we don't wait out the full window
+      // (and fail the deploy) for a lock nobody will ever release.
+      if (attempt >= 3) await clearStaleLock(client);
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
     if (!holdsLock) {
