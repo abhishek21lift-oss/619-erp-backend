@@ -19,7 +19,14 @@ const PATH_TRAVERSAL_RE = /\.\.[/\\]/;
 
 function sanitizeValue(v) {
   if (typeof v !== 'string') return v;
-  return v.replace(NULL_BYTE_RE, '').slice(0, MAX_STRING_LENGTH);
+  const stripped = v.replace(NULL_BYTE_RE, '');
+  // Data URLs (signature captures, inline image uploads, etc.) are legitimately
+  // far longer than normal text fields. Truncating one mid-stream corrupts the
+  // payload — a chopped base64 PNG can no longer be decoded, which is exactly
+  // what broke signature rendering in the consent/PAR-Q PDFs. The JSON body-size
+  // limit already bounds total request size, so pass data URLs through uncapped.
+  if (stripped.startsWith('data:')) return stripped;
+  return stripped.slice(0, MAX_STRING_LENGTH);
 }
 
 function sanitizeObj(obj) {
