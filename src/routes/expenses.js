@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 
 // GET /api/expenses — list expenses with optional filters
 // ISSUE-030: excludes soft-deleted rows (deleted_at IS NULL).
@@ -20,6 +21,9 @@ router.get('/', auth, async (req, res, next) => {
     if (to)       { conditions.push(`expense_date <= $${p++}`); params.push(to); }
     if (category) { conditions.push(`category = $${p++}`);      params.push(category); }
     if (status)   { conditions.push(`status = $${p++}`);        params.push(status); }
+
+    const scope = tenantScope(req);
+    if (scope.applyFilter) { conditions.push(`e.organization_id = $${p++}`); params.push(scope.orgId); }
 
     params.push(Math.min(parseInt(qLimit) || 200, 1000));
     params.push(parseInt(offset) || 0);
@@ -57,6 +61,9 @@ router.get('/stats', auth, async (req, res, next) => {
     if (from) { conditions.push(`expense_date >= $${p++}`); params.push(from); }
     if (to)   { conditions.push(`expense_date <= $${p++}`); params.push(to); }
 
+    const scope = tenantScope(req);
+    if (scope.applyFilter) { conditions.push(`e.organization_id = $${p++}`); params.push(scope.orgId); }
+
     const { rows: totals } = await pool.query(
       `SELECT
          COUNT(*) AS total_expenses,
@@ -91,8 +98,8 @@ router.post('/', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'description is required' });
 
     const { rows } = await pool.query(
-      `INSERT INTO expenses (category, description, amount, expense_date, payment_method, receipt_url, notes, created_by, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `INSERT INTO expenses (category, description, amount, expense_date, payment_method, receipt_url, notes, created_by, status, organization_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        RETURNING *`,
       [
         d.category || 'other',
@@ -104,6 +111,7 @@ router.post('/', auth, async (req, res, next) => {
         d.notes || null,
         req.user.id,
         d.status || 'approved',
+        orgIdOf(req),
       ]
     );
     res.status(201).json({ message: 'Expense created', expense: rows[0] });
@@ -116,12 +124,14 @@ router.post('/', auth, async (req, res, next) => {
 // ISSUE-030: excludes soft-deleted rows.
 router.get('/:id', auth, async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const guard = scope.applyFilter ? ' AND e.organization_id = $2' : '';
     const { rows } = await pool.query(
       `SELECT e.*, u.name AS created_by_name
        FROM expenses e
        LEFT JOIN users u ON u.id = e.created_by
-       WHERE e.id = $1 AND e.deleted_at IS NULL`,
-      [req.params.id]
+       WHERE e.id = $1 AND e.deleted_at IS NULL${guard}`,
+      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Expense not found' });
     res.json(rows[0]);
@@ -134,8 +144,11 @@ router.get('/:id', auth, async (req, res, next) => {
 // ISSUE-030: also checks deleted_at IS NULL so soft-deleted expenses cannot be updated.
 router.put('/:id', auth, async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const existGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
     const { rows: existing } = await pool.query(
-      'SELECT * FROM expenses WHERE id = $1 AND deleted_at IS NULL', [req.params.id]
+      'SELECT * FROM expenses WHERE id = $1 AND deleted_at IS NULL' + existGuard,
+      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
     );
     if (!existing[0]) return res.status(404).json({ error: 'Expense not found' });
 
@@ -172,8 +185,11 @@ router.put('/:id', auth, async (req, res, next) => {
 // ISSUE-030: changed from hard DELETE to soft delete via deleted_at timestamp.
 router.delete('/:id', auth, async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const existGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
     const { rows: existing } = await pool.query(
-      'SELECT * FROM expenses WHERE id = $1 AND deleted_at IS NULL', [req.params.id]
+      'SELECT * FROM expenses WHERE id = $1 AND deleted_at IS NULL' + existGuard,
+      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
     );
     if (!existing[0]) return res.status(404).json({ error: 'Expense not found' });
 
