@@ -65,12 +65,16 @@ async function getTrainerPayouts(month) {
   return rows;
 }
 
-async function getBalanceSheet(trainerId) {
+async function getBalanceSheet(trainerId, scope = {}) {
   const where = [];
   const params = [];
   if (trainerId) {
     params.push(trainerId);
     where.push(`c.trainer_id = $${params.length}`);
+  }
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    where.push(`c.organization_id = $${params.length}`);
   }
   const whereSql = where.length ? `AND ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(`
@@ -101,7 +105,7 @@ async function getBalanceSheet(trainerId) {
   return rows;
 }
 
-async function getActiveClients(trainerId) {
+async function getActiveClients(trainerId, scope = {}) {
   // Returns ALL non-deleted PT clients so the "All Clients" page can show
   // every status. The frontend applies its own status filter on top.
   const where = ['c.deleted_at IS NULL'];
@@ -109,6 +113,10 @@ async function getActiveClients(trainerId) {
   if (trainerId) {
     params.push(trainerId);
     where.push(`c.trainer_id = $${params.length}`);
+  }
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    where.push(`c.organization_id = $${params.length}`);
   }
   const { rows } = await pool.query(`
     SELECT c.id, c.unique_id, c.client_id, c.name, c.gender, c.mobile, c.email,
@@ -137,7 +145,15 @@ async function getActiveClients(trainerId) {
   return rows;
 }
 
-async function getDashboardStats() {
+async function getDashboardStats(scope = {}) {
+  // Tenant scope: filter every aggregate to the caller's org. $1 (when present)
+  // is the org id; bare `organization_id` for single-table queries, aliased
+  // `c.organization_id` for the trainer/client join.
+  const apply = Boolean(scope.applyFilter);
+  const orgParams = apply ? [scope.orgId] : [];
+  const orgBare = apply ? ' AND organization_id = $1' : '';
+  const orgC = apply ? ' AND c.organization_id = $1' : '';
+
   const { rows: [totals] } = await pool.query(`
     SELECT
       COUNT(*) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL)::INT AS active_pt_clients,
@@ -146,8 +162,8 @@ async function getDashboardStats() {
       COALESCE(SUM(trainer_commission) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL), 0) AS total_monthly_commission,
       COALESCE(SUM(balance_amount), 0) AS total_outstanding
     FROM pt_clients
-    WHERE deleted_at IS NULL
-  `);
+    WHERE deleted_at IS NULL${orgBare}
+  `, orgParams);
 
   // ISSUE-005: use actual collected payments (pt_payments) for current-month
   // revenue, not the contracted monthly_pt_amount from pt_clients.
@@ -156,8 +172,8 @@ async function getDashboardStats() {
     FROM pt_payments
     WHERE date >= date_trunc('month', CURRENT_DATE)
       AND date < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
-      AND deleted_at IS NULL
-  `);
+      AND deleted_at IS NULL${orgBare}
+  `, orgParams);
   totals.total_monthly_pt_revenue = revenueRow.total_monthly_pt_revenue;
 
   const { rows: trainerStats } = await pool.query(`
@@ -167,11 +183,11 @@ async function getDashboardStats() {
       COALESCE(SUM(c.monthly_pt_amount) FILTER (WHERE c.status = 'active'), 0) AS monthly_revenue,
       COALESCE(SUM(c.trainer_commission) FILTER (WHERE c.status = 'active'), 0) AS monthly_commission
     FROM pt_trainers t
-    LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL
+    LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL${orgC}
     WHERE t.deleted_at IS NULL AND t.status = 'active'
     GROUP BY t.id, t.name
     ORDER BY active_clients DESC
-  `);
+  `, orgParams);
 
   const { rows: revenueTrend } = await pool.query(`
     SELECT
@@ -181,10 +197,10 @@ async function getDashboardStats() {
       COALESCE(SUM(incentive_amt), 0) AS incentives
     FROM pt_payments
     WHERE date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '5 months')
-      AND deleted_at IS NULL
+      AND deleted_at IS NULL${orgBare}
     GROUP BY DATE_TRUNC('month', date)
     ORDER BY month ASC
-  `);
+  `, orgParams);
 
   return { ...totals, trainers: trainerStats, revenueTrend };
 }
@@ -273,8 +289,15 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) 
  *   session_stats    — this-month vs last-month completed session counts
  *   trainer_sessions — per-trainer session totals this month
  */
-async function getOpsSummary() {
+async function getOpsSummary(scope = {}) {
   const today = new Date().toISOString().slice(0, 10);
+  // Tenant scope: $1 is always `today`; when filtering, $2 is the org id.
+  const apply = Boolean(scope.applyFilter);
+  const orgS = apply ? ' AND s.organization_id = $2' : '';   // aliased pt_sessions
+  const sessParams = apply ? [today, scope.orgId] : [today];
+  // For queries whose only param is the org id (bare table, $1).
+  const orgBare1 = apply ? ' AND organization_id = $1' : '';
+  const bareParams = apply ? [scope.orgId] : [];
 
   const { rows: today_sessions } = await pool.query(`
     SELECT
@@ -285,9 +308,9 @@ async function getOpsSummary() {
     FROM pt_sessions s
     LEFT JOIN pt_clients c  ON c.id = s.client_id
     LEFT JOIN pt_trainers t ON t.id = s.trainer_id
-    WHERE s.session_date = $1 AND s.deleted_at IS NULL
+    WHERE s.session_date = $1 AND s.deleted_at IS NULL${orgS}
     ORDER BY COALESCE(s.start_time, '00:00'::TIME)
-  `, [today]);
+  `, sessParams);
 
   const { rows: renewals_due } = await pool.query(`
     SELECT
@@ -300,10 +323,10 @@ async function getOpsSummary() {
     WHERE deleted_at IS NULL
       AND status = 'active'
       AND pt_end_date IS NOT NULL
-      AND pt_end_date::DATE BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+      AND pt_end_date::DATE BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'${orgBare1}
     ORDER BY pt_end_date ASC
     LIMIT 15
-  `);
+  `, bareParams);
 
   const { rows: top_dues } = await pool.query(`
     SELECT
@@ -311,10 +334,10 @@ async function getOpsSummary() {
       pt_end_date::TEXT,
       CASE WHEN pt_end_date IS NOT NULL AND pt_end_date::DATE < CURRENT_DATE THEN 'overdue' ELSE 'due' END AS due_status
     FROM pt_clients
-    WHERE deleted_at IS NULL AND balance_amount > 0
+    WHERE deleted_at IS NULL AND balance_amount > 0${orgBare1}
     ORDER BY balance_amount DESC
     LIMIT 5
-  `);
+  `, bareParams);
 
   const { rows: [session_stats] } = await pool.query(`
     SELECT
@@ -333,8 +356,8 @@ async function getOpsSummary() {
           AND status = 'completed'
       )::INT AS last_month_completed
     FROM pt_sessions
-    WHERE deleted_at IS NULL
-  `);
+    WHERE deleted_at IS NULL${orgBare1}
+  `, bareParams);
 
   const { rows: trainer_sessions } = await pool.query(`
     SELECT

@@ -80,7 +80,7 @@ router.post('/trainers', auth, adminOnly, wrap(async (req, res) => {
 
 // ─── Dashboard stats ─────────────────────────────────────────
 router.get('/dashboard', auth, wrap(async (req, res) => {
-  const stats = await svc.getDashboardStats();
+  const stats = await svc.getDashboardStats(tenantScope(req));
   res.json({ data: stats });
 }));
 
@@ -88,7 +88,7 @@ router.get('/dashboard', auth, wrap(async (req, res) => {
 router.get('/clients', auth, wrap(async (req, res) => {
   const trainerId = req.query.trainer_id;
   const tid = req.user.role === 'trainer' ? req.user.trainer_id : trainerId;
-  const rows = await svc.getActiveClients(tid);
+  const rows = await svc.getActiveClients(tid, tenantScope(req));
   res.json({ data: rows, total: rows.length });
 }));
 
@@ -559,7 +559,7 @@ router.get('/clients/:id/subscriptions', auth, wrap(async (req, res) => {
 // ─── Balance sheet ──────────────────────────────────────────
 router.get('/balance-sheet', auth, wrap(async (req, res) => {
   const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : req.query.trainer_id;
-  const rows = await svc.getBalanceSheet(trainerId);
+  const rows = await svc.getBalanceSheet(trainerId, tenantScope(req));
   res.json({ data: rows, total: rows.length, total_outstanding: rows.reduce((s, r) => s + Number(r.balance_amount), 0) });
 }));
 
@@ -1004,7 +1004,7 @@ router.post('/clients/merge-duplicates', auth, adminOnly, wrap(async (req, res) 
 
 // ─── Operations Summary (today's sessions, renewals, dues) ──────────────────
 router.get('/dashboard/ops', auth, wrap(async (req, res) => {
-  const data = await svc.getOpsSummary();
+  const data = await svc.getOpsSummary(tenantScope(req));
   res.json({ data });
 }));
 
