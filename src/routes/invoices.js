@@ -3,6 +3,7 @@ const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 
 // GET /api/invoices — List invoices
@@ -12,6 +13,10 @@ router.get('/', auth, async (req, res, next) => {
     const conds = [];
     const params = [];
     let p = 1;
+
+    // Multi-tenant isolation: only the caller's org's invoices.
+    const scope = tenantScope(req);
+    if (scope.applyFilter) { conds.push(`i.organization_id = $${p++}`); params.push(scope.orgId); }
 
     if (status && status !== 'all') {
       conds.push(`i.status = $${p++}`);
@@ -44,7 +49,9 @@ router.get('/', auth, async (req, res, next) => {
       [...params, parseInt(limit), parseInt(offset)]
     );
 
-    // Stats
+    // Stats (same tenant scope as the list)
+    const statsWhere  = scope.applyFilter ? 'WHERE organization_id = $1' : '';
+    const statsParams = scope.applyFilter ? [scope.orgId] : [];
     const { rows: stats } = await pool.query(`
       SELECT
         COUNT(*)::int AS total,
@@ -52,7 +59,8 @@ router.get('/', auth, async (req, res, next) => {
         COALESCE(SUM(total_amount) FILTER (WHERE status IN ('draft','sent','partial')), 0) AS pending,
         COALESCE(SUM(total_amount) FILTER (WHERE status = 'overdue'), 0) AS overdue
       FROM invoices
-    `);
+      ${statsWhere}
+    `, statsParams);
 
     res.json({ invoices: rows, stats: stats[0] });
   } catch (err) {
@@ -63,6 +71,9 @@ router.get('/', auth, async (req, res, next) => {
 // GET /api/invoices/:id
 router.get('/:id', auth, async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const guard = scope.applyFilter ? ' AND i.organization_id = $2' : '';
+    const params = scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id];
     const { rows } = await pool.query(`
       SELECT i.*,
         COALESCE((SELECT json_agg(json_build_object(
@@ -73,7 +84,7 @@ router.get('/:id', auth, async (req, res, next) => {
           'amount', ii.amount,
           'type', ii.type
         )) FROM invoice_items ii WHERE ii.invoice_id = i.id), '[]'::json) AS items
-      FROM invoices i WHERE i.id = $1`, [req.params.id]
+      FROM invoices i WHERE i.id = $1${guard}`, params
     );
     if (!rows[0]) return res.status(404).json({ error: 'Invoice not found' });
     res.json(rows[0]);
@@ -128,11 +139,11 @@ router.post('/', auth, async (req, res, next) => {
 
     await tx.query(`
       INSERT INTO invoices (id, invoice_no, client_id, client_name, amount, tax_amount, total_amount,
-        status, due_date, issue_date, payment_method, notes, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        status, due_date, issue_date, payment_method, notes, created_by, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
       [id, invNo, clientId, clientName, subtotal, taxAmt, total,
        d.status || 'draft', d.due_date || null, d.issue_date || new Date().toISOString().split('T')[0],
-       d.payment_method || null, d.notes || d.description || null, req.user.id]
+       d.payment_method || null, d.notes || d.description || null, req.user.id, orgIdOf(req)]
     );
 
     if (!isSimplified) {
@@ -170,8 +181,11 @@ router.post('/', auth, async (req, res, next) => {
 // PUT /api/invoices/:id — Update invoice
 router.put('/:id', auth, async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const gCol = scope.applyFilter ? ' AND organization_id = $2' : '';
+    const gParams = scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id];
     const { rows: ex } = await pool.query(
-      'SELECT * FROM invoices WHERE id=$1', [req.params.id]
+      `SELECT * FROM invoices WHERE id=$1${gCol}`, gParams
     );
     if (!ex[0]) return res.status(404).json({ error: 'Invoice not found' });
     if (ex[0].status === 'paid')
@@ -198,10 +212,13 @@ router.put('/:id', auth, async (req, res, next) => {
 // POST /api/invoices/:id/send — Mark as sent
 router.post('/:id/send', auth, async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+    const params = scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id];
     const { rows } = await pool.query(
       `UPDATE invoices SET status='sent', sent_at=NOW(), updated_at=NOW()
-       WHERE id=$1 AND status='draft' RETURNING *`,
-      [req.params.id]
+       WHERE id=$1 AND status='draft'${guard} RETURNING *`,
+      params
     );
     if (!rows[0]) return res.status(404).json({ error: 'Invoice not found or already sent' });
     res.json({ message: 'Invoice sent', invoice: rows[0] });
@@ -215,10 +232,13 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
   const tx = await pool.connect();
   try {
     await tx.query('BEGIN');
+    const scope = tenantScope(req);
+    const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+    const params = scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id];
     const { rows: inv } = await tx.query(
       `UPDATE invoices SET status='paid', paid_at=NOW(), paid_amount=total_amount, updated_at=NOW()
-       WHERE id=$1 AND status IN ('sent','draft','partial','overdue') RETURNING *`,
-      [req.params.id]
+       WHERE id=$1 AND status IN ('sent','draft','partial','overdue')${guard} RETURNING *`,
+      params
     );
     if (!inv[0]) { await tx.query('ROLLBACK'); return res.status(404).json({ error: 'Invoice not found or already paid' }); }
 
@@ -257,7 +277,10 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
 // POST /api/invoices/:id/remind
 router.post('/:id/remind', auth, async (req, res, next) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM invoices WHERE id=$1', [req.params.id]);
+    const scope = tenantScope(req);
+    const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+    const params = scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id];
+    const { rows } = await pool.query(`SELECT * FROM invoices WHERE id=$1${guard}`, params);
     if (!rows[0]) return res.status(404).json({ error: 'Invoice not found' });
     logger.info({ invoiceId: req.params.id, userId: req.user.id }, 'Payment reminder sent');
     res.json({ message: 'Reminder sent to ' + rows[0].client_name });
@@ -269,10 +292,13 @@ router.post('/:id/remind', auth, async (req, res, next) => {
 // POST /api/invoices/:id/cancel
 router.post('/:id/cancel', auth, async (req, res, next) => {
   try {
+    const scope = tenantScope(req);
+    const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+    const params = scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id];
     const { rows } = await pool.query(
       `UPDATE invoices SET status='cancelled', cancelled_at=NOW(), updated_at=NOW()
-       WHERE id=$1 AND status NOT IN ('paid','cancelled') RETURNING *`,
-      [req.params.id]
+       WHERE id=$1 AND status NOT IN ('paid','cancelled')${guard} RETURNING *`,
+      params
     );
     if (!rows[0]) return res.status(404).json({ error: 'Invoice not found or cannot be cancelled' });
     res.json({ message: 'Invoice cancelled', invoice: rows[0] });
