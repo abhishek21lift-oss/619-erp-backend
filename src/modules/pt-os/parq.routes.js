@@ -17,6 +17,7 @@ const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
 const { generateConsentPdf } = require('../../lib/parqPdf');
 const { saveFile } = require('../../lib/fileStorage');
+const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -204,6 +205,8 @@ router.get('/parq/forms', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = ['deleted_at IS NULL'];
   const params = [];
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
   if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const { rows } = await pool.query(
     `SELECT * FROM pt_parq_forms WHERE ${where.join(' AND ')} ORDER BY assessment_date DESC`, params
@@ -217,8 +220,11 @@ router.get('/parq/forms', auth, wrap(async (req, res) => {
 // the parent row in application code anyway).
 router.get('/parq/forms/:id', auth, wrap(async (req, res) => {
   const { id } = req.params;
+  const scope = tenantScope(req);
+  const formGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const formParams = scope.applyFilter ? [id, scope.orgId] : [id];
   const [formRes, familyRes, clearanceRes, consentRes, docsRes] = await Promise.all([
-    pool.query('SELECT * FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL', [id]),
+    pool.query(`SELECT * FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${formGuard}`, formParams),
     pool.query('SELECT * FROM pt_family_medical_history WHERE parq_form_id = $1 ORDER BY created_at', [id]),
     pool.query('SELECT * FROM pt_medical_clearances WHERE parq_form_id = $1 ORDER BY created_at DESC', [id]),
     pool.query('SELECT * FROM pt_consent_records WHERE parq_form_id = $1 ORDER BY created_at DESC', [id]),
@@ -241,9 +247,11 @@ router.get('/parq/forms/:id', auth, wrap(async (req, res) => {
 // GET /parq/forms/:id/gate-status — lightweight pre-check for the frontend
 // before showing the workout Assign button.
 router.get('/parq/forms/:id/gate-status', auth, wrap(async (req, res) => {
+  const scope = tenantScope(req);
+  const gsGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
   const { rows } = await pool.query(
-    'SELECT workout_gate_status, risk_level FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL',
-    [req.params.id]
+    `SELECT workout_gate_status, risk_level FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${gsGuard}`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ data: rows[0] });
@@ -270,7 +278,7 @@ router.post('/parq/forms', auth, requireRole('admin', 'manager', 'trainer'), val
          risk_level, risk_message,
          trainer_notes,
          status, workout_gate_status,
-         created_by
+         created_by, organization_id
        ) VALUES (
          $1, COALESCE($2, CURRENT_DATE), (SELECT COUNT(*)+1 FROM pt_parq_forms WHERE client_id = $1),
          $3,$4,$5,$6,$7,$8,$9,$10,
@@ -280,7 +288,7 @@ router.post('/parq/forms', auth, requireRole('admin', 'manager', 'trainer'), val
          $19,$20,
          $21::jsonb,
          $22,$23,
-         $24
+         $24,$25
        ) RETURNING id`,
       [
         b.client_id, b.assessment_date || null,
@@ -293,7 +301,7 @@ router.post('/parq/forms', auth, requireRole('admin', 'manager', 'trainer'), val
         analysis.riskLevel, analysis.riskMessage,
         b.trainer_notes ? JSON.stringify(b.trainer_notes) : null,
         b.status || 'submitted', gateStatus,
-        req.user.id,
+        req.user.id, orgIdOf(req),
       ]
     );
     formId = rows[0].id;
@@ -338,8 +346,11 @@ router.patch('/parq/forms/:id', auth, requireRole('admin', 'manager', 'trainer')
   let formId;
   try {
     await tx.query('BEGIN');
+    const scope = tenantScope(req);
+    const upGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
     const { rows: existingRows } = await tx.query(
-      'SELECT * FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [id]
+      `SELECT * FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${upGuard} FOR UPDATE`,
+      scope.applyFilter ? [id, scope.orgId] : [id]
     );
     const existing = existingRows[0];
     if (!existing) {
@@ -412,8 +423,11 @@ router.patch('/parq/forms/:id', auth, requireRole('admin', 'manager', 'trainer')
 // POST /parq/forms/:formId/clearance
 router.post('/parq/forms/:formId/clearance', auth, requireRole('admin', 'manager', 'trainer'), validate(clearanceCreateSchema), wrap(async (req, res) => {
   const { formId } = req.params;
+  const scope = tenantScope(req);
+  const clGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
   const { rows: formRows } = await pool.query(
-    'SELECT client_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL', [formId]
+    `SELECT client_id, organization_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${clGuard}`,
+    scope.applyFilter ? [formId, scope.orgId] : [formId]
   );
   const form = formRows[0];
   if (!form) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -422,11 +436,12 @@ router.post('/parq/forms/:formId/clearance', auth, requireRole('admin', 'manager
   const { rows } = await pool.query(
     `INSERT INTO pt_medical_clearances (
        parq_form_id, client_id, doctor_name, hospital, clearance_date,
-       certificate_url, doctor_contact, expiry_date, approval_status
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+       certificate_url, doctor_contact, expiry_date, approval_status, organization_id
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
     [
       formId, form.client_id, b.doctor_name || null, b.hospital || null, b.clearance_date || null,
       b.certificate_url || null, b.doctor_contact || null, b.expiry_date || null, b.approval_status || 'pending',
+      form.organization_id,
     ]
   );
 
@@ -438,7 +453,12 @@ router.post('/parq/forms/:formId/clearance', auth, requireRole('admin', 'manager
 router.patch('/parq/clearance/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
   const allowed = ['doctor_name', 'hospital', 'clearance_date', 'certificate_url', 'doctor_contact', 'expiry_date', 'approval_status'];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_medical_clearances WHERE id = $1', [req.params.id]);
+  const scope = tenantScope(req);
+  const mcGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_medical_clearances WHERE id = $1${mcGuard}`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -487,8 +507,11 @@ router.patch('/parq/clearance/:id', auth, requireRole('admin', 'manager', 'train
 // record for a PT client they have no association with).
 router.post('/parq/forms/:formId/consent', auth, requireRole('admin', 'manager', 'trainer'), validate(consentCreateSchema), wrap(async (req, res) => {
   const { formId } = req.params;
+  const scope = tenantScope(req);
+  const coGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
   const { rows: formRows } = await pool.query(
-    'SELECT client_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL', [formId]
+    `SELECT client_id, organization_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${coGuard}`,
+    scope.applyFilter ? [formId, scope.orgId] : [formId]
   );
   const form = formRows[0];
   if (!form) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -511,11 +534,11 @@ router.post('/parq/forms/:formId/consent', auth, requireRole('admin', 'manager',
   const { rows } = await pool.query(
     `INSERT INTO pt_consent_records (
        parq_form_id, client_id, consent_checkboxes, client_signature, trainer_signature,
-       client_signed_at, trainer_signed_at, ip_address, device, browser, location
-     ) VALUES ($1,$2,$3::jsonb,$4,$5,NOW(),NOW(),$6,$7,$8,$9) RETURNING *`,
+       client_signed_at, trainer_signed_at, ip_address, device, browser, location, organization_id
+     ) VALUES ($1,$2,$3::jsonb,$4,$5,NOW(),NOW(),$6,$7,$8,$9,$10) RETURNING *`,
     [
       formId, form.client_id, JSON.stringify(checkboxes), b.client_signature || null, b.trainer_signature || null,
-      req.ip || null, device, browser, b.location || null,
+      req.ip || null, device, browser, b.location || null, form.organization_id,
     ]
   );
   let consentRecord = rows[0];
@@ -579,8 +602,11 @@ router.post('/parq/forms/:formId/documents', auth, requireRole('admin', 'manager
   if (!req.file) return res.status(400).json({ error: 'File is required' });
 
   const { formId } = req.params;
+  const scope = tenantScope(req);
+  const dGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
   const { rows: formRows } = await pool.query(
-    'SELECT client_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL', [formId]
+    `SELECT client_id, organization_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${dGuard}`,
+    scope.applyFilter ? [formId, scope.orgId] : [formId]
   );
   const form = formRows[0];
   if (!form) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -596,9 +622,9 @@ router.post('/parq/forms/:formId/documents', auth, requireRole('admin', 'manager
   const fileUrl = await saveFile('parq', filename, req.file.buffer, detected.mime);
 
   const { rows } = await pool.query(
-    `INSERT INTO pt_parq_documents (parq_form_id, client_id, doc_type, file_name, file_url, mime_type, size_bytes, uploaded_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [formId, form.client_id, docType, req.file.originalname || filename, fileUrl, detected.mime, req.file.size, req.user.id]
+    `INSERT INTO pt_parq_documents (parq_form_id, client_id, doc_type, file_name, file_url, mime_type, size_bytes, uploaded_by, organization_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [formId, form.client_id, docType, req.file.originalname || filename, fileUrl, detected.mime, req.file.size, req.user.id, form.organization_id]
   );
   res.status(201).json({ data: rows[0] });
 }));

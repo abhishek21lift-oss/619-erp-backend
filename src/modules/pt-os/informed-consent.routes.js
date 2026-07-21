@@ -18,6 +18,7 @@ const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
 const { generateInformedConsentPdf } = require('../../lib/informedConsentPdf');
 const { saveFile } = require('../../lib/fileStorage');
+const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -107,6 +108,8 @@ router.get('/informed-consent', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = [];
   const params = [];
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
   if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
@@ -117,7 +120,12 @@ router.get('/informed-consent', auth, wrap(async (req, res) => {
 
 // GET /informed-consent/:id
 router.get('/informed-consent/:id', auth, wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM pt_informed_consents WHERE id = $1', [req.params.id]);
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows } = await pool.query(
+    `SELECT * FROM pt_informed_consents WHERE id = $1${guard}`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+  );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ data: rows[0] });
 }));
@@ -126,6 +134,15 @@ router.get('/informed-consent/:id', auth, wrap(async (req, res) => {
 // table (see src/lib/activityLog.js); scoped by entity rather than by
 // user, unlike GET /profile/activity.
 router.get('/informed-consent/:id/activity', auth, wrap(async (req, res) => {
+  // Gate on the parent consent's org — activity_log has no org column.
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: owner } = await pool.query(
+    `SELECT id FROM pt_informed_consents WHERE id = $1${guard}`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+  );
+  if (!owner[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
   const { rows } = await pool.query(
     `SELECT id, user_id, user_name, action, new_data, ip_address, created_at
        FROM activity_log
@@ -155,13 +172,13 @@ router.post('/informed-consent', auth, requireRole('admin', 'manager', 'trainer'
     `INSERT INTO pt_informed_consents (
        client_id, trainer_id, status,
        full_name, gender, dob, mobile, email, emergency_contact, emergency_phone, address, occupation,
-       created_by
-     ) VALUES ($1,$2,'draft',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+       created_by, organization_id
+     ) VALUES ($1,$2,'draft',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
     [
       b.client_id, snapshot.trainer_id || null,
       values.full_name, values.gender, values.dob, values.mobile, values.email,
       values.emergency_contact, values.emergency_phone, values.address, values.occupation,
-      req.user.id,
+      req.user.id, orgIdOf(req),
     ]
   );
   const record = rows[0];
@@ -189,8 +206,11 @@ router.patch('/informed-consent/:id', auth, requireRole('admin', 'manager', 'tra
   const tx = await pool.connect();
   try {
     await tx.query('BEGIN');
+    const scope = tenantScope(req);
+    const upGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
     const { rows: existingRows } = await tx.query(
-      'SELECT * FROM pt_informed_consents WHERE id = $1 FOR UPDATE', [id]
+      `SELECT * FROM pt_informed_consents WHERE id = $1${upGuard} FOR UPDATE`,
+      scope.applyFilter ? [id, scope.orgId] : [id]
     );
     const existing = existingRows[0];
     if (!existing) { await tx.query('ROLLBACK'); return res.status(404).json({ error: { code: 'NOT_FOUND' } }); }
@@ -209,12 +229,12 @@ router.patch('/informed-consent/:id', auth, requireRole('admin', 'manager', 'tra
            client_id, trainer_id, version, previous_version_id, status,
            full_name, gender, dob, mobile, email, emergency_contact, emergency_phone, address, occupation,
            acknowledgements, physician_advised_against, physician_name, hospital, medical_condition,
-           created_by
+           created_by, organization_id
          )
          SELECT client_id, trainer_id, version + 1, id, 'draft',
                 full_name, gender, dob, mobile, email, emergency_contact, emergency_phone, address, occupation,
                 acknowledgements, physician_advised_against, physician_name, hospital, medical_condition,
-                $2
+                $2, organization_id
            FROM pt_informed_consents WHERE id = $1
          RETURNING id`,
         [id, req.user.id]
@@ -268,7 +288,12 @@ router.patch('/informed-consent/:id', auth, requireRole('admin', 'manager', 'tra
 // generated.
 router.post('/informed-consent/:id/sign', auth, requireRole('admin', 'manager', 'trainer'), validate(signSchema), wrap(async (req, res) => {
   const { id } = req.params;
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_informed_consents WHERE id = $1', [id]);
+  const scope = tenantScope(req);
+  const signGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_informed_consents WHERE id = $1${signGuard}`,
+    scope.applyFilter ? [id, scope.orgId] : [id]
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   if (['completed', 'revoked', 'archived', 'expired'].includes(existing.status)) {
@@ -334,9 +359,11 @@ router.post('/informed-consent/:id/sign', auth, requireRole('admin', 'manager', 
 
 // POST /informed-consent/:id/revoke
 router.post('/informed-consent/:id/revoke', auth, requireRole('admin', 'manager'), wrap(async (req, res) => {
+  const scope = tenantScope(req);
+  const rvGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
   const { rows } = await pool.query(
-    `UPDATE pt_informed_consents SET status = 'revoked', updated_at = NOW() WHERE id = $1 RETURNING *`,
-    [req.params.id]
+    `UPDATE pt_informed_consents SET status = 'revoked', updated_at = NOW() WHERE id = $1${rvGuard} RETURNING *`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   await logActivity(req, 'informed_consent.revoke', 'pt_informed_consents', req.params.id, {});
@@ -377,7 +404,12 @@ router.post('/informed-consent/:id/medical-clearance', auth, requireRole('admin'
   if (!req.file) return res.status(400).json({ error: { code: 'FILE_REQUIRED' } });
 
   const { id } = req.params;
-  const { rows: existingRows } = await pool.query('SELECT id FROM pt_informed_consents WHERE id = $1', [id]);
+  const scope = tenantScope(req);
+  const mcGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: existingRows } = await pool.query(
+    `SELECT id FROM pt_informed_consents WHERE id = $1${mcGuard}`,
+    scope.applyFilter ? [id, scope.orgId] : [id]
+  );
   if (!existingRows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
   const detected = detectFileType(req.file.buffer);
