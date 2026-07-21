@@ -402,12 +402,14 @@ router.patch('/goals/:id', auth, wrap(async (req, res) => {
 router.get('/weekly-checkins', auth, wrap(async (req, res) => {
   const { client_id, limit } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const lim = Math.min(Math.max(parseInt(limit, 10) || 12, 1), 52);
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   params.push(lim);
   const { rows } = await pool.query(
-    `SELECT * FROM weekly_checkins ${whereSql} ORDER BY week_start_date DESC LIMIT $${where.length + 1}`, params
+    `SELECT * FROM weekly_checkins ${whereSql} ORDER BY week_start_date DESC LIMIT $${params.length}`, params
   );
   res.json({ data: rows });
 }));
@@ -416,8 +418,8 @@ router.post('/weekly-checkins', auth, wrap(async (req, res) => {
   const { client_id, week_start_date, weight, mood, sleep_hours, water_glasses, workout_count, calories_avg, adherence_pct, trainer_notes, client_notes } = req.body;
   const { rows } = await pool.query(
     `INSERT INTO weekly_checkins (client_id, week_start_date, weight, mood, sleep_hours, water_glasses,
-      workout_count, calories_avg, adherence_pct, trainer_notes, client_notes, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      workout_count, calories_avg, adherence_pct, trainer_notes, client_notes, created_by, organization_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
      ON CONFLICT (client_id, week_start_date) DO UPDATE SET
        weight = EXCLUDED.weight, mood = EXCLUDED.mood, sleep_hours = EXCLUDED.sleep_hours,
        water_glasses = EXCLUDED.water_glasses, workout_count = EXCLUDED.workout_count,
@@ -427,7 +429,7 @@ router.post('/weekly-checkins', auth, wrap(async (req, res) => {
      RETURNING *`,
     [client_id, week_start_date, num(weight, null), mood || null, num(sleep_hours, null),
      num(water_glasses, null), num(workout_count, 0), num(calories_avg, null),
-     num(adherence_pct, null), trainer_notes || null, client_notes || null, req.user.id]
+     num(adherence_pct, null), trainer_notes || null, client_notes || null, req.user.id, orgIdOf(req)]
   );
   res.status(201).json({ data: rows[0] });
 }));
@@ -435,13 +437,15 @@ router.post('/weekly-checkins', auth, wrap(async (req, res) => {
 router.get('/strength-logs', auth, wrap(async (req, res) => {
   const { client_id, exercise_name, limit } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
-  if (exercise_name) { params.push(exercise_name); where.push(`exercise_name = $${where.length + 1}`); }
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
+  if (exercise_name) { params.push(exercise_name); where.push(`exercise_name = $${params.length}`); }
   const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   params.push(lim);
   const { rows } = await pool.query(
-    `SELECT * FROM strength_logs ${whereSql} ORDER BY log_date DESC LIMIT $${where.length + 1}`, params
+    `SELECT * FROM strength_logs ${whereSql} ORDER BY log_date DESC LIMIT $${params.length}`, params
   );
   res.json({ data: rows });
 }));
@@ -468,10 +472,10 @@ router.post('/strength-logs', auth, requireRole('admin', 'manager', 'trainer'), 
     ? num(one_rm_estimate, null)
     : scoring.calc1RM(num(weight_kg), num(reps_done, 10), formula);
   const { rows } = await pool.query(
-    `INSERT INTO strength_logs (client_id, exercise_name, weight_kg, sets_done, reps_done, one_rm_estimate, notes, assessment_id, one_rm_formula, is_direct_1rm)
-     VALUES ($1,$2,$3,$4,$5,ROUND($6::NUMERIC,2),$7,$8,$9,$10) RETURNING *`,
+    `INSERT INTO strength_logs (client_id, exercise_name, weight_kg, sets_done, reps_done, one_rm_estimate, notes, assessment_id, one_rm_formula, is_direct_1rm, organization_id)
+     VALUES ($1,$2,$3,$4,$5,ROUND($6::NUMERIC,2),$7,$8,$9,$10,$11) RETURNING *`,
     [client_id, exercise_name, num(weight_kg), num(sets_done, 3), num(reps_done, 10), oneRm, notes || null,
-     assessment_id || null, formula, Boolean(is_direct_1rm)]
+     assessment_id || null, formula, Boolean(is_direct_1rm), orgIdOf(req)]
   );
   res.status(201).json({ data: rows[0] });
 }));
@@ -479,12 +483,14 @@ router.post('/strength-logs', auth, requireRole('admin', 'manager', 'trainer'), 
 router.get('/progress-photos', auth, wrap(async (req, res) => {
   const { client_id, limit } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   params.push(lim);
   const { rows } = await pool.query(
-    `SELECT * FROM progress_photos ${whereSql} ORDER BY taken_at DESC LIMIT $${where.length + 1}`, params
+    `SELECT * FROM progress_photos ${whereSql} ORDER BY taken_at DESC LIMIT $${params.length}`, params
   );
   res.json({ data: rows });
 }));
@@ -502,16 +508,21 @@ const progressPhotoCreateSchema = {
 router.post('/progress-photos', auth, requireRole('admin', 'manager', 'trainer'), validate(progressPhotoCreateSchema), wrap(async (req, res) => {
   const { client_id, photo_url, photo_type, taken_at, notes } = req.body;
   const { rows } = await pool.query(
-    `INSERT INTO progress_photos (client_id, photo_url, photo_type, taken_at, notes, uploaded_by)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    `INSERT INTO progress_photos (client_id, photo_url, photo_type, taken_at, notes, uploaded_by, organization_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
     [client_id, photo_url, photo_type || 'front', taken_at || new Date().toISOString().split('T')[0],
-     notes || null, req.user.id]
+     notes || null, req.user.id, orgIdOf(req)]
   );
   res.status(201).json({ data: rows[0] });
 }));
 
 router.delete('/progress-photos/:id', auth, wrap(async (req, res) => {
-  await pool.query('DELETE FROM progress_photos WHERE id = $1', [req.params.id]);
+  const scope = tenantScope(req);
+  if (scope.applyFilter) {
+    await pool.query('DELETE FROM progress_photos WHERE id = $1 AND organization_id = $2', [req.params.id, scope.orgId]);
+  } else {
+    await pool.query('DELETE FROM progress_photos WHERE id = $1', [req.params.id]);
+  }
   res.status(204).end();
 }));
 
