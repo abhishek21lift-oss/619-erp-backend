@@ -252,14 +252,17 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
        req.body.payment_method || 'CASH', receiptNo, 'Payment for invoice ' + inv[0].invoice_no]
     );
 
-    // Update the linked client's paid/balance fields so their financial record stays correct
+    // Update the linked client's paid/balance fields so their financial record
+    // stays correct. pt_clients is the live client table (the legacy `clients`
+    // table has been empty since PT-OS shipped), and invoices.client_id keys
+    // into it — so this is what actually reflects the payment on the client.
     if (inv[0].client_id) {
       await tx.query(`
-        UPDATE clients
-        SET paid_amount    = paid_amount + $1,
-            balance_amount = GREATEST(0, balance_amount - $1),
+        UPDATE pt_clients
+        SET paid_amount    = COALESCE(paid_amount, 0) + $1,
+            balance_amount = GREATEST(0, COALESCE(balance_amount, 0) - $1),
             updated_at     = NOW()
-        WHERE id = $2`,
+        WHERE id = $2 AND deleted_at IS NULL`,
         [inv[0].total_amount, inv[0].client_id]
       );
     }
