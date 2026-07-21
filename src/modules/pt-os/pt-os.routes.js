@@ -8,7 +8,7 @@ const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
 const { generateClientId } = require('../../db/id-gen');
-const { orgIdOf } = require('../../lib/tenant-db');
+const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
 
 const ptClientCreateSchema = {
   body: z.object({
@@ -686,6 +686,8 @@ router.get('/sessions', auth, wrap(async (req, res) => {
   const { trainer_id, date } = req.query;
   const where = ['s.deleted_at IS NULL'];
   const params = [];
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`s.organization_id = $${params.length}`); }
   if (trainer_id) { params.push(trainer_id); where.push(`s.trainer_id = $${params.length}`); }
   if (date) { params.push(date); where.push(`s.session_date = $${params.length}`); }
   const { rows } = await pool.query(`
@@ -738,10 +740,10 @@ router.post('/sessions', auth, wrap(async (req, res) => {
     const occDate = i === 0 ? date : addDaysToDate(date, 7 * i);
     const { rows } = await pool.query(
       `INSERT INTO pt_sessions (client_id, trainer_id, title, session_date, start_time, end_time,
-         notes, created_by, duration_minutes, session_type, recurrence_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+         notes, created_by, duration_minutes, session_type, recurrence_id, organization_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [cid, trainer_id, title || 'PT Session', occDate, start_time, computedEndTime, notes, req.user.id,
-       duration, session_type || '1-on-1', recurrenceId]
+       duration, session_type || '1-on-1', recurrenceId, orgIdOf(req)]
     );
     created.push(rows[0]);
   }
@@ -752,9 +754,11 @@ router.post('/sessions', auth, wrap(async (req, res) => {
 router.patch('/sessions/:id', auth, wrap(async (req, res) => {
   const { id } = req.params;
   const b = req.body;
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
   const { rows: existingRows } = await pool.query(
-    'SELECT start_time, duration_minutes FROM pt_sessions WHERE id = $1 AND deleted_at IS NULL',
-    [id]
+    `SELECT start_time, duration_minutes FROM pt_sessions WHERE id = $1 AND deleted_at IS NULL${guard}`,
+    scope.applyFilter ? [id, scope.orgId] : [id]
   );
   if (!existingRows[0]) return res.status(404).json({ error: 'Session not found' });
 
