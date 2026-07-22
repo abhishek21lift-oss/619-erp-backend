@@ -23,7 +23,7 @@ const authnLimiter = rateLimit({
   message: { error: 'Too many authentication attempts. Please wait 15 minutes.' },
 });
 
-const RP_NAME = process.env.RP_NAME || '619 Fitness';
+const RP_NAME = process.env.RP_NAME || 'MY PT STUDIO';
 const isProd  = process.env.NODE_ENV === 'production';
 
 // Derive rpId and expectedOrigin when env vars are not set.

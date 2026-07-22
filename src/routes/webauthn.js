@@ -11,7 +11,7 @@ const router = express.Router();
 const rateLimit = require('express-rate-limit');
 const authnLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many authentication attempts' } });
 
-const RP_NAME = process.env.RP_NAME || '619 Fitness';
+const RP_NAME = process.env.RP_NAME || 'MY PT STUDIO';
 const isProd = process.env.NODE_ENV === 'production';
 
 function getEffectiveRpId(req) {

@@ -27,7 +27,7 @@ async function generateInformedConsentPdf(record) {
     .text('Personal Training Informed Consent', { align: 'center' });
   doc.moveDown(0.3);
   doc.fontSize(10).font('Helvetica').fillColor('#6B7280')
-    .text('619 Fitness Studio', { align: 'center' });
+    .text('MY PT STUDIO', { align: 'center' });
   doc.moveDown();
 
   drawSectionHeading(doc, 'Client Details');

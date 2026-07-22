@@ -1,5 +1,5 @@
 -- ============================================================
--- 619 Fitness Studio ERP — Full Database Schema v4.0
+-- MY PT STUDIO ERP — Full Database Schema v4.0
 -- PostgreSQL 14+
 --
 -- Run order:
@@ -417,7 +417,7 @@ CREATE TABLE IF NOT EXISTS system_settings (
 );
 
 INSERT INTO system_settings (key, value, type, description) VALUES
-  ('gym_name',            '619 Fitness Studio', 'string', 'Studio display name'),
+  ('gym_name',            'MY PT STUDIO', 'string', 'Studio display name'),
   ('gym_phone',           '',                   'string', 'Contact phone number'),
   ('gym_address',         '',                   'string', 'Studio address'),
   ('currency',            'INR',                'string', 'Currency code'),

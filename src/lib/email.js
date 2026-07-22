@@ -41,7 +41,7 @@ async function sendPasswordReset(email, rawToken) {
     await getTransport().sendMail({
       from: FROM_ADDR,
       to: email,
-      subject: 'Password Reset — 619 Fitness Studio',
+      subject: 'Password Reset — MY PT STUDIO',
       html: `
         <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto">
           <h2 style="color:#e11d48">Password Reset Request</h2>
@@ -67,7 +67,7 @@ async function sendAdminResetOtp(email, otp) {
     await t.sendMail({
       from: FROM_ADDR,
       to: email,
-      subject: '619 ERP — Admin Data Reset OTP',
+      subject: 'MY PT STUDIO — Admin Data Reset OTP',
       text: `Your one-time code to confirm the data reset is: ${otp}\n\nThis code expires in 10 minutes. If you did not request this, ignore this email.`,
       html: `<p>Your one-time code to confirm the data reset is:</p><h2>${otp}</h2><p>This code expires in <strong>10 minutes</strong>. If you did not request this, ignore this email.</p>`,
     });

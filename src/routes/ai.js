@@ -1,5 +1,5 @@
 'use strict';
-// src/routes/ai.js — Multi-model AI routes for 619 Fitness ERP
+// src/routes/ai.js — Multi-model AI routes for MY PT STUDIO
 // All models are resolved from env vars; no hardcoded model names here.
 
 const express    = require('express');
@@ -805,7 +805,7 @@ router.get('/health', auth, async (req, res) => {
 router.post('/test', auth, requireConfigured, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
 
-  const { intent = 'chat', prompt = 'Say "619 Fitness AI is ready" and nothing else.' } = req.body || {};
+  const { intent = 'chat', prompt = 'Say "MY PT STUDIO AI is ready" and nothing else.' } = req.body || {};
   try {
     const start  = Date.now();
     const result = await routedChat({
