@@ -2,6 +2,16 @@
 const router = require('express').Router();
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { tenantScope } = require('../lib/tenant-db');
+
+// Null-safe tenant param: a tenant user gets their org id (queries then filter
+// `organization_id = $x`); a platform super admin operating platform-wide gets
+// NULL, and `$x IS NULL OR organization_id = $x` matches every row. A super
+// admin targeting one org via x-org-id gets that org id and is filtered.
+function orgParam(req) {
+  const scope = tenantScope(req);
+  return scope.applyFilter ? scope.orgId : null;
+}
 
 // GET /api/reports/monthly
 // ISSUE-029: UNIONs gym payments with PT payments so the monthly
@@ -13,6 +23,10 @@ router.get('/monthly', auth, async (req, res, next) => {
     const tid = isTrainer ? req.user.trainer_id : null;
     const params = tid ? [parseInt(year), tid] : [parseInt(year)];
     const trainerWhere = tid ? 'AND p.trainer_id=$2' : '';
+    // Tenant isolation: scope PT revenue to the caller's org (null-safe for
+    // platform super admins). The legacy `payments` union is empty here.
+    params.push(orgParam(req));
+    const ptOrgWhere = `AND ($${params.length}::uuid IS NULL OR p.organization_id = $${params.length})`;
 
     const { rows } = await pool.query(`
       SELECT
@@ -41,6 +55,7 @@ router.get('/monthly', auth, async (req, res, next) => {
         WHERE EXTRACT(YEAR FROM p.date::date) = $1
           AND p.deleted_at IS NULL
           ${trainerWhere}
+          ${ptOrgWhere}
       ) combined
       GROUP BY month_num, month_name
       ORDER BY month_num`, params
@@ -57,6 +72,9 @@ router.get('/monthly', auth, async (req, res, next) => {
 // includes gym clients + PT clients and gym payments + PT payments.
 router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
   try {
+    // Tenant isolation: scope to the caller's org via the driving `trainers`
+    // table (null-safe for platform super admins). The client/payment joins
+    // hang off trainer_id, so scoping trainers scopes the whole summary.
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
         COUNT(DISTINCT c.id)   FILTER (WHERE c.status='active'   AND c.deleted_at IS NULL)   +
@@ -73,8 +91,10 @@ router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
       LEFT JOIN payments    p   ON p.trainer_id   = t.id
       LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
       WHERE t.status = 'active'
+        AND ($1::uuid IS NULL OR t.organization_id = $1)
       GROUP BY t.id, t.name, t.specialization
-      ORDER BY total_revenue DESC`
+      ORDER BY total_revenue DESC`,
+      [orgParam(req)]
     );
     res.json(rows);
   } catch (err) {
@@ -86,6 +106,8 @@ router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
 // ISSUE-021: mirrors the fix above — includes pt_clients + pt_payments.
 router.get('/trainers', auth, adminOnly, async (req, res, next) => {
   try {
+    // Tenant isolation: scope to the caller's org via the driving `trainers`
+    // table (null-safe for platform super admins).
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
         COUNT(DISTINCT c.id)   FILTER (WHERE c.status='active'   AND c.deleted_at IS NULL)   +
@@ -102,8 +124,10 @@ router.get('/trainers', auth, adminOnly, async (req, res, next) => {
       LEFT JOIN payments    p   ON p.trainer_id   = t.id
       LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
       WHERE t.status = 'active'
+        AND ($1::uuid IS NULL OR t.organization_id = $1)
       GROUP BY t.id, t.name, t.specialization
-      ORDER BY total_revenue DESC`
+      ORDER BY total_revenue DESC`,
+      [orgParam(req)]
     );
     res.json(rows);
   } catch (err) {
@@ -130,6 +154,12 @@ router.get('/revenue', auth, async (req, res, next) => {
 
     const where = 'WHERE ' + conditions.join(' AND ');
 
+    // Tenant isolation: scope PT revenue to the caller's org inside the
+    // pt_payments arm of the union (null-safe for platform super admins). The
+    // legacy `payments` arm is empty in this deployment.
+    params.push(orgParam(req));
+    const orgIdx = params.length;
+
     const { rows } = await pool.query(`
       SELECT
         COUNT(*)::int                AS count,
@@ -139,6 +169,7 @@ router.get('/revenue', auth, async (req, res, next) => {
         SELECT amount, incentive_amt, date, deleted_at FROM payments
         UNION ALL
         SELECT amount, incentive_amt, date, deleted_at FROM pt_payments
+        WHERE ($${orgIdx}::uuid IS NULL OR organization_id = $${orgIdx})
       ) p
       ${where}
     `, params);
@@ -158,6 +189,11 @@ router.get('/dues', auth, async (req, res, next) => {
       params.push(tid);
       trainerFilter = ` AND trainer_id = $${params.length}`;
     }
+    // Tenant isolation: scope PT dues to the caller's org inside the pt_clients
+    // arm of the union (null-safe for platform super admins). The legacy
+    // `clients` arm is empty in this deployment.
+    params.push(orgParam(req));
+    const orgIdx = params.length;
     const { rows } = await pool.query(`
       SELECT id, client_id, name, mobile, trainer_name,
              balance_amount, pt_end_date, status
@@ -171,6 +207,7 @@ router.get('/dues', auth, async (req, res, next) => {
                ptc.balance_amount, ptc.pt_end_date, ptc.status, ptc.trainer_id
         FROM pt_clients ptc
         WHERE ptc.balance_amount > 0 AND ptc.deleted_at IS NULL
+          AND ($${orgIdx}::uuid IS NULL OR ptc.organization_id = $${orgIdx})
       ) combined
       WHERE 1=1${trainerFilter}
       ORDER BY balance_amount DESC LIMIT 100`,

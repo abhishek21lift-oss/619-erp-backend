@@ -5,7 +5,17 @@
 const express    = require('express');
 const pool       = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { tenantScope } = require('../lib/tenant-db');
 const logger     = require('../lib/logger');
+
+// Null-safe tenant param: a tenant user gets their org id (queries then filter
+// `organization_id = $x`); a platform super admin operating platform-wide gets
+// NULL, and `$x IS NULL OR organization_id = $x` matches every row. A super
+// admin targeting one org via x-org-id gets that org id and is filtered.
+function orgParam(req) {
+  const scope = tenantScope(req);
+  return scope.applyFilter ? scope.orgId : null;
+}
 const { routedChat, routedStream }     = require('../lib/ai/router');
 const { pingModel }                    = require('../lib/ai/openrouter');
 const { models }                       = require('../lib/ai/models');
@@ -65,11 +75,16 @@ function extractJson(text) {
   return null;
 }
 
-async function buildClientContext(client_id) {
+// Tenant isolation: `org` is the caller's org id (null for a platform super
+// admin operating platform-wide). The parent pt_clients lookup is org-scoped,
+// so a client_id belonging to another tenant yields no row and the function
+// returns '' — the child goal/assessment/check-in rows (all keyed by that
+// client_id) are only ever read into the context after that in-org check.
+async function buildClientContext(client_id, org) {
   if (!client_id) return '';
   try {
     const [clientRes, goalsRes, assessRes, checkinsRes] = await Promise.all([
-      pool.query('SELECT name, dob, gender, mobile FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [client_id]),
+      pool.query('SELECT name, dob, gender, mobile FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)', [client_id, org]),
       pool.query('SELECT goal_type, target_weight, target_body_fat, notes FROM pt_goals WHERE client_id=$1 AND is_active=true LIMIT 3', [client_id]),
       pool.query('SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 2', [client_id]),
       pool.query('SELECT weight, mood, sleep_hours, client_notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at DESC LIMIT 4', [client_id]),
@@ -147,8 +162,8 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       [convId]
     );
 
-    // Build system prompt with optional client context
-    const clientCtx = await buildClientContext(client_id);
+    // Build system prompt with optional client context (org-scoped)
+    const clientCtx = await buildClientContext(client_id, orgParam(req));
     const systemPrompt = buildCoachSystemPrompt(clientCtx);
 
     const messages = [
@@ -403,9 +418,14 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
   if (!client_id) return res.status(400).json({ error: 'client_id is required' });
 
   try {
+    // Tenant isolation: verify the client belongs to the caller's org before
+    // reading any of their progress data. A wrong-org client_id yields no
+    // parent row → 404 below, and the child queries (keyed by client_id) are
+    // never surfaced.
+    const org = orgParam(req);
     // Fetch all progress data for this client
     const [clientRes, assessRes, goalsRes, checkinsRes, strengthRes, attRes, photosRes] = await Promise.all([
-      pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [client_id]),
+      pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)', [client_id, org]),
       pool.query('SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, thigh_right_cm, thigh_left_cm, arm_right_cm, arm_left_cm, bmi, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
       pool.query('SELECT goal_type, target_weight, target_body_fat, is_active, created_at FROM pt_goals WHERE client_id=$1 ORDER BY created_at DESC LIMIT 5', [client_id]),
       pool.query('SELECT weight, mood, sleep_hours, water_glasses, client_notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
@@ -516,7 +536,11 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
   if (!assessment_id) return res.status(400).json({ error: 'assessment_id is required' });
 
   try {
-    const { rows: assessRows } = await pool.query('SELECT * FROM pt_assessments WHERE id = $1', [assessment_id]);
+    // Tenant isolation: the assessment must belong to the caller's org. A
+    // wrong-org assessment_id yields no row → 404, so neither the assessment
+    // nor the client it points at can be read across tenants.
+    const org = orgParam(req);
+    const { rows: assessRows } = await pool.query('SELECT * FROM pt_assessments WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2)', [assessment_id, org]);
     const assessment = assessRows[0];
     if (!assessment) return res.status(404).json({ error: 'Assessment not found' });
 
@@ -622,27 +646,35 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
   const toDate   = to   ? new Date(to)   : new Date();
 
   try {
+    // Tenant isolation: an org admin sees only their own gym's business data;
+    // a platform super admin operating platform-wide ($3/$1 = NULL) sees all.
+    // pt_client_renewals has no organization_id, so it is scoped via a join to
+    // its client's org (LEFT JOIN so a super admin still counts orphan rows).
+    const org = orgParam(req);
     const [revenueRes, membersRes, sessionsRes, trainersRes, renewalsRes, duesRes] = await Promise.all([
       pool.query(
         `SELECT
            COALESCE(SUM(amount),0) AS total_revenue,
            COUNT(*)                AS total_payments
-         FROM pt_payments WHERE date BETWEEN $1 AND $2 AND deleted_at IS NULL`,
-        [fromDate, toDate]
+         FROM pt_payments WHERE date BETWEEN $1 AND $2 AND deleted_at IS NULL
+           AND ($3::uuid IS NULL OR organization_id = $3)`,
+        [fromDate, toDate, org]
       ),
       pool.query(
         `SELECT
            COUNT(*) FILTER (WHERE status='active')   AS active_members,
            COUNT(*) FILTER (WHERE status='inactive') AS inactive_members,
            COUNT(*) FILTER (WHERE pt_start_date BETWEEN $1 AND $2) AS new_members_period
-         FROM pt_clients WHERE deleted_at IS NULL`,
-        [fromDate, toDate]
+         FROM pt_clients WHERE deleted_at IS NULL
+           AND ($3::uuid IS NULL OR organization_id = $3)`,
+        [fromDate, toDate, org]
       ),
       pool.query(
         `SELECT COUNT(*) AS total_sessions,
                 COUNT(DISTINCT client_id) AS active_clients
-         FROM pt_sessions WHERE session_date BETWEEN $1 AND $2`,
-        [fromDate, toDate]
+         FROM pt_sessions WHERE session_date BETWEEN $1 AND $2
+           AND ($3::uuid IS NULL OR organization_id = $3)`,
+        [fromDate, toDate, org]
       ),
       pool.query(
         `SELECT t.name AS trainer_name,
@@ -652,19 +684,25 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
          LEFT JOIN pt_sessions s ON s.trainer_id=t.id AND s.session_date BETWEEN $1 AND $2
          LEFT JOIN pt_payments p ON p.trainer_id=t.id AND p.date BETWEEN $1 AND $2 AND p.deleted_at IS NULL
          WHERE t.deleted_at IS NULL
+           AND ($3::uuid IS NULL OR t.organization_id = $3)
          GROUP BY t.id, t.name ORDER BY revenue DESC`,
-        [fromDate, toDate]
+        [fromDate, toDate, org]
       ),
       pool.query(
         `SELECT COUNT(*) AS total_renewals,
-                COALESCE(SUM(paid_amount),0) AS renewal_revenue
-         FROM pt_client_renewals WHERE renewed_at BETWEEN $1 AND $2`,
-        [fromDate, toDate]
+                COALESCE(SUM(r.paid_amount),0) AS renewal_revenue
+         FROM pt_client_renewals r
+         LEFT JOIN pt_clients c ON c.id = r.client_id
+         WHERE r.renewed_at BETWEEN $1 AND $2
+           AND ($3::uuid IS NULL OR c.organization_id = $3)`,
+        [fromDate, toDate, org]
       ),
       pool.query(
         `SELECT COUNT(*) AS clients_with_dues,
                 COALESCE(SUM(balance_amount) FILTER (WHERE balance_amount > 0),0) AS total_dues
-         FROM pt_clients WHERE deleted_at IS NULL AND balance_amount > 0`
+         FROM pt_clients WHERE deleted_at IS NULL AND balance_amount > 0
+           AND ($1::uuid IS NULL OR organization_id = $1)`,
+        [org]
       ),
     ]);
 
