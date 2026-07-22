@@ -4,7 +4,7 @@ const logger = require('../logger');
 const BASE_URL     = 'https://openrouter.ai/api/v1';
 const TIMEOUT_MS   = 90_000;
 const SITE_URL     = process.env.FRONTEND_URL || 'https://619fitness.app';
-const SITE_NAME    = '619 Fitness ERP';
+const SITE_NAME    = 'MY PT STUDIO';
 
 function getApiKey() {
   const key = process.env.OPENROUTER_API_KEY;

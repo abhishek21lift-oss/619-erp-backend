@@ -1,5 +1,5 @@
 // src/server.js
-// 619 ERP API — consolidated v2 + v3 entry point
+// MY PT STUDIO API — consolidated v2 + v3 entry point
 // ───────────────────────────────────────────────────
 // STARTUP ENV CHECKS — fail fast with clear messages
 // ───────────────────────────────────────────────────
@@ -184,7 +184,7 @@ app.use(function(req, res, next) {
 // HEALTH CHECK
 // ────────────────────────
 app.get('/', function(req, res) {
-  res.json({ status: 'ok', app: '619 ERP API', version: '3.0.0' });
+  res.json({ status: 'ok', app: 'MY PT STUDIO API', version: '3.0.0' });
 });
 
 app.get('/api/health', async function(req, res) {
@@ -387,7 +387,7 @@ runMigrationsWithRetry()
         port: PORT,
         env: NODE_ENV,
         corsOrigins: allowedOrigins.length ? allowedOrigins : '(server-to-server only)',
-      }, '619 ERP API listening on port %d (%s)', PORT, NODE_ENV);
+      }, 'MY PT STUDIO API listening on port %d (%s)', PORT, NODE_ENV);
     });
 
     // Render free tier sleeps after 15 min of inactivity — ping every 14 min.

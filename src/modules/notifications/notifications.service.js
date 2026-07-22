@@ -175,7 +175,7 @@ const templates = {
     title: 'Payment received',
     body: `Hi ${name}, we received your payment of ${currency}${amount}. Thanks!`,
     email: {
-      subject: 'Payment receipt — 619 Fitness',
+      subject: 'Payment receipt — MY PT STUDIO',
       html: `<p>Hi ${name},</p><p>We received your payment of <b>${currency}${amount}</b>.</p>`,
     },
     whatsapp: { template: 'payment_received', variables: [name, `${currency}${amount}`] },

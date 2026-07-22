@@ -192,14 +192,14 @@ async function createBookingEvent(userId, bookingId) {
     const event = await calendar.events.insert({
       calendarId: calId,
       requestBody: {
-        summary:     `${bk.class_name} — 619 Fitness`,
+        summary:     `${bk.class_name} — MY PT STUDIO`,
         description: [
           `Class: ${bk.class_name}`,
           bk.trainer_name ? `Trainer: ${bk.trainer_name}` : null,
           `Status: Confirmed`,
           `Booking ID: ${bk.id}`,
         ].filter(Boolean).join('\n'),
-        location:  bk.branch_name ? `619 Fitness Studio — ${bk.branch_name}` : '619 Fitness Studio',
+        location:  bk.branch_name ? `MY PT STUDIO — ${bk.branch_name}` : 'MY PT STUDIO',
         start:     { dateTime: bk.starts_at },
         end:       { dateTime: bk.ends_at   },
         colorId:   '11',  // Tomato — gym-brand red-ish
