@@ -122,7 +122,11 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  // x-org-id lets a platform super_admin scope requests to one tenant org
+  // (the org-switcher). It is ignored for every non-super_admin (tenant users
+  // are always locked to their JWT org — see lib/tenant-db.js), so allowing it
+  // through CORS cannot widen any tenant user's access.
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-org-id'],
 }));
 
 // ────────────────────────
