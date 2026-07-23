@@ -57,7 +57,7 @@ const cookieParser  = require('cookie-parser');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { auth, adminOnly }        = require('./middleware/auth');
-const { requireSuperAdmin }      = require('./middleware/tenant');
+const { requireSuperAdmin, requireSuperAdminMfa } = require('./middleware/tenant');
 const { branchScope }            = require('./middleware/branch-scope');
 
 const app  = express();
@@ -320,7 +320,7 @@ app.use('/api/admin',             auth, adminOnly, require('./routes/admin-reset
 
 // Platform Super Admin portal (multi-tenant SaaS). Guarded at the mount with
 // auth + requireSuperAdmin — inaccessible to tenant admins and everyone else.
-app.use('/api/super-admin',       auth, requireSuperAdmin, require('./modules/platform/super-admin.routes'));
+app.use('/api/super-admin',       auth, requireSuperAdmin, requireSuperAdminMfa, require('./modules/platform/super-admin.routes'));
 
 app.use('/api/modules',           require('./modules/operations/operations.routes'));
 
