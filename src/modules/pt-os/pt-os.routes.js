@@ -209,7 +209,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
         INSERT INTO pt_clients
           (name, gender, mobile, email, dob, status, joining_date,
            whatsapp, occupation, emergency_contact, emergency_phone, address, organization_id)
-        VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$8,$9,$10,$11,$12)
+        VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8,$9,$10,$11,$12)
         RETURNING id
       `, [
         name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date(),
@@ -275,7 +275,18 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
         health_conditions = COALESCE($17, health_conditions),
         injuries          = COALESCE($18, injuries),
         frequency         = COALESCE($19, frequency),
-        status = 'active',
+        -- Promote to 'active' only once the client is actually enrolled in a
+        -- package (has an end date, a charged amount, or a duration). A name-only
+        -- add stays 'pending' so it never shows in the active-clients list/counts.
+        -- Existing enrolled clients keep 'active' since COALESCE preserves their
+        -- stored package fields even when this edit doesn't touch them.
+        status = CASE
+          WHEN COALESCE($10, pt_end_date) IS NOT NULL
+            OR COALESCE($7, final_amount) > 0
+            OR COALESCE($11, duration_months) > 0
+          THEN 'active'
+          ELSE status
+        END,
         updated_at = NOW()
       WHERE id = $1 AND deleted_at IS NULL
       RETURNING *
