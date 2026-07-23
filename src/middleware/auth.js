@@ -101,6 +101,24 @@ async function auth(req, res, next) {
     }
 
     req.user = user;
+
+    // Super-admin impersonation: the token carries an `imp` claim minted by the
+    // platform portal. req.user is already the impersonated admin (loaded above),
+    // so the whole app renders as them. While read-only (`ro`), reject every
+    // mutating request — the operator must exit impersonation to make changes.
+    if (decoded.imp) {
+      req.impersonation = decoded.imp;
+      const method = (req.method || 'GET').toUpperCase();
+      if (decoded.imp.ro && method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+        return res.status(403).json({
+          error: {
+            code: 'IMPERSONATION_READONLY',
+            message: 'Read-only impersonation: changes are disabled. Exit impersonation to act as super admin.',
+          },
+        });
+      }
+    }
+
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {

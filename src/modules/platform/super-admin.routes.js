@@ -19,11 +19,19 @@
 const router = require('express').Router();
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
 const { saveFile } = require('../../lib/fileStorage');
 const { invalidateUserCache } = require('../../middleware/auth');
+
+// Roles a tenant login may hold (never 'super_admin' — that is platform-only and
+// cannot be created, edited, or impersonated through this tenant-facing portal).
+const TENANT_ROLES = ['admin', 'manager', 'trainer', 'member'];
+// How long a read-only impersonation session stays valid before the operator
+// must re-enter the studio. Short by design — impersonation is a spot check.
+const IMPERSONATION_TTL = process.env.IMPERSONATION_TTL || '30m';
 
 // ── Logo upload (per-studio branding) ───────────────────────────────────────
 // memoryStorage + magic-byte sniff (MIME header alone can be spoofed), same
@@ -209,22 +217,129 @@ router.patch('/organizations/:id', async (req, res, next) => {
 });
 
 // ── PATCH /users/:id ──────────────────────────────────────────────────────────
-// Activate / deactivate a single login. Deactivating revokes existing sessions.
+// Edit a tenant login: name, email, role, and/or activate/deactivate. Changing
+// role or is_active bumps token_version so the account re-authenticates with its
+// new powers (and a deactivation immediately revokes existing sessions).
+// Platform (super_admin) accounts cannot be edited through this portal.
 router.patch('/users/:id', async (req, res, next) => {
   try {
-    if (typeof req.body.is_active !== 'boolean') {
-      return res.status(400).json({ error: { code: 'VALIDATION', message: 'is_active (boolean) is required' } });
+    const { rows: existing } = await pool.query(
+      `SELECT id, role FROM users WHERE id = $1 AND deleted_at IS NULL`, [req.params.id]
+    );
+    if (!existing.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
+    if (existing[0].role === 'super_admin') {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Platform accounts cannot be edited here' } });
     }
+
+    const { name, email, role, is_active } = req.body;
+    const sets = [];
+    const params = [req.params.id];
+    let securityChange = false;
+
+    if (name !== undefined) {
+      const v = String(name).trim();
+      if (!v) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Name cannot be empty' } });
+      params.push(v); sets.push(`name = $${params.length}`);
+    }
+    if (email !== undefined) {
+      const v = String(email).trim().toLowerCase();
+      if (!EMAIL_RE.test(v)) return res.status(400).json({ error: { code: 'VALIDATION', message: 'A valid email is required' } });
+      const { rows: dupe } = await pool.query('SELECT 1 FROM users WHERE LOWER(email) = $1 AND id <> $2', [v, req.params.id]);
+      if (dupe.length) return res.status(409).json({ error: { code: 'CONFLICT', message: 'That email is already in use' } });
+      params.push(v); sets.push(`email = $${params.length}`);
+    }
+    if (role !== undefined) {
+      if (!TENANT_ROLES.includes(role)) return res.status(400).json({ error: { code: 'VALIDATION', message: `role must be one of: ${TENANT_ROLES.join(', ')}` } });
+      params.push(role); sets.push(`role = $${params.length}`); securityChange = true;
+    }
+    if (is_active !== undefined) {
+      if (typeof is_active !== 'boolean') return res.status(400).json({ error: { code: 'VALIDATION', message: 'is_active must be a boolean' } });
+      params.push(is_active); sets.push(`is_active = $${params.length}`); securityChange = true;
+    }
+    if (!sets.length) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Nothing to update' } });
+    if (securityChange) sets.push('token_version = token_version + 1');
+    sets.push('updated_at = now()');
+
     const { rows } = await pool.query(
-      `UPDATE users SET is_active = $2, token_version = token_version + 1, updated_at = now()
+      `UPDATE users SET ${sets.join(', ')}
         WHERE id = $1 AND deleted_at IS NULL
         RETURNING id, name, email, role, organization_id, is_active`,
-      [req.params.id, req.body.is_active]
+      params
     );
-    if (!rows.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
     invalidateUserCache(req.params.id);
-    await audit(req, req.body.is_active ? 'user_activated' : 'user_deactivated', 'user', req.params.id, {});
+    const action = is_active === false ? 'user_deactivated' : is_active === true ? 'user_activated' : 'user_updated';
+    await audit(req, action, 'user', req.params.id, { name, email, role, is_active });
     res.json({ data: rows[0] });
+  } catch (err) { next(err); }
+});
+
+// ── POST /organizations/:id/users ─────────────────────────────────────────────
+// Add another login account to a studio (beyond the owner created with the org).
+router.post('/organizations/:id/users', async (req, res, next) => {
+  try {
+    const { rows: orgs } = await pool.query('SELECT id FROM organizations WHERE id = $1', [req.params.id]);
+    if (!orgs.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
+
+    const name = String(req.body.name || '').trim();
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const password = String(req.body.password || '');
+    const role = req.body.role || 'admin';
+
+    if (!name) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Name is required' } });
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: { code: 'VALIDATION', message: 'A valid email is required' } });
+    if (password.length < 8) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Password must be at least 8 characters' } });
+    if (!TENANT_ROLES.includes(role)) return res.status(400).json({ error: { code: 'VALIDATION', message: `role must be one of: ${TENANT_ROLES.join(', ')}` } });
+
+    const { rows: dupe } = await pool.query('SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
+    if (dupe.length) return res.status(409).json({ error: { code: 'CONFLICT', message: 'That email is already in use' } });
+
+    const hashed = await bcrypt.hash(password, 12);
+    const userId = crypto.randomUUID();
+    const { rows } = await pool.query(
+      `INSERT INTO users (id, name, email, password, role, organization_id, is_active)
+       VALUES ($1,$2,$3,$4,$5,$6,true)
+       RETURNING id, name, email, role, organization_id, is_active, created_at`,
+      [userId, name, email, hashed, role, req.params.id]
+    );
+    await audit(req, 'user_created', 'user', userId, { email, role, organization_id: req.params.id });
+    res.status(201).json({ data: rows[0] });
+  } catch (err) { next(err); }
+});
+
+// ── DELETE /users/:id ─────────────────────────────────────────────────────────
+// Soft-delete a tenant login and revoke its sessions. Guards: cannot delete the
+// platform account, yourself, or a studio's last remaining active admin.
+router.delete('/users/:id', async (req, res, next) => {
+  try {
+    if (req.params.id === req.user?.id) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'You cannot delete your own account' } });
+    }
+    const { rows: existing } = await pool.query(
+      `SELECT id, role, organization_id FROM users WHERE id = $1 AND deleted_at IS NULL`, [req.params.id]
+    );
+    if (!existing.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
+    const target = existing[0];
+    if (target.role === 'super_admin') {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Platform accounts cannot be deleted here' } });
+    }
+    if (target.role === 'admin' && target.organization_id) {
+      const { rows: [{ count }] } = await pool.query(
+        `SELECT count(*)::int AS count FROM users
+          WHERE organization_id = $1 AND role = 'admin' AND is_active = true AND deleted_at IS NULL AND id <> $2`,
+        [target.organization_id, req.params.id]
+      );
+      if (count === 0) {
+        return res.status(409).json({ error: { code: 'LAST_ADMIN', message: "Cannot delete a studio's last active admin. Add another admin first." } });
+      }
+    }
+    await pool.query(
+      `UPDATE users SET deleted_at = now(), is_active = false, token_version = token_version + 1, updated_at = now()
+        WHERE id = $1`,
+      [req.params.id]
+    );
+    invalidateUserCache(req.params.id);
+    await audit(req, 'user_deleted', 'user', req.params.id, { role: target.role, organization_id: target.organization_id });
+    res.json({ data: { id: req.params.id, message: 'Account removed and sessions revoked.' } });
   } catch (err) { next(err); }
 });
 
@@ -268,6 +383,138 @@ router.post('/organizations/:id/logo', logoUpload.single('file'), async (req, re
     );
     await audit(req, 'org_logo_updated', 'organization', req.params.id, { logo_url: url });
     res.json({ data: rows[0] });
+  } catch (err) { next(err); }
+});
+
+// ── GET /overview ─────────────────────────────────────────────────────────────
+// Cross-studio command-centre dashboard: one row of KPIs per studio plus rolled-
+// up platform totals. Revenue is collected cash (SUM paid_amount); outstanding is
+// balances still owed. Sessions counted for the current calendar month.
+router.get('/overview', async (req, res, next) => {
+  try {
+    const { rows: studios } = await pool.query(`
+      SELECT o.id, o.name, o.slug, o.status, o.logo_url, o.created_at,
+        (SELECT count(*) FROM users u
+           WHERE u.organization_id = o.id AND u.deleted_at IS NULL AND u.role = 'admin')::int              AS admin_count,
+        (SELECT max(u.last_login) FROM users u
+           WHERE u.organization_id = o.id AND u.deleted_at IS NULL)                                        AS last_login,
+        (SELECT count(*) FROM pt_clients c
+           WHERE c.organization_id = o.id AND c.deleted_at IS NULL)::int                                   AS total_clients,
+        (SELECT count(*) FROM pt_clients c
+           WHERE c.organization_id = o.id AND c.deleted_at IS NULL AND c.status = 'active')::int           AS active_clients,
+        (SELECT COALESCE(SUM(c.paid_amount), 0) FROM pt_clients c
+           WHERE c.organization_id = o.id AND c.deleted_at IS NULL)                                        AS revenue,
+        (SELECT COALESCE(SUM(c.balance_amount), 0) FROM pt_clients c
+           WHERE c.organization_id = o.id AND c.deleted_at IS NULL)                                        AS outstanding,
+        (SELECT count(*) FROM pt_sessions s
+           WHERE s.organization_id = o.id AND s.session_date >= date_trunc('month', CURRENT_DATE))::int    AS sessions_this_month
+      FROM organizations o
+      ORDER BY o.created_at DESC`);
+
+    const totals = studios.reduce((t, s) => ({
+      studios: t.studios + 1,
+      active_studios: t.active_studios + (s.status === 'active' ? 1 : 0),
+      suspended_studios: t.suspended_studios + (s.status === 'suspended' ? 1 : 0),
+      total_clients: t.total_clients + Number(s.total_clients || 0),
+      active_clients: t.active_clients + Number(s.active_clients || 0),
+      revenue: t.revenue + Number(s.revenue || 0),
+      outstanding: t.outstanding + Number(s.outstanding || 0),
+      sessions_this_month: t.sessions_this_month + Number(s.sessions_this_month || 0),
+    }), {
+      studios: 0, active_studios: 0, suspended_studios: 0, total_clients: 0,
+      active_clients: 0, revenue: 0, outstanding: 0, sessions_this_month: 0,
+    });
+
+    res.json({ data: { totals, studios } });
+  } catch (err) { next(err); }
+});
+
+// ── GET /activity ─────────────────────────────────────────────────────────────
+// Platform-wide audit feed. Filter by studio (org_id), user, or action. The
+// activity_log has no org column, so studio is resolved through the acting user.
+router.get('/activity', async (req, res, next) => {
+  try {
+    const orgId  = req.query.org_id  || null;
+    const userId = req.query.user_id || null;
+    const action = req.query.action  || null;
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const { rows } = await pool.query(`
+      SELECT a.id, a.user_id, a.user_name, a.action, a.entity_type, a.entity_id,
+             a.new_data, a.ip_address, a.created_at,
+             u.organization_id, o.name AS organization_name
+        FROM activity_log a
+        LEFT JOIN users u ON u.id = a.user_id
+        LEFT JOIN organizations o ON o.id = u.organization_id
+       WHERE ($1::uuid IS NULL OR u.organization_id = $1::uuid)
+         AND ($2::uuid IS NULL OR a.user_id = $2::uuid)
+         AND ($3::text IS NULL OR a.action = $3)
+       ORDER BY a.created_at DESC
+       LIMIT $4 OFFSET $5`,
+      [orgId, userId, action, limit, offset]
+    );
+    res.json({ data: rows, paging: { limit, offset, count: rows.length } });
+  } catch (err) { next(err); }
+});
+
+// ── POST /organizations/:id/impersonate ───────────────────────────────────────
+// Mint a short-lived, READ-ONLY access token for a studio's admin so the operator
+// can enter the workspace and see exactly what that admin sees. The token carries
+// an `imp` claim; the auth middleware loads the target admin as req.user (so the
+// whole app renders as them) and rejects every write while `imp.ro` is set. The
+// operator's own super-admin session is untouched — the client sends this token
+// via Authorization header and simply drops it to exit. No refresh token issued.
+router.post('/organizations/:id/impersonate', async (req, res, next) => {
+  try {
+    const { rows: orgs } = await pool.query(
+      'SELECT id, name, slug, logo_url, status FROM organizations WHERE id = $1', [req.params.id]
+    );
+    if (!orgs.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
+    const org = orgs[0];
+
+    // Target: an explicit user in this org, else the studio's primary admin.
+    let target;
+    if (req.body.user_id) {
+      const { rows } = await pool.query(
+        `SELECT id, name, email, role, token_version, is_active FROM users
+          WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+        [req.body.user_id, org.id]
+      );
+      target = rows[0];
+    } else {
+      const { rows } = await pool.query(
+        `SELECT id, name, email, role, token_version, is_active FROM users
+          WHERE organization_id = $1 AND role = 'admin' AND deleted_at IS NULL
+          ORDER BY is_active DESC, created_at ASC LIMIT 1`,
+        [org.id]
+      );
+      target = rows[0];
+    }
+
+    if (!target) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'No admin account to impersonate in this studio' } });
+    if (target.role === 'super_admin') return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot impersonate a platform account' } });
+    if (!target.is_active) return res.status(409).json({ error: { code: 'INACTIVE', message: 'That account is deactivated' } });
+
+    const token = jwt.sign(
+      {
+        id: target.id,
+        token_version: target.token_version,
+        imp: { by: req.user.id, byName: req.user.name || 'Super Admin', ro: true, org: org.id },
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: IMPERSONATION_TTL }
+    );
+
+    await audit(req, 'user_impersonated', 'user', target.id, { organization_id: org.id, readonly: true });
+    res.json({
+      data: {
+        token,
+        readonly: true,
+        admin: { id: target.id, name: target.name, email: target.email, role: target.role },
+        organization: { id: org.id, name: org.name, slug: org.slug, logo_url: org.logo_url },
+      },
+    });
   } catch (err) { next(err); }
 });
 
