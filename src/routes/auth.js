@@ -6,8 +6,9 @@ const jwt    = require('jsonwebtoken');
 const { authenticator } = require('otplib');
 const pool   = require('../db/pool');
 const logger = require('../lib/logger');
-const { auth, adminOnly, invalidateUserCache } = require('../middleware/auth');
+const { auth, invalidateUserCache } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const { requireSuperAdmin } = require('../middleware/tenant');
 const { validate } = require('../middleware/validate');
 const { authSchemas } = require('../lib/validation');
 const { sendPasswordReset } = require('../lib/email');
@@ -393,12 +394,12 @@ async function createUserHandler(req, res) {
     res.status(500).json({ error: 'Server error' });
   }
 }
-router.post('/create-user', auth, adminOnly, validate(authSchemas.createUser), createUserHandler);
+router.post('/create-user', auth, requireSuperAdmin, validate(authSchemas.createUser), createUserHandler);
 // Compatibility alias — the frontend at one point posted here
-router.post('/users', auth, adminOnly, validate(authSchemas.createUser), createUserHandler);
+router.post('/users', auth, requireSuperAdmin, validate(authSchemas.createUser), createUserHandler);
 
 // GET /api/auth/users  (admin only)
-router.get('/users', auth, adminOnly, async (req, res) => {
+router.get('/users', auth, requireSuperAdmin, async (req, res) => {
   try {
     const limit  = Math.min(parseInt(req.query.limit, 10) || 100, 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
@@ -422,7 +423,7 @@ router.get('/users', auth, adminOnly, async (req, res) => {
 });
 
 // PUT /api/auth/users/:id (admin only) — update name, email, role, status
-router.put('/users/:id', auth, adminOnly, async (req, res) => {
+router.put('/users/:id', auth, requireSuperAdmin, async (req, res) => {
   if (req.params.id === req.user.id && req.body.role && req.body.role !== req.user.role)
     return res.status(400).json({ error: 'Cannot change your own role' });
   try {
@@ -456,7 +457,7 @@ router.put('/users/:id', auth, adminOnly, async (req, res) => {
 });
 
 // PUT /api/auth/users/:id/toggle  (admin only)
-router.put('/users/:id/toggle', auth, adminOnly, async (req, res) => {
+router.put('/users/:id/toggle', auth, requireSuperAdmin, async (req, res) => {
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot disable yourself' });
   try {
     // Tenant isolation: only within the caller's own org.
@@ -479,7 +480,7 @@ router.put('/users/:id/toggle', auth, adminOnly, async (req, res) => {
 // DELETE /api/auth/users/:id (admin only)
 // FIX: soft delete — sets deleted_at and bumps token_version so existing tokens are immediately revoked.
 // Hard delete left a dangling reference risk and bypassed the deleted_at guard in auth middleware.
-router.delete('/users/:id', auth, adminOnly, async (req, res) => {
+router.delete('/users/:id', auth, requireSuperAdmin, async (req, res) => {
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
   try {
     // Tenant isolation: only within the caller's own org.
