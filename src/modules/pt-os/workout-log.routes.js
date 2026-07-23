@@ -20,6 +20,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { calc1RM } = require('../progress/fitness-scoring');
 const { checkScreeningGate } = require('../../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+const { clientInOrg } = require('../../lib/orgGuard');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -251,6 +252,7 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
 // POST /workout-log/sessions
 router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trainer'), validate(sessionCreateSchema), wrap(async (req, res) => {
   const b = req.body;
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
   // Same PAR-Q + Informed Consent gate as plan assignment — logging a
   // session is training just as much as following an assigned plan, so it

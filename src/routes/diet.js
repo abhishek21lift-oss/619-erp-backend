@@ -4,6 +4,7 @@ const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOrManager } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const { clientInOrg } = require('../lib/orgGuard');
 const logger = require('../lib/logger');
 
 // ─── MEALS ───────────────────────────────────────────────────
@@ -165,6 +166,8 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
     const d = req.body;
     if (!d.diet_template_id || !d.client_id)
       return res.status(400).json({ error: 'diet_template_id and client_id required' });
+    if (!await clientInOrg(req, d.client_id))
+      return res.status(404).json({ error: 'Client not found' });
 
     const { rows } = await pool.query(`
       INSERT INTO diet_assignments (id, diet_template_id, client_id, trainer_id,
@@ -227,6 +230,8 @@ router.put('/tracker', auth, async (req, res, next) => {
     const d = req.body;
     if (!d.client_id)
       return res.status(400).json({ error: 'client_id required' });
+    if (!await clientInOrg(req, d.client_id))
+      return res.status(404).json({ error: 'Client not found' });
 
     const logDate = d.log_date || new Date().toISOString().split('T')[0];
 
@@ -278,6 +283,8 @@ router.put('/fitness-profile/:clientId', auth, async (req, res, next) => {
   try {
     const d = req.body;
     const clientId = req.params.clientId;
+    if (!await clientInOrg(req, clientId))
+      return res.status(404).json({ error: 'Client not found' });
 
     const { rows } = await pool.query(`
       INSERT INTO client_fitness_profiles (id, client_id, goal, goal_other,

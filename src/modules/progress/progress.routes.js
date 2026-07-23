@@ -5,6 +5,7 @@ const { requireRole } = require('../../middleware/rbac');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+const { clientInOrg } = require('../../lib/orgGuard');
 const scoring = require('./fitness-scoring');
 const goalScoring = require('./goal-scoring');
 const lifestyleScoring = require('./lifestyle-scoring');
@@ -93,6 +94,7 @@ router.get('/assessments', auth, wrap(async (req, res) => {
 
 router.post('/assessments', auth, requireRole('admin','manager','trainer'), validate(assessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const trainer_id = req.user.role === 'trainer' ? req.user.trainer_id : b.trainer_id;
 
   // Age/gender: prefer what the frontend sent (it already has the client
@@ -299,6 +301,7 @@ router.get('/goals', auth, wrap(async (req, res) => {
 
 router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) => {
   const b = req.body;
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
   // Starting weight/body-fat: prefer client-submitted (manual entry when no
   // assessment exists yet), else snapshot the client's latest assessment.
@@ -423,6 +426,7 @@ router.get('/weekly-checkins', auth, wrap(async (req, res) => {
 
 router.post('/weekly-checkins', auth, wrap(async (req, res) => {
   const { client_id, week_start_date, weight, mood, sleep_hours, water_glasses, workout_count, calories_avg, adherence_pct, trainer_notes, client_notes } = req.body;
+  if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const { rows } = await pool.query(
     `INSERT INTO weekly_checkins (client_id, week_start_date, weight, mood, sleep_hours, water_glasses,
       workout_count, calories_avg, adherence_pct, trainer_notes, client_notes, created_by, organization_id)
@@ -474,6 +478,7 @@ const strengthLogCreateSchema = {
 router.post('/strength-logs', auth, requireRole('admin', 'manager', 'trainer'), validate(strengthLogCreateSchema), wrap(async (req, res) => {
   const { client_id, exercise_name, weight_kg, sets_done, reps_done, notes,
     assessment_id, one_rm_formula, is_direct_1rm, one_rm_estimate } = req.body;
+  if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const formula = one_rm_formula === 'brzycki' ? 'brzycki' : 'epley';
   const oneRm = is_direct_1rm
     ? num(one_rm_estimate, null)
@@ -514,6 +519,7 @@ const progressPhotoCreateSchema = {
 
 router.post('/progress-photos', auth, requireRole('admin', 'manager', 'trainer'), validate(progressPhotoCreateSchema), wrap(async (req, res) => {
   const { client_id, photo_url, photo_type, taken_at, notes } = req.body;
+  if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const { rows } = await pool.query(
     `INSERT INTO progress_photos (client_id, photo_url, photo_type, taken_at, notes, uploaded_by, organization_id)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
@@ -627,6 +633,7 @@ router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
 
 router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(lifestyleAssessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computeLifestyleAnalysis(b);
 
   const { rows } = await pool.query(
@@ -850,6 +857,7 @@ router.get('/nutrition-assessments', auth, wrap(async (req, res) => {
 
 router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(nutritionAssessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = await computeNutritionAnalysis(b.client_id, b);
 
   const { rows } = await pool.query(
@@ -1012,6 +1020,7 @@ router.get('/mobility-performance-assessments', auth, wrap(async (req, res) => {
 
 router.post('/mobility-performance-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(mobilityPerformanceAssessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computeMobilityAnalysis(b);
 
   const { rows } = await pool.query(
@@ -1100,6 +1109,7 @@ router.get('/posture-assessments', auth, wrap(async (req, res) => {
 
 router.post('/posture-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(postureAssessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computePostureAnalysis(b);
 
   const { rows } = await pool.query(
