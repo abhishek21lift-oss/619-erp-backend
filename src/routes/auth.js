@@ -7,6 +7,7 @@ const { authenticator } = require('otplib');
 const pool   = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, adminOnly, invalidateUserCache } = require('../middleware/auth');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { validate } = require('../middleware/validate');
 const { authSchemas } = require('../lib/validation');
 const { sendPasswordReset } = require('../lib/email');
@@ -380,9 +381,11 @@ async function createUserHandler(req, res) {
 
     const hashed = await bcrypt.hash(password, 12);
     const id = crypto.randomUUID();
+    // Stamp the new user with the creating admin's org so they belong to that
+    // studio (and only that studio's admins can see/manage them).
     await pool.query(
-      'INSERT INTO users (id, name, email, password, role, trainer_id, member_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-      [id, name.trim(), email.toLowerCase().trim(), hashed, role, trainer_id || null, member_id || null]
+      'INSERT INTO users (id, name, email, password, role, trainer_id, member_id, organization_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [id, name.trim(), email.toLowerCase().trim(), hashed, role, trainer_id || null, member_id || null, orgIdOf(req)]
     );
     res.status(201).json({ message: 'User created', user: { id, name, email: email.toLowerCase(), role } });
   } catch (err) {
@@ -399,9 +402,18 @@ router.get('/users', auth, adminOnly, async (req, res) => {
   try {
     const limit  = Math.min(parseInt(req.query.limit, 10) || 100, 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    // Tenant isolation: a studio admin only ever sees users in their own org.
+    // The platform super admin (null org) is naturally excluded from a tenant
+    // admin's list; a super admin operating platform-wide sees everyone.
+    const scope = tenantScope(req);
+    const orgParam = scope.applyFilter ? scope.orgId : null;
     const { rows } = await pool.query(
-      'SELECT id, name, email, role, trainer_id, is_active, last_login, created_at FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2',
-      [limit, offset]
+      `SELECT id, name, email, role, trainer_id, is_active, last_login, created_at
+         FROM users
+        WHERE deleted_at IS NULL
+          AND ($3::uuid IS NULL OR organization_id = $3)
+        ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+      [limit, offset, orgParam]
     );
     res.json(rows);
   } catch (err) {
@@ -426,8 +438,13 @@ router.put('/users/:id', auth, adminOnly, async (req, res) => {
     }
     if (!updates.length) return res.status(400).json({ error: 'No fields to update' });
     vals.push(req.params.id);
+    const idPos = idx; // $idx is the target user id
+    // Tenant isolation: an admin can only modify users within their own org.
+    const scope = tenantScope(req);
+    let orgClause = '';
+    if (scope.applyFilter) { vals.push(scope.orgId); orgClause = ` AND organization_id = $${vals.length}`; }
     const { rows } = await pool.query(
-      `UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${idx} AND deleted_at IS NULL RETURNING id, name, email, role`,
+      `UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${idPos} AND deleted_at IS NULL${orgClause} RETURNING id, name, email, role`,
       vals
     );
     if (!rows[0]) return res.status(404).json({ error: 'User not found' });
@@ -442,9 +459,14 @@ router.put('/users/:id', auth, adminOnly, async (req, res) => {
 router.put('/users/:id/toggle', auth, adminOnly, async (req, res) => {
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot disable yourself' });
   try {
+    // Tenant isolation: only within the caller's own org.
+    const scope = tenantScope(req);
+    const params = [req.params.id];
+    let orgClause = '';
+    if (scope.applyFilter) { params.push(scope.orgId); orgClause = ` AND organization_id = $${params.length}`; }
     const { rows } = await pool.query(
-      'UPDATE users SET is_active = NOT is_active, token_version = token_version + 1, updated_at = NOW() WHERE id = $1 RETURNING id, is_active',
-      [req.params.id]
+      `UPDATE users SET is_active = NOT is_active, token_version = token_version + 1, updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL${orgClause} RETURNING id, is_active`,
+      params
     );
     if (!rows[0]) return res.status(404).json({ error: 'User not found' });
     invalidateUserCache(req.params.id);
@@ -460,6 +482,11 @@ router.put('/users/:id/toggle', auth, adminOnly, async (req, res) => {
 router.delete('/users/:id', auth, adminOnly, async (req, res) => {
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
   try {
+    // Tenant isolation: only within the caller's own org.
+    const scope = tenantScope(req);
+    const params = [req.params.id];
+    let orgClause = '';
+    if (scope.applyFilter) { params.push(scope.orgId); orgClause = ` AND organization_id = $${params.length}`; }
     const { rows } = await pool.query(
       `UPDATE users
           SET deleted_at = NOW(),
@@ -467,9 +494,9 @@ router.delete('/users/:id', auth, adminOnly, async (req, res) => {
               token_version = token_version + 1,
               updated_at = NOW()
         WHERE id = $1
-          AND deleted_at IS NULL
+          AND deleted_at IS NULL${orgClause}
         RETURNING id`,
-      [req.params.id]
+      params
     );
     if (!rows[0]) return res.status(404).json({ error: 'User not found or already deleted' });
     invalidateUserCache(req.params.id);
