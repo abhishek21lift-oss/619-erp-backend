@@ -496,21 +496,26 @@ router.post('/organizations/:id/impersonate', async (req, res, next) => {
     if (target.role === 'super_admin') return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot impersonate a platform account' } });
     if (!target.is_active) return res.status(409).json({ error: { code: 'INACTIVE', message: 'That account is deactivated' } });
 
+    // Mode: read-only by default (safe). 'full' allows writes as the admin — every
+    // audited write during that window is stamped with who really acted
+    // (_impersonated_by) by the shared activity logger.
+    const readonly = req.body.mode !== 'full';
+
     const token = jwt.sign(
       {
         id: target.id,
         token_version: target.token_version,
-        imp: { by: req.user.id, byName: req.user.name || 'Super Admin', ro: true, org: org.id },
+        imp: { by: req.user.id, byName: req.user.name || 'Super Admin', ro: readonly, org: org.id },
       },
       process.env.JWT_SECRET,
       { expiresIn: IMPERSONATION_TTL }
     );
 
-    await audit(req, 'user_impersonated', 'user', target.id, { organization_id: org.id, readonly: true });
+    await audit(req, 'user_impersonated', 'user', target.id, { organization_id: org.id, readonly, mode: readonly ? 'read_only' : 'full' });
     res.json({
       data: {
         token,
-        readonly: true,
+        readonly,
         admin: { id: target.id, name: target.name, email: target.email, role: target.role },
         organization: { id: org.id, name: org.name, slug: org.slug, logo_url: org.logo_url },
       },
