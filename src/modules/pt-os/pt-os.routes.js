@@ -48,6 +48,32 @@ const ptClientCreateSchema = {
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
+// Tenant-scope predicate for by-id / aggregate pt_clients queries. Appends the
+// caller's org id to `params` and returns ` AND <col> = $N`; for a platform
+// super admin operating platform-wide it returns '' (no filter, sees all).
+// Every read/write that targets a client by id must AND this in, otherwise one
+// studio can read, edit, or delete another studio's rows (cross-tenant IDOR).
+function orgWhere(req, params, col = 'organization_id') {
+  const scope = tenantScope(req);
+  if (!scope.applyFilter) return '';
+  params.push(scope.orgId);
+  return ` AND ${col} = $${params.length}`;
+}
+
+// True if `clientId` belongs to the caller's org (always true for a platform
+// super admin operating platform-wide). Used to gate reads of a client's
+// child records (renewals, communication, subscriptions) whose own tables
+// carry no organization_id — the tenant boundary is the parent client.
+async function clientInOrg(req, clientId) {
+  const params = [clientId];
+  const orgClause = orgWhere(req, params);
+  const { rowCount } = await pool.query(
+    `SELECT 1 FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${orgClause}`,
+    params
+  );
+  return rowCount > 0;
+}
+
 // ─── Trainers ───────────────────────────────────────────────
 router.get('/trainers', auth, wrap(async (req, res) => {
   // Include trainers from both the main trainers table and the PT-OS-specific
@@ -94,6 +120,8 @@ router.get('/clients', auth, wrap(async (req, res) => {
 
 // ─── Duplicate Client Audit (MUST be before /clients/:id) ───
 router.get('/clients/duplicates', auth, adminOnly, wrap(async (req, res) => {
+  const params = [];
+  const orgClause = orgWhere(req, params);
   const { rows } = await pool.query(`
     SELECT
       TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g'))) AS normalized_name,
@@ -114,11 +142,11 @@ router.get('/clients/duplicates', auth, adminOnly, wrap(async (req, res) => {
       (ARRAY_AGG(trainer_name ORDER BY pt_start_date DESC NULLS LAST)
         FILTER (WHERE trainer_name IS NOT NULL))[1] AS trainer_name
     FROM pt_clients
-    WHERE deleted_at IS NULL
+    WHERE deleted_at IS NULL${orgClause}
     GROUP BY TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
     HAVING COUNT(*) > 1
     ORDER BY COUNT(*) DESC, normalized_name
-  `);
+  `, params);
   res.json({
     data: rows,
     total_groups: rows.length,
@@ -130,6 +158,8 @@ router.get('/clients/duplicates', auth, adminOnly, wrap(async (req, res) => {
 
 // ─── Single client details ──────────────────────────────────
 router.get('/clients/:id', auth, wrap(async (req, res) => {
+  const params = [req.params.id];
+  const orgClause = orgWhere(req, params, 'c.organization_id');
   const { rows } = await pool.query(`
     SELECT c.*,
            CASE
@@ -152,8 +182,8 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
       WHERE deleted_at IS NULL
       GROUP BY client_id
     ) pp ON pp.client_id = c.id
-    WHERE c.id = $1 AND c.deleted_at IS NULL
-  `, [req.params.id]);
+    WHERE c.id = $1 AND c.deleted_at IS NULL${orgClause}
+  `, params);
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   res.json({ data: rows[0] });
 }));
@@ -269,6 +299,8 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
 
 // ─── Renewal history for a client ───────────────────────────
 router.get('/clients/:id/renewals', auth, wrap(async (req, res) => {
+  if (!await clientInOrg(req, req.params.id))
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const { rows } = await pool.query(
     `SELECT * FROM pt_client_renewals WHERE client_id = $1 ORDER BY renewed_at DESC`,
     [req.params.id]
@@ -293,9 +325,11 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
   const monthlyAmt = Number(d.monthly_pt_amount)  || 0;
   const packageType = d.package_type || null;
 
+  const exParams = [req.params.id];
+  const exOrg = orgWhere(req, exParams);
   const { rows: existing } = await pool.query(
-    'SELECT * FROM pt_clients WHERE id = $1 AND deleted_at IS NULL',
-    [req.params.id]
+    `SELECT * FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${exOrg}`,
+    exParams
   );
   if (existing.length === 0)
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
@@ -404,9 +438,11 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
     // Validate the two fields together against whichever value isn't being
     // changed in this request — never trust the client to have already
     // enforced paid <= final; recompute and re-check server-side.
+    const exParams = [req.params.id];
+    const exOrg = orgWhere(req, exParams);
     const { rows: existingRows } = await pool.query(
-      'SELECT final_amount, paid_amount FROM pt_clients WHERE id = $1 AND deleted_at IS NULL',
-      [req.params.id]
+      `SELECT final_amount, paid_amount FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${exOrg}`,
+      exParams
     );
     if (existingRows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
     const existing = existingRows[0];
@@ -463,8 +499,9 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS', message: 'No fields to update' } });
   sets.push('updated_at = NOW()');
 
+  const updOrg = orgWhere(req, params);
   const { rows } = await pool.query(
-    `UPDATE pt_clients SET ${sets.join(', ')} WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
+    `UPDATE pt_clients SET ${sets.join(', ')} WHERE id = $1 AND deleted_at IS NULL${updOrg} RETURNING *`,
     params
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
@@ -499,9 +536,11 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
 router.post('/clients/:id/photo', auth, wrap(async (req, res) => {
   const { photo } = req.body;
   if (!photo) return res.status(400).json({ error: { code: 'NO_PHOTO', message: 'No photo data provided' } });
+  const params = [photo, req.params.id];
+  const orgClause = orgWhere(req, params);
   const { rows } = await pool.query(
-    'UPDATE pt_clients SET photo_url = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL RETURNING id',
-    [photo, req.params.id]
+    `UPDATE pt_clients SET photo_url = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL${orgClause} RETURNING id`,
+    params
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   res.json({ data: rows[0] });
@@ -511,9 +550,11 @@ router.post('/clients/:id/photo', auth, wrap(async (req, res) => {
 router.put('/clients/:id/notes', auth, wrap(async (req, res) => {
   const { notes } = req.body;
   if (notes === undefined) return res.status(400).json({ error: { code: 'NO_NOTES', message: 'Missing notes' } });
+  const params = [notes, req.params.id];
+  const orgClause = orgWhere(req, params);
   const { rows } = await pool.query(
-    'UPDATE pt_clients SET notes = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL RETURNING id, notes',
-    [notes, req.params.id]
+    `UPDATE pt_clients SET notes = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL${orgClause} RETURNING id, notes`,
+    params
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   res.json({ data: rows[0] });
@@ -521,18 +562,22 @@ router.put('/clients/:id/notes', auth, wrap(async (req, res) => {
 
 // ─── Delete PT client (soft-delete) ─────────────────────────
 router.delete('/clients/:id', auth, requireRole('admin','manager'), wrap(async (req, res) => {
+  const params = [req.params.id];
+  const orgClause = orgWhere(req, params);
   const { rows } = await pool.query(`
     UPDATE pt_clients
     SET deleted_at = NOW(), updated_at = NOW(), status = 'inactive'
-    WHERE id = $1 AND deleted_at IS NULL
+    WHERE id = $1 AND deleted_at IS NULL${orgClause}
     RETURNING id
-  `, [req.params.id]);
+  `, params);
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   res.json({ message: 'Client deleted' });
 }));
 
 // ─── Client communication history ───────────────────────────
 router.get('/clients/:id/communication', auth, wrap(async (req, res) => {
+  if (!await clientInOrg(req, req.params.id))
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const { rows } = await pool.query(`
     SELECT cl.*, c.name AS client_name
     FROM communication_logs cl
@@ -546,6 +591,8 @@ router.get('/clients/:id/communication', auth, wrap(async (req, res) => {
 
 // ─── Subscription history ───────────────────────────────────
 router.get('/clients/:id/subscriptions', auth, wrap(async (req, res) => {
+  if (!await clientInOrg(req, req.params.id))
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const { rows } = await pool.query(`
     SELECT id, plan_name, start_date, end_date, duration_months,
            selling_price, amount_paid, balance_amount, trainer_name, status, source, created_at
@@ -724,9 +771,15 @@ router.post('/sessions', auth, wrap(async (req, res) => {
     duration_minutes, session_type, recurring } = req.body;
   let cid = client_id;
   if (!cid && client) {
-    const { rows } = await pool.query("SELECT id FROM pt_clients WHERE name = $1 AND deleted_at IS NULL LIMIT 1", [client]);
+    const nameParams = [client];
+    const nameOrg = orgWhere(req, nameParams);
+    const { rows } = await pool.query(`SELECT id FROM pt_clients WHERE name = $1 AND deleted_at IS NULL${nameOrg} LIMIT 1`, nameParams);
     if (rows.length > 0) cid = rows[0].id;
   }
+  // When client_id is supplied directly, verify it belongs to the caller's org
+  // so a session can't be booked against another studio's client.
+  if (cid && !await clientInOrg(req, cid))
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
   const duration = parseInt(duration_minutes, 10) || 60;
   const computedEndTime = end_time || (start_time ? addMinutesToTime(start_time, duration) : null);
@@ -793,6 +846,8 @@ router.get('/payments', auth, wrap(async (req, res) => {
   const params = [];
   if (client_id) { params.push(client_id); where.push(`p.client_id = $${params.length}`); }
   if (trainer_id) { params.push(trainer_id); where.push(`p.trainer_id = $${params.length}`); }
+  const pOrg = orgWhere(req, params, 'p.organization_id');
+  if (pOrg) where.push(pOrg.replace(/^ AND /, ''));
   const { rows } = await pool.query(`
     SELECT p.*, c.name AS client_name, COALESCE(t.name, ptt.name) AS trainer_name
     FROM pt_payments p
@@ -808,6 +863,10 @@ router.get('/payments', auth, wrap(async (req, res) => {
 router.post('/payments', auth, wrap(async (req, res) => {
   const { client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes } = req.body;
   const numAmount = Number(amount) || 0;
+
+  // A payment can only be recorded against a client in the caller's own org.
+  if (client_id && !await clientInOrg(req, client_id))
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
   // Validate trainer_id FK (pt_payments.trainer_id references trainers after
   // migration 072) — fall back to null if the trainer no longer exists.
@@ -853,6 +912,13 @@ router.post('/payments', auth, wrap(async (req, res) => {
 
 // ─── Execute Duplicate Merge ─────────────────────────────────
 router.post('/clients/merge-duplicates', auth, adminOnly, wrap(async (req, res) => {
+  // Tenant boundary: duplicate detection + merge must stay within the caller's
+  // own org, or an admin could merge (and thereby absorb/destroy) another
+  // studio's clients. A platform super admin operating platform-wide gets NULL
+  // → the null-safe predicate matches all orgs (they should use the
+  // org-switcher to target one studio before merging).
+  const scope = tenantScope(req);
+  const oParam = scope.applyFilter ? scope.orgId : null;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -870,13 +936,15 @@ router.post('/clients/merge-duplicates', auth, adminOnly, wrap(async (req, res) 
       INSERT INTO pt_clients_merge_backup
         SELECT *, NOW(), $1 FROM pt_clients
         WHERE deleted_at IS NULL
+          AND ($2::uuid IS NULL OR organization_id = $2)
           AND TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g'))) IN (
             SELECT TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
             FROM pt_clients WHERE deleted_at IS NULL
+              AND ($2::uuid IS NULL OR organization_id = $2)
             GROUP BY TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
             HAVING COUNT(*) > 1
           )
-    `, [mergeRun]);
+    `, [mergeRun, oParam]);
 
     // 2. Ensure merge log table exists
     await client.query(`
@@ -906,9 +974,10 @@ router.post('/clients/merge-duplicates', auth, adminOnly, wrap(async (req, res) 
         SUM(base_amount)   AS total_base,
         GREATEST(0, SUM(final_amount) - SUM(paid_amount)) AS balance
       FROM pt_clients WHERE deleted_at IS NULL
+        AND ($1::uuid IS NULL OR organization_id = $1)
       GROUP BY TRIM(LOWER(REGEXP_REPLACE(name, '\\s+', ' ', 'g')))
       HAVING COUNT(*) > 1
-    `);
+    `, [oParam]);
 
     const results = [];
 

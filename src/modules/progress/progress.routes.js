@@ -101,7 +101,12 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
   let age = b.age ?? null;
   let gender = b.gender ?? null;
   if (age == null || gender == null) {
-    const { rows: cRows } = await pool.query('SELECT dob, gender FROM pt_clients WHERE id = $1', [b.client_id]);
+    // Tenant scope: never read another studio's client demographics.
+    const dScope = tenantScope(req);
+    const cParams = [b.client_id];
+    let cOrg = '';
+    if (dScope.applyFilter) { cParams.push(dScope.orgId); cOrg = ' AND organization_id = $2'; }
+    const { rows: cRows } = await pool.query(`SELECT dob, gender FROM pt_clients WHERE id = $1${cOrg}`, cParams);
     const c = cRows[0];
     if (c) {
       if (age == null && c.dob) {
