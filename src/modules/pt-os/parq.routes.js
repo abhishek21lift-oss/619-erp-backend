@@ -112,7 +112,11 @@ async function replaceFamilyHistory(tx, formId, list) {
 
 const parqAnswerSchema = z.object({
   question_id: z.union([z.string(), z.number()]),
-  answer: z.enum(['yes', 'no']),
+  // Draft-friendly: the form is created as a draft on step 1, before the user
+  // reaches the PAR-Q step, so an answer may still be blank. '' / null means
+  // "not yet answered". computeParqAnalysis() ignores anything that isn't
+  // 'yes', and the client enforces all-answered before submit.
+  answer: z.enum(['yes', 'no']).or(z.literal('')).optional().nullable(),
   explanation: z.string().max(1000).optional().nullable(),
   diagnosis_date: z.string().optional().nullable(),
   treatment: z.string().max(500).optional().nullable(),
@@ -161,8 +165,9 @@ const parqFormCreateSchema = {
     // Step 4: Family Medical History
     family_history: z.array(familyHistorySchema).optional().nullable(),
 
-    // Step 5: PAR-Q — always exactly the 10 fixed questions
-    parq_answers: z.array(parqAnswerSchema).length(10, 'All 10 PAR-Q questions must be answered'),
+    // Step 5: PAR-Q — up to the 10 fixed questions; a draft created on step 1
+    // may carry blank/unanswered entries (see parqAnswerSchema).
+    parq_answers: z.array(parqAnswerSchema).max(10).optional().default([]),
 
     // Step 7: Trainer Notes
     trainer_notes: z.record(z.string(), z.unknown()).optional().nullable(),
