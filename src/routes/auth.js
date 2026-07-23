@@ -3,6 +3,7 @@ const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const jwt    = require('jsonwebtoken');
+const { authenticator } = require('otplib');
 const pool   = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, adminOnly, invalidateUserCache } = require('../middleware/auth');
@@ -94,6 +95,37 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
 
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
 
+    // ── 2FA enforcement for platform super admins ──────
+    // A super_admin operates the whole platform, so their account MUST be
+    // second-factor protected. If they have TOTP enabled, a valid 6-digit code
+    // is required here. If they have not enrolled yet, login is allowed (so
+    // they can reach Settings to set it up) but flagged mfaSetupRequired — the
+    // super-admin API itself is blocked until 2FA is on (requireSuperAdmin).
+    let mfaSetupRequired = false;
+    if (user.role === 'super_admin') {
+      let mfaEnabled = false;
+      let mfaSecret = null;
+      try {
+        const { rows: mrows } = await pool.query(
+          'SELECT mfa_enabled, mfa_secret FROM user_profiles WHERE user_id = $1', [user.id]
+        );
+        mfaEnabled = !!(mrows[0] && mrows[0].mfa_enabled);
+        mfaSecret = mrows[0] && mrows[0].mfa_secret;
+      } catch (mfaErr) {
+        // user_profiles may not exist pre-migration — treat as not enrolled.
+        logger.warn({ err: mfaErr.message }, 'super_admin mfa lookup failed');
+      }
+      if (mfaEnabled) {
+        const code = String(req.body.mfa_code || '').trim();
+        if (!code) return res.status(401).json({ error: 'MFA code required', mfaRequired: true });
+        if (!/^\d{6}$/.test(code) || !authenticator.check(code, mfaSecret, { window: 1 })) {
+          return res.status(401).json({ error: 'Invalid MFA code', mfaRequired: true });
+        }
+      } else {
+        mfaSetupRequired = true;
+      }
+    }
+
     // ── Update last login (non-critical, don't block on failure) ──
     pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id])
       .catch(function(err) { logger.warn({ err: err.message }, 'last_login update failed (non-critical)'); });
@@ -135,6 +167,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         organization_id:       user.organization_id,
         organization_name:     user.organization_name,
         organization_logo_url: user.organization_logo_url,
+        mfaSetupRequired,
       },
       token,
       refresh_token: refreshToken,

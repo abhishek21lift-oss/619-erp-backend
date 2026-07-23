@@ -9,6 +9,9 @@ const authSchemas = {
     body: z.object({
       email: emailSchema,
       password: z.string().min(1, 'Password is required'),
+      // Optional TOTP code — required at login for platform super admins who
+      // have 2FA enabled (enforced in the login handler, not here).
+      mfa_code: z.string().trim().regex(/^\d{6}$/, 'MFA code must be 6 digits').optional(),
     }),
   },
   changePassword: {

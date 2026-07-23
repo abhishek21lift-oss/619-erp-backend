@@ -53,4 +53,26 @@ function requireSuperAdmin(req, res, next) {
   next();
 }
 
-module.exports = { isSuperAdmin, resolveOrgId, tenantContext, requireSuperAdmin };
+// Express guard: a super_admin must have 2FA enrolled before operating the
+// platform admin. Enrollment lives under /api/profile/mfa/* (not gated here),
+// so there is no bootstrap deadlock. Fails closed — if MFA state can't be
+// confirmed, access is denied. Mount AFTER requireSuperAdmin.
+const pool = require('../db/pool');
+async function requireSuperAdminMfa(req, res, next) {
+  try {
+    const { rows } = await pool.query(
+      'SELECT mfa_enabled FROM user_profiles WHERE user_id = $1', [req.user.id]
+    );
+    if (rows[0] && rows[0].mfa_enabled) return next();
+  } catch {
+    /* user_profiles missing/unavailable — fall through to deny */
+  }
+  return res.status(403).json({
+    error: {
+      code: 'MFA_SETUP_REQUIRED',
+      message: 'Enable two-factor authentication in Settings before using the platform admin.',
+    },
+  });
+}
+
+module.exports = { isSuperAdmin, resolveOrgId, tenantContext, requireSuperAdmin, requireSuperAdminMfa };
