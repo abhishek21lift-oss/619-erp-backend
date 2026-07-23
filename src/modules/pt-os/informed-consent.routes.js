@@ -91,12 +91,19 @@ const SNAPSHOT_FIELDS = [
 
 // ─── Helpers ────────────────────────────────────────────────
 
-async function fetchClientSnapshot(clientId) {
+// Tenant scope: only snapshot a client in the caller's own org, otherwise a
+// consent create with a foreign client_id would copy that client's PII into a
+// new record owned by the caller's org (cross-tenant PII exfiltration).
+async function fetchClientSnapshot(clientId, req) {
+  const scope = tenantScope(req);
+  const params = [clientId];
+  let orgClause = '';
+  if (scope.applyFilter) { params.push(scope.orgId); orgClause = ' AND organization_id = $2'; }
   const { rows } = await pool.query(
     `SELECT name AS full_name, gender, dob, mobile, email, address, occupation,
             emergency_contact, emergency_phone, trainer_id
-       FROM pt_clients WHERE id = $1`,
-    [clientId]
+       FROM pt_clients WHERE id = $1${orgClause}`,
+    params
   );
   return rows[0] || null;
 }
@@ -157,7 +164,7 @@ router.get('/informed-consent/:id/activity', auth, wrap(async (req, res) => {
 // snapshot from pt_clients for any field not explicitly provided.
 router.post('/informed-consent', auth, requireRole('admin', 'manager', 'trainer'), validate(createSchema), wrap(async (req, res) => {
   const b = req.body;
-  const snapshot = await fetchClientSnapshot(b.client_id);
+  const snapshot = await fetchClientSnapshot(b.client_id, req);
   if (!snapshot) return res.status(404).json({ error: { code: 'CLIENT_NOT_FOUND' } });
 
   const values = {};
