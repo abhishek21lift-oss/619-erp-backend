@@ -25,7 +25,8 @@ const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
 const { saveFile } = require('../../lib/fileStorage');
 const { invalidateUserCache } = require('../../middleware/auth');
-const { TRIAL_DAYS } = require('../../lib/subscription');
+const subscription = require('../../lib/subscription');
+const { TRIAL_DAYS } = subscription;
 
 // Roles a tenant login may hold (never 'super_admin' — that is platform-only and
 // cannot be created, edited, or impersonated through this tenant-facing portal).
@@ -532,6 +533,178 @@ router.post('/organizations/:id/impersonate', async (req, res, next) => {
       },
     });
   } catch (err) { next(err); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SUBSCRIPTION / BILLING MANAGEMENT (platform operator)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /subscriptions — every studio's billing state + platform KPIs.
+router.get('/subscriptions', async (req, res, next) => {
+  try {
+    const { rows: studios } = await pool.query(`
+      SELECT o.id, o.name, o.slug, o.logo_url, o.status, o.subscription_status,
+             o.trial_ends_at, o.current_period_start, o.current_period_end,
+             o.plan_code, o.client_limit, o.is_founder, o.founder_number, o.locked_price_inr,
+             o.created_at, p.name AS plan_name,
+             (SELECT count(*) FROM pt_clients c WHERE c.organization_id = o.id AND c.deleted_at IS NULL)::int AS client_count
+        FROM organizations o
+        LEFT JOIN subscription_plans p ON p.code = o.plan_code
+       ORDER BY o.created_at DESC`);
+
+    const withState = studios.map((s) => {
+      const access = subscription.computeAccess({
+        status: s.status, subscription_status: s.subscription_status,
+        trial_ends_at: s.trial_ends_at, current_period_end: s.current_period_end,
+      });
+      return { ...s, effective_state: access.state, allowed: access.allowed,
+        trial_days_left: access.trialDaysLeft ?? null, period_days_left: access.periodDaysLeft ?? null,
+        renewal_due: access.renewalDue ?? false };
+    });
+
+    const { rows: [rev] } = await pool.query(`
+      SELECT COALESCE(SUM(amount_inr) FILTER (WHERE status='paid'), 0)::int AS total_revenue,
+             COALESCE(SUM(amount_inr) FILTER (WHERE status='paid' AND created_at >= date_trunc('month', now())), 0)::int AS revenue_this_month,
+             count(*) FILTER (WHERE status='paid')::int AS payment_count
+        FROM subscription_payments`);
+    const slots = await subscription.founderSlotsRemaining();
+
+    const kpis = {
+      studios: withState.length,
+      trial: withState.filter((s) => s.effective_state === 'trial').length,
+      active: withState.filter((s) => s.effective_state === 'active').length,
+      frozen: withState.filter((s) => ['frozen', 'trial_expired', 'expired', 'cancelled'].includes(s.effective_state)).length,
+      founders: withState.filter((s) => s.is_founder).length,
+      total_revenue: rev.total_revenue,
+      revenue_this_month: rev.revenue_this_month,
+      founder_slots_remaining: slots,
+    };
+    res.json({ data: { studios: withState, kpis } });
+  } catch (err) { next(err); }
+});
+
+// GET /organizations/:id/subscription — one studio's billing detail + history.
+router.get('/organizations/:id/subscription', async (req, res, next) => {
+  try {
+    const { rows: orgs } = await pool.query(`
+      SELECT o.*, p.name AS plan_name, p.duration_months, p.price_inr
+        FROM organizations o LEFT JOIN subscription_plans p ON p.code = o.plan_code
+       WHERE o.id = $1`, [req.params.id]);
+    if (!orgs.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Studio not found' } });
+    const o = orgs[0];
+    const access = subscription.computeAccess({
+      status: o.status, subscription_status: o.subscription_status,
+      trial_ends_at: o.trial_ends_at, current_period_end: o.current_period_end,
+    });
+    const [{ rows: payments }, { rows: invoices }, { rows: events }] = await Promise.all([
+      pool.query(`SELECT id, plan_code, amount_inr, method, reference, status, period_start, period_end, recorded_by_name, refunded_at, notes, created_at
+                    FROM subscription_payments WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 100`, [req.params.id]),
+      pool.query(`SELECT id, invoice_number, plan_code, amount_inr, period_start, period_end, status, issued_at
+                    FROM subscription_invoices WHERE organization_id=$1 ORDER BY issued_at DESC LIMIT 100`, [req.params.id]),
+      pool.query(`SELECT id, event, data, actor_name, created_at
+                    FROM subscription_events WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 50`, [req.params.id]),
+    ]);
+    res.json({ data: {
+      organization: {
+        id: o.id, name: o.name, slug: o.slug, status: o.status,
+        subscription_status: o.subscription_status, effective_state: access.state, allowed: access.allowed,
+        trial_ends_at: o.trial_ends_at, current_period_start: o.current_period_start, current_period_end: o.current_period_end,
+        plan_code: o.plan_code, plan_name: o.plan_name, client_limit: o.client_limit,
+        is_founder: o.is_founder, founder_number: o.founder_number, locked_price_inr: o.locked_price_inr,
+        trial_days_left: access.trialDaysLeft ?? null, period_days_left: access.periodDaysLeft ?? null,
+      },
+      payments, invoices, events,
+    } });
+  } catch (err) { next(err); }
+});
+
+// POST /organizations/:id/subscription/activate — record a payment + activate/renew.
+router.post('/organizations/:id/subscription/activate', async (req, res, next) => {
+  try {
+    const { plan_code, amount_inr, method, reference, notes, period_months } = req.body;
+    if (!plan_code) return res.status(400).json({ error: { code: 'VALIDATION', message: 'plan_code is required' } });
+    const result = await subscription.activate(req.params.id, plan_code, {
+      amount_inr: amount_inr != null ? Number(amount_inr) : undefined,
+      method, reference, notes,
+      periodMonths: period_months != null ? Number(period_months) : undefined,
+      actor: { id: req.user.id, name: req.user.name },
+    });
+    invalidateUserCache();
+    await audit(req, 'subscription_activated', 'organization', req.params.id, result);
+    res.json({ data: result });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: { code: 'ACTIVATION_FAILED', message: err.message } });
+    next(err);
+  }
+});
+
+// POST /organizations/:id/subscription/freeze
+router.post('/organizations/:id/subscription/freeze', async (req, res, next) => {
+  try {
+    await subscription.freeze(req.params.id, { id: req.user.id, name: req.user.name }, req.body?.reason);
+    invalidateUserCache();
+    await audit(req, 'subscription_frozen', 'organization', req.params.id, {});
+    res.json({ data: { id: req.params.id, subscription_status: 'frozen' } });
+  } catch (err) { next(err); }
+});
+
+// POST /organizations/:id/subscription/reactivate — comp un-freeze (no payment).
+router.post('/organizations/:id/subscription/reactivate', async (req, res, next) => {
+  try {
+    await subscription.reactivate(req.params.id, { id: req.user.id, name: req.user.name });
+    invalidateUserCache();
+    await audit(req, 'subscription_reactivated', 'organization', req.params.id, {});
+    res.json({ data: { id: req.params.id, subscription_status: 'active' } });
+  } catch (err) { next(err); }
+});
+
+// POST /organizations/:id/subscription/cancel
+router.post('/organizations/:id/subscription/cancel', async (req, res, next) => {
+  try {
+    await subscription.cancelSubscription(req.params.id, { id: req.user.id, name: req.user.name });
+    invalidateUserCache();
+    await audit(req, 'subscription_cancelled', 'organization', req.params.id, {});
+    res.json({ data: { id: req.params.id, subscription_status: 'cancelled' } });
+  } catch (err) { next(err); }
+});
+
+// PATCH /organizations/:id/subscription/expiry — override trial / period end.
+router.patch('/organizations/:id/subscription/expiry', async (req, res, next) => {
+  try {
+    const { trial_ends_at, current_period_end } = req.body;
+    await subscription.changeExpiry(req.params.id, {
+      trialEndsAt: trial_ends_at !== undefined ? (trial_ends_at || null) : undefined,
+      periodEnd: current_period_end !== undefined ? (current_period_end || null) : undefined,
+    }, { id: req.user.id, name: req.user.name });
+    invalidateUserCache();
+    await audit(req, 'subscription_expiry_changed', 'organization', req.params.id, { trial_ends_at, current_period_end });
+    res.json({ data: { id: req.params.id } });
+  } catch (err) { next(err); }
+});
+
+// POST /organizations/:id/subscription/founder — manually grant founder status.
+router.post('/organizations/:id/subscription/founder', async (req, res, next) => {
+  try {
+    const result = await subscription.grantFounder(req.params.id, { id: req.user.id, name: req.user.name });
+    invalidateUserCache();
+    await audit(req, 'founder_granted', 'organization', req.params.id, result);
+    res.json({ data: result });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: { code: 'FOUNDER_FAILED', message: err.message } });
+    next(err);
+  }
+});
+
+// POST /subscription-payments/:id/refund
+router.post('/subscription-payments/:id/refund', async (req, res, next) => {
+  try {
+    const pay = await subscription.refundPayment(req.params.id, { id: req.user.id, name: req.user.name });
+    await audit(req, 'subscription_refunded', 'organization', pay.organization_id, { payment_id: req.params.id });
+    res.json({ data: { id: req.params.id, status: 'refunded' } });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: { code: 'REFUND_FAILED', message: err.message } });
+    next(err);
+  }
 });
 
 module.exports = router;
