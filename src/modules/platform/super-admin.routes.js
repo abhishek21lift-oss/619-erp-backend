@@ -460,7 +460,7 @@ router.get('/activity', async (req, res, next) => {
         LEFT JOIN users u ON u.id = a.user_id
         LEFT JOIN organizations o ON o.id = u.organization_id
        WHERE ($1::uuid IS NULL OR u.organization_id = $1::uuid)
-         AND ($2::uuid IS NULL OR a.user_id = $2::uuid)
+         AND ($2::text IS NULL OR a.user_id = $2::text)
          AND ($3::text IS NULL OR a.action = $3)
        ORDER BY a.created_at DESC
        LIMIT $4 OFFSET $5`,
