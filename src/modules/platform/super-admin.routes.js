@@ -547,7 +547,10 @@ router.get('/subscriptions', async (req, res, next) => {
              o.trial_ends_at, o.current_period_start, o.current_period_end,
              o.plan_code, o.client_limit, o.is_founder, o.founder_number, o.locked_price_inr,
              o.created_at, p.name AS plan_name,
-             (SELECT count(*) FROM pt_clients c WHERE c.organization_id = o.id AND c.deleted_at IS NULL)::int AS client_count
+             (SELECT count(*) FROM pt_clients c WHERE c.organization_id = o.id AND c.deleted_at IS NULL)::int AS client_count,
+             (SELECT max(e.created_at) FROM subscription_events e
+                WHERE e.organization_id = o.id AND e.event = 'activation_requested'
+                  AND e.created_at > COALESCE(o.current_period_start, 'epoch'::timestamptz)) AS requested_at
         FROM organizations o
         LEFT JOIN subscription_plans p ON p.code = o.plan_code
        ORDER BY o.created_at DESC`);
