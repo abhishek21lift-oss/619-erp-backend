@@ -155,6 +155,161 @@ async function startTrial(orgId, days = TRIAL_DAYS, actor = null) {
   await logEvent(pool, orgId, 'trial_started', { days }, actor);
 }
 
+// ── Activation / renewal (records a payment and activates the studio) ─────────
+// opts: { amount_inr?, method?, reference?, notes?, periodMonths?, actor }
+// Founder club: the first 50 studios to activate become permanent Founder
+// Members with a lifetime-locked price. Founders keep their locked price on
+// renewal. The founder-slot check + assignment is serialized under a table lock
+// so the 50th slot can never be double-granted.
+async function activate(orgId, planCode, opts = {}) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('LOCK TABLE founder_members IN SHARE ROW EXCLUSIVE MODE');
+
+    const plan = (await client.query('SELECT * FROM subscription_plans WHERE code = $1', [planCode])).rows[0];
+    if (!plan) throw Object.assign(new Error('Unknown plan'), { status: 400 });
+    const org = (await client.query('SELECT * FROM organizations WHERE id = $1', [orgId])).rows[0];
+    if (!org) throw Object.assign(new Error('Studio not found'), { status: 404 });
+
+    const slots = await founderSlotsRemaining(client);
+    const alreadyFounder = org.is_founder;
+    const grantFounder = !alreadyFounder && slots > 0;
+
+    const { amount: effAmount } = effectivePrice(plan, slots);
+    const paidAmount = opts.amount_inr != null ? Number(opts.amount_inr)
+      : (alreadyFounder && org.locked_price_inr != null) ? org.locked_price_inr
+      : effAmount;
+
+    const months = opts.periodMonths || plan.duration_months;
+    const now = new Date();
+    const base = (org.current_period_end && new Date(org.current_period_end) > now) ? new Date(org.current_period_end) : now;
+    const periodEnd = new Date(base);
+    periodEnd.setMonth(periodEnd.getMonth() + Number(months));
+
+    let founderNumber = org.founder_number;
+    let lockedPrice = org.locked_price_inr;
+    if (grantFounder) {
+      const n = (await client.query('SELECT COALESCE(MAX(founder_number),0)+1 AS n FROM founder_members')).rows[0].n;
+      founderNumber = n;
+      lockedPrice = paidAmount;
+      await client.query(
+        `INSERT INTO founder_members (organization_id, founder_number, plan_code, locked_price_inr)
+         VALUES ($1,$2,$3,$4)`,
+        [orgId, n, planCode, lockedPrice]
+      );
+    }
+
+    await client.query(
+      `UPDATE organizations
+          SET subscription_status = 'active', plan_code = $2, client_limit = $3,
+              current_period_start = $4, current_period_end = $5, cancelled_at = NULL,
+              is_founder = (is_founder OR $6), founder_number = $7, locked_price_inr = $8,
+              updated_at = now()
+        WHERE id = $1`,
+      [orgId, planCode, plan.client_limit, now, periodEnd, grantFounder, founderNumber, lockedPrice]
+    );
+
+    const pay = (await client.query(
+      `INSERT INTO subscription_payments
+         (organization_id, plan_code, amount_inr, method, reference, status,
+          period_start, period_end, recorded_by, recorded_by_name, notes)
+       VALUES ($1,$2,$3,$4,$5,'paid',$6,$7,$8,$9,$10) RETURNING id`,
+      [orgId, planCode, paidAmount, opts.method || null, opts.reference || null,
+       now, periodEnd, opts.actor?.id || null, opts.actor?.name || null, opts.notes || null]
+    )).rows[0];
+
+    const seq = (await client.query('SELECT count(*)+1 AS n FROM subscription_invoices')).rows[0].n;
+    const invoiceNumber = `MPT-${now.getFullYear()}-${String(seq).padStart(5, '0')}`;
+    await client.query(
+      `INSERT INTO subscription_invoices
+         (organization_id, payment_id, invoice_number, plan_code, amount_inr, period_start, period_end, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'paid')`,
+      [orgId, pay.id, invoiceNumber, planCode, paidAmount, now, periodEnd]
+    );
+
+    await logEvent(client, orgId, 'activated', { plan_code: planCode, amount_inr: paidAmount, period_end: periodEnd }, opts.actor);
+    if (grantFounder) await logEvent(client, orgId, 'founder_granted', { founder_number: founderNumber, locked_price_inr: lockedPrice }, opts.actor);
+
+    await client.query('COMMIT');
+    return { plan_code: planCode, amount_inr: paidAmount, period_end: periodEnd, invoice_number: invoiceNumber, founder_granted: grantFounder, founder_number: founderNumber };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function freeze(orgId, actor, reason) {
+  await pool.query(`UPDATE organizations SET subscription_status='frozen', updated_at=now() WHERE id=$1`, [orgId]);
+  await logEvent(pool, orgId, 'frozen', { reason: reason || 'manual' }, actor);
+}
+
+// Comp reactivation (no payment) — un-freeze a studio back to active.
+async function reactivate(orgId, actor) {
+  await pool.query(`UPDATE organizations SET subscription_status='active', cancelled_at=NULL, updated_at=now() WHERE id=$1`, [orgId]);
+  await logEvent(pool, orgId, 'reactivated', {}, actor);
+}
+
+async function cancelSubscription(orgId, actor) {
+  await pool.query(`UPDATE organizations SET subscription_status='cancelled', cancelled_at=now(), updated_at=now() WHERE id=$1`, [orgId]);
+  await logEvent(pool, orgId, 'cancelled', {}, actor);
+}
+
+// Change the trial or subscription expiry directly (admin override / comps).
+async function changeExpiry(orgId, { trialEndsAt, periodEnd }, actor) {
+  const sets = [];
+  const params = [orgId];
+  if (trialEndsAt !== undefined) { params.push(trialEndsAt); sets.push(`trial_ends_at = $${params.length}`); }
+  if (periodEnd !== undefined) { params.push(periodEnd); sets.push(`current_period_end = $${params.length}`); }
+  if (!sets.length) return;
+  sets.push('updated_at = now()');
+  await pool.query(`UPDATE organizations SET ${sets.join(', ')} WHERE id = $1`, params);
+  await logEvent(pool, orgId, 'expiry_changed', { trialEndsAt, periodEnd }, actor);
+}
+
+// Manually grant founder status (outside the automatic first-50 flow).
+async function grantFounder(orgId, actor) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('LOCK TABLE founder_members IN SHARE ROW EXCLUSIVE MODE');
+    const org = (await client.query('SELECT is_founder, locked_price_inr, plan_code FROM organizations WHERE id=$1', [orgId])).rows[0];
+    if (!org) throw Object.assign(new Error('Studio not found'), { status: 404 });
+    if (org.is_founder) { await client.query('COMMIT'); return { already: true }; }
+    const n = (await client.query('SELECT COALESCE(MAX(founder_number),0)+1 AS n FROM founder_members')).rows[0].n;
+    const locked = org.locked_price_inr || 0;
+    await client.query(
+      `INSERT INTO founder_members (organization_id, founder_number, plan_code, locked_price_inr) VALUES ($1,$2,$3,$4)`,
+      [orgId, n, org.plan_code || null, locked]
+    );
+    await client.query(
+      `UPDATE organizations SET is_founder=TRUE, founder_number=$2, updated_at=now() WHERE id=$1`,
+      [orgId, n]
+    );
+    await logEvent(client, orgId, 'founder_granted', { founder_number: n, manual: true }, actor);
+    await client.query('COMMIT');
+    return { founder_number: n };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function refundPayment(paymentId, actor) {
+  const pay = (await pool.query(
+    `UPDATE subscription_payments SET status='refunded', refunded_at=now()
+      WHERE id=$1 AND status='paid' RETURNING organization_id, amount_inr`, [paymentId]
+  )).rows[0];
+  if (!pay) throw Object.assign(new Error('Payment not found or already refunded'), { status: 404 });
+  await pool.query(`UPDATE subscription_invoices SET status='refunded' WHERE payment_id=$1`, [paymentId]);
+  await logEvent(pool, pay.organization_id, 'refunded', { payment_id: paymentId, amount_inr: pay.amount_inr }, actor);
+  return pay;
+}
+
 module.exports = {
   FOUNDER_LIMIT,
   TRIAL_DAYS,
@@ -167,4 +322,11 @@ module.exports = {
   logEvent,
   startTrial,
   clientLimitStatus,
+  activate,
+  freeze,
+  reactivate,
+  cancelSubscription,
+  changeExpiry,
+  grantFounder,
+  refundPayment,
 };
