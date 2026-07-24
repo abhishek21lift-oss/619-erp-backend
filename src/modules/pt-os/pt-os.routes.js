@@ -9,6 +9,7 @@ const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
 const { generateClientId } = require('../../db/id-gen');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
+const subscription = require('../../lib/subscription');
 
 const ptClientCreateSchema = {
   body: z.object({
@@ -203,6 +204,20 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
 
     let cid = client_id;
     if (!cid) {
+      // Plan client-limit enforcement (SaaS). Adding a brand-new client to the
+      // roster is blocked once the studio hits its plan's client limit; existing
+      // clients stay fully accessible. Unlimited plans (limit null) never block.
+      const { limit, count, atLimit } = await subscription.clientLimitStatus(orgIdOf(req));
+      if (atLimit) {
+        return res.status(403).json({
+          error: {
+            code: 'PLAN_LIMIT_REACHED',
+            message: `You've reached your plan's limit of ${limit} clients. Upgrade your plan to add more.`,
+            limit, count,
+          },
+        });
+      }
+
       // Multi-tenant isolation (Phase 1): stamp the creator's organization so
       // the new client is only ever visible within that tenant's workspace.
       const { rows: [newCli] } = await pool.query(`
