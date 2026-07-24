@@ -280,6 +280,7 @@ app.use('/api/v1/auth',           require('./routes/auth'));
 app.use('/api/v1/auth',           require('./routes/auth-google'));
 app.use('/api/v1/auth/webauthn',  require('./routes/auth-webauthn'));
 app.use('/api/profile',           require('./routes/profile'));
+app.use('/api/subscription',      require('./routes/subscription'));
 
 // ROUTE INTEGRITY NOTE (R-02):
 // /api/clients mounts two separate routers. Express resolves in registration

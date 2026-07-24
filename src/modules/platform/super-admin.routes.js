@@ -25,6 +25,7 @@ const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
 const { saveFile } = require('../../lib/fileStorage');
 const { invalidateUserCache } = require('../../middleware/auth');
+const { TRIAL_DAYS } = require('../../lib/subscription');
 
 // Roles a tenant login may hold (never 'super_admin' — that is platform-only and
 // cannot be created, edited, or impersonated through this tenant-facing portal).
@@ -148,11 +149,21 @@ router.post('/organizations', async (req, res, next) => {
     const userId = crypto.randomUUID();
 
     await client.query('BEGIN');
+    // New studios get a 7-day free trial with all premium features unlocked.
+    // organizations.status stays 'active' (that column is the super-admin hard
+    // on/off switch); subscription_status drives the billing lifecycle.
     const { rows: orgRows } = await client.query(
-      `INSERT INTO organizations (name, slug, status) VALUES ($1,$2,'active') RETURNING *`,
-      [orgName, slug]
+      `INSERT INTO organizations (name, slug, status, subscription_status, trial_ends_at)
+       VALUES ($1,$2,'active','trial', now() + ($3 || ' days')::interval)
+       RETURNING *`,
+      [orgName, slug, String(TRIAL_DAYS)]
     );
     const org = orgRows[0];
+    await client.query(
+      `INSERT INTO subscription_events (organization_id, event, data, actor_id, actor_name)
+       VALUES ($1,'trial_started',$2,$3,$4)`,
+      [org.id, JSON.stringify({ days: TRIAL_DAYS }), req.user?.id || null, req.user?.name || null]
+    );
     const { rows: trainerRows } = await client.query(
       `INSERT INTO trainers (name, email, organization_id) VALUES ($1,$2,$3) RETURNING id`,
       [trainerName, email, org.id]
