@@ -2,6 +2,32 @@
 const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
 const logger = require('../lib/logger');
+const { computeAccess } = require('../lib/subscription');
+
+// Path prefixes that stay reachable even when a studio's subscription has lapsed,
+// so the studio can still authenticate, view its billing/frozen screen, manage
+// its own profile, and the platform operator can always get in.
+const SUBSCRIPTION_ALLOWLIST = [
+  '/api/auth', '/api/v1/auth', '/api/profile',
+  '/api/subscription', '/api/super-admin', '/api/health',
+];
+
+// Returns the blocking access decision when a tenant user's studio may not use
+// protected features, else null. Super admins and org-less users bypass.
+function subscriptionBlocked(req) {
+  const u = req.user;
+  if (!u || !u.organization_id || u.role === 'super_admin') return null;
+  // subscription columns are absent on the legacy fallback query — fail open.
+  if (u.subscription_status === undefined && u.organization_status === undefined) return null;
+  const access = computeAccess({
+    status: u.organization_status,
+    subscription_status: u.subscription_status,
+    trial_ends_at: u.trial_ends_at,
+    current_period_end: u.current_period_end,
+  });
+  req.subscriptionAccess = access;
+  return access.allowed ? null : access;
+}
 
 // In-memory user cache. The token only carries `id`; we re-load the row
 // on every request so role / trainer_id / is_active changes propagate
@@ -66,6 +92,8 @@ async function auth(req, res, next) {
           // SECURITY: filter out soft-deleted users (deleted_at IS NOT NULL).
           `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
                   u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
+                  o.status AS organization_status, o.subscription_status,
+                  o.trial_ends_at, o.current_period_end,
                   u.is_active, u.token_version
              FROM users u
              LEFT JOIN organizations o ON o.id = u.organization_id
@@ -116,6 +144,24 @@ async function auth(req, res, next) {
             message: 'Read-only impersonation: changes are disabled. Exit impersonation to act as super admin.',
           },
         });
+      }
+    }
+
+    // Subscription enforcement (SaaS billing). Compute the studio's access state
+    // from its cached subscription snapshot and block protected routes when the
+    // trial/subscription has lapsed or the studio is suspended. Super admins,
+    // legacy org-less users, and impersonation sessions bypass. Timestamps drive
+    // expiry, so this is correct even off a cached user row.
+    if (!req.impersonation) {
+      const blocked = subscriptionBlocked(req);
+      if (blocked) {
+        const path = (req.originalUrl || req.url || '').split('?')[0];
+        const allowed = SUBSCRIPTION_ALLOWLIST.some((p) => path.startsWith(p));
+        if (!allowed) {
+          return res.status(402).json({
+            error: { code: 'SUBSCRIPTION_INACTIVE', state: blocked.state, message: blocked.reason },
+          });
+        }
       }
     }
 
