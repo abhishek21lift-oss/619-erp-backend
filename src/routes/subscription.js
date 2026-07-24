@@ -104,4 +104,48 @@ router.get('/payments', auth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// POST /api/subscription/request-activation — a studio asks the platform to
+// activate/renew its subscription (admin-activated billing). Notifies the super
+// admins in-app and logs the request so it surfaces in the command centre.
+// Reachable while frozen (on the auth allowlist). De-duplicated to once / 6h.
+router.post('/request-activation', auth, async (req, res, next) => {
+  try {
+    const orgId = req.user?.organization_id;
+    if (!orgId) return res.status(400).json({ error: { code: 'NO_ORG', message: 'No studio context' } });
+    const planCode = req.body?.plan_code || null;
+
+    const { rows: recent } = await pool.query(
+      `SELECT 1 FROM subscription_events
+        WHERE organization_id=$1 AND event='activation_requested'
+          AND created_at > now() - interval '6 hours' LIMIT 1`, [orgId]
+    );
+    if (recent.length) {
+      return res.json({ data: { requested: true, deduped: true, message: 'We already have your request — we’ll activate shortly.' } });
+    }
+
+    const { rows: [org] } = await pool.query('SELECT name FROM organizations WHERE id=$1', [orgId]);
+    await pool.query(
+      `INSERT INTO subscription_events (organization_id, event, data, actor_id, actor_name)
+       VALUES ($1,'activation_requested',$2,$3,$4)`,
+      [orgId, JSON.stringify({ plan_code: planCode }), req.user.id, req.user.name || null]
+    );
+
+    // Notify every active platform super admin (in-app).
+    const { rows: admins } = await pool.query(
+      `SELECT id FROM users WHERE role='super_admin' AND is_active=true AND deleted_at IS NULL`
+    );
+    for (const a of admins) {
+      try {
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, body, link)
+           VALUES ($1,'subscription',$2,$3,'/platform')`,
+          [a.id, 'Activation requested', `${org?.name || 'A studio'} requested subscription activation${planCode ? ` (${planCode})` : ''}.`]
+        );
+      } catch { /* best-effort */ }
+    }
+
+    res.json({ data: { requested: true, message: 'Request sent — we’ll activate your subscription shortly.' } });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
