@@ -120,6 +120,24 @@ async function logEvent(client, orgId, event, data, actor) {
   } catch { /* best-effort audit */ }
 }
 
+// ── Client limits ─────────────────────────────────────────────────────────────
+// Current roster size vs the studio's plan limit. limit === null means unlimited
+// (grandfathered studios and the Elite plan). atLimit is the gate for new-client
+// creation; existing clients always stay accessible.
+async function clientLimitStatus(orgId, client = pool) {
+  if (!orgId) return { limit: null, count: 0, atLimit: false };
+  const { rows: [r] } = await client.query(
+    `SELECT o.client_limit,
+            (SELECT count(*) FROM pt_clients c
+               WHERE c.organization_id = o.id AND c.deleted_at IS NULL)::int AS count
+       FROM organizations o WHERE o.id = $1`,
+    [orgId]
+  );
+  if (!r) return { limit: null, count: 0, atLimit: false };
+  const limit = r.client_limit;
+  return { limit, count: r.count, atLimit: limit != null && r.count >= limit };
+}
+
 // ── Trial ────────────────────────────────────────────────────────────────────
 // Start (or restart) a studio's free trial. Called at studio creation.
 async function startTrial(orgId, days = TRIAL_DAYS, actor = null) {
@@ -148,4 +166,5 @@ module.exports = {
   quote,
   logEvent,
   startTrial,
+  clientLimitStatus,
 };
