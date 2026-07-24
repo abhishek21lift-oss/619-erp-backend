@@ -76,4 +76,32 @@ router.get('/plans', auth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /api/subscription/invoices — the studio's own invoice history.
+router.get('/invoices', auth, async (req, res, next) => {
+  try {
+    const orgId = req.user?.organization_id;
+    if (!orgId) return res.json({ data: [] });
+    const { rows } = await pool.query(
+      `SELECT id, invoice_number, plan_code, amount_inr, period_start, period_end, status, issued_at
+         FROM subscription_invoices WHERE organization_id = $1 ORDER BY issued_at DESC LIMIT 100`,
+      [orgId]
+    );
+    res.json({ data: rows });
+  } catch (err) { next(err); }
+});
+
+// GET /api/subscription/payments — the studio's own payment history.
+router.get('/payments', auth, async (req, res, next) => {
+  try {
+    const orgId = req.user?.organization_id;
+    if (!orgId) return res.json({ data: [] });
+    const { rows } = await pool.query(
+      `SELECT id, plan_code, amount_inr, method, reference, status, period_start, period_end, refunded_at, created_at
+         FROM subscription_payments WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 100`,
+      [orgId]
+    );
+    res.json({ data: rows });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
