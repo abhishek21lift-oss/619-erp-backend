@@ -406,6 +406,17 @@ runMigrationsWithRetry()
       logger.info({ interval: '14min' }, 'Uptime self-ping enabled');
     }
 
+    // Subscription sweep: freeze lapsed trials/subscriptions + send 7/3/1/expiry
+    // reminders. Idempotent + de-duplicated, so a simple interval is safe (and
+    // freezing is also enforced lazily on every request, independent of this).
+    // Disable with SUBSCRIPTION_SWEEP=off.
+    if (process.env.SUBSCRIPTION_SWEEP !== 'off') {
+      const { runSubscriptionSweep } = require('./workers/subscription.worker');
+      setTimeout(() => { runSubscriptionSweep(); }, 60 * 1000).unref();
+      setInterval(() => { runSubscriptionSweep(); }, 6 * 60 * 60 * 1000).unref();
+      logger.info({ interval: '6h' }, 'Subscription sweep scheduled');
+    }
+
     const pool = require('./db/pool');
     function shutdown(sig) {
       return function() {
