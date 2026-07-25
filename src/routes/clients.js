@@ -154,6 +154,15 @@ router.get('/search', auth, async (req, res, next) => {
       orgClause = ` AND c.organization_id = $${baseParams.length}`;
     }
 
+    // A trainer may only search their own roster. GET / above already enforces
+    // this; this route did not, which meant the same rule could be sidestepped
+    // simply by calling /search instead of /. Fail closed: a trainer account
+    // with no linked trainer record matches nothing rather than the whole org.
+    if (req.user.role === 'trainer') {
+      baseParams.push(req.user.trainer_id || null);
+      orgClause += ` AND c.trainer_id = $${baseParams.length}`;
+    }
+
     const { sql: bsql, params: bparams } = req.branchScope.appendTo(baseParams);
     const { rows } = await pool.query(
       `SELECT c.*, t.name as computed_trainer_name
