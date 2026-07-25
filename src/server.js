@@ -26,11 +26,13 @@ if (process.env.JWT_SECRET.length < 32) {
   process.exit(1);
 }
 
-// Warn about missing recommended (non-fatal) vars so ops teams notice early
+// Warn about missing recommended (non-fatal) vars so ops teams notice early.
+// SUPABASE_URL / SUPABASE_SERVICE_KEY were removed from this list: no code
+// path reads either one (the app reaches Postgres solely via DATABASE_URL +
+// pg), so warning about them only pushed operators to provision a
+// service_role key — which bypasses RLS entirely — that nothing consumes.
 const RECOMMENDED_ENV = [
   'KIOSK_HMAC_SECRET',
-  'SUPABASE_URL',
-  'SUPABASE_SERVICE_KEY',
   'RP_ID',
   'WEBAUTHN_ORIGIN',
   'FACE_ENCRYPTION_KEY',
@@ -49,6 +51,35 @@ if (isProd && !process.env.FACE_ENCRYPTION_KEY) {
   );
 }
 
+// ── Cloudflare R2 object storage ────────────────────────────────────────────
+// lib/fileStorage.js falls back to local disk whenever R2 is not fully
+// configured. On Render the filesystem is ephemeral, so that fallback silently
+// destroys every uploaded file — signed consent PDFs, PAR-Q forms, avatars —
+// on the next deploy or restart, with nothing in the logs to show for it.
+//
+// Partial configuration is always a mistake, so it is fatal in every
+// environment. A complete absence of R2 config is fatal in production only,
+// where the ephemeral-disk fallback is never the intended behaviour; local dev
+// keeps working on disk untouched.
+const R2_VARS = ['R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY'];
+const r2Set = R2_VARS.filter(function(k) { return Boolean(process.env[k]); });
+
+if (r2Set.length > 0 && r2Set.length < R2_VARS.length) {
+  logger.fatal(
+    { set: r2Set, missing: R2_VARS.filter(function(k) { return !process.env[k]; }) },
+    'R2 object storage is partially configured — uploads would silently fall back to ephemeral local disk. Set all three R2 variables, or none.'
+  );
+  process.exit(1);
+}
+
+if (isProd && r2Set.length === 0) {
+  logger.fatal(
+    { required: R2_VARS },
+    'R2 object storage is not configured in production — uploaded consent PDFs, PAR-Q forms and avatars would be written to ephemeral disk and lost on every deploy.'
+  );
+  process.exit(1);
+}
+
 const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
@@ -64,9 +95,23 @@ const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// Behind Render / Vercel / Cloudflare — trust the first proxy so
-// req.ip is real and rate-limit keys aren’t bucketed to one IP.
-app.set('trust proxy', 1);
+// Behind Render / Vercel / Cloudflare — trust the proxy hops in front of us so
+// req.ip is the real client and rate-limit keys aren't bucketed to one IP.
+//
+// The correct value is the NUMBER OF PROXIES in front of this process, and it
+// depends on the deployment topology: Render alone is 1, Cloudflare in front of
+// Render is 2. Setting it too low makes req.ip an infrastructure address, which
+// collapses every caller into a single rate-limit bucket and neuters the login
+// brute-force protection below. Overridable so the value can match the actual
+// topology without a code change; verify by logging req.ip in production and
+// confirming it matches real client addresses.
+const TRUST_PROXY = (() => {
+  const raw = (process.env.TRUST_PROXY || '').trim();
+  if (!raw) return 1;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : raw; // number of hops, or an express-compatible string
+})();
+app.set('trust proxy', TRUST_PROXY);
 app.disable('x-powered-by');
 
 // ────────────────────────
