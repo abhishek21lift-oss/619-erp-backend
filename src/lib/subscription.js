@@ -13,9 +13,17 @@
 
 const pool = require('../db/pool');
 
-const FOUNDER_LIMIT = 50;
+// Founder's Club cap. The launch offer (Elite at ₹7,999) stays live only while
+// slots remain, so this single number drives both. Env-overridable so the cap
+// can be adjusted without a deploy.
+const FOUNDER_LIMIT = parseInt(process.env.FOUNDER_LIMIT, 10) || 20;
 const TRIAL_DAYS = parseInt(process.env.TRIAL_DAYS, 10) || 7;
 const DAY_MS = 86400000;
+
+// Statuses that consume a plan seat. Per the product spec the limit applies to
+// ACTIVE clients only — pending, expired, archived and completed clients do not
+// count, so archiving a client frees a slot immediately.
+const SEAT_CONSUMING_STATUSES = ['active'];
 
 // ── Access decision (pure) ────────────────────────────────────────────────────
 // org snapshot: { status, subscription_status, trial_ends_at, current_period_end }
@@ -121,21 +129,34 @@ async function logEvent(client, orgId, event, data, actor) {
 }
 
 // ── Client limits ─────────────────────────────────────────────────────────────
-// Current roster size vs the studio's plan limit. limit === null means unlimited
+// Seat usage vs the studio's plan limit. limit === null means unlimited
 // (grandfathered studios and the Elite plan). atLimit is the gate for new-client
 // creation; existing clients always stay accessible.
+//
+// Only ACTIVE clients consume a seat. Pending, expired, archived and completed
+// clients are excluded, so archiving a client frees a slot straight away — a
+// Starter studio at 5/5 drops to 4/5 the moment one client is archived. This
+// previously counted every non-deleted row regardless of status, which silently
+// charged studios for name-only 'pending' entries and long-expired clients.
 async function clientLimitStatus(orgId, client = pool) {
-  if (!orgId) return { limit: null, count: 0, atLimit: false };
+  if (!orgId) return { limit: null, count: 0, remaining: null, atLimit: false };
   const { rows: [r] } = await client.query(
     `SELECT o.client_limit,
             (SELECT count(*) FROM pt_clients c
-               WHERE c.organization_id = o.id AND c.deleted_at IS NULL)::int AS count
+               WHERE c.organization_id = o.id
+                 AND c.deleted_at IS NULL
+                 AND c.status = ANY($2::text[]))::int AS count
        FROM organizations o WHERE o.id = $1`,
-    [orgId]
+    [orgId, SEAT_CONSUMING_STATUSES]
   );
-  if (!r) return { limit: null, count: 0, atLimit: false };
+  if (!r) return { limit: null, count: 0, remaining: null, atLimit: false };
   const limit = r.client_limit;
-  return { limit, count: r.count, atLimit: limit != null && r.count >= limit };
+  return {
+    limit,
+    count: r.count,
+    remaining: limit == null ? null : Math.max(0, limit - r.count),
+    atLimit: limit != null && r.count >= limit,
+  };
 }
 
 // ── Trial ────────────────────────────────────────────────────────────────────
@@ -183,7 +204,13 @@ async function activate(orgId, planCode, opts = {}) {
 
     const months = opts.periodMonths || plan.duration_months;
     const now = new Date();
-    const base = (org.current_period_end && new Date(org.current_period_end) > now) ? new Date(org.current_period_end) : now;
+    // Renewals stack on top of any time still remaining, so a studio never
+    // loses days by paying early. A prorated upgrade sets resetPeriod, because
+    // the remaining time has already been credited back in cash — stacking it
+    // as well would hand the studio that time twice.
+    const base = (!opts.resetPeriod && org.current_period_end && new Date(org.current_period_end) > now)
+      ? new Date(org.current_period_end)
+      : now;
     const periodEnd = new Date(base);
     periodEnd.setMonth(periodEnd.getMonth() + Number(months));
 
@@ -213,10 +240,13 @@ async function activate(orgId, planCode, opts = {}) {
     const pay = (await client.query(
       `INSERT INTO subscription_payments
          (organization_id, plan_code, amount_inr, method, reference, status,
-          period_start, period_end, recorded_by, recorded_by_name, notes)
-       VALUES ($1,$2,$3,$4,$5,'paid',$6,$7,$8,$9,$10) RETURNING id`,
+          period_start, period_end, recorded_by, recorded_by_name, notes,
+          proration_credit_inr, previous_plan_code)
+       VALUES ($1,$2,$3,$4,$5,'paid',$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
       [orgId, planCode, paidAmount, opts.method || null, opts.reference || null,
-       now, periodEnd, opts.actor?.id || null, opts.actor?.name || null, opts.notes || null]
+       now, periodEnd, opts.actor?.id || null, opts.actor?.name || null, opts.notes || null,
+       opts.prorationCreditInr != null ? opts.prorationCreditInr : null,
+       opts.previousPlanCode || null]
     )).rows[0];
 
     const seq = (await client.query('SELECT count(*)+1 AS n FROM subscription_invoices')).rows[0].n;
@@ -255,6 +285,229 @@ async function reactivate(orgId, actor) {
 async function cancelSubscription(orgId, actor) {
   await pool.query(`UPDATE organizations SET subscription_status='cancelled', cancelled_at=now(), updated_at=now() WHERE id=$1`, [orgId]);
   await logEvent(pool, orgId, 'cancelled', {}, actor);
+}
+
+// ── Plan changes: upgrade (immediate, prorated) / downgrade (deferred) ────────
+//
+// Direction is decided by price, not by name: whichever plan costs more per
+// month is the "upgrade". Comparing monthly rates rather than sticker price is
+// what makes Growth (₹3,999 / 3 mo = ₹1,333/mo) correctly read as an upgrade
+// from Starter (₹1,499 / 1 mo), even though its sticker price is higher.
+function monthlyRate(plan, priceInr) {
+  const months = Number(plan.duration_months) || 1;
+  return Number(priceInr) / months;
+}
+
+// Unused value left on the current period, in rupees. Time-based: the share of
+// the period still unconsumed, multiplied by what the studio actually paid for
+// it. Returns 0 when there is nothing to credit (on trial, expired, no period).
+function prorationCredit(org, paidForCurrentPeriod, now = new Date()) {
+  if (!org?.current_period_start || !org?.current_period_end) return 0;
+  const start = new Date(org.current_period_start).getTime();
+  const end = new Date(org.current_period_end).getTime();
+  const t = now.getTime();
+  const span = end - start;
+  if (!(span > 0) || t >= end) return 0;
+  const unusedFraction = Math.min(1, Math.max(0, (end - Math.max(t, start)) / span));
+  return Math.round(Number(paidForCurrentPeriod || 0) * unusedFraction);
+}
+
+// What the studio last actually paid for the period it is currently in. Falls
+// back to the plan's effective price when no payment row exists (e.g. a comped
+// activation), so a credit is still computed sensibly.
+async function amountPaidForCurrentPeriod(orgId, org, client = pool) {
+  const { rows } = await client.query(
+    `SELECT amount_inr FROM subscription_payments
+      WHERE organization_id = $1 AND status = 'paid'
+      ORDER BY created_at DESC LIMIT 1`,
+    [orgId]
+  );
+  if (rows.length) return Number(rows[0].amount_inr);
+  if (org?.locked_price_inr != null) return Number(org.locked_price_inr);
+  return 0;
+}
+
+/**
+ * Price a plan change without applying it — this is what the studio sees before
+ * confirming, and what the super admin sees before executing.
+ *
+ * Upgrades return `amount_due` (new plan price minus the unused credit, floored
+ * at 0) and take effect immediately. Downgrades are always ₹0 now and take
+ * effect at period end, so the studio keeps the time it already bought.
+ */
+async function quotePlanChange(orgId, newPlanCode) {
+  const org = (await pool.query('SELECT * FROM organizations WHERE id = $1', [orgId])).rows[0];
+  if (!org) throw Object.assign(new Error('Studio not found'), { status: 404 });
+  const newPlan = await getPlan(newPlanCode);
+  if (!newPlan) throw Object.assign(new Error('Unknown plan'), { status: 400 });
+
+  const currentPlan = org.plan_code ? await getPlan(org.plan_code) : null;
+  const slots = await founderSlotsRemaining();
+
+  // Founders keep their locked price for the life of the account; everyone else
+  // pays the current effective (launch-aware) price.
+  const { amount: listPrice, isLaunch } = effectivePrice(newPlan, slots);
+  const newPrice = (org.is_founder && org.locked_price_inr != null)
+    ? Number(org.locked_price_inr)
+    : listPrice;
+
+  const paid = await amountPaidForCurrentPeriod(orgId, org);
+  const credit = prorationCredit(org, paid);
+
+  // No current plan (trial / expired / never subscribed) → this is a plain
+  // activation, not a change: full price, immediate, no credit.
+  const isChange = Boolean(currentPlan) && org.subscription_status === 'active';
+  const direction = !isChange ? 'activation'
+    : newPlan.code === currentPlan.code ? 'renewal'
+    : monthlyRate(newPlan, newPrice) > monthlyRate(currentPlan, paid || currentPlan.price_inr) ? 'upgrade'
+    : 'downgrade';
+
+  const usage = await clientLimitStatus(orgId);
+  // A downgrade that would put the studio over the new plan's seat limit is
+  // allowed but must be surfaced — existing clients are never auto-archived.
+  const overLimitBy = newPlan.client_limit != null && usage.count > newPlan.client_limit
+    ? usage.count - newPlan.client_limit
+    : 0;
+
+  const immediate = direction !== 'downgrade';
+  const amountDue = direction === 'downgrade' ? 0 : Math.max(0, newPrice - (direction === 'activation' ? 0 : credit));
+
+  return {
+    direction,
+    immediate,
+    current_plan: currentPlan ? { code: currentPlan.code, name: currentPlan.name, client_limit: currentPlan.client_limit } : null,
+    new_plan: { code: newPlan.code, name: newPlan.name, client_limit: newPlan.client_limit, duration_months: newPlan.duration_months },
+    new_plan_price_inr: newPrice,
+    proration_credit_inr: direction === 'activation' ? 0 : credit,
+    amount_due_inr: amountDue,
+    is_launch_price: isLaunch && !org.is_founder,
+    founder_locked: Boolean(org.is_founder && org.locked_price_inr != null),
+    effective_at: immediate ? new Date() : (org.current_period_end || null),
+    active_clients: usage.count,
+    new_client_limit: newPlan.client_limit,
+    over_limit_by: overLimitBy,
+    warning: overLimitBy > 0
+      ? `This plan allows ${newPlan.client_limit} active clients and you currently have ${usage.count}. `
+        + `${overLimitBy} client${overLimitBy === 1 ? '' : 's'} will need to be archived before you can add new ones — `
+        + 'no existing client is removed or loses access.'
+      : null,
+  };
+}
+
+/**
+ * Apply an immediate, prorated plan change (upgrade or same-plan renewal).
+ *
+ * Delegates to activate() so there is exactly one code path that writes the
+ * payment, invoice, founder grant and period maths — this function's job is
+ * only to work out the prorated amount and hand it over.
+ */
+async function changePlan(orgId, newPlanCode, opts = {}) {
+  const q = await quotePlanChange(orgId, newPlanCode);
+  if (q.direction === 'downgrade') {
+    throw Object.assign(
+      new Error('Downgrades take effect at the end of the current billing period — use scheduleDowngrade()'),
+      { status: 400, code: 'DOWNGRADE_MUST_BE_SCHEDULED' }
+    );
+  }
+
+  const result = await activate(orgId, newPlanCode, {
+    ...opts,
+    // The studio pays the difference, not the full sticker price.
+    amount_inr: opts.amount_inr != null ? opts.amount_inr : q.amount_due_inr,
+    // An upgrade restarts the period from now; activate() would otherwise stack
+    // the new term on top of the remaining one, double-counting the time we
+    // just credited back.
+    resetPeriod: true,
+    // Recorded on the payment row inside the same transaction, so the invoice
+    // can show list price vs credit vs charged.
+    prorationCreditInr: q.proration_credit_inr,
+    previousPlanCode: q.current_plan?.code || null,
+  });
+
+  await logEvent(pool, orgId, 'plan_changed', {
+    from: q.current_plan?.code || null, to: newPlanCode,
+    direction: q.direction, credit_inr: q.proration_credit_inr, charged_inr: q.amount_due_inr,
+  }, opts.actor);
+
+  return { ...result, ...q };
+}
+
+/**
+ * Schedule a downgrade for the end of the current billing period. Nothing
+ * changes now: the studio keeps its current plan, limit and access until the
+ * period rolls over, at which point the worker applies it.
+ */
+async function scheduleDowngrade(orgId, newPlanCode, actor = null) {
+  const q = await quotePlanChange(orgId, newPlanCode);
+  if (q.direction !== 'downgrade') {
+    throw Object.assign(
+      new Error('That plan is not a downgrade — apply it immediately with changePlan()'),
+      { status: 400, code: 'NOT_A_DOWNGRADE' }
+    );
+  }
+  const effectiveAt = q.effective_at;
+  if (!effectiveAt) {
+    throw Object.assign(new Error('Studio has no active billing period to schedule against'), { status: 400 });
+  }
+
+  await pool.query(
+    `UPDATE organizations
+        SET pending_plan_code = $2, pending_plan_effective_at = $3,
+            pending_plan_requested_at = now(), updated_at = now()
+      WHERE id = $1`,
+    [orgId, newPlanCode, effectiveAt]
+  );
+  await logEvent(pool, orgId, 'downgrade_scheduled', {
+    from: q.current_plan?.code || null, to: newPlanCode,
+    effective_at: effectiveAt, over_limit_by: q.over_limit_by,
+  }, actor);
+
+  return q;
+}
+
+/** Cancel a scheduled downgrade before it takes effect. */
+async function cancelScheduledChange(orgId, actor = null) {
+  const { rowCount } = await pool.query(
+    `UPDATE organizations
+        SET pending_plan_code = NULL, pending_plan_effective_at = NULL,
+            pending_plan_requested_at = NULL, updated_at = now()
+      WHERE id = $1 AND pending_plan_code IS NOT NULL`,
+    [orgId]
+  );
+  if (rowCount) await logEvent(pool, orgId, 'downgrade_cancelled', {}, actor);
+  return { cancelled: rowCount > 0 };
+}
+
+/**
+ * Apply every scheduled downgrade that has come due. Called by the subscription
+ * worker. Idempotent — clearing the pending columns means a second run is a
+ * no-op, and a studio whose period was extended in the meantime is skipped.
+ */
+async function applyDueDowngrades(actor = null) {
+  const { rows } = await pool.query(
+    `SELECT id, pending_plan_code, plan_code
+       FROM organizations
+      WHERE pending_plan_code IS NOT NULL
+        AND pending_plan_effective_at IS NOT NULL
+        AND pending_plan_effective_at <= now()`
+  );
+
+  const applied = [];
+  for (const org of rows) {
+    const plan = await getPlan(org.pending_plan_code);
+    if (!plan) continue;
+    await pool.query(
+      `UPDATE organizations
+          SET plan_code = $2, client_limit = $3,
+              pending_plan_code = NULL, pending_plan_effective_at = NULL,
+              pending_plan_requested_at = NULL, updated_at = now()
+        WHERE id = $1`,
+      [org.id, plan.code, plan.client_limit]
+    );
+    await logEvent(pool, org.id, 'downgrade_applied', { from: org.plan_code, to: plan.code }, actor);
+    applied.push({ organization_id: org.id, from: org.plan_code, to: plan.code });
+  }
+  return applied;
 }
 
 // Change the trial or subscription expiry directly (admin override / comps).
@@ -329,4 +582,11 @@ module.exports = {
   changeExpiry,
   grantFounder,
   refundPayment,
+  // Plan changes (upgrade / downgrade)
+  quotePlanChange,
+  changePlan,
+  scheduleDowngrade,
+  cancelScheduledChange,
+  applyDueDowngrades,
+  prorationCredit,
 };

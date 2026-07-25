@@ -20,20 +20,56 @@ overrides everything. `organizations.subscription_status`
 
 ## Plans
 
-| Plan | Price | Duration | Clients |
-|------|-------|----------|---------|
-| Starter | ₹1,499 | 1 mo | 20 |
-| Growth | ₹3,999 | 3 mo | 25 |
+| Plan | Price | Duration | Active clients |
+|------|-------|----------|----------------|
+| Starter | ₹1,499 | 1 mo | 5 |
+| Growth | ₹3,999 | 3 mo | 15 |
 | Professional | ₹6,999 | 6 mo | 30 |
 | Elite | ₹9,999 (launch ₹7,999) | 12 mo | Unlimited |
 
-**Launch offer:** Elite is ₹7,999 while founder slots remain (first 50), then
+**Launch offer:** Elite is ₹7,999 while founder slots remain (first 20), then
 reverts to ₹9,999 — automatic, no manual change.
 
-**Founder's Club:** the first 50 studios to activate become permanent Founder
+**Founder's Club:** the first 20 studios to activate become permanent Founder
 Members with a lifetime-locked price (kept on every renewal) and `is_founder` +
-`founder_number`. Slot assignment is serialized under a table lock so the 50th
-slot can never be double-granted.
+`founder_number`. Slot assignment is serialized under a table lock so the last
+slot can never be double-granted. The cap lives in `FOUNDER_LIMIT`
+(`lib/subscription.js`) and is overridable via the `FOUNDER_LIMIT` env var.
+
+**Seats count ACTIVE clients only.** Pending, expired, archived and completed
+clients do not consume a seat, so archiving a client frees a slot immediately
+(5/5 → 4/5). `clientLimitStatus()` is the single source of truth for this and is
+used by both the 403 gate and the `/status` endpoint, so the number the UI shows
+can never disagree with the number enforcement applies.
+
+## Plan changes (upgrade / downgrade)
+
+| | Upgrade | Downgrade |
+|---|---|---|
+| When | Immediately | End of current billing period |
+| Cost | New price − unused credit | ₹0 now |
+| Period | Restarts from now | Unchanged until it applies |
+
+Proration is time-based: the unused fraction of the current period multiplied by
+what the studio actually paid for it. An upgrade passes `resetPeriod` to
+`activate()` — renewals stack remaining time on top, but an upgrade has already
+been given that time back as cash, so stacking it too would grant it twice.
+
+Direction is decided by **monthly rate**, not sticker price, so Growth
+(₹3,999 / 3 mo = ₹1,333/mo) correctly reads as an upgrade from Starter
+(₹1,499 / 1 mo) despite the larger number.
+
+A downgrade is stored on `organizations.pending_plan_*` and applied by the
+worker once it comes due; nothing changes before then. If the studio has more
+active clients than the target plan allows, the quote returns a warning and the
+change still proceeds — **no client is ever archived or loses access**; the
+studio simply cannot add new ones until it is back under the limit.
+
+Endpoints: `GET /api/subscription/change-quote?plan_code=`,
+`POST /api/subscription/request-change`,
+`POST /api/subscription/cancel-scheduled-change`, and on the operator side
+`GET|POST /api/super-admin/organizations/:id/subscription/change[-quote]`,
+`POST .../schedule-downgrade`, `DELETE .../scheduled-change`.
 
 ## Enforcement (never trust the frontend)
 

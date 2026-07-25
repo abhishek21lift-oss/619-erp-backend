@@ -14,6 +14,7 @@
 
 const pool = require('../db/pool');
 const logger = require('../lib/logger');
+const subscription = require('../lib/subscription');
 
 const REMINDER_DAYS = [7, 3, 1, 0]; // 0 = expiry day
 
@@ -120,8 +121,20 @@ async function sendReminders() {
   return { sent };
 }
 
+// Scheduled downgrades come due at period end. Applied before the expiry sweep
+// so a studio that downgrades and renews in the same window lands on the new
+// plan's limit rather than the old one.
+async function applyScheduledDowngrades() {
+  const applied = await subscription.applyDueDowngrades();
+  if (applied.length) {
+    logger.info({ count: applied.length, changes: applied }, 'scheduled downgrades applied');
+  }
+  return applied;
+}
+
 async function runSubscriptionSweep() {
   try {
+    await applyScheduledDowngrades();
     await sweepExpiries();
     await sendReminders();
   } catch (err) {
@@ -136,4 +149,4 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { runSubscriptionSweep, sweepExpiries, sendReminders, notifyStudioAdmins };
+module.exports = { runSubscriptionSweep, sweepExpiries, sendReminders, notifyStudioAdmins, applyScheduledDowngrades };

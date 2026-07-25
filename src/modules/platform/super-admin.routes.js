@@ -641,6 +641,68 @@ router.post('/organizations/:id/subscription/activate', async (req, res, next) =
   }
 });
 
+// GET /organizations/:id/subscription/change-quote?plan_code=  — price a plan
+// change for a studio before executing it (proration credit, amount due,
+// effective date, over-limit warning). Read-only.
+router.get('/organizations/:id/subscription/change-quote', async (req, res, next) => {
+  try {
+    const planCode = req.query.plan_code;
+    if (!planCode) return res.status(400).json({ error: { code: 'VALIDATION', message: 'plan_code is required' } });
+    const quote = await subscription.quotePlanChange(req.params.id, String(planCode));
+    res.json({ data: quote });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: { code: err.code || 'QUOTE_FAILED', message: err.message } });
+    next(err);
+  }
+});
+
+// POST /organizations/:id/subscription/change — execute an immediate, prorated
+// upgrade (or same-plan renewal) once payment is confirmed. The unused value of
+// the current period is credited, the studio is charged the difference, and the
+// billing period restarts from now. Downgrades are rejected here by design —
+// they must be scheduled so the studio keeps the time it already paid for.
+router.post('/organizations/:id/subscription/change', async (req, res, next) => {
+  try {
+    const { plan_code, amount_inr, method, reference, notes } = req.body;
+    if (!plan_code) return res.status(400).json({ error: { code: 'VALIDATION', message: 'plan_code is required' } });
+    const result = await subscription.changePlan(req.params.id, plan_code, {
+      amount_inr: amount_inr != null ? Number(amount_inr) : undefined,
+      method, reference, notes,
+      actor: { id: req.user.id, name: req.user.name },
+    });
+    invalidateUserCache();
+    await audit(req, 'subscription_plan_changed', 'organization', req.params.id, result);
+    res.json({ data: result });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: { code: err.code || 'CHANGE_FAILED', message: err.message } });
+    next(err);
+  }
+});
+
+// POST /organizations/:id/subscription/schedule-downgrade — queue a downgrade
+// for the end of the current period. Nothing changes now.
+router.post('/organizations/:id/subscription/schedule-downgrade', async (req, res, next) => {
+  try {
+    const { plan_code } = req.body;
+    if (!plan_code) return res.status(400).json({ error: { code: 'VALIDATION', message: 'plan_code is required' } });
+    const result = await subscription.scheduleDowngrade(req.params.id, plan_code, { id: req.user.id, name: req.user.name });
+    await audit(req, 'subscription_downgrade_scheduled', 'organization', req.params.id, result);
+    res.json({ data: result });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: { code: err.code || 'SCHEDULE_FAILED', message: err.message } });
+    next(err);
+  }
+});
+
+// DELETE /organizations/:id/subscription/scheduled-change — drop a pending downgrade.
+router.delete('/organizations/:id/subscription/scheduled-change', async (req, res, next) => {
+  try {
+    const result = await subscription.cancelScheduledChange(req.params.id, { id: req.user.id, name: req.user.name });
+    await audit(req, 'subscription_scheduled_change_cancelled', 'organization', req.params.id, result);
+    res.json({ data: result });
+  } catch (err) { next(err); }
+});
+
 // POST /organizations/:id/subscription/freeze
 router.post('/organizations/:id/subscription/freeze', async (req, res, next) => {
   try {
