@@ -586,6 +586,150 @@ router.get('/subscriptions', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /subscription-metrics — SaaS health for the command centre.
+//
+// MRR is a RUN-RATE, not cash collected: each active subscription's recurring
+// price normalised to one month. It deliberately ignores proration credits and
+// one-off adjustments, which move cash but not the underlying run-rate. A
+// founder's locked price is their recurring price, so locked_price_inr wins
+// over the list price where present. Grandfathered studios (no plan) contribute
+// nothing, which is correct — they pay nothing.
+router.get('/subscription-metrics', async (req, res, next) => {
+  try {
+    const [mrrRow, planMix, states, conversion, founders, revenueTrend, growth] = await Promise.all([
+      // Run-rate across everything currently entitled to service.
+      pool.query(`
+        SELECT
+          COALESCE(SUM(COALESCE(o.locked_price_inr, p.price_inr)::numeric
+                       / NULLIF(p.duration_months, 0)), 0)::int AS mrr_inr,
+          count(*)::int AS paying_studios,
+          COALESCE(AVG(COALESCE(o.locked_price_inr, p.price_inr)::numeric
+                       / NULLIF(p.duration_months, 0)), 0)::int AS arpu_inr
+          FROM organizations o
+          JOIN subscription_plans p ON p.code = o.plan_code
+         WHERE o.subscription_status = 'active'
+           AND o.status <> 'suspended'
+           AND (o.current_period_end IS NULL OR o.current_period_end > now())`),
+
+      // Distribution of paying studios across the catalogue.
+      pool.query(`
+        SELECT p.code, p.name, p.price_inr, p.duration_months,
+               count(o.id)::int AS studios,
+               COALESCE(SUM(COALESCE(o.locked_price_inr, p.price_inr)::numeric
+                            / NULLIF(p.duration_months, 0)), 0)::int AS mrr_inr
+          FROM subscription_plans p
+          LEFT JOIN organizations o
+                 ON o.plan_code = p.code
+                AND o.subscription_status = 'active'
+                AND o.status <> 'suspended'
+                AND (o.current_period_end IS NULL OR o.current_period_end > now())
+         GROUP BY p.code, p.name, p.price_inr, p.duration_months, p.sort_order
+         ORDER BY p.sort_order NULLS LAST, p.price_inr`),
+
+      // Lifecycle spread. Timestamp-aware so a lapsed row that the worker has
+      // not swept yet is still reported as expired.
+      pool.query(`
+        SELECT
+          count(*) FILTER (WHERE status = 'suspended')::int AS suspended,
+          count(*) FILTER (WHERE status <> 'suspended' AND subscription_status = 'trial'
+                             AND (trial_ends_at IS NULL OR trial_ends_at > now()))::int AS on_trial,
+          count(*) FILTER (WHERE status <> 'suspended' AND subscription_status = 'trial'
+                             AND trial_ends_at IS NOT NULL AND trial_ends_at <= now())::int AS trial_lapsed,
+          count(*) FILTER (WHERE status <> 'suspended' AND subscription_status = 'active'
+                             AND (current_period_end IS NULL OR current_period_end > now()))::int AS active,
+          count(*) FILTER (WHERE status <> 'suspended' AND subscription_status = 'active'
+                             AND current_period_end IS NOT NULL AND current_period_end <= now())::int AS lapsed,
+          count(*) FILTER (WHERE subscription_status = 'frozen')::int AS frozen,
+          count(*) FILTER (WHERE subscription_status = 'expired')::int AS expired,
+          count(*) FILTER (WHERE subscription_status = 'cancelled')::int AS cancelled,
+          count(*)::int AS total
+          FROM organizations`),
+
+      // Trial → paid conversion, scoped to studios that actually ran a trial.
+      // Grandfathered studios never had one and would otherwise skew this.
+      pool.query(`
+        WITH trials AS (
+          SELECT DISTINCT organization_id, min(created_at) AS started_at
+            FROM subscription_events WHERE event = 'trial_started'
+           GROUP BY organization_id
+        ), converted AS (
+          SELECT DISTINCT t.organization_id
+            FROM trials t
+            JOIN subscription_events e
+              ON e.organization_id = t.organization_id
+             AND e.event = 'activated'
+             AND e.created_at >= t.started_at
+        )
+        SELECT (SELECT count(*) FROM trials)::int    AS trials_started,
+               (SELECT count(*) FROM converted)::int AS trials_converted`),
+
+      pool.query(`
+        SELECT count(*)::int AS granted,
+               COALESCE(SUM(locked_price_inr), 0)::int AS locked_value_inr,
+               MAX(founder_number)::int AS highest_number
+          FROM founder_members`),
+
+      // Cash actually collected, last 12 months.
+      pool.query(`
+        SELECT to_char(date_trunc('month', created_at), 'Mon YYYY') AS label,
+               date_trunc('month', created_at)::date AS month,
+               COALESCE(SUM(amount_inr) FILTER (WHERE status = 'paid'), 0)::int AS revenue_inr,
+               count(*) FILTER (WHERE status = 'paid')::int AS payments,
+               COALESCE(SUM(amount_inr) FILTER (WHERE status = 'refunded'), 0)::int AS refunded_inr
+          FROM subscription_payments
+         WHERE created_at >= date_trunc('month', now()) - interval '11 months'
+         GROUP BY 1, 2 ORDER BY 2`),
+
+      // New paying studios per month — first activation only, so renewals do
+      // not inflate it.
+      pool.query(`
+        WITH first_activation AS (
+          SELECT organization_id, min(created_at) AS activated_at
+            FROM subscription_events WHERE event = 'activated'
+           GROUP BY organization_id
+        )
+        SELECT to_char(date_trunc('month', activated_at), 'Mon YYYY') AS label,
+               date_trunc('month', activated_at)::date AS month,
+               count(*)::int AS new_studios
+          FROM first_activation
+         WHERE activated_at >= date_trunc('month', now()) - interval '11 months'
+         GROUP BY 1, 2 ORDER BY 2`),
+    ]);
+
+    const mrr = mrrRow.rows[0] || { mrr_inr: 0, paying_studios: 0, arpu_inr: 0 };
+    const conv = conversion.rows[0] || { trials_started: 0, trials_converted: 0 };
+    const f = founders.rows[0] || { granted: 0, locked_value_inr: 0, highest_number: null };
+    const slotsRemaining = await subscription.founderSlotsRemaining();
+
+    res.json({
+      data: {
+        mrr_inr: mrr.mrr_inr,
+        arr_inr: mrr.mrr_inr * 12,
+        arpu_inr: mrr.arpu_inr,
+        paying_studios: mrr.paying_studios,
+        states: states.rows[0],
+        plan_distribution: planMix.rows,
+        trial_conversion: {
+          started: conv.trials_started,
+          converted: conv.trials_converted,
+          rate_pct: conv.trials_started > 0
+            ? Math.round((conv.trials_converted / conv.trials_started) * 1000) / 10
+            : null,
+        },
+        founders: {
+          granted: f.granted,
+          limit: subscription.FOUNDER_LIMIT,
+          slots_remaining: slotsRemaining,
+          locked_value_inr: f.locked_value_inr,
+          highest_number: f.highest_number,
+        },
+        revenue_trend: revenueTrend.rows,
+        growth: growth.rows,
+      },
+    });
+  } catch (err) { next(err); }
+});
+
 // GET /organizations/:id/subscription — one studio's billing detail + history.
 router.get('/organizations/:id/subscription', async (req, res, next) => {
   try {
