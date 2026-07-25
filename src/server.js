@@ -318,6 +318,10 @@ app.use('/api/', branchScope);
 // /api/auth and /api/v1/auth both mount the same router intentionally.
 // /api/v1/auth exists for legacy mobile app callers. Any changes to auth
 // behaviour must be tested against both URL prefixes.
+// Unauthenticated marketing data (plan catalogue + platform aggregates) for the
+// public landing page. Aggregate-only — no per-tenant values are exposed.
+app.use('/api/public',            require('./routes/public'));
+
 app.use('/api/auth',              require('./routes/auth'));
 app.use('/api/auth',              require('./routes/auth-google'));
 app.use('/api/auth/webauthn',     require('./routes/auth-webauthn'));
