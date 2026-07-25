@@ -7,7 +7,6 @@
 //
 //   admin / manager   → see all branches
 //   reception / trainer / member → only their own branch_id
-//   kiosk             → its branch_id (set by kiosk-token middleware)
 //
 // Routes use `req.branchScope.appendTo(existingParams)` to inject the filter:
 //

@@ -32,23 +32,12 @@ if (process.env.JWT_SECRET.length < 32) {
 // pg), so warning about them only pushed operators to provision a
 // service_role key — which bypasses RLS entirely — that nothing consumes.
 const RECOMMENDED_ENV = [
-  'KIOSK_HMAC_SECRET',
   'RP_ID',
   'WEBAUTHN_ORIGIN',
-  'FACE_ENCRYPTION_KEY',
 ];
 const missingRecommended = RECOMMENDED_ENV.filter(function(k) { return !process.env[k]; });
 if (missingRecommended.length) {
   logger.warn({ missing: missingRecommended }, 'Recommended env vars not set — some features may be degraded');
-}
-
-// Hard warn on missing face encryption key in production — biometric data
-// would be stored as plaintext JSONB, which violates GDPR Art. 9.
-if (isProd && !process.env.FACE_ENCRYPTION_KEY) {
-  logger.warn(
-    'FACE_ENCRYPTION_KEY is not set — face descriptors will be stored as plaintext. ' +
-    'Generate a 64-char hex key and set FACE_ENCRYPTION_KEY to enable AES-256-GCM encryption.'
-  );
 }
 
 // ── Cloudflare R2 object storage ────────────────────────────────────────────
@@ -183,7 +172,7 @@ app.use('/api/webhooks/razorpay', require('./routes/razorpay-webhook'));
 // ────────────────────────
 // BODY PARSING
 // ────────────────────────
-// L-06: 100kb default — checkin routes get a higher limit for face descriptors
+// L-06: 100kb default
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use(cookieParser());
@@ -345,7 +334,6 @@ app.use('/api/clients',           userApiLimiter, require('./routes/client-actio
 app.use('/api/trainers',          require('./routes/trainers'));
 app.use('/api/payments',          userApiLimiter, require('./routes/payments'));
 app.use('/api/attendance',        require('./routes/attendance'));
-app.use('/api/checkin',           express.json({ limit: '50kb' }), require('./routes/checkin'));
 
 // ROUTE INTEGRITY NOTE (R-03):
 // Legacy /api/reports (routes/reports.js) and v3 /api/v1/reports
