@@ -141,11 +141,16 @@ router.post('/request-activation', auth, async (req, res, next) => {
       return res.json({ data: { requested: true, deduped: true, message: 'We already have your request — we’ll activate shortly.' } });
     }
 
+    // A coupon travels with the request so the operator applies it at
+    // activation — validation still happens server-side at redemption time,
+    // under a lock, so a code that has since been exhausted is caught there.
+    const couponCode = req.body?.coupon_code ? String(req.body.coupon_code).trim().toUpperCase() : null;
+
     const { rows: [org] } = await pool.query('SELECT name FROM organizations WHERE id=$1', [orgId]);
     await pool.query(
       `INSERT INTO subscription_events (organization_id, event, data, actor_id, actor_name)
        VALUES ($1,'activation_requested',$2,$3,$4)`,
-      [orgId, JSON.stringify({ plan_code: planCode }), req.user.id, req.user.name || null]
+      [orgId, JSON.stringify({ plan_code: planCode, coupon_code: couponCode }), req.user.id, req.user.name || null]
     );
 
     // Notify every active platform super admin (in-app).
@@ -157,7 +162,8 @@ router.post('/request-activation', auth, async (req, res, next) => {
         await pool.query(
           `INSERT INTO notifications (user_id, type, title, body, link)
            VALUES ($1,'subscription',$2,$3,'/platform')`,
-          [a.id, 'Activation requested', `${org?.name || 'A studio'} requested subscription activation${planCode ? ` (${planCode})` : ''}.`]
+          [a.id, 'Activation requested',
+           `${org?.name || 'A studio'} requested subscription activation${planCode ? ` (${planCode})` : ''}${couponCode ? ` with coupon ${couponCode}` : ''}.`]
         );
       } catch { /* best-effort */ }
     }
@@ -255,6 +261,36 @@ router.post('/request-change', auth, async (req, res, next) => {
     if (err.status) return res.status(err.status).json({ error: { code: err.code || 'BAD_REQUEST', message: err.message } });
     next(err);
   }
+});
+
+// GET /api/subscription/validate-coupon?code=&plan_code= — preview a discount
+// before requesting activation. Read-only: nothing is reserved or redeemed, so
+// a code that passes here can still be taken by someone else first. The real
+// check happens under a row lock at redemption time.
+router.get('/validate-coupon', auth, async (req, res, next) => {
+  try {
+    const orgId = req.user?.organization_id;
+    if (!orgId) return res.status(400).json({ error: { code: 'NO_ORG', message: 'No studio context' } });
+    const { code, plan_code: planCode } = req.query;
+    if (!code) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'code is required' } });
+
+    // Price the order the same way activation will, so the previewed discount
+    // matches what is actually charged.
+    let amountInr = 0;
+    if (planCode) {
+      const q = await sub.quote(String(planCode));
+      if (!q) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Unknown plan' } });
+      const { rows: [org] } = await pool.query(
+        'SELECT is_founder, locked_price_inr FROM organizations WHERE id = $1', [orgId]
+      );
+      amountInr = (org?.is_founder && org.locked_price_inr != null)
+        ? Number(org.locked_price_inr)
+        : q.effective_price_inr;
+    }
+
+    const result = await sub.validateCoupon(String(code), { orgId, planCode: planCode ? String(planCode) : null, amountInr }, pool);
+    res.json({ data: { ...result, gross_amount_inr: amountInr } });
+  } catch (err) { next(err); }
 });
 
 // POST /api/subscription/cancel-scheduled-change — drop a pending downgrade so

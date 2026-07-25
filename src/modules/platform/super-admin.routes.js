@@ -586,6 +586,129 @@ router.get('/subscriptions', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── Coupons ───────────────────────────────────────────────────────────────────
+// times_redeemed is derived from the redemption ledger rather than kept as a
+// counter on the coupon, so it cannot drift out of step with reality.
+router.get('/coupons', async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT c.*,
+             (SELECT count(*) FROM subscription_coupon_redemptions r WHERE r.coupon_id = c.id)::int AS times_redeemed,
+             (SELECT COALESCE(SUM(r.discount_inr), 0) FROM subscription_coupon_redemptions r WHERE r.coupon_id = c.id)::int AS total_discount_inr
+        FROM subscription_coupons c
+       ORDER BY c.created_at DESC`);
+    res.json({ data: rows });
+  } catch (err) { next(err); }
+});
+
+// GET /coupons/:id/redemptions — who used it, when, and for how much.
+router.get('/coupons/:id/redemptions', async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT r.*, o.name AS organization_name
+        FROM subscription_coupon_redemptions r
+        LEFT JOIN organizations o ON o.id = r.organization_id
+       WHERE r.coupon_id = $1
+       ORDER BY r.redeemed_at DESC`, [req.params.id]);
+    res.json({ data: rows });
+  } catch (err) { next(err); }
+});
+
+router.post('/coupons', async (req, res, next) => {
+  try {
+    const {
+      code, description, discount_type, discount_value, max_discount_inr,
+      min_amount_inr, applies_to_plans, max_redemptions, max_per_org,
+      valid_from, valid_until,
+    } = req.body;
+
+    if (!code || !String(code).trim()) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'code is required' } });
+    }
+    if (!['percent', 'fixed'].includes(discount_type)) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: "discount_type must be 'percent' or 'fixed'" } });
+    }
+    const value = Number(discount_value);
+    if (!Number.isFinite(value) || value <= 0) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'discount_value must be greater than 0' } });
+    }
+    if (discount_type === 'percent' && value > 100) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'A percentage discount cannot exceed 100' } });
+    }
+
+    const { rows } = await pool.query(`
+      INSERT INTO subscription_coupons
+        (code, description, discount_type, discount_value, max_discount_inr, min_amount_inr,
+         applies_to_plans, max_redemptions, max_per_org, valid_from, valid_until,
+         created_by, created_by_name)
+      VALUES (upper(trim($1)),$2,$3,$4,$5,$6,$7,$8,COALESCE($9,1),$10,$11,$12,$13)
+      RETURNING *`,
+      [code, description || null, discount_type, value,
+       max_discount_inr != null ? Number(max_discount_inr) : null,
+       min_amount_inr != null ? Number(min_amount_inr) : null,
+       Array.isArray(applies_to_plans) && applies_to_plans.length ? applies_to_plans : null,
+       max_redemptions != null ? Number(max_redemptions) : null,
+       max_per_org != null ? Number(max_per_org) : null,
+       valid_from || null, valid_until || null,
+       req.user.id, req.user.name || null]
+    );
+    await audit(req, 'coupon_created', 'coupon', rows[0].id, { code: rows[0].code });
+    res.status(201).json({ data: rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: { code: 'DUPLICATE', message: 'A coupon with that code already exists' } });
+    }
+    next(err);
+  }
+});
+
+// PATCH /coupons/:id — edit terms or deactivate. Past redemptions are never
+// rewritten: the ledger records what was actually granted at the time.
+router.patch('/coupons/:id', async (req, res, next) => {
+  try {
+    const allowed = ['description', 'is_active', 'max_redemptions', 'max_per_org', 'valid_from', 'valid_until', 'min_amount_inr', 'max_discount_inr'];
+    const sets = [];
+    const params = [req.params.id];
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) {
+        params.push(req.body[key]);
+        sets.push(`${key} = $${params.length}`);
+      }
+    }
+    if (!sets.length) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Nothing to update' } });
+    sets.push('updated_at = now()');
+
+    const { rows } = await pool.query(
+      `UPDATE subscription_coupons SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params
+    );
+    if (!rows.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Coupon not found' } });
+    await audit(req, 'coupon_updated', 'coupon', req.params.id, req.body);
+    res.json({ data: rows[0] });
+  } catch (err) { next(err); }
+});
+
+// DELETE /coupons/:id — only while unused. Once redeemed a coupon is part of the
+// billing record, so it is deactivated instead of deleted.
+router.delete('/coupons/:id', async (req, res, next) => {
+  try {
+    const { rows: [used] } = await pool.query(
+      'SELECT count(*)::int AS n FROM subscription_coupon_redemptions WHERE coupon_id = $1', [req.params.id]
+    );
+    if (used.n > 0) {
+      return res.status(409).json({
+        error: {
+          code: 'COUPON_IN_USE',
+          message: `This coupon has been redeemed ${used.n} time${used.n === 1 ? '' : 's'} and is part of the billing record. Deactivate it instead.`,
+        },
+      });
+    }
+    const { rowCount } = await pool.query('DELETE FROM subscription_coupons WHERE id = $1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Coupon not found' } });
+    await audit(req, 'coupon_deleted', 'coupon', req.params.id, {});
+    res.json({ data: { deleted: true } });
+  } catch (err) { next(err); }
+});
+
 // GET /subscription-metrics — SaaS health for the command centre.
 //
 // MRR is a RUN-RATE, not cash collected: each active subscription's recurring
@@ -768,12 +891,14 @@ router.get('/organizations/:id/subscription', async (req, res, next) => {
 // POST /organizations/:id/subscription/activate — record a payment + activate/renew.
 router.post('/organizations/:id/subscription/activate', async (req, res, next) => {
   try {
-    const { plan_code, amount_inr, method, reference, notes, period_months } = req.body;
+    const { plan_code, amount_inr, method, reference, notes, period_months, coupon_code } = req.body;
     if (!plan_code) return res.status(400).json({ error: { code: 'VALIDATION', message: 'plan_code is required' } });
     const result = await subscription.activate(req.params.id, plan_code, {
       amount_inr: amount_inr != null ? Number(amount_inr) : undefined,
       method, reference, notes,
       periodMonths: period_months != null ? Number(period_months) : undefined,
+      // Redeemed under a row lock inside the activation transaction.
+      couponCode: coupon_code || undefined,
       actor: { id: req.user.id, name: req.user.name },
     });
     invalidateUserCache();

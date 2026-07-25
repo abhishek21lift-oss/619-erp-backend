@@ -71,6 +71,32 @@ Endpoints: `GET /api/subscription/change-quote?plan_code=`,
 `GET|POST /api/super-admin/organizations/:id/subscription/change[-quote]`,
 `POST .../schedule-downgrade`, `DELETE .../scheduled-change`.
 
+## Coupons
+
+`subscription_coupons` (the catalogue) + `subscription_coupon_redemptions` (an
+immutable ledger). `times_redeemed` is always **derived from the ledger**, never
+a counter on the coupon, so it cannot drift and it answers "who used this, when,
+for how much".
+
+Percentage or fixed-amount, with optional absolute cap, minimum order, plan
+allowlist, total redemption limit, per-studio limit (default 1, so one studio
+cannot drain a promotion by renewing), and a validity window.
+
+`validateCoupon()` is a **preview** — it reserves nothing. `redeemCoupon()`
+re-validates under `SELECT … FOR UPDATE` on the coupon row inside the activation
+transaction, so a `max_redemptions` of 1 can only ever be claimed once. Same
+reasoning as the founder-slot table lock.
+
+A founder's `locked_price_inr` is deliberately the **gross** price, not the
+discounted one: the lifetime benefit is a locked *plan* price, and letting a
+one-off promo become someone's permanent rate would leak revenue on every
+renewal.
+
+A redeemed coupon can be deactivated but not deleted — it is part of the billing
+record. Endpoints: `GET /api/subscription/validate-coupon`, and
+`GET|POST|PATCH|DELETE /api/super-admin/coupons[/:id]`,
+`GET /api/super-admin/coupons/:id/redemptions`.
+
 ## Enforcement (never trust the frontend)
 
 - **Freeze/expiry:** `middleware/auth.js` calls `subscription.computeAccess()` on

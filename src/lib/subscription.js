@@ -117,6 +117,127 @@ async function quote(code) {
   };
 }
 
+// ── Coupons ───────────────────────────────────────────────────────────────────
+// Discount maths is pure and separated from validation so it can be tested
+// without a database. Rounds to whole rupees and can never exceed the gross —
+// a coupon reduces a charge, it never creates a credit.
+function computeDiscount(coupon, grossInr) {
+  const gross = Math.max(0, Math.round(Number(grossInr) || 0));
+  if (!coupon || gross <= 0) return 0;
+
+  let discount = coupon.discount_type === 'percent'
+    ? Math.round(gross * (Number(coupon.discount_value) / 100))
+    : Math.round(Number(coupon.discount_value));
+
+  if (coupon.max_discount_inr != null) discount = Math.min(discount, Number(coupon.max_discount_inr));
+  return Math.max(0, Math.min(discount, gross));
+}
+
+/**
+ * Check a coupon against a studio and an order amount.
+ *
+ * Read-only — nothing is reserved. Returns { valid, reason, coupon, discount_inr,
+ * net_amount_inr }. `reason` is a human-readable rejection the UI can show
+ * directly. Fails closed: an unknown code is simply invalid.
+ *
+ * Pass an open client to run inside an activation transaction (which locks the
+ * coupon row first); otherwise it runs on the pool for a preview.
+ */
+async function validateCoupon(code, { orgId, planCode, amountInr }, client = pool) {
+  const normalised = String(code || '').trim().toUpperCase();
+  if (!normalised) return { valid: false, reason: 'Enter a coupon code.' };
+
+  const { rows } = await client.query(
+    'SELECT * FROM subscription_coupons WHERE code = $1', [normalised]
+  );
+  const coupon = rows[0];
+  if (!coupon) return { valid: false, reason: 'That coupon code is not recognised.' };
+  if (!coupon.is_active) return { valid: false, reason: 'This coupon is no longer active.' };
+
+  const now = new Date();
+  if (coupon.valid_from && new Date(coupon.valid_from) > now) {
+    return { valid: false, reason: 'This coupon is not valid yet.' };
+  }
+  if (coupon.valid_until && new Date(coupon.valid_until) < now) {
+    return { valid: false, reason: 'This coupon has expired.' };
+  }
+  if (coupon.applies_to_plans?.length && planCode && !coupon.applies_to_plans.includes(planCode)) {
+    return { valid: false, reason: 'This coupon does not apply to the selected plan.' };
+  }
+  if (coupon.min_amount_inr != null && Number(amountInr) < Number(coupon.min_amount_inr)) {
+    return { valid: false, reason: `This coupon needs an order of at least ₹${coupon.min_amount_inr}.` };
+  }
+
+  // Redemption limits are counted from the ledger, never from a stored counter,
+  // so they stay correct even if a payment is later adjusted.
+  const { rows: [counts] } = await client.query(
+    `SELECT count(*)::int AS total,
+            count(*) FILTER (WHERE organization_id = $2)::int AS by_org
+       FROM subscription_coupon_redemptions WHERE coupon_id = $1`,
+    [coupon.id, orgId || null]
+  );
+  if (coupon.max_redemptions != null && counts.total >= coupon.max_redemptions) {
+    return { valid: false, reason: 'This coupon has been fully redeemed.' };
+  }
+  if (orgId && counts.by_org >= coupon.max_per_org) {
+    return { valid: false, reason: 'You have already used this coupon.' };
+  }
+
+  const discount = computeDiscount(coupon, amountInr);
+  if (discount <= 0) return { valid: false, reason: 'This coupon does not reduce this order.' };
+
+  return {
+    valid: true,
+    reason: null,
+    coupon: {
+      id: coupon.id, code: coupon.code, description: coupon.description,
+      discount_type: coupon.discount_type, discount_value: coupon.discount_value,
+    },
+    discount_inr: discount,
+    net_amount_inr: Math.max(0, Math.round(Number(amountInr)) - discount),
+  };
+}
+
+/**
+ * Re-validate under a row lock and write the redemption. Must be called inside
+ * an open transaction.
+ *
+ * The lock is the point: validateCoupon on the pool is a preview and two studios
+ * can pass it simultaneously on the last remaining use. Taking FOR UPDATE on the
+ * coupon row serialises redemption so a max_redemptions of 1 can only ever be
+ * claimed once — the same reasoning as the founder-slot table lock.
+ */
+async function redeemCoupon(client, code, { orgId, planCode, amountInr, paymentId }) {
+  const normalised = String(code || '').trim().toUpperCase();
+  if (!normalised) return null;
+
+  await client.query('SELECT id FROM subscription_coupons WHERE code = $1 FOR UPDATE', [normalised]);
+
+  const check = await validateCoupon(normalised, { orgId, planCode, amountInr }, client);
+  if (!check.valid) {
+    throw Object.assign(new Error(check.reason || 'Coupon is not valid'), {
+      status: 400, code: 'COUPON_INVALID',
+    });
+  }
+
+  const gross = Math.max(0, Math.round(Number(amountInr) || 0));
+  const net = Math.max(0, gross - check.discount_inr);
+
+  const { rows: [redemption] } = await client.query(
+    `INSERT INTO subscription_coupon_redemptions
+       (coupon_id, organization_id, payment_id, plan_code, gross_amount_inr, discount_inr, net_amount_inr)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+    [check.coupon.id, orgId, paymentId || null, planCode || null, gross, check.discount_inr, net]
+  );
+
+  return {
+    redemption_id: redemption.id,
+    code: check.coupon.code,
+    discount_inr: check.discount_inr,
+    net_amount_inr: net,
+  };
+}
+
 // ── Billing audit ──────────────────────────────────────────────────────────────
 async function logEvent(client, orgId, event, data, actor) {
   try {
@@ -214,12 +335,26 @@ async function activate(orgId, planCode, opts = {}) {
     const periodEnd = new Date(base);
     periodEnd.setMonth(periodEnd.getMonth() + Number(months));
 
+    // A coupon reduces THIS charge only. It is redeemed under a row lock inside
+    // this transaction, so the last remaining use cannot be claimed twice.
+    let coupon = null;
+    if (opts.couponCode) {
+      coupon = await redeemCoupon(client, opts.couponCode, {
+        orgId, planCode, amountInr: paidAmount,
+      });
+    }
+    const grossAmount = paidAmount;
+    const chargedAmount = coupon ? coupon.net_amount_inr : paidAmount;
+
     let founderNumber = org.founder_number;
     let lockedPrice = org.locked_price_inr;
     if (grantFounder) {
       const n = (await client.query('SELECT COALESCE(MAX(founder_number),0)+1 AS n FROM founder_members')).rows[0].n;
       founderNumber = n;
-      lockedPrice = paidAmount;
+      // Deliberately the GROSS price, not what was charged after a coupon. The
+      // founder benefit is a lifetime-locked PLAN price; letting a one-off promo
+      // become someone's permanent rate would leak revenue on every renewal.
+      lockedPrice = grossAmount;
       await client.query(
         `INSERT INTO founder_members (organization_id, founder_number, plan_code, locked_price_inr)
          VALUES ($1,$2,$3,$4)`,
@@ -241,13 +376,23 @@ async function activate(orgId, planCode, opts = {}) {
       `INSERT INTO subscription_payments
          (organization_id, plan_code, amount_inr, method, reference, status,
           period_start, period_end, recorded_by, recorded_by_name, notes,
-          proration_credit_inr, previous_plan_code)
-       VALUES ($1,$2,$3,$4,$5,'paid',$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
-      [orgId, planCode, paidAmount, opts.method || null, opts.reference || null,
+          proration_credit_inr, previous_plan_code, coupon_code, discount_inr)
+       VALUES ($1,$2,$3,$4,$5,'paid',$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+      [orgId, planCode, chargedAmount, opts.method || null, opts.reference || null,
        now, periodEnd, opts.actor?.id || null, opts.actor?.name || null, opts.notes || null,
        opts.prorationCreditInr != null ? opts.prorationCreditInr : null,
-       opts.previousPlanCode || null]
+       opts.previousPlanCode || null,
+       coupon?.code || null, coupon?.discount_inr || null]
     )).rows[0];
+
+    // Link the redemption to the payment now that it exists, so the ledger and
+    // the charge can be reconciled from either side.
+    if (coupon?.redemption_id) {
+      await client.query(
+        'UPDATE subscription_coupon_redemptions SET payment_id = $1 WHERE id = $2',
+        [pay.id, coupon.redemption_id]
+      );
+    }
 
     const seq = (await client.query('SELECT count(*)+1 AS n FROM subscription_invoices')).rows[0].n;
     const invoiceNumber = `MPT-${now.getFullYear()}-${String(seq).padStart(5, '0')}`;
@@ -255,14 +400,23 @@ async function activate(orgId, planCode, opts = {}) {
       `INSERT INTO subscription_invoices
          (organization_id, payment_id, invoice_number, plan_code, amount_inr, period_start, period_end, status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,'paid')`,
-      [orgId, pay.id, invoiceNumber, planCode, paidAmount, now, periodEnd]
+      [orgId, pay.id, invoiceNumber, planCode, chargedAmount, now, periodEnd]
     );
 
-    await logEvent(client, orgId, 'activated', { plan_code: planCode, amount_inr: paidAmount, period_end: periodEnd }, opts.actor);
+    await logEvent(client, orgId, 'activated', {
+      plan_code: planCode, amount_inr: chargedAmount, gross_amount_inr: grossAmount,
+      coupon_code: coupon?.code || null, discount_inr: coupon?.discount_inr || null,
+      period_end: periodEnd,
+    }, opts.actor);
     if (grantFounder) await logEvent(client, orgId, 'founder_granted', { founder_number: founderNumber, locked_price_inr: lockedPrice }, opts.actor);
 
     await client.query('COMMIT');
-    return { plan_code: planCode, amount_inr: paidAmount, period_end: periodEnd, invoice_number: invoiceNumber, founder_granted: grantFounder, founder_number: founderNumber };
+    return {
+      plan_code: planCode, amount_inr: chargedAmount, gross_amount_inr: grossAmount,
+      coupon_code: coupon?.code || null, discount_inr: coupon?.discount_inr || null,
+      period_end: periodEnd, invoice_number: invoiceNumber,
+      founder_granted: grantFounder, founder_number: founderNumber,
+    };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
@@ -582,6 +736,10 @@ module.exports = {
   changeExpiry,
   grantFounder,
   refundPayment,
+  // Coupons
+  computeDiscount,
+  validateCoupon,
+  redeemCoupon,
   // Plan changes (upgrade / downgrade)
   quotePlanChange,
   changePlan,
