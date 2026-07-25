@@ -39,6 +39,55 @@ the frontend renders `title / subtitle / meta / badges / href` and knows nothing
 about clients specifically, so a new entity type appears in the UI without a
 frontend change.
 
+## Registered providers
+
+In render order. Each returns at most 4 items except the two client groups,
+which get the caller's requested limit; the whole response is capped at 24
+items so a broad query cannot turn the dropdown into a report.
+
+| Group | Table | Scoped by | Matches on |
+| ----- | ----- | --------- | ---------- |
+| `clients` | `pt_clients` (active, not deleted) | org + trainer | name, mobile digits, email, client code |
+| `archived_clients` | `pt_clients` (everything else) | org + trainer | same |
+| `exercises` | `exercises` | **nothing** — shared reference library | name, muscle, target, equipment, body part |
+| `workout_plans` | `workout_plans` | org, NULL = shared | name, goal |
+| `diet_plans` | `diet_templates` | org, NULL = shared | name, goal |
+| `assessments` | `pt_assessments` | via the client row | client name, type, number |
+| `invoices` | `invoices` | via the client row | client name, invoice number |
+| `payments` | `pt_payments` | via the client row | client name, reference, notes |
+| `messages` | `communication_history` | org; **not offered to trainers** | title, body |
+| `ai_conversations` | `ai_conversations` | `user_id` — personal, not org | title |
+
+Three scoping shapes, deliberately distinct:
+
+- **Direct** — the table has `organization_id`, so `scopeClause()` applies to it.
+- **Via the client row** — invoices, payments and assessments have no
+  trustworthy trainer relationship of their own, so they join `pt_clients` and
+  apply `scopeClause()` to *that* alias. A trainer cannot see a payment against
+  someone else's client because they cannot see that client. One rule, one
+  implementation.
+- **Library** — `workout_plans` and `diet_templates` use `libraryScope()`:
+  `organization_id IS NULL OR = <caller's org>`, where NULL means shipped with
+  the product.
+
+`exercises` is the one provider with no isolation at all. It is a seeded
+reference library of ~890 movements with no `organization_id`, shared by every
+studio exactly as `/api/workouts/exercises` already shares it. Nothing in it
+belongs to a studio, so there is nothing to isolate. If studio-authored
+exercises are ever added, that provider needs the `libraryScope()` treatment.
+
+`ai_conversations` is scoped to the **user**, not the org — a coach's chat
+history is personal even inside one studio.
+
+### Known gap
+
+Migration 106 added `organization_id` to `workout_plans` and `diet_templates`
+and backfilled it from `created_by`, and both create routes now stamp it. The
+**existing GET routes for those two tables still read unscoped**, exactly as
+they did before. Narrowing them changes what current screens show, so it is its
+own change; the column is in place so it becomes a one-line `WHERE` when
+someone takes it. Search does not widen the exposure in the meantime.
+
 ## Adding a searchable entity type
 
 Append a provider to `PROVIDERS` in `src/modules/search/search.service.js`:

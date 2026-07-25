@@ -247,11 +247,15 @@ router.post('/plans', auth, adminOrManager, async (req, res, next) => {
     const id = randomUUID();
     const { rows } = await pool.query(`
       INSERT INTO workout_plans (id, name, description, goal, difficulty,
-        duration_weeks, sessions_per_week, is_template, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        duration_weeks, sessions_per_week, is_template, created_by, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [id, d.name.trim(), d.description || null, d.goal || 'general_fitness',
        d.difficulty || 'beginner', parseInt(d.duration_weeks) || 4,
-       parseInt(d.sessions_per_week) || 3, d.is_template !== false, req.user.id]
+       parseInt(d.sessions_per_week) || 3, d.is_template !== false, req.user.id,
+       // Stamps the owning studio (migration 106). NULL only for a platform
+       // operator authoring a template that every studio should see — the same
+       // meaning the seeded rows carry.
+       orgIdOf(req)]
     );
 
     // Add exercises if provided

@@ -64,6 +64,11 @@ router.get('/', auth, searchLimiter, async (req, res, next) => {
       query: req.query.q,
       scope,
       trainerId,
+      // AI conversations are personal, not organizational, so that provider
+      // scopes on the user rather than the org. Role gates the groups a
+      // trainer is not offered at all (see PROVIDERS).
+      userId: req.user.id,
+      role: req.user.role,
       limit: req.query.limit,
       types,
     });

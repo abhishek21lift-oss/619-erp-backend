@@ -14,7 +14,9 @@
 //
 // The queries themselves need a database and are exercised through the route.
 
-const { escapeLike, normalise, scopeClause } = require('../modules/search/search.service');
+const {
+  escapeLike, normalise, scopeClause, libraryScope, providerTypes, providersFor,
+} = require('../modules/search/search.service');
 
 describe('scopeClause — tenant isolation', () => {
   test('a tenant user is pinned to their own organization', () => {
@@ -53,6 +55,75 @@ describe('scopeClause — tenant isolation', () => {
     const params = ['like', 'lower', 'digits'];
     const sql = scopeClause({ scope: { applyFilter: true, orgId: 'org-1' }, trainerId: 'trn-9' }, 'c', params);
     expect(sql).toBe('c.organization_id = $4 AND c.trainer_id = $5');
+  });
+});
+
+describe('libraryScope — workout plans and diet templates', () => {
+  // Migration 106 gave these tables an organization_id where NULL means
+  // "shipped with the product". Getting this wrong in either direction is bad:
+  // too strict hides the seeded templates from everyone, too loose exposes one
+  // studio's authored programmes to the next.
+  test('a studio sees the shared catalogue plus its own', () => {
+    const params = ['like', 'lower'];
+    const sql = libraryScope({ scope: { applyFilter: true, orgId: 'org-1' } }, 'x', params);
+    expect(sql).toBe('(x.organization_id IS NULL OR x.organization_id = $3)');
+    expect(params).toEqual(['like', 'lower', 'org-1']);
+  });
+
+  test('a platform-wide super admin sees everything', () => {
+    const params = [];
+    expect(libraryScope({ scope: { applyFilter: false, orgId: null } }, 'x', params)).toBe('TRUE');
+    expect(params).toEqual([]);
+  });
+
+  test('an org-less user still sees the shared catalogue, and nothing authored', () => {
+    // `organization_id = NULL` matches no authored row, so the IS NULL branch
+    // is the only one that can be true. Seeded templates stay usable.
+    const params = [];
+    const sql = libraryScope({ scope: { applyFilter: true, orgId: null } }, 'x', params);
+    expect(sql).toBe('(x.organization_id IS NULL OR x.organization_id = $1)');
+  });
+});
+
+describe('provider visibility', () => {
+  const base = (over = {}) => ({
+    q: normalise('rahul'), scope: { applyFilter: true, orgId: 'org-1' },
+    userId: 'user-1', role: 'admin', limit: 8, ...over,
+  });
+
+  test('clients lead, archived clients follow', () => {
+    expect(providerTypes().slice(0, 2)).toEqual(['clients', 'archived_clients']);
+  });
+
+  test('a trainer is not offered studio broadcasts', () => {
+    // communication_history has no per-coach ownership, so rather than invent
+    // one the group is withheld. If this ever flips, it must be because the
+    // table gained an owner — not because the filter was relaxed.
+    expect(providersFor(base({ role: 'trainer' }))).not.toContain('messages');
+    expect(providersFor(base({ role: 'admin' }))).toContain('messages');
+  });
+
+  test('AI conversations need a user to scope to', () => {
+    expect(providersFor(base({ userId: null }))).not.toContain('ai_conversations');
+    expect(providersFor(base())).toContain('ai_conversations');
+  });
+
+  test('two-character queries only reach the cheap, selective groups', () => {
+    // "ab" against 890 exercises is an arbitrary slice of the library, not an
+    // answer. Same for every record type keyed on a client name.
+    const types = providersFor(base({ q: normalise('ab') }));
+    expect(types).toContain('clients');
+    expect(types).not.toContain('exercises');
+    expect(types).not.toContain('archived_clients');
+    expect(types).not.toContain('invoices');
+  });
+
+  test('a three-character query opens the rest up', () => {
+    const types = providersFor(base({ q: normalise('abc') }));
+    expect(types).toEqual(expect.arrayContaining([
+      'clients', 'archived_clients', 'exercises', 'workout_plans',
+      'diet_plans', 'assessments', 'invoices', 'payments',
+    ]));
   });
 });
 

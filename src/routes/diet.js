@@ -106,11 +106,14 @@ router.post('/templates', auth, adminOrManager, async (req, res, next) => {
     const id = randomUUID();
     const { rows } = await pool.query(`
       INSERT INTO diet_templates (id, name, description, goal,
-        daily_calories, daily_protein_g, daily_carbs_g, daily_fats_g, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        daily_calories, daily_protein_g, daily_carbs_g, daily_fats_g, created_by, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [id, d.name.trim(), d.description || null, d.goal || 'maintenance',
        parseInt(d.daily_calories) || 2000, parseFloat(d.daily_protein_g) || 0,
-       parseFloat(d.daily_carbs_g) || 0, parseFloat(d.daily_fats_g) || 0, req.user.id]
+       parseFloat(d.daily_carbs_g) || 0, parseFloat(d.daily_fats_g) || 0, req.user.id,
+       // Stamps the owning studio (migration 106). NULL only for a platform
+       // operator authoring a template every studio should see.
+       orgIdOf(req)]
     );
 
     // Link meals
