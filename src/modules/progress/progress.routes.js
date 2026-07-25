@@ -50,18 +50,20 @@ const assessmentCreateSchema = {
     cardio_test_type: z.enum(['YMCA 3-Minute Step Test', 'Rockport 1-Mile Walk', 'Cooper 12-Minute Run', 'Bruce Protocol', 'Harvard Step Test', 'Custom']).optional().nullable(),
     cardio_test_data: z.record(z.string(), z.unknown()).optional().nullable(),
 
-    // Step 5 — Muscular Strength
+    // Step 5 — Muscular Strength (two distinct tests required, same battery
+    // pattern as Endurance below — any exercise can be tested, but exactly
+    // two are needed to complete the step)
     strength_exercise: z.string().max(100).optional().nullable(),
-    strength_weight_kg: numOpt(), strength_reps: numOpt(),
-    strength_formula: z.enum(['brzycki', 'epley']).optional(),
-    strength_direct_1rm: numOpt(), strength_is_direct: z.boolean().optional(),
+    strength_exercise_2: z.string().max(100).optional().nullable(),
+    strength_test_data: z.record(z.string(), z.unknown()).optional().nullable(),
 
     // Step 6 — Muscular Endurance (two distinct tests required)
     endurance_test_type: z.enum(['Push Up Test', 'Curl Up Test', 'Wall Sit', 'Plank', 'Bodyweight Squat', 'Custom']).optional().nullable(),
     endurance_test_type_2: z.enum(['Push Up Test', 'Curl Up Test', 'Wall Sit', 'Plank', 'Bodyweight Squat', 'Custom']).optional().nullable(),
     endurance_test_data: z.record(z.string(), z.unknown()).optional().nullable(),
 
-    // Step 7 — Flexibility
+    // Step 7 — Flexibility (two distinct tests required — same battery
+    // pattern; flexibility_test_data now holds {test1, test2})
     flexibility_test_data: z.record(z.string(), z.unknown()).optional().nullable(),
 
     posture_notes: z.string().max(2000).optional().nullable(),
@@ -157,13 +159,27 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
   if (vo2Max != null && !cardioCategory) cardioCategory = scoring.classifyVo2Max(vo2Max, age, gender);
   const cardioScore = scoring.scoreCategory(cardioCategory);
 
-  // ── Step 5: Strength ──
-  const strengthFormula = b.strength_formula === 'brzycki' ? 'brzycki' : 'epley';
-  const strengthOneRm = b.strength_is_direct
-    ? (b.strength_direct_1rm ?? null)
-    : scoring.calc1RM(b.strength_weight_kg ?? null, b.strength_reps ?? null, strengthFormula);
-  const strengthCategory = scoring.classifyStrength(strengthOneRm, b.weight ?? null, b.strength_exercise || 'Bench Press', gender);
-  const strengthScore = scoring.scoreCategory(strengthCategory);
+  // ── Step 5: Strength (two-test battery, same shape as Endurance below —
+  //    any exercise may be tested, but only 2 are required to complete the
+  //    step; the combined score is the average of both, same averaging
+  //    scoreEnduranceBattery already does for Endurance) ──
+  const sd = b.strength_test_data || {};
+  const st1 = sd.test1 || {};
+  const st2 = sd.test2 || {};
+  const strengthFormula1 = st1.formula === 'brzycki' ? 'brzycki' : 'epley';
+  const strengthFormula2 = st2.formula === 'brzycki' ? 'brzycki' : 'epley';
+  const strengthOneRm1 = st1.isDirect
+    ? num(st1.direct1RM, null)
+    : scoring.calc1RM(num(st1.weightKg, null), num(st1.reps, null), strengthFormula1);
+  const strengthOneRm2 = st2.isDirect
+    ? num(st2.direct1RM, null)
+    : scoring.calc1RM(num(st2.weightKg, null), num(st2.reps, null), strengthFormula2);
+  const strengthCategory = scoring.classifyStrength(strengthOneRm1, b.weight ?? null, b.strength_exercise || null, gender);
+  const strengthCategory2 = scoring.classifyStrength(strengthOneRm2, b.weight ?? null, b.strength_exercise_2 || null, gender);
+  const strengthScore = scoring.scoreEnduranceBattery(
+    scoring.scoreCategory(strengthCategory),
+    scoring.scoreCategory(strengthCategory2),
+  );
 
   // ── Step 6: Endurance (two tests, combined into one averaged score) ──
   const ed = b.endurance_test_data || {};
@@ -178,11 +194,20 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
     scoring.scoreCategory(enduranceCategory2),
   );
 
-  // ── Step 7: Flexibility ──
+  // ── Step 7: Flexibility (two-test battery — flexibility_test_data holds
+  //    {test1, test2} going forward; asymmetry flags if EITHER test shows
+  //    it, and the mobility score averages both tests' categories) ──
   const fd = b.flexibility_test_data || {};
-  const hasAsymmetry = scoring.checkAsymmetry(num(fd.left, null), num(fd.right, null));
-  const flexibilityCategory = scoring.classifyFlexibilityScore(num(fd.score, null));
-  const mobilityScore = scoring.scoreCategory(flexibilityCategory);
+  const ft1 = fd.test1 || {};
+  const ft2 = fd.test2 || {};
+  const hasAsymmetry = scoring.checkAsymmetry(num(ft1.left, null), num(ft1.right, null))
+    || scoring.checkAsymmetry(num(ft2.left, null), num(ft2.right, null));
+  const flexibilityCategory = scoring.classifyFlexibilityScore(num(ft1.score, null));
+  const flexibilityCategory2 = scoring.classifyFlexibilityScore(num(ft2.score, null));
+  const mobilityScore = scoring.scoreEnduranceBattery(
+    scoring.scoreCategory(flexibilityCategory),
+    scoring.scoreCategory(flexibilityCategory2),
+  );
 
   // ── Dashboard scores ──
   const bodyCompositionScore = scoring.scoreBodyComposition(b.body_fat_pct ?? null, gender);
@@ -203,9 +228,9 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
        body_comp_method, body_fat_pct, muscle_mass_pct, lean_body_mass_kg, fat_mass_kg,
        visceral_fat, subcutaneous_fat_pct, body_water_pct, bone_mass_kg, bmr, bmr_auto_suggested, metabolic_age,
        cardio_test_type, cardio_test_data, vo2_max, cardio_category, cardio_score_computed,
-       strength_score_computed,
+       strength_exercise, strength_exercise_2, strength_category, strength_category_2, strength_test_data, strength_score_computed,
        endurance_test_type, endurance_test_type_2, endurance_test_data, endurance_category, endurance_category_2, endurance_score_computed,
-       flexibility_test_data, flexibility_category, has_asymmetry, mobility_score_computed,
+       flexibility_test_data, flexibility_category, flexibility_category_2, has_asymmetry, mobility_score_computed,
        body_composition_score, health_risk_score, overall_fitness_score,
        posture_notes, health_notes, created_by, organization_id
      ) VALUES (
@@ -217,11 +242,11 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
        $26,$27,$28,$29,$30,
        $31,$32,$33,$34,$35,$36,$37,
        $38,$39::jsonb,$40,$41,$42,
-       $43,
-       $44,$45,$46::jsonb,$47,$48,$49,
-       $50::jsonb,$51,$52,$53,
-       $54,$55,$56,
-       $57,$58,$59,$60
+       $43,$44,$45,$46,$47::jsonb,$48,
+       $49,$50,$51::jsonb,$52,$53,$54,
+       $55::jsonb,$56,$57,$58,$59,
+       $60,$61,$62,
+       $63,$64,$65,$66
      ) RETURNING *`,
     [
       b.client_id, trainer_id, b.assessment_type || 'initial', b.assessment_date || null,
@@ -232,9 +257,9 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
       b.body_comp_method || null, b.body_fat_pct ?? null, b.muscle_mass_pct ?? null, leanBodyMass, fatMass,
       b.visceral_fat ?? null, b.subcutaneous_fat_pct ?? null, b.body_water_pct ?? null, b.bone_mass_kg ?? null, bmr, bmrAutoSuggested, b.metabolic_age ?? null,
       b.cardio_test_type || null, JSON.stringify(cd), vo2Max, cardioCategory, cardioScore,
-      strengthScore,
+      b.strength_exercise || null, b.strength_exercise_2 || null, strengthCategory, strengthCategory2, JSON.stringify(sd), strengthScore,
       b.endurance_test_type || null, b.endurance_test_type_2 || null, JSON.stringify(ed), enduranceCategory, enduranceCategory2, enduranceScore,
-      JSON.stringify(fd), flexibilityCategory, hasAsymmetry, mobilityScore,
+      JSON.stringify(fd), flexibilityCategory, flexibilityCategory2, hasAsymmetry, mobilityScore,
       bodyCompositionScore, healthRiskScore, overallScore,
       b.posture_notes || null, b.health_notes || null, req.user.id,
       orgIdOf(req),
