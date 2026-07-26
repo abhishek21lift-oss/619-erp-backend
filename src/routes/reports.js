@@ -219,4 +219,125 @@ router.get('/dues', auth, async (req, res, next) => {
   }
 });
 
+// ── Monthly revenue target ──────────────────────────────────────────────────
+//
+// A studio admin commits to one revenue figure per calendar month. Once set it
+// cannot be changed — that is enforced by a UNIQUE (organization_id, period)
+// constraint and by the deliberate absence of any update route, NOT by
+// disabling an input on the client.
+//
+// `achieved` reuses the EXACT union that GET /monthly aggregates (payments +
+// pt_payments, same date column, same soft-delete filter, same org scope). If
+// the two ever diverged, the hero card and the chart directly below it would
+// show different numbers for the same month, which destroys trust in both.
+
+/** Sum of this month's revenue for the caller's scope. */
+async function currentMonthRevenue(req) {
+  const params = [orgParam(req)];
+  const { rows } = await pool.query(`
+    SELECT COALESCE(SUM(revenue), 0) AS achieved
+    FROM (
+      SELECT p.amount AS revenue
+        FROM payments p
+       WHERE p.deleted_at IS NULL
+         AND date_trunc('month', p.date::date) = date_trunc('month', CURRENT_DATE)
+      UNION ALL
+      SELECT p.amount AS revenue
+        FROM pt_payments p
+       WHERE p.deleted_at IS NULL
+         AND date_trunc('month', p.date::date) = date_trunc('month', CURRENT_DATE)
+         AND ($1::uuid IS NULL OR p.organization_id = $1)
+    ) combined`, params);
+  return Number(rows[0]?.achieved ?? 0);
+}
+
+// GET /api/reports/revenue-target — this month's target, progress and lock state.
+router.get('/revenue-target', auth, async (req, res, next) => {
+  try {
+    const orgId = orgParam(req);
+    const [{ rows }, achieved] = await Promise.all([
+      pool.query(
+        `SELECT t.id, t.period, t.target_amount, t.created_at, u.name AS set_by_name
+           FROM revenue_targets t
+           LEFT JOIN users u ON u.id = t.set_by
+          WHERE t.period = date_trunc('month', CURRENT_DATE)::date
+            AND ($1::uuid IS NULL OR t.organization_id = $1)
+          LIMIT 1`,
+        [orgId],
+      ),
+      currentMonthRevenue(req),
+    ]);
+
+    const row = rows[0] || null;
+    const target = row ? Number(row.target_amount) : null;
+
+    res.json({
+      data: {
+        period: row?.period ?? new Date().toISOString().slice(0, 7) + '-01',
+        target_amount: target,
+        achieved,
+        // Never negative: once the target is beaten "remaining" is zero, not a
+        // negative number the UI would have to special-case.
+        balance: target !== null ? Math.max(0, target - achieved) : null,
+        surplus: target !== null ? Math.max(0, achieved - target) : null,
+        pct: target !== null && target > 0 ? Math.min(999, (achieved / target) * 100) : null,
+        // The single flag the client renders from — it must not infer the lock
+        // from the presence of a value and get it subtly wrong.
+        locked: Boolean(row),
+        set_by_name: row?.set_by_name ?? null,
+        set_at: row?.created_at ?? null,
+        // Only an admin may set it; surfaced so the UI shows the right message
+        // to a trainer rather than a form that will 403.
+        can_set: req.user.role === 'admin' || req.user.role === 'super_admin',
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/reports/revenue-target — set this month's target. Once only.
+router.post('/revenue-target', auth, adminOnly, async (req, res, next) => {
+  try {
+    const orgId = orgParam(req);
+    if (!orgId) {
+      // A platform super admin with no x-org-id has no studio to set a target
+      // for. Fail loudly rather than writing an orphan row.
+      return res.status(400).json({ error: 'Select an organization first' });
+    }
+
+    const amount = Number(req.body?.target_amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(422).json({ error: 'Enter a target amount greater than zero' });
+    }
+    // Matches NUMERIC(12,2): anything larger would be a fat-finger, and letting
+    // it through returns a confusing 500 from the column overflow instead.
+    if (amount > 9999999999) {
+      return res.status(422).json({ error: 'That target is unrealistically large' });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO revenue_targets (organization_id, period, target_amount, set_by)
+       VALUES ($1, date_trunc('month', CURRENT_DATE)::date, $2, $3)
+       ON CONFLICT (organization_id, period) DO NOTHING
+       RETURNING id, period, target_amount, created_at`,
+      [orgId, amount.toFixed(2), req.user.id],
+    );
+
+    // DO NOTHING + no returned row means a target already existed for this
+    // month. This is the lock firing, and it is race-safe: two concurrent
+    // requests cannot both insert, because the unique index arbitrates.
+    if (!rows[0]) {
+      return res.status(409).json({
+        error: 'This month’s target is already set and cannot be changed until next month',
+        code: 'TARGET_ALREADY_SET',
+      });
+    }
+
+    res.status(201).json({ data: rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;
