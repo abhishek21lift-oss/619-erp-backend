@@ -5,7 +5,7 @@
 const router = require('express').Router();
 const pool = require('../db/pool');
 const logger = require('../lib/logger');
-const { auth, adminOnly, adminOrManager } = require('../middleware/auth');
+const { auth, adminOrManager } = require('../middleware/auth');
 
 // GET /api/leave — list leave requests
 // Filters: status, trainer_id, from, to

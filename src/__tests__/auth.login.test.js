@@ -10,11 +10,20 @@ jest.mock('../db/pool', () => {
       member_id: null,
       is_active: true,
       token_version: 0,
+      organization_id: 'org-1',
+      organization_name: 'Test Studio',
+      organization_logo_url: null,
     },
   ];
   return {
     query: jest.fn(async function(sql, params) {
-      if (/SELECT \* FROM users WHERE LOWER\(email\)/i.test(sql)) {
+      // Matched on the shape that survives edits — a SELECT against `users`
+      // filtering on a lower-cased email. The previous pattern pinned the
+      // exact old text (`SELECT * FROM users WHERE LOWER(email)`), so when the
+      // real query gained its LEFT JOIN on organizations the mock silently
+      // stopped matching, returned no rows, and login 401'd. Nobody saw it
+      // because the suite could not even parse.
+      if (/from\s+users/i.test(sql) && /lower\(\s*u?\.?email\s*\)/i.test(sql)) {
         const email = (params && params[0]) || '';
         const row = store.find(u => u.email.toLowerCase() === email.toLowerCase()) || null;
         return { rows: row ? [row] : [] };
@@ -35,6 +44,16 @@ jest.mock('bcryptjs', () => ({
 
 const request = require('supertest');
 const express = require('express');
+// routes/auth.js requires otplib, whose CJS build in turn requires the
+// ESM-only @scure/base. Node can resolve that; Jest's own module resolver
+// cannot, and the suite failed to parse before it ran a single assertion.
+// This test covers password login, not TOTP, so otplib is stubbed out — the
+// real module is exercised by otplib.contract.test.js under plain Node.
+jest.mock('otplib', () => ({
+  generateSecret: jest.fn(() => 'JBSWY3DPEHPK3PXP'),
+  verifySync: jest.fn(() => ({ valid: false })),
+}));
+
 process.env.JWT_SECRET = 'a'.repeat(64);
 process.env.DATABASE_URL = 'postgres://test';
 process.env.FRONTEND_URL = 'https://test.example.com';

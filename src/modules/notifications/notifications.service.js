@@ -263,7 +263,6 @@ async function recipientFromMember(memberId) {
   // Try the clients table first (619 ERP schema), fall back to members
   for (const table of ['clients', 'members']) {
     try {
-      const col = table === 'clients' ? 'id' : 'id';
       const { rows } = await pool.query(
         `SELECT c.id AS member_id, c.name, c.email, c.mobile AS phone, NULL AS user_id
          FROM ${table} c WHERE c.id = $1`,

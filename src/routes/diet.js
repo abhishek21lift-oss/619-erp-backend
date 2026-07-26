@@ -5,7 +5,6 @@ const pool = require('../db/pool');
 const { auth, adminOrManager } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
-const logger = require('../lib/logger');
 
 // ─── MEALS ───────────────────────────────────────────────────
 

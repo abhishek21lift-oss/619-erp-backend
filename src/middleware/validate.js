@@ -16,7 +16,7 @@ function validate(schemas) {
     } catch (err) {
       const issues = err && err.issues ? err.issues : [];
       const fields = {};
-      for (var i = 0; i < issues.length; i++) {
+      for (let i = 0; i < issues.length; i++) {
         const issue = issues[i];
         fields[issue.path.join('.')] = issue.message;
       }

@@ -7,7 +7,6 @@ const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
-const { generateClientId } = require('../../db/id-gen');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
 const subscription = require('../../lib/subscription');
 
@@ -198,7 +197,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
           pt_start_date, pt_end_date, duration_months, monthly_pt_amount,
           notes, weight,
           goal, height, body_fat, health_conditions, injuries, frequency,
-          pt_package_id, base_price, selling_price,
+          pt_package_id,
           whatsapp, occupation, emergency_contact, emergency_phone, address,
         } = req.body;
 

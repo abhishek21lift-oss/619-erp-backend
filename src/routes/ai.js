@@ -175,11 +175,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
 
     // Stream response
     let fullContent  = '';
-    let finalUsage   = null;
-    let usedFallback = false;
-    let actualModel  = models.primary;
-
-    const { model: routedModel, tier } = (() => {
+    const { model: routedModel } = (() => {
       const { resolveModel } = require('../lib/ai/models');
       return resolveModel('chat');
     })();
@@ -232,7 +228,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   const {
     age, gender, weight_kg, height_cm, goal, experience_level,
     injuries = 'none', equipment = 'full gym', training_days = 4,
-    client_id, duration_weeks = 8,
+    duration_weeks = 8,
   } = req.body || {};
 
   const required = { age, gender, weight_kg, height_cm, goal, experience_level };
@@ -324,7 +320,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
   const {
     age, gender, weight_kg, height_cm, activity_level, goal,
     dietary_preferences = 'none', allergies = 'none',
-    budget = 'medium', meal_frequency = 4, client_id,
+    budget = 'medium', meal_frequency = 4,
   } = req.body || {};
 
   const required = { age, gender, weight_kg, height_cm, activity_level, goal };
@@ -845,7 +841,6 @@ router.post('/test', auth, requireConfigured, async (req, res) => {
 
   const { intent = 'chat', prompt = 'Say "MY PT STUDIO AI is ready" and nothing else.' } = req.body || {};
   try {
-    const start  = Date.now();
     const result = await routedChat({
       intent,
       messages: [{ role: 'user', content: prompt }],

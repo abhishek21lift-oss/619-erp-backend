@@ -1,7 +1,6 @@
 // src/middleware/auth.js
 const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
-const logger = require('../lib/logger');
 const { computeAccess } = require('../lib/subscription');
 
 // Path prefixes that stay reachable even when a studio's subscription has lapsed,

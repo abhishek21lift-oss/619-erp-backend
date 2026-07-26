@@ -17,8 +17,13 @@ services:
     # serving before routing traffic to it / marking the deploy healthy.
     healthCheckPath: /api/health
     envVars:
+      # Node 20.18 cannot `require()` an ES module. otplib's CommonJS build
+      # requires @scure/base, which is ESM-only, so on 20.18 loading
+      # routes/auth.js throws ERR_REQUIRE_ESM and the service never boots.
+      # require(esm) landed in 20.19; 22 is the current LTS and Node 20 is now
+      # end-of-life, so the pin moves forward rather than to 20.19.
       - key: NODE_VERSION
-        value: 20.18.0
+        value: 22.11.0
       - key: NODE_ENV
         value: production
       - key: PORT

@@ -6,7 +6,6 @@ const pool = require('../../db/pool');
 const { HttpError } = require('../../middleware/errorHandler');
 
 const CANCEL_GRACE_HOURS = 2;     // free cancel if > 2h before start
-const NO_SHOW_PENALTY = 1;        // class-pack credits forfeited
 
 /**
  * Book a class session for a member.
@@ -191,7 +190,7 @@ async function cancel(bookingId, { reason } = {}, ctx) {
 /**
  * Check in (member arrives at the gym).
  */
-async function checkIn(bookingId, { method = 'manual' }, ctx) {
+async function checkIn(bookingId, { method = 'manual' }, _ctx) {
   const r = await pool.query(
     `UPDATE bookings SET status='attended', checked_in_at = NOW(), check_in_method = $2
      WHERE id = $1 AND status = 'confirmed'

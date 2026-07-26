@@ -238,7 +238,7 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
 // POST /api/trainers/sessions — create a PT session
 router.post('/sessions', auth, async (req, res, next) => {
   try {
-    const { trainer_id, client_id, date, time, duration, type, notes, recurring } = req.body;
+    const { trainer_id, client_id, date, time, duration, type, notes } = req.body;
     if (!trainer_id || !client_id || !date) {
       return res.status(400).json({ error: 'trainer_id, client_id, and date are required' });
     }

@@ -483,6 +483,7 @@ router.post('/action/verify', auth, async (req, res, next) => {
         requireUserVerification: true,
       });
     } catch (err) {
+      logger.warn({ err: err.message }, 'webauthn action verification failed');
       return res.status(400).json({ error: 'Action verification failed' });
     }
 

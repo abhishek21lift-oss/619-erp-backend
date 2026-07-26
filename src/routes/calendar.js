@@ -14,7 +14,6 @@ const { auth } = require('../middleware/auth');
 const cal    = require('../lib/google-calendar');
 const logger = require('../lib/logger');
 
-const isProd = process.env.NODE_ENV === 'production';
 
 function notConfigured(res) {
   return res.status(501).json({

@@ -29,7 +29,6 @@ const ACK_KEYS = [
   'understands_confidentiality', 'voluntary_participation', 'final_declaration',
 ];
 
-const ACTIVE_STATUSES = ['draft', 'pending_client_signature', 'pending_trainer_signature', 'completed'];
 
 // ─── Schemas ────────────────────────────────────────────────
 

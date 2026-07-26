@@ -457,7 +457,7 @@ router.get('/my-history', auth, async (req, res) => {
     let currentStreak = 0;
     let longestStreak = 0;
     let tempStreak = 0;
-    let d = new Date();
+    const d = new Date();
 
     // Walk backwards from today
     for (let i = 0; i < 365; i++) {

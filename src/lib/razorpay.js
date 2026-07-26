@@ -1,5 +1,4 @@
 const Razorpay = require('razorpay');
-const logger = require('./logger');
 
 const KEY_ID = process.env.RAZORPAY_KEY_ID || '';
 const KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';

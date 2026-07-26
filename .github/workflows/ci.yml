@@ -21,17 +21,16 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
       - name: Lint
-        # Warning ceiling frozen at the current count so lint debt can only
-        # shrink — any *new* warning fails CI. Lower this number as warnings
-        # are cleaned up. (Lint errors always fail.)
-        run: npm run lint -- --max-warnings=193
+        # The backlog is cleared, so the ceiling is zero: any new warning fails
+        # CI immediately rather than being absorbed into a budget.
+        run: npm run lint -- --max-warnings=0
 
   # ── Job 2: Unit tests ──────────────────────────────────────────────
   test:
@@ -62,7 +61,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
@@ -80,8 +79,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Audit dependencies
+        # Clean as of the brace-expansion override in package.json. When a new
+        # advisory lands, prefer `overrides` for a transitive dependency over
+        # loosening this threshold.
         run: npm audit --audit-level=high

@@ -2,9 +2,14 @@ const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const multer = require('multer');
-const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
-const { authenticator } = require('otplib');
+// otplib v13 removed the `authenticator` singleton that v12 exported and
+// replaced it with these functions. Verification now returns a RESULT OBJECT
+// ({ valid, delta, ... }), not a boolean — reading it as a boolean would make
+// every code appear valid, so the `.valid` property is checked explicitly.
+// `epochTolerance` is in SECONDS; 30 is one TOTP step either side, matching
+// what v12's `{ window: 1 }` meant.
+const { generateSecret, verifySync } = require('otplib');
 const pool = require('../db/pool');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const { logActivity } = require('../lib/activityLog');
@@ -246,7 +251,7 @@ router.put('/password', async (req, res, next) => {
 router.post('/mfa/setup', async (req, res, next) => {
   try {
     await ensureSchema();
-    const secret = authenticator.generateSecret();
+    const secret = generateSecret();
     await pool.query(
       `INSERT INTO user_profiles (user_id, mfa_secret, updated_at)
        VALUES ($1,$2,NOW())
@@ -281,7 +286,9 @@ router.post('/mfa/verify', mfaVerifyLimiter, async (req, res, next) => {
     const { rows } = await pool.query('SELECT mfa_secret FROM user_profiles WHERE user_id = $1', [req.user.id]);
     const storedSecret = rows[0] && rows[0].mfa_secret;
     if (!storedSecret) return res.status(400).json({ error: 'MFA setup required before verification' });
-    const valid = authenticator.check(code, storedSecret, { window: 1 });
+    const valid = verifySync({
+      secret: storedSecret, token: code, strategy: 'totp', epochTolerance: 30,
+    }).valid;
     if (!valid) return res.status(400).json({ error: 'Invalid MFA code' });
     await pool.query(
       `UPDATE user_profiles

@@ -1,9 +1,8 @@
 'use strict';
 const express = require('express');
-const crypto  = require('crypto');
 const jwt     = require('jsonwebtoken');
 const pool = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth } = require('../middleware/auth');
 const logger = require('../lib/logger');
 
 const router = express.Router();
@@ -99,14 +98,6 @@ async function findUserByEmail(email) {
 
 function memberIdFromRequest(req, fallback) {
   return req.user?.member_id || fallback || null;
-}
-
-function issueActionToken(user) {
-  return jwt.sign(
-    { id: user.id, purpose: 'webauthn_action' },
-    process.env.JWT_SECRET,
-    { expiresIn: '5m' }
-  );
 }
 
 async function logWebauthnEvent(req, action, detail) {
@@ -461,7 +452,7 @@ router.delete('/credentials/:id', auth, async (req, res, next) => {
     if (req.user?.role !== 'admin' && member_id !== existing.rows[0].member_id) {
       return res.status(403).json({ error: 'Not authorized to remove this credential' });
     }
-    const result = await pool.query(
+    await pool.query(
       'DELETE FROM webauthn_credentials WHERE id = $1 RETURNING id',
       [req.params.id]
     );

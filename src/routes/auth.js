@@ -3,7 +3,13 @@ const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const jwt    = require('jsonwebtoken');
-const { authenticator } = require('otplib');
+// otplib v13 removed the `authenticator` singleton that v12 exported and
+// replaced it with these functions. Verification now returns a RESULT OBJECT
+// ({ valid, delta, ... }), not a boolean — reading it as a boolean would make
+// every code appear valid, so the `.valid` property is checked explicitly.
+// `epochTolerance` is in SECONDS; 30 is one TOTP step either side, matching
+// what v12's `{ window: 1 }` meant.
+const { verifySync } = require('otplib');
 const pool   = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, invalidateUserCache } = require('../middleware/auth');
@@ -120,7 +126,9 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
       if (mfaEnabled) {
         const code = String(req.body.mfa_code || '').trim();
         if (!code) return res.status(401).json({ error: 'MFA code required', mfaRequired: true });
-        if (!/^\d{6}$/.test(code) || !authenticator.check(code, mfaSecret, { window: 1 })) {
+        const mfaOk = /^\d{6}$/.test(code)
+          && verifySync({ secret: mfaSecret, token: code, strategy: 'totp', epochTolerance: 30 }).valid;
+        if (!mfaOk) {
           return res.status(401).json({ error: 'Invalid MFA code', mfaRequired: true });
         }
       } else {
@@ -418,6 +426,7 @@ router.get('/users', auth, requireSuperAdmin, async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
+    logger.error({ err: err.message }, 'list users failed');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -452,6 +461,7 @@ router.put('/users/:id', auth, requireSuperAdmin, async (req, res) => {
     invalidateUserCache(req.params.id);
     res.json({ message: 'Updated', user: rows[0] });
   } catch (err) {
+    logger.error({ err: err.message, userId: req.params.id }, 'update user failed');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -473,6 +483,7 @@ router.put('/users/:id/toggle', auth, requireSuperAdmin, async (req, res) => {
     invalidateUserCache(req.params.id);
     res.json({ message: 'Updated', is_active: rows[0].is_active });
   } catch (err) {
+    logger.error({ err: err.message, userId: req.params.id }, 'toggle user active failed');
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -503,6 +514,7 @@ router.delete('/users/:id', auth, requireSuperAdmin, async (req, res) => {
     invalidateUserCache(req.params.id);
     res.json({ message: 'User deleted' });
   } catch (err) {
+    logger.error({ err: err.message, userId: req.params.id }, 'delete user failed');
     res.status(500).json({ error: 'Server error' });
   }
 });

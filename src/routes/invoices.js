@@ -2,7 +2,7 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 
@@ -107,7 +107,7 @@ router.post('/', auth, async (req, res, next) => {
 
     await tx.query('BEGIN');
 
-    let clientId = d.client_id || null;
+    const clientId = d.client_id || null;
     let clientName = d.client_name || d.member_name || '';
 
     // Structured form: look up the client (pt_clients is the live client

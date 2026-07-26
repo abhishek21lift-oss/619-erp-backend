@@ -1,8 +1,11 @@
+// Mocked against otplib v13's functional API. This mock previously described
+// v12's `authenticator` singleton, which is why it kept passing after the
+// dependency was bumped and the real code had already broken — the mock was
+// asserting an API that no longer existed. otplib.contract.test.js now pins
+// the real shape so that cannot recur.
 jest.mock('otplib', () => ({
-  authenticator: {
-    check: jest.fn(),
-    generateSecret: jest.fn(() => 'JBSWY3DPEHPK3PXP'),
-  },
+  generateSecret: jest.fn(() => 'JBSWY3DPEHPK3PXP'),
+  verifySync: jest.fn(),
 }));
 
 jest.mock('../db/pool', () => ({
@@ -16,7 +19,7 @@ process.env.JWT_SECRET = 'a'.repeat(64);
 
 const profileRouter = require('../routes/profile');
 const pool = require('../db/pool');
-const { authenticator } = require('otplib');
+const { verifySync } = require('otplib');
 
 const app = express();
 app.use(express.json());
@@ -69,15 +72,17 @@ describe('POST /api/profile/mfa/verify', () => {
 
   it('returns 400 for an incorrect TOTP code', async () => {
     mockProfilePool({ mfaSecret: 'JBSWY3DPEHPK3PXP' });
-    authenticator.check.mockReturnValue(false);
+    verifySync.mockReturnValue({ valid: false });
     const res = await withAuth(request(app).post('/api/profile/mfa/verify').send({ code: '000000' }));
     expect(res.status).toBe(400);
-    expect(authenticator.check).toHaveBeenCalledWith('000000', 'JBSWY3DPEHPK3PXP', { window: 1 });
+    expect(verifySync).toHaveBeenCalledWith({
+      secret: 'JBSWY3DPEHPK3PXP', token: '000000', strategy: 'totp', epochTolerance: 30,
+    });
   });
 
   it('returns 200 with recovery codes for a correct TOTP code', async () => {
     mockProfilePool({ mfaSecret: 'JBSWY3DPEHPK3PXP' });
-    authenticator.check.mockReturnValue(true);
+    verifySync.mockReturnValue({ valid: true });
     const res = await withAuth(request(app).post('/api/profile/mfa/verify').send({ code: '123456' }));
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body.recoveryCodes)).toBe(true);

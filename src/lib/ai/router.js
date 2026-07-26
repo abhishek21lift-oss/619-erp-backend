@@ -42,10 +42,8 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
   const { model, tier } = resolveModel(intent);
 
   try {
-    let fullContent = '';
     const gen = streamCompletion({ model, messages, temperature, max_tokens, timeout });
     for await (const chunk of gen) {
-      fullContent += chunk;
       yield chunk;
     }
     return { model, tier, intent, used_fallback: false };
