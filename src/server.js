@@ -331,12 +331,6 @@ app.use('/api/search',            require('./routes/search'));
 app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
 app.use('/api/clients',           userApiLimiter, require('./routes/client-actions'));
 
-// Whiteboards. Autosave is a frequent PUT while a trainer draws, so this is
-// intentionally outside userApiLimiter — the canvas debounces client-side and
-// would otherwise burn the shared per-user budget that ordinary API calls need,
-// exactly as noted for /api/search above.
-app.use('/api/whiteboards',       require('./modules/whiteboard/whiteboard.routes'));
-
 app.use('/api/trainers',          require('./routes/trainers'));
 app.use('/api/payments',          userApiLimiter, require('./routes/payments'));
 app.use('/api/attendance',        require('./routes/attendance'));
