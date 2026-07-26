@@ -332,6 +332,10 @@ app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
 app.use('/api/clients',           userApiLimiter, require('./routes/client-actions'));
 
 app.use('/api/trainers',          require('./routes/trainers'));
+// Manual UTR verification payments. MUST be mounted before the finance ledger
+// router below: that one owns DELETE /:id and a bare /:id would otherwise
+// swallow /api/payments/upi/... before this router ever sees it.
+app.use('/api/payments/upi',      userApiLimiter, require('./routes/upi-payments'));
 app.use('/api/payments',          userApiLimiter, require('./routes/payments'));
 app.use('/api/attendance',        require('./routes/attendance'));
 
@@ -456,6 +460,21 @@ runMigrationsWithRetry()
       setTimeout(() => { runSubscriptionSweep(); }, 60 * 1000).unref();
       setInterval(() => { runSubscriptionSweep(); }, 6 * 60 * 60 * 1000).unref();
       logger.info({ interval: '6h' }, 'Subscription sweep scheduled');
+    }
+
+    // UPI order expiry: close orders nobody ever paid so they stop occupying
+    // the one-open-order-per-plan slot and cluttering the member's history.
+    // Only touches CREATED/PAYMENT_PENDING — an order awaiting the studio's
+    // verification is never expired out from under the admin.
+    // Disable with UPI_EXPIRY_SWEEP=off.
+    if (process.env.UPI_EXPIRY_SWEEP !== 'off') {
+      const { expireStaleOrders } = require('./lib/upiPayments');
+      const sweep = () => expireStaleOrders()
+        .then((n) => { if (n) logger.info({ expired: n }, 'UPI orders expired'); })
+        .catch((err) => logger.warn({ err: err.message }, 'UPI expiry sweep failed'));
+      setTimeout(sweep, 90 * 1000).unref();
+      setInterval(sweep, 15 * 60 * 1000).unref();
+      logger.info({ interval: '15min' }, 'UPI order expiry sweep scheduled');
     }
 
     const pool = require('./db/pool');

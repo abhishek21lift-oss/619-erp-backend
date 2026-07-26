@@ -38,6 +38,18 @@ const OWNED_CATEGORIES = {
   'informed-consent': 'pt_informed_consents',
 };
 
+// Payment proofs are keyed differently: routes/upi-payments.js writes
+// `upi-proof/<orderId>-<randomUUID>.<ext>`, so the owning row's id is the
+// PREFIX of the filename rather than the whole of it. The generic resolver
+// below strips the extension and expects the remainder to be a bare UUID,
+// which would never match here — hence a category-specific extractor.
+//
+// This matters: a payment screenshot shows a member's bank app, their name and
+// the amount they paid. Without this, any authenticated user in any studio
+// holding the key could fetch another studio's proof.
+const PROOF_CATEGORY = 'upi-proof';
+const PROOF_TABLE = 'payment_orders';
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Derived from req.path rather than req.params[0]: this router registers both
@@ -70,16 +82,20 @@ function normaliseKey(req, res) {
  * false) is allowed through, consistent with tenantScope() everywhere else.
  */
 async function callerOwnsRecord(req, category, key) {
-  const table = OWNED_CATEGORIES[category];
+  const isProof = category === PROOF_CATEGORY;
+  const table = isProof ? PROOF_TABLE : OWNED_CATEGORIES[category];
   if (!table) return true; // not an owned category — a valid session suffices
 
   const scope = tenantScope(req);
   if (!scope.applyFilter) return true; // platform-wide super_admin
 
   // Keys are written as `<category>/pdf/<record-uuid>.pdf` by lib/parqPdf.js
-  // and lib/informedConsentPdf.js.
+  // and lib/informedConsentPdf.js — except payment proofs, where the order id
+  // is a prefix of a longer filename (see PROOF_CATEGORY above).
   const basename = key.split('/').pop() || '';
-  const id = basename.replace(/\.[^.]+$/, '');
+  const id = isProof
+    ? basename.slice(0, 36)
+    : basename.replace(/\.[^.]+$/, '');
   if (!UUID_RE.test(id)) return false;
 
   // Table name comes from the OWNED_CATEGORIES allowlist above, never from
