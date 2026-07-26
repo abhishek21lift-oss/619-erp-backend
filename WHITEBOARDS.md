@@ -16,6 +16,10 @@ attach without schema changes.
 - Attachments (PNG/JPG/WEBP/GIF/PDF) to R2, with magic-byte validation.
 - Tenant isolation, role-gated writes, soft delete, and search by title or by
   the text written on the canvas.
+- **Anatomy overlays** — 61 assets (body, muscles, skeleton, joints, ligaments,
+  rehab, exercise form) inserted locked and behind existing annotations at a
+  chosen opacity. Lives in the frontend repo: see `ANATOMY-REPORT.md` there for
+  provenance and licensing of every asset.
 
 ## What did NOT ship, and why
 
@@ -25,9 +29,12 @@ Called out explicitly so nobody assumes these exist:
 |---|---|
 | Real-time multi-cursor collaboration | Needs a websocket/CRDT layer; neither repo has one. Deferred by decision. Optimistic concurrency (below) is the interim guard. |
 | Per-board ACLs, share links, comments | Needs a `whiteboard_members` table + sharing UI. Phase 1 is org-scoped + role-gated. |
-| Anatomy / organ / exercise overlays | Licensed medical & fitness illustration assets. The image-annotation mechanism exists; the artwork must be supplied. |
 | Templates, mind-map mode, rehab timeline | Product surfaces on top of this foundation, not engine features. |
 | PDF export | Excalidraw exports PNG/SVG/JSON natively; PDF needs a separate render step. |
+
+Note on the anatomy artwork: it is clinical *schematic* quality — correct
+structure and labelling, not rendered medical illustration. Fine for coaching
+and client explanation; not a substitute for a licensed anatomical atlas.
 
 ## Storage model
 
