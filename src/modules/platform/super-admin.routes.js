@@ -1052,4 +1052,176 @@ router.post('/subscription-payments/:id/refund', async (req, res, next) => {
   }
 });
 
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SUBSCRIPTION SELF-CHECKOUT — the operator's verification queue
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Studios pay the platform over UPI and submit the bank reference. This is
+// where the operator matches that reference against the platform bank account
+// and turns it into an active subscription. Approval delegates to
+// subscription.activate(), so founder pricing, coupon redemption, invoices and
+// period stacking all behave exactly as they do for a manually recorded
+// payment — there is no second activation path.
+
+const checkout = require('../../lib/subscriptionCheckout');
+
+function checkoutActor(req) {
+  return { id: req.user.id, name: req.user.name || null, role: req.user.role };
+}
+
+function sendCheckoutError(res, err, next) {
+  if (err && err.name === 'PaymentError') {
+    return res.status(err.status).json({ error: { code: err.code, message: err.message } });
+  }
+  if (err && err.status) {
+    return res.status(err.status).json({ error: { code: 'CHECKOUT_FAILED', message: err.message } });
+  }
+  return next(err);
+}
+
+// GET /platform-payment-settings — the platform's own payee details.
+router.get('/platform-payment-settings', async (req, res, next) => {
+  try {
+    const data = await checkout.getPlatformSettings();
+    res.json({ data, configured: Boolean(data), enabled: Boolean(data?.is_enabled) });
+  } catch (err) { next(err); }
+});
+
+// PUT /platform-payment-settings
+router.put('/platform-payment-settings', async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const saved = await checkout.savePlatformSettings({
+      upi_id: String(body.upi_id || '').trim(),
+      merchant_name: String(body.merchant_name || '').trim(),
+      instructions: body.instructions ? String(body.instructions).trim().slice(0, 500) : null,
+      is_enabled: body.is_enabled === true || body.is_enabled === 'true',
+      request_ttl_minutes: Number(body.request_ttl_minutes) || 60,
+    }, req.user.id);
+    await audit(req, 'platform_payment_settings_updated', 'platform', null, {
+      upi_id: saved.upi_id, is_enabled: saved.is_enabled,
+    });
+    res.json({ data: saved });
+  } catch (err) { sendCheckoutError(res, err, next); }
+});
+
+// GET /subscription-requests — the queue plus its counters.
+router.get('/subscription-requests', async (req, res, next) => {
+  try {
+    const status = ['AWAITING_VERIFICATION', 'AWAITING_PAYMENT', 'APPROVED', 'ALL']
+      .includes(req.query.status) ? req.query.status : 'AWAITING_VERIFICATION';
+    const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const conds = [];
+    const params = [];
+    if (status !== 'ALL') { params.push(status); conds.push(`r.status = $${params.length}`); }
+    if (req.query.q) {
+      params.push(`%${String(req.query.q).trim()}%`);
+      conds.push(`(o.name ILIKE $${params.length} OR r.request_no ILIKE $${params.length} OR r.utr ILIKE $${params.length})`);
+    }
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+    const listParams = [...params, limit, offset];
+    const { rows } = await pool.query(
+      `SELECT ${checkout.REQUEST_COLUMNS},
+              o.name AS organization_name, o.slug AS organization_slug,
+              o.subscription_status, o.current_period_end,
+              p.name AS plan_name, p.duration_months
+         FROM subscription_payment_requests r
+         JOIN organizations o ON o.id = r.organization_id
+         LEFT JOIN subscription_plans p ON p.code = r.plan_code
+         ${where}
+        ORDER BY r.submitted_at ASC NULLS LAST, r.created_at ASC
+        LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+      listParams
+    );
+
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*)::int AS total
+         FROM subscription_payment_requests r
+         JOIN organizations o ON o.id = r.organization_id ${where}`,
+      params
+    );
+
+    // Counters come from SQL, so "collected" is the real total rather than the
+    // total of whatever happens to be on this page.
+    const { rows: stats } = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status='AWAITING_VERIFICATION')::int              AS awaiting_count,
+         COALESCE(SUM(amount_inr) FILTER (WHERE status='AWAITING_VERIFICATION'),0)::int AS awaiting_amount_inr,
+         COUNT(*) FILTER (WHERE status='AWAITING_PAYMENT')::int                   AS unpaid_count,
+         COUNT(*) FILTER (WHERE status='APPROVED' AND reviewed_at::date = CURRENT_DATE)::int AS approved_today,
+         COALESCE(SUM(amount_inr) FILTER (WHERE status='APPROVED' AND reviewed_at::date = CURRENT_DATE),0)::int AS approved_today_amount_inr,
+         COALESCE(SUM(amount_inr) FILTER (WHERE status='APPROVED'),0)::int        AS collected_inr
+       FROM subscription_payment_requests`
+    );
+
+    res.json({
+      data: rows, total: countRows[0].total, stats: stats[0],
+      reject_reasons: checkout.REJECT_REASONS,
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /subscription-requests/:id/approve — verify and activate.
+router.post('/subscription-requests/:id/approve', async (req, res, next) => {
+  try {
+    const result = await checkout.approve({ requestId: req.params.id, actor: checkoutActor(req) });
+    await audit(req, 'subscription_checkout_approved', 'organization',
+      result.request.organization_id, {
+        request_no: result.request.request_no, utr: result.request.utr,
+        amount_inr: result.request.amount_inr, plan_code: result.request.plan_code,
+      });
+
+    // Tell the studio's admins their subscription is live.
+    try {
+      const { rows: admins } = await pool.query(
+        `SELECT id FROM users WHERE organization_id=$1 AND role='admin' AND is_active=true`,
+        [result.request.organization_id]
+      );
+      for (const a of admins) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, body, link)
+           VALUES ($1,'subscription','Payment approved',$2,'/subscription')`,
+          [a.id, `Your ${result.request.plan_code} subscription is active.`]
+        );
+      }
+    } catch { /* best-effort */ }
+
+    res.json({ data: result });
+  } catch (err) { sendCheckoutError(res, err, next); }
+});
+
+// POST /subscription-requests/:id/reject
+router.post('/subscription-requests/:id/reject', async (req, res, next) => {
+  try {
+    const result = await checkout.reject({
+      requestId: req.params.id,
+      reason: req.body?.reason,
+      note: req.body?.note ? String(req.body.note).trim().slice(0, 500) : null,
+      actor: checkoutActor(req),
+    });
+    await audit(req, 'subscription_checkout_rejected', 'organization',
+      result.request.organization_id, { reason: result.reason, note: result.note });
+
+    try {
+      const { rows: admins } = await pool.query(
+        `SELECT id FROM users WHERE organization_id=$1 AND role='admin' AND is_active=true`,
+        [result.request.organization_id]
+      );
+      for (const a of admins) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, body, link)
+           VALUES ($1,'subscription','Payment could not be verified',$2,'/subscription')`,
+          [a.id, `${checkout.REJECT_REASONS[result.reason]}${result.note ? ` — ${result.note}` : ''} You can submit a corrected reference.`]
+        );
+      }
+    } catch { /* best-effort */ }
+
+    res.json({ data: result });
+  } catch (err) { sendCheckoutError(res, err, next); }
+});
+
 module.exports = router;

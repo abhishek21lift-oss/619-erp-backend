@@ -7,6 +7,177 @@ const router = require('express').Router();
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 const sub = require('../lib/subscription');
+const checkout = require('../lib/subscriptionCheckout');
+const { validate } = require('../middleware/validate');
+const { z } = require('../lib/validation');
+const logger = require('../lib/logger');
+
+// ── UPI self-checkout ────────────────────────────────────────────────────────
+// The studio pays the PLATFORM here. Amounts are never read from the request —
+// see lib/subscriptionCheckout.js priceFor(). Reachable while frozen, which is
+// the whole point: a frozen studio's only way back is to pay.
+
+const checkoutSchemas = {
+  open: {
+    body: z.object({
+      plan_code: z.string().trim().min(1).max(40),
+      coupon_code: z.string().trim().max(40).optional().nullable(),
+    }),
+  },
+  idParam: { params: z.object({ id: z.string().uuid('Invalid id') }) },
+  submitUtr: {
+    params: z.object({ id: z.string().uuid('Invalid id') }),
+    body: z.object({
+      utr: z.string().trim().regex(/^[0-9]{12,16}$/, 'UPI reference must be 12 to 16 digits'),
+      screenshot_url: z.string().max(300).optional().nullable(),
+      note: z.string().trim().max(500).optional().nullable(),
+    }),
+  },
+};
+
+function actorOf(req) {
+  return { id: req.user?.id || null, name: req.user?.name || null, role: req.user?.role || null };
+}
+
+function sendCheckoutError(res, err) {
+  if (err && err.name === 'PaymentError') {
+    return res.status(err.status).json({
+      error: { code: err.code, message: err.message, ...(err.detail ? { detail: err.detail } : {}) },
+    });
+  }
+  throw err;
+}
+
+/** Only a studio ADMIN may commit the studio to a payment. */
+function requireStudioAdmin(req, res) {
+  if (req.user?.role !== 'admin') {
+    res.status(403).json({
+      error: { code: 'FORBIDDEN', message: 'Only the studio admin can pay for the subscription.' },
+    });
+    return false;
+  }
+  return true;
+}
+
+// GET /api/subscription/checkout/settings — is self-checkout available at all?
+router.get('/checkout/settings', auth, async (req, res, next) => {
+  try {
+    const s = await checkout.getPlatformSettings();
+    // The VPA itself is deliberately NOT returned here — it only ever travels
+    // inside a priced request, so it cannot be harvested from this endpoint.
+    res.json({
+      data: {
+        available: Boolean(s && s.is_enabled),
+        merchant_name: s?.is_enabled ? s.merchant_name : null,
+        instructions: s?.is_enabled ? s.instructions : null,
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /api/subscription/checkout — open (or resume) a payment for a plan.
+router.post('/checkout', auth, validate(checkoutSchemas.open), async (req, res, next) => {
+  try {
+    if (!requireStudioAdmin(req, res)) return;
+    const orgId = req.user?.organization_id;
+    if (!orgId) return res.status(400).json({ error: { code: 'NO_ORG', message: 'No studio context' } });
+
+    const { request, reused } = await checkout.openCheckout({
+      orgId, planCode: req.body.plan_code,
+      couponCode: req.body.coupon_code || null, actor: actorOf(req),
+    });
+    const view = await checkout.buildCheckoutView(request);
+    res.status(reused ? 200 : 201).json({ data: { request, payment: view, reused } });
+  } catch (err) {
+    try { sendCheckoutError(res, err); } catch (e) { next(e); }
+  }
+});
+
+// GET /api/subscription/checkout/:id — the checkout page's polling target.
+router.get('/checkout/:id', auth, validate(checkoutSchemas.idParam), async (req, res, next) => {
+  try {
+    const orgId = req.user?.organization_id;
+    const { rows } = await pool.query(
+      `SELECT ${checkout.REQUEST_COLUMNS}, p.name AS plan_name, p.duration_months
+         FROM subscription_payment_requests r
+         LEFT JOIN subscription_plans p ON p.code = r.plan_code
+        WHERE r.id = $1 AND r.organization_id = $2`,
+      [req.params.id, orgId]
+    );
+    const request = rows[0];
+    if (!request) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Payment request not found' } });
+
+    // Only a payable request gets a QR — rendering one for an approved request
+    // invites a second transfer.
+    const payable = request.status === checkout.REQUEST_STATUS.AWAITING_PAYMENT;
+    const payment = payable ? await checkout.buildCheckoutView(request) : null;
+    res.json({ data: { request, payment, reject_reasons: checkout.REJECT_REASONS } });
+  } catch (err) { next(err); }
+});
+
+// POST /api/subscription/checkout/:id/submit-utr
+router.post('/checkout/:id/submit-utr', auth, validate(checkoutSchemas.submitUtr), async (req, res, next) => {
+  try {
+    if (!requireStudioAdmin(req, res)) return;
+    const orgId = req.user?.organization_id;
+
+    const updated = await checkout.submitUtr({
+      requestId: req.params.id, orgId,
+      utr: req.body.utr, screenshotUrl: null, note: req.body.note, actor: actorOf(req),
+    });
+
+    // Land it in the operator's command centre.
+    const { rows: [org] } = await pool.query('SELECT name FROM organizations WHERE id=$1', [orgId]);
+    const { rows: admins } = await pool.query(
+      `SELECT id FROM users WHERE role='super_admin' AND is_active=true AND deleted_at IS NULL`
+    );
+    for (const a of admins) {
+      try {
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, body, link)
+           VALUES ($1,'subscription',$2,$3,'/platform?tab=payments')`,
+          [a.id, 'Subscription payment to verify',
+           `${org?.name || 'A studio'} submitted UTR ${updated.utr} for ₹${updated.amount_inr} (${updated.plan_code}).`]
+        );
+      } catch (e) { logger.warn({ err: e.message }, 'checkout: notify super admin failed'); }
+    }
+
+    res.status(201).json({ data: updated });
+  } catch (err) {
+    try { sendCheckoutError(res, err); } catch (e) { next(e); }
+  }
+});
+
+// POST /api/subscription/checkout/:id/cancel
+router.post('/checkout/:id/cancel', auth, validate(checkoutSchemas.idParam), async (req, res, next) => {
+  try {
+    if (!requireStudioAdmin(req, res)) return;
+    const cancelled = await checkout.cancel({
+      requestId: req.params.id, orgId: req.user?.organization_id, actor: actorOf(req),
+    });
+    res.json({ data: cancelled });
+  } catch (err) {
+    try { sendCheckoutError(res, err); } catch (e) { next(e); }
+  }
+});
+
+// GET /api/subscription/checkout — this studio's checkout history.
+router.get('/checkout', auth, async (req, res, next) => {
+  try {
+    const orgId = req.user?.organization_id;
+    if (!orgId) return res.json({ data: [] });
+    const { rows } = await pool.query(
+      `SELECT ${checkout.REQUEST_COLUMNS}, p.name AS plan_name
+         FROM subscription_payment_requests r
+         LEFT JOIN subscription_plans p ON p.code = r.plan_code
+        WHERE r.organization_id = $1
+        ORDER BY r.created_at DESC LIMIT 25`,
+      [orgId]
+    );
+    res.json({ data: rows });
+  } catch (err) { next(err); }
+});
+
 
 // GET /api/subscription/status — the caller's studio subscription snapshot.
 router.get('/status', auth, async (req, res, next) => {

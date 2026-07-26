@@ -469,12 +469,16 @@ runMigrationsWithRetry()
     // Disable with UPI_EXPIRY_SWEEP=off.
     if (process.env.UPI_EXPIRY_SWEEP !== 'off') {
       const { expireStaleOrders } = require('./lib/upiPayments');
-      const sweep = () => expireStaleOrders()
-        .then((n) => { if (n) logger.info({ expired: n }, 'UPI orders expired'); })
-        .catch((err) => logger.warn({ err: err.message }, 'UPI expiry sweep failed'));
+      const { expireStaleRequests } = require('./lib/subscriptionCheckout');
+      const sweep = () => Promise.all([
+        expireStaleOrders()
+          .then((n) => { if (n) logger.info({ expired: n }, 'UPI member orders expired'); }),
+        expireStaleRequests()
+          .then((n) => { if (n) logger.info({ expired: n }, 'Subscription checkouts expired'); }),
+      ]).catch((err) => logger.warn({ err: err.message }, 'UPI expiry sweep failed'));
       setTimeout(sweep, 90 * 1000).unref();
       setInterval(sweep, 15 * 60 * 1000).unref();
-      logger.info({ interval: '15min' }, 'UPI order expiry sweep scheduled');
+      logger.info({ interval: '15min' }, 'UPI expiry sweeps scheduled');
     }
 
     const pool = require('./db/pool');
