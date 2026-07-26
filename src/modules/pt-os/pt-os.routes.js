@@ -522,6 +522,21 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
         `${paidAmountParamIdx ? `$${paidAmountParamIdx}::numeric` : 'paid_amount'}, 0)`
     );
   }
+  // Defense in depth: PATCH only ever touches status when a caller explicitly
+  // sends it, unlike POST /clients (which auto-promotes 'pending' to
+  // 'active' once a package is attached). If this request IS establishing
+  // enrollment — an end date, a real duration, or a real final amount — but
+  // forgot to say so, promote it here too. Without this, a caller that omits
+  // status (as the enroll page did) silently leaves a fully-paid,
+  // fully-scheduled client stuck showing "Not Enrolled" forever.
+  if (req.body.status === undefined) {
+    const looksEnrolled =
+      req.body.pt_end_date != null ||
+      Number(req.body.duration_months) > 0 ||
+      (wantsFinalAmount && finalAmount > 0);
+    if (looksEnrolled) sets.push(`status = 'active'`);
+  }
+
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS', message: 'No fields to update' } });
   sets.push('updated_at = NOW()');
 
