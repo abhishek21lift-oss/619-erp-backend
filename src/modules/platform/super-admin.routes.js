@@ -548,11 +548,22 @@ router.get('/subscriptions', async (req, res, next) => {
              o.plan_code, o.client_limit, o.is_founder, o.founder_number, o.locked_price_inr,
              o.created_at, p.name AS plan_name,
              (SELECT count(*) FROM pt_clients c WHERE c.organization_id = o.id AND c.deleted_at IS NULL)::int AS client_count,
-             (SELECT max(e.created_at) FROM subscription_events e
-                WHERE e.organization_id = o.id AND e.event = 'activation_requested'
-                  AND e.created_at > COALESCE(o.current_period_start, 'epoch'::timestamptz)) AS requested_at
+             req.created_at AS requested_at, req.plan_code AS requested_plan_code,
+             req.direction AS requested_direction, rp.name AS requested_plan_name
         FROM organizations o
         LEFT JOIN subscription_plans p ON p.code = o.plan_code
+        -- Latest pending ask, whether it's a first activation or a plan
+        -- change on an already-active studio — both go through the same
+        -- operator queue (routes/subscription.js), so both must surface here.
+        LEFT JOIN LATERAL (
+          SELECT e.created_at, e.data->>'plan_code' AS plan_code, e.data->>'direction' AS direction
+            FROM subscription_events e
+           WHERE e.organization_id = o.id
+             AND e.event IN ('activation_requested', 'change_requested')
+             AND e.created_at > COALESCE(o.current_period_start, 'epoch'::timestamptz)
+           ORDER BY e.created_at DESC LIMIT 1
+        ) req ON true
+        LEFT JOIN subscription_plans rp ON rp.code = req.plan_code
        ORDER BY o.created_at DESC`);
 
     const withState = studios.map((s) => {
