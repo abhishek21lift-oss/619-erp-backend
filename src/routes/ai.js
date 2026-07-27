@@ -98,8 +98,11 @@ async function buildClientContext(client_id, org) {
    POST /api/ai/chat
    ═══════════════════════════════════════════════════════════════════════════ */
 router.post('/chat', auth, requireConfigured, async (req, res) => {
-  const { message, conversation_id, client_id } = req.body || {};
+  const { message, conversation_id, client_id, regenerate } = req.body || {};
   if (!message?.trim()) return res.status(400).json({ error: 'message is required' });
+  // Regenerate only makes sense against an existing thread — without one
+  // there is no previous answer to replace, so it degrades to a normal send.
+  const isRegenerate = Boolean(regenerate) && Boolean(conversation_id);
 
   // SSE headers
   res.setHeader('Content-Type',  'text/event-stream');
@@ -122,11 +125,25 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       convId = rows[0].id;
     }
 
-    // Save user message
-    await pool.query(
-      `INSERT INTO ai_messages (conversation_id, role, content) VALUES ($1,'user',$2)`,
-      [convId, message]
-    );
+    if (isRegenerate) {
+      // "Try again" on the last answer. The user's question is already in the
+      // thread, so re-inserting it would leave the same question stored twice
+      // and shown twice. Instead drop the previous answer, leaving history
+      // ending on that question — the model then answers it afresh, and the
+      // new reply is appended below exactly like a first attempt.
+      await pool.query(
+        `DELETE FROM ai_messages WHERE id = (
+           SELECT id FROM ai_messages
+           WHERE conversation_id = $1 AND role = 'assistant'
+           ORDER BY created_at DESC LIMIT 1)`,
+        [convId]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO ai_messages (conversation_id, role, content) VALUES ($1,'user',$2)`,
+        [convId, message]
+      );
+    }
 
     // Build conversation history (last 20 messages)
     const histRes = await pool.query(
@@ -771,17 +788,53 @@ router.get('/conversations', auth, async (req, res) => {
   const offset = parseInt(req.query.offset || '0', 10);
 
   const { rows } = await pool.query(
-    `SELECT c.id, c.title, c.client_id,
+    `SELECT c.id, c.title, c.client_id, c.pinned,
             c.created_at, c.updated_at,
             (SELECT content FROM ai_messages WHERE conversation_id=c.id ORDER BY created_at DESC LIMIT 1) AS last_message,
             (SELECT COUNT(*) FROM ai_messages WHERE conversation_id=c.id) AS message_count
      FROM ai_conversations c
      WHERE c.user_id=$1
-     ORDER BY c.updated_at DESC
+     ORDER BY c.pinned DESC, c.updated_at DESC
      LIMIT $2 OFFSET $3`,
     [req.user.id, limit, offset]
   );
   res.json({ data: rows });
+});
+
+/**
+ * PATCH /api/ai/conversations/:id — rename and/or pin.
+ * Both fields are optional; sending neither is a 400 rather than a silent
+ * no-op that would look like a failed save to the caller.
+ */
+router.patch('/conversations/:id', auth, async (req, res) => {
+  const { title, pinned } = req.body || {};
+
+  const sets = [];
+  const params = [req.params.id, req.user.id];
+
+  if (title !== undefined) {
+    const clean = String(title).trim().slice(0, 200);
+    if (!clean) return res.status(400).json({ error: 'title cannot be empty' });
+    params.push(clean);
+    sets.push(`title = $${params.length}`);
+  }
+  if (pinned !== undefined) {
+    params.push(Boolean(pinned));
+    sets.push(`pinned = $${params.length}`);
+  }
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to update — send title and/or pinned' });
+
+  // Deliberately does NOT touch updated_at: renaming or pinning a
+  // conversation is not activity in it, and bumping the timestamp would
+  // reshuffle the "most recent" ordering of the history list under the user.
+  const { rows } = await pool.query(
+    `UPDATE ai_conversations SET ${sets.join(', ')}
+     WHERE id = $1 AND user_id = $2
+     RETURNING id, title, pinned, client_id, created_at, updated_at`,
+    params
+  );
+  if (!rows.length) return res.status(404).json({ error: 'Conversation not found' });
+  res.json({ data: rows[0] });
 });
 
 router.get('/conversations/:id', auth, async (req, res) => {
