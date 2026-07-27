@@ -443,15 +443,29 @@ runMigrationsWithRetry()
       }, 'MY PT STUDIO API listening on port %d (%s)', PORT, NODE_ENV);
     });
 
-    // Render free tier sleeps after 15 min of inactivity — ping every 14 min.
-    // Self-ping keeps the service warm without external dependencies.
+    // Render free tier sleeps after 15 min without inbound traffic — ping every
+    // 14 min, during studio hours only. See lib/keepalive.js for why the ping
+    // has to go to the public URL rather than localhost, and why it stops
+    // overnight instead of running around the clock.
     if (isProd) {
+      const { resolveKeepalive, isWithinActiveHours } = require('./lib/keepalive');
       const PING_INTERVAL_MS = 14 * 60 * 1000;
-      const selfPingUrl = `http://localhost:${PORT}/api/health`;
-      setInterval(() => {
-        fetch(selfPingUrl).catch(() => {});
-      }, PING_INTERVAL_MS).unref();
-      logger.info({ interval: '14min' }, 'Uptime self-ping enabled');
+      const ka = resolveKeepalive(process.env);
+
+      if (!ka.url) {
+        logger.warn(
+          'Keepalive disabled — no RENDER_EXTERNAL_URL or KEEPALIVE_URL. The service will sleep after 15 minutes idle and the next visitor pays a cold start.'
+        );
+      } else {
+        setInterval(() => {
+          if (!isWithinActiveHours(new Date(), ka)) return;
+          fetch(ka.url).catch(() => {});
+        }, PING_INTERVAL_MS).unref();
+        logger.info(
+          { url: ka.url, activeHours: `${ka.startHour}:00–${ka.endHour}:00 ${ka.timeZone}`, interval: '14min' },
+          'Uptime keepalive enabled'
+        );
+      }
     }
 
     // AI knowledge-base embedding warmup: the local embedding model
