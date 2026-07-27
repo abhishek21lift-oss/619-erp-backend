@@ -13,6 +13,7 @@ const jwt    = require('jsonwebtoken');
 const { auth } = require('../middleware/auth');
 const cal    = require('../lib/google-calendar');
 const logger = require('../lib/logger');
+const { frontendUrl } = require('../lib/frontendUrl');
 
 
 function notConfigured(res) {
@@ -49,8 +50,9 @@ router.get('/callback', async (req, res) => {
   if (!cal.isConfigured()) return notConfigured(res);
 
   const { code, state, error } = req.query;
-  const frontendBase = process.env.FRONTEND_URL || 'http://localhost:3000';
-  const redirectBase = `${frontendBase}/settings/integrations`;
+  // Normalised: FRONTEND_URL carries a trailing slash in production, which
+  // would send the user to ".com//settings/integrations" after authorising.
+  const redirectBase = frontendUrl('/settings/integrations') || 'http://localhost:3000/settings/integrations';
 
   if (error) {
     logger.warn({ error }, 'Google Calendar OAuth denied by user');

@@ -1,8 +1,8 @@
 const nodemailer = require('nodemailer');
 const logger = require('./logger');
+const { frontendUrl } = require('./frontendUrl');
 
-const FRONTEND_URL = process.env.FRONTEND_URL;
-if (!FRONTEND_URL) {
+if (!process.env.FRONTEND_URL) {
   throw new Error('FRONTEND_URL env var is required');
 }
 
@@ -35,7 +35,10 @@ async function sendPasswordReset(email, rawToken) {
     return;
   }
 
-  const resetUrl = `${FRONTEND_URL}/reset-password?token=${rawToken}`;
+  // frontendUrl(), not string concatenation: FRONTEND_URL is stored with a
+  // trailing slash in production, which would make every reset link
+  // ".com//reset-password".
+  const resetUrl = frontendUrl(`/reset-password?token=${rawToken}`);
 
   try {
     await getTransport().sendMail({
