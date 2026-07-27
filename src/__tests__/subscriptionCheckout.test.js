@@ -6,6 +6,11 @@
 //
 //   - a studio must never be shown a QR before the operator has a real VPA
 //   - the amount must come from the server, never from the request body
+//   - pricing for an ALREADY ACTIVE studio must net out its proration credit,
+//     not just quote the plan's sticker price — this is the bug that let an
+//     upgrading studio skip payment entirely and go through a manual,
+//     un-verified request instead
+//   - a downgrade must never be checked out — it's free and scheduled, not paid
 //   - a second "Pay" tap must not create a second queue entry
 //   - two operators approving at once must not activate twice
 //   - an activation that fails must NOT leave the request marked approved
@@ -47,13 +52,12 @@ jest.mock('../db/pool', () => ({
   connect: jest.fn(async () => mockCurrentClient),
 }));
 
-// subscription.js owns activation, founder pricing and coupon redemption.
-// Mocked because this module's contract is "delegate to it correctly", not
-// "reimplement it" — subscription.proration/coupons tests cover its internals.
+// subscription.js owns pricing (quotePlanChange), activation, founder pricing
+// and coupon redemption. Mocked because this module's contract is "delegate
+// to it correctly", not "reimplement it" — subscription.proration/coupons
+// tests cover quotePlanChange's/activate's own internals.
 jest.mock('../lib/subscription', () => ({
-  getPlan: jest.fn(),
-  effectivePrice: jest.fn(),
-  founderSlotsRemaining: jest.fn(async () => 12),
+  quotePlanChange: jest.fn(),
   validateCoupon: jest.fn(),
   activate: jest.fn(),
   logEvent: jest.fn(async () => {}),
@@ -81,8 +85,6 @@ const SETTINGS = {
   request_ttl_minutes: 60,
 };
 
-const PLAN = { code: 'pro', name: 'Pro', price_inr: 2999, duration_months: 1 };
-
 function aRequest(overrides = {}) {
   return {
     id: REQ_ID,
@@ -93,6 +95,9 @@ function aRequest(overrides = {}) {
     discount_inr: 0,
     amount_inr: 2999,
     coupon_code: null,
+    direction: 'activation',
+    proration_credit_inr: 0,
+    previous_plan_code: null,
     upi_id: SETTINGS.upi_id,
     merchant_name: SETTINGS.merchant_name,
     status: checkout.REQUEST_STATUS.AWAITING_PAYMENT,
@@ -102,13 +107,31 @@ function aRequest(overrides = {}) {
   };
 }
 
+/** subscription.quotePlanChange()'s return shape, defaulted to a plain
+    first-time activation — no current plan, no proration credit. */
+function aQuote(overrides = {}) {
+  return {
+    direction: 'activation',
+    immediate: true,
+    current_plan: null,
+    new_plan: { code: 'pro', name: 'Pro', client_limit: 30, duration_months: 1 },
+    new_plan_price_inr: 2999,
+    proration_credit_inr: 0,
+    amount_due_inr: 2999,
+    is_launch_price: false,
+    founder_locked: false,
+    effective_at: new Date().toISOString(),
+    active_clients: 0,
+    new_client_limit: 30,
+    over_limit_by: 0,
+    warning: null,
+    ...overrides,
+  };
+}
+
 /** The happy-path scripting shared by the pricing tests. */
-function scriptPricing({ isFounder = false, lockedPrice = null, effective = 2999 } = {}) {
-  subscription.getPlan.mockResolvedValue(PLAN);
-  subscription.effectivePrice.mockReturnValue({ amount: effective, isFounder: false });
-  on(/SELECT is_founder, locked_price_inr FROM organizations/, {
-    rows: [{ is_founder: isFounder, locked_price_inr: lockedPrice }],
-  });
+function scriptPricing(overrides = {}) {
+  subscription.quotePlanChange.mockResolvedValue(aQuote(overrides));
 }
 
 beforeEach(() => {
@@ -116,7 +139,6 @@ beforeEach(() => {
   state.log = [];
   mockCurrentClient = makeClient();
   jest.clearAllMocks();
-  subscription.founderSlotsRemaining.mockResolvedValue(12);
   subscription.logEvent.mockResolvedValue(undefined);
 });
 
@@ -159,26 +181,71 @@ describe('platform payee settings', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PRICING — the server decides
+//  PRICING — the server decides, and it decides the SAME WAY for a brand-new
+//  subscription and an already-active studio's upgrade/renewal
 // ════════════════════════════════════════════════════════════════════════════
 
 describe('pricing', () => {
-  test('price comes from the plan catalogue, not from anything a caller passes', async () => {
-    scriptPricing({ effective: 2999 });
+  test('a first-time activation is priced at the full quoted amount', async () => {
+    scriptPricing({ direction: 'activation', new_plan_price_inr: 2999, amount_due_inr: 2999 });
     const p = await checkout.priceFor(ORG, 'pro');
     expect(p.amount_inr).toBe(2999);
     expect(p.list_price_inr).toBe(2999);
     expect(p.discount_inr).toBe(0);
+    expect(p.direction).toBe('activation');
+    expect(p.previous_plan_code).toBeNull();
   });
 
-  test('a founder studio renews at its locked price, not the current list price', async () => {
-    scriptPricing({ isFounder: true, lockedPrice: 999, effective: 2999 });
+  // The bug this fixes: an already-active studio upgrading was previously
+  // priced (and activated) through an entirely separate, unpaid path. Now it
+  // goes through the exact same pricing engine as a fresh subscription —
+  // quotePlanChange() — so the amount already has proration credit netted out.
+  test('an upgrade for an ACTIVE studio is priced net of its proration credit, not the sticker price', async () => {
+    scriptPricing({
+      direction: 'upgrade',
+      current_plan: { code: 'starter', name: 'Starter', client_limit: 5 },
+      new_plan_price_inr: 4999,
+      proration_credit_inr: 1200,
+      amount_due_inr: 3799,
+    });
+    const p = await checkout.priceFor(ORG, 'growth');
+    expect(p.amount_inr).toBe(3799);
+    expect(p.list_price_inr).toBe(3799);
+    expect(p.direction).toBe('upgrade');
+    expect(p.previous_plan_code).toBe('starter');
+    expect(p.proration_credit_inr).toBe(1200);
+  });
+
+  test('a renewal of the current plan is also priced through quotePlanChange, net of credit', async () => {
+    scriptPricing({
+      direction: 'renewal',
+      current_plan: { code: 'pro', name: 'Pro', client_limit: 30 },
+      new_plan_price_inr: 2999,
+      proration_credit_inr: 400,
+      amount_due_inr: 2599,
+    });
+    const p = await checkout.priceFor(ORG, 'pro');
+    expect(p.amount_inr).toBe(2599);
+    expect(p.direction).toBe('renewal');
+  });
+
+  // Downgrades are free and take effect at period end — scheduleDowngrade()
+  // handles those with no payment involved. A downgrade must never reach the
+  // paid checkout path at all.
+  test('a downgrade cannot be checked out — there is nothing to pay', async () => {
+    scriptPricing({ direction: 'downgrade', amount_due_inr: 0 });
+    await expect(checkout.priceFor(ORG, 'starter'))
+      .rejects.toMatchObject({ code: 'DOWNGRADE_NOT_PAYABLE', status: 400 });
+  });
+
+  test('a founder studio prices at its locked price — quotePlanChange already applied it', async () => {
+    scriptPricing({ new_plan_price_inr: 999, amount_due_inr: 999, founder_locked: true });
     const p = await checkout.priceFor(ORG, 'pro');
     expect(p.amount_inr).toBe(999);
   });
 
   test('a valid coupon reduces the amount and is recorded for redemption at approval', async () => {
-    scriptPricing({ effective: 2999 });
+    scriptPricing({ amount_due_inr: 2999 });
     subscription.validateCoupon.mockResolvedValue({ valid: true, discount_inr: 500 });
     const p = await checkout.priceFor(ORG, 'pro', 'launch50');
     expect(p.discount_inr).toBe(500);
@@ -187,26 +254,31 @@ describe('pricing', () => {
   });
 
   test('an invalid coupon does not block checkout — the studio just pays full price', async () => {
-    scriptPricing({ effective: 2999 });
+    scriptPricing({ amount_due_inr: 2999 });
     subscription.validateCoupon.mockRejectedValue(new Error('expired'));
     const p = await checkout.priceFor(ORG, 'pro', 'DEAD');
     expect(p.amount_inr).toBe(2999);
     expect(p.coupon_code).toBeNull();
   });
 
-  test('a coupon larger than the price cannot make the amount negative or zero', async () => {
+  test('a coupon larger than the amount due cannot make the price negative or zero', async () => {
     // UPI apps reject a zero-rupee intent, so this path must refuse rather
     // than generate a QR the studio can never pay.
-    scriptPricing({ effective: 2999 });
+    scriptPricing({ amount_due_inr: 2999 });
     subscription.validateCoupon.mockResolvedValue({ valid: true, discount_inr: 5000 });
     await expect(checkout.priceFor(ORG, 'pro', 'FREE'))
       .rejects.toMatchObject({ code: 'NOTHING_TO_PAY', status: 409 });
   });
 
-  test('an unknown plan is a 400, not a crash', async () => {
-    subscription.getPlan.mockResolvedValue(null);
-    await expect(checkout.priceFor(ORG, 'nope'))
-      .rejects.toMatchObject({ code: 'UNKNOWN_PLAN', status: 400 });
+  test('a renewal fully covered by proration credit also refuses rather than checking out for ₹0', async () => {
+    scriptPricing({ direction: 'renewal', amount_due_inr: 0 });
+    await expect(checkout.priceFor(ORG, 'pro'))
+      .rejects.toMatchObject({ code: 'NOTHING_TO_PAY', status: 409 });
+  });
+
+  test('an unknown plan surfaces the 400 the shared pricing engine raises', async () => {
+    subscription.quotePlanChange.mockRejectedValue(Object.assign(new Error('Unknown plan'), { status: 400 }));
+    await expect(checkout.priceFor(ORG, 'nope')).rejects.toMatchObject({ status: 400 });
   });
 });
 
@@ -217,7 +289,7 @@ describe('pricing', () => {
 describe('openCheckout', () => {
   beforeEach(() => {
     on(/FROM platform_payment_settings/, { rows: [SETTINGS] });
-    scriptPricing({ effective: 2999 });
+    scriptPricing({ amount_due_inr: 2999 });
   });
 
   test('the amount is written from server pricing and the payee is snapshotted', async () => {
@@ -233,6 +305,27 @@ describe('openCheckout', () => {
     expect(p).toContain(SETTINGS.upi_id);         // payee frozen onto the row
     expect(p).toContain(SETTINGS.merchant_name);
     expect(request.amount_inr).toBe(2999);
+  });
+
+  test('an upgrade writes its direction, credit and previous plan onto the row', async () => {
+    scriptPricing({
+      direction: 'upgrade',
+      current_plan: { code: 'starter', name: 'Starter', client_limit: 5 },
+      new_plan_price_inr: 4999,
+      proration_credit_inr: 1200,
+      amount_due_inr: 3799,
+    });
+    on(/FROM subscription_payment_requests r WHERE r\.organization_id = \$1 AND r\.status = ANY/, { rows: [] });
+    on(/SELECT nextval/, { rows: [{ n: 5005 }] });
+    on(/INSERT INTO subscription_payment_requests/,
+      { rows: [aRequest({ direction: 'upgrade', proration_credit_inr: 1200, previous_plan_code: 'starter', amount_inr: 3799 })] });
+
+    await checkout.openCheckout({ orgId: ORG, planCode: 'growth', actor: ACTOR });
+
+    const p = paramsOf(/INSERT INTO subscription_payment_requests/);
+    expect(p).toContain('upgrade');
+    expect(p).toContain(1200);
+    expect(p).toContain('starter');
   });
 
   test('a second tap on the same plan reuses the open request instead of queueing twice', async () => {
@@ -379,14 +472,13 @@ describe('submitUtr', () => {
 // ════════════════════════════════════════════════════════════════════════════
 
 describe('approve', () => {
-  const submitted = () => aRequest({
-    status: 'AWAITING_VERIFICATION', utr: '123456789012', organization_name: 'Iron House',
+  const submitted = (overrides = {}) => aRequest({
+    status: 'AWAITING_VERIFICATION', utr: '123456789012', organization_name: 'Iron House', ...overrides,
   });
 
-  test('activation is delegated, with the SNAPSHOTTED amount and the UTR as reference', async () => {
+  test('a first-time activation does NOT pass resetPeriod/prorationCreditInr — nothing to reset', async () => {
     on(/FROM subscription_payment_requests r JOIN organizations o/, { rows: [submitted()] });
     on(/UPDATE subscription_payment_requests SET status = \$1, reviewed_by = \$2/, { rows: [], rowCount: 1 });
-    on(/SELECT id FROM subscription_payments/, { rows: [{ id: 'pay-1' }] });
     subscription.activate.mockResolvedValue({ invoice_no: 'INV-1' });
 
     await checkout.approve({ requestId: REQ_ID, actor: OPERATOR });
@@ -394,13 +486,61 @@ describe('approve', () => {
     expect(subscription.activate).toHaveBeenCalledWith(ORG, 'pro', expect.objectContaining({
       amount_inr: 2999, method: 'upi', reference: '123456789012',
     }));
+    expect(subscription.activate.mock.calls[0][2]).not.toHaveProperty('resetPeriod');
+    // A fresh activation isn't a "plan change" — no extra activity-log entry.
+    expect(subscription.logEvent).not.toHaveBeenCalledWith(
+      expect.anything(), ORG, 'plan_changed', expect.anything(), expect.anything()
+    );
+  });
+
+  // The bug: an upgrade approved through self-checkout must produce the exact
+  // same activate() call shape as subscription.changePlan() does for an
+  // operator-executed upgrade — resetPeriod:true (the credited time was
+  // already paid out in a smaller charge, so stacking it again would be a
+  // double credit), plus the frozen proration credit and previous plan for
+  // the invoice/payment record.
+  test('an upgrade passes resetPeriod, the frozen proration credit and the previous plan to activate()', async () => {
+    on(/FROM subscription_payment_requests r JOIN organizations o/, {
+      rows: [submitted({
+        direction: 'upgrade', previous_plan_code: 'starter', proration_credit_inr: 1200, amount_inr: 3799,
+      })],
+    });
+    on(/UPDATE subscription_payment_requests SET status = \$1, reviewed_by = \$2/, { rows: [], rowCount: 1 });
+    subscription.activate.mockResolvedValue({ invoice_no: 'INV-UP' });
+
+    await checkout.approve({ requestId: REQ_ID, actor: OPERATOR });
+
+    expect(subscription.activate).toHaveBeenCalledWith(ORG, 'pro', expect.objectContaining({
+      amount_inr: 3799, resetPeriod: true, prorationCreditInr: 1200, previousPlanCode: 'starter',
+    }));
+    expect(subscription.logEvent).toHaveBeenCalledWith(
+      expect.anything(), ORG, 'plan_changed',
+      expect.objectContaining({ from: 'starter', to: 'pro', direction: 'upgrade', charged_inr: 3799 }),
+      OPERATOR
+    );
+  });
+
+  test('a renewal is treated as a change too — resetPeriod passed, previous plan is the same plan', async () => {
+    on(/FROM subscription_payment_requests r JOIN organizations o/, {
+      rows: [submitted({
+        direction: 'renewal', previous_plan_code: 'pro', proration_credit_inr: 400, amount_inr: 2599,
+      })],
+    });
+    on(/UPDATE subscription_payment_requests SET status = \$1, reviewed_by = \$2/, { rows: [], rowCount: 1 });
+    subscription.activate.mockResolvedValue({ invoice_no: 'INV-REN' });
+
+    await checkout.approve({ requestId: REQ_ID, actor: OPERATOR });
+
+    expect(subscription.activate).toHaveBeenCalledWith(ORG, 'pro', expect.objectContaining({
+      resetPeriod: true, prorationCreditInr: 400, previousPlanCode: 'pro',
+    }));
   });
 
   test('a coupon is handed to activate() under the key it actually reads', async () => {
     // opts.couponCode, not coupon_code. The snake_case spelling would have
     // charged the discounted amount while leaving the coupon unredeemed.
     on(/FROM subscription_payment_requests r JOIN organizations o/,
-      { rows: [{ ...submitted(), coupon_code: 'LAUNCH50', amount_inr: 2499 }] });
+      { rows: [submitted({ coupon_code: 'LAUNCH50', amount_inr: 2499 })] });
     on(/UPDATE subscription_payment_requests SET status = \$1, reviewed_by = \$2/, { rows: [], rowCount: 1 });
     subscription.activate.mockResolvedValue({ invoice_no: 'INV-2' });
 
@@ -566,7 +706,7 @@ describe('expiry sweep', () => {
 describe('separation from the member→studio system', () => {
   test('this module never touches the member payment tables', async () => {
     on(/FROM platform_payment_settings/, { rows: [SETTINGS] });
-    scriptPricing({ effective: 2999 });
+    scriptPricing({ amount_due_inr: 2999 });
     on(/FROM subscription_payment_requests r WHERE r\.organization_id = \$1 AND r\.status = ANY/, { rows: [] });
     on(/SELECT nextval/, { rows: [{ n: 5010 }] });
     on(/INSERT INTO subscription_payment_requests/, { rows: [aRequest()] });

@@ -61,6 +61,7 @@ const REJECT_REASONS = Object.freeze({
 const REQUEST_COLUMNS = `
   r.id, r.organization_id, r.request_no, r.plan_code,
   r.list_price_inr, r.discount_inr, r.amount_inr, r.coupon_code,
+  r.direction, r.proration_credit_inr, r.previous_plan_code,
   r.upi_id, r.merchant_name, r.status, r.expires_at,
   r.utr, r.screenshot_url, r.payer_note, r.submitted_at,
   r.reviewed_at, r.rejected_reason, r.rejected_note, r.payment_id,
@@ -135,33 +136,42 @@ async function savePlatformSettings(input, actorId, client = pool) {
 /**
  * What this studio should be charged for this plan, right now.
  *
- * Never trusts a client-supplied amount. Founder lock-in and launch pricing
- * come from subscription.quote()/effectivePrice(), and a coupon is PREVIEWED
- * here only — it is redeemed for real inside subscription.activate(), under a
- * row lock, at approval time. So a code that gets exhausted between checkout
- * and approval is caught there rather than being silently honoured.
+ * Delegates the base figure to subscription.quotePlanChange() — the SAME
+ * function the priced preview and the operator's manual execute path use —
+ * rather than pricing a plain activation independently. That function already
+ * knows: a brand-new subscription pays the full (founder/launch-aware) price;
+ * an already-active studio switching or renewing gets that price MINUS
+ * whatever credit is left on its current period. Two pricing engines for "what
+ * does this studio owe" is how one of them quietly drifts from the other.
+ *
+ * A coupon is PREVIEWED here only — it is redeemed for real inside
+ * subscription.activate(), under a row lock, at approval time. So a code that
+ * gets exhausted between checkout and approval is caught there rather than
+ * being silently honoured.
  */
 async function priceFor(orgId, planCode, couponCode, client = pool) {
-  const plan = await subscription.getPlan(planCode);
-  if (!plan) throw new PaymentError('UNKNOWN_PLAN', 'Unknown plan', 400);
+  const q = await subscription.quotePlanChange(orgId, planCode);
 
-  const { rows: [org] } = await client.query(
-    'SELECT is_founder, locked_price_inr FROM organizations WHERE id = $1', [orgId]
-  );
-  if (!org) throw new PaymentError('NOT_FOUND', 'Studio not found', 404);
+  if (q.direction === 'downgrade') {
+    // Downgrades are free and take effect at period end — there is nothing to
+    // collect, so there is nothing to check out. The tenant UI schedules
+    // these through requestChange()/scheduleDowngrade() instead; a client
+    // reaching this path for a downgrade is a stale quote, not a real intent.
+    throw new PaymentError(
+      'DOWNGRADE_NOT_PAYABLE',
+      'Downgrades take effect at the end of your billing period and cost nothing to schedule.',
+      400
+    );
+  }
 
-  const slots = await subscription.founderSlotsRemaining(client);
-  // A studio already in the founder club keeps its locked price on renewal.
-  const listPrice = (org.is_founder && org.locked_price_inr != null)
-    ? Number(org.locked_price_inr)
-    : Number(subscription.effectivePrice(plan, slots).amount);
+  const baseAmount = q.amount_due_inr;
 
   let discount = 0;
   let appliedCoupon = null;
   if (couponCode) {
     try {
       const v = await subscription.validateCoupon(
-        couponCode, { orgId, planCode, amountInr: listPrice }, client
+        couponCode, { orgId, planCode, amountInr: baseAmount }, client
       );
       if (v && v.valid) {
         discount = Number(v.discount_inr) || 0;
@@ -174,24 +184,28 @@ async function priceFor(orgId, planCode, couponCode, client = pool) {
     }
   }
 
-  if (discount > listPrice) discount = listPrice;
-  const amount = listPrice - discount;
+  if (discount > baseAmount) discount = baseAmount;
+  const amount = baseAmount - discount;
   if (amount <= 0) {
-    // A zero-rupee UPI intent is rejected by every app, so a 100%-off coupon
-    // cannot go down this path — the operator activates those directly.
+    // A zero-rupee UPI intent is rejected by every app, so a fully-credited
+    // renewal or a 100%-off coupon cannot go down this path — the operator
+    // activates those directly.
     throw new PaymentError(
       'NOTHING_TO_PAY',
-      'This plan costs nothing with that code. Contact the team to activate it directly.',
+      'This plan costs nothing right now. Contact the team to activate it directly.',
       409
     );
   }
 
   return {
-    plan,
-    list_price_inr: listPrice,
+    plan: q.new_plan,
+    list_price_inr: baseAmount,
     discount_inr: discount,
     amount_inr: amount,
     coupon_code: appliedCoupon,
+    direction: q.direction,
+    proration_credit_inr: q.proration_credit_inr,
+    previous_plan_code: q.current_plan?.code || null,
   };
 }
 
@@ -250,13 +264,15 @@ async function openCheckout({ orgId, planCode, couponCode, actor }, db = pool) {
     const { rows } = await tx.query(
       `INSERT INTO subscription_payment_requests
          (organization_id, request_no, plan_code, list_price_inr, discount_inr,
-          amount_inr, coupon_code, upi_id, merchant_name, status, expires_at, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-               NOW() + ($11 || ' minutes')::interval, $12)
+          amount_inr, coupon_code, direction, proration_credit_inr, previous_plan_code,
+          upi_id, merchant_name, status, expires_at, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+               NOW() + ($14 || ' minutes')::interval, $15)
        RETURNING ${REQUEST_COLUMNS_BARE}`,
       [
         orgId, requestNo, planCode,
         pricing.list_price_inr, pricing.discount_inr, pricing.amount_inr, pricing.coupon_code,
+        pricing.direction, pricing.proration_credit_inr, pricing.previous_plan_code,
         settings.upi_id, settings.merchant_name,
         REQUEST_STATUS.AWAITING_PAYMENT, String(settings.request_ttl_minutes),
         actor?.id || null,
@@ -397,6 +413,12 @@ async function submitUtr({ requestId, orgId, utr, screenshotUrl, note, actor }, 
  * one atomic unit — so the flip happens first and is treated as the claim on
  * the work. If activation then fails, the request is put back for retry rather
  * than left marked approved with nothing activated.
+ *
+ * For an upgrade or renewal (request.direction !== 'activation'), the proration
+ * credit and previous plan frozen at checkout time are passed through exactly
+ * as subscription.changePlan() would — resetPeriod:true, since that credit was
+ * already paid out in cash by charging a smaller amount, so stacking the new
+ * term on top of the remaining one would hand the studio that time twice.
  */
 async function approve({ requestId, actor }, db = pool) {
   const { rows } = await db.query(
@@ -426,6 +448,13 @@ async function approve({ requestId, actor }, db = pool) {
     throw new PaymentError('CONCURRENT_UPDATE', 'This request was just reviewed by someone else.', 409);
   }
 
+  // An upgrade/renewal was priced against the studio's REMAINING period
+  // (proration credit already netted out of amount_inr) — the same shape
+  // subscription.changePlan() produces for an operator-executed change. A
+  // brand-new activation has no previous period to credit, so these stay at
+  // their defaults.
+  const isChange = request.direction !== 'activation';
+
   let result;
   try {
     result = await subscription.activate(request.organization_id, request.plan_code, {
@@ -439,7 +468,19 @@ async function approve({ requestId, actor }, db = pool) {
       // the coupon unspent.
       couponCode: request.coupon_code || undefined,
       actor,
+      ...(isChange ? {
+        resetPeriod: true,
+        prorationCreditInr: request.proration_credit_inr,
+        previousPlanCode: request.previous_plan_code,
+      } : {}),
     });
+    if (isChange) {
+      await subscription.logEvent(db, request.organization_id, 'plan_changed', {
+        from: request.previous_plan_code, to: request.plan_code,
+        direction: request.direction, credit_inr: request.proration_credit_inr,
+        charged_inr: request.amount_inr, via: 'self_checkout',
+      }, actor).catch(() => {});
+    }
   } catch (err) {
     // Put it back so the operator can retry, rather than leaving a request
     // marked approved against a subscription that never activated.
