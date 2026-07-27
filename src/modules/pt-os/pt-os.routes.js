@@ -156,6 +156,60 @@ router.get('/clients/duplicates', auth, adminOnly, wrap(async (req, res) => {
   });
 }));
 
+// Feb 29 only exists every 4th year — re-applying a Feb-29 birth date to an
+// arbitrary year needs to fall back to Feb 28 in the years that aren't leap
+// years. Every other month/day pair is always valid in every year, so this
+// is the one case that needs special-casing.
+const isLeapYear = (y) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+
+// Days from `todayUTC` to the next occurrence of `birthMonth`/`birthDay`
+// (0 if today IS the birthday), plus the age the client turns that day.
+// All math is done in UTC on date-only values (no time-of-day component) so
+// it is not sensitive to server timezone.
+function nextBirthday(birthMonth, birthDay, birthYear, todayUTC) {
+  const y = todayUTC.getUTCFullYear();
+  const dayIn = (year) => (birthMonth === 2 && birthDay === 29 && !isLeapYear(year)) ? 28 : birthDay;
+  let next = Date.UTC(y, birthMonth - 1, dayIn(y));
+  if (next < todayUTC.getTime()) next = Date.UTC(y + 1, birthMonth - 1, dayIn(y + 1));
+  const days_until = Math.round((next - todayUTC.getTime()) / 86400000);
+  const turning_age = new Date(next).getUTCFullYear() - birthYear;
+  return { days_until, turning_age };
+}
+
+// ─── Client birthdays (MUST be before /clients/:id) ──────────
+router.get('/clients/birthdays', auth, wrap(async (req, res) => {
+  const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : req.query.trainer_id;
+  const params = [];
+  const orgClause = orgWhere(req, params);
+  let trainerClause = '';
+  if (trainerId) {
+    params.push(trainerId);
+    trainerClause = ` AND c.trainer_id = $${params.length}`;
+  }
+  const [{ rows: todayRows }, { rows }] = await Promise.all([
+    pool.query('SELECT CURRENT_DATE AS today'),
+    pool.query(`
+      SELECT c.id, c.name, c.mobile, c.email, c.photo_url, c.dob, c.status,
+             c.trainer_id, COALESCE(t.name, c.trainer_name) AS trainer_name
+      FROM pt_clients c
+      LEFT JOIN trainers t ON t.id = c.trainer_id
+      WHERE c.deleted_at IS NULL AND c.dob IS NOT NULL${orgClause}${trainerClause}
+      ORDER BY c.name
+    `, params),
+  ]);
+
+  const todayUTC = new Date(todayRows[0].today);
+  const enriched = rows.map((c) => {
+    const dob = new Date(c.dob);
+    const { days_until, turning_age } = nextBirthday(
+      dob.getUTCMonth() + 1, dob.getUTCDate(), dob.getUTCFullYear(), todayUTC,
+    );
+    return { ...c, days_until_birthday: days_until, turning_age, is_today: days_until === 0 };
+  }).sort((a, b) => a.days_until_birthday - b.days_until_birthday || a.name.localeCompare(b.name));
+
+  res.json({ data: enriched, total: enriched.length, today_count: enriched.filter((c) => c.is_today).length });
+}));
+
 // ─── Single client details ──────────────────────────────────
 router.get('/clients/:id', auth, wrap(async (req, res) => {
   const params = [req.params.id];
