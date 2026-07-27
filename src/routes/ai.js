@@ -43,37 +43,7 @@ function requireConfigured(req, res, next) {
 }
 
 /* ─── Helpers ───────────────────────────────────────────────────────────── */
-function extractJson(text) {
-  if (!text) return null;
-  // Strip markdown code fences — models add them despite the prompt's
-  // "no code fences" instruction often enough that raw parse fails.
-  const cleaned = text.replace(/```(?:json)?/gi, '').trim();
-  // Try raw parse first
-  try { return JSON.parse(cleaned); } catch { /* continue */ }
-  // Balanced-brace scan: parse from the first '{' to its matching close.
-  // The old greedy /\{[\s\S]+\}/ regex spanned first-{ to LAST-}, which
-  // breaks whenever prose or a second object follows the JSON.
-  const start = cleaned.indexOf('{');
-  if (start === -1) return null;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < cleaned.length; i++) {
-    const ch = cleaned[i];
-    if (escaped) { escaped = false; continue; }
-    if (ch === '\\') { if (inString) escaped = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
-    if (inString) continue;
-    if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) {
-        try { return JSON.parse(cleaned.slice(start, i + 1)); } catch { return null; }
-      }
-    }
-  }
-  return null;
-}
+const { extractJson } = require('../lib/ai/jsonExtract');
 
 // Tenant isolation: `org` is the caller's org id (null for a platform super
 // admin operating platform-wide). The parent pt_clients lookup is org-scoped,
@@ -361,7 +331,13 @@ Calculate accurate TDEE, set appropriate calorie and macro targets, then create 
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.5,
-      max_tokens:  8000,
+      // Higher than workout's 8000: the diet schema nests a full macro
+      // breakdown per FOOD ITEM inside every meal, plus a grocery list and
+      // supplement stack after that — considerably more tokens to fully
+      // complete than the workout schedule, and the most common cause of
+      // the "Could not parse AI response as JSON" failure was simply running
+      // out of budget mid-object before ever reaching the closing brace.
+      max_tokens:  14000,
     })[Symbol.asyncIterator]();
 
     let step;
