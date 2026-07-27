@@ -37,6 +37,115 @@ const MUSCLE_KEYWORDS = [
   'hamstrings', 'glutes', 'calves', 'core', 'abs', 'abdominals', 'arms', 'forearms', 'traps', 'lats',
 ];
 
+/* ── Person-name detection for the client-lookup tool ──────────────────────
+ *
+ * The first version of this only matched the literal phrasing "client named
+ * X" / "member called X", which nobody actually types — "Tell me about
+ * Prakhar Sharma" matched nothing, so no lookup ran and the model answered
+ * that it had no information about a client who was right there in the
+ * database. Matching real phrasing with ever-more regexes is a losing game,
+ * so the approach is inverted: pull out anything that *could* be a name and
+ * let the database decide whether it is one. A candidate that matches no
+ * client simply produces no context (see `explicit` below), so a false
+ * positive costs one indexed ILIKE and nothing else.
+ */
+
+// Capitalised at the start of a sentence, or just common words — a capital
+// letter alone doesn't make a word someone's name.
+const NAME_STOPWORDS = new Set([
+  'a', 'an', 'the', 'and', 'or', 'but', 'if', 'so', 'then', 'than', 'this', 'that', 'these', 'those',
+  'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'their', 'our',
+  'tell', 'show', 'give', 'list', 'find', 'get', 'look', 'check', 'compare', 'explain', 'summarise', 'summarize',
+  'what', 'whats', 'when', 'where', 'who', 'whos', 'why', 'how', 'hows', 'which',
+  'is', 'are', 'was', 'were', 'be', 'been', 'do', 'does', 'did', 'can', 'could', 'should', 'would', 'will', 'has', 'have', 'had',
+  'about', 'for', 'with', 'from', 'into', 'over', 'under', 'on', 'in', 'at', 'to', 'of', 'by', 'as',
+  'client', 'clients', 'member', 'members', 'trainer', 'trainers', 'studio', 'gym', 'staff',
+  'please', 'thanks', 'thank', 'hi', 'hello', 'hey', 'ok', 'okay', 'yes', 'no', 'not',
+  'workout', 'workouts', 'training', 'diet', 'nutrition', 'meal', 'meals', 'plan', 'plans',
+  'exercise', 'exercises', 'attendance', 'revenue', 'payment', 'payments', 'dues', 'session', 'sessions',
+  'progress', 'goal', 'goals', 'report', 'reports', 'profile', 'details', 'info', 'information', 'status',
+  'today', 'tomorrow', 'yesterday', 'week', 'month', 'year', 'last', 'next', 'this',
+  'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+  'january', 'february', 'march', 'april', 'may', 'june', 'july',
+  'august', 'september', 'october', 'november', 'december',
+  'ai', 'coach', 'pt', 'all', 'any', 'some', 'more', 'most', 'many', 'much',
+  // Connector words that survive the phrase patterns above and would
+  // otherwise end up inside a search pattern ("%named priya%").
+  'named', 'called', 'new', 'update', 'updates', 'doing', 'know', 'like', 'need', 'want',
+]);
+
+// Only these two say outright "this is a client" — a miss on them is worth
+// reporting back ("no client matching X"). Everything else is a heuristic
+// guess, and a miss there stays silent rather than telling the model about a
+// failed lookup for something that was never a name.
+const EXPLICIT_NAME_RE = /\b(?:client|member)\s+(?:named|called)\s+([A-Za-z][A-Za-z\s.'’-]{1,40})/i;
+
+// Phrasings that strongly imply a person follows, but could equally be a
+// topic ("tell me about protein timing") — hence heuristic, not explicit.
+const IMPLICIT_NAME_RES = [
+  /\btell me about\s+([A-Za-z][A-Za-z\s.'’-]{1,40})/i,
+  /\bhow(?:'s|’s| is)\s+([A-Za-z][A-Za-z\s.'’-]{1,40})\s+doing\b/i,
+  /\b(?:profile|details|info|information|status|progress|attendance|balance|dues)\s+(?:for|of|on)\s+([A-Za-z][A-Za-z\s.'’-]{1,40})/i,
+  /\b(?:look up|lookup|search for|find)\s+([A-Za-z][A-Za-z\s.'’-]{1,40})/i,
+];
+
+function cleanCandidate(raw) {
+  let s = String(raw || '').trim().replace(/[?.!,;:]+$/, '');
+  // "prakhar sharma and his plan" → "prakhar sharma"
+  s = s.split(/\s+(?:and|or|for|with|in|on|at|to|from|about|please|regarding|vs)\s+/i)[0];
+  s = s.replace(/['’]s$/i, '');
+  const words = s.split(/\s+/).filter(Boolean).slice(0, 4)
+    .filter((w) => !NAME_STOPWORDS.has(w.toLowerCase().replace(/[^a-z'’-]/gi, '')));
+  return words.join(' ').trim();
+}
+
+/**
+ * Returns { candidates: string[], explicit: boolean } — names worth looking
+ * up, and whether the user unambiguously called one a client/member.
+ */
+function extractNameCandidates(msg) {
+  const text = String(msg || '');
+  const candidates = [];
+  let explicit = false;
+
+  const exp = text.match(EXPLICIT_NAME_RE);
+  if (exp) {
+    const c = cleanCandidate(exp[1]);
+    if (c.length >= 2) { candidates.push(c); explicit = true; }
+  }
+
+  for (const re of IMPLICIT_NAME_RES) {
+    const m = text.match(re);
+    if (m) {
+      const c = cleanCandidate(m[1]);
+      if (c.length >= 2) candidates.push(c);
+    }
+  }
+
+  // Bare capitalised runs anywhere in the message ("Any update on Prakhar
+  // Sharma?"), which the phrasing patterns above would miss entirely.
+  const capRuns = text.match(/\b[A-Z][a-z'’-]{1,}(?:\s+[A-Z][a-z'’-]{1,})*/g) || [];
+  for (const run of capRuns) {
+    const c = cleanCandidate(run);
+    if (c.length >= 3) candidates.push(c);
+  }
+
+  // Dedup case-insensitively, longest first (a full name beats its first
+  // name), and cap the count so one message can't fan out into many queries.
+  const seen = new Set();
+  const unique = candidates
+    .sort((a, b) => b.length - a.length)
+    .filter((c) => {
+      const k = c.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .slice(0, 3);
+
+  return { candidates: unique, explicit };
+}
+
 const TOOLS = [
   /* ── Client stats (any staff role; trainers see only their own roster) ── */
   {
@@ -72,31 +181,49 @@ const TOOLS = [
     name: 'find_client',
     label: 'Client Lookup',
     roles: ['admin', 'manager', 'trainer', 'reception'],
-    test: (msg) => /\b(?:client|member)\s+(?:named|called)\s+[a-z]/i.test(msg),
-    extract: (msg) => {
-      const m = msg.match(/\b(?:client|member)\s+(?:named|called)\s+([a-z][a-z\s.'-]{1,40})/i);
-      return m ? m[1].trim().replace(/[?.!,]+$/, '') : null;
-    },
-    async run(req, name) {
+    test: (msg) => extractNameCandidates(msg).candidates.length > 0,
+    extract: (msg) => extractNameCandidates(msg),
+    async run(req, extracted) {
+      const { candidates } = extracted;
       const org = orgParam(req);
       const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : null;
-      const params = [`%${name}%`];
-      let p = 2;
-      const conds = ['deleted_at IS NULL', 'name ILIKE $1'];
+
+      const params = candidates.map((c) => `%${c}%`);
+      const nameClause = candidates.map((_, i) => `name ILIKE $${i + 1}`).join(' OR ');
+      let p = candidates.length + 1;
+      const conds = ['deleted_at IS NULL', `(${nameClause})`];
       if (org) { conds.push(`organization_id = $${p++}`); params.push(org); }
       if (trainerId) { conds.push(`trainer_id = $${p++}`); params.push(trainerId); }
+
       const { rows } = await pool.query(
-        `SELECT name, status, mobile, package_type, trainer_name, balance_amount, pt_end_date
+        `SELECT name, status, mobile, package_type, trainer_name, balance_amount,
+                paid_amount, final_amount, pt_start_date, pt_end_date, goal
          FROM pt_clients WHERE ${conds.join(' AND ')} ORDER BY created_at DESC LIMIT 3`,
         params
       );
       return rows;
     },
-    format: (rows, name) => {
-      if (!rows.length) return `No client matching "${name}" was found in this studio's records.`;
-      return rows.map((c) =>
-        `${c.name} — status: ${c.status}, plan: ${c.package_type || 'n/a'}, trainer: ${c.trainer_name || 'unassigned'}, balance due: ${fmtINR(c.balance_amount)}, PT ends: ${c.pt_end_date ? new Date(c.pt_end_date).toLocaleDateString('en-IN') : 'n/a'}`
-      ).join('\n');
+    format: (rows, extracted) => {
+      const { candidates, explicit } = extracted;
+      if (!rows.length) {
+        // Only report a miss when the user actually said "client named X".
+        // A heuristic guess that found nothing was probably never a name
+        // ("Tell me about Progressive Overload") — staying silent lets the
+        // model answer the question normally instead of being told about a
+        // failed client lookup it should then explain away.
+        return explicit
+          ? `No client matching "${candidates[0]}" was found in this studio's records.`
+          : '';
+      }
+      return rows.map((c) => [
+        `${c.name} — status: ${c.status}`,
+        `plan: ${c.package_type || 'n/a'}`,
+        `trainer: ${c.trainer_name || 'unassigned'}`,
+        c.goal ? `goal: ${c.goal}` : null,
+        `fee: ${fmtINR(c.final_amount)}, paid: ${fmtINR(c.paid_amount)}, balance due: ${fmtINR(c.balance_amount)}`,
+        `PT period: ${c.pt_start_date ? new Date(c.pt_start_date).toLocaleDateString('en-IN') : 'n/a'} → ${c.pt_end_date ? new Date(c.pt_end_date).toLocaleDateString('en-IN') : 'n/a'}`,
+        c.mobile ? `mobile: ${c.mobile}` : null,
+      ].filter(Boolean).join(', ')).join('\n');
     },
   },
 
@@ -264,7 +391,13 @@ async function runTools(req, message) {
       const match = tool.extract ? tool.extract(message) : null;
       if (tool.extract && !match) continue; // pattern matched but couldn't extract a usable argument
       const result = await tool.run(req, match, message);
-      contextParts.push(`[${tool.label}] ${tool.format(result, match)}`);
+      const text = tool.format(result, match);
+      // An empty format() means the tool deliberately found nothing worth
+      // saying (e.g. a guessed name that matched no client). Injecting an
+      // empty "[Client Lookup]" heading, or claiming the tool was consulted
+      // in the UI, would both be noise.
+      if (!text) continue;
+      contextParts.push(`[${tool.label}] ${text}`);
       toolNames.push(tool.label);
     } catch (err) {
       logger.warn({ tool: tool.name, err: err.message }, 'ai_tool_run_failed');

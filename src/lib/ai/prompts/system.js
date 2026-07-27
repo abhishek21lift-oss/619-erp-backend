@@ -28,7 +28,14 @@ function buildCoachSystemPrompt(clientContext, knowledgeContext, toolContext) {
     clientContext ? `\nCurrent client context:\n${clientContext}` : '',
     knowledgeContext
       ? `\nReference material from this studio's own documents (SOPs/guides/policies):\n${knowledgeContext}\n\nWhen the question is about this studio's specific procedures or policy, prefer the reference material above over general knowledge, and you may cite the document title. If the reference material does not cover the question, answer from general fitness knowledge as usual — but do not present general knowledge as if it were this studio's official policy.`
-      : `\nNo studio-specific documents matched this question. If the user is asking about THIS STUDIO's specific policy, SOP, or procedure (not general fitness knowledge), say plainly that you don't have that documented rather than guessing — recommend they check with a manager or upload the relevant document to the knowledge base.`,
+      // Deliberately narrow. An earlier, broader version of this told the
+      // model to say "I don't have that documented" whenever no document
+      // matched, which made it answer questions about real, onboarded
+      // clients with "not in the knowledge base — upload a document" even
+      // though client records never live in the document store at all.
+      // The knowledge base holds POLICY documents; people, money and
+      // attendance come from the live data section below.
+      : `\nNo uploaded policy/SOP document matched this question. That only limits questions about this studio's written procedures and policies — it says nothing about clients, members, staff, bookings or finances, which come from the studio's live records, not from uploaded documents. If the user asks about a written policy or SOP you have no document for, say so plainly rather than inventing one.`,
     toolContext
       ? `\nLive data just pulled from this studio's own records:\n${toolContext}\n\nUse these figures directly when answering — do not recompute or second-guess them, and do not invent additional numbers beyond what's given. If a line says the user isn't permitted to view something, tell them that plainly instead of answering anyway.`
       : '',

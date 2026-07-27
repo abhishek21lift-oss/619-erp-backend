@@ -44,6 +44,61 @@ describe('AI Coach tool-calling (runTools)', () => {
     expect(result.toolNames).not.toContain('Client Lookup');
   });
 
+  // Regression: the original implementation only matched the literal phrasing
+  // "client named X", so this — how people actually ask — ran no lookup at
+  // all and the coach claimed it had no information about a real, onboarded
+  // client.
+  it('find_client: triggers on "Tell me about <Name>" and injects the record', async () => {
+    pool.query.mockResolvedValueOnce({
+      rows: [{
+        name: 'Prakhar Sharma', status: 'active', package_type: '3 Month PT',
+        trainer_name: 'Ravi', balance_amount: '0', paid_amount: '30000',
+        final_amount: '30000', pt_start_date: null, pt_end_date: null, mobile: '9999999999',
+      }],
+    });
+    const result = await runTools(reqAs('admin'), 'Tell me about Prakhar Sharma');
+    expect(result.toolNames).toContain('Client Lookup');
+    expect(result.contextText).toMatch(/Prakhar Sharma/);
+    expect(result.contextText).toMatch(/status: active/);
+  });
+
+  it('find_client: triggers on a bare capitalised name anywhere in the question', async () => {
+    pool.query.mockResolvedValueOnce({
+      rows: [{
+        name: 'Prakhar Sharma', status: 'active', package_type: null, trainer_name: null,
+        balance_amount: '5000', paid_amount: '0', final_amount: '5000',
+        pt_start_date: null, pt_end_date: null, mobile: null,
+      }],
+    });
+    const result = await runTools(reqAs('admin'), 'Any update on Prakhar Sharma?');
+    expect(result.toolNames).toContain('Client Lookup');
+    expect(result.contextText).toMatch(/Prakhar Sharma/);
+  });
+
+  it('find_client: stays silent when a guessed name matches no client', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [] });
+    const result = await runTools(reqAs('admin'), 'Tell me about Progressive Overload');
+    // Ran a lookup, found nothing, and said nothing — the model should answer
+    // the training question normally rather than explain a failed name search.
+    expect(result.toolNames).not.toContain('Client Lookup');
+    expect(result.contextText).toBe('');
+  });
+
+  it('find_client: scopes the lookup to the caller organization', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [] });
+    await runTools(reqAs('admin'), 'Tell me about Prakhar Sharma');
+    const [, params] = pool.query.mock.calls[0];
+    expect(params).toContain('org-1');
+  });
+
+  it('find_client: a trainer only sees their own roster', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [] });
+    await runTools(reqAs('trainer'), 'Tell me about Prakhar Sharma');
+    const [sql, params] = pool.query.mock.calls[0];
+    expect(sql).toMatch(/trainer_id = \$\d/);
+    expect(params).toContain('trn-1');
+  });
+
   it('revenue_summary: denies a trainer role without running the query', async () => {
     const result = await runTools(reqAs('trainer'), 'What was our revenue this month?');
     expect(result.toolNames).toContain('Revenue');
