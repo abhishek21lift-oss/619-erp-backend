@@ -8,10 +8,34 @@
 
 const logger = require('../lib/logger');
 
+// Paths that must not be origin-checked.
+//
+// NOTE the leading segment: this middleware is mounted with app.use('/api/', …),
+// and Express strips the mount path, so inside here req.path is '/health' — NOT
+// '/api/health'. The previous check compared against '/api/health' and therefore
+// never matched anything. It went unnoticed because Render's health probe sends
+// no Origin or Referer and so exits on the line above.
+const ORIGIN_EXEMPT = new Set([
+  '/health',
+
+  // Google's OAuth redirect. This is a top-level browser navigation FROM
+  // accounts.google.com, so it arrives with a third-party Referer by
+  // definition — an origin allowlist can only ever reject it, which is
+  // exactly what happened: connecting a calendar died on {"error":"Forbidden"}.
+  //
+  // Exempting it does not weaken anything, because an origin check was never
+  // this endpoint's protection. The CSRF defence is the signed `state` JWT
+  // (verified with JWT_SECRET and required to carry purpose='calendar_oauth'),
+  // and the authorization code is single-use and redeemed server-to-server
+  // with Google. Both are checked in routes/calendar.js before any token is
+  // stored.
+  '/calendar/callback',
+]);
+
 function originCheck(req, res, next) {
   // Skip for server-to-server calls (no origin) and health checks
   if (!req.headers.origin && !req.headers.referer) return next();
-  if (req.path === '/api/health') return next();
+  if (ORIGIN_EXEMPT.has(req.path)) return next();
 
   const origin = req.headers.origin || req.headers.referer;
   if (!origin) return next();
