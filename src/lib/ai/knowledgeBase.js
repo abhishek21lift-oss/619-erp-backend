@@ -69,17 +69,26 @@ async function ingestDocument(documentId) {
 }
 
 /**
- * Deletes a document: its chunks (via FK cascade), its stored file, and its
- * row. Caller must have already verified organizationId ownership.
+ * Deletes a document: its row (chunks cascade via FK) first, then its stored
+ * R2/disk file. Caller must have already verified organizationId ownership.
+ *
+ * The DB row is deleted BEFORE the file, and the file delete is
+ * fire-and-forget rather than awaited — an R2 network hiccup deleting the
+ * underlying object must never make "delete this document" hang or fail from
+ * the user's side. An orphaned R2 object costs a little storage; a delete
+ * button that never responds is a much worse outcome, and was exactly the
+ * symptom reported (this mirrors the same R2-request-timeout fix applied to
+ * fileStorage.js's S3Client — this fire-and-forget is what actually keeps the
+ * user-facing delete fast regardless of how long R2 takes to answer).
  */
 async function deleteDocument(documentId) {
   const { rows } = await pool.query('SELECT file_key FROM ai_documents WHERE id = $1', [documentId]);
+  await pool.query('DELETE FROM ai_documents WHERE id = $1', [documentId]);
   if (rows[0]) {
-    await deleteFile(rows[0].file_key).catch((err) =>
+    deleteFile(rows[0].file_key).catch((err) =>
       logger.warn({ documentId, err: err.message }, 'ai_knowledge_delete_file_failed')
     );
   }
-  await pool.query('DELETE FROM ai_documents WHERE id = $1', [documentId]);
 }
 
 /**

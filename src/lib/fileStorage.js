@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { NodeHttpHandler } = require('@smithy/node-http-handler');
 
 const UPLOADS_ROOT = path.join(__dirname, '..', '..', 'uploads');
 const R2_BUCKET = process.env.R2_BUCKET || 'client-files';
@@ -25,6 +26,21 @@ function getS3Client() {
       accessKeyId: process.env.R2_ACCESS_KEY_ID,
       secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
     },
+    // The AWS SDK v3's default Node HTTP handler has NO timeout at all unless
+    // one is set explicitly — a stalled TCP connection (as opposed to an
+    // actively-refused one) would hang a GetObjectCommand/DeleteObjectCommand
+    // forever with no error. That's a silent, permanent hang for anything
+    // that awaits it: a knowledge-base document's ingestion (which reads the
+    // file before it can even start chunking/embedding) and its deletion
+    // (which deletes the file before the DB row) both depend on this client.
+    requestHandler: new NodeHttpHandler({
+      connectionTimeout: 8000,
+      requestTimeout: 20000,
+    }),
+    // Keep total retry latency bounded too — 3 retries with exponential
+    // backoff on top of an already-timed-out request just triples the wait
+    // before the caller ever finds out something is wrong.
+    maxAttempts: 2,
   });
   return _s3Client;
 }
