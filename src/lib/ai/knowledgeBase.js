@@ -35,7 +35,15 @@ async function ingestDocument(documentId) {
     const buffer = await getFileBuffer(doc.file_key);
     const text = await extractText(buffer, doc.mime_type);
     if (!text || text.length < 20) {
-      throw new Error('No extractable text found in this document.');
+      // The parser ran fine but the file carries no text layer — almost
+      // always a scanned/photographed document, where every page is an
+      // image. Say that explicitly and give the fix, rather than a bare
+      // "no text found" that reads like a bug in the app.
+      throw new Error(
+        doc.mime_type === 'application/pdf'
+          ? 'This PDF has no selectable text — it looks like a scan or photos of pages. Re-export it as a text PDF (or run OCR on it) and upload again.'
+          : 'No extractable text found in this document.'
+      );
     }
 
     const chunks = chunkText(text);
