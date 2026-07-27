@@ -21,6 +21,7 @@ const { pingModel }                    = require('../lib/ai/openrouter');
 const { models }                       = require('../lib/ai/models');
 const { logUsage, getUserUsage, getModelStats } = require('../lib/ai/usage');
 const { retrieveContext }              = require('../lib/ai/knowledgeBase');
+const { runTools }                     = require('../lib/ai/tools');
 const {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -150,7 +151,21 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       .map((c, i) => `[${i + 1}] (${c.title}) ${c.content}`)
       .join('\n\n');
 
-    const systemPrompt = buildCoachSystemPrompt(clientCtx, knowledgeCtx);
+    // Tool-calling: pattern-match the message against this studio's own live
+    // data (members, attendance, revenue, dues, trainers, exercises) — see
+    // lib/ai/tools.js for why this is app-layer routing rather than
+    // model-driven function calling. Non-fatal on failure, same as RAG above.
+    let toolNames = [];
+    let toolCtx = '';
+    try {
+      const toolResult = await runTools(req, message);
+      toolNames = toolResult.toolNames;
+      toolCtx = toolResult.contextText;
+    } catch (toolErr) {
+      logger.warn({ err: toolErr.message }, 'ai_chat_tools_failed');
+    }
+
+    const systemPrompt = buildCoachSystemPrompt(clientCtx, knowledgeCtx, toolCtx);
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -163,6 +178,9 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       // "Answered using: <titles>" without exposing raw chunk text or ids.
       const sources = [...new Set(knowledgeChunks.map((c) => c.title))];
       send({ type: 'sources', sources });
+    }
+    if (toolNames.length) {
+      send({ type: 'tools', tools: toolNames });
     }
 
     // Stream response

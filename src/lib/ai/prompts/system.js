@@ -14,7 +14,12 @@ When a client has medical conditions, always recommend consulting a qualified ph
 // nothing relevant was found. Passing '' rather than omitting the block
 // keeps the instruction to answer honestly present on every request, not
 // just the ones that happened to retrieve something.
-function buildCoachSystemPrompt(clientContext, knowledgeContext) {
+//
+// toolContext: live results from this studio's own database (see
+// lib/ai/tools.js) — member counts, attendance, revenue, etc. — for
+// questions about what's actually happening in the studio right now, as
+// opposed to knowledgeContext's static documents.
+function buildCoachSystemPrompt(clientContext, knowledgeContext, toolContext) {
   return [
     GYM_CTX,
     '',
@@ -24,6 +29,9 @@ function buildCoachSystemPrompt(clientContext, knowledgeContext) {
     knowledgeContext
       ? `\nReference material from this studio's own documents (SOPs/guides/policies):\n${knowledgeContext}\n\nWhen the question is about this studio's specific procedures or policy, prefer the reference material above over general knowledge, and you may cite the document title. If the reference material does not cover the question, answer from general fitness knowledge as usual — but do not present general knowledge as if it were this studio's official policy.`
       : `\nNo studio-specific documents matched this question. If the user is asking about THIS STUDIO's specific policy, SOP, or procedure (not general fitness knowledge), say plainly that you don't have that documented rather than guessing — recommend they check with a manager or upload the relevant document to the knowledge base.`,
+    toolContext
+      ? `\nLive data just pulled from this studio's own records:\n${toolContext}\n\nUse these figures directly when answering — do not recompute or second-guess them, and do not invent additional numbers beyond what's given. If a line says the user isn't permitted to view something, tell them that plainly instead of answering anyway.`
+      : '',
     '',
     'Guidelines:',
     '• Keep responses concise and actionable.',
