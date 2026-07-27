@@ -21,19 +21,49 @@ const EMBEDDING_PROVIDER = process.env.AI_EMBEDDING_PROVIDER || 'local';
 const LOCAL_MODEL = process.env.AI_EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2';
 const EMBEDDING_DIM = 384;
 
+// Model download (first use) and, separately, each inference call are both
+// wrapped in a timeout. Without this, a network policy that silently drops
+// packets to huggingface.co (rather than actively refusing the connection)
+// leaves the underlying fetch hanging indefinitely — no error, no timeout,
+// just a promise that never settles. Because the pipeline is cached as a
+// module-level singleton, that one hang would otherwise wedge EVERY future
+// embedding call for the lifetime of the process, silently — every document
+// uploaded afterwards would sit at status='processing' forever with no error
+// to explain why. A timed-out load also resets the cached promise so the
+// next attempt (e.g. hitting "reindex") gets a clean retry instead of
+// re-awaiting the same wedged promise.
+const MODEL_LOAD_TIMEOUT_MS = parseInt(process.env.AI_EMBEDDING_LOAD_TIMEOUT_MS, 10) || 120000;
+const INFERENCE_TIMEOUT_MS = parseInt(process.env.AI_EMBEDDING_TIMEOUT_MS, 10) || 30000;
+
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // @xenova/transformers is ESM-only; this file is CommonJS, so the import is
 // dynamic and cached. The pipeline itself downloads/caches model weights on
-// first use (see TRANSFORMERS_CACHE env var to control where).
+// first use (see AI_EMBEDDING_CACHE_DIR env var to control where).
 let pipelinePromise = null;
 function getPipeline() {
   if (!pipelinePromise) {
-    pipelinePromise = import('@xenova/transformers').then(({ pipeline, env }) => {
+    const loadPromise = import('@xenova/transformers').then(({ pipeline, env }) => {
       // Keep model files under the app's own directory rather than the
       // default OS cache path, so it's predictable across deploys.
       if (process.env.AI_EMBEDDING_CACHE_DIR) {
         env.cacheDir = process.env.AI_EMBEDDING_CACHE_DIR;
       }
       return pipeline('feature-extraction', LOCAL_MODEL);
+    });
+    pipelinePromise = withTimeout(
+      loadPromise,
+      MODEL_LOAD_TIMEOUT_MS,
+      `Embedding model "${LOCAL_MODEL}" did not finish loading within ${MODEL_LOAD_TIMEOUT_MS}ms — the server likely cannot reach huggingface.co to download it (check network/firewall egress rules for this deploy target).`
+    ).catch((err) => {
+      pipelinePromise = null; // let the next call retry cleanly instead of re-awaiting this failure forever
+      throw err;
     });
   }
   return pipelinePromise;
@@ -46,7 +76,11 @@ async function embedLocal(texts) {
   // concurrent calls would just queue behind Node's single thread anyway,
   // while making memory usage and error attribution harder to reason about.
   for (const text of texts) {
-    const output = await extractor(text, { pooling: 'mean', normalize: true });
+    const output = await withTimeout(
+      extractor(text, { pooling: 'mean', normalize: true }),
+      INFERENCE_TIMEOUT_MS,
+      `Embedding inference timed out after ${INFERENCE_TIMEOUT_MS}ms.`
+    );
     results.push(Array.from(output.data));
   }
   return results;
