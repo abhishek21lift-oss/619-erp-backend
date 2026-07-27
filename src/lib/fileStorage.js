@@ -6,7 +6,7 @@
 // local dev keeps working unmodified without any Cloudflare account.
 const fs = require('fs');
 const path = require('path');
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 
 const UPLOADS_ROOT = path.join(__dirname, '..', '..', 'uploads');
 const R2_BUCKET = process.env.R2_BUCKET || 'client-files';
@@ -77,4 +77,35 @@ async function serveFile(key, res, { maxAgeSeconds } = {}) {
   res.sendFile(filePath);
 }
 
-module.exports = { isR2Configured, saveFile, serveFile };
+/**
+ * Reads the object at `key` fully into memory and returns its Buffer, from
+ * R2 or disk depending on configuration. Unlike serveFile(), this does not
+ * write to an HTTP response — for callers that need the raw bytes (e.g. to
+ * extract text for indexing). Throws if the object does not exist.
+ */
+async function getFileBuffer(key) {
+  if (isR2Configured()) {
+    const result = await getS3Client().send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+    const chunks = [];
+    for await (const chunk of result.Body) chunks.push(chunk);
+    return Buffer.concat(chunks);
+  }
+  const filePath = path.join(UPLOADS_ROOT, key);
+  return fs.promises.readFile(filePath);
+}
+
+/**
+ * Deletes the object at `key` from R2 or disk. Safe to call on a
+ * already-missing object — DeleteObjectCommand and fs unlink-if-exists both
+ * treat that as a no-op rather than an error.
+ */
+async function deleteFile(key) {
+  if (isR2Configured()) {
+    await getS3Client().send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+    return;
+  }
+  const filePath = path.join(UPLOADS_ROOT, key);
+  await fs.promises.rm(filePath, { force: true });
+}
+
+module.exports = { isR2Configured, saveFile, serveFile, getFileBuffer, deleteFile };

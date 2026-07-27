@@ -36,6 +36,7 @@ const PUBLIC_CACHE_SECONDS = isProd ? 7 * 24 * 60 * 60 : 0;
 const OWNED_CATEGORIES = {
   'parq': 'pt_parq_forms',
   'informed-consent': 'pt_informed_consents',
+  'knowledge': 'ai_documents',
 };
 
 // Payment proofs are keyed differently: routes/upi-payments.js writes

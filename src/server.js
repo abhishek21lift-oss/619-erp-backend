@@ -386,6 +386,9 @@ app.use('/api/campaigns',         require('./routes/campaigns'));
 app.use('/api/offers',            require('./routes/offers'));
 app.use('/api/feedback',          require('./routes/feedback'));
 app.use('/api/communication',     require('./routes/communication'));
+// Mounted before /api/ai so /api/ai/knowledge/* is matched here first,
+// regardless of what routes/ai.js's own router does internally.
+app.use('/api/ai/knowledge',      userApiLimiter, require('./routes/aiKnowledge'));
 app.use('/api/ai',               require('./routes/ai'));
 
 // ────────────────────────
@@ -449,6 +452,22 @@ runMigrationsWithRetry()
         fetch(selfPingUrl).catch(() => {});
       }, PING_INTERVAL_MS).unref();
       logger.info({ interval: '14min' }, 'Uptime self-ping enabled');
+    }
+
+    // AI knowledge-base embedding warmup: the local embedding model
+    // (@xenova/transformers) downloads its weights from Hugging Face on
+    // first use, which is slow and — in network-restricted environments —
+    // can fail outright. Doing that on server boot rather than on the first
+    // real document upload surfaces a broken/blocked download in the logs
+    // immediately instead of as a confusing "upload succeeded, indexing
+    // failed" for whichever user happens to try it first. Non-fatal either
+    // way: a failure here just means documents will show status='failed'
+    // until it's fixed, not that the server won't start.
+    if (process.env.AI_EMBEDDING_WARMUP !== 'off') {
+      require('./lib/ai/embeddings').embedText('warmup').then(
+        () => logger.info('AI embedding model ready'),
+        (err) => logger.warn({ err: err.message }, 'AI embedding model warmup failed — document indexing will error until this is resolved')
+      );
     }
 
     // Subscription sweep: freeze lapsed trials/subscriptions + send 7/3/1/expiry

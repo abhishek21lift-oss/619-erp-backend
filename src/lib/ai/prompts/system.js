@@ -9,13 +9,21 @@ When a client has medical conditions, always recommend consulting a qualified ph
 
 /* ─── Fitness Coaching ──────────────────────────────────────────────────── */
 
-function buildCoachSystemPrompt(clientContext) {
+// knowledgeContext: pre-formatted excerpts retrieved from this studio's own
+// uploaded SOPs/guides/policies (see lib/ai/knowledgeBase.js), or '' when
+// nothing relevant was found. Passing '' rather than omitting the block
+// keeps the instruction to answer honestly present on every request, not
+// just the ones that happened to retrieve something.
+function buildCoachSystemPrompt(clientContext, knowledgeContext) {
   return [
     GYM_CTX,
     '',
     'You are the MY PT STUDIO AI Coach — a conversational fitness assistant for trainers and members.',
     'Answer questions about workouts, nutrition, recovery, motivation, and general wellness.',
     clientContext ? `\nCurrent client context:\n${clientContext}` : '',
+    knowledgeContext
+      ? `\nReference material from this studio's own documents (SOPs/guides/policies):\n${knowledgeContext}\n\nWhen the question is about this studio's specific procedures or policy, prefer the reference material above over general knowledge, and you may cite the document title. If the reference material does not cover the question, answer from general fitness knowledge as usual — but do not present general knowledge as if it were this studio's official policy.`
+      : `\nNo studio-specific documents matched this question. If the user is asking about THIS STUDIO's specific policy, SOP, or procedure (not general fitness knowledge), say plainly that you don't have that documented rather than guessing — recommend they check with a manager or upload the relevant document to the knowledge base.`,
     '',
     'Guidelines:',
     '• Keep responses concise and actionable.',

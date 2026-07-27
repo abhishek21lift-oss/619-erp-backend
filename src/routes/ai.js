@@ -20,6 +20,7 @@ const { routedChat, routedStream }     = require('../lib/ai/router');
 const { pingModel }                    = require('../lib/ai/openrouter');
 const { models }                       = require('../lib/ai/models');
 const { logUsage, getUserUsage, getModelStats } = require('../lib/ai/usage');
+const { retrieveContext }              = require('../lib/ai/knowledgeBase');
 const {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -134,7 +135,22 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
 
     // Build system prompt with optional client context (org-scoped)
     const clientCtx = await buildClientContext(client_id, orgParam(req));
-    const systemPrompt = buildCoachSystemPrompt(clientCtx);
+
+    // RAG: ground the answer in this studio's own uploaded SOPs/guides/
+    // policies before falling back to the model's general knowledge.
+    // Retrieval failures (e.g. embedding model not yet warmed up) are
+    // non-fatal — the coach still answers, just without citations.
+    let knowledgeChunks = [];
+    try {
+      knowledgeChunks = await retrieveContext({ organizationId: orgParam(req), query: message });
+    } catch (ragErr) {
+      logger.warn({ err: ragErr.message }, 'ai_chat_rag_retrieval_failed');
+    }
+    const knowledgeCtx = knowledgeChunks
+      .map((c, i) => `[${i + 1}] (${c.title}) ${c.content}`)
+      .join('\n\n');
+
+    const systemPrompt = buildCoachSystemPrompt(clientCtx, knowledgeCtx);
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -142,6 +158,12 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     ];
 
     send({ type: 'start', conversation_id: convId });
+    if (knowledgeChunks.length) {
+      // De-duplicated document titles, in relevance order — lets the UI show
+      // "Answered using: <titles>" without exposing raw chunk text or ids.
+      const sources = [...new Set(knowledgeChunks.map((c) => c.title))];
+      send({ type: 'sources', sources });
+    }
 
     // Stream response
     let fullContent  = '';
