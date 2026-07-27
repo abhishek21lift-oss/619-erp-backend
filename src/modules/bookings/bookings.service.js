@@ -4,8 +4,49 @@
 
 const pool = require('../../db/pool');
 const { HttpError } = require('../../middleware/errorHandler');
+const cal = require('../../lib/google-calendar');
+const logger = require('../../lib/logger');
 
 const CANCEL_GRACE_HOURS = 2;     // free cancel if > 2h before start
+
+/**
+ * Push a booking to (or remove it from) the member's own Google Calendar.
+ *
+ * Two rules govern every call site below, and both matter:
+ *
+ * 1. ALWAYS AFTER COMMIT. Booking runs inside a transaction that holds a
+ *    FOR UPDATE lock on the class_sessions row to prevent overbooking. A
+ *    Google API round-trip inside that transaction would make every concurrent
+ *    booker for that session queue behind an external network call — turning a
+ *    lock held for microseconds into one held for hundreds of milliseconds,
+ *    and coupling the studio's booking throughput to Google's latency.
+ *
+ * 2. NEVER FATAL. Calendar sync is a convenience; the booking is the product.
+ *    google-calendar.js already swallows its own errors, and this adds a
+ *    .catch() so a rejection can never surface as an unhandled promise and
+ *    take the process down.
+ *
+ * The event goes to the MEMBER's calendar, not the acting user's — an admin
+ * booking a class on someone's behalf should not have it appear in their own
+ * diary. Members without a login simply have nothing to sync to.
+ */
+function syncBookingToCalendar(action, memberId, bookingId) {
+  if (!memberId || !bookingId || !cal.isConfigured()) return;
+
+  (async () => {
+    const { rows } = await pool.query(
+      'SELECT id FROM users WHERE member_id = $1 AND deleted_at IS NULL LIMIT 1',
+      [memberId]
+    );
+    const userId = rows[0]?.id;
+    if (!userId) return;
+
+    if (action === 'create') await cal.createBookingEvent(userId, bookingId);
+    else await cal.deleteBookingEvent(userId, bookingId);
+  })().catch((err) => {
+    logger.warn({ err: err.message, action, bookingId }, 'calendar sync failed (non-critical)');
+  });
+}
 
 /**
  * Book a class session for a member.
@@ -99,6 +140,13 @@ async function book({ session_id, member_id }, ctx) {
     );
 
     await client.query('COMMIT');
+
+    // Only confirmed bookings get a calendar entry — a waitlist place is not
+    // an appointment, and putting one in someone's diary would be a lie. It
+    // gets its event later, if and when the waitlist promotes it in cancel().
+    if (booking.status === 'confirmed') {
+      syncBookingToCalendar('create', member_id, booking.id);
+    }
     return booking;
   } catch (err) {
     await client.query('ROLLBACK');
@@ -151,6 +199,7 @@ async function cancel(bookingId, { reason } = {}, ctx) {
     }
 
     // Promote first waitlist booking if a confirmed slot freed up
+    let promoted = null;
     if (b.status === 'confirmed') {
       const promote = await client.query(
         `SELECT id, member_id, membership_id, position FROM bookings
@@ -159,6 +208,7 @@ async function cancel(bookingId, { reason } = {}, ctx) {
         [b.session_id]
       );
       if (promote.rows.length > 0) {
+        promoted = promote.rows[0];
         const promotedPos = promote.rows[0].position;
         await client.query(
           `UPDATE bookings SET status='confirmed', position=NULL WHERE id = $1`,
@@ -178,6 +228,19 @@ async function cancel(bookingId, { reason } = {}, ctx) {
       [ctx.user_id, bookingId]
     );
     await client.query('COMMIT');
+
+    // Remove the cancelled member's event. Safe even if there was never one
+    // (waitlist bookings never got one) — deleteBookingEvent no-ops when it
+    // finds no stored google_event_id.
+    syncBookingToCalendar('delete', b.member_id, bookingId);
+
+    // Someone promoted off the waitlist now genuinely has a class to attend,
+    // so they get the event the cancelled member just lost. Without this, a
+    // promotion is invisible in their calendar and they miss the session.
+    if (promoted) {
+      syncBookingToCalendar('create', promoted.member_id, promoted.id);
+    }
+
     return { id: bookingId, status: 'cancelled', refunded: inGrace };
   } catch (err) {
     await client.query('ROLLBACK');
