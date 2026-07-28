@@ -471,6 +471,169 @@ router.get('/activity', async (req, res, next) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  ADMIN MANAGEMENT — operator actions on a studio's login accounts
+//
+//  These sit beside the existing reset-password / activate-deactivate
+//  handlers above. All four are platform-only and every one is audited.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Loads a tenant user, refusing to touch a super_admin. The tenant portal must
+// never be able to act on a platform operator's own account — same guard the
+// existing user handlers apply.
+async function loadTenantUser(id) {
+  const { rows } = await pool.query(
+    `SELECT id, name, email, role, organization_id FROM users WHERE id = $1 AND deleted_at IS NULL`, [id]
+  );
+  const u = rows[0];
+  if (!u) return { error: 'NOT_FOUND' };
+  if (!TENANT_ROLES.includes(u.role)) return { error: 'FORBIDDEN' };
+  return { user: u };
+}
+
+// ── POST /users/:id/force-logout ─────────────────────────────────────────────
+// Revokes every live session for one account by bumping token_version, which
+// the auth middleware compares against the claim in each JWT. Deliberately
+// does not touch the password: "sign this person out everywhere" and "lock
+// them out" are different operator intents and conflating them is how support
+// accidentally locks a paying admin out of their own studio.
+router.post('/users/:id/force-logout', async (req, res, next) => {
+  try {
+    const { user, error } = await loadTenantUser(req.params.id);
+    if (error === 'NOT_FOUND') return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
+    if (error === 'FORBIDDEN') return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot act on a platform account' } });
+
+    const { rows } = await pool.query(
+      `UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = $1
+       RETURNING id, token_version`, [req.params.id]
+    );
+    invalidateUserCache();
+    await audit(req, 'user_force_logout', 'user', req.params.id,
+      { email: user.email, organization_id: user.organization_id, token_version: rows[0].token_version });
+    res.json({ data: { id: rows[0].id, message: 'All sessions revoked' } });
+  } catch (err) { next(err); }
+});
+
+// ── POST /users/:id/reset-mfa ────────────────────────────────────────────────
+// Clears the enrolled authenticator so a locked-out admin can re-enrol. This is
+// a support action with real weight — it removes a security factor — so it is
+// audited with the previous state, and sessions are revoked alongside it: an
+// existing session would otherwise outlive the factor that authorised it.
+router.post('/users/:id/reset-mfa', async (req, res, next) => {
+  try {
+    const { user, error } = await loadTenantUser(req.params.id);
+    if (error === 'NOT_FOUND') return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
+    if (error === 'FORBIDDEN') return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot act on a platform account' } });
+
+    const { rows: before } = await pool.query(
+      'SELECT mfa_enabled FROM user_profiles WHERE user_id = $1', [req.params.id]
+    );
+    const wasEnabled = !!(before[0] && before[0].mfa_enabled);
+
+    await pool.query(
+      `UPDATE user_profiles SET mfa_enabled = FALSE, mfa_secret = NULL WHERE user_id = $1`, [req.params.id]
+    );
+    await pool.query(
+      `UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = $1`, [req.params.id]
+    );
+    invalidateUserCache();
+
+    await audit(req, 'user_mfa_reset', 'user', req.params.id,
+      { email: user.email, organization_id: user.organization_id, was_enabled: wasEnabled });
+    res.json({ data: { id: req.params.id, was_enabled: wasEnabled, message: 'Two-factor reset; sessions revoked' } });
+  } catch (err) { next(err); }
+});
+
+// ── POST /organizations/:id/subscription/bonus-days ──────────────────────────
+// Extends the current period (or the trial, when still on one) by N days.
+// Separate from PATCH .../expiry, which sets an absolute date: goodwill is
+// expressed as "give them another 14 days", and making the operator compute
+// the target date by hand is how off-by-one credits happen. The delta is what
+// gets audited, so the reason for the new date stays legible later.
+const BONUS_DAYS_MAX = 365;
+
+router.post('/organizations/:id/subscription/bonus-days', async (req, res, next) => {
+  try {
+    const days = parseInt(req.body.days, 10);
+    if (!Number.isFinite(days) || days === 0 || Math.abs(days) > BONUS_DAYS_MAX) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION', message: `days must be a non-zero integer within ±${BONUS_DAYS_MAX}` },
+      });
+    }
+
+    const { rows: orgRows } = await pool.query(
+      `SELECT id, name, subscription_status, trial_ends_at, current_period_end
+         FROM organizations WHERE id = $1`, [req.params.id]
+    );
+    const org = orgRows[0];
+    if (!org) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
+
+    // Extend whichever clock the studio is actually on. A trialling studio has
+    // no period end to move, and moving the wrong one silently does nothing.
+    const onTrial = org.subscription_status === 'trial' || org.subscription_status === 'trial_expired';
+    const field = onTrial ? 'trial_ends_at' : 'current_period_end';
+    const current = onTrial ? org.trial_ends_at : org.current_period_end;
+
+    // Extending from today (not from a date already in the past) is what an
+    // operator means by "give them 14 more days" on an expired account.
+    const base = current && new Date(current) > new Date() ? new Date(current) : new Date();
+    const next = new Date(base.getTime() + days * 86400000);
+
+    await pool.query(`UPDATE organizations SET ${field} = $2 WHERE id = $1`, [req.params.id, next.toISOString()]);
+    invalidateUserCache();
+
+    await audit(req, 'subscription_bonus_days', 'organization', req.params.id, {
+      days, field, from: current, to: next.toISOString(), reason: req.body.reason || null,
+    });
+    res.json({ data: { id: req.params.id, field, previous: current, [field]: next.toISOString(), days } });
+  } catch (err) { next(err); }
+});
+
+// ── GET / PUT /organizations/:id/notes ───────────────────────────────────────
+// Operator-only scratchpad. Never surfaced on any tenant-facing endpoint — the
+// studio's own admins must not see what the platform wrote about them.
+router.get('/organizations/:id/notes', async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT internal_notes, internal_notes_updated_at, internal_notes_updated_by
+         FROM organizations WHERE id = $1`, [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
+    res.json({ data: rows[0] });
+  } catch (err) { next(err); }
+});
+
+const NOTES_MAX = 20000;
+
+router.put('/organizations/:id/notes', async (req, res, next) => {
+  try {
+    const notes = typeof req.body.notes === 'string' ? req.body.notes : '';
+    if (notes.length > NOTES_MAX) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: `notes must be ${NOTES_MAX} characters or fewer` } });
+    }
+
+    const { rows: before } = await pool.query('SELECT internal_notes FROM organizations WHERE id = $1', [req.params.id]);
+    if (!before[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
+
+    const { rows } = await pool.query(
+      `UPDATE organizations
+          SET internal_notes = $2, internal_notes_updated_at = NOW(), internal_notes_updated_by = $3
+        WHERE id = $1
+        RETURNING internal_notes, internal_notes_updated_at, internal_notes_updated_by`,
+      [req.params.id, notes || null, req.user?.name || req.user?.id || null]
+    );
+
+    // Length only, not content: the note is operator commentary about a
+    // customer and copying it wholesale into a second table is needless
+    // duplication of something that may name individuals.
+    await audit(req, 'org_notes_updated', 'organization', req.params.id, {
+      previous_length: (before[0].internal_notes || '').length,
+      new_length: notes.length,
+    });
+    res.json({ data: rows[0] });
+  } catch (err) { next(err); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  AUDIT CENTRE
 //
 //  /activity above is the dashboard's recent-events feed: newest 50, three
