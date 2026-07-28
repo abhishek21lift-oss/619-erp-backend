@@ -723,6 +723,137 @@ router.get('/clients/:id/subscriptions', auth, wrap(async (req, res) => {
   res.json({ data: rows, total: rows.length });
 }));
 
+// ─── Leads (pre-enrollment pipeline) ─────────────────────────
+const LEAD_STATUSES = ['new', 'contacted', 'trial_scheduled', 'converted', 'lost'];
+
+const ptLeadCreateSchema = {
+  body: z.object({
+    name: z.string().min(1).max(255),
+    mobile: z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable(),
+    email: z.string().email().optional().nullable(),
+    source: z.string().max(50).optional().nullable(),
+    interested_package: z.string().max(255).optional().nullable(),
+    trainer_id: z.string().optional().nullable(),
+    trainer_name: z.string().max(255).optional().nullable(),
+    follow_up_date: z.string().optional().nullable(),
+    notes: z.string().max(2000).optional().nullable(),
+  }),
+};
+
+router.get('/leads', auth, wrap(async (req, res) => {
+  const params = [];
+  const orgClause = orgWhere(req, params);
+  let statusClause = '';
+  if (req.query.status && LEAD_STATUSES.includes(String(req.query.status))) {
+    params.push(req.query.status);
+    statusClause = ` AND status = $${params.length}`;
+  }
+  let searchClause = '';
+  if (req.query.q) {
+    params.push(`%${req.query.q}%`);
+    searchClause = ` AND (name ILIKE $${params.length} OR mobile ILIKE $${params.length} OR email ILIKE $${params.length})`;
+  }
+  const { rows } = await pool.query(`
+    SELECT * FROM pt_leads
+    WHERE 1=1${orgClause}${statusClause}${searchClause}
+    ORDER BY created_at DESC
+  `, params);
+  res.json({ data: rows, total: rows.length });
+}));
+
+router.post('/leads', auth, requireRole('admin','manager','trainer'), validate(ptLeadCreateSchema), wrap(async (req, res) => {
+  const { name, mobile, email, source, interested_package, trainer_id, trainer_name, follow_up_date, notes } = req.body;
+  const { rows } = await pool.query(`
+    INSERT INTO pt_leads
+      (organization_id, name, mobile, email, source, interested_package, trainer_id, trainer_name, follow_up_date, notes)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    RETURNING *
+  `, [
+    orgIdOf(req), name, mobile || null, email || null, source || 'other',
+    interested_package || null, trainer_id || null, trainer_name || null,
+    follow_up_date || null, notes || null,
+  ]);
+  res.status(201).json({ data: rows[0] });
+}));
+
+router.patch('/leads/:id', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
+  if (req.body.status !== undefined && !LEAD_STATUSES.includes(req.body.status)) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: `status must be one of: ${LEAD_STATUSES.join(', ')}` } });
+  }
+  const allowed = ['name','mobile','email','source','status','interested_package','trainer_id','trainer_name','follow_up_date','notes'];
+  const sets = [];
+  const params = [req.params.id];
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      params.push(req.body[key]);
+      sets.push(`${key} = $${params.length}`);
+    }
+  }
+  if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS', message: 'No fields to update' } });
+  sets.push('updated_at = NOW()');
+  const orgClause = orgWhere(req, params);
+  const { rows } = await pool.query(
+    `UPDATE pt_leads SET ${sets.join(', ')} WHERE id = $1${orgClause} RETURNING *`,
+    params
+  );
+  if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
+  res.json({ data: rows[0] });
+}));
+
+router.delete('/leads/:id', auth, requireRole('admin','manager'), wrap(async (req, res) => {
+  const params = [req.params.id];
+  const orgClause = orgWhere(req, params);
+  const { rowCount } = await pool.query(`DELETE FROM pt_leads WHERE id = $1${orgClause}`, params);
+  if (rowCount === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
+  res.json({ message: 'Lead deleted' });
+}));
+
+// Converts a lead into a bare (pending) PT client — mirrors the bare-client
+// branch of POST /clients — then hands off to the existing Enroll flow for
+// package/payment details, rather than duplicating that form here.
+router.post('/leads/:id/convert', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
+  const params = [req.params.id];
+  const orgClause = orgWhere(req, params);
+  const { rows: leadRows } = await pool.query(`SELECT * FROM pt_leads WHERE id = $1${orgClause}`, params);
+  if (leadRows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
+  const lead = leadRows[0];
+  if (lead.status === 'converted' && lead.converted_client_id) {
+    return res.status(409).json({
+      error: { code: 'ALREADY_CONVERTED', message: 'This lead has already been converted.' },
+      client_id: lead.converted_client_id,
+    });
+  }
+
+  // Same plan-seat check as POST /clients (bare-client branch) — converting a
+  // lead creates a new pt_clients row too, so it must respect the same SaaS
+  // client-limit gate rather than offering a side door around it.
+  const { limit, count, atLimit } = await subscription.clientLimitStatus(orgIdOf(req));
+  if (atLimit) {
+    return res.status(403).json({
+      error: {
+        code: 'PLAN_LIMIT_REACHED',
+        message: `You've reached your plan's limit of ${limit} clients. Upgrade your plan to add more.`,
+        limit, count,
+      },
+    });
+  }
+
+  const { rows: clientRows } = await pool.query(`
+    INSERT INTO pt_clients
+      (name, mobile, email, status, joining_date, trainer_id, trainer_name, organization_id)
+    VALUES ($1,$2,$3,'pending',CURRENT_DATE,$4,$5,$6)
+    RETURNING id
+  `, [lead.name, lead.mobile, lead.email, lead.trainer_id, lead.trainer_name, orgIdOf(req)]);
+  const newClientId = clientRows[0].id;
+
+  await pool.query(
+    `UPDATE pt_leads SET status = 'converted', converted_client_id = $2, converted_at = NOW(), updated_at = NOW() WHERE id = $1`,
+    [req.params.id, newClientId]
+  );
+
+  res.status(201).json({ data: { client_id: newClientId } });
+}));
+
 // ─── Balance sheet ──────────────────────────────────────────
 router.get('/balance-sheet', auth, wrap(async (req, res) => {
   const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : req.query.trainer_id;
