@@ -318,6 +318,9 @@ app.use('/api/v1/auth',           require('./routes/auth'));
 app.use('/api/v1/auth',           require('./routes/auth-google'));
 app.use('/api/v1/auth/webauthn',  require('./routes/auth-webauthn'));
 app.use('/api/profile',           require('./routes/profile'));
+// Read-only: the caller's own studio's feature flags. Additive — nothing that
+// existed before this route consults it (see lib/features.js).
+app.use('/api/features',          require('./routes/features'));
 app.use('/api/subscription',      require('./routes/subscription'));
 // Global top-nav search. Carries its own rate limiter (see routes/search.js),
 // so it is deliberately NOT wrapped in userApiLimiter — debounced typing would
