@@ -470,6 +470,201 @@ router.get('/activity', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  AUDIT CENTRE
+//
+//  /activity above is the dashboard's recent-events feed: newest 50, three
+//  optional filters, no total. The Audit Centre is the investigative view —
+//  "what did this operator change on that studio last Tuesday, and what was
+//  the value before?" — so it adds a time window, entity filter, free-text
+//  search, a real total for pagination, and old_data alongside new_data.
+//  Kept as separate routes rather than growing /activity, so the dashboard
+//  feed stays cheap (no COUNT) and its contract is unchanged.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Builds the shared WHERE clause + params for both the list and the export, so
+// a CSV can never disagree with the table it was exported from.
+function buildAuditFilter(query) {
+  const where = [];
+  const params = [];
+  const add = (sql, val) => { params.push(val); where.push(sql.replace('$?', `$${params.length}`)); };
+
+  if (query.org_id)      add('u.organization_id = $?::uuid', query.org_id);
+  if (query.user_id)     add('a.user_id = $?', query.user_id);
+  if (query.action)      add('a.action = $?', query.action);
+  if (query.entity_type) add('a.entity_type = $?', query.entity_type);
+  if (query.from)        add('a.created_at >= $?::timestamptz', query.from);
+  // `to` is treated as an inclusive day: the UI sends a date, and an operator
+  // asking for activity "to the 5th" means through the end of the 5th.
+  if (query.to)          add('a.created_at < ($?::date + INTERVAL \'1 day\')', query.to);
+  if (query.q) {
+    params.push(`%${query.q}%`);
+    const i = params.length;
+    where.push(`(a.user_name ILIKE $${i} OR a.action ILIKE $${i} OR a.entity_id ILIKE $${i} OR o.name ILIKE $${i})`);
+  }
+  return { clause: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
+}
+
+const AUDIT_SELECT = `
+  SELECT a.id, a.user_id, a.user_name, a.action, a.entity_type, a.entity_id,
+         a.old_data, a.new_data, a.ip_address, a.user_agent, a.created_at,
+         u.organization_id, o.name AS organization_name
+    FROM activity_log a
+    LEFT JOIN users u ON u.id = a.user_id
+    LEFT JOIN organizations o ON o.id = u.organization_id`;
+
+// ── GET /audit ───────────────────────────────────────────────────────────────
+router.get('/audit', async (req, res, next) => {
+  try {
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const { clause, params } = buildAuditFilter(req.query);
+
+    // One round trip for the page and one for the total. The count is needed
+    // for pagination; running it in parallel keeps the added latency off the
+    // critical path rather than doubling it.
+    const [rowsRes, countRes] = await Promise.all([
+      pool.query(`${AUDIT_SELECT} ${clause} ORDER BY a.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, limit, offset]),
+      pool.query(`SELECT COUNT(*)::int AS total FROM activity_log a
+                    LEFT JOIN users u ON u.id = a.user_id
+                    LEFT JOIN organizations o ON o.id = u.organization_id ${clause}`, params),
+    ]);
+
+    res.json({
+      data: rowsRes.rows,
+      paging: { limit, offset, total: countRes.rows[0].total, count: rowsRes.rows.length },
+    });
+  } catch (err) { next(err); }
+});
+
+// ── GET /audit/filters ───────────────────────────────────────────────────────
+// Distinct actions and entity types actually present, so the filter dropdowns
+// offer what exists rather than a hardcoded list that drifts from reality.
+router.get('/audit/filters', async (req, res, next) => {
+  try {
+    const [actions, entities] = await Promise.all([
+      pool.query(`SELECT DISTINCT action AS v FROM activity_log WHERE action IS NOT NULL AND action <> '' ORDER BY 1`),
+      pool.query(`SELECT DISTINCT entity_type AS v FROM activity_log WHERE entity_type IS NOT NULL AND entity_type <> '' ORDER BY 1`),
+    ]);
+    res.json({ actions: actions.rows.map(r => r.v), entity_types: entities.rows.map(r => r.v) });
+  } catch (err) { next(err); }
+});
+
+// ── GET /audit/export ────────────────────────────────────────────────────────
+// CSV of the *same* filtered set, capped so one click cannot stream an
+// unbounded table into memory. Honours the identical filter builder as the
+// list route, so the export always matches what the operator is looking at.
+const AUDIT_EXPORT_MAX = 10000;
+
+function csvCell(v) {
+  if (v === null || v === undefined) return '';
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  // Escape per RFC 4180. The leading-character guard defuses spreadsheet
+  // formula injection: a logged value beginning =, +, - or @ would otherwise
+  // execute when the CSV is opened in Excel.
+  const safe = /^[=+\-@]/.test(s) ? `'${s}` : s;
+  return `"${safe.replace(/"/g, '""')}"`;
+}
+
+router.get('/audit/export', async (req, res, next) => {
+  try {
+    const { clause, params } = buildAuditFilter(req.query);
+    const { rows } = await pool.query(
+      `${AUDIT_SELECT} ${clause} ORDER BY a.created_at DESC LIMIT $${params.length + 1}`,
+      [...params, AUDIT_EXPORT_MAX]
+    );
+
+    const header = ['Timestamp', 'Actor', 'Actor ID', 'Studio', 'Action', 'Entity Type',
+                    'Entity ID', 'Previous Value', 'New Value', 'IP', 'User Agent'];
+    const lines = [header.map(csvCell).join(',')];
+    for (const r of rows) {
+      lines.push([
+        r.created_at ? new Date(r.created_at).toISOString() : '',
+        r.user_name, r.user_id, r.organization_name, r.action, r.entity_type,
+        r.entity_id, r.old_data, r.new_data, r.ip_address, r.user_agent,
+      ].map(csvCell).join(','));
+    }
+
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="audit-log-${stamp}.csv"`);
+    // Exporting the audit trail is itself an auditable act.
+    await audit(req, 'audit_exported', 'audit_log', null, { rows: rows.length, filters: req.query });
+    // BOM so Excel opens UTF-8 names correctly instead of mojibake.
+    res.send('﻿' + lines.join('\n'));
+  } catch (err) { next(err); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SYSTEM HEALTH
+//
+//  Live introspection, deliberately with no table of its own: anything
+//  persisted here would be a second copy of the truth that can go stale.
+//  Everything below is measured at request time.
+// ═══════════════════════════════════════════════════════════════════════════
+
+router.get('/system-health', async (req, res, next) => {
+  try {
+    const started = Date.now();
+    let db = { status: 'down', latency_ms: null, error: null };
+    let migrations = { applied: null, latest: null, applied_at: null };
+    let dbSize = null;
+
+    try {
+      const t0 = Date.now();
+      await pool.query('SELECT 1');
+      db = { status: 'up', latency_ms: Date.now() - t0, error: null };
+
+      const [mig, size] = await Promise.all([
+        pool.query(`SELECT COUNT(*)::int AS applied,
+                           (SELECT filename   FROM _migrations ORDER BY id DESC LIMIT 1) AS latest,
+                           (SELECT applied_at FROM _migrations ORDER BY id DESC LIMIT 1) AS applied_at
+                      FROM _migrations`),
+        pool.query(`SELECT pg_database_size(current_database())::bigint AS bytes`),
+      ]);
+      migrations = mig.rows[0];
+      dbSize = Number(size.rows[0].bytes);
+    } catch (err) {
+      db = { status: 'down', latency_ms: null, error: err.message };
+    }
+
+    // Error volume over the last 24h, read from the audit trail rather than
+    // log files — log files are not queryable from here and rotate away.
+    let errors24h = null;
+    try {
+      const { rows } = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM activity_log
+          WHERE created_at > NOW() - INTERVAL '24 hours' AND action ILIKE '%fail%'`);
+      errors24h = rows[0].n;
+    } catch { /* non-fatal: health must still render if this query fails */ }
+
+    const mem = process.memoryUsage();
+    res.json({
+      checked_at: new Date().toISOString(),
+      check_duration_ms: Date.now() - started,
+      database: {
+        ...db,
+        size_bytes: dbSize,
+        pool: { total: pool.totalCount ?? null, idle: pool.idleCount ?? null, waiting: pool.waitingCount ?? null },
+      },
+      migrations,
+      process: {
+        uptime_seconds: Math.round(process.uptime()),
+        node_version: process.version,
+        app_version: process.env.npm_package_version || null,
+        environment: process.env.NODE_ENV || 'development',
+        memory: {
+          rss_bytes: mem.rss,
+          heap_used_bytes: mem.heapUsed,
+          heap_total_bytes: mem.heapTotal,
+        },
+      },
+      errors_24h: errors24h,
+    });
+  } catch (err) { next(err); }
+});
+
 // ── POST /organizations/:id/impersonate ───────────────────────────────────────
 // Mint a short-lived, READ-ONLY access token for a studio's admin so the operator
 // can enter the workspace and see exactly what that admin sees. The token carries
