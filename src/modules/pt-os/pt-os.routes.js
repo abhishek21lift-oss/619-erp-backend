@@ -582,13 +582,11 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
   // forgot to say so, promote it here too. Without this, a caller that omits
   // status (as the enroll page did) silently leaves a fully-paid,
   // fully-scheduled client stuck showing "Not Enrolled" forever.
-  if (req.body.status === undefined) {
-    const looksEnrolled =
-      req.body.pt_end_date != null ||
-      Number(req.body.duration_months) > 0 ||
-      (wantsFinalAmount && finalAmount > 0);
-    if (looksEnrolled) sets.push(`status = 'active'`);
-  }
+  const looksEnrolled =
+    req.body.pt_end_date != null ||
+    Number(req.body.duration_months) > 0 ||
+    (wantsFinalAmount && finalAmount > 0);
+  if (req.body.status === undefined && looksEnrolled) sets.push(`status = 'active'`);
 
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS', message: 'No fields to update' } });
   sets.push('updated_at = NOW()');
@@ -599,6 +597,34 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
     params
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+
+  // Term history: unlike /clients/:id/renew, this endpoint (the actual
+  // enrollment action — see the enroll page) never wrote a row into
+  // pt_client_subscriptions, so a client's first term never appeared on
+  // the PT Subscription History page even though they were fully active —
+  // only later renewals showed up there. Log the initial term the first
+  // time a client crosses into "enrolled", i.e. only when they don't
+  // already have subscription history (so later plain-field edits through
+  // this same endpoint, e.g. the client-edit page, never add duplicates).
+  if (looksEnrolled) {
+    const { rows: existingTerms } = await pool.query(
+      'SELECT 1 FROM pt_client_subscriptions WHERE client_id = $1 LIMIT 1', [req.params.id]
+    );
+    if (existingTerms.length === 0) {
+      await pool.query(`
+        INSERT INTO pt_client_subscriptions
+          (client_id, plan_name, start_date, end_date, duration_months,
+           selling_price, amount_paid, balance_amount, trainer_name, status, source)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','enrollment')
+        ON CONFLICT DO NOTHING
+      `, [
+        req.params.id, rows[0].package_type,
+        rows[0].pt_start_date, rows[0].pt_end_date, rows[0].duration_months,
+        rows[0].final_amount, rows[0].paid_amount, rows[0].balance_amount,
+        rows[0].trainer_name,
+      ]);
+    }
+  }
 
   // Ledger: an increase in paid_amount is collected money — record it in
   // pt_payments so revenue reports (which sum the payment ledgers, not
