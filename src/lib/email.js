@@ -1,16 +1,73 @@
 const nodemailer = require('nodemailer');
 const logger = require('./logger');
 const { frontendUrl } = require('./frontendUrl');
+const { invitationHtml, invitationText } = require('./emailTemplates/invitation');
 
-if (!process.env.FRONTEND_URL) {
-  throw new Error('FRONTEND_URL env var is required');
-}
+// FRONTEND_URL is deliberately NOT checked here any more.
+//
+// This module used to throw at import time if it was unset. server.js already
+// lists FRONTEND_URL in REQUIRED_ENV and exits at boot when it is missing —
+// earlier, and reporting every missing variable at once instead of the first.
+// So the throw added nothing in production and made this module impossible to
+// import anywhere that had not set the variable, which silently took out seven
+// unrelated test suites the moment super-admin.routes.js started requiring it.
+//
+// An import-time throw for something a caller only needs at CALL time is a
+// landmine: it turns "this feature is misconfigured" into "this file cannot be
+// loaded". frontendUrl() reads the variable when a link is actually built.
 
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
 const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
 const FROM_ADDR = process.env.SMTP_FROM || 'noreply@619fitness.com';
+// Invitations are the one message a recipient is asked to TRUST, so they go
+// from the support identity rather than a noreply nobody can answer. Falls
+// back to the general from-address so a deploy that has not set it still
+// sends rather than silently doing nothing.
+const INVITE_FROM = process.env.EMAIL_FROM || FROM_ADDR;
+
+/** Retries for a send that failed for a reason that might not repeat. */
+const SEND_ATTEMPTS = parseInt(process.env.SMTP_SEND_ATTEMPTS, 10) || 3;
+
+/**
+ * SMTP failures split in two, and retrying the wrong kind is worse than not
+ * retrying at all: a rejected recipient retried three times is three bounces
+ * against the sending domain's reputation. 4xx and connection errors are
+ * transient; 5xx is the server saying "not this message, ever".
+ */
+function isTransient(err) {
+  const code = err?.responseCode;
+  if (typeof code === 'number') return code >= 400 && code < 500;
+  // No response code at all means it never got far enough to be rejected —
+  // DNS, TLS, timeout, refused connection. All worth another go.
+  return true;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Send with bounded retry and exponential backoff. Throws the final error so
+ * the caller can record WHY delivery failed rather than only that it did.
+ */
+async function sendWithRetry(message, ctx = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= SEND_ATTEMPTS; attempt++) {
+    try {
+      const info = await getTransport().sendMail(message);
+      if (attempt > 1) logger.info({ ...ctx, attempt }, 'email sent after retry');
+      return info;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransient(err) || attempt === SEND_ATTEMPTS) break;
+      const backoffMs = 500 * 2 ** (attempt - 1);
+      logger.warn({ ...ctx, attempt, err: err.message, backoffMs }, 'email send failed — retrying');
+      await sleep(backoffMs);
+    }
+  }
+  logger.error({ ...ctx, err: lastErr?.message }, 'email send failed permanently');
+  throw lastErr;
+}
 
 function isConfigured() {
   return !!(SMTP_HOST && SMTP_USER && SMTP_PASS);
@@ -79,4 +136,38 @@ async function sendAdminResetOtp(email, otp) {
   }
 }
 
-module.exports = { sendPasswordReset, sendAdminResetOtp, isConfigured };
+/**
+ * The admin invitation.
+ *
+ * Unlike the other senders here this one THROWS on failure instead of logging
+ * and returning. The difference is what the caller can do about it: a password
+ * reset that does not arrive can be requested again by the user themselves,
+ * but only the operator can resend an invitation, and they can only do that if
+ * the UI told them it failed. Swallowing this error produces a studio sitting
+ * unclaimed with everyone believing the email went out.
+ */
+async function sendAdminInvitation({ to, ownerName, studioName, actionUrl, pixelUrl, expiryHours }) {
+  if (!isConfigured()) {
+    const err = new Error('SMTP is not configured on this deploy');
+    err.code = 'SMTP_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const vars = { ownerName, studioName, email: to, actionUrl, pixelUrl, expiryHours };
+  return sendWithRetry({
+    from: INVITE_FROM,
+    to,
+    subject: `You're invited to MY PT STUDIO — activate ${studioName || 'your studio'}`,
+    text: invitationText(vars),
+    html: invitationHtml(vars),
+    headers: {
+      // Not a marketing email, and mail clients treat it better when told so.
+      'X-Entity-Ref-ID': 'admin-invitation',
+    },
+  }, { to, kind: 'admin_invitation' });
+}
+
+module.exports = {
+  sendPasswordReset, sendAdminResetOtp, sendAdminInvitation,
+  isConfigured, sendWithRetry, isTransient,
+};

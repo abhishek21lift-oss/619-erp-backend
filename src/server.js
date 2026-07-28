@@ -332,6 +332,10 @@ app.use('/api/', branchScope);
 // public landing page. Aggregate-only — no per-tenant values are exposed.
 app.use('/api/public',            require('./routes/public'));
 
+// Public by design: an invited admin has no password yet, so nothing here can
+// require one. The single-use hashed token IS the credential — see
+// routes/invitations.js for why every rejection returns the same shape.
+app.use('/api/invitations',       require('./routes/invitations'));
 app.use('/api/auth',              require('./routes/auth'));
 app.use('/api/auth',              require('./routes/auth-google'));
 app.use('/api/auth/webauthn',     require('./routes/auth-webauthn'));

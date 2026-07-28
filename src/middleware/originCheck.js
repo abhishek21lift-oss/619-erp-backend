@@ -32,10 +32,26 @@ const ORIGIN_EXEMPT = new Set([
   '/calendar/callback',
 ]);
 
+// Prefixes rather than exact paths, for exempt routes that carry an id.
+const ORIGIN_EXEMPT_PREFIXES = [
+  // The invitation email's open-tracking pixel. It is fetched by a mail client
+  // or an image proxy (Gmail's, Outlook's), never by our own frontend, so an
+  // origin allowlist can only reject it — and whichever Referer those proxies
+  // do send is not something we control or can enumerate.
+  //
+  // Exempting it gives nothing away: the URL carries an opaque track_id, not
+  // the invitation token, and the only effect a request can have is flipping
+  // one invitation from 'sent' to 'opened'. There is no state an attacker
+  // would want and nothing to read back — the response is a 1x1 GIF either
+  // way, including for ids that do not exist.
+  '/invitations/track/',
+];
+
 function originCheck(req, res, next) {
   // Skip for server-to-server calls (no origin) and health checks
   if (!req.headers.origin && !req.headers.referer) return next();
   if (ORIGIN_EXEMPT.has(req.path)) return next();
+  if (ORIGIN_EXEMPT_PREFIXES.some((p) => req.path.startsWith(p))) return next();
 
   const origin = req.headers.origin || req.headers.referer;
   if (!origin) return next();

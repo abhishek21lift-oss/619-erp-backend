@@ -26,6 +26,10 @@ const logger = require('../../lib/logger');
 const { saveFile } = require('../../lib/fileStorage');
 const { invalidateUserCache } = require('../../middleware/auth');
 const subscription = require('../../lib/subscription');
+const invitations = require('../../lib/invitations');
+const { sendAdminInvitation, isConfigured: smtpConfigured } = require('../../lib/email');
+const { frontendUrl } = require('../../lib/frontendUrl');
+const { apiUrl } = require('../../lib/apiUrl');
 const { TRIAL_DAYS } = subscription;
 
 // Roles a tenant login may hold (never 'super_admin' — that is platform-only and
@@ -136,17 +140,48 @@ router.post('/organizations', async (req, res, next) => {
     const orgName = String(req.body.name || '').trim();
     const trainerName = String(req.body.trainer_name || orgName).trim();
     const email = String(req.body.email || '').trim().toLowerCase();
+    const mobile = String(req.body.mobile || '').trim();
     const password = String(req.body.password || '');
+
+    // Two ways to create a studio, and the DEFAULT changed.
+    //
+    // Passing a password keeps the original behaviour exactly: the account is
+    // active immediately with that password. It is kept as the escape hatch
+    // for when SMTP is down and a studio has to be stood up now.
+    //
+    // Omitting it — which is what the UI now does — creates the account with
+    // NO usable password and emails an invitation instead. That is the
+    // difference between an operator who permanently knows a customer's
+    // credentials and one who never does.
+    const useInvite = password === '';
 
     if (!orgName) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Organization name is required' } });
     if (!EMAIL_RE.test(email)) return res.status(400).json({ error: { code: 'VALIDATION', message: 'A valid login email is required' } });
-    if (password.length < 8) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Password must be at least 8 characters' } });
+    if (!useInvite && password.length < 8) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Password must be at least 8 characters' } });
+    }
+    if (useInvite && !smtpConfigured()) {
+      // Refuse rather than create an account nobody can ever claim. The
+      // operator can still set a password explicitly to get unblocked.
+      return res.status(503).json({
+        error: {
+          code: 'SMTP_NOT_CONFIGURED',
+          message: 'Email is not configured on this deploy, so an invitation cannot be sent. Set a password to create the studio without one.',
+        },
+      });
+    }
 
     const { rows: dupe } = await pool.query('SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
     if (dupe.length) return res.status(409).json({ error: { code: 'CONFLICT', message: 'That login email is already in use' } });
 
     const slug = await uniqueSlug(slugify(orgName));
-    const hashed = await bcrypt.hash(password, 12);
+    // An invited account still gets a bcrypt hash, of a value nobody knows and
+    // nobody keeps. Not an empty string and not NULL: either would be one
+    // forgotten is_active check away from a login bypass, whereas a hash of
+    // 32 random bytes is simply unguessable.
+    const hashed = await bcrypt.hash(
+      useInvite ? crypto.randomBytes(32).toString('hex') : password, 12
+    );
     const userId = crypto.randomUUID();
 
     await client.query('BEGIN');
@@ -166,19 +201,64 @@ router.post('/organizations', async (req, res, next) => {
       [org.id, JSON.stringify({ days: TRIAL_DAYS }), req.user?.id || null, req.user?.name || null]
     );
     const { rows: trainerRows } = await client.query(
-      `INSERT INTO trainers (name, email, organization_id) VALUES ($1,$2,$3) RETURNING id`,
-      [trainerName, email, org.id]
+      `INSERT INTO trainers (name, email, mobile, organization_id) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [trainerName, email, mobile || null, org.id]
     );
     const trainerId = trainerRows[0].id;
     await client.query(
       `INSERT INTO users (id, name, email, password, role, trainer_id, organization_id, is_active)
-       VALUES ($1,$2,$3,$4,'admin',$5,$6,true)`,
-      [userId, trainerName, email, hashed, trainerId, org.id]
+       VALUES ($1,$2,$3,$4,'admin',$5,$6,$7)`,
+      // is_active FALSE for an invited admin. This is the actual lock — the
+      // auth middleware refuses inactive users — so an unclaimed studio cannot
+      // be logged into even by someone who guesses the random password.
+      [userId, trainerName, email, hashed, trainerId, org.id, !useInvite]
     );
+
+    // The invitation row is created INSIDE the same transaction. A studio that
+    // committed without one is an account no one can ever claim and no one can
+    // see is broken.
+    let inviteToken = null;
+    let invitation = null;
+    if (useInvite) {
+      const made = await invitations.create({
+        client, userId, organizationId: org.id, email,
+        ownerName: trainerName, studioName: orgName, req,
+      });
+      invitation = made.invitation;
+      inviteToken = made.token;
+    }
+
     await client.query('COMMIT');
 
-    await audit(req, 'org_created', 'organization', org.id, { name: orgName, slug, owner_email: email });
-    res.status(201).json({ data: { organization: org, owner: { id: userId, name: trainerName, email, role: 'admin', trainer_id: trainerId } } });
+    await audit(req, 'org_created', 'organization', org.id, {
+      name: orgName, slug, owner_email: email, onboarding: useInvite ? 'invitation' : 'password',
+    });
+
+    // Sending happens after the commit: an SMTP call inside a transaction
+    // holds a database connection open for the length of a network round trip,
+    // and a send that succeeded followed by a rollback would deliver a link to
+    // an account that does not exist.
+    let emailSent = false;
+    let emailError = null;
+    if (useInvite) {
+      const outcome = await deliverInvitation(invitation, inviteToken);
+      emailSent = outcome.sent;
+      emailError = outcome.error;
+    }
+
+    res.status(201).json({
+      data: {
+        organization: org,
+        owner: { id: userId, name: trainerName, email, role: 'admin', trainer_id: trainerId },
+        onboarding: useInvite ? 'invitation' : 'password',
+        invitation: invitation ? invitations.present({ ...invitation, status: emailSent ? 'sent' : invitation.status }) : null,
+        email_sent: emailSent,
+        // Surfaced, not swallowed: the studio exists either way, and only the
+        // operator can resend. A silent failure leaves everyone believing the
+        // email went out.
+        email_error: emailError,
+      },
+    });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     next(err);
@@ -3386,6 +3466,250 @@ router.put('/ai/routing', async (req, res, next) => {
     );
 
     res.json({ data: rows[0] });
+  } catch (err) { next(err); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ADMIN INVITATIONS
+//
+//  Creating a studio used to mean the operator typed a password and passed it
+//  to the customer out of band. That put a human-chosen credential into a
+//  chat app and left the operator permanently knowing it. Invitations replace
+//  that: the account is created with no usable password and the admin sets
+//  their own through a single-use link.
+//
+//  The raw token is never stored — only its SHA-256. One consequence is worth
+//  stating plainly because it shapes the API: the platform CANNOT show an
+//  operator a link it already sent. "Copy link" therefore ISSUES A NEW ONE and
+//  invalidates the old, and says so.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Send (or resend) one invitation and record the outcome.
+ *
+ * Never throws. The caller has already committed a studio; a failed email is
+ * something to report and retry, not something to unwind an account over.
+ */
+async function deliverInvitation(invitation, rawToken) {
+  try {
+    await sendAdminInvitation({
+      to: invitation.email,
+      ownerName: invitation.owner_name,
+      studioName: invitation.studio_name,
+      actionUrl: frontendUrl(`/auth/set-password?token=${rawToken}`),
+      // Omitted when the API has no public base URL — a relative pixel would
+      // resolve against the mail client and render as a broken image.
+      pixelUrl: apiUrl(`/api/invitations/track/${invitation.track_id}.gif`) || undefined,
+      expiryHours: invitations.EXPIRY_HOURS,
+    });
+    await invitations.markSent(invitation.id);
+    return { sent: true, error: null };
+  } catch (err) {
+    await invitations.markSendFailed(invitation.id, err.message).catch(() => {});
+    logger.error({ err: err.message, invitation: invitation.id }, 'invitation email failed');
+    return { sent: false, error: err.message };
+  }
+}
+
+// ── GET /invitations ─────────────────────────────────────────────────────────
+router.get('/invitations', async (req, res, next) => {
+  try {
+    const params = [];
+    const where = [];
+    if (req.query.org_id) { params.push(req.query.org_id); where.push(`i.organization_id = $${params.length}`); }
+    if (req.query.q) {
+      params.push(`%${String(req.query.q).toLowerCase()}%`);
+      where.push(`(LOWER(i.email) LIKE $${params.length} OR LOWER(i.studio_name) LIKE $${params.length} OR LOWER(i.owner_name) LIKE $${params.length})`);
+    }
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 200);
+
+    const { rows } = await pool.query(
+      `SELECT i.*, o.name AS org_name
+         FROM admin_invitations i
+         JOIN organizations o ON o.id = i.organization_id
+        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+        ORDER BY i.created_at DESC
+        LIMIT ${limit}`,
+      params
+    );
+
+    // Filtering by status happens here rather than in SQL because 'expired' is
+    // derived from the clock, not stored — a WHERE status = 'expired' would
+    // miss every invitation that lapsed since it was last written.
+    const wanted = req.query.status ? String(req.query.status) : null;
+    const data = rows.map(invitations.present).filter((r) => !wanted || r.status === wanted);
+
+    const counts = data.reduce((acc, r) => { acc[r.status] = (acc[r.status] || 0) + 1; return acc; }, {});
+    res.json({ data, counts, smtp_configured: smtpConfigured() });
+  } catch (err) { next(err); }
+});
+
+/** Loads an invitation and the studio it belongs to, or null. */
+async function loadInvitation(id) {
+  const { rows } = await pool.query(
+    `SELECT i.*, o.name AS org_name FROM admin_invitations i
+       JOIN organizations o ON o.id = i.organization_id
+      WHERE i.id = $1`, [id]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Issue a fresh token for an account, superseding whatever was outstanding.
+ * Shared by resend and copy-link so both go through the same rate limit and
+ * the same invalidation — a "copy link" that skipped either would be a way
+ * around both.
+ */
+async function reissue(inv, req) {
+  const limit = await invitations.withinRateLimit(inv.user_id);
+  if (!limit.ok) {
+    return { error: {
+      status: 429,
+      code: 'RATE_LIMITED',
+      message: `That account has already had ${limit.used} invitations in the last ${limit.windowHours} hour. Try again later.`,
+    } };
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Supersede first: a resend exists because the previous link may have gone
+    // astray, so leaving it live would defeat the reason for resending.
+    await invitations.supersedeOpen(inv.user_id, { client });
+    const made = await invitations.create({
+      client,
+      userId: inv.user_id,
+      organizationId: inv.organization_id,
+      email: inv.email,
+      ownerName: inv.owner_name,
+      studioName: inv.studio_name || inv.org_name,
+      req,
+    });
+    await client.query('COMMIT');
+    return { invitation: made.invitation, token: made.token };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// ── POST /invitations/:id/resend ─────────────────────────────────────────────
+router.post('/invitations/:id/resend', async (req, res, next) => {
+  try {
+    const inv = await loadInvitation(req.params.id);
+    if (!inv) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Invitation not found' } });
+    if (invitations.effectiveStatus(inv) === 'activated') {
+      return res.status(409).json({ error: { code: 'ALREADY_ACTIVATED', message: 'That studio has already activated. Resending would do nothing.' } });
+    }
+    if (!smtpConfigured()) {
+      return res.status(503).json({ error: { code: 'SMTP_NOT_CONFIGURED', message: 'Email is not configured on this deploy.' } });
+    }
+
+    const out = await reissue(inv, req);
+    if (out.error) return res.status(out.error.status).json({ error: { code: out.error.code, message: out.error.message } });
+
+    const outcome = await deliverInvitation(out.invitation, out.token);
+    await audit(req, 'admin_invitation_resent', 'admin_invitation', out.invitation.id, {
+      email: inv.email, organization_id: inv.organization_id,
+      superseded: inv.id, sent: outcome.sent, error: outcome.error,
+    });
+
+    if (!outcome.sent) {
+      return res.status(502).json({ error: { code: 'SEND_FAILED', message: outcome.error || 'The email could not be sent.' } });
+    }
+    res.json({ data: invitations.present({ ...out.invitation, status: 'sent' }) });
+  } catch (err) { next(err); }
+});
+
+// ── POST /invitations/:id/link ───────────────────────────────────────────────
+// A POST, not a GET, because it MUTATES: there is no stored link to read, so
+// this mints a new one and kills the old. A GET implying otherwise would be a
+// lie about a security-relevant side effect.
+router.post('/invitations/:id/link', async (req, res, next) => {
+  try {
+    const inv = await loadInvitation(req.params.id);
+    if (!inv) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Invitation not found' } });
+    if (invitations.effectiveStatus(inv) === 'activated') {
+      return res.status(409).json({ error: { code: 'ALREADY_ACTIVATED', message: 'That studio has already activated.' } });
+    }
+
+    const out = await reissue(inv, req);
+    if (out.error) return res.status(out.error.status).json({ error: { code: out.error.code, message: out.error.message } });
+
+    await audit(req, 'admin_invitation_link_issued', 'admin_invitation', out.invitation.id, {
+      email: inv.email, organization_id: inv.organization_id, superseded: inv.id,
+    });
+
+    // The one place a raw token leaves the server outside an email. It goes to
+    // an authenticated platform operator over TLS and is not stored.
+    res.json({
+      data: {
+        url: frontendUrl(`/auth/set-password?token=${out.token}`),
+        expires_at: out.invitation.expires_at,
+        invitation: invitations.present(out.invitation),
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+// ── POST /invitations/:id/cancel ─────────────────────────────────────────────
+router.post('/invitations/:id/cancel', async (req, res, next) => {
+  try {
+    const inv = await loadInvitation(req.params.id);
+    if (!inv) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Invitation not found' } });
+
+    const cancelled = await invitations.cancel(req.params.id);
+    if (!cancelled) {
+      return res.status(409).json({
+        error: { code: 'NOT_OPEN', message: `That invitation is ${invitations.effectiveStatus(inv)} and cannot be cancelled.` },
+      });
+    }
+    await audit(req, 'admin_invitation_cancelled', 'admin_invitation', cancelled.id, {
+      email: inv.email, organization_id: inv.organization_id,
+    });
+    res.json({ data: invitations.present(cancelled) });
+  } catch (err) { next(err); }
+});
+
+// ── GET /invitations/:id/events ──────────────────────────────────────────────
+// The audit trail for one invitation: who issued it, when it was sent, opened,
+// activated, and every failure in between.
+router.get('/invitations/:id/events', async (req, res, next) => {
+  try {
+    const inv = await loadInvitation(req.params.id);
+    if (!inv) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Invitation not found' } });
+
+    // Built from the row's own timestamps rather than a separate event table:
+    // every one of these is already recorded, and a second store would be one
+    // more thing to keep in step with the first.
+    const events = [
+      { at: inv.created_at, label: 'Invitation created', by: inv.created_by_name, meta: inv.created_ip },
+      inv.sent_at && { at: inv.sent_at, label: `Email sent to ${inv.email}`, by: null, meta: inv.send_attempts > 1 ? `${inv.send_attempts} attempts` : null },
+      inv.opened_at && { at: inv.opened_at, label: 'Email opened', by: null, meta: null },
+      inv.activated_at && { at: inv.activated_at, label: 'Password set — account activated', by: inv.owner_name, meta: inv.activated_ip },
+      inv.cancelled_at && { at: inv.cancelled_at, label: 'Invitation cancelled or superseded', by: null, meta: null },
+      inv.last_error && { at: inv.updated_at, label: 'Delivery failed', by: null, meta: inv.last_error },
+    ].filter(Boolean).sort((a, b) => new Date(a.at) - new Date(b.at));
+
+    const { rows: logRows } = await pool.query(
+      `SELECT action, user_name, ip_address, user_agent, created_at
+         FROM activity_log
+        WHERE entity_type = 'admin_invitation' AND entity_id = $1
+        ORDER BY created_at`,
+      [req.params.id]
+    );
+
+    res.json({
+      data: {
+        invitation: invitations.present(inv),
+        events,
+        audit: logRows,
+        created_user_agent: inv.created_user_agent,
+        activated_user_agent: inv.activated_user_agent,
+      },
+    });
   } catch (err) { next(err); }
 });
 
