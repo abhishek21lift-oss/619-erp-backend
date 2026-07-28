@@ -57,7 +57,8 @@ router.post('/', auth, requireRole('admin', 'manager'), (req, res, next) => {
     const id = randomUUID();
     const ext = EXT_BY_MIME[req.file.mimetype] || 'bin';
     const fileKey = `knowledge/${id}.${ext}`;
-    await saveFile('knowledge', `${id}.${ext}`, req.file.buffer, req.file.mimetype);
+    await saveFile('knowledge', `${id}.${ext}`, req.file.buffer, req.file.mimetype,
+      { organizationId: req.user?.organization_id, uploadedBy: req.user?.id });
 
     const { rows } = await pool.query(
       `INSERT INTO ai_documents

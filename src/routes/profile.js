@@ -207,7 +207,8 @@ router.post('/avatar', upload.single('avatar'), async (req, res, next) => {
       return res.status(400).json({ error: 'File content does not match an allowed image type (PNG, JPG, WEBP, GIF)' });
     }
     const filename = `${req.user.id}-${Date.now()}.${detected.ext}`;
-    const avatarUrl = await saveFile('profile', filename, req.file.buffer, detected.mime);
+    const avatarUrl = await saveFile('profile', filename, req.file.buffer, detected.mime,
+      { organizationId: req.user.organization_id, uploadedBy: req.user.id });
 
     await pool.query(
       `INSERT INTO user_profiles (user_id, avatar_url, updated_at)

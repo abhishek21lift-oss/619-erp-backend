@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const storageLedger = require('./storageLedger');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
 
 const UPLOADS_ROOT = path.join(__dirname, '..', '..', 'uploads');
@@ -49,8 +50,15 @@ function getS3Client() {
  * Persists `buffer` under `<category>/<filename>` and returns the URL the
  * app stores/serves (`/uploads/<category>/<filename>` either way — the
  * `/uploads` route transparently proxies from R2 or disk).
+ *
+ * `meta` is optional and purely for storage accounting: pass
+ * `{ organizationId, uploadedBy }` where the caller has them, and the write is
+ * attributed to that studio. Omitting it records the bytes with no owner
+ * rather than not recording them, so the platform total stays right even
+ * where attribution is not available. The ledger write is fire-and-forget and
+ * cannot fail this function — see lib/storageLedger.js.
  */
-async function saveFile(category, filename, buffer, contentType) {
+async function saveFile(category, filename, buffer, contentType, meta = {}) {
   const key = `${category}/${filename}`;
   if (isR2Configured()) {
     await getS3Client().send(new PutObjectCommand({
@@ -64,6 +72,16 @@ async function saveFile(category, filename, buffer, contentType) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, filename), buffer);
   }
+
+  storageLedger.record({
+    key,
+    bytes: buffer?.length ?? 0,
+    category,
+    contentType,
+    organizationId: meta.organizationId,
+    uploadedBy: meta.uploadedBy,
+  });
+
   return `/uploads/${key}`;
 }
 
@@ -118,10 +136,12 @@ async function getFileBuffer(key) {
 async function deleteFile(key) {
   if (isR2Configured()) {
     await getS3Client().send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+    storageLedger.recordDelete(key);
     return;
   }
   const filePath = path.join(UPLOADS_ROOT, key);
   await fs.promises.rm(filePath, { force: true });
+  storageLedger.recordDelete(key);
 }
 
 module.exports = { isR2Configured, saveFile, serveFile, getFileBuffer, deleteFile };

@@ -424,7 +424,8 @@ router.post('/informed-consent/:id/medical-clearance', auth, requireRole('admin'
   }
 
   const filename = `${id}-${Date.now()}.${detected.ext}`;
-  const fileUrl = await saveFile('informed-consent', filename, req.file.buffer, detected.mime);
+  const fileUrl = await saveFile('informed-consent', filename, req.file.buffer, detected.mime,
+    { organizationId: req.user?.organization_id, uploadedBy: req.user?.id });
 
   const { rows } = await pool.query(
     `UPDATE pt_informed_consents SET medical_clearance_file_url = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,

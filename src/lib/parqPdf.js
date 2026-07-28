@@ -95,7 +95,11 @@ async function generateConsentPdf(formData) {
     doc.on('error', reject);
   });
 
-  return saveFile('parq/pdf', `${form.id}.pdf`, buffer, 'application/pdf');
+  // Attribute the PDF's bytes to the studio that owns the form. There is no
+  // req.user here — the client signs this, and a client is not a user — so
+  // uploaded_by stays null while the studio is still known.
+  return saveFile('parq/pdf', `${form.id}.pdf`, buffer, 'application/pdf',
+    { organizationId: form?.organization_id });
 }
 
 module.exports = { generateConsentPdf };

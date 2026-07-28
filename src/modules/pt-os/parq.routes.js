@@ -624,7 +624,8 @@ router.post('/parq/forms/:formId/documents', auth, requireRole('admin', 'manager
   const docType = DOC_TYPES.includes(req.body.doc_type) ? req.body.doc_type : 'other';
 
   const filename = `${formId}-${Date.now()}.${detected.ext}`;
-  const fileUrl = await saveFile('parq', filename, req.file.buffer, detected.mime);
+  const fileUrl = await saveFile('parq', filename, req.file.buffer, detected.mime,
+    { organizationId: req.user?.organization_id, uploadedBy: req.user?.id });
 
   const { rows } = await pool.query(
     `INSERT INTO pt_parq_documents (parq_form_id, client_id, doc_type, file_name, file_url, mime_type, size_bytes, uploaded_by, organization_id)

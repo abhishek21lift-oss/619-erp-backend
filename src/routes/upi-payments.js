@@ -485,7 +485,8 @@ router.post('/:id/upload', auth, validate(schemas.idParam), (req, res, next) => 
     // prefix is what lets submit-utr verify the key belongs to this order, and
     // the random tail stops one member guessing another's key.
     const filename = `${order.id}-${randomUUID()}.${detected.ext}`;
-    const url = await saveFile('upi-proof', filename, req.file.buffer, detected.mime);
+    const url = await saveFile('upi-proof', filename, req.file.buffer, detected.mime,
+      { organizationId: req.user?.organization_id, uploadedBy: req.user?.id });
 
     await upi.audit(pool, {
       orgId: order.organization_id, orderId: order.id, action: 'SCREENSHOT_UPLOADED',

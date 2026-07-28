@@ -115,7 +115,10 @@ async function generateInformedConsentPdf(record) {
     doc.on('error', reject);
   });
 
-  return saveFile('informed-consent/pdf', `${record.id}.pdf`, buffer, 'application/pdf');
+  // As in parqPdf: the signer is a client, not a user, so only the studio is
+  // known at this point.
+  return saveFile('informed-consent/pdf', `${record.id}.pdf`, buffer, 'application/pdf',
+    { organizationId: record?.organization_id });
 }
 
 module.exports = { generateInformedConsentPdf };
