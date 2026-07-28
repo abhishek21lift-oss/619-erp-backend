@@ -80,6 +80,7 @@ const { auth, adminOnly }        = require('./middleware/auth');
 const { requireSuperAdmin, requireSuperAdminMfa } = require('./middleware/tenant');
 const { branchScope }            = require('./middleware/branch-scope');
 const { requireFeature }         = require('./lib/features');
+const { requireAiQuota }         = require('./lib/aiQuota');
 
 // Feature gating for tenant-facing routers.
 //
@@ -411,8 +412,14 @@ app.use('/api/feedback',          require('./routes/feedback'));
 app.use('/api/communication',     ...gate('communication'), require('./routes/communication'));
 // Mounted before /api/ai so /api/ai/knowledge/* is matched here first,
 // regardless of what routes/ai.js's own router does internally.
-app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), require('./routes/aiKnowledge'));
-app.use('/api/ai',               ...gate('ai_suite'), require('./routes/ai'));
+// The AI mounts additionally carry a token-quota guard. It runs AFTER the
+// feature gate (a disabled feature should say "not enabled", not "over
+// quota") and refuses only when an operator has switched enforcement on AND
+// the studio is over its monthly allowance. Enforcement ships OFF, and the
+// guard fails open if the check itself errors — a cost control must not be
+// able to take the AI Suite down. See lib/aiQuota.js.
+app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), requireAiQuota(), require('./routes/aiKnowledge'));
+app.use('/api/ai',               ...gate('ai_suite'), requireAiQuota(), require('./routes/ai'));
 
 // ────────────────────────
 // MEMBER PORTAL ROUTES
