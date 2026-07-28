@@ -342,6 +342,11 @@ app.use('/api/profile',           require('./routes/profile'));
 // Read-only: the caller's own studio's feature flags. Additive — nothing that
 // existed before this route consults it (see lib/features.js).
 app.use('/api/features',          require('./routes/features'));
+// The studio's side of support. Scoped to the caller's own organization with
+// no request-controlled org parameter; internal operator notes are excluded by
+// lib/support.TENANT_MESSAGE_SQL. Deliberately NOT feature-gated — a studio
+// must always be able to reach us, whatever else is switched off.
+app.use('/api/support',           require('./routes/support'));
 app.use('/api/subscription',      require('./routes/subscription'));
 // Global top-nav search. Carries its own rate limiter (see routes/search.js),
 // so it is deliberately NOT wrapped in userApiLimiter — debounced typing would
