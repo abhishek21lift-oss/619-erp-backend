@@ -17,6 +17,9 @@ const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { requireSuperAdmin } = require('../middleware/tenant');
 const { validate } = require('../middleware/validate');
 const { authSchemas } = require('../lib/validation');
+// Security Centre: one row per attempt. Fire-and-forget by design — see
+// lib/loginEvents.js. Nothing below awaits it, and it cannot fail a login.
+const loginEvents = require('../lib/loginEvents');
 const { sendPasswordReset } = require('../lib/email');
 
 const isProd = process.env.NODE_ENV === 'production';
@@ -90,7 +93,14 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     }
 
     const user = rows[0];
-    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+    if (!user) {
+      // The query already filters on is_active, so a missing row means either
+      // no such account or a deactivated one. They are recorded the same way
+      // because the RESPONSE is the same — distinguishing them here would tell
+      // an attacker which addresses are real.
+      loginEvents.record(req, { outcome: loginEvents.OUTCOMES.UNKNOWN_USER, email });
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
 
     // ── Verify password ────────────────────────────────
     let valid = false;
@@ -101,7 +111,13 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
       return res.status(500).json({ error: 'Authentication error. Please try again.' });
     }
 
-    if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
+    if (!valid) {
+      loginEvents.record(req, {
+        outcome: loginEvents.OUTCOMES.BAD_PASSWORD, email,
+        userId: user.id, orgId: user.organization_id,
+      });
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
 
     // ── 2FA enforcement for platform super admins ──────
     // A super_admin operates the whole platform, so their account MUST be
@@ -125,10 +141,22 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
       }
       if (mfaEnabled) {
         const code = String(req.body.mfa_code || '').trim();
-        if (!code) return res.status(401).json({ error: 'MFA code required', mfaRequired: true });
+        if (!code) {
+          loginEvents.record(req, {
+            outcome: loginEvents.OUTCOMES.MFA_REQUIRED, email,
+            userId: user.id, orgId: user.organization_id,
+          });
+          return res.status(401).json({ error: 'MFA code required', mfaRequired: true });
+        }
         const mfaOk = /^\d{6}$/.test(code)
           && verifySync({ secret: mfaSecret, token: code, strategy: 'totp', epochTolerance: 30 }).valid;
         if (!mfaOk) {
+          // A wrong second factor against a CORRECT password is the loudest
+          // signal in this table: the password is already compromised.
+          loginEvents.record(req, {
+            outcome: loginEvents.OUTCOMES.MFA_FAILED, email,
+            userId: user.id, orgId: user.organization_id,
+          });
           return res.status(401).json({ error: 'Invalid MFA code', mfaRequired: true });
         }
       } else {
@@ -139,6 +167,11 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // ── Update last login (non-critical, don't block on failure) ──
     pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id])
       .catch(function(err) { logger.warn({ err: err.message }, 'last_login update failed (non-critical)'); });
+
+    loginEvents.record(req, {
+      outcome: loginEvents.OUTCOMES.SUCCESS, email,
+      userId: user.id, orgId: user.organization_id,
+    });
 
     // ── Sign JWT ───────────────────────────────────────
     let token;

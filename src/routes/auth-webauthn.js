@@ -13,6 +13,7 @@ const pool     = require('../db/pool');
 const { auth } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
 const logger   = require('../lib/logger');
+const loginEvents = require('../lib/loginEvents');
 const rateLimit = require('express-rate-limit');
 
 const router = express.Router();
@@ -376,7 +377,10 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
     );
 
     const { rows: users } = await pool.query(
-      `SELECT id, name, email, role, trainer_id, member_id, token_version
+      // organization_id is selected only so the login event carries studio
+      // attribution; without it passkey sign-ins would be invisible to the
+      // Security Centre's per-studio filter. Nothing else on this path reads it.
+      `SELECT id, name, email, role, trainer_id, member_id, token_version, organization_id
        FROM users WHERE id = $1 AND is_active = true AND deleted_at IS NULL`,
       [cred.user_id]
     );
@@ -393,6 +397,10 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
     setTokenCookie(res, token);
 
     pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]).catch(() => {});
+    loginEvents.record(req, {
+      outcome: loginEvents.OUTCOMES.SUCCESS, method: 'passkey', email: user.email,
+      userId: user.id, orgId: user.organization_id,
+    });
     await logEvent(req, 'webauthn_staff_login', {
       entity_id: user.id,
       credential_id: credentialId,

@@ -5,6 +5,7 @@ const router = require('express').Router();
 const jwt    = require('jsonwebtoken');
 const pool   = require('../db/pool');
 const logger = require('../lib/logger');
+const loginEvents = require('../lib/loginEvents');
 
 const isProd = process.env.NODE_ENV === 'production';
 
@@ -57,7 +58,10 @@ router.post('/google-login', async (req, res) => {
     let user;
     try {
       const { rows } = await pool.query(
-        `SELECT id, name, email, role, token_version, trainer_id, member_id, is_active
+        // organization_id is selected only so the login event carries studio
+        // attribution; without it Google sign-ins would be invisible to the
+        // Security Centre's per-studio filter. Nothing else here reads it.
+        `SELECT id, name, email, role, token_version, trainer_id, member_id, is_active, organization_id
            FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true AND deleted_at IS NULL`,
         [email]
       );
@@ -68,6 +72,9 @@ router.post('/google-login', async (req, res) => {
     }
 
     if (!user) {
+      loginEvents.record(req, {
+        outcome: loginEvents.OUTCOMES.UNKNOWN_USER, method: 'google', email,
+      });
       return res.status(401).json({
         error: 'No active account found for this Google email. Contact your administrator.',
       });
@@ -76,6 +83,11 @@ router.post('/google-login', async (req, res) => {
     // Update last login (non-critical)
     pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id])
       .catch(err => logger.warn({ err: err.message }, 'last_login update failed (non-critical)'));
+
+    loginEvents.record(req, {
+      outcome: loginEvents.OUTCOMES.SUCCESS, method: 'google', email,
+      userId: user.id, orgId: user.organization_id,
+    });
 
     // Sign JWT — identical shape to the regular login cookie
     let token;
