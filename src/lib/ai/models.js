@@ -1,11 +1,28 @@
 'use strict';
-// AI model registry — reads all model IDs from environment variables.
-// No hardcoded model names anywhere in the application.
+// AI model registry. No hardcoded model names anywhere in the application.
+//
+// Each tier resolves in one order, most specific first:
+//   1. an operator override set in the Control Centre (lib/ai/settings.js)
+//   2. the environment variable
+//   3. the built-in default
+//
+// Step 1 is new and is additive: the override cache starts empty and stays
+// empty if the database is unreachable, so with no override set — which is
+// every deploy's starting state — this resolves exactly as it always did.
+// Nothing about steps 2 and 3 changed.
+
+const settings = require('./settings');
+
+const DEFAULTS = {
+  primary:   'openai/gpt-oss-120b:free',
+  secondary: 'poolside/laguna-m.1:free',
+  fallback:  'nvidia/nemotron-3-ultra-550b-a55b:free',
+};
 
 const models = {
-  get primary()   { return process.env.AI_PRIMARY_MODEL   || 'openai/gpt-oss-120b:free'; },
-  get secondary() { return process.env.AI_SECONDARY_MODEL || 'poolside/laguna-m.1:free'; },
-  get fallback()  { return process.env.AI_FALLBACK_MODEL  || 'nvidia/nemotron-3-ultra-550b-a55b:free'; },
+  get primary()   { return settings.override('primary')   || process.env.AI_PRIMARY_MODEL   || DEFAULTS.primary; },
+  get secondary() { return settings.override('secondary') || process.env.AI_SECONDARY_MODEL || DEFAULTS.secondary; },
+  get fallback()  { return settings.override('fallback')  || process.env.AI_FALLBACK_MODEL  || DEFAULTS.fallback; },
 };
 
 // Intent → tier routing table
@@ -78,4 +95,4 @@ function getFallbackModel(currentTier) {
   return null;
 }
 
-module.exports = { models, resolveModel, getFallbackModel, INTENT_ROUTES };
+module.exports = { models, resolveModel, getFallbackModel, INTENT_ROUTES, DEFAULTS };

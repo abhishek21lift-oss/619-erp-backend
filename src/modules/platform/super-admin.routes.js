@@ -2955,6 +2955,8 @@ router.get('/analytics', async (req, res, next) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const aiQuota = require('../../lib/aiQuota');
+const aiSettings = require('../../lib/ai/settings');
+const { models: aiModels, DEFAULTS: AI_DEFAULTS } = require('../../lib/ai/models');
 
 const AI_MAX_DAYS = 365;
 function aiDays(v, dflt = 30) {
@@ -3257,6 +3259,132 @@ router.put('/ai/rates/:model', async (req, res, next) => {
 
     await audit(req, 'ai_rate_updated', 'ai_model_rate', req.params.model,
       { prompt_per_1k_inr: prompt, completion_per_1k_inr: completion });
+    res.json({ data: rows[0] });
+  } catch (err) { next(err); }
+});
+
+// ── GET|PUT /ai/routing ──────────────────────────────────────────────────────
+//
+// Which MODEL each tier resolves to. Deliberately a separate endpoint from
+// /ai/settings, which governs quota enforcement and cost rates: those decide
+// how much a studio may spend, this decides what it spends it on. Folding them
+// into one payload would mean an operator adjusting a token allowance and an
+// operator swapping a deprecated model share a request shape, an audit action
+// and a blast radius, when only one of them can take the whole platform down.
+//
+// Tiers come from environment variables today (AI_PRIMARY_MODEL and friends),
+// which was right — it kept model names out of the source — but it makes
+// changing one a Render edit plus a redeploy. When a provider deprecates a
+// model mid-afternoon that is the wrong shape of operation.
+//
+// An empty override means "follow the environment variable", which is what
+// every deploy starts as, so this endpoint existing changes nothing until an
+// operator sets a value. See lib/ai/settings.js for why a database outage
+// cannot alter routing either.
+
+// A model id is an opaque provider string ("vendor/model:tag"). We cannot
+// check that it exists — only the provider knows — but we can refuse the
+// shapes that are certainly wrong, so a typo fails here rather than turning
+// into a run of provider 400s on live traffic with no obvious cause.
+const MODEL_ID_RE = /^[\w.-]+\/[\w.-]+(:[\w.-]+)?$/;
+
+function readModelField(body, key) {
+  const raw = body[key];
+  // undefined = "leave this tier alone"; null or '' = "clear the override and
+  // go back to the environment variable". Those are genuinely different
+  // intents, and conflating them makes clearing an override impossible.
+  if (raw === undefined) return { skip: true };
+  if (raw === null || String(raw).trim() === '') return { value: null };
+  const v = String(raw).trim();
+  if (v.length > 200 || !MODEL_ID_RE.test(v)) {
+    return { error: `${key} must look like "vendor/model" or "vendor/model:tag"` };
+  }
+  return { value: v };
+}
+
+router.get('/ai/routing', async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT primary_model, secondary_model, fallback_model,
+              updated_by_name, updated_at
+         FROM platform_ai_settings WHERE id = 'singleton'`
+    );
+    const row = rows[0] || {};
+    res.json({
+      data: {
+        override: {
+          primary: row.primary_model ?? null,
+          secondary: row.secondary_model ?? null,
+          fallback: row.fallback_model ?? null,
+        },
+        // What a request would route to right now. Returned alongside the
+        // override so an operator can see which tiers are following their
+        // setting and which are still on the environment, rather than
+        // inferring it from a blank field.
+        effective: {
+          primary: aiModels.primary,
+          secondary: aiModels.secondary,
+          fallback: aiModels.fallback,
+        },
+        from_env: {
+          primary: process.env.AI_PRIMARY_MODEL || null,
+          secondary: process.env.AI_SECONDARY_MODEL || null,
+          fallback: process.env.AI_FALLBACK_MODEL || null,
+        },
+        defaults: AI_DEFAULTS,
+        updated_by_name: row.updated_by_name ?? null,
+        updated_at: row.updated_at ?? null,
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+router.put('/ai/routing', async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const fields = {};
+    for (const tier of ['primary', 'secondary', 'fallback']) {
+      const r = readModelField(body, `${tier}_model`);
+      if (r.error) return res.status(400).json({ error: { code: 'VALIDATION', message: r.error } });
+      if (!r.skip) fields[`${tier}_model`] = r.value;
+    }
+    if (!Object.keys(fields).length) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'No fields to update' } });
+    }
+
+    // The previous values go in the audit row. "Changed the primary model"
+    // without the old value cannot be undone by whoever reads the log at 3am,
+    // which is exactly when this entry gets read.
+    const { rows: before } = await pool.query(
+      `SELECT primary_model, secondary_model, fallback_model
+         FROM platform_ai_settings WHERE id = 'singleton'`
+    );
+
+    const cols = Object.keys(fields);
+    const { rows } = await pool.query(
+      `UPDATE platform_ai_settings
+          SET ${cols.map((c, i) => `${c} = $${i + 1}`).join(', ')},
+              updated_by = $${cols.length + 1},
+              updated_by_name = $${cols.length + 2},
+              updated_at = now()
+        WHERE id = 'singleton'
+      RETURNING primary_model, secondary_model, fallback_model, updated_at`,
+      [...cols.map((c) => fields[c]), req.user?.id || null, req.user?.name || null]
+    );
+
+    // Refresh this instance immediately so the operator sees their own change
+    // take effect rather than waiting out the poll interval. Other instances
+    // pick it up on their next refresh.
+    await aiSettings.refresh();
+
+    await pool.query(
+      `INSERT INTO activity_log
+         (user_id, user_name, action, entity_type, entity_id, old_data, new_data, ip_address, user_agent)
+       VALUES ($1,$2,'ai_routing_updated','ai_platform','singleton',$3,$4,$5,$6)`,
+      [req.user?.id || null, req.user?.name || null,
+       before[0] || {}, rows[0] || {}, req.ip || null, req.get('user-agent') || null]
+    );
+
     res.json({ data: rows[0] });
   } catch (err) { next(err); }
 });

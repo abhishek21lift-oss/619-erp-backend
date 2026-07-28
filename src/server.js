@@ -470,6 +470,13 @@ const { runMigrationsWithRetry } = require('./db/migrate');
 logger.info('Running database migrations…');
 runMigrationsWithRetry()
   .then(function() {
+    // Start polling the operator's AI model overrides. After migrations, so
+    // the table is guaranteed to exist; before listen, so the first request
+    // has a warm cache. It cannot fail the boot — an unreachable table just
+    // leaves the cache empty, which means "use the environment variables",
+    // which is what every deploy does anyway until an operator sets one.
+    require('./lib/ai/settings').start();
+
     const server = app.listen(PORT, '0.0.0.0', function() {
       logger.info({
         port: PORT,
