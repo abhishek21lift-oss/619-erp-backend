@@ -12,6 +12,7 @@
 // flips the stored status + sends reminders, but enforcement never depends on it.
 
 const pool = require('../db/pool');
+const platformBilling = require('./platformBilling');
 
 // Founder's Club cap. The launch offer (Elite at ₹7,999) stays live only while
 // slots remain, so this single number drives both. Env-overridable so the cap
@@ -394,13 +395,23 @@ async function activate(orgId, planCode, opts = {}) {
       );
     }
 
+    // Tax and both parties' details are frozen onto the invoice here, at issue
+    // time, and never recomputed afterwards — see lib/platformBilling.js. Note
+    // this changes nothing about what was CHARGED: chargedAmount is still the
+    // figure collected, and the new columns only record how it splits.
+    const billing = await platformBilling.loadSettings(client);
+    const tax = platformBilling.buildInvoiceTax({ settings: billing, org, amountInr: chargedAmount });
+
     const seq = (await client.query('SELECT count(*)+1 AS n FROM subscription_invoices')).rows[0].n;
-    const invoiceNumber = `MPT-${now.getFullYear()}-${String(seq).padStart(5, '0')}`;
+    const invoiceNumber = `${billing.invoice_prefix || 'MPT'}-${now.getFullYear()}-${String(seq).padStart(5, '0')}`;
     await client.query(
       `INSERT INTO subscription_invoices
-         (organization_id, payment_id, invoice_number, plan_code, amount_inr, period_start, period_end, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'paid')`,
-      [orgId, pay.id, invoiceNumber, planCode, chargedAmount, now, periodEnd]
+         (organization_id, payment_id, invoice_number, plan_code, amount_inr, period_start, period_end, status,
+          taxable_value_inr, gst_percent, cgst_inr, sgst_inr, igst_inr, seller_snapshot, buyer_snapshot)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'paid',$8,$9,$10,$11,$12,$13,$14)`,
+      [orgId, pay.id, invoiceNumber, planCode, chargedAmount, now, periodEnd,
+       tax.taxable_value_inr, tax.gst_percent, tax.cgst_inr, tax.sgst_inr, tax.igst_inr,
+       JSON.stringify(tax.seller_snapshot), JSON.stringify(tax.buyer_snapshot)]
     );
 
     await logEvent(client, orgId, 'activated', {
