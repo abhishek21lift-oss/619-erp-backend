@@ -79,6 +79,26 @@ const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { auth, adminOnly }        = require('./middleware/auth');
 const { requireSuperAdmin, requireSuperAdminMfa } = require('./middleware/tenant');
 const { branchScope }            = require('./middleware/branch-scope');
+const { requireFeature }         = require('./lib/features');
+
+// Feature gating for tenant-facing routers.
+//
+// requireFeature() reads req.user, so it MUST run after auth — mounted before
+// it, the guard sees no user and returns next(), enforcing nothing while
+// looking wired. Most routers apply auth per-route rather than globally, so
+// the gate brings its own. auth is stateless (verify token, load user) and
+// safe to run twice.
+//
+// Only non-core, sellable capabilities are gated. Deliberately NOT gated:
+// auth, subscription and payments (a studio must always be able to sign in
+// and pay, whatever else is switched off), clients and sessions (is_core in
+// the registry, never disableable), and anything whose feature key does not
+// map cleanly to a whole mount.
+//
+// Every feature currently seeds default_enabled = true with no plan gating,
+// so this changes nothing for anyone until an operator turns something off in
+// the Control Centre — which is the point of the toggle existing.
+const gate = (key) => [auth, requireFeature(key)];
 
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -340,18 +360,18 @@ app.use('/api/trainers',          require('./routes/trainers'));
 // swallow /api/payments/upi/... before this router ever sees it.
 app.use('/api/payments/upi',      userApiLimiter, require('./routes/upi-payments'));
 app.use('/api/payments',          userApiLimiter, require('./routes/payments'));
-app.use('/api/attendance',        require('./routes/attendance'));
+app.use('/api/attendance',        ...gate('attendance'), require('./routes/attendance'));
 
 // ROUTE INTEGRITY NOTE (R-03):
 // Legacy /api/reports (routes/reports.js) and v3 /api/v1/reports
 // (modules/reports) coexist. Frontend pages must call the correct version.
 // New pages should use /api/v1/reports. Do not add endpoints to the legacy
 // router — it will be removed once all consumers are migrated.
-app.use('/api/reports',           userApiLimiter, require('./routes/reports'));
+app.use('/api/reports',           userApiLimiter, ...gate('insights'), require('./routes/reports'));
 
-app.use('/api/plans',             require('./routes/plans'));
+app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
 app.use('/api/leave',             require('./routes/leave'));
-app.use('/api/expenses',          require('./routes/expenses'));
+app.use('/api/expenses',          ...gate('finance'), require('./routes/expenses'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.
@@ -377,22 +397,22 @@ app.use('/api/modules',           require('./modules/operations/operations.route
 // PREMIUM FEATURE ROUTES (v4)
 // ────────────────────────
 app.use('/api/calendar',          require('./routes/calendar'));
-app.use('/api/qr',               require('./routes/qr-checkin'));
+app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-checkin'));
 app.use('/api/settings',          require('./routes/settings'));
-app.use('/api/invoices',          require('./routes/invoices'));
-app.use('/api/workouts',          require('./routes/workouts'));
+app.use('/api/invoices',          ...gate('finance'), require('./routes/invoices'));
+app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
 app.use('/api/diet',              require('./routes/diet'));
-app.use('/api/biometric-attend',  require('./routes/biometric-attend'));
+app.use('/api/biometric-attend',  ...gate('attendance'), require('./routes/biometric-attend'));
 app.use('/api/webauthn',          require('./routes/webauthn'));
-app.use('/api/integrations',      require('./routes/integrations'));
-app.use('/api/campaigns',         require('./routes/campaigns'));
+app.use('/api/integrations',      ...gate('integrations'), require('./routes/integrations'));
+app.use('/api/campaigns',         ...gate('communication'), require('./routes/campaigns'));
 app.use('/api/offers',            require('./routes/offers'));
 app.use('/api/feedback',          require('./routes/feedback'));
-app.use('/api/communication',     require('./routes/communication'));
+app.use('/api/communication',     ...gate('communication'), require('./routes/communication'));
 // Mounted before /api/ai so /api/ai/knowledge/* is matched here first,
 // regardless of what routes/ai.js's own router does internally.
-app.use('/api/ai/knowledge',      userApiLimiter, require('./routes/aiKnowledge'));
-app.use('/api/ai',               require('./routes/ai'));
+app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), require('./routes/aiKnowledge'));
+app.use('/api/ai',               ...gate('ai_suite'), require('./routes/ai'));
 
 // ────────────────────────
 // MEMBER PORTAL ROUTES
