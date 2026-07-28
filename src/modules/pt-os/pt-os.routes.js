@@ -998,6 +998,37 @@ router.get('/sessions', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
+// ─── My Schedule — the caller's OWN sessions as a trainer ────
+// Distinct from GET /sessions, which is the studio-wide list and only
+// filters by trainer when the caller passes an explicit trainer_id.
+// Here the trainer is always the authenticated user, so one staff member
+// can never read another's schedule by editing a query param.
+//
+// `trainer_linked: false` means this user account isn't attached to a
+// trainer profile (e.g. a front-desk admin who doesn't train). That is a
+// legitimate state, not an error — it returns no sessions and lets the
+// page say why, rather than showing a bare empty list that looks broken.
+router.get('/sessions/my', auth, wrap(async (req, res) => {
+  const trainerId = req.user.trainer_id;
+  if (!trainerId) return res.json({ data: [], total: 0, trainer_linked: false });
+
+  const params = [trainerId];
+  const where = ['s.deleted_at IS NULL', `s.trainer_id = $1`];
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`s.organization_id = $${params.length}`); }
+  if (req.query.from) { params.push(req.query.from); where.push(`s.session_date >= $${params.length}`); }
+  if (req.query.to)   { params.push(req.query.to);   where.push(`s.session_date <= $${params.length}`); }
+
+  const { rows } = await pool.query(`
+    SELECT s.*, c.name AS client_name, c.mobile AS client_mobile
+    FROM pt_sessions s
+    LEFT JOIN pt_clients c ON c.id = s.client_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY s.session_date ASC, s.start_time ASC
+  `, params);
+  res.json({ data: rows, total: rows.length, trainer_linked: true });
+}));
+
 // Adds `minutes` to a 'HH:MM' or 'HH:MM:SS' time string, returning 'HH:MM:SS'.
 // Used to derive end_time from start_time + duration server-side rather
 // than trusting a client-computed value (or leaving it null, which is
