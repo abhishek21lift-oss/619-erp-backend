@@ -498,6 +498,22 @@ runMigrationsWithRetry()
       logger.info({ interval: '6h' }, 'Subscription sweep scheduled');
     }
 
+    // Scheduled platform announcements. Each send is guarded by its own row
+    // lock and status check (lib/announcements.js), so an overlapping tick
+    // cannot deliver twice — which is what makes a plain interval safe here.
+    // The minute-level granularity matches the UI, which schedules to the
+    // minute. Disable with ANNOUNCEMENT_DISPATCH=off.
+    if (process.env.ANNOUNCEMENT_DISPATCH !== 'off') {
+      const { dispatchDue } = require('./lib/announcements');
+      const poolRef = require('./db/pool');
+      const tick = () => dispatchDue(poolRef)
+        .then((n) => { if (n) logger.info({ sent: n }, 'Scheduled announcements dispatched'); })
+        .catch((err) => logger.warn({ err: err.message }, 'Announcement dispatch failed'));
+      setTimeout(tick, 45 * 1000).unref();
+      setInterval(tick, 60 * 1000).unref();
+      logger.info({ interval: '60s' }, 'Announcement dispatcher scheduled');
+    }
+
     // UPI order expiry: close orders nobody ever paid so they stop occupying
     // the one-open-order-per-plan slot and cluttering the member's history.
     // Only touches CREATED/PAYMENT_PENDING — an order awaiting the studio's
