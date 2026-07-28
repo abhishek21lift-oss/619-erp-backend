@@ -7,7 +7,7 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
-const { tenantScope } = require('../lib/tenant-db');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { randomUUID } = require('crypto');
 
 const router = express.Router();
@@ -30,7 +30,10 @@ function verificationMethodToLogMethod(vm) {
 // POST /api/biometric-attend/mark
 router.post('/mark', async (req, res, next) => {
   try {
-    const { memberId, memberName, verificationMethod, deviceName, latitude, longitude } = req.body;
+    // memberName is deliberately NOT read from the body any more. The name
+    // written to the attendance record is resolved server-side below; taking
+    // it from the request let the caller decide what a record says.
+    const { memberId, verificationMethod, deviceName, latitude, longitude } = req.body;
     if (!memberId || !verificationMethod) {
       return res.status(400).json({ success: false, error: 'memberId and verificationMethod are required' });
     }
@@ -43,27 +46,43 @@ router.post('/mark', async (req, res, next) => {
     const method = verificationMethodToLogMethod(verificationMethod);
     const location = (latitude != null && longitude != null) ? `${latitude},${longitude}` : null;
 
-    // Resolve member name if not provided
-    let resolvedName = memberName;
-    if (!resolvedName) {
-      const { rows } = await pool.query('SELECT name FROM clients WHERE id = $1', [memberId]);
-      resolvedName = rows[0]?.name || 'Unknown';
+    // Resolve the member INSIDE the caller's studio, and always from the
+    // server rather than trusting the client-supplied memberName.
+    //
+    // This previously read `SELECT name FROM clients` — a table with zero rows
+    // and no organization_id column at all, so it could not be tenant-filtered
+    // even in principle. The lookup could only ever miss, leaving 'Unknown';
+    // it went unnoticed because the frontend always sends memberName, which
+    // meant the display name on an attendance record was whatever the caller
+    // typed. pt_clients is where members actually live.
+    const orgId = orgIdOf(req);
+    const { rows: member } = await pool.query(
+      `SELECT name FROM pt_clients
+        WHERE id = $1 AND deleted_at IS NULL
+          AND ($2::uuid IS NULL OR organization_id = $2)
+        LIMIT 1`,
+      [memberId, orgId]
+    );
+    if (!member.length) {
+      return res.status(404).json({ success: false, error: 'Member not found' });
     }
+    const resolvedName = member[0].name;
 
     const id = randomUUID();
     await pool.query(`
       INSERT INTO attendance_logs
         (id, ref_id, ref_type, ref_name, date, check_in_time, status, method, device_info, location, organization_id)
-      VALUES ($1, $2, 'client', $3, $4, NOW(), $5, $6, $7, $8,
-              (SELECT organization_id FROM pt_clients WHERE id = $2))
+      VALUES ($1, $2, 'client', $3, $4, NOW(), $5, $6, $7, $8, $9)
       ON CONFLICT (ref_id, ref_type, date) DO NOTHING`,
-      [id, memberId, resolvedName, today, status, method, deviceName || null, location]
+      [id, memberId, resolvedName, today, status, method, deviceName || null, location, orgId]
     );
 
     // Check if a record now exists (might have been blocked by conflict = already checked in)
     const { rows: existing } = await pool.query(
-      `SELECT id FROM attendance_logs WHERE ref_id = $1 AND ref_type = 'client' AND date = $2`,
-      [memberId, today]
+      `SELECT id FROM attendance_logs
+        WHERE ref_id = $1 AND ref_type = 'client' AND date = $2
+          AND ($3::uuid IS NULL OR organization_id = $3)`,
+      [memberId, today, orgId]
     );
     const attendanceId = existing[0]?.id;
 
@@ -85,12 +104,14 @@ router.post('/checkout', async (req, res, next) => {
     if (!memberId) return res.status(400).json({ success: false, error: 'memberId is required' });
 
     const today = new Date().toISOString().split('T')[0];
+    const orgId = orgIdOf(req);
     const { rows } = await pool.query(
       `SELECT id, check_in_time FROM attendance_logs
        WHERE ref_id = $1 AND ref_type = 'client' AND date = $2
          AND check_out_time IS NULL AND check_in_time IS NOT NULL
+         AND ($3::uuid IS NULL OR organization_id = $3)
        ORDER BY check_in_time DESC LIMIT 1`,
-      [memberId, today]
+      [memberId, today, orgId]
     );
     if (!rows.length) {
       return res.status(404).json({ success: false, error: 'No active check-in found for today' });

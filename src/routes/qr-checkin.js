@@ -16,7 +16,7 @@ const QRCode   = require('qrcode');
 const pool     = require('../db/pool');
 const logger   = require('../lib/logger');
 const { auth } = require('../middleware/auth');
-const { tenantScope } = require('../lib/tenant-db');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const rateLimit = require('express-rate-limit');
 
 const qrLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
@@ -74,40 +74,51 @@ async function generateQrDataUrl(userId, userType, dynamic = false) {
   });
 }
 
-// Real client data in this deployment lives in pt_clients — `clients` is
-// legacy and (in production) empty. Try clients first, fall back to
-// pt_clients (pt_clients has no member_code). Neither table actually has
-// expiry_date/subscription_end_date columns — pt_end_date is the only
-// real expiry signal membershipStatus() below can use.
-async function resolveUser(userId, userType) {
+// Note for membershipStatus() below: pt_clients has no expiry_date or
+// subscription_end_date column, so pt_end_date is the only real expiry signal
+// available.
+/**
+ * Resolve the person a scanned QR refers to — WITHIN the caller's studio.
+ *
+ * `orgId` is the caller's organization (null only for a platform super admin,
+ * who legitimately sees everything). Every lookup is filtered by it, because
+ * without that filter a scan returned the name, photo and package of a client
+ * belonging to a different studio: QR payloads are signed with one
+ * server-wide secret, so a code issued anywhere verifies everywhere, and the
+ * only thing standing between studios was this query.
+ *
+ * The `clients` table is gone from here. It holds zero rows, has no
+ * organization_id column at all — so it cannot be tenant-filtered even in
+ * principle — and pt_clients is where members actually live.
+ */
+async function resolveUser(userId, userType, orgId) {
+  // $2 IS NULL disables the filter for a super admin and applies it otherwise;
+  // the same pattern the rest of the codebase uses for tenant scoping.
   if (userType === 'client') {
     const { rows } = await pool.query(
-      `SELECT id, name, status, photo_url, member_code, client_id,
-              pt_end_date, package_type
-         FROM clients WHERE id = $1 LIMIT 1`,
-      [userId]
-    );
-    if (rows[0]) return { ...rows[0], _type: 'client' };
-
-    const { rows: ptRows } = await pool.query(
       `SELECT id, name, status, photo_url, client_id AS member_code, client_id,
               pt_end_date, package_type
-         FROM pt_clients WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
-      [userId]
+         FROM pt_clients
+        WHERE id = $1 AND deleted_at IS NULL
+          AND ($2::uuid IS NULL OR organization_id = $2)
+        LIMIT 1`,
+      [userId, orgId]
     );
-    return ptRows[0] ? { ...ptRows[0], _type: 'client' } : null;
+    return rows[0] ? { ...rows[0], _type: 'client' } : null;
   }
   if (userType === 'trainer') {
     const { rows } = await pool.query(
-      'SELECT id, name, email, mobile FROM trainers WHERE id = $1 LIMIT 1',
-      [userId]
+      `SELECT id, name, email, mobile FROM trainers
+        WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2) LIMIT 1`,
+      [userId, orgId]
     );
     return rows[0] ? { ...rows[0], status: 'active', _type: 'trainer' } : null;
   }
   // staff / user
   const { rows } = await pool.query(
-    'SELECT id, name, email, role FROM users WHERE id = $1 LIMIT 1',
-    [userId]
+    `SELECT id, name, email, role FROM users
+      WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2) LIMIT 1`,
+    [userId, orgId]
   );
   return rows[0] ? { ...rows[0], status: 'active', _type: userType } : null;
 }
@@ -122,16 +133,29 @@ function membershipStatus(user) {
   return 'active';
 }
 
-async function markAttendance(userId, userType, userName, method, deviceInfo, location) {
+/**
+ * Write the check-in.
+ *
+ * organization_id is the CALLER's org, passed in — not a subquery on the
+ * scanned person. It used to be
+ *   COALESCE((SELECT organization_id FROM pt_clients WHERE id = ref_id), …)
+ * which stamped the row with the TARGET's studio, so a scan performed by
+ * studio A against a code from studio B wrote a row into studio B's data and
+ * it showed up in their reports. routes/attendance.js has always used
+ * orgIdOf(req) here; this path simply never adopted it.
+ *
+ * resolveUser has already refused to return anyone outside the caller's org,
+ * so by the time we get here the two agree — this makes that explicit rather
+ * than trusting the join.
+ */
+async function markAttendance(userId, userType, userName, method, deviceInfo, location, orgId) {
   const refType = userType === 'client' ? 'client' : userType === 'trainer' ? 'trainer' : 'staff';
   const date = new Date().toISOString().slice(0, 10);
 
   const { rows } = await pool.query(
     `INSERT INTO attendance_logs
        (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes, user_id, device_info, location, organization_id)
-     VALUES ($1, $2, $3, $4::date, NOW(), $5, 'present', $6, $7, $8, $9,
-             COALESCE((SELECT organization_id FROM pt_clients WHERE id = $1),
-                      (SELECT organization_id FROM trainers WHERE id = $1)))
+     VALUES ($1, $2, $3, $4::date, NOW(), $5, 'present', $6, $7, $8, $9, $10)
      ON CONFLICT (ref_id, ref_type, date) DO UPDATE
        SET check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
            status        = 'present',
@@ -141,7 +165,7 @@ async function markAttendance(userId, userType, userName, method, deviceInfo, lo
            organization_id = COALESCE(attendance_logs.organization_id, EXCLUDED.organization_id)
      RETURNING id, check_in_time`,
     [userId, refType, userName, date, method,
-     `${method.toUpperCase()} check-in`, userId, deviceInfo || null, location || null]
+     `${method.toUpperCase()} check-in`, userId, deviceInfo || null, location || null, orgId]
   );
   return rows[0];
 }
@@ -227,28 +251,35 @@ router.post('/scan', auth, scanLimiter, async (req, res) => {
       return res.status(400).json({ error: verifyErr.message, success: false });
     }
 
+    // A QR is signed with one server-wide secret, so a code minted by any
+    // studio verifies at every studio. Resolve the person inside the caller's
+    // org FIRST and bail if they are not there — before touching attendance,
+    // and before echoing any of their details back. Doing the lookup up front
+    // also stops the duplicate-scan branch below leaking a name for someone
+    // the caller has no right to see.
+    const orgId = orgIdOf(req);
+    const user = await resolveUser(userId, userType, orgId);
+    if (!user) return res.status(404).json({ error: 'User not found', success: false });
+
     // Duplicate scan prevention: check if already checked in today within 5 minutes
     const refType = userType === 'client' ? 'client' : userType === 'trainer' ? 'trainer' : 'staff';
     const { rows: recent } = await pool.query(
       `SELECT id, check_in_time FROM attendance_logs
        WHERE ref_id = $1 AND ref_type = $2 AND date = CURRENT_DATE
          AND check_in_time > NOW() - INTERVAL '5 minutes'
+         AND ($3::uuid IS NULL OR organization_id = $3)
        LIMIT 1`,
-      [userId, refType]
+      [userId, refType, orgId]
     );
     if (recent[0]) {
-      const user = await resolveUser(userId, userType);
       return res.json({
         success: true,
         duplicate: true,
         message: `Already checked in (${new Date(recent[0].check_in_time).toLocaleTimeString()})`,
-        user: { id: userId, name: user?.name || 'Unknown', status: 'active' },
+        user: { id: userId, name: user.name, status: 'active' },
         attendance_id: recent[0].id,
       });
     }
-
-    const user = await resolveUser(userId, userType);
-    if (!user) return res.status(404).json({ error: 'User not found', success: false });
 
     const status = membershipStatus(user);
     if (status !== 'active' && userType === 'client') {
@@ -259,7 +290,7 @@ router.post('/scan', auth, scanLimiter, async (req, res) => {
       });
     }
 
-    const att = await markAttendance(userId, userType, user.name, 'qr', device_info, location);
+    const att = await markAttendance(userId, userType, user.name, 'qr', device_info, location, orgId);
 
     return res.json({
       success: true,
