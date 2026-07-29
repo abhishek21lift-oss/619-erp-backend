@@ -15,6 +15,7 @@ const { auth, invalidateUserCache } = require('../middleware/auth');
 const { logActivity } = require('../lib/activityLog');
 const { saveFile } = require('../lib/fileStorage');
 const credentials = require('../lib/credentials');
+const profileFields = require('../lib/profileFields');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -94,6 +95,17 @@ async function ensureSchema() {
         experience_since DATE,
         specialisations JSONB NOT NULL DEFAULT '[]'::jsonb,
         certifications JSONB NOT NULL DEFAULT '[]'::jsonb,
+        cover_url TEXT,
+        designation TEXT,
+        philosophy TEXT,
+        training_style TEXT,
+        current_gym TEXT,
+        languages JSONB NOT NULL DEFAULT '[]'::jsonb,
+        coaching_modes JSONB NOT NULL DEFAULT '[]'::jsonb,
+        previous_gyms JSONB NOT NULL DEFAULT '[]'::jsonb,
+        education JSONB NOT NULL DEFAULT '[]'::jsonb,
+        achievements JSONB NOT NULL DEFAULT '[]'::jsonb,
+        working_hours JSONB NOT NULL DEFAULT '{}'::jsonb,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
@@ -108,7 +120,10 @@ async function profileFor(userId) {
     `SELECT u.id, u.name, u.email, u.role, u.created_at, u.last_login,
             p.phone, p.location, p.bio, p.avatar_url,
             p.notification_preferences, p.preferences, p.mfa_enabled,
-            p.job_title, p.experience_since, p.specialisations, p.certifications
+            p.job_title, p.experience_since, p.specialisations, p.certifications,
+            p.cover_url, p.designation, p.philosophy, p.training_style, p.current_gym,
+            p.languages, p.coaching_modes, p.previous_gyms, p.education,
+            p.achievements, p.working_hours
        FROM users u
   LEFT JOIN user_profiles p ON p.user_id = u.id
       WHERE u.id = $1`,
@@ -116,6 +131,9 @@ async function profileFor(userId) {
   );
   return rows[0];
 }
+
+/** A JSONB column that should hold a list, defended at the boundary. */
+function arr(v) { return Array.isArray(v) ? v : []; }
 
 function shapeProfile(row) {
   const since = row.experience_since
@@ -147,6 +165,23 @@ function shapeProfile(row) {
     // qualified to take a session.
     certifications: credentials.presentCertifications(row.certifications),
     credentialSummary: credentials.credentialSummary(row.certifications),
+
+    // ── Migration 133 fields ────────────────────────────────────────────────
+    coverUrl: row.cover_url || null,
+    designation: row.designation || '',
+    philosophy: row.philosophy || '',
+    trainingStyle: row.training_style || '',
+    currentGym: row.current_gym || '',
+    languages: arr(row.languages),
+    coachingModes: arr(row.coaching_modes),
+    previousGyms: arr(row.previous_gyms),
+    education: arr(row.education),
+    achievements: arr(row.achievements),
+    workingHours: (row.working_hours && typeof row.working_hours === 'object'
+      && !Array.isArray(row.working_hours)) ? row.working_hours : {},
+    // Derived, so the UI never has to add up a week of split shifts itself
+    // and then disagree with the next screen that tries.
+    weeklyMinutes: profileFields.weeklyMinutes(row.working_hours),
   };
 }
 
@@ -161,14 +196,60 @@ router.get('/me', async (req, res, next) => {
   }
 });
 
+/**
+ * Every column on user_profiles that PUT /me may write, as data.
+ *
+ * ── Why a table and not eighteen if-blocks ───────────────────────────────────
+ *
+ * The rule "a field the client did not send is left alone" has to hold for
+ * every field, and the version of this written as one guard per field did not:
+ * phone, location and bio were built into the SET list unconditionally, so a
+ * PUT that omitted them wrote '' over whatever was there. Nobody noticed
+ * because the only client always sent all three — until this page grew tabs
+ * that legitimately do not render them.
+ *
+ * Expressed this way the rule lives in exactly one line of the loop below, so
+ * a nineteenth field cannot forget it.
+ *
+ * `parse` returns { value } or { error }, matching lib/credentials.js.
+ * `json` marks a column that must be stringified before it is bound.
+ */
+const ok = (value) => ({ value });
+
+const PROFILE_FIELDS = [
+  { body: 'phone',            col: 'phone',            parse: (v) => ok(credentials.cleanText(v, 40)) },
+  { body: 'location',         col: 'location',         parse: (v) => ok(credentials.cleanText(v, 160)) },
+  { body: 'bio',              col: 'bio',              parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.freeText)) },
+  { body: 'job_title',        col: 'job_title',        parse: (v) => ok(credentials.cleanText(v, credentials.LIMITS.job_title)) },
+  { body: 'designation',      col: 'designation',      parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.designation)) },
+  { body: 'philosophy',       col: 'philosophy',       parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.philosophy)) },
+  { body: 'training_style',   col: 'training_style',   parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.trainingStyle)) },
+  { body: 'current_gym',      col: 'current_gym',      parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.gymName)) },
+  {
+    body: 'experience_since',
+    col: 'experience_since',
+    parse: (v) => {
+      const d = credentials.cleanDate(v);
+      return d === undefined ? { error: 'Invalid experience start date' } : ok(d);
+    },
+  },
+  { body: 'specialisations',  col: 'specialisations',  parse: credentials.validateSpecialisations,  json: true },
+  { body: 'certifications',   col: 'certifications',   parse: credentials.validateCertifications,   json: true },
+  { body: 'languages',        col: 'languages',        parse: profileFields.validateLanguages,      json: true },
+  { body: 'coaching_modes',   col: 'coaching_modes',   parse: profileFields.validateCoachingModes,  json: true },
+  { body: 'previous_gyms',    col: 'previous_gyms',    parse: profileFields.validatePreviousGyms,   json: true },
+  { body: 'education',        col: 'education',        parse: profileFields.validateEducation,      json: true },
+  { body: 'achievements',     col: 'achievements',     parse: profileFields.validateAchievements,   json: true },
+  { body: 'working_hours',    col: 'working_hours',    parse: profileFields.validateWorkingHours,   json: true },
+];
+
 router.put('/me', async (req, res, next) => {
   try {
     await ensureSchema();
+    // name and email stay outside the table: they live on `users`, they are
+    // required rather than optional, and email carries a uniqueness check.
     const name = String(req.body.name || '').trim();
     const email = String(req.body.email || '').trim().toLowerCase();
-    const phone = String(req.body.phone || '').trim();
-    const location = String(req.body.location || '').trim();
-    const bio = String(req.body.bio || '').trim();
 
     if (!name) return res.status(400).json({ error: 'Name is required' });
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
@@ -181,30 +262,14 @@ router.put('/me', async (req, res, next) => {
     );
     if (existing.rows.length) return res.status(409).json({ error: 'Email already registered' });
 
-    // Professional credentials. Each field is only touched when the client
-    // actually sent it — a PUT from an older client, or from a form that does
-    // not show these, must not blank someone's certifications.
-    const jobTitle = req.body.job_title === undefined
-      ? undefined : credentials.cleanText(req.body.job_title, credentials.LIMITS.job_title);
-
-    let experienceSince;
-    if (req.body.experience_since !== undefined) {
-      experienceSince = credentials.cleanDate(req.body.experience_since);
-      if (experienceSince === undefined) return res.status(400).json({ error: 'Invalid experience start date' });
-    }
-
-    let specialisations;
-    if (req.body.specialisations !== undefined) {
-      const r = credentials.validateSpecialisations(req.body.specialisations);
+    // Validate everything BEFORE writing anything, so a bad certification
+    // cannot leave the name and email already updated.
+    const writes = [];
+    for (const f of PROFILE_FIELDS) {
+      if (req.body[f.body] === undefined) continue;   // ← the whole contract, once
+      const r = f.parse(req.body[f.body]);
       if (r.error) return res.status(400).json({ error: r.error });
-      specialisations = r.value;
-    }
-
-    let certs;
-    if (req.body.certifications !== undefined) {
-      const r = credentials.validateCertifications(req.body.certifications);
-      if (r.error) return res.status(400).json({ error: r.error });
-      certs = r.value;
+      writes.push([f.col, f.json ? JSON.stringify(r.value) : r.value]);
     }
 
     await pool.query('UPDATE users SET name = $1, email = $2, updated_at = NOW() WHERE id = $3', [name, email, req.user.id]);
@@ -215,20 +280,16 @@ router.put('/me', async (req, res, next) => {
     // value — cannot express the difference between "the client omitted this
     // field" and "the client cleared it", because both arrive as NULL and
     // COALESCE keeps the old value for each. That would make an experience
-    // date, once set, impossible to erase. Building the SET list from what was
-    // actually sent keeps both meanings.
+    // date, once set, impossible to erase.
     await pool.query('INSERT INTO user_profiles (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [req.user.id]);
 
-    const sets = ['phone = $2', 'location = $3', 'bio = $4', 'updated_at = NOW()'];
-    const params = [req.user.id, phone, location, bio];
-    const put = (sql, value) => { params.push(value); sets.push(`${sql} = $${params.length}`); };
+    if (writes.length) {
+      const params = [req.user.id];
+      const sets = writes.map(([col, value]) => { params.push(value); return `${col} = $${params.length}`; });
+      sets.push('updated_at = NOW()');
+      await pool.query(`UPDATE user_profiles SET ${sets.join(', ')} WHERE user_id = $1`, params);
+    }
 
-    if (jobTitle !== undefined) put('job_title', jobTitle);
-    if (experienceSince !== undefined) put('experience_since', experienceSince);
-    if (specialisations !== undefined) put('specialisations', JSON.stringify(specialisations));
-    if (certs !== undefined) put('certifications', JSON.stringify(certs));
-
-    await pool.query(`UPDATE user_profiles SET ${sets.join(', ')} WHERE user_id = $1`, params);
     invalidateUserCache(req.user.id);
     await logActivity(req, 'profile.update', 'user', req.user.id, { name, email });
     const row = await profileFor(req.user.id);
