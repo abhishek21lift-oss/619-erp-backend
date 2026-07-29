@@ -16,6 +16,7 @@ const { logActivity } = require('../lib/activityLog');
 const { saveFile } = require('../lib/fileStorage');
 const credentials = require('../lib/credentials');
 const profileFields = require('../lib/profileFields');
+const { profileCompletion } = require('../lib/profileCompletion');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -182,6 +183,13 @@ function shapeProfile(row) {
     // Derived, so the UI never has to add up a week of split shifts itself
     // and then disagree with the next screen that tries.
     weeklyMinutes: profileFields.weeklyMinutes(row.working_hours),
+
+    // The percentage and the checklist come from ONE call over one weight
+    // table, so the ring and the next-step list can never disagree about the
+    // same profile. Computed here rather than in the browser because it
+    // describes SAVED data — it must change when the server accepts a write,
+    // not while somebody is typing.
+    completion: profileCompletion(row),
   };
 }
 
