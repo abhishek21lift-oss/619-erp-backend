@@ -97,24 +97,30 @@ async function sendPasswordReset(email, rawToken) {
   // ".com//reset-password".
   const resetUrl = frontendUrl(`/reset-password?token=${rawToken}`);
 
-  try {
-    await getTransport().sendMail({
-      from: FROM_ADDR,
-      to: email,
-      subject: 'Password Reset — MY PT STUDIO',
-      html: `
+  // sendWithRetry, not a bare sendMail: a reset link that fails on a transient
+  // TLS blip is a person locked out, and the invitation path already retries.
+  //
+  // This THROWS on permanent failure rather than logging and returning. It used
+  // to swallow the error, which made the `.catch()` at its only call site
+  // (routes/auth.js) dead code and made "the email failed" indistinguishable
+  // from "the email was sent" to anything upstream. The public forgot-password
+  // route still cannot tell its caller — it must not reveal whether an address
+  // exists — but it already attaches that .catch(), so it is unaffected, and
+  // the operator-facing route can now report the truth.
+  await sendWithRetry({
+    from: FROM_ADDR,
+    to: email,
+    subject: 'Password Reset — MY PT STUDIO',
+    html: `
         <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto">
           <h2 style="color:#e11d48">Password Reset Request</h2>
-          <p>Click the link below to reset your password. This link expires in 15 minutes.</p>
-          <a href="${resetUrl}" style="display:inline-block;padding:12px 24px;background:#e11d48;color:#fff;text-decoration:none;border-radius:6px;margin:16px 0">Reset Password</a>
+          <p>Click the link below to set a new password.</p>
+          <a href="${resetUrl}" style="display:inline-block;padding:12px 24px;background:#e11d48;color:#fff;text-decoration:none;border-radius:6px;margin:16px 0">Set Password</a>
           <p style="color:#666;font-size:13px">If you didn't request this, ignore this email.</p>
         </div>
       `,
-    });
-    logger.info({ email }, 'Password reset email sent');
-  } catch (err) {
-    logger.error({ err: err.message, email }, 'Failed to send password reset email');
-  }
+  }, { email, kind: 'password_reset' });
+  logger.info({ email }, 'Password reset email sent');
 }
 
 async function sendAdminResetOtp(email, otp) {

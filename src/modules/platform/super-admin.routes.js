@@ -27,7 +27,7 @@ const { saveFile } = require('../../lib/fileStorage');
 const { invalidateUserCache } = require('../../middleware/auth');
 const subscription = require('../../lib/subscription');
 const invitations = require('../../lib/invitations');
-const { sendAdminInvitation, isConfigured: smtpConfigured } = require('../../lib/email');
+const { sendAdminInvitation, sendPasswordReset, isConfigured: smtpConfigured } = require('../../lib/email');
 const { frontendUrl } = require('../../lib/frontendUrl');
 const { apiUrl } = require('../../lib/apiUrl');
 const { TRIAL_DAYS } = subscription;
@@ -432,6 +432,111 @@ router.delete('/users/:id', async (req, res, next) => {
     invalidateUserCache(req.params.id);
     await audit(req, 'user_deleted', 'user', req.params.id, { role: target.role, organization_id: target.organization_id });
     res.json({ data: { id: req.params.id, message: 'Account removed and sessions revoked.' } });
+  } catch (err) { next(err); }
+});
+
+// ── POST /users/:id/send-password-setup ──────────────────────────────────────
+//
+// Emails the account a link to set their OWN password, instead of the operator
+// choosing one and having to convey it. Better on both counts: the operator
+// never learns the password, and it never travels through a chat window.
+//
+// ── Why this is not just "call /auth/forgot-password for them" ───────────────
+//
+// The public route cannot tell the caller anything. It answers "if the email
+// exists, a reset link has been sent" whether or not the address exists, and
+// silently returns without sending when SMTP is unconfigured — both correct
+// there, because an anonymous caller must not be able to probe which addresses
+// are registered.
+//
+// An operator who has just opened this exact user's row is not probing. So this
+// route reports what actually happened: whether the account exists, whether
+// SMTP is configured, and whether the send succeeded. Without that, "no email
+// arrived" is indistinguishable from "email is not set up", which is precisely
+// the trap the public route sets for its own operators.
+const PASSWORD_SETUP_EXPIRY_MINUTES = Math.min(
+  Math.max(parseInt(process.env.PASSWORD_SETUP_EXPIRY_MINUTES, 10) || 120, 15), 1440
+);
+
+router.post('/users/:id/send-password-setup', async (req, res, next) => {
+  try {
+    const { rows: users } = await pool.query(
+      `SELECT id, name, email, role FROM users WHERE id = $1 AND deleted_at IS NULL`,
+      [req.params.id]
+    );
+    if (!users.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
+    const user = users[0];
+    if (!user.email) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'That account has no email address to send to' } });
+    }
+
+    // Checked BEFORE issuing a token. Minting one that nobody can receive
+    // would invalidate any live reset link for no benefit, and would report
+    // success for an email that was never sent.
+    if (!smtpConfigured()) {
+      return res.status(503).json({
+        error: {
+          code: 'SMTP_NOT_CONFIGURED',
+          message: 'Email is not configured on the server, so nothing was sent. '
+            + 'Set SMTP_HOST, SMTP_USER and SMTP_PASS, then try again — '
+            + 'or use Reset password to set one directly.',
+        },
+      });
+    }
+
+    // Same token shape as /auth/forgot-password: a random 32-byte secret, of
+    // which only the SHA-256 is stored. The raw value exists in the email and
+    // nowhere else, so a database leak does not hand over live reset links.
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    // Longer than the public flow's 15 minutes, deliberately and separately.
+    // There, someone is sitting at the form waiting for the mail. Here an
+    // operator sends it and the recipient may be asleep; a 15-minute link
+    // would mostly expire unused and train everyone to ask for another. It is
+    // its own named constant rather than a change to the public window, which
+    // was shortened on purpose (auth.js, M-07), and is clamped to 15 minutes
+    // either side of a day so a typo in the environment cannot make a
+    // password-set link effectively permanent.
+    await pool.query(
+      `UPDATE users
+          SET password_reset_token = $1,
+              password_reset_expires = NOW() + ($2 || ' minutes')::interval
+        WHERE id = $3`,
+      [hashedToken, String(PASSWORD_SETUP_EXPIRY_MINUTES), user.id]
+    );
+
+    try {
+      await sendPasswordReset(user.email, rawToken);
+    } catch (err) {
+      // Undo the token rather than leave a live one behind for a link that
+      // never arrived — it would silently supersede any earlier valid link.
+      await pool.query(
+        `UPDATE users SET password_reset_token = NULL, password_reset_expires = NULL WHERE id = $1`,
+        [user.id]
+      ).catch(() => {});
+      logger.error({ err: err.message, userId: user.id }, 'password setup email failed');
+      return res.status(502).json({
+        error: { code: 'EMAIL_SEND_FAILED', message: `The email could not be sent: ${err.message}` },
+      });
+    }
+
+    // The address is recorded because it is the operative fact: an operator
+    // who has just changed someone's email needs the log to show which
+    // address the link actually went to. The token is not, and cannot be —
+    // only its hash was ever stored.
+    await audit(req, 'user_password_setup_sent', 'user', user.id, {
+      email: user.email, expires_in_minutes: PASSWORD_SETUP_EXPIRY_MINUTES,
+    });
+
+    res.json({
+      data: {
+        id: user.id,
+        email: user.email,
+        expires_in_minutes: PASSWORD_SETUP_EXPIRY_MINUTES,
+        message: `A set-password link was sent to ${user.email}. It expires in ${PASSWORD_SETUP_EXPIRY_MINUTES} minutes.`,
+      },
+    });
   } catch (err) { next(err); }
 });
 
