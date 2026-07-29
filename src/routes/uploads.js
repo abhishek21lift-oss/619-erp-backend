@@ -51,6 +51,11 @@ const OWNED_CATEGORIES = {
 const PROOF_CATEGORY = 'upi-proof';
 const PROOF_TABLE = 'payment_orders';
 
+// Portfolio media (migration 134). Deliberately NOT in the public tier: the
+// public profile page is out of scope for now, so nothing needs unauthenticated
+// access, and a before/after is a photograph of somebody's client.
+const PORTFOLIO_CATEGORY = 'portfolio';
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Derived from req.path rather than req.params[0]: this router registers both
@@ -83,11 +88,30 @@ function normaliseKey(req, res) {
  * false) is allowed through, consistent with tenantScope() everywhere else.
  */
 async function callerOwnsRecord(req, category, key) {
+  const scope = tenantScope(req);
+
+  // Portfolio media is resolved by KEY, not by an id parsed out of the
+  // filename. A before/after row owns two objects and each carries its own
+  // UUID, so the generic "basename is the row id" resolver below cannot match
+  // either of them — and without this branch `portfolio` falls through as an
+  // unowned category, meaning any authenticated user in any studio holding a
+  // key could fetch it. Before/after client photos are the last thing that
+  // should be readable across a tenant boundary.
+  if (category === PORTFOLIO_CATEGORY) {
+    if (!scope.applyFilter) return true; // platform-wide super_admin
+    const { rows } = await pool.query(
+      `SELECT organization_id FROM user_portfolio_items
+        WHERE file_key = $1 OR after_file_key = $1`,
+      [key]
+    );
+    if (rows.length === 0) return false;
+    return rows[0].organization_id === scope.orgId;
+  }
+
   const isProof = category === PROOF_CATEGORY;
   const table = isProof ? PROOF_TABLE : OWNED_CATEGORIES[category];
   if (!table) return true; // not an owned category — a valid session suffices
 
-  const scope = tenantScope(req);
   if (!scope.applyFilter) return true; // platform-wide super_admin
 
   // Keys are written as `<category>/pdf/<record-uuid>.pdf` by lib/parqPdf.js

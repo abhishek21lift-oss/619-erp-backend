@@ -13,10 +13,12 @@ const { generateSecret, verifySync } = require('otplib');
 const pool = require('../db/pool');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const { logActivity } = require('../lib/activityLog');
-const { saveFile } = require('../lib/fileStorage');
+const logger = require('../lib/logger');
+const { saveFile, deleteFile } = require('../lib/fileStorage');
 const credentials = require('../lib/credentials');
 const profileFields = require('../lib/profileFields');
 const { profileCompletion } = require('../lib/profileCompletion');
+const portfolio = require('../lib/portfolio');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -335,6 +337,14 @@ router.post('/avatar', upload.single('avatar'), async (req, res, next) => {
     if (!detected) {
       return res.status(400).json({ error: 'File content does not match an allowed image type (PNG, JPG, WEBP, GIF)' });
     }
+    // Read the outgoing avatar BEFORE overwriting the column, so the old
+    // object can be removed. Without this every avatar change left its
+    // predecessor in R2 for good — invisible, unreferenced, and billed.
+    const { rows: prev } = await pool.query(
+      'SELECT avatar_url FROM user_profiles WHERE user_id = $1', [req.user.id]
+    );
+    const previousUrl = prev[0]?.avatar_url || null;
+
     const filename = `${req.user.id}-${Date.now()}.${detected.ext}`;
     const avatarUrl = await saveFile('profile', filename, req.file.buffer, detected.mime,
       { organizationId: req.user.organization_id, uploadedBy: req.user.id });
@@ -346,11 +356,231 @@ router.post('/avatar', upload.single('avatar'), async (req, res, next) => {
        SET avatar_url = EXCLUDED.avatar_url, updated_at = NOW()`,
       [req.user.id, avatarUrl]
     );
+
+    // After the row points at the new object, never before: a delete that ran
+    // first and then failed to save would leave the profile pointing at a file
+    // that no longer exists. Fire-and-forget for the same reason the storage
+    // ledger is — a failed cleanup must not fail an upload that has already
+    // succeeded. The stale object stays in storage_objects and can be reaped.
+    if (previousUrl && previousUrl !== avatarUrl) {
+      const previousKey = previousUrl.replace(/^\/uploads\//, '');
+      Promise.resolve(deleteFile(previousKey)).catch((err) =>
+        logger.warn({ err: err.message, key: previousKey }, 'old avatar cleanup failed (non-critical)'));
+    }
     await logActivity(req, 'profile.avatar.update', 'user', req.user.id);
     res.json({ avatarUrl });
   } catch (err) {
     next(err);
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PORTFOLIO
+//
+//  Every route here is scoped by `user_id = req.user.id`, which is inherently
+//  tenant-scoped — a row belongs to exactly one person. organization_id is
+//  stamped from the session on insert so routes/uploads.js can resolve a
+//  served object key back to an owner without a join.
+//
+//  ── Ordering of writes, and why ──────────────────────────────────────────
+//
+//  UPLOAD: file first, row second, and the key deleted in the catch. If the
+//  INSERT fails, the orphan is one ledger entry an operator can reap.
+//
+//  DELETE: row first, file second. A failed file delete leaks an object that
+//  storage_objects still knows about. The inverse leaves a row pointing at
+//  nothing — a permanently broken tile whose delete button already "worked",
+//  which is the worse of the two.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const portfolioUpload = multer({
+  storage: multer.memoryStorage(),
+  // The route enforces the real per-kind limits; this is the outer wall so a
+  // large body is rejected before it is buffered.
+  limits: { fileSize: portfolio.LIMITS.imageBytes, files: 2 },
+});
+
+async function portfolioRows(userId) {
+  const { rows } = await pool.query(
+    `SELECT * FROM user_portfolio_items
+      WHERE user_id = $1
+      ORDER BY pinned DESC, sort_order ASC, created_at DESC`,
+    [userId]
+  );
+  return rows;
+}
+
+/** Save one image buffer, returning what the row needs. */
+async function saveImage(req, buffer, limitBytes) {
+  const detected = detectImageType(buffer);
+  if (!detected) return { error: 'File content does not match an allowed image type (PNG, JPG, WEBP, GIF)', status: 400 };
+  const quota = portfolio.checkQuota({ currentCount: 0, bytes: buffer.length, limitBytes });
+  if (quota.error) return quota;
+
+  // Its own UUID, not the row's: a before/after holds two objects, and
+  // uploads.js resolves ownership by looking the key up directly.
+  const key = `portfolio/${crypto.randomUUID()}.${detected.ext}`;
+  const url = await saveFile('portfolio', key.split('/')[1], buffer, detected.mime,
+    { organizationId: req.user.organization_id, uploadedBy: req.user.id });
+  return { value: { key, url, mime: detected.mime, bytes: buffer.length } };
+}
+
+router.get('/portfolio', async (req, res, next) => {
+  try {
+    res.json((await portfolioRows(req.user.id)).map(portfolio.present));
+  } catch (err) { next(err); }
+});
+
+router.post('/portfolio', portfolioUpload.fields([
+  { name: 'file', maxCount: 1 }, { name: 'after', maxCount: 1 },
+]), async (req, res, next) => {
+  const written = [];
+  try {
+    const kind = String(req.body.kind || 'image');
+    if (!portfolio.KINDS.includes(kind)) return res.status(400).json({ error: 'Unknown item kind' });
+
+    const existing = await portfolioRows(req.user.id);
+    const cap = portfolio.checkQuota({
+      currentCount: existing.length,
+      bytes: req.files?.file?.[0]?.buffer?.length ?? 0,
+      limitBytes: kind === 'video_link' ? portfolio.LIMITS.posterBytes : portfolio.LIMITS.imageBytes,
+    });
+    if (cap.error) return res.status(cap.status).json({ error: cap.error });
+
+    const { value: meta } = portfolio.validateMeta(req.body);
+
+    // Every kind needs a primary image: for a video_link it is the poster,
+    // because a card with no picture is a grey box in a gallery.
+    const primary = await saveImage(req, req.files.file[0].buffer,
+      kind === 'video_link' ? portfolio.LIMITS.posterBytes : portfolio.LIMITS.imageBytes);
+    if (primary.error) return res.status(primary.status).json({ error: primary.error });
+    written.push(primary.value.key);
+
+    let after = null;
+    let externalUrl = null;
+
+    if (kind === 'before_after') {
+      if (!req.files?.after?.[0]) return res.status(400).json({ error: 'A before/after needs both images' });
+      const second = await saveImage(req, req.files.after[0].buffer, portfolio.LIMITS.imageBytes);
+      if (second.error) return res.status(second.status).json({ error: second.error });
+      written.push(second.value.key);
+      after = second.value;
+    } else if (kind === 'video_link') {
+      const parsed = portfolio.parseVideoUrl(req.body.external_url);
+      if (parsed.error) return res.status(400).json({ error: parsed.error });
+      externalUrl = parsed.value.url;
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO user_portfolio_items
+         (user_id, organization_id, kind, title, caption,
+          file_key, file_url, mime_type, file_size_bytes,
+          after_file_key, after_file_url, after_mime_type, after_file_size_bytes,
+          external_url, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+               COALESCE((SELECT MAX(sort_order) + 1 FROM user_portfolio_items WHERE user_id = $1), 0))
+       RETURNING *`,
+      [req.user.id, req.user.organization_id || null, kind, meta.title, meta.caption,
+       primary.value.key, primary.value.url, primary.value.mime, primary.value.bytes,
+       after?.key || null, after?.url || null, after?.mime || null, after?.bytes ?? null,
+       externalUrl]
+    );
+
+    await logActivity(req, 'profile.portfolio.add', 'user', req.user.id, { kind });
+    res.status(201).json(portfolio.present(rows[0]));
+  } catch (err) {
+    // The files landed but the row did not. Remove them rather than leave
+    // objects nothing will ever reference.
+    for (const key of written) {
+      Promise.resolve(deleteFile(key)).catch(() => {});
+    }
+    next(err);
+  }
+});
+
+router.patch('/portfolio/:id', async (req, res, next) => {
+  try {
+    const { rows: found } = await pool.query(
+      'SELECT * FROM user_portfolio_items WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+    // 404 rather than 403 for someone else's item: a 403 confirms the id
+    // exists, which is information the caller has no business having.
+    if (!found.length) return res.status(404).json({ error: 'Item not found' });
+
+    const sets = [];
+    const params = [req.params.id, req.user.id];
+    const put = (col, v) => { params.push(v); sets.push(`${col} = $${params.length}`); };
+
+    // Same partial rule as PUT /me: omitted means untouched.
+    if (req.body.title !== undefined) put('title', portfolio.validateMeta(req.body).value.title);
+    if (req.body.caption !== undefined) put('caption', portfolio.validateMeta(req.body).value.caption);
+
+    if (req.body.pinned !== undefined) {
+      const want = Boolean(req.body.pinned);
+      if (want && !found[0].pinned) {
+        const { rows: c } = await pool.query(
+          'SELECT count(*)::int n FROM user_portfolio_items WHERE user_id = $1 AND pinned', [req.user.id]
+        );
+        const lim = portfolio.checkPinLimit(c[0].n);
+        if (lim.error) return res.status(lim.status).json({ error: lim.error });
+      }
+      put('pinned', want);
+    }
+
+    if (!sets.length) return res.json(portfolio.present(found[0]));
+    sets.push('updated_at = now()');
+    const { rows } = await pool.query(
+      `UPDATE user_portfolio_items SET ${sets.join(', ')} WHERE id = $1 AND user_id = $2 RETURNING *`,
+      params
+    );
+    res.json(portfolio.present(rows[0]));
+  } catch (err) { next(err); }
+});
+
+router.delete('/portfolio/:id', async (req, res, next) => {
+  try {
+    // DELETE ... RETURNING: one statement that both removes the row and hands
+    // back the keys, so two concurrent deletes cannot both try to remove the
+    // same objects.
+    const { rows } = await pool.query(
+      'DELETE FROM user_portfolio_items WHERE id = $1 AND user_id = $2 RETURNING file_key, after_file_key',
+      [req.params.id, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+
+    for (const key of [rows[0].file_key, rows[0].after_file_key].filter(Boolean)) {
+      Promise.resolve(deleteFile(key)).catch((err) =>
+        logger.warn({ err: err.message, key }, 'portfolio object cleanup failed (non-critical)'));
+    }
+    await logActivity(req, 'profile.portfolio.remove', 'user', req.user.id, {});
+    res.json({ id: req.params.id, removed: true });
+  } catch (err) { next(err); }
+});
+
+router.put('/portfolio/order', async (req, res, next) => {
+  try {
+    const existing = await portfolioRows(req.user.id);
+    const check = portfolio.validateOrder(req.body.ids, existing.map((r) => r.id));
+    if (check.error) {
+      // A 409 carries the current list so a stale tab can re-render from truth
+      // instead of guessing what it missed.
+      return res.status(check.status).json({
+        error: check.error,
+        ...(check.status === 409 ? { items: existing.map(portfolio.present) } : {}),
+      });
+    }
+
+    // One statement, so a failure part-way cannot leave half an order applied.
+    const values = check.value.map((_, i) => `($${i + 2}::uuid, ${i})`).join(', ');
+    await pool.query(
+      `UPDATE user_portfolio_items p SET sort_order = v.ord, updated_at = now()
+         FROM (VALUES ${values}) AS v(id, ord)
+        WHERE p.id = v.id AND p.user_id = $1`,
+      [req.user.id, ...check.value]
+    );
+    res.json((await portfolioRows(req.user.id)).map(portfolio.present));
+  } catch (err) { next(err); }
 });
 
 router.put('/password', async (req, res, next) => {
