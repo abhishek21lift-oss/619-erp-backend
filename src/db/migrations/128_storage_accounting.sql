@@ -65,3 +65,42 @@ CREATE TABLE IF NOT EXISTS storage_accounting_meta (
   measuring_since TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 INSERT INTO storage_accounting_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+-- ── Row Level Security (added retroactively — audit finding C-01) ────
+--
+-- This migration created the table(s) below without RLS, leaving them
+-- reachable through PostgREST with the publishable key. Migration 131
+-- swept the live database, but 131 sorts BEFORE this file: a database
+-- rebuilt from scratch would run the sweep first and then recreate the
+-- gap here. Declaring it in the migration that owns the table makes it
+-- order-independent and self-contained.
+--
+-- Idempotent; already-applied databases are unaffected.
+
+ALTER TABLE storage_objects ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON storage_objects FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'storage_objects'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON storage_objects
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+ALTER TABLE storage_accounting_meta ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON storage_accounting_meta FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'storage_accounting_meta'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON storage_accounting_meta
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;

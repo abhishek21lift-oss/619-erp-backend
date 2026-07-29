@@ -135,3 +135,56 @@ ON CONFLICT (key) DO UPDATE
 INSERT INTO plan_features (plan_code, feature_key, enabled)
 SELECT p.code, f.key, TRUE FROM subscription_plans p CROSS JOIN platform_features f
 ON CONFLICT (plan_code, feature_key) DO NOTHING;
+
+-- ── Row Level Security (added retroactively — audit finding C-01) ────
+--
+-- This migration created the table(s) below without RLS, leaving them
+-- reachable through PostgREST with the publishable key. Migration 131
+-- swept the live database, but 131 sorts BEFORE this file: a database
+-- rebuilt from scratch would run the sweep first and then recreate the
+-- gap here. Declaring it in the migration that owns the table makes it
+-- order-independent and self-contained.
+--
+-- Idempotent; already-applied databases are unaffected.
+
+ALTER TABLE platform_features ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON platform_features FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'platform_features'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON platform_features
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+ALTER TABLE plan_features ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON plan_features FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'plan_features'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON plan_features
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+ALTER TABLE organization_features ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON organization_features FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'organization_features'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON organization_features
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;

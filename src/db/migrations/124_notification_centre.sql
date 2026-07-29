@@ -106,3 +106,28 @@ CREATE INDEX IF NOT EXISTS idx_announcements_status  ON platform_announcements(s
 -- The dispatcher's only query: what is due right now.
 CREATE INDEX IF NOT EXISTS idx_announcements_due     ON platform_announcements(scheduled_for)
   WHERE status = 'scheduled';
+
+-- ── Row Level Security (added retroactively — audit finding C-01) ────
+--
+-- This migration created the table(s) below without RLS, leaving them
+-- reachable through PostgREST with the publishable key. Migration 131
+-- swept the live database, but 131 sorts BEFORE this file: a database
+-- rebuilt from scratch would run the sweep first and then recreate the
+-- gap here. Declaring it in the migration that owns the table makes it
+-- order-independent and self-contained.
+--
+-- Idempotent; already-applied databases are unaffected.
+
+ALTER TABLE platform_announcements ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON platform_announcements FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'platform_announcements'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON platform_announcements
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;

@@ -108,3 +108,42 @@ CREATE INDEX IF NOT EXISTS idx_tickets_org    ON support_tickets (organization_i
 CREATE INDEX IF NOT EXISTS idx_tickets_assignee ON support_tickets (assigned_to, status)
   WHERE assigned_to IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ticket_messages ON support_ticket_messages (ticket_id, created_at);
+
+-- ── Row Level Security (added retroactively — audit finding C-01) ────
+--
+-- This migration created the table(s) below without RLS, leaving them
+-- reachable through PostgREST with the publishable key. Migration 131
+-- swept the live database, but 131 sorts BEFORE this file: a database
+-- rebuilt from scratch would run the sweep first and then recreate the
+-- gap here. Declaring it in the migration that owns the table makes it
+-- order-independent and self-contained.
+--
+-- Idempotent; already-applied databases are unaffected.
+
+ALTER TABLE support_tickets ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON support_tickets FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'support_tickets'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON support_tickets
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+ALTER TABLE support_ticket_messages ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON support_ticket_messages FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'support_ticket_messages'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON support_ticket_messages
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;

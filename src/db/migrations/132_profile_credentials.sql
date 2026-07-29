@@ -84,3 +84,28 @@ BEGIN
          AND jsonb_typeof(certifications) = 'array');
   END IF;
 END $$;
+
+-- ── Row Level Security (added retroactively — audit finding C-01) ────
+--
+-- This migration created the table(s) below without RLS, leaving them
+-- reachable through PostgREST with the publishable key. Migration 131
+-- swept the live database, but 131 sorts BEFORE this file: a database
+-- rebuilt from scratch would run the sweep first and then recreate the
+-- gap here. Declaring it in the migration that owns the table makes it
+-- order-independent and self-contained.
+--
+-- Idempotent; already-applied databases are unaffected.
+
+ALTER TABLE user_profiles ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON user_profiles FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'user_profiles'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON user_profiles
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;

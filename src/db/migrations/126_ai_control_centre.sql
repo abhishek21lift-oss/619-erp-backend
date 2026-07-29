@@ -80,3 +80,56 @@ CREATE TABLE IF NOT EXISTS organization_ai_limits (
 -- joins through users. Both sides of that join need to be cheap.
 CREATE INDEX IF NOT EXISTS ai_usage_created_idx ON ai_usage_log (created_at DESC);
 CREATE INDEX IF NOT EXISTS ai_usage_provider_idx ON ai_usage_log (provider, created_at DESC);
+
+-- ── Row Level Security (added retroactively — audit finding C-01) ────
+--
+-- This migration created the table(s) below without RLS, leaving them
+-- reachable through PostgREST with the publishable key. Migration 131
+-- swept the live database, but 131 sorts BEFORE this file: a database
+-- rebuilt from scratch would run the sweep first and then recreate the
+-- gap here. Declaring it in the migration that owns the table makes it
+-- order-independent and self-contained.
+--
+-- Idempotent; already-applied databases are unaffected.
+
+ALTER TABLE ai_platform_settings ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON ai_platform_settings FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'ai_platform_settings'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON ai_platform_settings
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+ALTER TABLE ai_model_rates ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON ai_model_rates FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'ai_model_rates'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON ai_model_rates
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+ALTER TABLE organization_ai_limits ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON organization_ai_limits FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'organization_ai_limits'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON organization_ai_limits
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
