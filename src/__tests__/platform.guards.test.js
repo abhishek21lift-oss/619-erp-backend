@@ -78,14 +78,30 @@ describe('Support Mode — read-only is enforced server-side', () => {
 });
 
 describe('Audit coverage — nothing happens silently', () => {
-  const src = fs.readFileSync(
-    path.join(__dirname, '..', 'modules', 'platform', 'super-admin.routes.js'),
-    'utf8'
-  );
+  // Read every domain router, not one file.
+  //
+  // This used to read super-admin.routes.js directly. Audit H-03 split that
+  // 4,248-line module into src/modules/platform/super-admin/*.js and left the
+  // original path as a mount list, at which point this check found zero routes
+  // and PASSED VACUOUSLY — the "meaningful number of routes" test below is the
+  // only reason that was noticed. Globbing the directory means a new domain
+  // file is covered the moment it is added, with nothing to remember.
+  const DIR = path.join(__dirname, '..', 'modules', 'platform', 'super-admin');
+  const files = fs.readdirSync(DIR)
+    .filter((f) => f.endsWith('.js') && f !== 'shared.js')
+    .sort();
+  const src = files.map((f) => fs.readFileSync(path.join(DIR, f), 'utf8')).join('\n');
 
   // The single documented exception: it resolves who WOULD receive an
   // announcement and writes nothing. A POST only because it needs a body.
   const READ_ONLY_POSTS = ['/announcements/:id/preview'];
+
+  it('found the domain routers to read', () => {
+    // Guards the glob itself: a rename or a moved directory must fail loudly
+    // rather than quietly reducing this suite to nothing.
+    expect(files.length).toBeGreaterThan(10);
+    expect(files).toContain('organizations.js');
+  });
 
   it('audits every mutating super-admin route', () => {
     const parts = src.split(/\nrouter\.(get|post|put|patch|delete)\('([^']+)'/);
