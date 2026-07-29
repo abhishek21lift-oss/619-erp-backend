@@ -45,3 +45,40 @@ services:
         sync: false
       - key: CORS_ORIGIN
         sync: false
+      # ── Email ────────────────────────────────────────────────────────────
+      # Without these three, lib/email.js isConfigured() is false and every
+      # outgoing message is skipped: admin invitations, password-reset links,
+      # and the Control Centre's "email them a link" button. The public
+      # forgot-password endpoint still answers "a reset link has been sent",
+      # because it must not reveal whether an address is registered — so a
+      # missing value here is invisible from the outside. Declared (rather
+      # than omitted) so the requirement is part of the deployment contract
+      # instead of folklore.
+      #
+      # Values are per-deployment, not secrets-only: SMTP_HOST and SMTP_USER
+      # depend on whichever mailbox this instance sends from, so guessing them
+      # here would produce a service that boots fine and silently fails to
+      # send. Set all of them in the Render dashboard.
+      #
+      # Verify before trusting it — `npm run verify:smtp you@example.com`
+      # sends a real message using exactly these variables.
+      - key: SMTP_HOST
+        sync: false
+      # 465 selects implicit TLS, anything else STARTTLS (lib/email.js:
+      # `secure: SMTP_PORT === 465`). Unset means 587. It is listed here
+      # because the right value is a property of SMTP_HOST, not a default.
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      # The From address. Must be one the mailbox above is allowed to send as,
+      # or the provider rejects the message outright.
+      - key: SMTP_FROM
+        sync: false
+      # From address for invitations specifically — the one message a
+      # recipient is asked to trust, so it goes from something replyable
+      # rather than a noreply. Falls back to SMTP_FROM when unset.
+      - key: EMAIL_FROM
+        sync: false
