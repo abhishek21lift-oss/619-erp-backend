@@ -40,6 +40,45 @@ if (missingRecommended.length) {
   logger.warn({ missing: missingRecommended }, 'Recommended env vars not set — some features may be degraded');
 }
 
+// ── Email (SMTP) ────────────────────────────────────────────────────────────
+// lib/email.js sends nothing at all unless SMTP_HOST, SMTP_USER and SMTP_PASS
+// are ALL set. The reason that deserves a boot-time announcement rather than a
+// line in a runbook is that it is invisible from every other angle: the
+// service starts clean, passes its health check, serves every request, and
+// silently drops admin invitations, password-reset links and the Control
+// Centre's "email them a link". /auth/forgot-password even answers "if the
+// email exists, a reset link has been sent" — it must not reveal whether an
+// address is registered — so the first symptom is a person who cannot get
+// back into their account and no log line explaining why.
+//
+// Warned, never fatal — deliberately unlike the R2 check below. R2 silently
+// destroys uploaded files, so refusing to boot is the lesser harm. Email being
+// down does not lose data: check-ins, billing and client management all work
+// fine without it. Taking the whole platform offline over a mail typo would be
+// a bigger outage than the one it prevents.
+const emailConfig = require('./lib/email').describeConfig();
+if (emailConfig.state === 'partial') {
+  // Always an outright mistake — somebody set some of them and stopped.
+  logger.error(
+    { set: emailConfig.set, missing: emailConfig.missing },
+    'SMTP is PARTIALLY configured, so no email will be sent at all. '
+    + 'Invitations, password resets and set-password links will fail silently. '
+    + 'Set all three, or none.'
+  );
+} else if (emailConfig.state === 'absent') {
+  // In development this is the ordinary case and only worth a note. In
+  // production it means password recovery does not work for anyone.
+  const log = isProd ? logger.error : logger.warn;
+  log.call(
+    logger,
+    { missing: emailConfig.missing },
+    isProd
+      ? 'SMTP is not configured in production — nobody can recover a password '
+        + 'and no invitation will arrive. Verify with `npm run verify:smtp <address>`.'
+      : 'SMTP is not configured — outgoing email is disabled (normal in local development).'
+  );
+}
+
 // ── Cloudflare R2 object storage ────────────────────────────────────────────
 // lib/fileStorage.js falls back to local disk whenever R2 is not fully
 // configured. On Render the filesystem is ephemeral, so that fallback silently

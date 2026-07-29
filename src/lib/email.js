@@ -173,7 +173,29 @@ async function sendAdminInvitation({ to, ownerName, studioName, actionUrl, pixel
   }, { to, kind: 'admin_invitation' });
 }
 
+/** The three variables isConfigured() requires, in the order to report them. */
+const REQUIRED_VARS = ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS'];
+
+/**
+ * What state the mail configuration is in, as data rather than a log line.
+ *
+ * Split out from the boot check so the decision is testable without booting a
+ * server — server.js reads a database, binds a port, and exits the process on
+ * several paths, none of which a unit test can sit through.
+ *
+ * Reads process.env at CALL time, not module load, so a test can set a
+ * variable and ask again.
+ *
+ * @returns {{state:'configured'|'partial'|'absent', set:string[], missing:string[]}}
+ */
+function describeConfig(env = process.env) {
+  const set = REQUIRED_VARS.filter((k) => Boolean(env[k]));
+  const missing = REQUIRED_VARS.filter((k) => !env[k]);
+  if (set.length === REQUIRED_VARS.length) return { state: 'configured', set, missing };
+  return { state: set.length > 0 ? 'partial' : 'absent', set, missing };
+}
+
 module.exports = {
   sendPasswordReset, sendAdminResetOtp, sendAdminInvitation,
-  isConfigured, sendWithRetry, isTransient,
+  isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,
 };
