@@ -71,7 +71,10 @@ describe('describeConfig', () => {
   it('agrees with isConfigured() on every combination', () => {
     // The two must never disagree: one decides whether to send, the other
     // decides whether to warn about not sending.
-    const { isConfigured } = require('../lib/email');
+    //
+    // Deliberately not destructured up here: isConfigured() closes over
+    // values read at module load, so the binding would be stale for every
+    // iteration below. The loop re-requires the module each time instead.
     const saved = { ...process.env };
     try {
       for (const bits of [0, 1, 2, 3, 4, 5, 6, 7]) {
