@@ -14,6 +14,7 @@ const pool = require('../db/pool');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const { logActivity } = require('../lib/activityLog');
 const { saveFile } = require('../lib/fileStorage');
+const credentials = require('../lib/credentials');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -89,6 +90,10 @@ async function ensureSchema() {
         preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
         mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
         mfa_secret TEXT,
+        job_title TEXT,
+        experience_since DATE,
+        specialisations JSONB NOT NULL DEFAULT '[]'::jsonb,
+        certifications JSONB NOT NULL DEFAULT '[]'::jsonb,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
@@ -102,7 +107,8 @@ async function profileFor(userId) {
   const { rows } = await pool.query(
     `SELECT u.id, u.name, u.email, u.role, u.created_at, u.last_login,
             p.phone, p.location, p.bio, p.avatar_url,
-            p.notification_preferences, p.preferences, p.mfa_enabled
+            p.notification_preferences, p.preferences, p.mfa_enabled,
+            p.job_title, p.experience_since, p.specialisations, p.certifications
        FROM users u
   LEFT JOIN user_profiles p ON p.user_id = u.id
       WHERE u.id = $1`,
@@ -112,6 +118,8 @@ async function profileFor(userId) {
 }
 
 function shapeProfile(row) {
+  const since = row.experience_since
+    ? new Date(row.experience_since).toISOString().slice(0, 10) : null;
   return {
     id: row.id,
     name: row.name || '',
@@ -124,6 +132,21 @@ function shapeProfile(row) {
     createdAt: row.created_at,
     lastLoginAt: row.last_login,
     mfaEnabled: Boolean(row.mfa_enabled),
+    jobTitle: row.job_title || '',
+    // Normalise ONCE and derive from that. node-postgres hands a DATE column
+    // back as a Date object, not a 'YYYY-MM-DD' string, and passing the raw
+    // value to yearsOfExperience() made it reject its own stored date and
+    // report null years for everyone.
+    experienceSince: since,
+    // A date in, a duration out. See lib/credentials.js — storing "8 years"
+    // is wrong twelve months later and nobody comes back to correct it.
+    yearsExperience: credentials.yearsOfExperience(since),
+    specialisations: Array.isArray(row.specialisations) ? row.specialisations : [],
+    // Each certificate arrives with its expiry status already decided. The
+    // browser's clock is not evidence of whether someone is currently
+    // qualified to take a session.
+    certifications: credentials.presentCertifications(row.certifications),
+    credentialSummary: credentials.credentialSummary(row.certifications),
   };
 }
 
@@ -158,17 +181,54 @@ router.put('/me', async (req, res, next) => {
     );
     if (existing.rows.length) return res.status(409).json({ error: 'Email already registered' });
 
+    // Professional credentials. Each field is only touched when the client
+    // actually sent it — a PUT from an older client, or from a form that does
+    // not show these, must not blank someone's certifications.
+    const jobTitle = req.body.job_title === undefined
+      ? undefined : credentials.cleanText(req.body.job_title, credentials.LIMITS.job_title);
+
+    let experienceSince;
+    if (req.body.experience_since !== undefined) {
+      experienceSince = credentials.cleanDate(req.body.experience_since);
+      if (experienceSince === undefined) return res.status(400).json({ error: 'Invalid experience start date' });
+    }
+
+    let specialisations;
+    if (req.body.specialisations !== undefined) {
+      const r = credentials.validateSpecialisations(req.body.specialisations);
+      if (r.error) return res.status(400).json({ error: r.error });
+      specialisations = r.value;
+    }
+
+    let certs;
+    if (req.body.certifications !== undefined) {
+      const r = credentials.validateCertifications(req.body.certifications);
+      if (r.error) return res.status(400).json({ error: r.error });
+      certs = r.value;
+    }
+
     await pool.query('UPDATE users SET name = $1, email = $2, updated_at = NOW() WHERE id = $3', [name, email, req.user.id]);
-    await pool.query(
-      `INSERT INTO user_profiles (user_id, phone, location, bio, updated_at)
-       VALUES ($1,$2,$3,$4,NOW())
-       ON CONFLICT (user_id) DO UPDATE
-       SET phone = EXCLUDED.phone,
-           location = EXCLUDED.location,
-           bio = EXCLUDED.bio,
-           updated_at = NOW()`,
-      [req.user.id, phone, location, bio]
-    );
+
+    // Guarantee the row, then UPDATE only the columns this request carried.
+    //
+    // The obvious shape — one INSERT ... ON CONFLICT with COALESCE on each
+    // value — cannot express the difference between "the client omitted this
+    // field" and "the client cleared it", because both arrive as NULL and
+    // COALESCE keeps the old value for each. That would make an experience
+    // date, once set, impossible to erase. Building the SET list from what was
+    // actually sent keeps both meanings.
+    await pool.query('INSERT INTO user_profiles (user_id) VALUES ($1) ON CONFLICT DO NOTHING', [req.user.id]);
+
+    const sets = ['phone = $2', 'location = $3', 'bio = $4', 'updated_at = NOW()'];
+    const params = [req.user.id, phone, location, bio];
+    const put = (sql, value) => { params.push(value); sets.push(`${sql} = $${params.length}`); };
+
+    if (jobTitle !== undefined) put('job_title', jobTitle);
+    if (experienceSince !== undefined) put('experience_since', experienceSince);
+    if (specialisations !== undefined) put('specialisations', JSON.stringify(specialisations));
+    if (certs !== undefined) put('certifications', JSON.stringify(certs));
+
+    await pool.query(`UPDATE user_profiles SET ${sets.join(', ')} WHERE user_id = $1`, params);
     invalidateUserCache(req.user.id);
     await logActivity(req, 'profile.update', 'user', req.user.id, { name, email });
     const row = await profileFor(req.user.id);
