@@ -8,9 +8,22 @@
 
 const { WEIGHTS, MIN, profileCompletion, credentialAttention } = require('../lib/profileCompletion');
 
+/**
+ * Which row property each weight key reads, where the two differ.
+ *
+ * Kept as an explicit table rather than inferred: a key whose column was
+ * renamed would otherwise silently start reading `undefined`, every `done`
+ * would return false, and the suite below would keep passing while every
+ * profile on the platform scored zero for that field.
+ */
+const COLUMN = { avatar: 'avatar_url', cover: 'cover_url', portfolio: 'portfolio_count' };
+const columnFor = (key) => COLUMN[key] || key;
+
 /** A profile with every scored field satisfied. */
 const complete = () => ({
   avatar_url: '/uploads/profile/a.png',
+  cover_url: '/uploads/profile/cover-a.png',
+  portfolio_count: MIN.portfolio,
   phone: '9876543210',
   location: 'Kanpur',
   bio: 'x'.repeat(MIN.bio),
@@ -47,15 +60,18 @@ describe('the weight table', () => {
     expect(byKey.bio).toContain(String(MIN.bio));
     expect(byKey.philosophy).toContain(String(MIN.philosophy));
     expect(byKey.specialisations).toContain(String(MIN.specialisations));
+    expect(byKey.portfolio).toContain(String(MIN.portfolio));
   });
 
   it('scores nothing the user cannot yet fill', () => {
-    // Cover banner and portfolio have columns but no upload path. Scoring them
-    // would park everyone below 100 with a step they cannot take, and a
-    // checklist you cannot finish stops being read.
-    const keys = WEIGHTS.map((w) => w.key);
-    expect(keys).not.toContain('cover');
-    expect(keys).not.toContain('portfolio');
+    // The rule that kept cover and portfolio out of the table until their
+    // uploads shipped, stated as an assertion rather than a comment: every
+    // scored key must have somewhere to be filled in, named by `tab`.
+    for (const w of WEIGHTS) {
+      expect({ key: w.key, tab: w.tab }).toEqual({
+        key: w.key, tab: expect.stringMatching(/^(overview|credentials|portfolio)$/),
+      });
+    }
   });
 });
 
@@ -111,12 +127,14 @@ describe('profileCompletion', () => {
     const full = profileCompletion(complete());
     for (const w of WEIGHTS) {
       const p = complete();
-      // Clear this one field in whichever shape it takes.
-      const empty = { avatar_url: null, experience_since: null };
-      p[w.key === 'avatar' ? 'avatar_url' : w.key] =
-        empty[w.key === 'avatar' ? 'avatar_url' : w.key] !== undefined
-          ? null
-          : (Array.isArray(p[w.key]) ? [] : (typeof p[w.key] === 'object' && p[w.key] ? {} : ''));
+      // Clear this one field in whichever shape it takes — a count goes to
+      // zero, a list to empty, a map to {}, text to ''.
+      const col = columnFor(w.key);
+      const current = p[col];
+      p[col] = Array.isArray(current) ? []
+        : typeof current === 'number' ? 0
+          : (current && typeof current === 'object') ? {}
+            : '';
       const r = profileCompletion(p);
       expect({ key: w.key, earned: r.earned }).toEqual({ key: w.key, earned: full.earned - w.weight });
     }
@@ -165,14 +183,14 @@ describe('profileCompletion', () => {
     // The fastest route to a better profile, not a walk down the form.
     const r = profileCompletion({});
     expect(r.nextSteps).toHaveLength(3);
-    expect(r.nextSteps.map((s) => s.weight)).toEqual([12, 10, 8]);
+    expect(r.nextSteps.map((s) => s.weight)).toEqual([11, 9, 7]);
     const weights = r.nextSteps.map((s) => s.weight);
     expect([...weights].sort((a, b) => b - a)).toEqual(weights);
   });
 
   it('tells the UI which tab each step lives on', () => {
     for (const s of profileCompletion({}).nextSteps) {
-      expect(['overview', 'credentials']).toContain(s.tab);
+      expect(['overview', 'credentials', 'portfolio']).toContain(s.tab);
     }
   });
 });

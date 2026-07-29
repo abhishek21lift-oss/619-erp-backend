@@ -126,7 +126,11 @@ async function profileFor(userId) {
             p.job_title, p.experience_since, p.specialisations, p.certifications,
             p.cover_url, p.designation, p.philosophy, p.training_style, p.current_gym,
             p.languages, p.coaching_modes, p.previous_gyms, p.education,
-            p.achievements, p.working_hours
+            p.achievements, p.working_hours,
+            -- Completion scores the portfolio, and a count is all it needs.
+            -- Fetching the rows here would put a 30-item gallery inside every
+            -- profile read for one integer; the gallery has its own endpoint.
+            (SELECT count(*) FROM user_portfolio_items i WHERE i.user_id = u.id) AS portfolio_count
        FROM users u
   LEFT JOIN user_profiles p ON p.user_id = u.id
       WHERE u.id = $1`,
@@ -185,6 +189,10 @@ function shapeProfile(row) {
     // Derived, so the UI never has to add up a week of split shifts itself
     // and then disagree with the next screen that tries.
     weeklyMinutes: profileFields.weeklyMinutes(row.working_hours),
+    // count(*) is a BIGINT, which node-postgres hands back as a string. Left
+    // as one it would render "3" correctly and compare as "3" > 30, so it is
+    // coerced once here rather than at each place that reads it.
+    portfolioCount: Number(row.portfolio_count || 0),
 
     // The percentage and the checklist come from ONE call over one weight
     // table, so the ring and the next-step list can never disagree about the
@@ -327,48 +335,133 @@ function detectImageType(buf) {
   return null;
 }
 
+/**
+ * Remove an object a profile column no longer points at.
+ *
+ * Fire-and-forget, for the same reason the storage ledger is: a failed cleanup
+ * must not fail an upload that has already succeeded. The object stays in
+ * storage_objects, so it is still accounted for and can be reaped.
+ */
+function forgetObject(url, what) {
+  if (!url) return;
+  const key = String(url).replace(/^\/uploads\//, '');
+  Promise.resolve(deleteFile(key)).catch((err) =>
+    logger.warn({ err: err.message, key }, `old ${what} cleanup failed (non-critical)`));
+}
+
+/**
+ * Point a single-image profile column at a new object, and remove the one it
+ * replaced.
+ *
+ * Avatar and cover are the same operation on two columns, and the part worth
+ * sharing is the ORDER: read the outgoing URL, save the new object, write the
+ * row, and only then delete. A delete that ran first and then failed to save
+ * would leave the profile pointing at a file that no longer exists.
+ *
+ * `column` is interpolated into the SQL, so it is a literal from the two call
+ * sites below and never anything a request can influence.
+ *
+ * @returns {{value:string}|{error:string, status:number}}
+ */
+async function swapProfileImage(req, { column, buffer, prefix = '' }) {
+  // M-06: verify magic bytes — MIME header alone can be spoofed
+  const detected = detectImageType(buffer);
+  if (!detected) {
+    return { error: 'File content does not match an allowed image type (PNG, JPG, WEBP, GIF)', status: 400 };
+  }
+
+  // Read the outgoing object BEFORE overwriting the column. Without this every
+  // change left its predecessor in R2 for good — invisible, unreferenced, and
+  // billed.
+  const { rows: prev } = await pool.query(
+    `SELECT ${column} AS url FROM user_profiles WHERE user_id = $1`, [req.user.id]
+  );
+  const previousUrl = prev[0]?.url || null;
+
+  const filename = `${prefix}${req.user.id}-${Date.now()}.${detected.ext}`;
+  const url = await saveFile('profile', filename, buffer, detected.mime,
+    { organizationId: req.user.organization_id, uploadedBy: req.user.id });
+
+  await pool.query(
+    `INSERT INTO user_profiles (user_id, ${column}, updated_at)
+     VALUES ($1,$2,NOW())
+     ON CONFLICT (user_id) DO UPDATE
+     SET ${column} = EXCLUDED.${column}, updated_at = NOW()`,
+    [req.user.id, url]
+  );
+
+  if (previousUrl && previousUrl !== url) forgetObject(previousUrl, column);
+  return { value: url };
+}
+
 router.post('/avatar', upload.single('avatar'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Avatar file is required' });
     await ensureSchema();
 
-    // M-06: verify magic bytes — MIME header alone can be spoofed
-    const detected = detectImageType(req.file.buffer);
-    if (!detected) {
-      return res.status(400).json({ error: 'File content does not match an allowed image type (PNG, JPG, WEBP, GIF)' });
-    }
-    // Read the outgoing avatar BEFORE overwriting the column, so the old
-    // object can be removed. Without this every avatar change left its
-    // predecessor in R2 for good — invisible, unreferenced, and billed.
-    const { rows: prev } = await pool.query(
-      'SELECT avatar_url FROM user_profiles WHERE user_id = $1', [req.user.id]
-    );
-    const previousUrl = prev[0]?.avatar_url || null;
+    const saved = await swapProfileImage(req, { column: 'avatar_url', buffer: req.file.buffer });
+    if (saved.error) return res.status(saved.status).json({ error: saved.error });
 
-    const filename = `${req.user.id}-${Date.now()}.${detected.ext}`;
-    const avatarUrl = await saveFile('profile', filename, req.file.buffer, detected.mime,
-      { organizationId: req.user.organization_id, uploadedBy: req.user.id });
-
-    await pool.query(
-      `INSERT INTO user_profiles (user_id, avatar_url, updated_at)
-       VALUES ($1,$2,NOW())
-       ON CONFLICT (user_id) DO UPDATE
-       SET avatar_url = EXCLUDED.avatar_url, updated_at = NOW()`,
-      [req.user.id, avatarUrl]
-    );
-
-    // After the row points at the new object, never before: a delete that ran
-    // first and then failed to save would leave the profile pointing at a file
-    // that no longer exists. Fire-and-forget for the same reason the storage
-    // ledger is — a failed cleanup must not fail an upload that has already
-    // succeeded. The stale object stays in storage_objects and can be reaped.
-    if (previousUrl && previousUrl !== avatarUrl) {
-      const previousKey = previousUrl.replace(/^\/uploads\//, '');
-      Promise.resolve(deleteFile(previousKey)).catch((err) =>
-        logger.warn({ err: err.message, key: previousKey }, 'old avatar cleanup failed (non-critical)'));
-    }
     await logActivity(req, 'profile.avatar.update', 'user', req.user.id);
-    res.json({ avatarUrl });
+    res.json({ avatarUrl: saved.value });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// A cover banner is a wide image behind the identity block, so it carries more
+// pixels than an avatar and gets its own ceiling. Same category as the avatar:
+// `profile/` is the public tier in routes/uploads.js, which is correct for both
+// — they are the two images a profile exists to show.
+const coverUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter(_req, file, cb) {
+    if (!/^image\/(png|jpe?g|webp|gif)$/i.test(file.mimetype || '')) {
+      return cb(new Error('Only PNG, JPG, WEBP, or GIF images are allowed'));
+    }
+    cb(null, true);
+  },
+});
+
+router.post('/cover', coverUpload.single('cover'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Cover image is required' });
+    await ensureSchema();
+
+    const saved = await swapProfileImage(req, {
+      column: 'cover_url', buffer: req.file.buffer, prefix: 'cover-',
+    });
+    if (saved.error) return res.status(saved.status).json({ error: saved.error });
+
+    await logActivity(req, 'profile.cover.update', 'user', req.user.id);
+    res.json({ coverUrl: saved.value });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// A cover is decoration, and decoration someone regrets has to be removable —
+// unlike an avatar, which always falls back to initials, a banner they dislike
+// would otherwise be permanent. Column cleared first, object second, matching
+// the portfolio delete: a broken image is worse than a stale object.
+router.delete('/cover', async (req, res, next) => {
+  try {
+    await ensureSchema();
+    // Read then write, rather than one statement with a subquery in RETURNING:
+    // that form's correctness turns on which snapshot the subquery sees, which
+    // is exactly the kind of thing a later reader gets wrong. Two concurrent
+    // deletes would both remove the same key, which is a no-op.
+    const { rows } = await pool.query(
+      'SELECT cover_url FROM user_profiles WHERE user_id = $1', [req.user.id]
+    );
+    await pool.query(
+      'UPDATE user_profiles SET cover_url = NULL, updated_at = NOW() WHERE user_id = $1',
+      [req.user.id]
+    );
+    forgetObject(rows[0]?.cover_url, 'cover_url');
+    await logActivity(req, 'profile.cover.remove', 'user', req.user.id);
+    res.json({ coverUrl: null });
   } catch (err) {
     next(err);
   }
