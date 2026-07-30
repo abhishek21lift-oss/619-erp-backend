@@ -140,7 +140,7 @@ async function auth(req, res, next) {
         return res.status(403).json({
           error: {
             code: 'IMPERSONATION_READONLY',
-            message: 'Read-only impersonation: changes are disabled. Exit impersonation to act as super admin.',
+            message: 'Read-only impersonation: changes are disabled. Exit impersonation to act as admin.',
           },
         });
       }

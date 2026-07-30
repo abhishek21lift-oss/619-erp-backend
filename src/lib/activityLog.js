@@ -17,7 +17,7 @@ async function logActivity(req, action, entityType, entityId, data) {
       payload = {
         ...(data || {}),
         _impersonated_by: req.impersonation.by || null,
-        _impersonated_by_name: req.impersonation.byName || 'Super Admin',
+        _impersonated_by_name: req.impersonation.byName || 'Admin',
       };
     }
     await pool.query(

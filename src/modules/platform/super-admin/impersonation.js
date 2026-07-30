@@ -56,7 +56,7 @@ router.post('/organizations/:id/impersonate', async (req, res, next) => {
       {
         id: target.id,
         token_version: target.token_version,
-        imp: { by: req.user.id, byName: req.user.name || 'Super Admin', ro: readonly, org: org.id },
+        imp: { by: req.user.id, byName: req.user.name || 'Admin', ro: readonly, org: org.id },
       },
       process.env.JWT_SECRET,
       { expiresIn: IMPERSONATION_TTL }
