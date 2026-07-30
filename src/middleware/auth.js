@@ -193,6 +193,28 @@ function adminOrManager(req, res, next) {
   next();
 }
 
+/**
+ * Allows admin, manager OR trainer.
+ *
+ * Programme authoring is a trainer's job. Until now the workout-plan writes
+ * sat behind adminOrManager, so the people the module exists for got a 403 on
+ * every save and a studio owner had to build every programme themselves.
+ *
+ * This is only the ROLE gate. It deliberately does not decide WHICH plan a
+ * trainer may touch — that needs the plan row, so it lives next to the query
+ * that loads it (see loadEditablePlan in routes/workouts.js, which restricts a
+ * trainer to plans they created or that are assigned to a client they train).
+ * Splitting it this way keeps the middleware synchronous and keeps the
+ * ownership rule in one place rather than duplicated across five handlers.
+ */
+function adminManagerOrTrainer(req, res, next) {
+  const role = req.user?.role;
+  if (role !== 'admin' && role !== 'manager' && role !== 'trainer') {
+    return res.status(403).json({ error: 'Admin, manager or trainer access required' });
+  }
+  next();
+}
+
 // FIX (Route Integrity R-09):
 // requireRole and requireSelfOrRole were previously duplicated between
 // auth.js and rbac.js with different signatures and error response shapes:
@@ -209,6 +231,7 @@ module.exports = {
   auth,
   adminOnly,
   adminOrManager,
+  adminManagerOrTrainer,
   requireRole,
   requireSelfOrRole,
   invalidateUserCache,
