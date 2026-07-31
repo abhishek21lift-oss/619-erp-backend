@@ -10,6 +10,7 @@ const svc = require('./pt-os.service');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
+const { buildSnapshot } = require('./client-snapshot');
 
 const ptClientCreateSchema = {
   body: z.object({
@@ -1423,6 +1424,65 @@ router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
   res.json({
     data: buildBrief({
       client, parq, assessment, posture, mobility, lifestyle, goal, assignment, recentSessions: sessions,
+    }),
+  });
+}));
+
+// GET /clients/:id/snapshot
+//
+// What a trainer would otherwise have to remember about this client: whether
+// the term is about to lapse, whether anyone has weighed them lately, whether
+// last week's session happened, where they are against their goal.
+//
+// Every one of these was already derivable from data on the profile screen,
+// and none of it was said out loud — so it lived in somebody's head, and the
+// things that fall out of a head are the ones that cost a renewal.
+router.get('/clients/:id/snapshot', auth, wrap(async (req, res) => {
+  const clientId = req.params.id;
+  const params = [clientId];
+  const orgClause = orgWhere(req, params, 'c.organization_id');
+
+  const { rows: clientRows } = await pool.query(
+    `SELECT c.id, c.name, c.pt_end_date, c.balance_amount, c.organization_id
+       FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
+    params,
+  );
+  const client = clientRows[0];
+  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+
+  const many = (sql) => pool.query(sql, [clientId]).then((r) => r.rows);
+  const one = (sql) => many(sql).then((rows) => rows[0] ?? null);
+
+  const [lifestyle, measurements, assessments, goal, prRows, lastSession] = await Promise.all([
+    one(`SELECT sleep_category, sleep_duration_hours, recovery_score, recovery_risk
+           FROM pt_lifestyle_assessments WHERE client_id = $1
+          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+    many(`SELECT weight_kg, measured_at FROM pt_os_measurements
+           WHERE client_id = $1 AND weight_kg IS NOT NULL
+           ORDER BY measured_at DESC LIMIT 12`),
+    many(`SELECT weight, assessment_date FROM pt_assessments
+           WHERE client_id = $1 AND weight IS NOT NULL
+           ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 12`),
+    one(`SELECT goal_type, priority_goal, target_weight, starting_weight, target_date
+           FROM pt_goals WHERE client_id = $1 AND is_active = true
+          ORDER BY created_at DESC LIMIT 1`),
+    // PR flags are written at log time against everything before them, so this
+    // only reads them — recomputing here would disagree with the log.
+    many(`SELECT wse.exercise_name, s.weight_kg, s.reps, ws.session_date
+            FROM workout_sets s
+            JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+            JOIN workout_sessions ws ON ws.id = wse.session_id
+           WHERE ws.client_id = $1
+             AND (s.is_pr_weight OR s.is_pr_reps OR s.is_pr_volume)
+           ORDER BY ws.session_date DESC LIMIT 60`),
+    one(`SELECT session_date, status FROM workout_sessions
+          WHERE client_id = $1 AND session_date <= CURRENT_DATE
+          ORDER BY session_date DESC LIMIT 1`),
+  ]);
+
+  res.json({
+    data: buildSnapshot({
+      client, lifestyle, measurements, assessments, goal, prRows, lastSession,
     }),
   });
 }));
