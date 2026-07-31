@@ -24,6 +24,7 @@ const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
 const { weekOf, resolveWeek } = require('./progression');
 const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./training-analytics');
+const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -965,6 +966,139 @@ router.delete('/workout-log/landmarks/:muscle',
     // No shared default for this muscle is a legitimate outcome — some ship
     // without one on purpose. The row simply has no range now.
     res.json({ data: rows[0] ?? { target_muscle: req.params.muscle, mev_sets: null, mrv_sets: null, is_custom: false } });
+  }));
+
+// POST /workout-log/weekly-report — build the PDF a trainer sends a client.
+//
+// A POST, not a GET, because it writes a file. Keyed by client and week, so
+// pressing the button twice overwrites rather than littering storage with a
+// file per tap.
+//
+// The trainer's own note is optional and passed in. Everything else is read
+// from the log, and nothing is projected: a progress report is exactly where
+// "at this rate you will squat 140 kg by October" wants to appear, and two
+// months of extrapolation from four points is not a forecast. Inside a PDF it
+// would read as a record rather than as a guess.
+router.post('/workout-log/weekly-report',
+  auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+    const { client_id, week_start, coach_note } = req.body;
+    if (!client_id) return res.status(400).json({ error: { code: 'MISSING_CLIENT_ID' } });
+    if (!await clientInOrg(req, client_id)) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+    }
+
+    const start = weekStart(week_start || new Date().toISOString().slice(0, 10));
+    if (!start) return res.status(400).json({ error: { code: 'INVALID_WEEK' } });
+    const endDate = new Date(`${start}T00:00:00Z`);
+    endDate.setUTCDate(endDate.getUTCDate() + 6);
+    const end = endDate.toISOString().slice(0, 10);
+
+    const scope = tenantScope(req);
+    const orgId = scope.applyFilter ? scope.orgId : null;
+
+    const [clientRows, sessionRows, prRows, setRows, planRows, landmarkRows] = await Promise.all([
+      pool.query(
+        `SELECT c.id, c.name, c.organization_id, o.name AS studio_name
+           FROM pt_clients c LEFT JOIN organizations o ON o.id = c.organization_id
+          WHERE c.id = $1`,
+        [client_id],
+      ),
+      // Volume and set counts per session come from the sets, not from a
+      // stored total — nothing keeps a denormalised total in step with an
+      // edited set, and a report that disagrees with the log is worse than none.
+      pool.query(
+        `SELECT ws.session_date, ws.status, ws.duration_minutes, ws.notes,
+                COALESCE(SUM(s.weight_kg * s.reps) FILTER (WHERE s.completed), 0) AS total_volume,
+                COUNT(s.id) FILTER (WHERE s.completed)::int AS set_count
+           FROM workout_sessions ws
+           LEFT JOIN workout_session_exercises wse ON wse.session_id = ws.id
+           LEFT JOIN workout_sets s ON s.session_exercise_id = wse.id
+          WHERE ws.client_id = $1 AND ws.session_date BETWEEN $2::date AND $3::date
+            ${orgId ? 'AND ws.organization_id = $4' : ''}
+          GROUP BY ws.id, ws.session_date, ws.status, ws.duration_minutes, ws.notes
+          ORDER BY ws.session_date ASC`,
+        orgId ? [client_id, start, end, orgId] : [client_id, start, end],
+      ),
+      pool.query(
+        `SELECT ws.session_date, wse.exercise_name, s.weight_kg, s.reps,
+                s.is_pr_weight, s.is_pr_reps, s.is_pr_volume
+           FROM workout_sets s
+           JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+           JOIN workout_sessions ws ON ws.id = wse.session_id
+          WHERE ws.client_id = $1 AND s.completed = true
+            AND ws.session_date BETWEEN $2::date AND $3::date
+            AND (s.is_pr_weight OR s.is_pr_reps OR s.is_pr_volume)
+            ${orgId ? 'AND ws.organization_id = $4' : ''}`,
+        orgId ? [client_id, start, end, orgId] : [client_id, start, end],
+      ),
+      pool.query(
+        `SELECT e.target_muscle, COUNT(*)::int AS sets, MAX(ws.session_date) AS last_date
+           FROM workout_sets s
+           JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+           JOIN workout_sessions ws ON ws.id = wse.session_id
+           LEFT JOIN exercises e ON e.id = wse.exercise_id
+          WHERE ws.client_id = $1 AND s.completed = true
+            AND ws.session_date BETWEEN $2::date AND $3::date
+            ${orgId ? 'AND ws.organization_id = $4' : ''}
+          GROUP BY e.target_muscle`,
+        orgId ? [client_id, start, end, orgId] : [client_id, start, end],
+      ),
+      pool.query(
+        `SELECT wa.start_date,
+                COALESCE(ARRAY(
+                  SELECT DISTINCT we.day_of_week FROM workout_exercises we
+                   WHERE we.workout_plan_id = wp.id AND we.week_number = 1
+                   ORDER BY we.day_of_week
+                ), '{}') AS planned_days
+           FROM workout_assignments wa
+           JOIN workout_plans wp ON wp.id = wa.workout_plan_id
+          WHERE wa.client_id = $1 AND wa.status = 'active'
+            ${orgId ? 'AND wa.organization_id = $2' : ''}
+          ORDER BY wa.start_date DESC LIMIT 1`,
+        orgId ? [client_id, orgId] : [client_id],
+      ),
+      pool.query(
+        `SELECT DISTINCT ON (target_muscle) target_muscle, mev_sets, mrv_sets
+           FROM muscle_volume_landmarks
+          WHERE organization_id IS NULL ${orgId ? 'OR organization_id = $1' : ''}
+          ORDER BY target_muscle, organization_id NULLS LAST`,
+        orgId ? [orgId] : [],
+      ),
+    ]);
+
+    const client = clientRows.rows[0];
+    if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
+    const plan = planRows.rows[0];
+    const landmarks = new Map(landmarkRows.rows.map((r) => [r.target_muscle, r]));
+    // Attendance for THIS week only. What actually bounds it is `asOf: end` —
+    // adherence counts weeks between startDate and asOf, and those are six
+    // days apart, so it yields one row whatever `weeks` says. `weeks: 1` is
+    // belt and braces, not the guard; widening the date window is what would
+    // print the whole block's attendance under a single week's dates.
+    const week = plan
+      ? adherence(sessionRows.rows, {
+        perWeek: (plan.planned_days || []).length,
+        startDate: start,
+        asOf: end,
+        weeks: 1,
+      })
+      : null;
+
+    const url = await generateWeeklyProgressPdf({
+      client,
+      studioName: client.studio_name,
+      weekStart: start,
+      weekEnd: end,
+      sessions: sessionRows.rows,
+      adherence: week,
+      prs: prTimeline(prRows.rows),
+      muscles: muscleWeek(setRows.rows, { asOf: end, landmarks }).muscles,
+      coachNote: coach_note,
+    });
+
+    logActivity(req, 'weekly_progress_report', 'pt_client', client_id, { week_start: start });
+    res.json({ data: { url, week_start: start, week_end: end } });
   }));
 
 module.exports = router;

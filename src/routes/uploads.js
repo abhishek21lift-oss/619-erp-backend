@@ -56,6 +56,19 @@ const PROOF_TABLE = 'payment_orders';
 // access, and a before/after is a photograph of somebody's client.
 const PORTFOLIO_CATEGORY = 'portfolio';
 
+// Weekly progress reports, keyed `progress-reports/<clientUUID>-<YYYY-MM-DD>.pdf`
+// by lib/weeklyProgressPdf.js. Like payment proofs, the owning id is a PREFIX
+// of the filename rather than the whole of it, so the generic resolver — which
+// strips the extension and expects a bare UUID — would reject every one of
+// them and fall through to "not an owned category", which means any
+// authenticated user in any studio could fetch another studio's report.
+//
+// A progress report carries a named client, what they lifted, how often they
+// turned up and their coach's written notes about them. It gets the same
+// treatment as a payment proof.
+const REPORT_CATEGORY = 'progress-reports';
+const REPORT_TABLE = 'pt_clients';
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Derived from req.path rather than req.params[0]: this router registers both
@@ -109,16 +122,18 @@ async function callerOwnsRecord(req, category, key) {
   }
 
   const isProof = category === PROOF_CATEGORY;
-  const table = isProof ? PROOF_TABLE : OWNED_CATEGORIES[category];
+  const isReport = category === REPORT_CATEGORY;
+  const table = isProof ? PROOF_TABLE : isReport ? REPORT_TABLE : OWNED_CATEGORIES[category];
   if (!table) return true; // not an owned category — a valid session suffices
 
   if (!scope.applyFilter) return true; // platform-wide super_admin
 
   // Keys are written as `<category>/pdf/<record-uuid>.pdf` by lib/parqPdf.js
-  // and lib/informedConsentPdf.js — except payment proofs, where the order id
-  // is a prefix of a longer filename (see PROOF_CATEGORY above).
+  // and lib/informedConsentPdf.js — except payment proofs and progress
+  // reports, where the owning id is a prefix of a longer filename (see
+  // PROOF_CATEGORY and REPORT_CATEGORY above).
   const basename = key.split('/').pop() || '';
-  const id = isProof
+  const id = (isProof || isReport)
     ? basename.slice(0, 36)
     : basename.replace(/\.[^.]+$/, '');
   if (!UUID_RE.test(id)) return false;
