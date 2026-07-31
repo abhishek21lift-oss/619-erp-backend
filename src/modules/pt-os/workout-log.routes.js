@@ -935,4 +935,36 @@ router.put('/workout-log/landmarks/:muscle',
     res.json({ data: rows[0] });
   }));
 
+// DELETE /workout-log/landmarks/:muscle — drop this studio's override.
+//
+// Not the same action as clearing the range, and the difference matters. A PUT
+// with two nulls stores "this muscle has no range" and the analytics screen
+// stops judging it. This removes the studio's row entirely, so the shared
+// starting range comes back — which is what a trainer wants after editing one
+// by mistake, and there is otherwise no route back to a number they have
+// overwritten.
+router.delete('/workout-log/landmarks/:muscle',
+  auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+    const orgId = orgIdOf(req);
+    if (!orgId) {
+      return res.status(403).json({ error: { code: 'ORG_REQUIRED', message: 'A studio context is required' } });
+    }
+    // organization_id in the WHERE, not just the id: without it this deletes
+    // the shared default row for every studio on the platform.
+    await pool.query(
+      'DELETE FROM muscle_volume_landmarks WHERE organization_id = $1 AND target_muscle = $2',
+      [orgId, String(req.params.muscle).toLowerCase()],
+    );
+
+    const { rows } = await pool.query(
+      `SELECT target_muscle, mev_sets, mrv_sets, false AS is_custom
+         FROM muscle_volume_landmarks
+        WHERE organization_id IS NULL AND target_muscle = $1`,
+      [String(req.params.muscle).toLowerCase()],
+    );
+    // No shared default for this muscle is a legitimate outcome — some ship
+    // without one on purpose. The row simply has no range now.
+    res.json({ data: rows[0] ?? { target_muscle: req.params.muscle, mev_sets: null, mrv_sets: null, is_custom: false } });
+  }));
+
 module.exports = router;

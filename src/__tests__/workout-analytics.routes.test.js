@@ -147,3 +147,39 @@ describe('landmarks', () => {
       .send({ mev_sets: 8, mrv_sets: 20 }).expect(403);
   });
 });
+
+describe('DELETE /workout-log/landmarks/:muscle', () => {
+  it('deletes only THIS studio\'s row', async () => {
+    // Without organization_id in the WHERE this wipes the shared default for
+    // every studio on the platform — from a button labelled "restore default".
+    await request(app()).delete('/api/pt-os/workout-log/landmarks/chest').expect(200);
+    const [sql, params] = pool.query.mock.calls[0];
+    expect(String(sql)).toMatch(/DELETE FROM muscle_volume_landmarks/);
+    expect(String(sql).replace(/\s+/g, ' ')).toMatch(/WHERE organization_id = \$1 AND target_muscle = \$2/);
+    expect(params[0]).toBe(ORG);
+  });
+
+  it('hands back the shared default it just uncovered', async () => {
+    // The point of the action is the number that comes BACK. Returning the
+    // deletion alone would leave the editor showing the value it removed.
+    pool.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ target_muscle: 'chest', mev_sets: 8, mrv_sets: 22, is_custom: false }] });
+    const res = await request(app()).delete('/api/pt-os/workout-log/landmarks/chest').expect(200);
+    expect(res.body.data).toMatchObject({ mev_sets: 8, mrv_sets: 22, is_custom: false });
+  });
+
+  it('copes with a muscle that has no shared default', async () => {
+    // Some ship without one on purpose. "No range" is the correct answer, not
+    // a 500 and not an invented pair of numbers.
+    pool.query.mockResolvedValue({ rows: [] });
+    const res = await request(app()).delete('/api/pt-os/workout-log/landmarks/neck').expect(200);
+    expect(res.body.data).toMatchObject({ mev_sets: null, mrv_sets: null, is_custom: false });
+  });
+
+  it('refuses without a studio context', async () => {
+    global.__mockUser = { id: 'u-0', role: 'super_admin', organization_id: null };
+    await request(app()).delete('/api/pt-os/workout-log/landmarks/chest').expect(403);
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+});
