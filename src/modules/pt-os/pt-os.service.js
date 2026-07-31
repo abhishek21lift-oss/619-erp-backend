@@ -299,17 +299,74 @@ async function getOpsSummary(scope = {}) {
   const orgBare1 = apply ? ' AND organization_id = $1' : '';
   const bareParams = apply ? [scope.orgId] : [];
 
+  // Today's booked slots, in time order.
+  //
+  // plan_name comes from the client's ACTIVE assignment, via a LATERAL with
+  // LIMIT 1. A plain join would fan a client with two assignments into two
+  // rows of the same appointment — the same defect the Today roster had, found
+  // there against live data.
+  //
+  // It is the programme the client is on, not the session's own title. A
+  // trainer reading a slot wants to know what they are about to coach, and
+  // "PT Session" — which is what title usually holds — does not say.
   const { rows: today_sessions } = await pool.query(`
     SELECT
       s.id, s.title, s.session_date::TEXT, s.start_time::TEXT, s.end_time::TEXT,
       s.status, s.notes,
       c.name  AS client_name,  c.photo_url AS client_photo,
-      t.name  AS trainer_name
+      t.name  AS trainer_name,
+      wa.plan_name, wa.plan_id
     FROM pt_sessions s
     LEFT JOIN pt_clients c  ON c.id = s.client_id
     LEFT JOIN pt_trainers t ON t.id = s.trainer_id
+    LEFT JOIN LATERAL (
+      SELECT wp.name AS plan_name, wp.id AS plan_id
+        FROM workout_assignments a
+        JOIN workout_plans wp ON wp.id = a.workout_plan_id
+       WHERE a.client_id = s.client_id AND a.status = 'active'
+       ORDER BY a.start_date DESC
+       LIMIT 1
+    ) wa ON TRUE
     WHERE s.session_date = $1 AND s.deleted_at IS NULL${orgS}
     ORDER BY COALESCE(s.start_time, '00:00'::TIME)
+  `, sessParams);
+
+  // Clients whose PROGRAMME says they train today but who have no booked slot.
+  //
+  // Without this the section is blank for any studio that runs off programmes
+  // rather than the appointment book — which is every studio here today:
+  // pt_sessions holds no rows at all while five assignments are active. A
+  // "today" panel that can only ever say "nothing scheduled" is worse than no
+  // panel, because it teaches the trainer to stop looking at it.
+  //
+  // day_of_week is ISO (1 = Monday) to match workout_exercises.
+  const { rows: today_unscheduled } = await pool.query(`
+    SELECT
+      a.id AS assignment_id, a.client_id,
+      c.name AS client_name, c.photo_url AS client_photo,
+      wp.id AS plan_id, wp.name AS plan_name,
+      (SELECT COUNT(*) FROM workout_exercises we
+        WHERE we.workout_plan_id = wp.id
+          AND we.day_of_week = EXTRACT(ISODOW FROM $1::date)::int
+          AND we.week_number = 1)::INT AS planned_exercises
+    FROM workout_assignments a
+    JOIN workout_plans wp ON wp.id = a.workout_plan_id
+    JOIN pt_clients   c  ON c.id = a.client_id
+   WHERE a.status = 'active'
+     AND c.deleted_at IS NULL
+     AND EXISTS (
+       SELECT 1 FROM workout_exercises we
+        WHERE we.workout_plan_id = wp.id
+          AND we.day_of_week = EXTRACT(ISODOW FROM $1::date)::int
+          AND we.week_number = 1
+     )
+     AND NOT EXISTS (
+       SELECT 1 FROM pt_sessions s
+        WHERE s.client_id = a.client_id AND s.session_date = $1 AND s.deleted_at IS NULL
+     )
+     ${apply ? 'AND a.organization_id = $2' : ''}
+   ORDER BY c.name
+   LIMIT 25
   `, sessParams);
 
   const { rows: renewals_due } = await pool.query(`
@@ -376,7 +433,9 @@ async function getOpsSummary(scope = {}) {
     ORDER BY completed DESC
   `);
 
-  return { today_sessions, renewals_due, top_dues, session_stats, trainer_sessions };
+  return {
+    today_sessions, today_unscheduled, renewals_due, top_dues, session_stats, trainer_sessions,
+  };
 }
 
 module.exports = {
