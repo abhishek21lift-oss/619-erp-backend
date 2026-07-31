@@ -11,6 +11,8 @@ const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
 const { buildSnapshot } = require('./client-snapshot');
+const { generateCoach } = require('./coach-ai');
+const { routedChat } = require('../../lib/ai/router');
 
 const ptClientCreateSchema = {
   body: z.object({
@@ -1485,6 +1487,86 @@ router.get('/clients/:id/snapshot', auth, wrap(async (req, res) => {
       client, lifestyle, measurements, assessments, goal, prRows, lastSession,
     }),
   });
+}));
+
+// POST /clients/:id/coach
+//
+// Coaching prompts written by a model, from readings this database can prove.
+//
+// POST, not GET, and on demand rather than on page load: a profile is opened
+// dozens of times a day, mostly to check one thing, and an LLM call on every
+// open is somebody's money and two seconds of spinner for an answer that has
+// not changed since this morning.
+//
+// The facts are assembled first — the same snapshot and brief the profile
+// already renders, both of which only ever report measurements that exist —
+// and the model is asked to interpret them, not to supply them. If it is
+// unconfigured, times out, or answers with something uncited, the derived
+// prompts stand in: a coach card that vanishes when the API does teaches a
+// trainer not to rely on it.
+router.post('/clients/:id/coach', auth, wrap(async (req, res) => {
+  const clientId = req.params.id;
+  const params = [clientId];
+  const orgClause = orgWhere(req, params, 'c.organization_id');
+
+  const { rows: clientRows } = await pool.query(
+    `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes,
+            c.pt_end_date, c.balance_amount, c.organization_id
+       FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
+    params,
+  );
+  const client = clientRows[0];
+  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+
+  const many = (sql) => pool.query(sql, [clientId]).then((r) => r.rows);
+  const one = (sql) => many(sql).then((rows) => rows[0] ?? null);
+
+  const [lifestyle, measurements, assessments, goal, prRows, lastSession, parq, posture, mobility] =
+    await Promise.all([
+      one(`SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1
+            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+      many(`SELECT weight_kg, measured_at FROM pt_os_measurements
+             WHERE client_id = $1 AND weight_kg IS NOT NULL ORDER BY measured_at DESC LIMIT 12`),
+      many(`SELECT * FROM pt_assessments WHERE client_id = $1
+             ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 12`),
+      one(`SELECT * FROM pt_goals WHERE client_id = $1 AND is_active = true
+            ORDER BY created_at DESC LIMIT 1`),
+      many(`SELECT wse.exercise_name, s.weight_kg, s.reps, ws.session_date
+              FROM workout_sets s
+              JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+              JOIN workout_sessions ws ON ws.id = wse.session_id
+             WHERE ws.client_id = $1 AND (s.is_pr_weight OR s.is_pr_reps OR s.is_pr_volume)
+             ORDER BY ws.session_date DESC LIMIT 60`),
+      one(`SELECT session_date, status FROM workout_sessions
+            WHERE client_id = $1 AND session_date <= CURRENT_DATE
+            ORDER BY session_date DESC LIMIT 1`),
+      one(`SELECT * FROM pt_parq_forms WHERE client_id = $1 AND deleted_at IS NULL
+            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+      one(`SELECT * FROM pt_posture_assessments WHERE client_id = $1
+            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+      one(`SELECT * FROM pt_mobility_performance_assessments WHERE client_id = $1
+            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+    ]);
+
+  const snapshot = buildSnapshot({
+    client, lifestyle, measurements, assessments, goal, prRows, lastSession,
+  });
+  const brief = buildBrief({
+    client, parq, assessment: assessments[0] ?? null, posture, mobility, lifestyle, goal,
+    assignment: null, recentSessions: [],
+  });
+
+  const out = await generateCoach({
+    snapshot,
+    brief,
+    client: brief.client,
+    chat: routedChat,
+    // The rule-based prompts are true whatever the model does, so they are
+    // what the card falls back to rather than an empty state.
+    fallback: snapshot.coach,
+  });
+
+  res.json({ data: out });
 }));
 
 module.exports = router;
