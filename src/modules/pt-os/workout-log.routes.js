@@ -11,6 +11,7 @@
 // audit trail, and server-computed derived fields never trusted from
 // the client (here: PR flags and workout summary totals).
 const router = require('express').Router();
+const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
 const { auth } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
@@ -22,6 +23,7 @@ const { checkScreeningGate } = require('../../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
 const { weekOf, resolveWeek } = require('./progression');
+const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./training-analytics');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -735,5 +737,202 @@ router.get('/workout-log/volume-summary', auth, wrap(async (req, res) => {
   );
   res.json({ data: rows });
 }));
+
+// GET /workout-log/analytics?client_id=&weeks=12
+//
+// The four questions a trainer asks about a client, answered from the log:
+// did they show up, are they getting stronger, am I training everything, and
+// is anything overcooked.
+//
+// One endpoint rather than four, because the screen shows them together and
+// four round trips on a phone in a gym is four chances to see a spinner. The
+// arithmetic is in ./training-analytics; this assembles the rows it needs.
+//
+// Everything returned is either MEASURED from the log or a range the studio
+// stored. Nothing is modelled. There is deliberately no "fatigue score" and no
+// "recovery percentage" — those would be invented numbers printed beside real
+// ones in the same typeface, and a trainer would have no way to tell them
+// apart. Recovery is reported as days since a muscle was last trained, which
+// is a fact.
+router.get('/workout-log/analytics', auth, wrap(async (req, res) => {
+  const { client_id } = req.query;
+  if (!client_id) return res.status(400).json({ error: { code: 'MISSING_CLIENT_ID' } });
+  if (!await clientInOrg(req, client_id)) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
+
+  const weeks = Math.min(Math.max(parseInt(req.query.weeks, 10) || 12, 1), 52);
+  const asOf = (req.query.as_of && /^\d{4}-\d{2}-\d{2}$/.test(req.query.as_of))
+    ? req.query.as_of
+    : new Date().toISOString().slice(0, 10);
+
+  const scope = tenantScope(req);
+  const orgId = scope.applyFilter ? scope.orgId : null;
+
+  // The window. Sets and sessions older than this are not read at all rather
+  // than read and filtered — a client two years in should not pay for it.
+  const since = new Date(`${weekStart(asOf)}T00:00:00Z`);
+  since.setUTCDate(since.getUTCDate() - (weeks - 1) * 7);
+  const sinceDate = since.toISOString().slice(0, 10);
+
+  const [sessionRows, setRows, prRows, planRows, landmarkRows] = await Promise.all([
+    pool.query(
+      `SELECT ws.session_date, ws.status
+         FROM workout_sessions ws
+        WHERE ws.client_id = $1 AND ws.session_date >= $2::date
+          ${orgId ? 'AND ws.organization_id = $3' : ''}
+        ORDER BY ws.session_date ASC`,
+      orgId ? [client_id, sinceDate, orgId] : [client_id, sinceDate],
+    ),
+
+    // Hard sets per muscle over the window, plus the latest date each muscle
+    // was worked. GROUP BY in SQL rather than in JS: this is the one query
+    // whose row count grows with every set the client has ever logged.
+    pool.query(
+      `SELECT e.target_muscle,
+              COUNT(*)::int      AS sets,
+              MAX(ws.session_date) AS last_date
+         FROM workout_sets s
+         JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+         JOIN workout_sessions ws ON ws.id = wse.session_id
+         LEFT JOIN exercises e ON e.id = wse.exercise_id
+        WHERE ws.client_id = $1 AND s.completed = true AND ws.session_date >= $2::date
+          ${orgId ? 'AND ws.organization_id = $3' : ''}
+        GROUP BY e.target_muscle`,
+      orgId ? [client_id, sinceDate, orgId] : [client_id, sinceDate],
+    ),
+
+    pool.query(
+      `SELECT ws.session_date, wse.exercise_name, s.weight_kg, s.reps,
+              s.is_pr_weight, s.is_pr_reps, s.is_pr_volume
+         FROM workout_sets s
+         JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+         JOIN workout_sessions ws ON ws.id = wse.session_id
+        WHERE ws.client_id = $1 AND s.completed = true
+          AND (s.is_pr_weight OR s.is_pr_reps OR s.is_pr_volume)
+          ${orgId ? 'AND ws.organization_id = $2' : ''}
+        ORDER BY ws.session_date DESC
+        LIMIT 200`,
+      orgId ? [client_id, orgId] : [client_id],
+    ),
+
+    // The active programme, and the days it actually prescribes. Counted from
+    // real rows rather than from sessions_per_week, which is a label a trainer
+    // typed and can disagree with the programme underneath it.
+    pool.query(
+      `SELECT wa.start_date, wp.id AS plan_id, wp.name AS plan_name, wp.duration_weeks,
+              COALESCE(ARRAY(
+                SELECT DISTINCT we.day_of_week FROM workout_exercises we
+                 WHERE we.workout_plan_id = wp.id AND we.week_number = 1
+                 ORDER BY we.day_of_week
+              ), '{}') AS planned_days
+         FROM workout_assignments wa
+         JOIN workout_plans wp ON wp.id = wa.workout_plan_id
+        WHERE wa.client_id = $1 AND wa.status = 'active'
+          ${orgId ? 'AND wa.organization_id = $2' : ''}
+        ORDER BY wa.start_date DESC
+        LIMIT 1`,
+      orgId ? [client_id, orgId] : [client_id],
+    ),
+
+    // The studio's row wins over the platform default. DISTINCT ON with the
+    // NULLs sorted last is what expresses "mine, else the shared one" in a
+    // single pass.
+    pool.query(
+      `SELECT DISTINCT ON (target_muscle) target_muscle, mev_sets, mrv_sets, organization_id
+         FROM muscle_volume_landmarks
+        WHERE organization_id IS NULL ${orgId ? 'OR organization_id = $1' : ''}
+        ORDER BY target_muscle, organization_id NULLS LAST`,
+      orgId ? [orgId] : [],
+    ),
+  ]);
+
+  const landmarks = new Map(landmarkRows.rows.map((r) => [r.target_muscle, r]));
+  const plan = planRows.rows[0] || null;
+  const plannedDays = plan ? (plan.planned_days || []).map(Number) : [];
+
+  const adherenceOut = plan
+    ? adherence(sessionRows.rows, {
+      perWeek: plannedDays.length,
+      startDate: plan.start_date,
+      asOf,
+      weeks,
+    })
+    // No active programme means there is nothing to be adherent TO. Reporting
+    // 0% would read as a client who never turns up.
+    : { planned: 0, completed: 0, pct: null, weeks: [] };
+
+  res.json({
+    data: {
+      as_of: asOf,
+      weeks,
+      plan: plan ? { id: plan.plan_id, name: plan.plan_name, duration_weeks: plan.duration_weeks } : null,
+      adherence: adherenceOut,
+      this_week: plan ? missedDays(plannedDays, sessionRows.rows, { weekOf: asOf, asOf }) : null,
+      prs: prTimeline(prRows.rows),
+      ...muscleWeek(setRows.rows, { asOf, landmarks }),
+    },
+  });
+}));
+
+// GET /workout-log/landmarks — the studio's weekly set ranges, resolved.
+router.get('/workout-log/landmarks', auth, wrap(async (req, res) => {
+  const scope = tenantScope(req);
+  const orgId = scope.applyFilter ? scope.orgId : null;
+  const { rows } = await pool.query(
+    `SELECT DISTINCT ON (target_muscle)
+            target_muscle, mev_sets, mrv_sets,
+            (organization_id IS NOT NULL) AS is_custom
+       FROM muscle_volume_landmarks
+      WHERE organization_id IS NULL ${orgId ? 'OR organization_id = $1' : ''}
+      ORDER BY target_muscle, organization_id NULLS LAST`,
+    orgId ? [orgId] : [],
+  );
+  res.json({ data: rows });
+}));
+
+// PUT /workout-log/landmarks/:muscle — the studio's own range for one muscle.
+//
+// Writes a studio-owned row rather than editing the shared default, so one
+// studio's judgement never becomes another's. Clearing both values is allowed
+// and means "no range" — a blank is an honest answer, and better than a pair
+// of numbers nobody chose.
+router.put('/workout-log/landmarks/:muscle',
+  auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+    const orgId = orgIdOf(req);
+    if (!orgId) {
+      // A platform operator editing the shared defaults is a different action
+      // with a different blast radius, and it is not this endpoint.
+      return res.status(403).json({ error: { code: 'ORG_REQUIRED', message: 'A studio context is required' } });
+    }
+
+    const num = (v) => {
+      if (v === null || v === undefined || v === '') return null;
+      const n = parseInt(v, 10);
+      return Number.isFinite(n) ? n : undefined;      // undefined = malformed
+    };
+    const mev = num(req.body.mev_sets);
+    const mrv = num(req.body.mrv_sets);
+    if (mev === undefined || mrv === undefined) {
+      return res.status(400).json({ error: { code: 'INVALID_SETS', message: 'Sets must be whole numbers or blank' } });
+    }
+    if (mev != null && mrv != null && mev > mrv) {
+      return res.status(400).json({ error: { code: 'INVALID_RANGE', message: 'The minimum cannot exceed the maximum' } });
+    }
+    if ([mev, mrv].some((v) => v != null && (v < 0 || v > 60))) {
+      return res.status(400).json({ error: { code: 'OUT_OF_RANGE', message: 'Sets must be between 0 and 60' } });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO muscle_volume_landmarks (id, organization_id, target_muscle, mev_sets, mrv_sets, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (COALESCE(organization_id, '00000000-0000-0000-0000-000000000000'::uuid), target_muscle)
+       DO UPDATE SET mev_sets = EXCLUDED.mev_sets, mrv_sets = EXCLUDED.mrv_sets,
+                     updated_by = EXCLUDED.updated_by, updated_at = NOW()
+       RETURNING target_muscle, mev_sets, mrv_sets`,
+      [randomUUID(), orgId, String(req.params.muscle).toLowerCase(), mev, mrv, req.user.id],
+    );
+    res.json({ data: rows[0] });
+  }));
 
 module.exports = router;
