@@ -450,22 +450,38 @@ router.get('/weekly-checkins', auth, wrap(async (req, res) => {
 }));
 
 router.post('/weekly-checkins', auth, wrap(async (req, res) => {
-  const { client_id, week_start_date, weight, mood, sleep_hours, water_glasses, workout_count, calories_avg, adherence_pct, trainer_notes, client_notes } = req.body;
+  const { client_id, week_start_date, weight, mood, sleep_hours, water_glasses, workout_count, calories_avg, adherence_pct, trainer_notes, client_notes, stress_level, energy_level, soreness_level } = req.body;
   if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+
+  // Stress, energy and soreness are the three readings the readiness score
+  // needs, and all three are optional — a thirty-second check-in at the door
+  // should record what the client said and leave the rest blank. Out-of-scale
+  // values are stored as NULL rather than rejected: a mistyped 75 must not
+  // fail the whole check-in, and it must not drag the score either. The column
+  // CHECKs are the backstop; this is the polite version.
+  const scale10 = (v) => {
+    const n = num(v, null);
+    return n !== null && n >= 1 && n <= 10 ? Math.round(n) : null;
+  };
+
   const { rows } = await pool.query(
     `INSERT INTO weekly_checkins (client_id, week_start_date, weight, mood, sleep_hours, water_glasses,
-      workout_count, calories_avg, adherence_pct, trainer_notes, client_notes, created_by, organization_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      workout_count, calories_avg, adherence_pct, trainer_notes, client_notes, created_by, organization_id,
+      stress_level, energy_level, soreness_level)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
      ON CONFLICT (client_id, week_start_date) DO UPDATE SET
        weight = EXCLUDED.weight, mood = EXCLUDED.mood, sleep_hours = EXCLUDED.sleep_hours,
        water_glasses = EXCLUDED.water_glasses, workout_count = EXCLUDED.workout_count,
        calories_avg = EXCLUDED.calories_avg, adherence_pct = EXCLUDED.adherence_pct,
        trainer_notes = EXCLUDED.trainer_notes, client_notes = EXCLUDED.client_notes,
+       stress_level = EXCLUDED.stress_level, energy_level = EXCLUDED.energy_level,
+       soreness_level = EXCLUDED.soreness_level,
        updated_at = NOW()
      RETURNING *`,
     [client_id, week_start_date, num(weight, null), mood || null, num(sleep_hours, null),
      num(water_glasses, null), num(workout_count, 0), num(calories_avg, null),
-     num(adherence_pct, null), trainer_notes || null, client_notes || null, req.user.id, orgIdOf(req)]
+     num(adherence_pct, null), trainer_notes || null, client_notes || null, req.user.id, orgIdOf(req),
+     scale10(stress_level), scale10(energy_level), scale10(soreness_level)]
   );
   res.status(201).json({ data: rows[0] });
 }));

@@ -12,6 +12,7 @@ const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
 const { buildSnapshot } = require('./client-snapshot');
 const { generateCoach } = require('./coach-ai');
+const { buildRecovery } = require('./recovery');
 const { routedChat } = require('../../lib/ai/router');
 
 const ptClientCreateSchema = {
@@ -1455,7 +1456,7 @@ router.get('/clients/:id/snapshot', auth, wrap(async (req, res) => {
   const many = (sql) => pool.query(sql, [clientId]).then((r) => r.rows);
   const one = (sql) => many(sql).then((rows) => rows[0] ?? null);
 
-  const [lifestyle, measurements, assessments, goal, prRows, lastSession] = await Promise.all([
+  const [lifestyle, measurements, assessments, goal, prRows, lastSession, checkins] = await Promise.all([
     one(`SELECT sleep_category, sleep_duration_hours, recovery_score, recovery_risk
            FROM pt_lifestyle_assessments WHERE client_id = $1
           ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
@@ -1480,12 +1481,22 @@ router.get('/clients/:id/snapshot', auth, wrap(async (req, res) => {
     one(`SELECT session_date, status FROM workout_sessions
           WHERE client_id = $1 AND session_date <= CURRENT_DATE
           ORDER BY session_date DESC LIMIT 1`),
+    // Recovery rides along on the snapshot rather than getting its own call:
+    // the profile opens both at once, and two round trips for one screen is
+    // one more than it needs.
+    many(`SELECT week_start_date, mood, sleep_hours, water_glasses,
+                 stress_level, energy_level, soreness_level
+            FROM weekly_checkins WHERE client_id = $1
+           ORDER BY week_start_date DESC LIMIT 12`),
   ]);
 
   res.json({
-    data: buildSnapshot({
-      client, lifestyle, measurements, assessments, goal, prRows, lastSession,
-    }),
+    data: {
+      ...buildSnapshot({
+        client, lifestyle, measurements, assessments, goal, prRows, lastSession,
+      }),
+      recovery: buildRecovery(checkins),
+    },
   });
 }));
 
