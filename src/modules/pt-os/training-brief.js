@@ -104,6 +104,61 @@ function safeParse(s) {
 }
 
 /**
+ * Free text a trainer typed, from a column that may not hold text.
+ *
+ * The assessment screens save their notes as a JSONB OBJECT with one field per
+ * prompt — { summary, observations, precautions, … } — while the older screens
+ * save a plain string. This brief typed them all as strings and passed them
+ * through untouched, so the object reached the browser and was handed to React
+ * as a child: "Objects are not valid as a React child", thrown in the middle
+ * of the render.
+ *
+ * That is not a broken card. A throw during render unwinds to the nearest
+ * boundary, which is the whole /pt-os segment — so opening one client's brief
+ * took out Workout Plans, sessions and assessments with it. And because an
+ * object whose every value is an empty string is still truthy, it threw for
+ * every client whose PAR-Q had ever been opened, not just the ones with notes.
+ *
+ * Flattened rather than dropped: these are words a trainer wrote about a
+ * client, and a brief that quietly discards them is the same failure this file
+ * exists to prevent. Empty prompts are omitted; an object with nothing in it
+ * becomes null, which is what "no notes" should have looked like all along.
+ */
+function textFrom(value) {
+  if (value === null || value === undefined) return null;
+
+  if (typeof value === 'string') {
+    const t = value.trim();
+    if (!t) return null;
+    // Some rows hold the JSON as text rather than as jsonb.
+    if (t.startsWith('{') || t.startsWith('[')) {
+      const parsed = safeParse(t);
+      if (parsed && typeof parsed === 'object') return textFrom(parsed);
+    }
+    return t;
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+
+  if (Array.isArray(value)) {
+    const items = value.map((v) => textFrom(v)).filter(Boolean);
+    return items.length ? items.join('\n') : null;
+  }
+
+  if (typeof value === 'object') {
+    // "movement_limitations" → "Movement limitations: …", so the prompt the
+    // trainer was answering survives into the brief.
+    const lines = Object.entries(value)
+      .map(([k, v]) => [k, textFrom(v)])
+      .filter(([, v]) => v)
+      .map(([k, v]) => `${k.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase())}: ${v}`);
+    return lines.length ? lines.join('\n') : null;
+  }
+
+  return null;
+}
+
+/**
  * Assemble the brief from rows the caller has already fetched.
  *
  * Pure, so the shape of the thing a trainer reads can be tested without a
@@ -127,7 +182,7 @@ function buildBrief({
     current_health: labelsFrom(parq.current_health),
     past_history: labelsFrom(parq.past_history),
     blood_group: parq.blood_group ?? null,
-    notes: parq.trainer_notes ?? null,
+    notes: textFrom(parq.trainer_notes),
   } : { present: false };
 
   sections.body = assessment ? {
@@ -171,7 +226,7 @@ function buildBrief({
       as_of: dateOf(posture.assessment_date),
       risk_level: posture.posture_risk_level ?? null,
       issues: postureIssues,
-      notes: posture.coach_notes ?? null,
+      notes: textFrom(posture.coach_notes),
     } : null,
     mobility: mobility ? {
       as_of: dateOf(mobility.assessment_date),
@@ -181,11 +236,11 @@ function buildBrief({
       // which of the two it was — "restricted" and "painful" call for
       // different changes to a programme.
       findings: mobilityFindings(mobility.body_regions),
-      notes: mobility.performance_notes ?? null,
+      notes: textFrom(mobility.performance_notes),
     } : null,
     // Free text the trainer typed on the client record. Carried verbatim: it
     // is the one place an injury nobody ran an assessment for gets recorded.
-    injuries: client?.injuries || null,
+    injuries: textFrom(client?.injuries),
     has_asymmetry: assessment?.has_asymmetry ?? null,
   } : { present: false };
 
@@ -205,7 +260,7 @@ function buildBrief({
     recovery_quality: lifestyle.recovery_quality ?? null,
     recovery_risk: lifestyle.recovery_risk ?? null,
     lifestyle_score: num(lifestyle.lifestyle_score),
-    notes: lifestyle.coach_notes ?? null,
+    notes: textFrom(lifestyle.coach_notes),
   } : { present: false };
 
   sections.goal = goal ? {
@@ -213,7 +268,7 @@ function buildBrief({
     as_of: dateOf(goal.created_at),
     goal_type: goal.goal_type ?? null,
     priority: goal.priority_goal ?? null,
-    description: goal.goal_description ?? null,
+    description: textFrom(goal.goal_description),
     target_weight: num(goal.target_weight),
     target_body_fat: num(goal.target_body_fat),
     target_date: dateOf(goal.target_date),
@@ -248,7 +303,7 @@ function buildBrief({
       gender: client?.gender ?? null,
       age: ageFrom(client?.dob),
       goal: client?.goal ?? null,
-      notes: client?.notes || null,
+      notes: textFrom(client?.notes),
     },
     sections,
     // Named explicitly rather than left for the reader to notice. A brief that
@@ -265,4 +320,4 @@ function dateOf(v) {
   return s ? String(s).slice(0, 10) : null;
 }
 
-module.exports = { buildBrief, ageFrom, labelsFrom, mobilityFindings, SECTIONS };
+module.exports = { buildBrief, ageFrom, labelsFrom, mobilityFindings, textFrom, SECTIONS };

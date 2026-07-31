@@ -185,3 +185,73 @@ describe('ageFrom', () => {
     expect(ageFrom('1750-01-01')).toBeNull();
   });
 });
+
+// ── The notes columns are not text ──────────────────────────────────────────
+//
+// This is the defect that took the pt-os segment to its error boundary in
+// production. pt_parq_forms.trainer_notes and pt_lifestyle_assessments
+// .coach_notes are JSONB OBJECTS — one field per prompt on the assessment
+// screen — and the brief typed them as strings and passed them straight
+// through. React throws on an object child, mid-render, which unwinds to the
+// segment boundary: opening one client's brief took out Workout Plans,
+// sessions and assessments with it.
+//
+// The empty case is the one that made it universal: an object whose every
+// value is "" is still truthy, so it threw for every client whose PAR-Q had
+// ever been opened, not only those with notes written.
+describe('textFrom — free text out of columns that do not hold text', () => {
+  const { textFrom } = require('../modules/pt-os/training-brief');
+
+  // Copied verbatim from the live row for the client this was found on.
+  const PARQ_NOTES = {
+    posture: '', summary: '', precautions: '', observations: '',
+    recommendations: '', contraindications: '', movement_limitations: '',
+  };
+
+  it('turns an all-empty notes object into null, not an object', () => {
+    expect(textFrom(PARQ_NOTES)).toBeNull();
+  });
+
+  it('keeps what the trainer wrote, with the prompt it answers', () => {
+    expect(textFrom({ ...PARQ_NOTES, movement_limitations: 'No overhead press' }))
+      .toBe('Movement limitations: No overhead press');
+  });
+
+  it('keeps every answered prompt, in order', () => {
+    expect(textFrom({ summary: 'Deconditioned', precautions: 'Watch the knee' }))
+      .toBe('Summary: Deconditioned\nPrecautions: Watch the knee');
+  });
+
+  it('passes plain strings through, trimmed', () => {
+    expect(textFrom('  needs a shoulder screen  ')).toBe('needs a shoulder screen');
+    expect(textFrom('   ')).toBeNull();
+  });
+
+  it('reads a notes object that was stored as text', () => {
+    expect(textFrom('{"summary":"Tight hips"}')).toBe('Summary: Tight hips');
+  });
+
+  it('never returns a non-string', () => {
+    for (const v of [null, undefined, {}, [], [''], 0, false, { a: {} }, { a: [null] }]) {
+      const out = textFrom(v);
+      expect(out === null || typeof out === 'string').toBe(true);
+    }
+  });
+
+  it('carries a whole brief without leaving an object in a text slot', () => {
+    const brief = buildBrief({
+      client: { ...CLIENT, injuries: null, notes: null },
+      parq: { assessment_date: '2026-07-27', risk_level: 'low', trainer_notes: PARQ_NOTES },
+      lifestyle: { assessment_date: '2026-07-27', coach_notes: { sleep: '', stress: '' } },
+      goal: { created_at: '2026-07-27', goal_type: 'muscle_gain', goal_description: null },
+    });
+    for (const v of [
+      brief.sections.readiness.notes,
+      brief.sections.lifestyle.notes,
+      brief.sections.goal.description,
+      brief.client.notes,
+    ]) {
+      expect(v === null || typeof v === 'string').toBe(true);
+    }
+  });
+});
