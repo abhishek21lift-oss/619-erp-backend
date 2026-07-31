@@ -9,6 +9,7 @@ const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
 const subscription = require('../../lib/subscription');
+const { buildBrief } = require('./training-brief');
 
 const ptClientCreateSchema = {
   body: z.object({
@@ -1357,6 +1358,73 @@ router.post('/clients/merge-duplicates', auth, adminOnly, wrap(async (req, res) 
 router.get('/dashboard/ops', auth, wrap(async (req, res) => {
   const data = await svc.getOpsSummary(tenantScope(req));
   res.json({ data });
+}));
+
+// GET /clients/:id/training-brief
+//
+// Everything needed to write this client a programme, in one payload.
+//
+// The information already exists — PAR-Q, fitness testing, posture, mobility,
+// lifestyle, goals — spread across six screens a trainer would have to open
+// one at a time before designing anything. Nobody does that, so programmes get
+// written from memory and the assessment data goes unread.
+//
+// Seven reads in parallel rather than seven round trips from the client: this
+// is opened at the moment somebody has decided to build a plan, and a spinner
+// per section is a reason to skip the whole thing.
+//
+// Each source takes the LATEST row. A brief is a picture of the client now,
+// not a history — the history lives on its own screens.
+router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
+  const clientId = req.params.id;
+  const params = [clientId];
+  const orgClause = orgWhere(req, params, 'c.organization_id');
+
+  const { rows: clientRows } = await pool.query(
+    `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes, c.organization_id
+       FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
+    params,
+  );
+  const client = clientRows[0];
+  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+
+  const one = (sql) => pool.query(sql, [clientId]).then((r) => r.rows[0] ?? null);
+
+  const [parq, assessment, posture, mobility, lifestyle, goal, assignment, sessions] = await Promise.all([
+    one(`SELECT * FROM pt_parq_forms WHERE client_id = $1 AND deleted_at IS NULL
+          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+    one(`SELECT * FROM pt_assessments WHERE client_id = $1
+          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+    one(`SELECT * FROM pt_posture_assessments WHERE client_id = $1
+          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+    one(`SELECT * FROM pt_mobility_performance_assessments WHERE client_id = $1
+          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+    one(`SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1
+          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
+    one(`SELECT * FROM pt_goals WHERE client_id = $1 AND is_active = true
+          ORDER BY created_at DESC LIMIT 1`),
+    one(`SELECT wa.start_date, wa.progress_pct, wp.id AS plan_id, wp.name AS plan_name,
+                wp.duration_weeks,
+                (SELECT COUNT(DISTINCT we.day_of_week) FROM workout_exercises we
+                  WHERE we.workout_plan_id = wp.id AND we.week_number = 1)::int AS planned_days_count
+           FROM workout_assignments wa
+           JOIN workout_plans wp ON wp.id = wa.workout_plan_id
+          WHERE wa.client_id = $1 AND wa.status = 'active'
+          ORDER BY wa.start_date DESC LIMIT 1`),
+    // Four weeks of the log, so "do they turn up" is answered from what was
+    // performed rather than from the plan's own progress field.
+    pool.query(
+      `SELECT status FROM workout_sessions
+        WHERE client_id = $1 AND session_date >= CURRENT_DATE - INTERVAL '28 days'`,
+      [clientId],
+    ).then((r) => r.rows),
+  ]);
+
+  res.json({
+    data: buildBrief({
+      client, parq, assessment, posture, mobility, lifestyle, goal, assignment, recentSessions: sessions,
+    }),
+  });
 }));
 
 module.exports = router;
