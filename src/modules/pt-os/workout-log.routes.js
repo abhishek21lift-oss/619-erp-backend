@@ -21,6 +21,7 @@ const { calc1RM } = require('../progress/fitness-scoring');
 const { checkScreeningGate } = require('../../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
+const { weekOf, resolveWeek } = require('./progression');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -201,7 +202,9 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   if (session.workout_assignment_id) {
     const dayIndex = session.workout_day ? WEEKDAYS.indexOf(session.workout_day) : -1;
     const { rows: planRows } = await pool.query(
-      `SELECT wp.id AS plan_id, wp.name AS plan_name
+      `SELECT wp.id AS plan_id, wp.name AS plan_name, wp.duration_weeks,
+              wp.progression_type, wp.progression_amount, wp.progression_every_weeks,
+              wa.start_date
          FROM workout_assignments wa
          JOIN workout_plans wp ON wp.id = wa.workout_plan_id
         WHERE wa.id = $1`,
@@ -209,15 +212,36 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
     );
     const plan = planRows[0];
     if (plan && dayIndex >= 0) {
-      const { rows: plannedExercises } = await pool.query(
-        `SELECT we.exercise_id, e.name, we.sets, we.reps, we.rest_seconds, we.sort_order, we.notes
+      // Every week's rows for this weekday, not just week 1: resolveWeek needs
+      // the overrides as well as the base to decide which wins.
+      const { rows: allWeeks } = await pool.query(
+        `SELECT we.exercise_id, e.name, we.week_number, we.sets, we.reps, we.rest_seconds,
+                we.sort_order, we.notes, we.target_weight, we.tempo, we.rpe,
+                we.warmup_sets, we.superset_group, we.config
            FROM workout_exercises we
            LEFT JOIN exercises e ON e.id = we.exercise_id
           WHERE we.workout_plan_id = $1 AND we.day_of_week = $2
           ORDER BY we.sort_order`,
         [plan.plan_id, dayIndex + 1]
       );
-      planned = { plan_name: plan.plan_name, exercises: plannedExercises };
+      // Which week the client is actually in, from the assignment's start date
+      // and the date of THIS session — not today. Back-filling last Tuesday's
+      // workout must show last Tuesday's week, or the trainer is handed the
+      // wrong prescription for a session that already happened.
+      const week = weekOf(plan.start_date, session.session_date);
+      const resolved = resolveWeek(allWeeks, plan, week);
+      planned = {
+        plan_name: plan.plan_name,
+        week,
+        duration_weeks: plan.duration_weeks,
+        progression_type: plan.progression_type,
+        // 'derived' means these numbers came from week 1 plus the rule;
+        // 'override' means the trainer wrote this week by hand. The UI says
+        // which, because a derived number is a suggestion and a written one
+        // is an instruction.
+        source: resolved.source,
+        exercises: resolved.exercises,
+      };
     }
   }
 

@@ -5,6 +5,7 @@ const pool = require('../db/pool');
 const { auth, adminOrManager, adminManagerOrTrainer } = require('../middleware/auth');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const { resolveWeek, previewWeeks } = require('../modules/pt-os/progression');
 
 // ─── EXERCISES ────────────────────────────────────────────────
 
@@ -277,7 +278,7 @@ function exerciseParams(ex) {
 /** Columns selected for a planned exercise, everywhere. One list, one source. */
 const EXERCISE_SELECT = `
   we.id, we.exercise_id, e.name, e.muscle_group, e.video_url, e.gif_url,
-  we.day_of_week, we.sort_order, we.sets, we.reps, we.rest_seconds, we.notes,
+  we.day_of_week, we.week_number, we.sort_order, we.sets, we.reps, we.rest_seconds, we.notes,
   we.target_weight, we.tempo, we.rpe, we.warmup_sets, we.superset_group, we.config`;
 
 // GET /api/workouts/plans
@@ -351,7 +352,37 @@ router.get('/plans/:id', auth, async (req, res, next) => {
         ORDER BY we.day_of_week, we.sort_order`,
       [req.params.id]
     );
-    res.json({ ...plan, exercises });
+    // ?week=N returns the prescription for that week rather than the stored
+    // week-1 rows — the same resolution the client's log uses, so the builder
+    // and the gym floor cannot disagree about what week 6 says.
+    const requestedWeek = parseInt(req.query.week, 10);
+    if (Number.isFinite(requestedWeek) && requestedWeek > 1) {
+      const byDay = new Map();
+      for (const ex of exercises) {
+        if (!byDay.has(ex.day_of_week)) byDay.set(ex.day_of_week, []);
+        byDay.get(ex.day_of_week).push(ex);
+      }
+      const resolved = [];
+      let source = 'derived';
+      for (const rows of byDay.values()) {
+        const r = resolveWeek(rows, plan, requestedWeek);
+        if (r.source === 'override') source = 'override';
+        resolved.push(...r.exercises);
+      }
+      return res.json({ ...plan, week: requestedWeek, week_source: source, exercises: resolved });
+    }
+
+    // Where the rule lands, per exercise, without an extra round trip and
+    // without reimplementing the arithmetic in TypeScript where it could drift
+    // from the server's. A rule is abstract until you see that +2.5kg/week
+    // turns 60 into 87.5 by week 12 — which a trainer may well decide is too
+    // much, and that is cheaper to learn here than in week 9.
+    const preview = plan.progression_type === 'none' ? null : exercises.map((ex) => {
+      const weeks = previewWeeks(ex, plan, plan.duration_weeks);
+      return { id: ex.id, first: weeks[0], last: weeks[weeks.length - 1] };
+    });
+
+    res.json({ ...plan, week: 1, week_source: 'base', exercises, progression_preview: preview });
   } catch (err) {
     next(err);
   }
@@ -425,11 +456,22 @@ router.put('/plans/:id', auth, adminManagerOrTrainer, async (req, res, next) => 
         difficulty = COALESCE($4, difficulty),
         duration_weeks = COALESCE($5, duration_weeks),
         sessions_per_week = COALESCE($6, sessions_per_week),
+        progression_type = COALESCE($8, progression_type),
+        -- Not COALESCE: clearing the amount is a real edit, and the pair moves
+        -- together. When a type is sent, the amount sent with it wins —
+        -- including null, which the CHECK then rejects unless the type is
+        -- 'none'. That is the point: a rule with no amount cannot be stored.
+        progression_amount = CASE WHEN $8::text IS NULL THEN progression_amount ELSE $9 END,
+        progression_every_weeks = COALESCE($10, progression_every_weeks),
         updated_at = NOW()
       WHERE id = $7 RETURNING *`,
       [d.name || null, d.description ?? null, d.goal || null, d.difficulty || null,
        d.duration_weeks ? parseInt(d.duration_weeks) : null,
-       d.sessions_per_week ? parseInt(d.sessions_per_week) : null, req.params.id]
+       d.sessions_per_week ? parseInt(d.sessions_per_week) : null, req.params.id,
+       d.progression_type || null,
+       d.progression_amount === undefined || d.progression_amount === null || d.progression_amount === ''
+         ? null : Number(d.progression_amount),
+       d.progression_every_weeks ? parseInt(d.progression_every_weeks) : null]
     );
 
     if (Array.isArray(d.exercises)) {
@@ -454,6 +496,119 @@ router.put('/plans/:id', auth, adminManagerOrTrainer, async (req, res, next) => 
     next(err);
   } finally {
     client.release();
+  }
+});
+
+// ─── VERSION SNAPSHOTS ────────────────────────────────────────
+//
+// What is at risk here is the PRESCRIPTION, not the history. What a client
+// actually did is in workout_sessions and workout_sets, recorded independently
+// and unaffected by any edit. What an edit destroys is what the plan SAID —
+// the March programme, once April's numbers are typed over it.
+//
+// So a snapshot ARCHIVES the current state and leaves the live plan alone:
+// same id, same assignments, same clients. The alternative — minting a new
+// plan and repointing assignments — would move every client on a shared
+// template at once, which is not what "keep a copy of what I had" means.
+//
+// Not automatic. The builder autosaves on every field blur, so versioning on
+// write would mint a snapshot per keystroke. This is the deliberate action.
+
+// POST /api/workouts/plans/:id/versions — freeze the current state as history.
+router.post('/plans/:id/versions', auth, adminManagerOrTrainer, async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const plan = await loadEditablePlan(req, req.params.id, client);
+    if (!plan) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Workout plan not found' }); }
+    // Snapshotting a snapshot would build a chain nothing can render and
+    // nothing asked for. A snapshot's parent is always the live plan.
+    if (plan.parent_plan_id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This is already an archived version' });
+    }
+
+    const snapshotId = randomUUID();
+    // is_active = false and is_template = false keep it out of every list: an
+    // archived version is history to read, never a plan to assign.
+    await client.query(
+      `INSERT INTO workout_plans (
+         id, name, description, goal, difficulty, duration_weeks, sessions_per_week,
+         is_template, is_active, created_by, organization_id,
+         progression_type, progression_amount, progression_every_weeks,
+         version, parent_plan_id)
+       SELECT $1, name, description, goal, difficulty, duration_weeks, sessions_per_week,
+              false, false, $2, organization_id,
+              progression_type, progression_amount, progression_every_weeks,
+              version, id
+         FROM workout_plans WHERE id = $3`,
+      [snapshotId, req.user.id, req.params.id]
+    );
+
+    // INSERT ... SELECT rather than a read-then-loop: the copy is one
+    // statement inside the same transaction, so a concurrent edit cannot land
+    // between reading an exercise and writing it.
+    const { rowCount } = await client.query(
+      `INSERT INTO workout_exercises (
+         id, workout_plan_id, exercise_id, day_of_week, week_number, sort_order,
+         sets, reps, rest_seconds, notes,
+         target_weight, tempo, rpe, warmup_sets, superset_group, config)
+       SELECT gen_random_uuid()::text, $1, exercise_id, day_of_week, week_number, sort_order,
+              sets, reps, rest_seconds, notes,
+              target_weight, tempo, rpe, warmup_sets, superset_group, config
+         FROM workout_exercises WHERE workout_plan_id = $2`,
+      [snapshotId, req.params.id]
+    );
+
+    // The LIVE plan moves forward. The snapshot keeps the number it was.
+    const { rows } = await client.query(
+      'UPDATE workout_plans SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING *',
+      [req.params.id]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json({
+      message: `Saved version ${plan.version}`,
+      plan: rows[0],
+      snapshot: { id: snapshotId, version: plan.version, exercise_count: rowCount },
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/workouts/plans/:id/versions — the archived states, newest first.
+router.get('/plans/:id/versions', auth, async (req, res, next) => {
+  try {
+    // Scoped through the PARENT, so a caller who cannot read the plan cannot
+    // read its history either — the snapshots carry the same organization_id,
+    // but checking the parent means one rule to keep right instead of two.
+    const tenant = planReadFilter(req, 2);
+    const { rows: parent } = await pool.query(
+      `SELECT wp.id FROM workout_plans wp
+        WHERE wp.id = $1 AND wp.deleted_at IS NULL
+        ${tenant.sql ? `AND ${tenant.sql}` : ''}`,
+      [req.params.id, ...tenant.params]
+    );
+    if (!parent[0]) return res.status(404).json({ error: 'Workout plan not found' });
+
+    const { rows } = await pool.query(
+      `SELECT wp.id, wp.version, wp.created_at, wp.progression_type,
+              wp.progression_amount, wp.progression_every_weeks, wp.duration_weeks,
+              u.name AS created_by_name,
+              (SELECT COUNT(*) FROM workout_exercises we WHERE we.workout_plan_id = wp.id)::int AS exercise_count
+         FROM workout_plans wp
+         LEFT JOIN users u ON u.id = wp.created_by
+        WHERE wp.parent_plan_id = $1 AND wp.deleted_at IS NULL
+        ORDER BY wp.version DESC`,
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
   }
 });
 
