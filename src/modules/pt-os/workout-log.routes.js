@@ -222,8 +222,14 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   }
 
   let totalSets = 0, totalReps = 0, totalVolume = 0, rpeSum = 0, rpeCount = 0;
+  // plannedSets counts every set the trainer laid out, completed or not — it
+  // is the denominator for completion. prs counts SETS that beat a previous
+  // best, not exercises: three PRs on one lift is three PRs.
+  let plannedSets = 0, prs = 0;
   for (const ex of exercises) {
     for (const s of ex.sets) {
+      plannedSets += 1;
+      if (s.is_pr_weight || s.is_pr_reps || s.is_pr_volume) prs += 1;
       if (!s.completed) continue;
       totalSets += 1;
       if (s.reps) totalReps += s.reps;
@@ -244,6 +250,12 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
         exercises_completed: exercises.filter((ex) => ex.sets.some((s) => s.completed)).length,
         exercises_total: exercises.length,
         avg_rpe: rpeCount ? Math.round((rpeSum / rpeCount) * 10) / 10 : null,
+        planned_sets: plannedSets,
+        // null, not 0, when nothing was laid out: "no plan" and "none of the
+        // plan done" are different things and the UI must not show 0% for a
+        // session that was logged freestyle.
+        completion_pct: plannedSets ? Math.round((totalSets / plannedSets) * 100) : null,
+        prs,
       },
     },
   });
@@ -500,6 +512,102 @@ router.delete('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'tr
 
 // GET /workout-log/previous?client_id=&exercise_id=&exercise_name=&exclude_session_id=
 // Powers the "Previous" side-by-side panel and auto-fill.
+// GET /workout-log/today — the trainer's roster for one day.
+//
+// Answers the only question that matters when a trainer opens the app on the
+// gym floor: who am I training, what is their workout, and have I started it?
+// Before this, that took a client search, then their profile, then Workout
+// Log, then New Session, then picking the day from a dropdown — five screens
+// to reach the one thing they do every day.
+//
+// One row per client with an ACTIVE assignment whose date range covers the
+// day. `planned_exercises` is what the programme prescribes for that weekday,
+// and `session` is the log if one already exists, so the client can be
+// resumed rather than double-started.
+//
+// Scoped like every other read here: tenant first, then — for a trainer who
+// is not an admin — their own clients only.
+router.get('/workout-log/today', auth, wrap(async (req, res) => {
+  const date = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
+    ? req.query.date
+    : new Date().toISOString().slice(0, 10);
+
+  // ISO weekday: Postgres ISODOW gives Monday=1, matching
+  // workout_exercises.day_of_week and the WEEKDAYS array above.
+  const { rows: dowRows } = await pool.query('SELECT EXTRACT(ISODOW FROM $1::date)::int AS dow', [date]);
+  const dow = dowRows[0].dow;
+
+  const params = [date, dow];
+  const scope = tenantScope(req);
+  let orgClause = '';
+  if (scope.applyFilter) { params.push(scope.orgId); orgClause = `AND wa.organization_id = $${params.length}`; }
+
+  // A trainer who is not admin/manager sees only their own clients. Mirrors
+  // the ownership rule used across pt-os reads.
+  let trainerClause = '';
+  if (!['admin', 'manager', 'super_admin'].includes(req.user.role) && req.user.trainer_id) {
+    params.push(req.user.trainer_id);
+    trainerClause = `AND c.trainer_id = $${params.length}`;
+  }
+
+  const { rows } = await pool.query(
+    `SELECT wa.id                AS assignment_id,
+            wa.client_id,
+            c.name               AS client_name,
+            c.photo_url          AS client_photo,
+            wp.id                AS plan_id,
+            wp.name              AS plan_name,
+            wa.progress_pct,
+            ws.id                AS session_id,
+            ws.status            AS session_status,
+            (SELECT COUNT(*) FROM workout_exercises we
+              WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2) AS planned_exercises
+       FROM workout_assignments wa
+       JOIN workout_plans wp  ON wp.id = wa.workout_plan_id
+       JOIN pt_clients   c    ON c.id  = wa.client_id
+       -- LATERAL, not a plain LEFT JOIN: nothing stops a client having two
+       -- sessions on one date, and a plain join fans the client out into two
+       -- rows. Tested against live data, where one client already has two.
+       -- An in-progress session wins, so "Resume" points at the live one.
+       LEFT JOIN LATERAL (
+         SELECT s.id, s.status
+           FROM workout_sessions s
+          WHERE s.client_id = wa.client_id AND s.session_date = $1::date
+          ORDER BY (s.status = 'in_progress') DESC, s.created_at DESC
+          LIMIT 1
+       ) ws ON TRUE
+      WHERE wa.status = 'active'
+        AND wa.start_date <= $1::date
+        AND (wa.end_date IS NULL OR wa.end_date >= $1::date)
+        ${orgClause}
+        ${trainerClause}
+      ORDER BY (ws.id IS NOT NULL), c.name`,
+    params
+  );
+
+  res.json({
+    data: {
+      date,
+      day_of_week: WEEKDAYS[dow - 1],
+      clients: rows.map((r) => ({
+        assignment_id: r.assignment_id,
+        client_id: r.client_id,
+        client_name: r.client_name,
+        client_photo: r.client_photo,
+        plan_id: r.plan_id,
+        plan_name: r.plan_name,
+        progress_pct: r.progress_pct,
+        planned_exercises: Number(r.planned_exercises),
+        // A rest day is a real answer, not a missing one: the programme
+        // simply prescribes nothing for this weekday.
+        is_rest_day: Number(r.planned_exercises) === 0,
+        session_id: r.session_id,
+        session_status: r.session_status,
+      })),
+    },
+  });
+}));
+
 router.get('/workout-log/previous', auth, wrap(async (req, res) => {
   const { client_id, exercise_id, exercise_name, exclude_session_id } = req.query;
   if (!client_id || (!exercise_id && !exercise_name)) {
