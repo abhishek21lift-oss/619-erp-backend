@@ -284,20 +284,46 @@ router.post('/forgot-password', async (req, res) => {
     const rawToken = crypto.randomBytes(32).toString('hex');
     const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
 
+    // btrim on BOTH sides. A stored address with a stray leading or trailing
+    // space — easy to introduce when an operator pastes one into the admin UI
+    // — would never match, and the request would then look exactly like a
+    // broken mailer: the caller is told a link was sent, and nothing is sent.
     const { rows } = await pool.query(
-      'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
+      'SELECT id FROM users WHERE btrim(LOWER(email)) = btrim(LOWER($1))',
       [email]
     );
 
-    if (rows.length) {
+    // Every outcome is logged server-side, because until now one of them was
+    // not logged at all. A request for an address with no user did nothing and
+    // said nothing — indistinguishable in the logs from SMTP being down, while
+    // the caller saw the same reassuring message either way. That is the state
+    // "password reset emails are not arriving" is reported from, and there was
+    // no way to tell which of the two it was.
+    //
+    // The RESPONSE is deliberately unchanged: it must not reveal whether an
+    // address is registered. The logs are operator-only and can be honest.
+    if (!rows.length) {
+      logger.warn({ email, outcome: 'unknown_address' },
+        'Password reset requested for an address with no user account — nothing sent');
+    } else {
       await pool.query(
         // M-07: 15-minute window — was 1 hour, which gave too large an interception window
       'UPDATE users SET password_reset_token = $1, password_reset_expires = NOW() + INTERVAL \'15 minutes\' WHERE id = $2',
         [hashedToken, rows[0].id]
       );
-      // FIX: await + .catch so email failures are logged instead of silently swallowed
       sendPasswordReset(email, rawToken)
-        .catch(function(err) { logger.warn({ err: err.message }, 'Password reset email failed (non-critical)'); });
+        .then(function(result) {
+          if (result && result.sent === false) {
+            logger.error({ email, outcome: 'smtp_not_configured' },
+              'Password reset email NOT sent: SMTP is not configured on this deploy');
+          } else {
+            logger.info({ email, outcome: 'sent' }, 'Password reset email sent');
+          }
+        })
+        .catch(function(err) {
+          logger.error({ email, outcome: 'send_failed', err: err.message },
+            'Password reset email failed to send');
+        });
     }
 
     // Always return success — don't reveal if email exists
