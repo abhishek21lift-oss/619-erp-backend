@@ -308,7 +308,32 @@ async function activate(orgId, planCode, opts = {}) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Serialises every activation for THIS studio, so two requests for the
+    // same org launched a moment apart (a double click on "Record Payment",
+    // a network retry) queue up instead of both reading "no duplicate yet"
+    // and each inserting a payment. Released automatically at COMMIT/ROLLBACK.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [orgId]);
     await client.query('LOCK TABLE founder_members IN SHARE ROW EXCLUSIVE MODE');
+
+    // A payment reference (UTR, bank note, whatever the operator typed) can
+    // only ever record one real transaction. Checked here for a clean error;
+    // uq_sub_payments_live_reference is the actual backstop (see migration
+    // 140) since this pre-check alone would still race under concurrency —
+    // the advisory lock above is what closes that race.
+    if (opts.reference) {
+      const dupe = await client.query(
+        `SELECT invoice_number FROM subscription_invoices si
+           JOIN subscription_payments sp ON sp.id = si.payment_id
+          WHERE sp.organization_id = $1 AND sp.reference = $2 AND sp.status = 'paid'`,
+        [orgId, opts.reference]
+      );
+      if (dupe.rows[0]) {
+        throw Object.assign(
+          new Error(`This reference has already been recorded as payment (invoice ${dupe.rows[0].invoice_number}).`),
+          { status: 409, code: 'DUPLICATE_REFERENCE' }
+        );
+      }
+    }
 
     const plan = (await client.query('SELECT * FROM subscription_plans WHERE code = $1', [planCode])).rows[0];
     if (!plan) throw Object.assign(new Error('Unknown plan'), { status: 400 });
@@ -373,18 +398,31 @@ async function activate(orgId, planCode, opts = {}) {
       [orgId, planCode, plan.client_limit, now, periodEnd, grantFounder, founderNumber, lockedPrice]
     );
 
-    const pay = (await client.query(
-      `INSERT INTO subscription_payments
-         (organization_id, plan_code, amount_inr, method, reference, status,
-          period_start, period_end, recorded_by, recorded_by_name, notes,
-          proration_credit_inr, previous_plan_code, coupon_code, discount_inr)
-       VALUES ($1,$2,$3,$4,$5,'paid',$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
-      [orgId, planCode, chargedAmount, opts.method || null, opts.reference || null,
-       now, periodEnd, opts.actor?.id || null, opts.actor?.name || null, opts.notes || null,
-       opts.prorationCreditInr != null ? opts.prorationCreditInr : null,
-       opts.previousPlanCode || null,
-       coupon?.code || null, coupon?.discount_inr || null]
-    )).rows[0];
+    let pay;
+    try {
+      pay = (await client.query(
+        `INSERT INTO subscription_payments
+           (organization_id, plan_code, amount_inr, method, reference, status,
+            period_start, period_end, recorded_by, recorded_by_name, notes,
+            proration_credit_inr, previous_plan_code, coupon_code, discount_inr)
+         VALUES ($1,$2,$3,$4,$5,'paid',$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+        [orgId, planCode, chargedAmount, opts.method || null, opts.reference || null,
+         now, periodEnd, opts.actor?.id || null, opts.actor?.name || null, opts.notes || null,
+         opts.prorationCreditInr != null ? opts.prorationCreditInr : null,
+         opts.previousPlanCode || null,
+         coupon?.code || null, coupon?.discount_inr || null]
+      )).rows[0];
+    } catch (err) {
+      // Backstop for the pre-check above: closes the race it cannot, on its
+      // own, fully rule out (see uq_sub_payments_live_reference, migration 140).
+      if (err.code === '23505' && String(err.constraint || '').includes('live_reference')) {
+        throw Object.assign(
+          new Error('This reference has already been recorded as payment for this studio.'),
+          { status: 409, code: 'DUPLICATE_REFERENCE' }
+        );
+      }
+      throw err;
+    }
 
     // Link the redemption to the payment now that it exists, so the ledger and
     // the charge can be reconciled from either side.
