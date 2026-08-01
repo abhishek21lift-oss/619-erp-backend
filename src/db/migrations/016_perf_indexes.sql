@@ -14,8 +14,20 @@ DO $$ BEGIN
   END IF;
 END $$;
 
-CREATE INDEX IF NOT EXISTS idx_clients_branch_id
-  ON clients(branch_id) WHERE deleted_at IS NULL;
+-- Same guard as the subscriptions index above, which this one was missing:
+-- clients.branch_id is added by migration 046, i.e. after this file, so on a
+-- fresh database the index had no column to attach to and aborted the
+-- migration. The file's own header already states this is the intended
+-- pattern for exactly this case.
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'clients' AND column_name = 'branch_id'
+  ) THEN
+    CREATE INDEX IF NOT EXISTS idx_clients_branch_id
+      ON clients(branch_id) WHERE deleted_at IS NULL;
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_payments_deleted_at
   ON payments(deleted_at) WHERE deleted_at IS NOT NULL;

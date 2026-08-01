@@ -1,4 +1,12 @@
--- Run once to create the staff tables if they don't exist yet
+-- Creates the staff tables if they don't exist yet.
+--
+-- Renamed from the unnumbered `staff.sql`, which sorted after every numbered
+-- file and therefore ran LAST — while migration 031 adds a unique_id column
+-- and trigger to `staff`, so a fresh database aborted there with "relation
+-- staff does not exist". The number places it before its first consumer.
+--
+-- Both statements are CREATE TABLE IF NOT EXISTS, so a database that already
+-- applied this under the old filename simply re-runs it as a no-op.
 
 CREATE TABLE IF NOT EXISTS staff (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),

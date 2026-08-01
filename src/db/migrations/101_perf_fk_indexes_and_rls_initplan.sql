@@ -70,11 +70,20 @@ DROP INDEX IF EXISTS public.idx_exercises_body_part;
 -- ── 3. InitPlan-cache the per-row current_setting() calls ───────────────────
 -- Each policy below is recreated with identical logic, differing only in that
 -- current_setting(...) is wrapped in (SELECT ...).
-DROP POLICY IF EXISTS gym_settings_admin_policy ON public.gym_settings;
-CREATE POLICY gym_settings_admin_policy ON public.gym_settings
-  FOR ALL
-  USING ((SELECT current_setting('app.role', true)) = 'admin')
-  WITH CHECK ((SELECT current_setting('app.role', true)) = 'admin');
+-- gym_settings is the one table in this block that no tracked migration
+-- creates — it exists on the live database only because it was created out of
+-- band. DROP POLICY IF EXISTS still errors when the TABLE is missing, so this
+-- aborted a fresh database. Every other table policed below is created by this
+-- repo and needs no guard.
+DO $$ BEGIN
+  IF to_regclass('public.gym_settings') IS NOT NULL THEN
+    DROP POLICY IF EXISTS gym_settings_admin_policy ON public.gym_settings;
+    CREATE POLICY gym_settings_admin_policy ON public.gym_settings
+      FOR ALL
+      USING ((SELECT current_setting('app.role', true)) = 'admin')
+      WITH CHECK ((SELECT current_setting('app.role', true)) = 'admin');
+  END IF;
+END $$;
 
 DROP POLICY IF EXISTS webauthn_credentials_member_policy ON public.webauthn_credentials;
 CREATE POLICY webauthn_credentials_member_policy ON public.webauthn_credentials

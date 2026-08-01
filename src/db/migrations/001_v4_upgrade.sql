@@ -58,9 +58,18 @@ CREATE TABLE IF NOT EXISTS attendance_logs (
 
 -- Migrate data from old attendance table if it exists
 -- NOTE: v3 attendance table has no 'method' column — use literal 'manual'
+-- Guarded on the v3 COLUMN, not just the table name. `attendance` is now
+-- created by schema.sql (the bookings and members services still use it), so
+-- a table-name check is true on a brand-new database too — and this block
+-- then failed on `ref_name`, a column only the v3 shape ever had. Checking
+-- for that column is what actually distinguishes "there is legacy data to
+-- migrate" from "this is a fresh install with nothing to copy".
 DO $$
 BEGIN
-  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'attendance') THEN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'attendance' AND column_name = 'ref_name'
+  ) THEN
     INSERT INTO attendance_logs (ref_id, ref_type, ref_name, date, check_in_time, method, status, created_at)
     SELECT
       ref_id,

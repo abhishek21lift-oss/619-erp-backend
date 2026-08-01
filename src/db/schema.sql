@@ -51,8 +51,12 @@ CREATE TABLE IF NOT EXISTS users (
   password      TEXT        NOT NULL,            -- bcrypt hash
   role          TEXT        NOT NULL DEFAULT 'trainer'
                             CHECK (role IN ('admin','manager','trainer','reception','member')),
-  trainer_id    TEXT        REFERENCES trainers(id) ON DELETE SET NULL,
-  member_id     TEXT        REFERENCES clients(id)  ON DELETE SET NULL,
+  -- The two FKs these columns carry are attached further down, once trainers
+  -- and clients exist. Declaring them inline made this file unrunnable in its
+  -- own stated order: users is defined first, so both targets are still
+  -- missing at this point and a fresh database stopped here.
+  trainer_id    TEXT,
+  member_id     TEXT,
   branch_id     TEXT,
   is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
   last_login    TIMESTAMPTZ,
@@ -148,7 +152,13 @@ CREATE TABLE IF NOT EXISTS clients (
   -- Biometric / face recognition
   biometric_code  TEXT,
   biometric_added BOOLEAN     DEFAULT FALSE,
-  face_descriptor FLOAT8[],   -- 128-D face embedding
+  -- JSONB, which is what migration 013b converts this to and what the code
+  -- reads today. Declared in its final shape so a fresh database never needs
+  -- the conversion: by the time 013b runs, migration 009 has built the
+  -- v_clients view over this column, and Postgres refuses to ALTER the type
+  -- of a column a view depends on. 013b's guard checks for the old float8[]
+  -- type, so it correctly no-ops here and still upgrades legacy databases.
+  face_descriptor JSONB,      -- 128-D face embedding
   face_enrolled   BOOLEAN     DEFAULT FALSE,
   face_enrolled_at TIMESTAMPTZ,
 
@@ -171,6 +181,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS clients_email_uniq  ON clients (LOWER(email))
   WHERE email IS NOT NULL AND email != '';
 CREATE UNIQUE INDEX IF NOT EXISTS trainers_email_uniq ON trainers (LOWER(email))
   WHERE email IS NOT NULL AND email != '';
+
+-- The FKs deferred from the users table above, now that both targets exist.
+-- users → trainers/clients while trainers/clients are themselves defined
+-- after users, so one of the three has to be attached out of line; doing it
+-- here keeps the table definitions in their documented reading order.
+--
+-- Guarded by name rather than IF NOT EXISTS, which ADD CONSTRAINT does not
+-- support, so this stays idempotent and leaves a live database — where these
+-- constraints already exist — completely untouched.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_trainer_id_fkey') THEN
+    ALTER TABLE users ADD CONSTRAINT users_trainer_id_fkey
+      FOREIGN KEY (trainer_id) REFERENCES trainers(id) ON DELETE SET NULL;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_member_id_fkey') THEN
+    ALTER TABLE users ADD CONSTRAINT users_member_id_fkey
+      FOREIGN KEY (member_id) REFERENCES clients(id) ON DELETE SET NULL;
+  END IF;
+END $$;
 
 
 -- ─── PAYMENTS ────────────────────────────────────────────────
@@ -237,6 +267,36 @@ CREATE TABLE IF NOT EXISTS branches (
 INSERT INTO branches (id, name, code)
 VALUES ('main', 'Main Studio', 'MAIN')
 ON CONFLICT (code) DO NOTHING;
+
+-- `plans` must exist before `subscriptions`, which carries an FK to it.
+--
+-- It was previously created only by migration 003a — which runs AFTER this
+-- file — so a fresh database failed here with "relation plans does not
+-- exist", took `subscriptions` down with it, and then failed migration 001
+-- for the missing `users` that the aborted run never reached. The live
+-- database has never seen this because it predates the split.
+--
+-- The full column set, defaults and the `features` TEXT→JSONB upgrade still
+-- live in 003a. This is the minimum shape the FK below needs; 003a's
+-- ADD COLUMN IF NOT EXISTS statements fill in the rest and remain a no-op on
+-- any database that already has them.
+CREATE TABLE IF NOT EXISTS plans (
+  id                TEXT          PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
+  kind              TEXT          NOT NULL DEFAULT 'Membership'
+                                  CHECK (kind IN ('Membership','PT')),
+  name              TEXT          NOT NULL,
+  duration          TEXT          NOT NULL DEFAULT 'Monthly'
+                                  CHECK (duration IN ('Monthly','Quarterly','Half Yearly','Yearly')),
+  base_amount       NUMERIC(10,2) NOT NULL DEFAULT 0,
+  discount          NUMERIC(10,2) NOT NULL DEFAULT 0,
+  final_amount      NUMERIC(10,2) NOT NULL DEFAULT 0,
+  sessions_per_week INT,
+  features          JSONB         NOT NULL DEFAULT '[]',
+  popular           BOOLEAN       NOT NULL DEFAULT FALSE,
+  is_active         BOOLEAN       NOT NULL DEFAULT TRUE,
+  created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
 
 CREATE TABLE IF NOT EXISTS subscriptions (
   id                TEXT          PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
@@ -305,13 +365,52 @@ CREATE INDEX IF NOT EXISTS atlog_date_idx ON attendance_logs (date DESC);
 CREATE INDEX IF NOT EXISTS atlog_type_idx ON attendance_logs (ref_type, date DESC);
 
 
+-- ─── ATTENDANCE (class-booking mirror) ───────────────────────
+-- Distinct from attendance_logs above, and NOT a leftover: the bookings and
+-- members services read and write this table today
+-- (modules/bookings/bookings.service.js mirrors a check-in into it,
+-- modules/members/members.service.js reads a member's history out of it).
+--
+-- It was never in any tracked file — it exists on the live database because
+-- it was created out of band, exactly like the `exercises` columns that
+-- migration 069 later reconciled. The visible symptom was migration 010
+-- failing on a fresh database with "relation attendance does not exist" when
+-- it tried to index it.
+--
+-- The shape is taken from what the code actually uses; the composite UNIQUE
+-- is required by the bookings service's ON CONFLICT (type, ref_id, date).
+-- IF NOT EXISTS, so a database that already has its own copy keeps it
+-- untouched.
+CREATE TABLE IF NOT EXISTS attendance (
+  id               TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
+  type             TEXT        NOT NULL DEFAULT 'client'
+                   CHECK (type IN ('client','trainer','staff')),
+  ref_id           TEXT        NOT NULL,
+  member_id        TEXT,
+  booking_id       TEXT,
+  branch_id        TEXT        REFERENCES branches(id),
+  date             DATE        NOT NULL DEFAULT CURRENT_DATE,
+  check_in         TIME,
+  check_out        TIME,
+  status           TEXT        NOT NULL DEFAULT 'present'
+                   CHECK (status IN ('present','absent','late','half_day')),
+  check_in_method  TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (type, ref_id, date)
+);
+
+
 -- ─── FACE DESCRIPTORS ────────────────────────────────────────
 -- Separate table keeps the heavy 128-float arrays out of the main
 -- clients row, speeding up list queries.
 CREATE TABLE IF NOT EXISTS face_descriptors (
   id            TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id     TEXT        NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-  descriptor    FLOAT8[]    NOT NULL,  -- 128-D face-api.js embedding
+  -- JSONB for the same reason as clients.face_descriptor above: this is what
+  -- migration 013b converts it to, and declaring the end state here keeps the
+  -- two columns the same type so migration 001's copy between them works on a
+  -- fresh database.
+  descriptor    JSONB       NOT NULL,  -- 128-D face-api.js embedding
   enrolled_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at    TIMESTAMPTZ,
   enrolled_by   TEXT        REFERENCES users(id) ON DELETE SET NULL,
