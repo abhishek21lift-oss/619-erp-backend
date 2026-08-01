@@ -133,14 +133,39 @@ UPDATE public.exercises
    SET slug = trim(both '-' from regexp_replace(lower(name), '[^a-z0-9]+', '-', 'g'))
  WHERE slug IS NULL AND name IS NOT NULL;
 
-UPDATE public.exercises e
-   SET slug = e.slug || '-' || right(replace(e.id::text, '-', ''), 6)
-  FROM (
-    SELECT id, slug, row_number() OVER (PARTITION BY slug ORDER BY created_at, id) AS rn
-      FROM public.exercises
-     WHERE slug IS NOT NULL
-  ) dup
- WHERE dup.id = e.id AND dup.rn > 1;
+-- Looped, not a single pass: suffixing can itself collide. Two rows named
+-- "Plank" and one named "Plank (ab12cd)" all reduce to the slug
+-- "plank-ab12cd" once the first pair is disambiguated, and a single pass
+-- would leave that collision behind for the unique index to trip over.
+-- Bounded so a pathological dataset cannot spin here forever.
+DO $$
+DECLARE
+  fixed INT;
+  pass  INT := 0;
+BEGIN
+  LOOP
+    pass := pass + 1;
+
+    WITH dupes AS (
+      SELECT id, row_number() OVER (PARTITION BY slug ORDER BY created_at, id) AS rn
+        FROM public.exercises
+       WHERE slug IS NOT NULL AND deleted_at IS NULL
+    )
+    UPDATE public.exercises e
+       SET slug = e.slug || '-' || right(replace(e.id::text, '-', ''), 6)
+      FROM dupes d
+     WHERE d.id = e.id AND d.rn > 1;
+
+    GET DIAGNOSTICS fixed = ROW_COUNT;
+    EXIT WHEN fixed = 0 OR pass >= 5;
+
+    RAISE NOTICE 'exercise_library: disambiguated % duplicate slug(s) on pass %', fixed, pass;
+  END LOOP;
+
+  IF pass >= 5 AND fixed > 0 THEN
+    RAISE EXCEPTION 'exercise_library: duplicate slugs still present after % passes', pass;
+  END IF;
+END $$;
 
 -- Empty-name edge case: a row whose name was all punctuation slugs to ''.
 UPDATE public.exercises
@@ -153,6 +178,66 @@ CREATE UNIQUE INDEX IF NOT EXISTS exercises_slug_unique_idx
   ON public.exercises (slug) WHERE deleted_at IS NULL;
 
 -- ── 4. Duplicate-name protection ────────────────────────────────────────
+--
+-- Existing duplicates have to be resolved BEFORE the unique index below, for
+-- the same reason migration 140 deduplicates before its constraint: Postgres
+-- will not build a unique index over data that already violates it. The
+-- seeded library was imported from free-exercise-db, whose dedup pass ran in
+-- application code against source_id and exact name — so rows differing only
+-- by case, or re-imported under a new source_id, are already present.
+--
+-- Duplicates are RENAMED, never deleted and never merged:
+--
+--   * workout_exercises.exercise_id and workout_session_exercises.exercise_id
+--     point at these rows. Deleting one would cascade into a client's saved
+--     programme; soft-deleting it would blank the exercise inside a plan that
+--     still references it, because every read filters on deleted_at.
+--   * Merging means choosing which row's metadata survives and repointing
+--     history. That is a judgement call about a studio's data, not something
+--     a migration should decide unattended.
+--
+-- Renaming keeps every row, every id and every reference intact, makes the
+-- collision visible in the UI, and leaves a human free to merge later. The
+-- earliest row (by created_at, then id) keeps the original name.
+--
+-- The suffix is drawn from the row id rather than a counter so the result is
+-- stable on re-run and needs no second pass to renumber. The loop covers the
+-- rare case where a suffixed name collides with something already present;
+-- it is bounded so a pathological dataset cannot spin here forever.
+DO $$
+DECLARE
+  renamed INT;
+  pass    INT := 0;
+BEGIN
+  LOOP
+    pass := pass + 1;
+
+    WITH dupes AS (
+      SELECT id,
+             row_number() OVER (
+               PARTITION BY COALESCE(organization_id, '00000000-0000-0000-0000-000000000000'::uuid),
+                            lower(name)
+               ORDER BY created_at, id
+             ) AS rn
+        FROM public.exercises
+       WHERE deleted_at IS NULL AND name IS NOT NULL
+    )
+    UPDATE public.exercises e
+       SET name = e.name || ' (' || right(replace(e.id::text, '-', ''), 6) || ')'
+      FROM dupes d
+     WHERE d.id = e.id AND d.rn > 1;
+
+    GET DIAGNOSTICS renamed = ROW_COUNT;
+    EXIT WHEN renamed = 0 OR pass >= 5;
+
+    RAISE NOTICE 'exercise_library: renamed % duplicate exercise name(s) on pass %', renamed, pass;
+  END LOOP;
+
+  IF pass >= 5 AND renamed > 0 THEN
+    RAISE EXCEPTION 'exercise_library: duplicate names still present after % passes', pass;
+  END IF;
+END $$;
+
 -- Case-insensitive, scoped per owning studio (two different studios may each
 -- have their own "619 Deadlift"; one studio may not have two). NULLs — the
 -- shared platform library — are collapsed to a sentinel so the same rule
