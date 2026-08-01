@@ -20,7 +20,10 @@ const channels = {
 
   email: async ({ to, subject, html }) => {
     if (!to) return { status: 'failed', error: 'no recipient' };
-    const FROM = process.env.EMAIL_FROM || 'no-reply@619fitness.com';
+    // No hardcoded domain fallback here on purpose — see lib/email.js's
+    // FROM_ADDR comment. SMTP_USER is the one address guaranteed to belong to
+    // a domain this deployment can actually send from.
+    const FROM = process.env.EMAIL_FROM || process.env.SMTP_USER || '';
 
     // Resend (preferred when RESEND_API_KEY is set)
     if (process.env.RESEND_API_KEY) {

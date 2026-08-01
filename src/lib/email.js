@@ -20,7 +20,15 @@ const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
 const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
-const FROM_ADDR = process.env.SMTP_FROM || 'noreply@619fitness.com';
+// Falls back to SMTP_USER, not a hardcoded address, when SMTP_FROM is unset.
+// The mailbox can always send as itself; a hardcoded domain it was never
+// provisioned for cannot — and previously fell back to noreply@619fitness.com,
+// a domain with no DNS records at all. Hostinger (and any relay) rejects the
+// envelope outright when the From domain doesn't match the authenticated
+// mailbox's, which fails password resets and the admin reset OTP silently:
+// SMTP looks "configured" (host/port/user/pass all present) because the
+// failure is in the From address, not the credentials.
+const FROM_ADDR = process.env.SMTP_FROM || SMTP_USER;
 // Invitations are the one message a recipient is asked to TRUST, so they go
 // from the support identity rather than a noreply nobody can answer. Falls
 // back to the general from-address so a deploy that has not set it still
