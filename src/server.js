@@ -79,6 +79,39 @@ if (emailConfig.state === 'partial') {
   );
 }
 
+// Having all three variables set only means something was typed into them. It
+// does not mean the host answers, the mailbox exists, or the password is
+// right — and nothing downstream will tell you, because every failure on the
+// password-reset path is invisible by design: the endpoint must answer the
+// same whether or not an address is registered, so a dead mailbox looks
+// exactly like a working one until somebody reports a missing email.
+//
+// So the credentials are proved at boot, once, and the answer goes in the
+// deploy log whether or not anyone thinks to look. Nothing is sent — this is
+// an SMTP handshake and AUTH, no message.
+//
+// Non-fatal, and deliberately not awaited: mail being misconfigured must not
+// stop a studio taking check-ins, and the port must not wait on a network
+// round-trip to a third party.
+if (emailConfig.state === 'configured') {
+  require('./lib/email').verifyConnection()
+    .then(function(r) {
+      if (r.ok) {
+        logger.info({ host: r.host, port: r.port, user: r.user, from: r.from },
+          'SMTP verified at boot — credentials accepted, outgoing email should work');
+      } else {
+        logger.error(
+          { reason: r.reason, err: r.message, response: r.response, diagnosis: r.diagnosis,
+            host: r.host, port: r.port, user: r.user, from: r.from },
+          'SMTP FAILED verification at boot — password resets and invitations will NOT arrive'
+        );
+      }
+    })
+    .catch(function(err) {
+      logger.error({ err: err.message }, 'SMTP boot verification could not run');
+    });
+}
+
 // ── Cloudflare R2 object storage ────────────────────────────────────────────
 // lib/fileStorage.js falls back to local disk whenever R2 is not fully
 // configured. On Render the filesystem is ephemeral, so that fallback silently
