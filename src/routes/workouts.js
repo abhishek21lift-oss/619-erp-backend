@@ -2,47 +2,169 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
-const { auth, adminManagerOrTrainer } = require('../middleware/auth');
+const { auth, adminOrManager, adminManagerOrTrainer } = require('../middleware/auth');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks } = require('../modules/pt-os/progression');
-const exerciseSvc = require('../modules/exercises/exercises.service');
 
-// ─── EXERCISES (legacy compatibility) ─────────────────────────
-//
-// The exercise library now lives at /api/exercises
-// (modules/exercises/), which owns the premium fields, permissions,
-// versioning, favourites and full-text search.
-//
-// These two routes remain as thin adapters over the same service, because
-// the mobile client and any bookmarked integration still call them. They
-// delegate rather than reimplement — a second copy of the visibility rule is
-// how one of them ends up leaking another studio's custom exercises.
-//
-// The legacy WRITE routes are gone. They wrote rows with no slug, no
-// organization_id and no version snapshot, which the new reads then could not
-// scope or the history explain. Writes go through /api/exercises.
+// ─── EXERCISES ────────────────────────────────────────────────
 
-// GET /api/workouts/exercises — legacy shape: a bare array, not {data,…}.
+// GET /api/workouts/exercises
 router.get('/exercises', auth, async (req, res, next) => {
   try {
-    const result = await exerciseSvc.list(pool, {
-      query: { ...req.query, limit: Math.min(parseInt(req.query.limit, 10) || 200, 200) },
-      user: req.user,
-      orgId: orgIdOf(req),
-    });
-    res.json(result.data);
+    const { muscle_group, body_part, equipment, exercise_type, difficulty, search } = req.query;
+    const conds = ['is_active = true'];
+    const params = [];
+    let p = 1;
+
+    if (muscle_group)   { conds.push(`muscle_group = $${p++}`);   params.push(muscle_group); }
+    if (body_part)      { conds.push(`body_part = $${p++}`);       params.push(body_part); }
+    if (equipment)      { conds.push(`equipment = $${p++}`);       params.push(equipment); }
+    if (exercise_type)  { conds.push(`exercise_type = $${p++}`);   params.push(exercise_type); }
+    if (difficulty)     { conds.push(`difficulty = $${p++}`);      params.push(difficulty); }
+    if (search)         { conds.push(`name ILIKE $${p++}`);        params.push(`%${search}%`); }
+
+    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    params.push(limit, offset);
+    const { rows } = await pool.query(
+      `SELECT id, name, muscle_group, body_part, target_muscle, secondary_muscles,
+              equipment, difficulty, instructions, gif_url, exercise_type,
+              force, mechanic, sets_default, reps_default, rest_seconds,
+              video_url, image_url, is_active, source_id, created_at
+       FROM exercises WHERE ${conds.join(' AND ')} ORDER BY body_part, name
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    res.json(rows);
   } catch (err) {
     if (err.message?.includes('does not exist')) return res.json([]);
     next(err);
   }
 });
 
-// GET /api/workouts/exercises/meta
+// GET /api/workouts/exercises/meta — filter values + optional filtered total count
 router.get('/exercises/meta', auth, async (req, res, next) => {
   try {
-    res.json(await exerciseSvc.meta(pool, { orgId: orgIdOf(req) }));
-  } catch (err) { next(err); }
+    const { body_part, equipment, exercise_type, difficulty, search } = req.query;
+    const hasFilters = body_part || equipment || exercise_type || difficulty || search;
+
+    // Always return global metadata for dropdowns
+    const { rows: [meta] } = await pool.query(`
+      SELECT
+        array_agg(DISTINCT body_part    ORDER BY body_part)    FILTER (WHERE body_part IS NOT NULL)    AS body_parts,
+        array_agg(DISTINCT equipment    ORDER BY equipment)    FILTER (WHERE equipment IS NOT NULL)    AS equipment_types,
+        array_agg(DISTINCT exercise_type ORDER BY exercise_type) FILTER (WHERE exercise_type IS NOT NULL) AS exercise_types,
+        array_agg(DISTINCT difficulty   ORDER BY difficulty)   FILTER (WHERE difficulty IS NOT NULL)   AS difficulties,
+        COUNT(*)::int AS total
+      FROM exercises WHERE is_active = true
+    `);
+
+    if (!hasFilters) return res.json(meta);
+
+    // Filtered count
+    const conds = ['is_active = true'];
+    const params = [];
+    let p = 1;
+    if (body_part)     { conds.push(`body_part = $${p++}`);     params.push(body_part); }
+    if (equipment)     { conds.push(`equipment = $${p++}`);     params.push(equipment); }
+    if (exercise_type) { conds.push(`exercise_type = $${p++}`); params.push(exercise_type); }
+    if (difficulty)    { conds.push(`difficulty = $${p++}`);    params.push(difficulty); }
+    if (search)        { conds.push(`name ILIKE $${p++}`);      params.push(`%${search}%`); }
+
+    const { rows: [cnt] } = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM exercises WHERE ${conds.join(' AND ')}`,
+      params
+    );
+    res.json({ ...meta, total: cnt.total });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/workouts/exercises
+router.post('/exercises', auth, adminOrManager, async (req, res, next) => {
+  try {
+    const d = req.body;
+    if (!d.name?.trim())
+      return res.status(400).json({ error: 'Exercise name required' });
+
+    const { rows } = await pool.query(`
+      INSERT INTO exercises (id, name, description, muscle_group, body_part, target_muscle,
+        secondary_muscles, equipment, difficulty, instructions, gif_url, exercise_type,
+        force, mechanic, sets_default, reps_default, rest_seconds, created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+      [randomUUID(), d.name.trim(), d.description || null,
+       d.muscle_group || d.body_part || 'Full Body',
+       d.body_part || d.muscle_group || 'Full Body',
+       d.target_muscle || null, d.secondary_muscles || null,
+       d.equipment || null, d.difficulty || 'beginner',
+       d.instructions || null, d.gif_url || null, d.exercise_type || null,
+       d.force || null, d.mechanic || null,
+       parseInt(d.sets_default) || 3, parseInt(d.reps_default) || 12,
+       parseInt(d.rest_seconds) || 60, req.user.id]
+    );
+    res.status(201).json({ message: 'Exercise created', exercise: rows[0] });
+  } catch (err) {
+    if (err.message?.includes('does not exist')) return res.status(400).json({ error: 'Tables not ready. Run migrations.' });
+    next(err);
+  }
+});
+
+// PUT /api/workouts/exercises/:id
+router.put('/exercises/:id', auth, adminOrManager, async (req, res, next) => {
+  try {
+    const d = req.body;
+    const { rows } = await pool.query(`
+      UPDATE exercises SET
+        name              = COALESCE($1,  name),
+        description       = COALESCE($2,  description),
+        muscle_group      = COALESCE($3,  muscle_group),
+        body_part         = COALESCE($4,  body_part),
+        target_muscle     = COALESCE($5,  target_muscle),
+        secondary_muscles = COALESCE($6,  secondary_muscles),
+        equipment         = COALESCE($7,  equipment),
+        difficulty        = COALESCE($8,  difficulty),
+        instructions      = COALESCE($9,  instructions),
+        gif_url           = COALESCE($10, gif_url),
+        exercise_type     = COALESCE($11, exercise_type),
+        force             = COALESCE($12, force),
+        mechanic          = COALESCE($13, mechanic),
+        sets_default      = COALESCE($14, sets_default),
+        reps_default      = COALESCE($15, reps_default),
+        rest_seconds      = COALESCE($16, rest_seconds),
+        updated_at        = NOW()
+      WHERE id = $17 RETURNING *`,
+      [d.name || null, d.description ?? null,
+       d.muscle_group || null, d.body_part || null,
+       d.target_muscle ?? null, d.secondary_muscles ?? null,
+       d.equipment ?? null, d.difficulty || null,
+       d.instructions ?? null, d.gif_url ?? null,
+       d.exercise_type ?? null, d.force ?? null, d.mechanic ?? null,
+       d.sets_default ? parseInt(d.sets_default) : null,
+       d.reps_default ? parseInt(d.reps_default) : null,
+       d.rest_seconds ? parseInt(d.rest_seconds) : null,
+       req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Exercise not found' });
+    res.json({ message: 'Exercise updated', exercise: rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/workouts/exercises/:id
+router.delete('/exercises/:id', auth, adminOrManager, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      'UPDATE exercises SET is_active=false WHERE id=$1 RETURNING id',
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Exercise not found' });
+    res.json({ message: 'Exercise deleted' });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ─── WORKOUT PLANS ────────────────────────────────────────────

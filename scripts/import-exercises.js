@@ -1,21 +1,8 @@
 /**
  * Exercise Library Import Script
- * Imports the free-exercise-db dataset into the exercises table.
+ * Imports 873 exercises from free-exercise-db into the exercises table.
+ * Run from: G:\619\619-erp-backend
  * Usage: node scripts/import-exercises.js
- *
- * Imported rows are PLATFORM library rows: organization_id stays NULL, so
- * every studio sees them and none can edit them in place (a studio that wants
- * its own version duplicates it — see modules/exercises).
- *
- * Slug, category and search_keywords are generated here as well as in
- * migration 141. The migration backfills what already existed; this covers
- * everything imported afterwards, which would otherwise arrive with a NULL
- * slug and be invisible to slug lookup and full-text search.
- *
- * Note on 'Neck': BODY_PART_MAP maps a primary muscle of `neck` to 'Neck',
- * which the muscle_group CHECK constraint rejected until migration 141 added
- * it. Before that migration every neck exercise failed its INSERT and was
- * counted as "skipped" with no visible explanation.
  */
 
 require('dotenv').config();
@@ -100,51 +87,6 @@ function normalize(ex) {
   };
 }
 
-/**
- * Category, derived the same way migration 141 derives it for existing rows,
- * so an imported exercise and a backfilled one land in the same bucket.
- */
-function categoryFor(n) {
-  const t = String(n.exercise_type || '').toLowerCase();
-  if (t.includes('stretch')) return 'Flexibility';
-  if (t.includes('cardio')) return 'Cardio';
-  if (t.includes('plyo')) return 'Plyometric';
-  if (t.includes('olympic')) return 'Olympic';
-  if (t.includes('powerlifting')) return 'Powerlifting';
-  if (t.includes('strongman')) return 'Strongman';
-  if (n.muscle_group === 'Cardio') return 'Cardio';
-  return 'Strength';
-}
-
-/** The facet terms a trainer would search by. Mirrors the service's version. */
-function buildSearchKeywords(n) {
-  const seen = new Set();
-  for (const raw of [n.target_muscle, n.muscle_group, n.body_part, n.equipment,
-    n.exercise_type, n.force, n.mechanic, categoryFor(n)]) {
-    if (raw == null) continue;
-    const v = String(raw).trim().toLowerCase();
-    if (v) seen.add(v);
-  }
-  return [...seen];
-}
-
-const slugify = (name) => String(name || '')
-  .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-
-/** A slug nothing else holds. The unique index is partial on deleted_at. */
-async function uniqueSlug(name) {
-  const base = slugify(name) || 'exercise';
-  for (let i = 0; i < 50; i++) {
-    const candidate = i === 0 ? base : `${base}-${i + 1}`;
-    const { rows } = await pool.query(
-      'SELECT 1 FROM exercises WHERE slug = $1 AND deleted_at IS NULL LIMIT 1',
-      [candidate]
-    );
-    if (!rows[0]) return candidate;
-  }
-  return `${base}-${randomUUID().slice(0, 8)}`;
-}
-
 async function run() {
   const rawPath = path.join(__dirname, '..', '..', 'exercises_raw.json');
   if (!fs.existsSync(rawPath)) {
@@ -196,22 +138,16 @@ async function run() {
         ]);
         updated++;
       } else {
-        // Slug and search keywords are generated here rather than left for
-        // migration 141's backfill: that runs once, so anything imported
-        // afterwards would arrive with a NULL slug and be invisible to
-        // lookup-by-slug and to full-text search.
-        const slug = await uniqueSlug(n.name);
         await pool.query(`
           INSERT INTO exercises
             (id, name, muscle_group, body_part, target_muscle, secondary_muscles,
              equipment, difficulty, instructions, gif_url, exercise_type,
-             force, mechanic, source_id, slug, category, search_keywords, is_active)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,true)
+             force, mechanic, source_id, is_active)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true)
         `, [
           randomUUID(), n.name, n.muscle_group, n.body_part, n.target_muscle,
           n.secondary_muscles, n.equipment, n.difficulty, n.instructions,
           n.gif_url, n.exercise_type, n.force, n.mechanic, n.source_id,
-          slug, categoryFor(n), buildSearchKeywords(n),
         ]);
         inserted++;
         byName.set(n.name.toLowerCase(), 'new');

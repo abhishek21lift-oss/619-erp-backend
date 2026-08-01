@@ -450,9 +450,6 @@ app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-che
 app.use('/api/settings',          require('./routes/settings'));
 app.use('/api/invoices',          ...gate('finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
-// The exercise library. Gated on the same feature flag as the nav entry that
-// links to it (see platform_features 'exercise_library', migration 123).
-app.use('/api/exercises',         ...gate('exercise_library'), require('./modules/exercises/exercises.routes'));
 app.use('/api/diet',              require('./routes/diet'));
 app.use('/api/biometric-attend',  ...gate('attendance'), require('./routes/biometric-attend'));
 app.use('/api/webauthn',          require('./routes/webauthn'));
