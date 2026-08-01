@@ -20,7 +20,15 @@ const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
 const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
-const FROM_ADDR = process.env.SMTP_FROM || 'noreply@619fitness.com';
+// Falls back to SMTP_USER, not a hardcoded address, when SMTP_FROM is unset.
+// The mailbox can always send as itself; a hardcoded domain it was never
+// provisioned for cannot — and previously fell back to noreply@619fitness.com,
+// a domain with no DNS records at all. Hostinger (and any relay) rejects the
+// envelope outright when the From domain doesn't match the authenticated
+// mailbox's, which fails password resets and the admin reset OTP silently:
+// SMTP looks "configured" (host/port/user/pass all present) because the
+// failure is in the From address, not the credentials.
+const FROM_ADDR = process.env.SMTP_FROM || SMTP_USER;
 // Invitations are the one message a recipient is asked to TRUST, so they go
 // from the support identity rather than a noreply nobody can answer. Falls
 // back to the general from-address so a deploy that has not set it still
@@ -173,6 +181,28 @@ async function sendAdminInvitation({ to, ownerName, studioName, actionUrl, pixel
   }, { to, kind: 'admin_invitation' });
 }
 
+/**
+ * Generic send for callers that are not one of the named flows above (e.g.
+ * the notification centre's email channel). Routes through the same
+ * transporter, retry policy and FROM address as everything else in this
+ * file — there must be exactly one place that knows how to reach Hostinger,
+ * or the two drift (which is how the notification channel ended up with its
+ * own copy of the SMTP setup, keyed off an SMTP_SECURE variable this file
+ * never reads and Render was never told to set).
+ *
+ * Never throws — returns a result object instead, since callers here (the
+ * notification log) want a status to record, not an exception to catch.
+ */
+async function sendRaw({ to, subject, html, text }, ctx = {}) {
+  if (!isConfigured()) return { sent: false, reason: 'SMTP_NOT_CONFIGURED' };
+  try {
+    const info = await sendWithRetry({ from: FROM_ADDR, to, subject, html, text }, ctx);
+    return { sent: true, messageId: info?.messageId };
+  } catch (err) {
+    return { sent: false, reason: err.message };
+  }
+}
+
 /** The three variables isConfigured() requires, in the order to report them. */
 const REQUIRED_VARS = ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS'];
 
@@ -196,6 +226,6 @@ function describeConfig(env = process.env) {
 }
 
 module.exports = {
-  sendPasswordReset, sendAdminResetOtp, sendAdminInvitation,
+  sendPasswordReset, sendAdminResetOtp, sendAdminInvitation, sendRaw,
   isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,
 };

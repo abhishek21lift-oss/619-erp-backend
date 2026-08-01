@@ -20,7 +20,10 @@ const channels = {
 
   email: async ({ to, subject, html }) => {
     if (!to) return { status: 'failed', error: 'no recipient' };
-    const FROM = process.env.EMAIL_FROM || 'no-reply@619fitness.com';
+    // No hardcoded domain fallback here on purpose — see lib/email.js's
+    // FROM_ADDR comment. SMTP_USER is the one address guaranteed to belong to
+    // a domain this deployment can actually send from.
+    const FROM = process.env.EMAIL_FROM || process.env.SMTP_USER || '';
 
     // Resend (preferred when RESEND_API_KEY is set)
     if (process.env.RESEND_API_KEY) {
@@ -35,27 +38,28 @@ const channels = {
       }
     }
 
-    // Nodemailer SMTP fallback (SMTP_HOST + SMTP_USER + SMTP_PASS)
+    // SMTP fallback — delegates to lib/email.js rather than keeping a second
+    // copy of the transporter setup. The second copy is what broke this
+    // channel: it read a "secure" flag from SMTP_SECURE, a variable nothing
+    // in .env.example or the Render setup docs ever told anyone to set, so a
+    // Hostinger deploy on port 465 (implicit TLS) connected with secure:false
+    // and failed. lib/email.js has always derived it correctly from the port.
     if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-      try {
-        const nodemailer = require('nodemailer');
-        const transporter = nodemailer.createTransport({
-          host: process.env.SMTP_HOST,
-          port: Number(process.env.SMTP_PORT) || 587,
-          secure: process.env.SMTP_SECURE === 'true',
-          auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-        });
-        const info = await transporter.sendMail({ from: FROM, to, subject, html });
-        return { status: 'sent', provider_id: info.messageId };
-      } catch (err) {
-        logger.error({ err, to, subject }, 'nodemailer email failed');
-        return { status: 'failed', error: err.message };
-      }
+      const emailLib = require('../../lib/email');
+      const result = await emailLib.sendRaw({ to, subject, html }, { to, subject, kind: 'notification' });
+      if (result.sent) return { status: 'sent', provider_id: result.messageId };
+      logger.error({ to, subject, reason: result.reason }, 'smtp email failed');
+      return { status: 'failed', error: result.reason };
     }
 
-    // No provider configured — log and no-op
-    logger.info({ to, subject }, 'email stub (set RESEND_API_KEY or SMTP_* to enable)');
-    return { status: 'sent', provider_id: `stub_${Date.now()}` };
+    // No provider configured. Previously this returned status: 'sent' with a
+    // fake provider_id — indistinguishable, everywhere this result is read
+    // (notification_log, callers checking res.email.status), from an email
+    // that actually went out. That is precisely the failure mode described as
+    // "confirmation emails are not being delivered" with nothing in the logs
+    // to explain why: the log line existed, but the STATUS lied about it.
+    logger.warn({ to, subject }, 'email not_configured (set RESEND_API_KEY or SMTP_* to enable)');
+    return { status: 'not_configured', provider_id: null };
   },
 
   whatsapp: async ({ to, template, variables }) => {
@@ -304,4 +308,4 @@ async function markAllRead(userId) {
   );
 }
 
-module.exports = { send, recipientFromMember, inbox, markRead, markAllRead, templates };
+module.exports = { send, recipientFromMember, inbox, markRead, markAllRead, templates, channels };
