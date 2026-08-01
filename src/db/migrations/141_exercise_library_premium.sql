@@ -335,6 +335,17 @@ CREATE TABLE IF NOT EXISTS exercise_versions (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Reconciled for the same reason as exercise_relations below: a pre-existing
+-- table of another shape would make the CREATE above a no-op and the index
+-- fail on a missing column.
+ALTER TABLE exercise_versions ADD COLUMN IF NOT EXISTS exercise_id     TEXT;
+ALTER TABLE exercise_versions ADD COLUMN IF NOT EXISTS version         INTEGER;
+ALTER TABLE exercise_versions ADD COLUMN IF NOT EXISTS snapshot        JSONB;
+ALTER TABLE exercise_versions ADD COLUMN IF NOT EXISTS changed_by      TEXT;
+ALTER TABLE exercise_versions ADD COLUMN IF NOT EXISTS changed_by_name TEXT;
+ALTER TABLE exercise_versions ADD COLUMN IF NOT EXISTS change_note     TEXT;
+ALTER TABLE exercise_versions ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 CREATE UNIQUE INDEX IF NOT EXISTS exercise_versions_exercise_version_idx
   ON exercise_versions (exercise_id, version);
 CREATE INDEX IF NOT EXISTS exercise_versions_exercise_idx
@@ -363,6 +374,17 @@ CREATE TABLE IF NOT EXISTS exercise_favorites (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (user_id, exercise_id)
 );
+
+ALTER TABLE exercise_favorites ADD COLUMN IF NOT EXISTS user_id     TEXT;
+ALTER TABLE exercise_favorites ADD COLUMN IF NOT EXISTS exercise_id TEXT;
+ALTER TABLE exercise_favorites ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- The composite primary key comes from the CREATE above, but a reconciled
+-- table may not have one — and toggling a favourite upserts with
+-- ON CONFLICT (user_id, exercise_id), which needs a unique index to arbitrate
+-- against. A unique index satisfies that just as a primary key does.
+CREATE UNIQUE INDEX IF NOT EXISTS exercise_favorites_user_exercise_idx
+  ON exercise_favorites (user_id, exercise_id);
 
 CREATE INDEX IF NOT EXISTS exercise_favorites_user_idx
   ON exercise_favorites (user_id, created_at DESC);
@@ -393,6 +415,16 @@ CREATE TABLE IF NOT EXISTS exercise_recent_uses (
   last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (user_id, exercise_id)
 );
+
+ALTER TABLE exercise_recent_uses ADD COLUMN IF NOT EXISTS user_id      TEXT;
+ALTER TABLE exercise_recent_uses ADD COLUMN IF NOT EXISTS exercise_id  TEXT;
+ALTER TABLE exercise_recent_uses ADD COLUMN IF NOT EXISTS use_count    INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE exercise_recent_uses ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- Recording a use upserts with ON CONFLICT (user_id, exercise_id); see the
+-- note on exercise_favorites above for why a unique index is asserted here.
+CREATE UNIQUE INDEX IF NOT EXISTS exercise_recent_uses_user_exercise_idx
+  ON exercise_recent_uses (user_id, exercise_id);
 
 CREATE INDEX IF NOT EXISTS exercise_recent_uses_user_idx
   ON exercise_recent_uses (user_id, last_used_at DESC);
@@ -430,6 +462,35 @@ CREATE TABLE IF NOT EXISTS exercise_relations (
   CONSTRAINT exercise_relations_no_self_check
     CHECK (exercise_id <> related_id)
 );
+
+-- ── Reconcile a pre-existing table ──────────────────────────────────────
+--
+-- CREATE TABLE IF NOT EXISTS is a no-op when the table already exists, even
+-- if its columns are nothing like the ones declared above — and the indexes
+-- below then fail on a column that was never created. This is not
+-- hypothetical: the deploy of this migration failed with
+--
+--   ✗ 141_exercise_library_premium.sql FAILED: column "related_id" does not exist
+--
+-- because the production database already carried an exercise_relations
+-- table of a different shape, created out of band rather than by any file in
+-- this directory. The same is true elsewhere in this schema — gym_settings,
+-- attendance and clients.branch_id all exist there and in no migration.
+--
+-- So every column is asserted individually. On a database where the CREATE
+-- above did the work, all of these are no-ops. On one carrying a divergent
+-- table, they add what is missing so the indexes can be built.
+--
+-- Added WITHOUT the NOT NULL and REFERENCES that the CREATE declares: a
+-- table that already holds rows cannot take a NOT NULL column with no
+-- default, and a foreign key would fail against pre-existing data that does
+-- not satisfy it. A fresh database gets the full constraints from the CREATE;
+-- a reconciled one gets a working table, which is the point.
+ALTER TABLE exercise_relations ADD COLUMN IF NOT EXISTS exercise_id TEXT;
+ALTER TABLE exercise_relations ADD COLUMN IF NOT EXISTS related_id  TEXT;
+ALTER TABLE exercise_relations ADD COLUMN IF NOT EXISTS kind        TEXT;
+ALTER TABLE exercise_relations ADD COLUMN IF NOT EXISTS sort_order  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE exercise_relations ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 CREATE UNIQUE INDEX IF NOT EXISTS exercise_relations_unique_idx
   ON exercise_relations (exercise_id, related_id, kind);
