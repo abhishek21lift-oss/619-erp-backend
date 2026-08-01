@@ -12,6 +12,7 @@
 // flips the stored status + sends reminders, but enforcement never depends on it.
 
 const pool = require('../db/pool');
+const logger = require('./logger');
 const platformBilling = require('./platformBilling');
 
 // Founder's Club cap. The launch offer (Elite at ₹7,999) stays live only while
@@ -20,6 +21,14 @@ const platformBilling = require('./platformBilling');
 const FOUNDER_LIMIT = parseInt(process.env.FOUNDER_LIMIT, 10) || 20;
 const TRIAL_DAYS = parseInt(process.env.TRIAL_DAYS, 10) || 7;
 const DAY_MS = 86400000;
+
+// How close two activations of the same plan have to be before the second is
+// treated as a repeat of the first rather than an early renewal. Ten minutes
+// covers a double-submit, a retried request and an operator recording the same
+// payment twice, without touching anything a studio would plausibly do on
+// purpose. Env-overridable so it can be tuned without a deploy.
+const DUPLICATE_ACTIVATION_WINDOW_MINUTES =
+  parseInt(process.env.DUPLICATE_ACTIVATION_WINDOW_MINUTES, 10) || 10;
 
 // Statuses that consume a plan seat. Per the product spec the limit applies to
 // ACTIVE clients only — pending, expired, archived and completed clients do not
@@ -358,8 +367,51 @@ async function activate(orgId, planCode, opts = {}) {
     const base = (!opts.resetPeriod && org.current_period_end && new Date(org.current_period_end) > now)
       ? new Date(org.current_period_end)
       : now;
-    const periodEnd = new Date(base);
+    let periodEnd = new Date(base);
     periodEnd.setMonth(periodEnd.getMonth() + Number(months));
+
+    // ── Stacking guard ──────────────────────────────────────────────────
+    //
+    // Stacking is right for a real early renewal and wrong for a repeat of
+    // the same one. Studio #1 paid for twelve months of Elite and ended up
+    // with an expiry two years out, because one UPI payment produced two
+    // activations and each stacked its own term. The money was refundable;
+    // the extra year of access was simply granted.
+    //
+    // The reference-level defences upstream (the unique index on
+    // (organization_id, reference), the pre-check, the per-org advisory
+    // lock) stop the case that caused it. They cannot stop the same thing
+    // arriving with a different reference, or none at all — a cash or comp
+    // activation recorded twice.
+    //
+    // So: an activation of the SAME plan for the same studio, within a few
+    // minutes of one already recorded, does not extend anything. The payment
+    // is still written, because money received is a fact worth recording and
+    // may need refunding; what it must not do is silently hand over another
+    // term. The event log says it happened so an operator can act on it.
+    //
+    // Deliberately narrow. A genuine second renewal minutes after the first,
+    // for the same plan, is not a thing studios do; anything outside the
+    // window, or for a different plan, stacks exactly as before.
+    let duplicateOf = null;
+    if (!opts.resetPeriod && org.current_period_end) {
+      const recent = await client.query(
+        `SELECT id, created_at
+           FROM subscription_payments
+          WHERE organization_id = $1
+            AND plan_code = $2
+            AND status = 'paid'
+            AND created_at > now() - ($3 || ' minutes')::interval
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [orgId, planCode, String(DUPLICATE_ACTIVATION_WINDOW_MINUTES)]
+      );
+      if (recent.rows[0]) {
+        duplicateOf = recent.rows[0].id;
+        // Leave the period exactly where the first activation put it.
+        periodEnd = new Date(org.current_period_end);
+      }
+    }
 
     // A coupon reduces THIS charge only. It is redeemed under a row lock inside
     // this transaction, so the last remaining use cannot be claimed twice.
@@ -456,7 +508,24 @@ async function activate(orgId, planCode, opts = {}) {
       plan_code: planCode, amount_inr: chargedAmount, gross_amount_inr: grossAmount,
       coupon_code: coupon?.code || null, discount_inr: coupon?.discount_inr || null,
       period_end: periodEnd,
+      // Present only when the stacking guard fired, so "why did this payment
+      // not move the renewal date" is answerable from the billing history
+      // rather than by reading this file.
+      ...(duplicateOf ? { period_unchanged_duplicate_of: duplicateOf } : {}),
     }, opts.actor);
+
+    if (duplicateOf) {
+      await logEvent(client, orgId, 'duplicate_activation_no_stack', {
+        plan_code: planCode, amount_inr: chargedAmount,
+        duplicate_of_payment_id: duplicateOf,
+        window_minutes: DUPLICATE_ACTIVATION_WINDOW_MINUTES,
+        period_end: periodEnd,
+      }, opts.actor);
+      logger.warn(
+        { orgId, planCode, duplicateOf, periodEnd },
+        'subscription: repeat activation within the duplicate window — payment recorded, period NOT extended'
+      );
+    }
     if (grantFounder) await logEvent(client, orgId, 'founder_granted', { founder_number: founderNumber, locked_price_inr: lockedPrice }, opts.actor);
 
     await client.query('COMMIT');
