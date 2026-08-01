@@ -2,18 +2,35 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
-const { auth, adminOrManager, adminManagerOrTrainer } = require('../middleware/auth');
+// adminOrManager is gone from this file with the exercise write endpoints —
+// exercise authoring is now trainer-accessible and lives in routes/exercises.js.
+const { auth, adminManagerOrTrainer } = require('../middleware/auth');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks } = require('../modules/pt-os/progression');
 
-// ─── EXERCISES ────────────────────────────────────────────────
+// ─── EXERCISES (COMPATIBILITY) ────────────────────────────────
+//
+// The Exercise Library now lives in routes/exercises.js and serves
+// /api/exercises. These two readers stay because older clients still call
+// them; they read the same table, so nothing has forked.
+//
+// The write endpoints that used to live here (POST/PUT/DELETE
+// /api/workouts/exercises) are GONE, not deprecated. They wrote the flat
+// legacy columns directly and knew nothing about slugs, the muscle join
+// table, version history or ownership — a write through them would have
+// produced a row the new library could not filter, search or attribute.
+// Creation and editing go through /api/exercises, which is the only path
+// that maintains all of it.
+//
+// Both readers below now exclude soft-deleted and archived rows, so an
+// exercise retired in the new library disappears here too.
 
-// GET /api/workouts/exercises
+// GET /api/workouts/exercises  →  prefer GET /api/exercises
 router.get('/exercises', auth, async (req, res, next) => {
   try {
     const { muscle_group, body_part, equipment, exercise_type, difficulty, search } = req.query;
-    const conds = ['is_active = true'];
+    const conds = ['is_active = true', 'deleted_at IS NULL', 'archived_at IS NULL'];
     const params = [];
     let p = 1;
 
@@ -28,7 +45,7 @@ router.get('/exercises', auth, async (req, res, next) => {
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     params.push(limit, offset);
     const { rows } = await pool.query(
-      `SELECT id, name, muscle_group, body_part, target_muscle, secondary_muscles,
+      `SELECT id, name, slug, muscle_group, body_part, target_muscle, secondary_muscles,
               equipment, difficulty, instructions, gif_url, exercise_type,
               force, mechanic, sets_default, reps_default, rest_seconds,
               video_url, image_url, is_active, source_id, created_at
@@ -43,13 +60,13 @@ router.get('/exercises', auth, async (req, res, next) => {
   }
 });
 
-// GET /api/workouts/exercises/meta — filter values + optional filtered total count
+// GET /api/workouts/exercises/meta  →  prefer GET /api/exercises/meta
 router.get('/exercises/meta', auth, async (req, res, next) => {
   try {
     const { body_part, equipment, exercise_type, difficulty, search } = req.query;
     const hasFilters = body_part || equipment || exercise_type || difficulty || search;
+    const live = 'is_active = true AND deleted_at IS NULL AND archived_at IS NULL';
 
-    // Always return global metadata for dropdowns
     const { rows: [meta] } = await pool.query(`
       SELECT
         array_agg(DISTINCT body_part    ORDER BY body_part)    FILTER (WHERE body_part IS NOT NULL)    AS body_parts,
@@ -57,13 +74,12 @@ router.get('/exercises/meta', auth, async (req, res, next) => {
         array_agg(DISTINCT exercise_type ORDER BY exercise_type) FILTER (WHERE exercise_type IS NOT NULL) AS exercise_types,
         array_agg(DISTINCT difficulty   ORDER BY difficulty)   FILTER (WHERE difficulty IS NOT NULL)   AS difficulties,
         COUNT(*)::int AS total
-      FROM exercises WHERE is_active = true
+      FROM exercises WHERE ${live}
     `);
 
     if (!hasFilters) return res.json(meta);
 
-    // Filtered count
-    const conds = ['is_active = true'];
+    const conds = [live];
     const params = [];
     let p = 1;
     if (body_part)     { conds.push(`body_part = $${p++}`);     params.push(body_part); }
@@ -82,90 +98,6 @@ router.get('/exercises/meta', auth, async (req, res, next) => {
   }
 });
 
-// POST /api/workouts/exercises
-router.post('/exercises', auth, adminOrManager, async (req, res, next) => {
-  try {
-    const d = req.body;
-    if (!d.name?.trim())
-      return res.status(400).json({ error: 'Exercise name required' });
-
-    const { rows } = await pool.query(`
-      INSERT INTO exercises (id, name, description, muscle_group, body_part, target_muscle,
-        secondary_muscles, equipment, difficulty, instructions, gif_url, exercise_type,
-        force, mechanic, sets_default, reps_default, rest_seconds, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
-      [randomUUID(), d.name.trim(), d.description || null,
-       d.muscle_group || d.body_part || 'Full Body',
-       d.body_part || d.muscle_group || 'Full Body',
-       d.target_muscle || null, d.secondary_muscles || null,
-       d.equipment || null, d.difficulty || 'beginner',
-       d.instructions || null, d.gif_url || null, d.exercise_type || null,
-       d.force || null, d.mechanic || null,
-       parseInt(d.sets_default) || 3, parseInt(d.reps_default) || 12,
-       parseInt(d.rest_seconds) || 60, req.user.id]
-    );
-    res.status(201).json({ message: 'Exercise created', exercise: rows[0] });
-  } catch (err) {
-    if (err.message?.includes('does not exist')) return res.status(400).json({ error: 'Tables not ready. Run migrations.' });
-    next(err);
-  }
-});
-
-// PUT /api/workouts/exercises/:id
-router.put('/exercises/:id', auth, adminOrManager, async (req, res, next) => {
-  try {
-    const d = req.body;
-    const { rows } = await pool.query(`
-      UPDATE exercises SET
-        name              = COALESCE($1,  name),
-        description       = COALESCE($2,  description),
-        muscle_group      = COALESCE($3,  muscle_group),
-        body_part         = COALESCE($4,  body_part),
-        target_muscle     = COALESCE($5,  target_muscle),
-        secondary_muscles = COALESCE($6,  secondary_muscles),
-        equipment         = COALESCE($7,  equipment),
-        difficulty        = COALESCE($8,  difficulty),
-        instructions      = COALESCE($9,  instructions),
-        gif_url           = COALESCE($10, gif_url),
-        exercise_type     = COALESCE($11, exercise_type),
-        force             = COALESCE($12, force),
-        mechanic          = COALESCE($13, mechanic),
-        sets_default      = COALESCE($14, sets_default),
-        reps_default      = COALESCE($15, reps_default),
-        rest_seconds      = COALESCE($16, rest_seconds),
-        updated_at        = NOW()
-      WHERE id = $17 RETURNING *`,
-      [d.name || null, d.description ?? null,
-       d.muscle_group || null, d.body_part || null,
-       d.target_muscle ?? null, d.secondary_muscles ?? null,
-       d.equipment ?? null, d.difficulty || null,
-       d.instructions ?? null, d.gif_url ?? null,
-       d.exercise_type ?? null, d.force ?? null, d.mechanic ?? null,
-       d.sets_default ? parseInt(d.sets_default) : null,
-       d.reps_default ? parseInt(d.reps_default) : null,
-       d.rest_seconds ? parseInt(d.rest_seconds) : null,
-       req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Exercise not found' });
-    res.json({ message: 'Exercise updated', exercise: rows[0] });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// DELETE /api/workouts/exercises/:id
-router.delete('/exercises/:id', auth, adminOrManager, async (req, res, next) => {
-  try {
-    const { rows } = await pool.query(
-      'UPDATE exercises SET is_active=false WHERE id=$1 RETURNING id',
-      [req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Exercise not found' });
-    res.json({ message: 'Exercise deleted' });
-  } catch (err) {
-    next(err);
-  }
-});
 
 // ─── WORKOUT PLANS ────────────────────────────────────────────
 //
