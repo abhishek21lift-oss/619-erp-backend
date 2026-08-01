@@ -93,6 +93,125 @@ ALTER TABLE public.exercises
   ADD COLUMN IF NOT EXISTS organization_id       UUID REFERENCES organizations (id) ON DELETE CASCADE,
   ADD COLUMN IF NOT EXISTS version               INTEGER NOT NULL DEFAULT 1;
 
+-- ── 2b. Normalise column TYPES, not just their presence ─────────────────
+--
+-- ADD COLUMN IF NOT EXISTS skips a column that already exists whatever its
+-- type, so a pre-existing column of the wrong type survives the block above
+-- and breaks something later that assumed otherwise. The deploy failed on
+-- exactly that:
+--
+--   ✗ 141_exercise_library_premium.sql FAILED:
+--     function array_to_string(text, unknown) does not exist
+--
+-- tags and search_keywords already existed on the production database as
+-- plain TEXT — added out of band, like exercise_relations, gym_settings and
+-- attendance before them — so the search-vector trigger's array_to_string()
+-- was handed a scalar.
+--
+-- These two must genuinely be arrays: the service reads and writes them as
+-- arrays, and the GIN index queries them with && / @>. So they are converted
+-- rather than worked around, splitting on comma because that is how a
+-- delimited text column of this kind is written. An empty or NULL value
+-- becomes NULL rather than a one-element array containing ''.
+-- Postgres has no non-throwing cast to timestamptz, and a single unparseable
+-- string in a text column would otherwise abort the conversion — and the
+-- deploy with it. Created for the conversion below and dropped straight
+-- after, so it leaves nothing behind in the schema.
+CREATE OR REPLACE FUNCTION exercises_try_timestamptz(v TEXT) RETURNS TIMESTAMPTZ AS $try$
+BEGIN
+  RETURN v::timestamptz;
+EXCEPTION WHEN others THEN
+  RETURN NULL;
+END;
+$try$ LANGUAGE plpgsql IMMUTABLE;
+
+-- Every conversion below is written so no existing value can abort it: a
+-- value that does not fit the target type becomes NULL rather than raising.
+-- Losing an unparseable stray beats refusing to deploy.
+DO $types$
+DECLARE
+  col  TEXT;
+  kind TEXT;
+BEGIN
+  -- tags / search_keywords → text[]. The service reads and writes these as
+  -- arrays and the GIN index queries them with && / @>, so they cannot stay
+  -- scalar. Split on comma, the way a delimited text column of this kind is
+  -- written; empty or NULL becomes NULL, not a one-element array of ''.
+  FOREACH col IN ARRAY ARRAY['tags', 'search_keywords'] LOOP
+    SELECT data_type INTO kind
+      FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'exercises' AND column_name = col;
+
+    IF kind IS NOT NULL AND kind <> 'ARRAY' THEN
+      RAISE NOTICE 'exercise_library: converting exercises.% from % to text[]', col, kind;
+      EXECUTE format(
+        'ALTER TABLE public.exercises ALTER COLUMN %I TYPE TEXT[] USING (
+           CASE WHEN %I IS NULL OR btrim(%I::text) = '''' THEN NULL
+                ELSE string_to_array(btrim(%I::text), '','')
+           END)', col, col, col, col);
+    END IF;
+  END LOOP;
+
+  -- organization_id → uuid. The per-studio unique index below collapses NULL
+  -- to a sentinel with COALESCE(organization_id, '0000…'::uuid), which will
+  -- not type-check against a text column.
+  SELECT data_type INTO kind
+    FROM information_schema.columns
+   WHERE table_schema = 'public' AND table_name = 'exercises' AND column_name = 'organization_id';
+  IF kind IS NOT NULL AND kind <> 'uuid' THEN
+    RAISE NOTICE 'exercise_library: converting exercises.organization_id from % to uuid', kind;
+    ALTER TABLE public.exercises ALTER COLUMN organization_id TYPE UUID USING (
+      CASE WHEN organization_id::text ~*
+             '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+           THEN organization_id::text::uuid END);
+  END IF;
+
+  -- version → integer, and NOT NULL DEFAULT 1: it is incremented on every
+  -- edit, so a text column would concatenate instead of counting.
+  SELECT data_type INTO kind
+    FROM information_schema.columns
+   WHERE table_schema = 'public' AND table_name = 'exercises' AND column_name = 'version';
+  IF kind IS NOT NULL AND kind NOT IN ('integer', 'bigint', 'smallint') THEN
+    RAISE NOTICE 'exercise_library: converting exercises.version from % to integer', kind;
+    ALTER TABLE public.exercises ALTER COLUMN version TYPE INTEGER USING (
+      CASE WHEN version::text ~ '^[0-9]+$' THEN version::text::integer ELSE 1 END);
+    UPDATE public.exercises SET version = 1 WHERE version IS NULL;
+    ALTER TABLE public.exercises ALTER COLUMN version SET DEFAULT 1;
+    ALTER TABLE public.exercises ALTER COLUMN version SET NOT NULL;
+  END IF;
+
+  -- archived_at / deleted_at → timestamptz. Every read filters on
+  -- "deleted_at IS NULL" and the partial indexes below are built on it, so a
+  -- text column would silently change what those mean.
+  FOREACH col IN ARRAY ARRAY['archived_at', 'deleted_at'] LOOP
+    SELECT data_type INTO kind
+      FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'exercises' AND column_name = col;
+
+    IF kind IS NOT NULL AND kind NOT LIKE 'timestamp%' THEN
+      RAISE NOTICE 'exercise_library: converting exercises.% from % to timestamptz', col, kind;
+      EXECUTE format(
+        'ALTER TABLE public.exercises ALTER COLUMN %I TYPE TIMESTAMPTZ USING (
+           CASE WHEN btrim(coalesce(%I::text, '''')) = '''' THEN NULL
+                ELSE exercises_try_timestamptz(%I::text) END)', col, col, col);
+    END IF;
+  END LOOP;
+
+  -- visibility must be non-null for the CHECK constraint added later.
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'exercises'
+       AND column_name = 'visibility' AND is_nullable = 'YES'
+  ) THEN
+    UPDATE public.exercises SET visibility = 'public'
+     WHERE visibility IS NULL OR btrim(visibility) = '';
+    ALTER TABLE public.exercises ALTER COLUMN visibility SET DEFAULT 'public';
+    ALTER TABLE public.exercises ALTER COLUMN visibility SET NOT NULL;
+  END IF;
+END $types$;
+
+DROP FUNCTION IF EXISTS exercises_try_timestamptz(TEXT);
+
 COMMENT ON COLUMN public.exercises.slug             IS 'URL-safe unique identifier, generated from name.';
 COMMENT ON COLUMN public.exercises.organization_id  IS 'NULL = shared platform library; set = a studio''s own custom exercise.';
 COMMENT ON COLUMN public.exercises.visibility       IS 'public | private — a private custom exercise is visible only to its own studio.';
