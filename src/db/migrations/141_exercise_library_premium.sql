@@ -1,0 +1,422 @@
+-- ============================================================
+-- 141_exercise_library_premium.sql
+--
+-- Turns the imported reference list into a library a trainer can own.
+--
+-- What exists today is the free-exercise-db import: name, a coarse
+-- muscle_group, body_part/target_muscle/equipment, instructions, a gif_url,
+-- and force/mechanic. Everything a coach actually needs to hand an exercise
+-- to another human — cues, common mistakes, contraindications, what to
+-- regress or progress to — has had nowhere to live.
+--
+-- ── Extended, not replaced ──────────────────────────────────────────────
+--
+-- workout_exercises.exercise_id and workout_session_exercises.exercise_id
+-- are live foreign keys into this table, holding every plan and every logged
+-- session in the system. A new table plus a data migration would mean
+-- repointing both under a rename, and any row that failed to map would take
+-- a client's programme history with it. Adding columns cannot do that: every
+-- existing row stays exactly where it is and keeps its id.
+--
+-- Every column here is nullable (or defaulted). A deploy mid-rollout, an
+-- older client, and the existing GET/POST/PUT payloads all keep working
+-- untouched — the API widens, it does not change shape.
+--
+-- ── The muscle_group CHECK bug ──────────────────────────────────────────
+--
+-- scripts/import-exercises.js maps a primary muscle of `neck` to 'Neck',
+-- which was never in the CHECK constraint from migration 006. Those INSERTs
+-- have been failing the constraint and landing in the importer's silent
+-- per-row error counter since the import shipped. 'Neck' and 'Olympic' are
+-- added to the allowed set rather than remapped, because a neck exercise is
+-- not honestly any of Chest/Back/Legs/Shoulders/Arms/Core.
+--
+-- Idempotent throughout, and safe to re-run.
+-- ============================================================
+
+-- ── 1. Fix the CHECK constraint that has been silently dropping rows ────
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conname = 'exercises_muscle_group_check'
+       AND conrelid = 'public.exercises'::regclass
+  ) THEN
+    ALTER TABLE public.exercises DROP CONSTRAINT exercises_muscle_group_check;
+  END IF;
+
+  ALTER TABLE public.exercises
+    ADD CONSTRAINT exercises_muscle_group_check
+    CHECK (muscle_group IN (
+      'Chest','Back','Legs','Shoulders','Arms','Core','Cardio','Full Body','Neck','Olympic'
+    ));
+END $$;
+
+-- ── 2. The premium columns ──────────────────────────────────────────────
+-- Grouped by what a trainer is doing when they need them: identifying the
+-- movement, coaching it, keeping it safe, and programming around it.
+ALTER TABLE public.exercises
+  -- Identity / taxonomy
+  ADD COLUMN IF NOT EXISTS slug                  TEXT,
+  ADD COLUMN IF NOT EXISTS category              TEXT,
+  ADD COLUMN IF NOT EXISTS movement_pattern      TEXT,
+  ADD COLUMN IF NOT EXISTS plane_of_motion       TEXT,
+  -- Coaching
+  ADD COLUMN IF NOT EXISTS coaching_cues         TEXT,
+  ADD COLUMN IF NOT EXISTS common_mistakes       TEXT,
+  ADD COLUMN IF NOT EXISTS breathing_tips        TEXT,
+  ADD COLUMN IF NOT EXISTS beginner_notes        TEXT,
+  ADD COLUMN IF NOT EXISTS advanced_notes        TEXT,
+  ADD COLUMN IF NOT EXISTS trainer_notes         TEXT,
+  -- Safety
+  ADD COLUMN IF NOT EXISTS safety_tips           TEXT,
+  ADD COLUMN IF NOT EXISTS contraindications     TEXT,
+  -- Prescription defaults (sets_default/reps_default/rest_seconds already exist)
+  ADD COLUMN IF NOT EXISTS tempo_recommendation  TEXT,
+  -- Discovery. tags and search_keywords are arrays rather than delimited text
+  -- so they can be GIN-indexed and queried with && / @> instead of LIKE.
+  ADD COLUMN IF NOT EXISTS tags                  TEXT[],
+  ADD COLUMN IF NOT EXISTS search_keywords       TEXT[],
+  -- Lifecycle. is_active already exists and is what the current DELETE route
+  -- flips; archived_at is separate on purpose — "archived" is a curator
+  -- hiding a movement they still want, deleted_at is a removal. Collapsing
+  -- them would make an archive irreversible.
+  ADD COLUMN IF NOT EXISTS visibility            TEXT NOT NULL DEFAULT 'public',
+  ADD COLUMN IF NOT EXISTS archived_at           TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS deleted_at            TIMESTAMPTZ,
+  -- Attribution. created_by exists; who last touched it did not.
+  ADD COLUMN IF NOT EXISTS updated_by            TEXT,
+  -- Ownership. NULL = a platform/library exercise every studio sees (which is
+  -- what all ~890 imported rows are). Non-NULL = a studio's own custom
+  -- movement, visible only to them. Matches how workout_plans scopes its
+  -- shared template library, so the visibility rule is one a reader knows.
+  ADD COLUMN IF NOT EXISTS organization_id       UUID REFERENCES organizations (id) ON DELETE CASCADE,
+  ADD COLUMN IF NOT EXISTS version               INTEGER NOT NULL DEFAULT 1;
+
+COMMENT ON COLUMN public.exercises.slug             IS 'URL-safe unique identifier, generated from name.';
+COMMENT ON COLUMN public.exercises.organization_id  IS 'NULL = shared platform library; set = a studio''s own custom exercise.';
+COMMENT ON COLUMN public.exercises.visibility       IS 'public | private — a private custom exercise is visible only to its own studio.';
+COMMENT ON COLUMN public.exercises.archived_at      IS 'Hidden from pickers but kept, and restorable. Distinct from deleted_at.';
+COMMENT ON COLUMN public.exercises.deleted_at       IS 'Soft delete. Rows are never hard-deleted: workout history references them.';
+COMMENT ON COLUMN public.exercises.version          IS 'Bumped on each edit; see exercise_versions for the prior snapshots.';
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conname = 'exercises_visibility_check'
+       AND conrelid = 'public.exercises'::regclass
+  ) THEN
+    ALTER TABLE public.exercises
+      ADD CONSTRAINT exercises_visibility_check
+      CHECK (visibility IN ('public','private'));
+  END IF;
+
+  -- A private exercise with no owning studio would be visible to nobody at
+  -- all — it could never be read back by the org filter that gates it.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conname = 'exercises_private_needs_org_check'
+       AND conrelid = 'public.exercises'::regclass
+  ) THEN
+    ALTER TABLE public.exercises
+      ADD CONSTRAINT exercises_private_needs_org_check
+      CHECK (visibility = 'public' OR organization_id IS NOT NULL);
+  END IF;
+END $$;
+
+-- ── 3. Backfill slugs for the existing library ──────────────────────────
+-- Lower-cased, non-alphanumerics collapsed to a single hyphen, trimmed.
+-- Collisions get a short suffix from the row id rather than a counter: a
+-- counter would need a second pass and would renumber on re-run.
+UPDATE public.exercises
+   SET slug = trim(both '-' from regexp_replace(lower(name), '[^a-z0-9]+', '-', 'g'))
+ WHERE slug IS NULL AND name IS NOT NULL;
+
+UPDATE public.exercises e
+   SET slug = e.slug || '-' || right(replace(e.id::text, '-', ''), 6)
+  FROM (
+    SELECT id, slug, row_number() OVER (PARTITION BY slug ORDER BY created_at, id) AS rn
+      FROM public.exercises
+     WHERE slug IS NOT NULL
+  ) dup
+ WHERE dup.id = e.id AND dup.rn > 1;
+
+-- Empty-name edge case: a row whose name was all punctuation slugs to ''.
+UPDATE public.exercises
+   SET slug = 'exercise-' || right(replace(id::text, '-', ''), 8)
+ WHERE slug IS NULL OR slug = '';
+
+-- One slug per row, enforced from here on. Partial on deleted_at so a
+-- deleted exercise's slug returns to the pool for reuse.
+CREATE UNIQUE INDEX IF NOT EXISTS exercises_slug_unique_idx
+  ON public.exercises (slug) WHERE deleted_at IS NULL;
+
+-- ── 4. Duplicate-name protection ────────────────────────────────────────
+-- Case-insensitive, scoped per owning studio (two different studios may each
+-- have their own "619 Deadlift"; one studio may not have two). NULLs — the
+-- shared platform library — are collapsed to a sentinel so the same rule
+-- applies there.
+CREATE UNIQUE INDEX IF NOT EXISTS exercises_name_per_org_unique_idx
+  ON public.exercises (
+    COALESCE(organization_id, '00000000-0000-0000-0000-000000000000'::uuid),
+    lower(name)
+  )
+  WHERE deleted_at IS NULL;
+
+-- ── 5. Full-text search ─────────────────────────────────────────────────
+-- The trigram indexes from migration 106 stay: they serve fuzzy/substring
+-- matching ("bicp" finding "bicep"), which tsvector cannot do. This adds the
+-- other half — real ranked term search across the fields a trainer would
+-- search by, including the free-text coaching content the trigram facet
+-- string never covered.
+--
+-- Trigger-maintained rather than GENERATED ALWAYS, for one hard reason:
+-- array_to_string() is STABLE, not IMMUTABLE, and Postgres rejects any
+-- non-immutable function in a generated expression. tags and
+-- search_keywords are exactly the fields a trainer searches by, so dropping
+-- them to keep a generated column would defeat the point. The trigger fires
+-- on INSERT and on UPDATE of the contributing columns only, so an unrelated
+-- write does not pay to rebuild it.
+ALTER TABLE public.exercises
+  ADD COLUMN IF NOT EXISTS search_vector tsvector;
+
+CREATE OR REPLACE FUNCTION exercises_search_vector_refresh() RETURNS trigger AS $fn$
+BEGIN
+  NEW.search_vector :=
+    setweight(to_tsvector('english', coalesce(NEW.name, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(array_to_string(NEW.search_keywords, ' '), '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(array_to_string(NEW.tags, ' '), '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(NEW.target_muscle, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(NEW.muscle_group, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(NEW.equipment, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(NEW.category, '')), 'C') ||
+    setweight(to_tsvector('english', coalesce(NEW.movement_pattern, '')), 'C') ||
+    setweight(to_tsvector('english', coalesce(NEW.description, '')), 'D') ||
+    setweight(to_tsvector('english', coalesce(NEW.coaching_cues, '')), 'D');
+  RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS exercises_search_vector_trg ON public.exercises;
+CREATE TRIGGER exercises_search_vector_trg
+  BEFORE INSERT OR UPDATE OF
+    name, search_keywords, tags, target_muscle, muscle_group,
+    equipment, category, movement_pattern, description, coaching_cues
+  ON public.exercises
+  FOR EACH ROW EXECUTE FUNCTION exercises_search_vector_refresh();
+
+CREATE INDEX IF NOT EXISTS exercises_search_vector_idx
+  ON public.exercises USING gin (search_vector);
+
+-- ── 6. Indexes for the filter facets the library UI actually offers ─────
+-- Partial on deleted_at: every read path excludes deleted rows, so the index
+-- should not carry them either.
+CREATE INDEX IF NOT EXISTS exercises_category_idx
+  ON public.exercises (category) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS exercises_difficulty_idx
+  ON public.exercises (difficulty) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS exercises_equipment_idx
+  ON public.exercises (equipment) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS exercises_mechanic_idx
+  ON public.exercises (mechanic) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS exercises_force_idx
+  ON public.exercises (force) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS exercises_tags_idx
+  ON public.exercises USING gin (tags);
+-- The library list is "this studio's customs + the shared library", ordered
+-- by name. This is the index that query sorts and filters on.
+CREATE INDEX IF NOT EXISTS exercises_org_active_name_idx
+  ON public.exercises (organization_id, name)
+  WHERE deleted_at IS NULL AND archived_at IS NULL;
+
+-- ── 7. Version history ──────────────────────────────────────────────────
+-- A snapshot of the row as it was BEFORE each edit, so "what did this look
+-- like when I programmed it in March" has an answer. Written by the API on
+-- update, not by a trigger: the API knows who made the change and a trigger
+-- would only ever see the database user.
+CREATE TABLE IF NOT EXISTS exercise_versions (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  exercise_id   TEXT NOT NULL REFERENCES exercises (id) ON DELETE CASCADE,
+  version       INTEGER NOT NULL,
+  -- The whole prior row. JSONB rather than a mirrored column set: this table
+  -- must not need a migration every time exercises gains a field, and it is
+  -- read for display/diffing, never filtered on individual keys.
+  snapshot      JSONB NOT NULL,
+  changed_by    TEXT,
+  changed_by_name TEXT,
+  -- What the editor said they changed. Free text, optional.
+  change_note   TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS exercise_versions_exercise_version_idx
+  ON exercise_versions (exercise_id, version);
+CREATE INDEX IF NOT EXISTS exercise_versions_exercise_idx
+  ON exercise_versions (exercise_id, created_at DESC);
+
+ALTER TABLE exercise_versions ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON exercise_versions FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'exercise_versions'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON exercise_versions
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+-- ── 8. Favorites ────────────────────────────────────────────────────────
+-- Per USER, not per studio: a favourite is one trainer's shortlist, and two
+-- trainers in the same studio have different ones.
+CREATE TABLE IF NOT EXISTS exercise_favorites (
+  user_id     TEXT NOT NULL,
+  exercise_id TEXT NOT NULL REFERENCES exercises (id) ON DELETE CASCADE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, exercise_id)
+);
+
+CREATE INDEX IF NOT EXISTS exercise_favorites_user_idx
+  ON exercise_favorites (user_id, created_at DESC);
+
+ALTER TABLE exercise_favorites ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON exercise_favorites FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'exercise_favorites'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON exercise_favorites
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+-- ── 9. Recently used ────────────────────────────────────────────────────
+-- One row per user per exercise, last_used_at bumped on write. Not an
+-- append-only event log: the only question asked of it is "the last N
+-- distinct exercises this trainer used", and a log would need a DISTINCT ON
+-- over an ever-growing table to answer it.
+CREATE TABLE IF NOT EXISTS exercise_recent_uses (
+  user_id      TEXT NOT NULL,
+  exercise_id  TEXT NOT NULL REFERENCES exercises (id) ON DELETE CASCADE,
+  use_count    INTEGER NOT NULL DEFAULT 1,
+  last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, exercise_id)
+);
+
+CREATE INDEX IF NOT EXISTS exercise_recent_uses_user_idx
+  ON exercise_recent_uses (user_id, last_used_at DESC);
+
+ALTER TABLE exercise_recent_uses ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON exercise_recent_uses FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'exercise_recent_uses'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON exercise_recent_uses
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+-- ── 10. Exercise-to-exercise relations ──────────────────────────────────
+-- Regressions, progressions and alternatives are all "this exercise relates
+-- to that one, in this direction". One table with a kind column rather than
+-- three: the queries are identical, and three tables would mean three joins
+-- to render one detail page.
+CREATE TABLE IF NOT EXISTS exercise_relations (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  exercise_id    TEXT NOT NULL REFERENCES exercises (id) ON DELETE CASCADE,
+  related_id     TEXT NOT NULL REFERENCES exercises (id) ON DELETE CASCADE,
+  kind           TEXT NOT NULL,
+  sort_order     INTEGER NOT NULL DEFAULT 0,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT exercise_relations_kind_check
+    CHECK (kind IN ('regression','progression','alternative')),
+  -- An exercise is not a regression of itself; the UI would render a loop.
+  CONSTRAINT exercise_relations_no_self_check
+    CHECK (exercise_id <> related_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS exercise_relations_unique_idx
+  ON exercise_relations (exercise_id, related_id, kind);
+CREATE INDEX IF NOT EXISTS exercise_relations_exercise_idx
+  ON exercise_relations (exercise_id, kind, sort_order);
+-- The reverse lookup ("what progresses INTO this exercise") is a real query
+-- on the detail page and would otherwise scan.
+CREATE INDEX IF NOT EXISTS exercise_relations_related_idx
+  ON exercise_relations (related_id, kind);
+
+ALTER TABLE exercise_relations ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON exercise_relations FROM anon, authenticated;
+DO $rls$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'exercise_relations'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON exercise_relations
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $rls$;
+
+-- ── 11. Seed category / movement pattern for the imported library ───────
+-- Derived from the columns the import already populated, so the new filters
+-- are useful on day one instead of empty until someone edits 890 rows by
+-- hand. Only fills NULLs — never overwrites a curated value, so re-running
+-- after an edit is safe.
+UPDATE public.exercises
+   SET category = CASE
+     WHEN lower(coalesce(exercise_type, '')) LIKE '%stretch%'      THEN 'Flexibility'
+     WHEN lower(coalesce(exercise_type, '')) LIKE '%cardio%'       THEN 'Cardio'
+     WHEN lower(coalesce(exercise_type, '')) LIKE '%plyo%'         THEN 'Plyometric'
+     WHEN lower(coalesce(exercise_type, '')) LIKE '%olympic%'      THEN 'Olympic'
+     WHEN lower(coalesce(exercise_type, '')) LIKE '%powerlifting%' THEN 'Powerlifting'
+     WHEN lower(coalesce(exercise_type, '')) LIKE '%strongman%'    THEN 'Strongman'
+     WHEN muscle_group = 'Cardio'                                  THEN 'Cardio'
+     ELSE 'Strength'
+   END
+ WHERE category IS NULL;
+
+UPDATE public.exercises
+   SET movement_pattern = CASE
+     WHEN lower(name) ~ '(squat|lunge|step.?up|leg press)'      THEN 'Squat'
+     WHEN lower(name) ~ '(deadlift|good.?morning|hip thrust|rdl)' THEN 'Hinge'
+     WHEN lower(name) ~ '(bench|push.?up|chest press|overhead press|shoulder press|dip)' THEN 'Push'
+     WHEN lower(name) ~ '(row|pull.?up|chin.?up|pulldown|pull.?down|curl)' THEN 'Pull'
+     WHEN lower(name) ~ '(carry|farmer|walk)'                   THEN 'Carry'
+     WHEN lower(name) ~ '(plank|crunch|sit.?up|twist|rotation|woodchop)' THEN 'Core'
+     ELSE NULL
+   END
+ WHERE movement_pattern IS NULL;
+
+-- Search keywords: the terms a trainer would actually type that are not
+-- already the name. Built from the facet columns, de-duplicated, blanks
+-- dropped. Only for rows that have none, so curated keywords survive.
+UPDATE public.exercises
+   SET search_keywords = ARRAY(
+     SELECT DISTINCT lower(trim(kw))
+       FROM unnest(ARRAY[
+         target_muscle, muscle_group, body_part, equipment,
+         exercise_type, force, mechanic, category, movement_pattern
+       ]) AS kw
+      WHERE kw IS NOT NULL AND trim(kw) <> ''
+   )
+ WHERE search_keywords IS NULL;
+
+-- ── 12. Backfill the search vector ──────────────────────────────────────
+-- The trigger only fires on write, so the ~890 rows that predate it still
+-- have a NULL vector and would be invisible to full-text search. A no-op
+-- UPDATE touching a contributing column fires the trigger for each.
+UPDATE public.exercises SET name = name WHERE search_vector IS NULL;
+
+ANALYZE public.exercises;
