@@ -5,7 +5,8 @@
 const express    = require('express');
 const pool       = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
-const { tenantScope } = require('../lib/tenant-db');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const exerciseSvc = require('../modules/exercises/exercises.service');
 const logger     = require('../lib/logger');
 
 // Null-safe tenant param: a tenant user gets their org id (queries then filter
@@ -288,10 +289,22 @@ Create a complete progressive programme with warm-up, cool-down, and progression
     let fullContent = '';
     let streamMeta  = { model: models.primary, tier: 'primary', used_fallback: false };
 
+    // Ground the generator in this studio's real library. Best-effort: if the
+    // catalogue cannot be read the model still produces a plan, it is just
+    // unconstrained — which is strictly what it did before this existed, so a
+    // library outage must not take generation down with it.
+    const orgId = orgIdOf(req);
+    let catalogue = [];
+    try {
+      catalogue = await exerciseSvc.catalogueForPrompt(pool, { orgId, equipment });
+    } catch (err) {
+      logger.warn({ err: err.message }, 'ai: exercise catalogue unavailable — generating ungrounded');
+    }
+
     const it = routedStream({
       intent:      'workout',
       messages:    [
-        { role: 'system', content: buildWorkoutSystemPrompt(trainerName) },
+        { role: 'system', content: buildWorkoutSystemPrompt(trainerName, catalogue) },
         { role: 'user',   content: userPrompt },
       ],
       temperature: 0.6,
@@ -321,6 +334,23 @@ Create a complete progressive programme with warm-up, cool-down, and progression
       return;
     }
 
+    // Resolve every generated exercise name to a real library row, so the plan
+    // can be saved with exercise_ids rather than free text. Anything that
+    // cannot be placed is reported, never guessed at — a wrong match silently
+    // swaps one movement for another in a client's programme.
+    let grounded = plan;
+    let unmatched = [];
+    try {
+      const r = await exerciseSvc.groundGeneratedPlan(pool, plan, { orgId });
+      grounded = r.plan;
+      unmatched = r.unmatched;
+      if (unmatched.length) {
+        logger.info({ unmatched, orgId }, 'ai: generated exercises not found in the library');
+      }
+    } catch (err) {
+      logger.warn({ err: err.message }, 'ai: could not ground generated plan against the library');
+    }
+
     logUsage({
       user_id:           req.user.id,
       model:             streamMeta.model,
@@ -330,7 +360,12 @@ Create a complete progressive programme with warm-up, cool-down, and progression
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
-    send({ type: 'done', data: plan, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
+    send({
+      type: 'done', data: grounded,
+      unmatched_exercises: unmatched,
+      grounded: catalogue.length > 0,
+      model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback,
+    });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_generate_error');
     send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI workout generation failed. Please try again.' });
