@@ -2,48 +2,102 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
+// adminOrManager is gone from this file with the exercise write endpoints —
+// exercise authoring is now trainer-accessible and lives in routes/exercises.js.
 const { auth, adminManagerOrTrainer } = require('../middleware/auth');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks } = require('../modules/pt-os/progression');
-const exerciseSvc = require('../modules/exercises/exercises.service');
 
-// ─── EXERCISES (legacy compatibility) ─────────────────────────
+// ─── EXERCISES (COMPATIBILITY) ────────────────────────────────
 //
-// The exercise library now lives at /api/exercises
-// (modules/exercises/), which owns the premium fields, permissions,
-// versioning, favourites and full-text search.
+// The Exercise Library now lives in routes/exercises.js and serves
+// /api/exercises. These two readers stay because older clients still call
+// them; they read the same table, so nothing has forked.
 //
-// These two routes remain as thin adapters over the same service, because
-// the mobile client and any bookmarked integration still call them. They
-// delegate rather than reimplement — a second copy of the visibility rule is
-// how one of them ends up leaking another studio's custom exercises.
+// The write endpoints that used to live here (POST/PUT/DELETE
+// /api/workouts/exercises) are GONE, not deprecated. They wrote the flat
+// legacy columns directly and knew nothing about slugs, the muscle join
+// table, version history or ownership — a write through them would have
+// produced a row the new library could not filter, search or attribute.
+// Creation and editing go through /api/exercises, which is the only path
+// that maintains all of it.
 //
-// The legacy WRITE routes are gone. They wrote rows with no slug, no
-// organization_id and no version snapshot, which the new reads then could not
-// scope or the history explain. Writes go through /api/exercises.
+// Both readers below now exclude soft-deleted and archived rows, so an
+// exercise retired in the new library disappears here too.
 
-// GET /api/workouts/exercises — legacy shape: a bare array, not {data,…}.
+// GET /api/workouts/exercises  →  prefer GET /api/exercises
 router.get('/exercises', auth, async (req, res, next) => {
   try {
-    const result = await exerciseSvc.list(pool, {
-      query: { ...req.query, limit: Math.min(parseInt(req.query.limit, 10) || 200, 200) },
-      user: req.user,
-      orgId: orgIdOf(req),
-    });
-    res.json(result.data);
+    const { muscle_group, body_part, equipment, exercise_type, difficulty, search } = req.query;
+    const conds = ['is_active = true', 'deleted_at IS NULL', 'archived_at IS NULL'];
+    const params = [];
+    let p = 1;
+
+    if (muscle_group)   { conds.push(`muscle_group = $${p++}`);   params.push(muscle_group); }
+    if (body_part)      { conds.push(`body_part = $${p++}`);       params.push(body_part); }
+    if (equipment)      { conds.push(`equipment = $${p++}`);       params.push(equipment); }
+    if (exercise_type)  { conds.push(`exercise_type = $${p++}`);   params.push(exercise_type); }
+    if (difficulty)     { conds.push(`difficulty = $${p++}`);      params.push(difficulty); }
+    if (search)         { conds.push(`name ILIKE $${p++}`);        params.push(`%${search}%`); }
+
+    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    params.push(limit, offset);
+    const { rows } = await pool.query(
+      `SELECT id, name, slug, muscle_group, body_part, target_muscle, secondary_muscles,
+              equipment, difficulty, instructions, gif_url, exercise_type,
+              force, mechanic, sets_default, reps_default, rest_seconds,
+              video_url, image_url, is_active, source_id, created_at
+       FROM exercises WHERE ${conds.join(' AND ')} ORDER BY body_part, name
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    res.json(rows);
   } catch (err) {
     if (err.message?.includes('does not exist')) return res.json([]);
     next(err);
   }
 });
 
-// GET /api/workouts/exercises/meta
+// GET /api/workouts/exercises/meta  →  prefer GET /api/exercises/meta
 router.get('/exercises/meta', auth, async (req, res, next) => {
   try {
-    res.json(await exerciseSvc.meta(pool, { orgId: orgIdOf(req) }));
-  } catch (err) { next(err); }
+    const { body_part, equipment, exercise_type, difficulty, search } = req.query;
+    const hasFilters = body_part || equipment || exercise_type || difficulty || search;
+    const live = 'is_active = true AND deleted_at IS NULL AND archived_at IS NULL';
+
+    const { rows: [meta] } = await pool.query(`
+      SELECT
+        array_agg(DISTINCT body_part    ORDER BY body_part)    FILTER (WHERE body_part IS NOT NULL)    AS body_parts,
+        array_agg(DISTINCT equipment    ORDER BY equipment)    FILTER (WHERE equipment IS NOT NULL)    AS equipment_types,
+        array_agg(DISTINCT exercise_type ORDER BY exercise_type) FILTER (WHERE exercise_type IS NOT NULL) AS exercise_types,
+        array_agg(DISTINCT difficulty   ORDER BY difficulty)   FILTER (WHERE difficulty IS NOT NULL)   AS difficulties,
+        COUNT(*)::int AS total
+      FROM exercises WHERE ${live}
+    `);
+
+    if (!hasFilters) return res.json(meta);
+
+    const conds = [live];
+    const params = [];
+    let p = 1;
+    if (body_part)     { conds.push(`body_part = $${p++}`);     params.push(body_part); }
+    if (equipment)     { conds.push(`equipment = $${p++}`);     params.push(equipment); }
+    if (exercise_type) { conds.push(`exercise_type = $${p++}`); params.push(exercise_type); }
+    if (difficulty)    { conds.push(`difficulty = $${p++}`);    params.push(difficulty); }
+    if (search)        { conds.push(`name ILIKE $${p++}`);      params.push(`%${search}%`); }
+
+    const { rows: [cnt] } = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM exercises WHERE ${conds.join(' AND ')}`,
+      params
+    );
+    res.json({ ...meta, total: cnt.total });
+  } catch (err) {
+    next(err);
+  }
 });
+
 
 // ─── WORKOUT PLANS ────────────────────────────────────────────
 //
