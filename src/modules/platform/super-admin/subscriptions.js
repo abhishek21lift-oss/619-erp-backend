@@ -386,7 +386,7 @@ router.post('/organizations/:id/subscription/activate', async (req, res, next) =
     await audit(req, 'subscription_activated', 'organization', req.params.id, result);
     res.json({ data: result });
   } catch (err) {
-    if (err.status) return res.status(err.status).json({ error: { code: 'ACTIVATION_FAILED', message: err.message } });
+    if (err.status) return res.status(err.status).json({ error: { code: err.code || 'ACTIVATION_FAILED', message: err.message } });
     next(err);
   }
 });
