@@ -450,6 +450,10 @@ app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-che
 app.use('/api/settings',          require('./routes/settings'));
 app.use('/api/invoices',          ...gate('finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
+// The Exercise Library. Sits behind the same 'programs' feature as the Workout
+// Builder it feeds — a studio with programmes always has the library, and one
+// without it has no use for either.
+app.use('/api/exercises',         ...gate('programs'), require('./routes/exercises'));
 app.use('/api/diet',              require('./routes/diet'));
 app.use('/api/biometric-attend',  ...gate('attendance'), require('./routes/biometric-attend'));
 app.use('/api/webauthn',          require('./routes/webauthn'));
