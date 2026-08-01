@@ -94,10 +94,17 @@ function getTransport() {
   return transporter;
 }
 
+/**
+ * @returns {Promise<{sent: boolean, reason?: string}>} so the caller can tell
+ *   "not configured" from "sent" — it used to return undefined in both cases,
+ *   which made the two indistinguishable at the only call site that has to
+ *   stay silent to its own caller for enumeration reasons.
+ */
 async function sendPasswordReset(email, rawToken) {
   if (!isConfigured()) {
-    logger.warn({ email }, 'SMTP not configured — password reset email skipped');
-    return;
+    logger.warn({ email, missing: describeConfig().missing },
+      'SMTP not configured — password reset email skipped');
+    return { sent: false, reason: 'SMTP_NOT_CONFIGURED' };
   }
 
   // frontendUrl(), not string concatenation: FRONTEND_URL is stored with a
@@ -129,6 +136,7 @@ async function sendPasswordReset(email, rawToken) {
       `,
   }, { email, kind: 'password_reset' });
   logger.info({ email }, 'Password reset email sent');
+  return { sent: true };
 }
 
 async function sendAdminResetOtp(email, otp) {
