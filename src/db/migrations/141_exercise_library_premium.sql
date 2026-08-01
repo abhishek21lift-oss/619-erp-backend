@@ -158,6 +158,76 @@ BEGIN
   END LOOP;
 END $gen$;
 
+-- ── 2a-ii. Set aside views that pin the types below ─────────────────────
+--
+-- A view or materialised view over a column blocks ALTER TYPE the same way a
+-- generated column does ("cannot alter type of a column used by a view or
+-- rule"), and this schema is full of them — migration 009's v_clients caused
+-- exactly this failure against clients.face_descriptor.
+--
+-- Unlike a generated column these are cheap to restore: the definition is
+-- recoverable with pg_get_viewdef, so each one is saved, dropped, and
+-- recreated verbatim once the conversions are done. Saved to a TEMP table so
+-- the definitions survive between the DO blocks below and disappear with the
+-- session either way.
+--
+-- Ordered by oid so a view built on another view is dropped after its
+-- dependency and recreated before it.
+CREATE TEMP TABLE IF NOT EXISTS exercises_saved_views (
+  seq   SERIAL,
+  ident TEXT,
+  kind  "char",
+  def   TEXT
+);
+
+DO $saveviews$
+DECLARE
+  v RECORD;
+BEGIN
+  -- Recursive, because DROP ... CASCADE reaches further than a direct
+  -- dependency search does. A view built on a view that reads exercises is
+  -- dropped by the cascade but would not appear in a one-level query — so it
+  -- would be destroyed here and never restored. Verified: without the
+  -- recursion, a second-level view silently disappeared.
+  FOR v IN
+    WITH RECURSIVE dependents AS (
+      SELECT c.oid
+        FROM pg_depend  d
+        JOIN pg_rewrite r ON r.oid = d.objid
+        JOIN pg_class   c ON c.oid = r.ev_class
+       WHERE d.refobjid = 'public.exercises'::regclass
+         AND c.relkind IN ('v', 'm')
+      UNION
+      SELECT c2.oid
+        FROM dependents dep
+        JOIN pg_depend  d2 ON d2.refobjid = dep.oid
+        JOIN pg_rewrite r2 ON r2.oid = d2.objid
+        JOIN pg_class   c2 ON c2.oid = r2.ev_class
+       WHERE c2.relkind IN ('v', 'm')
+         AND c2.oid <> dep.oid
+    )
+    SELECT c.oid, c.relkind,
+           quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS ident,
+           pg_get_viewdef(c.oid, true) AS def
+      FROM dependents dep
+      JOIN pg_class     c ON c.oid = dep.oid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     ORDER BY c.oid
+  LOOP
+    INSERT INTO exercises_saved_views (ident, kind, def) VALUES (v.ident, v.relkind, v.def);
+  END LOOP;
+
+  -- Reverse order: dependants first.
+  FOR v IN SELECT ident, kind FROM exercises_saved_views ORDER BY seq DESC LOOP
+    RAISE NOTICE 'exercise_library: temporarily dropping view % (restored after the type changes)', v.ident;
+    IF v.kind = 'm' THEN
+      EXECUTE format('DROP MATERIALIZED VIEW IF EXISTS %s CASCADE', v.ident);
+    ELSE
+      EXECUTE format('DROP VIEW IF EXISTS %s CASCADE', v.ident);
+    END IF;
+  END LOOP;
+END $saveviews$;
+
 -- Postgres has no non-throwing cast to timestamptz, and a single unparseable
 -- string in a text column would otherwise abort the conversion — and the
 -- deploy with it. Created for the conversion below and dropped straight
@@ -189,6 +259,12 @@ BEGIN
 
     IF kind IS NOT NULL AND kind <> 'ARRAY' THEN
       RAISE NOTICE 'exercise_library: converting exercises.% from % to text[]', col, kind;
+      -- The DEFAULT is converted separately from the rows, and USING does not
+      -- apply to it — so a column defaulting to '' fails with
+      -- "malformed array literal" however carefully the row conversion is
+      -- written. Dropped first; an array column wants no scalar default
+      -- anyway, and NULL already means "no tags".
+      EXECUTE format('ALTER TABLE public.exercises ALTER COLUMN %I DROP DEFAULT', col);
       EXECUTE format(
         'ALTER TABLE public.exercises ALTER COLUMN %I TYPE TEXT[] USING (
            CASE WHEN %I IS NULL OR btrim(%I::text) = '''' THEN NULL
@@ -205,6 +281,7 @@ BEGIN
    WHERE table_schema = 'public' AND table_name = 'exercises' AND column_name = 'organization_id';
   IF kind IS NOT NULL AND kind <> 'uuid' THEN
     RAISE NOTICE 'exercise_library: converting exercises.organization_id from % to uuid', kind;
+    ALTER TABLE public.exercises ALTER COLUMN organization_id DROP DEFAULT;
     ALTER TABLE public.exercises ALTER COLUMN organization_id TYPE UUID USING (
       CASE WHEN organization_id::text ~*
              '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -218,6 +295,7 @@ BEGIN
    WHERE table_schema = 'public' AND table_name = 'exercises' AND column_name = 'version';
   IF kind IS NOT NULL AND kind NOT IN ('integer', 'bigint', 'smallint') THEN
     RAISE NOTICE 'exercise_library: converting exercises.version from % to integer', kind;
+    ALTER TABLE public.exercises ALTER COLUMN version DROP DEFAULT;
     ALTER TABLE public.exercises ALTER COLUMN version TYPE INTEGER USING (
       CASE WHEN version::text ~ '^[0-9]+$' THEN version::text::integer ELSE 1 END);
     UPDATE public.exercises SET version = 1 WHERE version IS NULL;
@@ -235,6 +313,7 @@ BEGIN
 
     IF kind IS NOT NULL AND kind NOT LIKE 'timestamp%' THEN
       RAISE NOTICE 'exercise_library: converting exercises.% from % to timestamptz', col, kind;
+      EXECUTE format('ALTER TABLE public.exercises ALTER COLUMN %I DROP DEFAULT', col);
       EXECUTE format(
         'ALTER TABLE public.exercises ALTER COLUMN %I TYPE TIMESTAMPTZ USING (
            CASE WHEN btrim(coalesce(%I::text, '''')) = '''' THEN NULL
@@ -256,6 +335,30 @@ BEGIN
 END $types$;
 
 DROP FUNCTION IF EXISTS exercises_try_timestamptz(TEXT);
+
+-- Put the views back, in creation order so a view built on another follows
+-- its dependency. A definition that no longer compiles is reported by name
+-- with its error rather than swallowed: the view existed for a reason, and a
+-- silently missing one is worse than a failed deploy that says which.
+DO $restoreviews$
+DECLARE
+  v RECORD;
+BEGIN
+  FOR v IN SELECT ident, kind, def FROM exercises_saved_views ORDER BY seq LOOP
+    BEGIN
+      IF v.kind = 'm' THEN
+        EXECUTE format('CREATE MATERIALIZED VIEW %s AS %s', v.ident, v.def);
+      ELSE
+        EXECUTE format('CREATE VIEW %s AS %s', v.ident, v.def);
+      END IF;
+      RAISE NOTICE 'exercise_library: restored view %', v.ident;
+    EXCEPTION WHEN others THEN
+      RAISE EXCEPTION 'exercise_library: could not restore view % after the type changes: %', v.ident, SQLERRM;
+    END;
+  END LOOP;
+END $restoreviews$;
+
+DROP TABLE IF EXISTS exercises_saved_views;
 
 COMMENT ON COLUMN public.exercises.slug             IS 'URL-safe unique identifier, generated from name.';
 COMMENT ON COLUMN public.exercises.organization_id  IS 'NULL = shared platform library; set = a studio''s own custom exercise.';
