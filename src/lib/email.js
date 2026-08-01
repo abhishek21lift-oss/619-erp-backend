@@ -211,6 +211,72 @@ async function sendRaw({ to, subject, html, text }, ctx = {}) {
   }
 }
 
+/**
+ * Explain an SMTP failure in terms of what to change, rather than echoing a
+ * code. Lifted here from scripts/verify-smtp.js so the boot check and the
+ * script give the same answer — two diagnoses that disagree is worse than one.
+ */
+function diagnose(err) {
+  const code = err?.code || '';
+  const response = err?.response || '';
+
+  if (code === 'EAUTH' || /535|534|password|authenticat/i.test(response)) {
+    return 'The host accepted the connection but rejected the credentials. '
+      + 'SMTP_USER must be the FULL address, not the mailbox name; SMTP_PASS is the '
+      + 'MAILBOX password from hPanel → Emails → the mailbox → Change password, not the '
+      + 'hPanel account password; and the mailbox must actually exist — authenticating '
+      + 'against an address that was never provisioned fails exactly like a wrong password.';
+  }
+  if (code === 'EDNS' || /ENOTFOUND|EAI_AGAIN/.test(err?.message || '')) {
+    return `The hostname "${SMTP_HOST}" does not resolve, so this is a wrong host or a typo `
+      + 'rather than a credentials problem. Check for a stray space or a pasted https:// prefix — '
+      + 'this field is a bare hostname, not a URL.';
+  }
+  if (code === 'ETIMEDOUT' || code === 'ESOCKET' || code === 'ECONNREFUSED') {
+    return `Could not establish a session on port ${SMTP_PORT}. 465 is implicit TLS and 587 is `
+      + 'STARTTLS, and those are the only two correct pairings. Note some hosts block outbound '
+      + 'SMTP entirely — if this works from a laptop but not from the deploy, that is the likely cause.';
+  }
+  if (code === 'EENVELOPE' || /550|553|relay/i.test(response)) {
+    return 'The server refused the envelope, usually the From address. SMTP_FROM / EMAIL_FROM must be '
+      + 'an address on a domain this mailbox may send as; a relay will not send for a domain it does '
+      + 'not host, even with valid credentials.';
+  }
+  return 'No specific diagnosis for this one — see the raw error.';
+}
+
+/**
+ * Prove the credentials work, without sending anything.
+ *
+ * Exists because every failure on the password-reset path is invisible by
+ * design: the endpoint must answer the same whether or not an address is
+ * registered, so a broken mailbox looks exactly like a working one until
+ * somebody reports a missing email. Running this at boot turns that into a
+ * line in the deploy log, on every deploy, without anyone having to think of
+ * it.
+ *
+ * Never throws — the caller is startup, and mail being misconfigured must not
+ * stop a studio taking check-ins.
+ */
+async function verifyConnection() {
+  if (!isConfigured()) {
+    return { ok: false, reason: 'SMTP_NOT_CONFIGURED', missing: describeConfig().missing };
+  }
+  try {
+    await getTransport().verify();
+    return { ok: true, host: SMTP_HOST, port: SMTP_PORT, user: SMTP_USER, from: FROM_ADDR };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err.code || 'ERROR',
+      message: err.message,
+      response: err.response,
+      diagnosis: diagnose(err),
+      host: SMTP_HOST, port: SMTP_PORT, user: SMTP_USER, from: FROM_ADDR,
+    };
+  }
+}
+
 /** The three variables isConfigured() requires, in the order to report them. */
 const REQUIRED_VARS = ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS'];
 
@@ -235,5 +301,6 @@ function describeConfig(env = process.env) {
 
 module.exports = {
   sendPasswordReset, sendAdminResetOtp, sendAdminInvitation, sendRaw,
+  verifyConnection, diagnose,
   isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,
 };
