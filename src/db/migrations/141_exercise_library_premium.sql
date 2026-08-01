@@ -113,6 +113,51 @@ ALTER TABLE public.exercises
 -- rather than worked around, splitting on comma because that is how a
 -- delimited text column of this kind is written. An empty or NULL value
 -- becomes NULL rather than a one-element array containing ''.
+-- ── 2a. Clear generated columns that pin the types below ────────────────
+--
+-- A GENERATED column freezes the type of every column its expression reads:
+-- Postgres refuses to ALTER them while it exists. The deploy failed on that:
+--
+--   ✗ 141_exercise_library_premium.sql FAILED:
+--     cannot alter type of a column used by a generated column
+--
+-- The production database already has search_vector as a GENERATED column,
+-- built over the very fields being converted below.
+--
+-- Dropping it is not a loss, and not a workaround. Section 5 rebuilds
+-- search_vector as a trigger-maintained column precisely BECAUSE it cannot
+-- be generated: array_to_string() is STABLE rather than IMMUTABLE, so a
+-- generated expression may not call it, which means any generated
+-- search_vector necessarily omits tags and search_keywords — the two fields
+-- a trainer most wants to search by. The column is rebuilt and repopulated a
+-- few hundred lines down, wider than the one being removed here.
+--
+-- Any OTHER generated column is a deliberate refusal rather than a silent
+-- drop: this migration knows what search_vector is for and can replace it,
+-- but it has no idea what an unknown generated column means to whoever added
+-- it, and destroying that unattended is not a call a migration should make.
+-- The error names the column so it is actionable rather than opaque.
+DO $gen$
+DECLARE
+  gen_col TEXT;
+BEGIN
+  FOR gen_col IN
+    SELECT a.attname
+      FROM pg_attribute a
+     WHERE a.attrelid = 'public.exercises'::regclass
+       AND a.attgenerated <> ''
+       AND NOT a.attisdropped
+  LOOP
+    IF gen_col = 'search_vector' THEN
+      RAISE NOTICE 'exercise_library: dropping GENERATED search_vector; section 5 rebuilds it by trigger, including tags and search_keywords';
+      ALTER TABLE public.exercises DROP COLUMN search_vector;
+    ELSE
+      RAISE EXCEPTION
+        'exercises.% is a GENERATED column and blocks the type changes this migration needs. Drop or redefine it, then re-run.', gen_col;
+    END IF;
+  END LOOP;
+END $gen$;
+
 -- Postgres has no non-throwing cast to timestamptz, and a single unparseable
 -- string in a text column would otherwise abort the conversion — and the
 -- deploy with it. Created for the conversion below and dropped straight
