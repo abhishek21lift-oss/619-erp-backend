@@ -19,10 +19,23 @@ ALTER TABLE pt_sessions ADD COLUMN IF NOT EXISTS recurrence_id TEXT;
 -- exist here) — every PT-OS session booking has been failing on these
 -- constraints (confirmed: 0 rows in pt_sessions despite the feature being
 -- in active use), silently masked by an empty catch block on the frontend.
-ALTER TABLE pt_sessions ALTER COLUMN member_id DROP NOT NULL;
-ALTER TABLE pt_sessions ALTER COLUMN starts_at DROP NOT NULL;
-ALTER TABLE pt_sessions ALTER COLUMN ends_at DROP NOT NULL;
-ALTER TABLE pt_sessions ALTER COLUMN trainer_id DROP NOT NULL;
+-- Guarded per column: these are exactly the "remnants of an unrelated, never-
+-- wired member portal schema" described above, so a database built from this
+-- repo never has them and the bare ALTERs aborted the migration. Where the
+-- column does not exist there is no NOT NULL to drop, which is the state this
+-- block is trying to reach anyway.
+DO $$
+DECLARE col TEXT;
+BEGIN
+  FOREACH col IN ARRAY ARRAY['member_id', 'starts_at', 'ends_at', 'trainer_id'] LOOP
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'pt_sessions' AND column_name = col
+    ) THEN
+      EXECUTE format('ALTER TABLE pt_sessions ALTER COLUMN %I DROP NOT NULL', col);
+    END IF;
+  END LOOP;
+END $$;
 
 DO $$ BEGIN
   ALTER TABLE pt_sessions ADD CONSTRAINT pt_sessions_session_type_check

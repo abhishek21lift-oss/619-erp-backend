@@ -3,12 +3,22 @@
 -- Adds admin_reset_intents table for two-step admin reset (H-04)
 
 -- C-04: bind WebAuthn auth challenges to a session cookie
-ALTER TABLE webauthn_challenges
-  ADD COLUMN IF NOT EXISTS session_id TEXT;
+--
+-- Guarded because webauthn_challenges is created by migration 026, i.e. after
+-- this one — on a fresh database there is no table to alter and the migration
+-- aborted here. 026 declares session_id in the table itself, so a fresh
+-- install ends up with the same shape by a different route; this block is
+-- what upgrades a database that already had the pre-026 table.
+DO $$ BEGIN
+  IF to_regclass('public.webauthn_challenges') IS NOT NULL THEN
+    ALTER TABLE webauthn_challenges
+      ADD COLUMN IF NOT EXISTS session_id TEXT;
 
-CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_session_id
-  ON webauthn_challenges (session_id)
-  WHERE session_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_session_id
+      ON webauthn_challenges (session_id)
+      WHERE session_id IS NOT NULL;
+  END IF;
+END $$;
 
 -- H-04: two-step admin data-reset with email OTP
 CREATE TABLE IF NOT EXISTS admin_reset_intents (

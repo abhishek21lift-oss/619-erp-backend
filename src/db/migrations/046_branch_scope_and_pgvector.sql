@@ -8,12 +8,25 @@ ALTER TABLE payments
   ADD COLUMN IF NOT EXISTS branch_id TEXT;
 
 -- Backfill from the linked client's branch_id where we know it.
-UPDATE payments p
-   SET branch_id = c.branch_id
-  FROM clients c
- WHERE p.client_id = c.id
-   AND p.branch_id IS NULL
-   AND c.branch_id IS NOT NULL;
+--
+-- Guarded on clients.branch_id, which no tracked migration ever adds — it
+-- exists on the live database because it was created out of band. Without the
+-- guard this statement aborts a fresh database, and there is nothing for it to
+-- do there anyway: a database being created for the first time has no payment
+-- rows to backfill.
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'clients' AND column_name = 'branch_id'
+  ) THEN
+    UPDATE payments p
+       SET branch_id = c.branch_id
+      FROM clients c
+     WHERE p.client_id = c.id
+       AND p.branch_id IS NULL
+       AND c.branch_id IS NOT NULL;
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_payments_branch_id ON payments (branch_id)
   WHERE branch_id IS NOT NULL;

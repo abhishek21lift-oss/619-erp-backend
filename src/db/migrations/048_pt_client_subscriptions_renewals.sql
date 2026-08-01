@@ -6,7 +6,11 @@
 -- Written to by the PT onboarding/renewal flow and bulk import.
 CREATE TABLE IF NOT EXISTS pt_client_subscriptions (
   id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-  client_id        INTEGER     NOT NULL REFERENCES pt_clients(id) ON DELETE CASCADE,
+  -- TEXT, matching pt_clients.id (migration 017 declares it
+  -- "TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT"). Declared INTEGER
+  -- here, which cannot reference a TEXT key, so Postgres rejected the foreign
+  -- key and a fresh database stopped on this migration.
+  client_id        TEXT        NOT NULL REFERENCES pt_clients(id) ON DELETE CASCADE,
   plan_name        VARCHAR(200),
   start_date       DATE,
   end_date         DATE,
@@ -29,7 +33,11 @@ CREATE INDEX IF NOT EXISTS idx_pt_client_subs_end_date ON pt_client_subscription
 -- Written by the renewal endpoint; queried for renewal history and business analytics.
 CREATE TABLE IF NOT EXISTS pt_client_renewals (
   id               SERIAL      PRIMARY KEY,
-  client_id        INTEGER     NOT NULL REFERENCES pt_clients(id) ON DELETE CASCADE,
+  -- TEXT, matching pt_clients.id (migration 017 declares it
+  -- "TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT"). Declared INTEGER
+  -- here, which cannot reference a TEXT key, so Postgres rejected the foreign
+  -- key and a fresh database stopped on this migration.
+  client_id        TEXT        NOT NULL REFERENCES pt_clients(id) ON DELETE CASCADE,
   client_name      VARCHAR(200),
   trainer_name     VARCHAR(200),
   old_package      VARCHAR(200),

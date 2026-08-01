@@ -4,7 +4,13 @@
 
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- TEXT, matching users.id. It was declared UUID, which cannot reference a
+  -- TEXT primary key — Postgres rejects the foreign key outright, so a fresh
+  -- database stopped here. TEXT ids are the convention throughout this schema;
+  -- migration 033 explicitly converts a stray UUID key back to TEXT "to match
+  -- the rest of the schema". The live database already has this table, so
+  -- CREATE TABLE IF NOT EXISTS leaves it untouched there.
+  user_id     TEXT        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   token_hash  TEXT        NOT NULL,
   expires_at  TIMESTAMPTZ NOT NULL,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),

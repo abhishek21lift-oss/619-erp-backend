@@ -10,7 +10,18 @@
 -- client_id as the client reference, so the legacy member_id NOT NULL
 -- constraint is relaxed (the column is kept for backward compatibility).
 
-ALTER TABLE invoices ALTER COLUMN member_id DROP NOT NULL;
+-- Guarded: member_id is part of "the live invoices table (from an early
+-- schema)" this file exists to reconcile, so it is present on the live
+-- database but absent from one built out of this repo — where the bare ALTER
+-- aborted the migration. Nothing to relax when the column was never created.
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'invoices' AND column_name = 'member_id'
+  ) THEN
+    ALTER TABLE invoices ALTER COLUMN member_id DROP NOT NULL;
+  END IF;
+END $$;
 
 ALTER TABLE invoices ADD COLUMN IF NOT EXISTS invoice_no     TEXT;
 ALTER TABLE invoices ADD COLUMN IF NOT EXISTS client_id      TEXT;

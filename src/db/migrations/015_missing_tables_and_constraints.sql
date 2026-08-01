@@ -279,7 +279,19 @@ CREATE INDEX IF NOT EXISTS audit_table_idx     ON audit_log (table_name, record_
 CREATE INDEX IF NOT EXISTS audit_date_idx      ON audit_log (created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS clients_mobile_uniq ON clients (mobile)
   WHERE mobile IS NOT NULL AND mobile != '';
-CREATE INDEX IF NOT EXISTS st_staff_idx        ON staff_targets (staff_id);
+-- staff_targets is created by migration 033, i.e. AFTER this one, so on a
+-- fresh database this index has nothing to attach to and the whole migration
+-- aborts. It only worked on the live database because that table already
+-- existed there by the time this file first ran. Guarded rather than moved:
+-- 015 and 033 are both applied in production already, so reordering them
+-- would change nothing there and risk diverging the two histories. 033
+-- creates its own index on this column, so a fresh database still ends up
+-- fully indexed.
+DO $$ BEGIN
+  IF to_regclass('public.staff_targets') IS NOT NULL THEN
+    CREATE INDEX IF NOT EXISTS st_staff_idx ON staff_targets (staff_id);
+  END IF;
+END $$;
 
 -- ─── UPDATED-AT TRIGGERS ─────────────────────────────────────
 DO $$ DECLARE
