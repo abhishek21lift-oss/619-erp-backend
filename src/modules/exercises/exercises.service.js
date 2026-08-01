@@ -707,7 +707,133 @@ async function setRelations(db, id, { kind, relatedIds }) {
   }
 }
 
+// ── Grounding the AI generator ──────────────────────────────────────────────
+//
+// The workout generator used to invent exercise names from the model's own
+// vocabulary, so a plan could contain movements this studio does not have,
+// cannot equip, or that simply do not exist. Nothing downstream could link
+// such a name to a library row, which meant no muscle, no cues, no
+// contraindications and no logging history for the exercise a client was
+// actually told to perform.
+//
+// Two halves fix that: give the model the real catalogue to choose from, and
+// resolve whatever it returns back to real rows before the plan is saved.
+
+/**
+ * A compact list of real exercise names to put in the prompt.
+ *
+ * Capped, because the full library is ~900 rows and every name is prompt
+ * tokens on a request the studio pays for. Compound movements come first:
+ * they are the backbone of a programme, and if the cap truncates anything it
+ * should be the third variation of a cable fly rather than the squat.
+ */
+async function catalogueForPrompt(db, { orgId, equipment = null, limit = 300 } = {}) {
+  const params = [orgId];
+  let equipmentFilter = '';
+  // "full gym" (the default) means do not narrow at all.
+  if (equipment && !/full gym|any|all/i.test(equipment)) {
+    params.push(`%${equipment}%`);
+    equipmentFilter = `AND (equipment IS NULL OR equipment ILIKE $${params.length})`;
+  }
+  params.push(limit);
+
+  const { rows } = await db.query(
+    `SELECT name, equipment, muscle_group
+       FROM exercises
+      WHERE deleted_at IS NULL AND archived_at IS NULL AND is_active = true
+        AND (organization_id IS NULL OR organization_id = $1::uuid)
+        ${equipmentFilter}
+      ORDER BY (lower(mechanic) = 'compound') DESC NULLS LAST,
+               (organization_id IS NOT NULL) DESC,
+               name
+      LIMIT $${params.length}`,
+    params
+  );
+  return rows;
+}
+
+/**
+ * Match generated exercise names back to library rows.
+ *
+ * Exact (case-insensitive) first, then a trigram similarity pass for the
+ * near-misses a model reliably produces — "Barbell Bench Press (Flat)",
+ * "Dumbbell Shoulder Press" for "Dumbbell Overhead Press". The 0.45 floor is
+ * deliberately not lower: a bad match is worse than no match, because it
+ * silently swaps one exercise for another in a client's programme, whereas an
+ * unmatched name is reported and a human decides.
+ */
+async function resolveNames(db, { orgId, names }) {
+  const wanted = [...new Set((names || []).map((n) => String(n || '').trim()).filter(Boolean))];
+  if (!wanted.length) return { matched: {}, unmatched: [] };
+
+  const { rows } = await db.query(
+    `WITH wanted AS (SELECT unnest($2::text[]) AS q)
+     SELECT w.q,
+            e.id, e.name, e.slug,
+            similarity(lower(e.name), lower(w.q)) AS score
+       FROM wanted w
+       JOIN LATERAL (
+         SELECT id, name, slug
+           FROM exercises
+          WHERE deleted_at IS NULL AND is_active = true
+            AND (organization_id IS NULL OR organization_id = $1::uuid)
+          ORDER BY (lower(name) = lower(w.q)) DESC,
+                   similarity(lower(name), lower(w.q)) DESC
+          LIMIT 1
+       ) e ON true`,
+    [orgId, wanted]
+  );
+
+  const matched = {};
+  const unmatched = [];
+  for (const r of rows) {
+    const exact = r.name.toLowerCase() === r.q.toLowerCase();
+    if (exact || Number(r.score) >= 0.45) {
+      matched[r.q] = { id: r.id, name: r.name, slug: r.slug, exact, score: Number(r.score) };
+    } else {
+      unmatched.push(r.q);
+    }
+  }
+  return { matched, unmatched };
+}
+
+/**
+ * Walk a generated plan, attaching exercise_id to every exercise it names.
+ *
+ * Mutates nothing the caller owns — returns a new plan — and reports what it
+ * could not place rather than dropping it silently, so the UI can show the
+ * trainer exactly which movements need a decision.
+ */
+async function groundGeneratedPlan(db, plan, { orgId }) {
+  const schedule = plan?.weekly_schedule;
+  if (!schedule || typeof schedule !== 'object') return { plan, unmatched: [] };
+
+  const names = [];
+  for (const day of Object.values(schedule)) {
+    for (const ex of day?.exercises || []) if (ex?.name) names.push(ex.name);
+  }
+
+  const { matched, unmatched } = await resolveNames(db, { orgId, names });
+
+  const grounded = { ...plan, weekly_schedule: {} };
+  for (const [dayName, day] of Object.entries(schedule)) {
+    grounded.weekly_schedule[dayName] = {
+      ...day,
+      exercises: (day?.exercises || []).map((ex) => {
+        const hit = ex?.name ? matched[ex.name] : null;
+        return hit
+          // The library's spelling wins, so two plans naming the same movement
+          // differently still point at one row.
+          ? { ...ex, exercise_id: hit.id, name: hit.name, matched_exactly: hit.exact }
+          : { ...ex, exercise_id: null, unmatched: true };
+      }),
+    };
+  }
+  return { plan: grounded, unmatched };
+}
+
 module.exports = {
+  catalogueForPrompt, resolveNames, groundGeneratedPlan,
   slugify, uniqueSlug, buildSearchKeywords, toArray,
   canCreate, canModify, readPayload, validate, findDuplicateName,
   list, getById, meta, create, update, duplicate, setLifecycle,

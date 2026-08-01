@@ -51,7 +51,15 @@ function buildCoachSystemPrompt(clientContext, knowledgeContext, toolContext) {
 
 /* ─── Workout Plan Generation ───────────────────────────────────────────── */
 
-function buildWorkoutSystemPrompt(trainerName) {
+/**
+ * @param {string} trainerName
+ * @param {Array<{name:string,equipment:string|null,muscle_group:string|null}>} [catalogue]
+ *   The studio's real exercise library. When supplied, the model must choose
+ *   from it rather than inventing names — see the rule below.
+ */
+function buildWorkoutSystemPrompt(trainerName, catalogue = []) {
+  const hasCatalogue = Array.isArray(catalogue) && catalogue.length > 0;
+
   return [
     GYM_CTX,
     '',
@@ -65,6 +73,25 @@ function buildWorkoutSystemPrompt(trainerName) {
     '• Apply progressive overload principles.',
     '• Specify sets × reps (or time), tempo notation (e.g. 3-1-2-0), and rest in seconds.',
     '• Provide a weekly periodisation overview.',
+    ...(hasCatalogue ? [
+      // Without this the model names movements from its own vocabulary, and
+      // nothing downstream can link those to a library row — so the exercise
+      // a client is told to perform has no cues, no contraindications and no
+      // logging history. Names are matched back after generation; an invented
+      // one is reported to the trainer rather than silently accepted.
+      '',
+      'EXERCISE SELECTION — this overrides your own exercise vocabulary:',
+      '• Use ONLY exercises from the AVAILABLE EXERCISES list below.',
+      '• Copy each name EXACTLY as written there, character for character.',
+      '• Never invent an exercise, and never rename one to a variation the list does not contain.',
+      '• If the ideal movement is absent, choose the closest one that IS listed.',
+      '• Warm-up and cool-down prose may mention general movements freely — this rule applies to the exercises array only.',
+      '',
+      'AVAILABLE EXERCISES:',
+      catalogue
+        .map((e) => `- ${e.name}${e.equipment ? ` [${e.equipment}]` : ''}`)
+        .join('\n'),
+    ] : []),
     '',
     'CRITICAL: Respond ONLY with a valid JSON object. No markdown, no prose, no code fences.',
     'JSON schema:',

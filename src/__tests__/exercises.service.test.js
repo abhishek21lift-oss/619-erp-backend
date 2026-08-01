@@ -163,6 +163,87 @@ describe('buildSearchKeywords', () => {
   });
 });
 
+describe('groundGeneratedPlan', () => {
+  // The AI generator used to name exercises from the model's own vocabulary,
+  // so a plan could prescribe a movement the studio does not have or that does
+  // not exist — with no library row behind it, and therefore no cues, no
+  // contraindications and no logging history.
+  const dbWith = (matches) => ({
+    query: jest.fn(async (_sql, params) => ({
+      rows: (params[1] || []).map((q) => {
+        const hit = matches[q];
+        return hit
+          ? { q, id: hit.id, name: hit.name, slug: hit.slug ?? null, score: hit.score ?? 1 }
+          // The lateral join always returns SOMETHING (its nearest row); a low
+          // score is what marks it as not a real match.
+          : { q, id: 'nearest', name: 'Some Other Lift', slug: 's', score: 0.02 };
+      }),
+    })),
+  });
+
+  const plan = () => ({
+    name: 'Test plan',
+    weekly_schedule: {
+      Monday: { name: 'Push', exercises: [{ name: 'Barbell Bench Press', sets: 4 }, { name: 'Invented Lift', sets: 3 }] },
+    },
+  });
+
+  test('attaches a real exercise_id to a name that exists', async () => {
+    const db = dbWith({ 'Barbell Bench Press': { id: 'e1', name: 'Barbell Bench Press' } });
+    const { plan: out } = await svc.groundGeneratedPlan(db, plan(), { orgId: 'org-1' });
+    expect(out.weekly_schedule.Monday.exercises[0]).toMatchObject({ exercise_id: 'e1', sets: 4 });
+  });
+
+  test('an invented exercise is flagged and reported, never silently swapped', async () => {
+    // The dangerous alternative is accepting the nearest row: that quietly
+    // replaces one movement with another in a client's programme.
+    const db = dbWith({ 'Barbell Bench Press': { id: 'e1', name: 'Barbell Bench Press' } });
+    const { plan: out, unmatched } = await svc.groundGeneratedPlan(db, plan(), { orgId: 'org-1' });
+    expect(out.weekly_schedule.Monday.exercises[1]).toMatchObject({ exercise_id: null, unmatched: true });
+    expect(unmatched).toEqual(['Invented Lift']);
+  });
+
+  test('the library spelling wins, so two plans naming it differently point at one row', async () => {
+    const db = dbWith({ 'barbell bench press': { id: 'e1', name: 'Barbell Bench Press', score: 1 } });
+    const p = { weekly_schedule: { Mon: { exercises: [{ name: 'barbell bench press' }] } } };
+    const { plan: out } = await svc.groundGeneratedPlan(db, p, { orgId: 'org-1' });
+    expect(out.weekly_schedule.Mon.exercises[0].name).toBe('Barbell Bench Press');
+  });
+
+  test('a close-but-not-exact match above the floor is accepted', async () => {
+    // 0.4545 is what "Dumbbell Shoulder Press" scores against "Dumbbell
+    // Overhead Press" — verified against real pg_trgm. It must stay accepted.
+    const db = dbWith({ 'Dumbbell Shoulder Press': { id: 'e4', name: 'Dumbbell Overhead Press', score: 0.4545 } });
+    const p = { weekly_schedule: { Mon: { exercises: [{ name: 'Dumbbell Shoulder Press' }] } } };
+    const { plan: out, unmatched } = await svc.groundGeneratedPlan(db, p, { orgId: 'org-1' });
+    expect(out.weekly_schedule.Mon.exercises[0].exercise_id).toBe('e4');
+    expect(unmatched).toEqual([]);
+  });
+
+  test('a weak similarity below the floor is rejected rather than guessed', async () => {
+    const db = dbWith({ 'Zercher Carry XYZ': { id: 'e9', name: 'Farmer Walk', score: 0.3 } });
+    const p = { weekly_schedule: { Mon: { exercises: [{ name: 'Zercher Carry XYZ' }] } } };
+    const { plan: out, unmatched } = await svc.groundGeneratedPlan(db, p, { orgId: 'org-1' });
+    expect(out.weekly_schedule.Mon.exercises[0].exercise_id).toBeNull();
+    expect(unmatched).toEqual(['Zercher Carry XYZ']);
+  });
+
+  test('does not mutate the plan it was given', async () => {
+    const db = dbWith({});
+    const original = plan();
+    await svc.groundGeneratedPlan(db, original, { orgId: 'org-1' });
+    expect(original.weekly_schedule.Monday.exercises[0].exercise_id).toBeUndefined();
+  });
+
+  test('a plan with no schedule passes through untouched', async () => {
+    const db = dbWith({});
+    const { plan: out, unmatched } = await svc.groundGeneratedPlan(db, { name: 'x' }, { orgId: 'org-1' });
+    expect(out).toEqual({ name: 'x' });
+    expect(unmatched).toEqual([]);
+    expect(db.query).not.toHaveBeenCalled();
+  });
+});
+
 describe('uniqueSlug', () => {
   test('returns the plain slug when nothing holds it', async () => {
     const db = { query: jest.fn(async () => ({ rows: [] })) };
