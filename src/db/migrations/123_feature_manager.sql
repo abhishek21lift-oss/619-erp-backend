@@ -105,7 +105,7 @@ CREATE INDEX IF NOT EXISTS idx_org_features_expiry  ON organization_features(exp
 INSERT INTO platform_features (key, name, description, category, is_core, sort_order) VALUES
   ('clients',            'Clients',              'Client records, leads and onboarding.',                       'core',          TRUE,  10),
   ('sessions',           'Sessions',             'Scheduling, session balance and history.',                    'core',          TRUE,  20),
-  ('attendance',         'Attendance',           'QR check-in, kiosk mode and attendance records.',             'operations',    FALSE, 30),
+  ('attendance',         'Attendance',           'QR check-in and attendance records.',                         'operations',    FALSE, 30),
   ('programs',           'Programs',             'Workout plans, workout log and diet plans.',                  'training',      FALSE, 40),
   ('exercise_library',   'Exercise Library',     'The studio''s exercise catalogue.',                           'training',      FALSE, 50),
   ('screening',          'Screening & Assessments', 'PAR-Q, consent, fitness testing and the assessment suite.', 'training',     FALSE, 60),

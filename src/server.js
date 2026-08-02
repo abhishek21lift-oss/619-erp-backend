@@ -488,8 +488,11 @@ app.use('/api/workouts',          ...gate('programs'), require('./routes/workout
 // without it has no use for either.
 app.use('/api/exercises',         ...gate('programs'), require('./routes/exercises'));
 app.use('/api/diet',              require('./routes/diet'));
-app.use('/api/biometric-attend',  ...gate('attendance'), require('./routes/biometric-attend'));
-app.use('/api/webauthn',          require('./routes/webauthn'));
+// '/api/biometric-attend' and '/api/webauthn' were mounted here: a second
+// check-in path (fingerprint / GPS) writing the same attendance_logs rows as
+// '/api/qr' above, plus the member fingerprint enrolment behind it. Check-in
+// is QR only now. Note that '/api/auth/webauthn' — staff passkey LOGIN — is a
+// different system and is still mounted above.
 app.use('/api/integrations',      ...gate('integrations'), require('./routes/integrations'));
 app.use('/api/campaigns',         ...gate('communication'), require('./routes/campaigns'));
 app.use('/api/offers',            require('./routes/offers'));

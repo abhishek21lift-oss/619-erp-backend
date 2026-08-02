@@ -1,11 +1,15 @@
-// Cross-tenant isolation on the two attendance WRITE paths.
+// Cross-tenant isolation on the attendance WRITE path.
 //
-// These are regression tests for a real defect. Both scan paths stamped
+// This is a regression test for a real defect. The scan path stamped
 // attendance_logs.organization_id from a subquery on the SCANNED PERSON
 // rather than from the caller, so a check-in performed by studio A against a
 // code belonging to studio B wrote a row into studio B's data — where it then
-// appeared in their reports. The reads on the same paths were unfiltered too,
+// appeared in their reports. The reads on the same path were unfiltered too,
 // so a scan echoed back another studio's client name, photo and package.
+//
+// The fingerprint check-in path at /api/biometric-attend had the same defect
+// and the same fix, and was covered here too. That path no longer exists —
+// check-in is QR only — so its cases went with it.
 //
 // QR payloads are signed with a single server-wide HMAC secret, which means a
 // code minted by any studio verifies at every studio. The org filter in these
@@ -34,12 +38,10 @@ const express = require('express');
 const pool = require('../db/pool');
 
 const qrRouter = require('../routes/qr-checkin');
-const bioRouter = require('../routes/biometric-attend');
 
 const app = express();
 app.use(express.json());
 app.use('/api/qr', qrRouter);
-app.use('/api/biometric-attend', bioRouter);
 
 /** Build a payload the server will accept — same construction as the route. */
 function signedQr(userId, userType = 'client') {
@@ -103,37 +105,5 @@ describe('POST /api/qr/scan — tenant isolation', () => {
     // The legacy `clients` table has no organization_id column at all, so it
     // can never be tenant-filtered. It must not be consulted here.
     expect(sql).not.toMatch(/FROM clients\b/);
-  });
-});
-
-describe('POST /api/biometric-attend/mark — tenant isolation', () => {
-  const body = { memberId: MEMBER, verificationMethod: 'passkey', memberName: 'Client Supplied' };
-
-  it('404s for a member outside the caller studio and writes nothing', async () => {
-    pool.query
-      .mockResolvedValueOnce({ rows: [{ value: '10' }] }) // getLateHour (system_settings)
-      .mockResolvedValueOnce({ rows: [] });               // member lookup, org-filtered
-    const res = await request(app).post('/api/biometric-attend/mark').send(body);
-
-    expect(res.status).toBe(404);
-    expect(inserts()).toHaveLength(0);
-  });
-
-  it('uses the server-resolved name, not the one the caller sent', async () => {
-    // The old code trusted req.body.memberName and only fell back to a lookup
-    // against an empty table — so the name on an attendance record was
-    // whatever the client typed.
-    pool.query
-      .mockResolvedValueOnce({ rows: [{ value: '10' }] })       // getLateHour
-      .mockResolvedValueOnce({ rows: [{ name: 'Real Name' }] }) // member lookup
-      .mockResolvedValueOnce({ rows: [] })                      // insert
-      .mockResolvedValueOnce({ rows: [{ id: 'x' }] });          // duplicate probe
-
-    await request(app).post('/api/biometric-attend/mark').send(body);
-
-    const [, params] = inserts()[0];
-    expect(params).toContain('Real Name');
-    expect(params).not.toContain('Client Supplied');
-    expect(params).toContain(ORG_A);
   });
 });

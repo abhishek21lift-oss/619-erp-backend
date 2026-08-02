@@ -11,12 +11,9 @@
 
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
-const rateLimit = require('express-rate-limit');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
-
-const biometricLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
 
 // GET /api/attendance?date=YYYY-MM-DD&type=client&page=1&limit=100
 router.get('/', auth, async (req, res, next) => {
@@ -141,95 +138,6 @@ router.post('/', auth, async (req, res, next) => {
        'manual', req.user.id, orgIdOf(req)]
     );
     res.status(201).json({ message: 'Attendance marked' });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// POST /api/attendance/biometric
-router.post('/biometric', auth, biometricLimiter, async (req, res, next) => {
-  try {
-    const code = String(req.body?.biometric_code || '').trim();
-    const requestedType = req.body?.type;
-    if (!code) return res.status(400).json({ error: 'biometric_code required' });
-    if (requestedType && !['client', 'trainer'].includes(requestedType)) {
-      return res.status(400).json({ error: 'type must be client or trainer' });
-    }
-
-    const lookups = requestedType ? [requestedType] : ['client', 'trainer'];
-    let person = null;
-    let type = null;
-
-    for (const t of lookups) {
-      if (t === 'client') {
-        const { rows } = await pool.query(
-          `SELECT id, name, client_id, trainer_id, trainer_name
-             FROM clients
-            WHERE biometric_code = $1 OR client_id = $1 OR member_code = $1
-            LIMIT 1`, [code]
-        );
-        if (rows[0]) { person = rows[0]; type = 'client'; break; }
-
-        // `clients` is legacy/empty in this deployment — real client rows
-        // live in pt_clients, which has no member_code but does have
-        // client_id/unique_id for card/badge codes.
-        const { rows: ptRows } = await pool.query(
-          `SELECT id, name, client_id, trainer_id, trainer_name
-             FROM pt_clients
-            WHERE (biometric_code = $1 OR client_id = $1 OR unique_id = $1)
-              AND deleted_at IS NULL
-            LIMIT 1`, [code]
-        );
-        if (ptRows[0]) { person = ptRows[0]; type = 'client'; break; }
-      } else {
-        const { rows } = await pool.query(
-          `SELECT id, name, biometric_code FROM trainers WHERE biometric_code = $1 LIMIT 1`,
-          [code]
-        );
-        if (rows[0]) { person = rows[0]; type = 'trainer'; break; }
-      }
-    }
-
-    if (!person || !type) return res.status(404).json({ error: 'Biometric code not found' });
-
-    if (req.user.role === 'trainer') {
-      if (type === 'client' && person.trainer_id !== req.user.trainer_id)
-        return res.status(403).json({ error: 'Access denied: member is not assigned to you' });
-      if (type === 'trainer' && person.id !== req.user.trainer_id)
-        return res.status(403).json({ error: 'Access denied' });
-    }
-
-    const settingRow = await pool.query("SELECT value FROM system_settings WHERE key = 'late_threshold_hour' LIMIT 1");
-    const lateHour = settingRow.rows[0] ? parseInt(settingRow.rows[0].value) : 10;
-
-    const now = new Date();
-    const date = now.toISOString().split('T')[0];
-    const isLate = now.getHours() >= lateHour;
-    const status = isLate ? 'late' : 'present';
-    const id = randomUUID();
-
-    await pool.query(`
-      INSERT INTO attendance_logs
-        (id, ref_id, ref_type, ref_name, date, check_in_time, status, notes, method, marked_by, organization_id)
-      VALUES ($1,$2,$3,$4,$5,NOW(),$6,'biometric','biometric',$7,$8)
-      ON CONFLICT (ref_id, ref_type, date) DO UPDATE
-        SET status=$6,
-            check_in_time=COALESCE(attendance_logs.check_in_time, NOW()),
-            notes='biometric',
-            method='biometric',
-            organization_id=COALESCE(attendance_logs.organization_id, $8)`,
-      [id, person.id, type, person.name, date, status, req.user.id, orgIdOf(req)]
-    );
-
-    const { rows } = await pool.query(
-      'SELECT id, ref_id, ref_type AS type, ref_name, date, check_in_time AS check_in, check_out_time AS check_out, status, notes, method AS check_in_method, created_at FROM attendance_logs WHERE ref_type=$1 AND ref_id=$2 AND date=$3',
-      [type, person.id, date]
-    );
-    res.status(201).json({
-      message: `${person.name} checked in by biometric`,
-      attendance: rows[0],
-      person: { id: person.id, name: person.name, type },
-    });
   } catch (err) {
     next(err);
   }
