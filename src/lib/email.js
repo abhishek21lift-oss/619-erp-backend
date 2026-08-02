@@ -90,6 +90,29 @@ function getTransport() {
     port: SMTP_PORT,
     secure: SMTP_PORT === 465,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
+    // Force IPv4. This is the whole reason no mail was leaving the deploy.
+    //
+    // smtp.hostinger.com publishes both records:
+    //   AAAA  2606:4700:90:0:f225:a1af:129b:4ba1
+    //   A     172.65.255.143
+    //
+    // The deploy connected over IPv6 and had no route to it:
+    //   ENETUNREACH 2606:4700:90:0:f225:a1af:129b:4ba1:587 - Local (:::0)
+    // "Local (:::0)" is the tell — no local IPv6 address to source from.
+    //
+    // Exactly why it reached for the AAAA is not worth pinning down (verbatim
+    // resolver ordering, Happy Eyeballs, the container's own address setup —
+    // all of them produce this), and it does not change the fix. Note this
+    // does NOT reproduce everywhere: a host whose resolver already prefers
+    // IPv4 connects fine without this line, so "it works on my machine" is
+    // not evidence the option is unnecessary.
+    // Port 465 failed the same way and only looked different (ETIMEDOUT
+    // rather than ENETUNREACH), which is why changing the port did not help.
+    //
+    // Nothing was wrong with the host, credentials, TLS pairing or DNS. This
+    // is not Hostinger-specific either: any SMTP host with an AAAA record
+    // fails identically on an IPv4-only network.
+    family: 4,
   });
   return transporter;
 }
@@ -232,10 +255,26 @@ function diagnose(err) {
       + 'rather than a credentials problem. Check for a stray space or a pasted https:// prefix — '
       + 'this field is a bare hostname, not a URL.';
   }
+  // Checked before the generic connection branch below, which used to catch
+  // this and blame a blocked SMTP port — confident, wrong, and it cost several
+  // rounds of changing SMTP_PORT back and forth. An unreachable network with a
+  // colon-bearing address is IPv6, and it is a different problem entirely.
+  if (code === 'ENETUNREACH' || code === 'EHOSTUNREACH' || /ENETUNREACH|EHOSTUNREACH/.test(err?.message || '')) {
+    const v6 = /\b([0-9a-f]{0,4}:){3,}[0-9a-f]{0,4}\b/i.test(err?.message || '');
+    return v6
+      ? `No route to "${SMTP_HOST}" over IPv6. The host publishes an AAAA record, this network `
+        + 'has no IPv6 route, and Node prefers AAAA by default — so the connection never reaches '
+        + 'the IPv4 address that does work. The transport pins family: 4 to prevent this; if you '
+        + 'are seeing this, something is building a transport that does not.'
+      : `No route to "${SMTP_HOST}" from this host — a network reachability problem rather than `
+        + 'credentials, TLS or the port pairing.';
+  }
   if (code === 'ETIMEDOUT' || code === 'ESOCKET' || code === 'ECONNREFUSED') {
     return `Could not establish a session on port ${SMTP_PORT}. 465 is implicit TLS and 587 is `
-      + 'STARTTLS, and those are the only two correct pairings. Note some hosts block outbound '
-      + 'SMTP entirely — if this works from a laptop but not from the deploy, that is the likely cause.';
+      + 'STARTTLS, and those are the only two correct pairings. If the address in the error '
+      + 'contains colons it is IPv6 and the port is a red herring — see the family: 4 note in '
+      + 'getTransport(). Otherwise, some hosts do block outbound SMTP: if this works from a '
+      + 'laptop but not from the deploy, that is the likely cause.';
   }
   if (code === 'EENVELOPE' || /550|553|relay/i.test(response)) {
     return 'The server refused the envelope, usually the From address. SMTP_FROM / EMAIL_FROM must be '
