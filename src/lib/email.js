@@ -338,8 +338,56 @@ function describeConfig(env = process.env) {
   return { state: set.length > 0 ? 'partial' : 'absent', set, missing };
 }
 
+
+/** A studio name is user-supplied and goes straight into the markup below. */
+function escapeHtml(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/**
+ * Welcome mail sent the moment a studio application is approved.
+ *
+ * Its whole job is to say "you can log in now, with the password you already
+ * chose" — the applicant last saw a Pending Approval screen and has no other
+ * signal that anything changed. Deliberately plain: no invitation link, because
+ * there is no second credential to hand out.
+ */
+async function sendWelcome({ to, name, studioName, trialDays }) {
+  const url = `${(process.env.FRONTEND_URL || '').replace(/\/$/, '')}/login`;
+  const days = Number(trialDays) || 3;
+  const subject = `${studioName} is live on MY PT STUDIO`;
+
+  const html = `
+    <div style="font-family:system-ui,-apple-system,sans-serif;max-width:520px;margin:0 auto;color:#0F172A">
+      <h1 style="font-size:20px;margin:0 0 12px">You're approved${name ? `, ${escapeHtml(name)}` : ''} 🎉</h1>
+      <p style="font-size:14px;line-height:1.6;color:#334155;margin:0 0 12px">
+        <strong>${escapeHtml(studioName)}</strong> has been activated by the MY PT STUDIO Command Centre.
+        Your ${days}-day free trial starts now.
+      </p>
+      <p style="font-size:14px;line-height:1.6;color:#334155;margin:0 0 20px">
+        Sign in with the email and password you created when you registered.
+      </p>
+      <a href="${url}" style="display:inline-block;background:#0067E0;color:#fff;text-decoration:none;
+        padding:12px 22px;border-radius:12px;font-weight:700;font-size:14px">Sign in</a>
+      <p style="font-size:12px;color:#94A3B8;margin:20px 0 0">
+        If the button does not work, open ${url}
+      </p>
+    </div>`;
+
+  const text = [
+    `You're approved${name ? `, ${name}` : ''}.`,
+    `${studioName} has been activated. Your ${days}-day free trial starts now.`,
+    'Sign in with the email and password you created when you registered.',
+    url,
+  ].join('\n\n');
+
+  return sendRaw({ to, subject, html, text }, { kind: 'welcome' });
+}
+
 module.exports = {
-  sendPasswordReset, sendAdminResetOtp, sendAdminInvitation, sendRaw,
+  sendWelcome, sendPasswordReset, sendAdminResetOtp, sendAdminInvitation, sendRaw,
   verifyConnection, diagnose,
   isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,
 };
