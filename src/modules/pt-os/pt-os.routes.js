@@ -557,9 +557,23 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
     previousPaid = Number(existing.paid_amount) || 0;
 
     if (wantsFinalAmount) {
+      // `>= 0`, not `> 0`. This rejected every save on a client priced at zero
+      // — and the edit form posts the whole form, so a trainer correcting a
+      // phone number re-sent final_amount and got "Final Selling Price must be
+      // greater than zero" for a field they never touched. Two ways in, both
+      // real: a stored 0 posts as 0, and a stored NULL renders as an empty
+      // input and posts as null, which Number() also makes 0.
+      //
+      // A price of zero is legitimate anyway — complimentary, trial, founding
+      // member — so the rule was wrong on its own terms as well as unreachable
+      // to satisfy. "Must be positive" belongs to enrollment, where the amount
+      // is being entered on purpose, not to a PATCH that carries it along.
+      //
+      // Negative and non-numeric are still refused, and paid <= final below is
+      // untouched: that is the rule that actually protects the ledger.
       finalAmount = Number(req.body.final_amount);
-      if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
-        return res.status(400).json({ error: { code: 'VALIDATION', message: 'Final Selling Price must be greater than zero.' } });
+      if (!Number.isFinite(finalAmount) || finalAmount < 0) {
+        return res.status(400).json({ error: { code: 'VALIDATION', message: 'Final Selling Price cannot be negative.' } });
       }
     }
     if (wantsPaidAmount) {
