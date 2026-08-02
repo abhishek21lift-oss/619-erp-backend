@@ -19,6 +19,19 @@ const platformBilling = require('./platformBilling');
 // slots remain, so this single number drives both. Env-overridable so the cap
 // can be adjusted without a deploy.
 const FOUNDER_LIMIT = parseInt(process.env.FOUNDER_LIMIT, 10) || 20;
+
+// Founder's Club is for annual subscribers. A slot carries a price locked for
+// the life of the studio, so it cannot be bought with one month of Starter and
+// then ridden forever — which is exactly what the grant used to allow: any
+// plan qualified while a slot was free, and the catalogue runs 1, 3, 6 and 12
+// months.
+//
+// Compared against the term actually granted (opts.periodMonths when a super
+// admin sets one, otherwise the plan's own duration) rather than against the
+// plan code, so a 12-month term on any plan qualifies and a shortened Elite
+// term does not. >= rather than ===: a longer commitment is not a reason to
+// refuse.
+const FOUNDER_MIN_TERM_MONTHS = parseInt(process.env.FOUNDER_MIN_TERM_MONTHS, 10) || 12;
 const TRIAL_DAYS = parseInt(process.env.TRIAL_DAYS, 10) || 7;
 const DAY_MS = 86400000;
 
@@ -122,7 +135,10 @@ async function quote(code) {
     ...plan,
     effective_price_inr: amount,
     is_launch: isLaunch,
-    founder_eligible: slots > 0,
+    // Both conditions, because this is what the pricing page reads: a slot
+    // being free does not make a one-month plan a founder purchase, and
+    // saying otherwise promises something the activation will not grant.
+    founder_eligible: slots > 0 && plan.duration_months >= FOUNDER_MIN_TERM_MONTHS,
     founder_slots_remaining: slots,
   };
 }
@@ -351,14 +367,17 @@ async function activate(orgId, planCode, opts = {}) {
 
     const slots = await founderSlotsRemaining(client);
     const alreadyFounder = org.is_founder;
-    const grantFounder = !alreadyFounder && slots > 0;
+
+    // The term actually being bought, needed before the founder decision.
+    const months = opts.periodMonths || plan.duration_months;
+
+    const grantFounder = !alreadyFounder && slots > 0 && months >= FOUNDER_MIN_TERM_MONTHS;
 
     const { amount: effAmount } = effectivePrice(plan, slots);
     const paidAmount = opts.amount_inr != null ? Number(opts.amount_inr)
       : (alreadyFounder && org.locked_price_inr != null) ? org.locked_price_inr
       : effAmount;
 
-    const months = opts.periodMonths || plan.duration_months;
     const now = new Date();
     // Renewals stack on top of any time still remaining, so a studio never
     // loses days by paying early. A prorated upgrade sets resetPeriod, because
