@@ -83,16 +83,35 @@ async function clientInOrg(req, clientId) {
 router.get('/trainers', auth, wrap(async (req, res) => {
   // Include trainers from both the main trainers table and the PT-OS-specific
   // pt_trainers table so adding a trainer in either place makes them available here.
+  //
+  // Scoped by organization. This route had no tenant filter at all, so every
+  // studio saw every trainer on the platform — the Book PT Session dialog
+  // listed four trainers from four different studios — and the payload carried
+  // email, mobile, specialization and incentive_rate with them, which is one
+  // studio's commission terms readable by its competitors. Every sibling route
+  // in this file already scopes with tenantScope(req); this one was the outlier.
+  //
+  // NULL organization_id is excluded rather than treated as shared: an
+  // unattributable trainer shown to every studio is exactly the bug being
+  // fixed. Migration 143 backfills what it can and reports what it cannot.
+  const scope = tenantScope(req);
+  const params = [];
+  let orgFilter = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgFilter = `AND organization_id = $${params.length}`;
+  }
+
   const { rows } = await pool.query(`
     SELECT id, name, email, mobile, specialization, incentive_rate, status, NULL::text AS photo_url
     FROM trainers
-    WHERE deleted_at IS NULL AND status = 'active'
+    WHERE deleted_at IS NULL AND status = 'active' ${orgFilter}
     UNION
     SELECT id, name, email, mobile, specialization, incentive_rate, status, photo_url
     FROM pt_trainers
-    WHERE deleted_at IS NULL AND status = 'active'
+    WHERE deleted_at IS NULL AND status = 'active' ${orgFilter}
     ORDER BY name
-  `);
+  `, params);
   res.json({ data: rows });
 }));
 
@@ -101,10 +120,15 @@ router.post('/trainers', auth, adminOnly, wrap(async (req, res) => {
   // Insert into the canonical trainers table (not pt_trainers): pt_clients
   // assignments and the pt_payments.trainer_id FK both resolve against
   // trainers, so a trainer created here must land there to be usable.
+  // organization_id is stamped at creation. Without it the trainer is created
+  // org-less, and now that the GET above filters on organization_id, an
+  // org-less trainer is invisible to the very studio that just created them —
+  // the create would appear to silently do nothing.
+  const scope = tenantScope(req);
   const { rows } = await pool.query(
-    `INSERT INTO trainers (name, email, mobile, specialization, incentive_rate, status)
-     VALUES ($1,$2,$3,$4,$5,'active') RETURNING *`,
-    [name, email, mobile, specialization, incentive_rate ?? 0.5]
+    `INSERT INTO trainers (name, email, mobile, specialization, incentive_rate, status, organization_id)
+     VALUES ($1,$2,$3,$4,$5,'active',$6) RETURNING *`,
+    [name, email, mobile, specialization, incentive_rate ?? 0.5, scope.orgId]
   );
   res.status(201).json({ data: rows[0] });
 }));
