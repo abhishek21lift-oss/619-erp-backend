@@ -68,7 +68,6 @@ function nullableText(v) {
 }
 
 const DIFFICULTIES = new Set(['beginner', 'intermediate', 'advanced']);
-const VISIBILITIES = new Set(['public', 'organization', 'private']);
 const SORTS = {
   name:        'e.name ASC',
   name_desc:   'e.name DESC',
@@ -77,12 +76,28 @@ const SORTS = {
 };
 
 /**
- * The visibility + tenancy predicate every read goes through.
+ * The tenancy predicate every read goes through.
  *
- * Built-in exercises (organization_id IS NULL) are shared by every studio.
- * A studio's custom exercises are theirs alone. 'private' narrows further to
- * the author. Written once and reused by list, count and facet queries so the
- * three can never disagree about what a user is allowed to see.
+ * Two kinds of exercise, two rules:
+ *
+ *   Built-in (organization_id IS NULL) — the 890-row seeded library, shared by
+ *   every studio. Nobody owns these and everybody sees them.
+ *
+ *   Custom (organization_id set) — visible ONLY to the trainer who wrote it,
+ *   and only inside their own organisation. A trainer's custom work is their
+ *   own: their cues, their naming, their half-finished experiments. Another
+ *   trainer in the same studio does not see them, and no other studio can
+ *   reach them at all.
+ *
+ * This replaced a three-way `visibility` column ('public' / 'organization' /
+ * 'private') that let an author widen the audience. The column still exists —
+ * dropping it is a migration for no gain — but nothing reads it any more, so
+ * there is no value anyone could set that would share a custom exercise. The
+ * ownership check is here rather than in the handlers precisely so list, count
+ * and facet queries cannot drift apart about who may see what.
+ *
+ * created_by is NULL on the seeded rows, which is why the ownership test sits
+ * inside the custom branch — a NULL author must never match a real user.
  */
 function visibilityClause(req, params) {
   const { orgId } = tenantScope(req);
@@ -90,8 +105,10 @@ function visibilityClause(req, params) {
   const orgP = `$${params.length}`;
   params.push(req.user.id);
   const userP = `$${params.length}`;
-  return `(e.organization_id IS NULL OR e.organization_id = ${orgP}::uuid)
-          AND (e.visibility <> 'private' OR e.created_by = ${userP})`;
+  return `(
+            e.organization_id IS NULL
+            OR (e.organization_id = ${orgP}::uuid AND e.created_by = ${userP})
+          )`;
 }
 
 /** Shared column list for list/detail responses. One list, one source. */
@@ -452,8 +469,6 @@ router.post('/', auth, async (req, res, next) => {
     if (name.length > 120) return res.status(400).json({ error: 'Exercise name is too long (max 120)' });
     if (d.difficulty && !DIFFICULTIES.has(d.difficulty))
       return res.status(400).json({ error: 'Invalid difficulty' });
-    if (d.visibility && !VISIBILITIES.has(d.visibility))
-      return res.status(400).json({ error: 'Invalid visibility' });
 
     await client.query('BEGIN');
 
@@ -490,7 +505,7 @@ router.post('/', auth, async (req, res, next) => {
          COALESCE($15,'{}'),COALESCE($16,'{}'),COALESCE($17,'{}'),COALESCE($18,'{}'),
          $19,$20,$21,$22,$23,$24,$25,
          COALESCE($26,3),COALESCE($27,12),COALESCE($28,60),
-         COALESCE($29,'{}'),$30,COALESCE($31,'organization'),TRUE,$32,$33,$33
+         COALESCE($29,'{}'),$30,'private',TRUE,$31,$32,$32
        )`,
       [
         id, name, slug, nullableText(d.description) ?? null,
@@ -510,7 +525,7 @@ router.post('/', auth, async (req, res, next) => {
         d.rest_seconds ? parseInt(d.rest_seconds, 10) : null,
         textArray(d.tags, 30),
         [name, d.search_keywords || '', d.equipment_name || ''].filter(Boolean).join(' ').trim(),
-        d.visibility || null, orgId, req.user.id,
+        orgId, req.user.id,
       ]
     );
 
@@ -548,8 +563,6 @@ router.put('/:id', auth, async (req, res, next) => {
     const d = req.body || {};
     if (d.difficulty && !DIFFICULTIES.has(d.difficulty))
       return res.status(400).json({ error: 'Invalid difficulty' });
-    if (d.visibility && !VISIBILITIES.has(d.visibility))
-      return res.status(400).json({ error: 'Invalid visibility' });
     if (d.name !== undefined && !String(d.name).trim())
       return res.status(400).json({ error: 'Exercise name cannot be empty' });
 
@@ -589,7 +602,6 @@ router.put('/:id', auth, async (req, res, next) => {
     set('trainer_notes',        nullableText(d.trainer_notes));
     set('tags',                 textArray(d.tags, 30) ?? undefined);
     set('search_keywords',      nullableText(d.search_keywords));
-    set('visibility',           d.visibility);
     set('sets_default',         d.sets_default !== undefined ? parseInt(d.sets_default, 10) || null : undefined);
     set('reps_default',         d.reps_default !== undefined ? parseInt(d.reps_default, 10) || null : undefined);
     set('rest_seconds',         d.rest_seconds !== undefined ? parseInt(d.rest_seconds, 10) || null : undefined);
