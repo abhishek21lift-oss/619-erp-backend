@@ -408,6 +408,9 @@ app.use('/api/public',            require('./routes/public'));
 // require one. The single-use hashed token IS the credential — see
 // routes/invitations.js for why every rejection returns the same shape.
 app.use('/api/invitations',       require('./routes/invitations'));
+// Self-serve trial signup. Deliberately unauthenticated: the whole point is
+// that the applicant does not have an account yet.
+app.use('/api/registrations',     require('./routes/registrations'));
 app.use('/api/auth',              require('./routes/auth'));
 app.use('/api/auth',              require('./routes/auth-google'));
 app.use('/api/auth/webauthn',     require('./routes/auth-webauthn'));

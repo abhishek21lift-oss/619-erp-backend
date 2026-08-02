@@ -45,5 +45,6 @@ router.use(require('./super-admin/ai'));
 router.use(require('./super-admin/invitations'));
 router.use(require('./super-admin/support'));
 router.use(require('./super-admin/storage'));
+router.use(require('./super-admin/registrations'));
 
 module.exports = router;
