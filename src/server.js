@@ -319,13 +319,8 @@ app.get('/', function(req, res) {
 });
 
 app.get('/api/health', async function(req, res) {
-  try {
-    const pool = require('./db/pool');
-    await pool.query('SELECT 1');
-    res.json({ status: 'ok', version: 'v3', time: new Date().toISOString(), db: 'connected' });
-  } catch (err) {
-    res.status(503).json({ status: 'error', db: 'disconnected', error: err.message });
-  }
+  const { sendHealthResponse } = require('./lib/health');
+  return sendHealthResponse(req, res);
 });
 
 
