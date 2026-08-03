@@ -64,45 +64,10 @@ const channels = {
 
   whatsapp: async ({ to, template, variables }) => {
     if (!to) return { status: 'failed', error: 'no recipient' };
-
-    const sid    = process.env.TWILIO_ACCOUNT_SID;
-    const token  = process.env.TWILIO_AUTH_TOKEN;
-    const from   = process.env.TWILIO_WHATSAPP_FROM; // e.g. whatsapp:+14155238886
-    if (sid && token && from) {
-      try {
-        // Build a human-readable message from template variables when a
-        // pre-approved template isn't configured — replace with your
-        // approved template name and component parameters for production.
-        const text = variables ? variables.join(' — ') : template;
-        const body = new URLSearchParams({
-          From: from,
-          To:   to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
-          Body: text,
-        });
-        const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Authorization': 'Basic ' + Buffer.from(`${sid}:${token}`).toString('base64'),
-          },
-          body: body.toString(),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          logger.error({ status: res.status, data }, 'twilio whatsapp failed');
-          return { status: 'failed', error: data.message || 'twilio error' };
-        }
-        return { status: 'sent', provider_id: data.sid };
-      } catch (err) {
-        logger.error({ err: err.message }, 'twilio whatsapp exception');
-        return { status: 'failed', error: err.message };
-      }
-    }
-
-    // No provider configured — surface as not_configured so logs show real state
-    logger.warn({ to, template }, 'whatsapp not_configured (set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN + TWILIO_WHATSAPP_FROM)');
-    return { status: 'not_configured', provider_id: null };
+    // One copy of the Twilio transport, shared with the whatsapp worker — see
+    // whatsappDelivery.js. The notification log records exactly what it returns.
+    const { sendText } = require('../../services/whatsappDelivery');
+    return sendText({ to, template, variables });
   },
 
   sms: async ({ to, body }) => {
@@ -211,53 +176,100 @@ const templates = {
 };
 
 /**
+ * Deliver one notification through one channel: resolve template args, call
+ * the channel adapter, and write the attempt to notification_log. Shared by
+ * the inline fallback path (send) and the notifications worker.
+ */
+async function deliverChannel(ch, type, recipient, data) {
+  const tpl = templates[type]?.({ ...data, name: recipient.name });
+  if (!tpl) throw new Error(`Unknown notification template: ${type}`);
+
+  let adapterArgs;
+  switch (ch) {
+    case 'inapp':    adapterArgs = { user_id: recipient.user_id, title: tpl.title, body: tpl.body, link: data.link }; break;
+    case 'email':    adapterArgs = { to: recipient.email, ...tpl.email }; break;
+    case 'whatsapp': adapterArgs = { to: recipient.phone, ...tpl.whatsapp }; break;
+    case 'sms':      adapterArgs = { to: recipient.phone, body: tpl.body }; break;
+    case 'push':     adapterArgs = { device_token: recipient.device_token, title: tpl.title, body: tpl.body }; break;
+    default: throw new Error(`Unknown channel: ${ch}`);
+  }
+
+  let res;
+  try {
+    res = await channels[ch](adapterArgs);
+  } catch (err) {
+    res = { status: 'failed', error: err.message };
+  }
+
+  // Log the attempt
+  try {
+    await pool.query(
+      `INSERT INTO notification_log (recipient_user_id, recipient_member_id, channel, template, payload, status, provider_id, error, sent_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8, CASE WHEN $6='sent' OR $6='delivered' THEN NOW() END)`,
+      [
+        recipient.user_id || null,
+        recipient.member_id || null,
+        ch, type, data,
+        res.status,
+        res.provider_id || null,
+        res.error || null,
+      ]
+    );
+  } catch {
+    logger.warn('notification_log table may not exist yet');
+  }
+  return res;
+}
+
+/**
  * Send a notification to a recipient through one or more channels.
+ *
+ * With Redis available each channel is enqueued as its own job on the
+ * 'notifications' queue (fan-out: one failure retries without blocking the
+ * other channels) and this returns {status:'queued', jobId}. Without Redis —
+ * or if the enqueue fails — delivery degrades to the inline adapter, so a
+ * queue outage costs latency, never a lost message.
+ *
  * @param {string} type - template key
  * @param {object} recipient - { user_id, member_id, email, phone, device_token, name }
  * @param {object} data - template variables
  * @param {string[]} via - channels to use (default: ['inapp'])
  */
 async function send(type, recipient, data, via = ['inapp']) {
-  const tpl = templates[type]?.({ ...data, name: recipient.name });
-  if (!tpl) throw new Error(`Unknown notification template: ${type}`);
+  if (!templates[type]) throw new Error(`Unknown notification template: ${type}`);
 
   const results = {};
   for (const ch of via) {
-    let adapterArgs;
-    switch (ch) {
-      case 'inapp':    adapterArgs = { user_id: recipient.user_id, title: tpl.title, body: tpl.body, link: data.link }; break;
-      case 'email':    adapterArgs = { to: recipient.email, ...tpl.email }; break;
-      case 'whatsapp': adapterArgs = { to: recipient.phone, ...tpl.whatsapp }; break;
-      case 'sms':      adapterArgs = { to: recipient.phone, body: tpl.body }; break;
-      case 'push':     adapterArgs = { device_token: recipient.device_token, title: tpl.title, body: tpl.body }; break;
-      default: continue;
-    }
-    let res;
+    if (!channels[ch]) continue;
+
+    let queued = null;
     try {
-      res = await channels[ch](adapterArgs);
+      const redis = require('../../lib/redis');
+      if (await redis.ensureReady()) {
+        const { enqueueNotification } = require('../../services/notificationFanout');
+        queued = await enqueueNotification(ch, type, recipient, data);
+      }
     } catch (err) {
-      res = { status: 'failed', error: err.message };
+      logger.warn({ err: err.message, ch, type }, 'notify enqueue failed — sending inline');
     }
-    // Log the attempt
-    try {
-      await pool.query(
-        `INSERT INTO notification_log (recipient_user_id, recipient_member_id, channel, template, payload, status, provider_id, error, sent_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8, CASE WHEN $6='sent' OR $6='delivered' THEN NOW() END)`,
-        [
-          recipient.user_id || null,
-          recipient.member_id || null,
-          ch, type, data,
-          res.status,
-          res.provider_id || null,
-          res.error || null,
-        ]
-      );
-    } catch {
-      logger.warn('notification_log table may not exist yet');
-    }
-    results[ch] = res;
+
+    results[ch] = queued
+      ? { status: 'queued', jobId: queued.id }
+      : await deliverChannel(ch, type, recipient, data);
   }
   return results;
+}
+
+/**
+ * Worker processor: deliver a single queued notification job (one channel).
+ * Throws on unknown template/channel so BullMQ marks the job failed instead of
+ * silently completing it.
+ */
+async function processNotificationJob(job) {
+  const { ch, type, recipient, data } = job.data || {};
+  if (!channels[ch]) throw new Error(`Unknown notification channel: ${ch}`);
+  if (!templates[type]) throw new Error(`Unknown notification template: ${type}`);
+  return deliverChannel(ch, type, recipient, data);
 }
 
 /**
@@ -308,4 +320,4 @@ async function markAllRead(userId) {
   );
 }
 
-module.exports = { send, recipientFromMember, inbox, markRead, markAllRead, templates, channels };
+module.exports = { send, deliverChannel, processNotificationJob, recipientFromMember, inbox, markRead, markAllRead, templates, channels };

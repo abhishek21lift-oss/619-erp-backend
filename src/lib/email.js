@@ -81,6 +81,29 @@ function isConfigured() {
   return !!(SMTP_HOST && SMTP_USER && SMTP_PASS);
 }
 
+/**
+ * Queue-or-inline dispatcher shared by the public senders below.
+ *
+ * When Redis/BullMQ is available the send is enqueued for the email worker and
+ * this returns immediately — the request path never blocks on SMTP. When Redis
+ * is unavailable, or the enqueue itself fails, it degrades to the inline send
+ * so the message is still attempted. This is the "graceful degradation" rule:
+ * a queue outage must mean slower/fallback sends, never a dropped email.
+ */
+async function dispatchEmail(type, payload, inline) {
+  try {
+    const redis = require('./redis');
+    if (redis.isReady()) {
+      const { enqueueEmail } = require('../services/email.service');
+      const job = await enqueueEmail(type, payload);
+      if (job) return { sent: true, queued: true, jobId: job.id };
+    }
+  } catch (err) {
+    logger.warn({ err: err.message, type }, 'email enqueue failed — sending inline');
+  }
+  return inline();
+}
+
 let transporter = null;
 
 function getTransport() {
@@ -118,12 +141,23 @@ function getTransport() {
 }
 
 /**
+ * Public entry point — enqueues the reset email when Redis is ready, otherwise
+ * falls back to the inline SMTP send (which throws on permanent failure so the
+ * caller can surface it; see sendPasswordResetInline).
+ */
+async function sendPasswordReset(email, rawToken) {
+  return dispatchEmail('password_reset', { email, token: rawToken }, () =>
+    sendPasswordResetInline(email, rawToken)
+  );
+}
+
+/**
  * @returns {Promise<{sent: boolean, reason?: string}>} so the caller can tell
  *   "not configured" from "sent" — it used to return undefined in both cases,
  *   which made the two indistinguishable at the only call site that has to
  *   stay silent to its own caller for enumeration reasons.
  */
-async function sendPasswordReset(email, rawToken) {
+async function sendPasswordResetInline(email, rawToken) {
   if (!isConfigured()) {
     logger.warn({ email, missing: describeConfig().missing },
       'SMTP not configured — password reset email skipped');
@@ -163,22 +197,31 @@ async function sendPasswordReset(email, rawToken) {
 }
 
 async function sendAdminResetOtp(email, otp) {
-  if (!isConfigured()) {
-    logger.warn({ email }, 'SMTP not configured — admin reset OTP not sent');
-    return;
-  }
-  try {
-    const t = getTransport();
-    await t.sendMail({
-      from: FROM_ADDR,
-      to: email,
-      subject: 'MY PT STUDIO — Admin Data Reset OTP',
-      text: `Your one-time code to confirm the data reset is: ${otp}\n\nThis code expires in 10 minutes. If you did not request this, ignore this email.`,
-      html: `<p>Your one-time code to confirm the data reset is:</p><h2>${otp}</h2><p>This code expires in <strong>10 minutes</strong>. If you did not request this, ignore this email.</p>`,
-    });
-  } catch (err) {
-    logger.error({ err: err.message, email }, 'Failed to send admin reset OTP email');
-  }
+  return dispatchEmail('admin_otp', { email, otp }, () =>
+    sendAdminResetOtpInline(email, otp).catch((err) => {
+      logger.error({ err: err.message, email }, 'Failed to send admin reset OTP email');
+      return { sent: false, reason: err.message };
+    })
+  );
+}
+
+/**
+ * Inline SMTP send used by the email worker and by sendAdminResetOtp's
+ * fallback. Unlike the public wrapper this THROWS on failure — the worker
+ * relies on the throw so BullMQ retry/backoff applies to a transient SMTP
+ * blip. A user waiting for a reset code is exactly who deserves a retry.
+ */
+async function sendAdminResetOtpInline(email, otp) {
+  if (!isConfigured()) return { sent: false, reason: 'SMTP_NOT_CONFIGURED' };
+  const t = getTransport();
+  await t.sendMail({
+    from: FROM_ADDR,
+    to: email,
+    subject: 'MY PT STUDIO — Admin Data Reset OTP',
+    text: `Your one-time code to confirm the data reset is: ${otp}\n\nThis code expires in 10 minutes. If you did not request this, ignore this email.`,
+    html: `<p>Your one-time code to confirm the data reset is:</p><h2>${otp}</h2><p>This code expires in <strong>10 minutes</strong>. If you did not request this, ignore this email.</p>`,
+  });
+  return { sent: true };
 }
 
 /**
@@ -355,6 +398,16 @@ function escapeHtml(v) {
  * there is no second credential to hand out.
  */
 async function sendWelcome({ to, name, studioName, trialDays }) {
+  return dispatchEmail('welcome', { to, name, studioName, trialDays }, () =>
+    sendWelcomeInline({ to, name, studioName, trialDays })
+  );
+}
+
+/**
+ * Inline send used by the email worker and by sendWelcome's fallback. Returns
+ * sendRaw's {sent, reason} shape (never throws).
+ */
+async function sendWelcomeInline({ to, name, studioName, trialDays }) {
   const url = `${(process.env.FRONTEND_URL || '').replace(/\/$/, '')}/login`;
   const days = Number(trialDays) || 3;
   const subject = `${studioName} is live on MY PT STUDIO`;
@@ -388,6 +441,7 @@ async function sendWelcome({ to, name, studioName, trialDays }) {
 
 module.exports = {
   sendWelcome, sendPasswordReset, sendAdminResetOtp, sendAdminInvitation, sendRaw,
+  sendWelcomeInline, sendPasswordResetInline, sendAdminResetOtpInline,
   verifyConnection, diagnose,
   isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,
 };

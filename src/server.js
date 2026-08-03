@@ -558,6 +558,22 @@ runMigrationsWithRetry()
     // which is what every deploy does anyway until an operator sets one.
     require('./lib/ai/settings').start();
 
+    // ── Background workers (BullMQ, in-process) ───────────────────────────────
+    // Single-instance deploys (Render) run the queue workers inside the API
+    // process instead of a second service: when Redis is configured, producer
+    // queues enqueue email/whatsapp/AI/notification work and these workers
+    // drain them on this same process. Set RUN_WORKERS=0 to keep workers in a
+    // separate process (see the "worker" script in package.json). Without
+    // Redis everything degrades to the pre-queue inline paths and this is a
+    // no-op, so dev machines and test runs are unaffected.
+    let workers = [];
+    if (process.env.RUN_WORKERS !== '0') {
+      const { startWorkers } = require('./workers');
+      startWorkers()
+        .then((ws) => { workers = ws; })
+        .catch((err) => logger.warn({ err: err.message }, 'in-process workers failed to start — falling back to inline sends'));
+    }
+
     const server = app.listen(PORT, '0.0.0.0', function() {
       logger.info({
         port: PORT,
@@ -657,7 +673,19 @@ runMigrationsWithRetry()
     function shutdown(sig) {
       return function() {
         logger.info({ signal: sig }, 'Received signal — shutting down');
-        server.close(function() {
+        server.close(async function() {
+          try {
+            if (workers.length) {
+              const { stopWorkers } = require('./workers');
+              await stopWorkers();
+            }
+            const queueLib = require('./jobs/queue');
+            await queueLib.closeAll();
+            const redisLib = require('./lib/redis');
+            await redisLib.close();
+          } catch (err) {
+            logger.warn({ err: err.message }, 'shutdown cleanup error');
+          }
           pool.end(function() { process.exit(0); });
         });
         setTimeout(function() { process.exit(1); }, 10_000).unref();

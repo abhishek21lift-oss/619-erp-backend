@@ -1,13 +1,30 @@
 // src/workers/renewal.worker.js
-// Daily job: send expiry reminders + auto-renew memberships flagged auto_renew=true.
+// Membership maintenance: expiry reminders + auto-renew (charged via Razorpay)
+// + class reminders.
 //
-// Run via: node src/workers/renewal.worker.js
-// In production: schedule via cron, BullMQ, or a Vercel cron route.
+// Two modes:
+//
+//   1. BullMQ worker (production): consumes the 'membership-renewals' queue.
+//      scheduleRenewalCron() registers two job schedulers (bullmq v6 API):
+//        - 'daily-membership-renewal'   cron RENEWAL_CRON       (default 0 3 * * *)
+//                                      reminders + auto-renew
+//        - 'class-reminder-sweep'       cron RENEWAL_CLASS_CRON (default */30 * * * *)
+//                                      class reminders (matches sessions starting
+//                                      ~30 min out, so it must run frequently)
+//      BullMQ guarantees a scheduled job fires on exactly one worker, so
+//      multiple API replicas cannot double-charge.
+//
+//   2. One-shot script (manual): node src/workers/renewal.worker.js — runs the
+//      full daily pass once and exits. Useful for backfills.
+//
+// In-process: see src/workers/index.js.
 
+const { Worker } = require('bullmq');
 const pool = require('../db/pool');
 const notifier = require('../modules/notifications/notifications.service');
 const razorpay = require('../lib/razorpay');
 const logger = require('../lib/logger');
+const redis = require('../lib/redis');
 
 const REMINDER_DAYS = [7, 3, 1];   // send reminder when this many days remain
 
@@ -124,11 +141,108 @@ async function runClassReminders() {
   }
 }
 
+/** The full daily pass, shared by the one-shot script and the 'daily' job. */
+async function runDailyRenewalTasks() {
+  await runReminders();
+  await runAutoRenew();
+}
+
+/** BullMQ processor for the membership-renewals queue. */
+async function processRenewalJob(job) {
+  if (job.name === 'daily') {
+    await runDailyRenewalTasks();
+    return { ran: 'daily' };
+  }
+  if (job.name === 'class-reminders') {
+    await runClassReminders();
+    return { ran: 'class-reminders' };
+  }
+  throw new Error(`Unknown renewal job: ${job.name}`);
+}
+
+function createRenewalWorker() {
+  const worker = new Worker('membership-renewals', processRenewalJob, {
+    connection: redis.getWorkerConnection(),
+    prefix: process.env.BULL_PREFIX || 'bull',
+    concurrency: 1,
+  });
+
+  worker.on('completed', (job) => logger.info({ jobId: job.id, name: job.name }, 'renewal job completed'));
+  worker.on('failed', (job, err) =>
+    logger.error({ jobId: job?.id, name: job?.name, err: err.message }, 'renewal job failed'));
+  worker.on('error', (err) => logger.error({ err: err.message }, 'renewal worker error'));
+
+  return worker;
+}
+
+const RENEWAL_JOB_ID = 'daily-membership-renewal';
+const CLASS_REMINDER_JOB_ID = 'class-reminder-sweep';
+
+/**
+ * Register the renewal job schedulers (bullmq v6 Job Scheduler API — the
+ * repeatable-job API was removed in v6, so a scheduler is the supported way to
+ * express "run X on a cron"). Idempotent: upserting the same schedulerId
+ * updates it rather than creating duplicates, so this is safe to call on every
+ * boot and from every replica.
+ *
+ * Bounded like every other queue call: if Redis is unreachable the upsert
+ * would sit in the offline queue forever, so it races a timeout and throws so
+ * the caller can log and move on (the workers themselves keep retrying in the
+ * background and the scheduler gets registered on a later boot).
+ */
+async function scheduleRenewalCron() {
+  const cron = process.env.RENEWAL_CRON || '0 3 * * *';
+  const classCron = process.env.RENEWAL_CLASS_CRON || '*/30 * * * *';
+
+  const { membershipRenewalsQueue } = require('../jobs/queue');
+
+  const withTimeout = (p, ms) =>
+    Promise.race([
+      p,
+      new Promise((_, reject) => {
+        const t = setTimeout(() => reject(new Error('renewal cron schedule timeout')), ms);
+        if (typeof t.unref === 'function') t.unref();
+      }),
+    ]);
+
+  await withTimeout(membershipRenewalsQueue.upsertJobScheduler(
+    RENEWAL_JOB_ID,
+    { pattern: cron },
+    {
+      name: 'daily',
+      data: {},
+      opts: {
+        // attempts: 1 on purpose — the per-member work is transactional, and a
+        // retry of a partially-completed pass risks double-charging. A missed
+        // pass is caught by the next day's (or interval's) run.
+        attempts: 1,
+        removeOnComplete: true,
+        removeOnFail: true,
+      },
+    }
+  ), 5000);
+
+  await withTimeout(membershipRenewalsQueue.upsertJobScheduler(
+    CLASS_REMINDER_JOB_ID,
+    { pattern: classCron },
+    {
+      name: 'class-reminders',
+      data: {},
+      opts: { attempts: 1, removeOnComplete: true, removeOnFail: true },
+    }
+  ), 5000);
+
+  logger.info({ cron, classCron }, 'renewal cron scheduled');
+  return {
+    daily: { jobSchedulerId: RENEWAL_JOB_ID },
+    classReminders: { jobSchedulerId: CLASS_REMINDER_JOB_ID },
+  };
+}
+
 async function main() {
   logger.info('worker run starting');
   try {
-    await runReminders();
-    await runAutoRenew();
+    await runDailyRenewalTasks();
     await runClassReminders();
   } catch (err) {
     logger.error({ err: err.message }, 'worker run failed');
@@ -137,6 +251,25 @@ async function main() {
   process.exit(0);
 }
 
-if (require.main === module) main();
+if (require.main === module) {
+  // One-shot manual run (historical behavior): --watch keeps the process
+  // alive as a worker instead of exiting after a single pass.
+  if (process.argv.includes('--watch')) {
+    const worker = createRenewalWorker();
+    scheduleRenewalCron().catch((err) => logger.error({ err: err.message }, 'renewal cron schedule failed'));
+    logger.info('renewal worker started (watch mode)');
+    const shutdown = async () => {
+      await worker.close();
+      process.exit(0);
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+  } else {
+    main();
+  }
+}
 
-module.exports = { runReminders, runAutoRenew, runClassReminders };
+module.exports = {
+  runReminders, runAutoRenew, runClassReminders, runDailyRenewalTasks,
+  createRenewalWorker, scheduleRenewalCron, processRenewalJob,
+};
