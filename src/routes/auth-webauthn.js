@@ -27,59 +27,180 @@ const authnLimiter = rateLimit({
 const RP_NAME = process.env.RP_NAME || 'MY PT STUDIO';
 const isProd  = process.env.NODE_ENV === 'production';
 
-// Derive rpId and expectedOrigin when env vars are not set.
-// Priority: RP_ID env var > Origin header > x-forwarded-host (Vercel proxy) > localhost.
-// When the frontend is on Vercel and rewrites /api/* to this backend, the browser
-// makes a same-origin request to Vercel; Vercel proxies it server-side and may not
-// forward the Origin header, but always sets x-forwarded-host to the client's hostname.
-function getEffectiveRpId(req) {
-  if (process.env.RP_ID) return process.env.RP_ID;
+// ── rpId and expectedOrigin ─────────────────────────────────────────────────
+//
+// These two values decide whether passkeys work at all, and getting either
+// wrong fails in the most unhelpful way available: /register/options returns
+// 200, a challenge lands in the database, and the BROWSER refuses — so the
+// server sees a perfectly healthy request and the user sees nothing happen.
+//
+// The rule the browser enforces is fixed: rpId must equal the page's hostname
+// or be a registrable suffix of it. Nothing else is negotiable, which means a
+// stale RP_ID is not a preference to honour — it is a guaranteed outage. This
+// used to return process.env.RP_ID unconditionally, so a value left pointing at
+// a previous domain (a rebrand, a second client, a moved deployment) broke
+// every enrolment with no error anywhere on this side.
 
+/**
+ * WebAuthn's registrable-suffix test.
+ *
+ * Not endsWith: 'fitnessstudio.com' must NOT match 'my619fitnessstudio.com',
+ * so the boundary has to be a literal dot. (The public-suffix rule that also
+ * forbids rpId='com' is enforced by the browser; this only has to agree with
+ * it on the cases that reach us.)
+ */
+function isRegistrableSuffix(rpId, hostname) {
+  if (!rpId || !hostname) return false;
+  if (rpId === hostname) return true;
+  return hostname.endsWith(`.${rpId}`);
+}
+
+/**
+ * The hostname the browser is actually looking at, whatever route the request
+ * took to reach this process.
+ *
+ * Origin first: a same-origin POST carries it, and it is the browser's own
+ * account of the page. x-forwarded-host second, for proxies that drop Origin —
+ * Vercel's rewrite and nginx both set it to the client-facing host. Host last.
+ */
+function requestHostname(req) {
   const origin = req.headers.origin;
   if (origin) {
     try {
-      const hostname = new URL(origin).hostname;
-      if (hostname && hostname !== 'localhost' && !hostname.startsWith('127.')) {
-        logger.warn({ hostname }, 'WebAuthn rpId derived from Origin header (set RP_ID env var)');
-        return hostname;
-      }
-    } catch { /* ignore */ }
+      const { hostname } = new URL(origin);
+      if (hostname) return hostname;
+    } catch { /* malformed Origin — fall through to the forwarded headers */ }
+  }
+  const candidate = req.headers['x-forwarded-host'] || req.headers.host;
+  if (candidate) {
+    const host = String(candidate).split(',')[0].trim().replace(/:\d+$/, '');
+    if (host) return host;
+  }
+  return null;
+}
+
+/** Full scheme://host the browser used, reconstructed if the proxy dropped Origin. */
+function requestOrigin(req) {
+  const origin = req.headers.origin;
+  if (origin) {
+    try { return new URL(origin).origin; } catch { /* fall through */ }
+  }
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  if (!host) return null;
+  const h = String(host).split(',')[0].trim();
+  const proto = String(req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http'))
+    .split(',')[0].trim();
+  return h ? `${proto}://${h}` : null;
+}
+
+/**
+ * FRONTEND_URL's hostname — the domain this API exists to serve.
+ *
+ * This is the fallback rpId rather than the request's hostname, and the
+ * distinction matters: a request header is chosen by whoever is calling, so
+ * deriving the rpId from one lets any origin that can reach this route decide
+ * which domain a credential gets minted for. FRONTEND_URL is required config
+ * (server.js refuses to boot without it), so it is always available and it is
+ * never the caller's to set.
+ */
+function frontendHostname() {
+  const raw = String(process.env.FRONTEND_URL || '').split(',')[0].trim();
+  if (!raw) return null;
+  try { return new URL(raw).hostname || null; } catch { return null; }
+}
+
+function getEffectiveRpId(req) {
+  const hostname = requestHostname(req);
+  const configured = process.env.RP_ID;
+
+  // Honoured whenever the browser could actually accept it.
+  if (configured && (!hostname || isRegistrableSuffix(configured, hostname))) return configured;
+
+  // Either RP_ID is unset, or it is set to a value this host cannot use — a
+  // value left pointing at a previous domain after a rebrand or a move, which
+  // fails in the one way nothing here can see: /register/options returns 200,
+  // the challenge is written, and the browser refuses.
+  const frontend = frontendHostname();
+
+  if (configured) {
+    logger.error(
+      { configured, requestHostname: hostname, frontendHostname: frontend },
+      'RP_ID is not a registrable suffix of the requesting host, so passkey enrolment '
+      + 'from that host fails in the browser with SecurityError. Falling back to '
+      + "FRONTEND_URL's hostname — set RP_ID to the domain the app is served from."
+    );
   }
 
-  // x-forwarded-host is set by Vercel/nginx reverse proxies to the original
-  // client-facing hostname — exactly what WebAuthn rpId must match.
-  const fwdHost = req.headers['x-forwarded-host'];
-  if (fwdHost) {
-    const host = String(fwdHost).split(',')[0].trim();
-    if (host && host !== 'localhost' && !host.startsWith('127.')) {
-      logger.warn({ host }, 'WebAuthn rpId derived from x-forwarded-host (set RP_ID env var)');
-      return host;
-    }
+  if (frontend) return frontend;
+
+  // No FRONTEND_URL (impossible in production; server.js exits at boot without
+  // it). Only now is the request worth reading, and only to keep local
+  // development working.
+  if (hostname && hostname !== 'localhost' && !hostname.startsWith('127.')) {
+    logger.warn({ hostname }, 'WebAuthn rpId derived from the request — set RP_ID and FRONTEND_URL');
+    return hostname;
   }
 
-  logger.warn('RP_ID env var not set and no usable origin header — falling back to localhost');
   return 'localhost';
 }
 
 function getExpectedOrigin(req) {
-  if (process.env.WEBAUTHN_ORIGIN) {
-    const list = process.env.WEBAUTHN_ORIGIN.split(',').map(o => o.trim()).filter(Boolean);
-    return list.length === 1 ? list[0] : list;
-  }
-
-  const origin = req.headers.origin;
-  if (origin) return origin;
-
-  // Reconstruct from x-forwarded-host + x-forwarded-proto (Vercel proxy)
-  const fwdHost = req.headers['x-forwarded-host'];
-  if (fwdHost) {
-    const host = String(fwdHost).split(',')[0].trim();
-    const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
-    if (host && host !== 'localhost') return `${proto}://${host}`;
-  }
-
+  const configured = (process.env.WEBAUTHN_ORIGIN || '')
+    .split(',').map(o => o.trim()).filter(Boolean);
+  const actual = requestOrigin(req);
   const rpId = getEffectiveRpId(req);
+
+  // The caller's own origin is added to the allowlist when it satisfies the
+  // same registrable-suffix test the browser applies. That is not a hole: a
+  // credential the browser was willing to sign for this rpId could only have
+  // come from an origin that already passes this test, so nothing is accepted
+  // here that the rpId check was keeping out. What it buys is that a stale or
+  // single-valued WEBAUTHN_ORIGIN stops being able to break verification on a
+  // second domain pointed at the same API.
+  const list = [...configured];
+  if (actual && !list.includes(actual)) {
+    let hostname = null;
+    try { hostname = new URL(actual).hostname; } catch { /* ignore */ }
+    if (isRegistrableSuffix(rpId, hostname)) {
+      if (configured.length) {
+        logger.warn(
+          { actual, configured },
+          'WEBAUTHN_ORIGIN does not list the requesting origin; accepting it because it '
+          + 'matches the effective rpId. Add it to WEBAUTHN_ORIGIN to silence this.'
+        );
+      }
+      list.push(actual);
+    }
+  }
+
+  if (list.length === 1) return list[0];
+  if (list.length) return list;
   return rpId === 'localhost' ? 'http://localhost:3000' : `https://${rpId}`;
+}
+
+/**
+ * The challenge the authenticator actually signed, read back out of
+ * clientDataJSON.
+ *
+ * Every verify path used to ask the database for "the newest unexpired
+ * challenge for this user" instead, which is a different thing and is wrong
+ * whenever there is more than one in flight: press Register twice, or leave a
+ * second tab open, and the response signed against challenge #1 gets checked
+ * against challenge #2 and fails with "Unexpected registration response
+ * challenge". On /login/verify it was worse — that query also matched rows
+ * with user_id IS NULL, i.e. any other person's anonymous login challenge.
+ *
+ * The response tells us which one it was. Ask for that one.
+ */
+function signedChallenge(payload) {
+  try {
+    const raw = payload?.response?.clientDataJSON;
+    if (typeof raw !== 'string') return null;
+    const data = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
+    return typeof data.challenge === 'string' && data.challenge ? data.challenge : null;
+  } catch {
+    return null;
+  }
 }
 
 // Lazy-load @simplewebauthn/server so a missing module only fails at call-time
@@ -112,6 +233,42 @@ async function saveChallenge(challenge, userId, type) {
      ON CONFLICT (challenge) DO NOTHING`,
     [challenge, userId || null, type]
   );
+  // Expired rows were never collected anywhere — consumeChallenge only deletes
+  // the one that verified, so every abandoned or failed attempt left a row
+  // behind for good. Swept here rather than on a timer: it is one cheap indexed
+  // delete on a path that already writes, and it needs no scheduler to exist.
+  pool.query(`DELETE FROM webauthn_challenges WHERE expires_at < NOW()`)
+    .catch((err) => logger.warn({ err: err.message }, 'webauthn challenge sweep failed'));
+}
+
+/**
+ * Find the exact challenge a response was signed against.
+ *
+ * Falls back to the newest unexpired challenge of that type for the user when
+ * clientDataJSON cannot be read, so a malformed-but-genuine client is no worse
+ * off than it was before. `userId` null means the row must be anonymous.
+ */
+async function findChallenge({ signed, type, userId }) {
+  if (signed) {
+    const params = userId ? [signed, type, userId] : [signed, type];
+    const scope = userId ? 'AND (user_id = $3 OR user_id IS NULL)' : 'AND user_id IS NULL';
+    const { rows } = await pool.query(
+      `SELECT challenge FROM webauthn_challenges
+       WHERE challenge = $1 AND type = $2 AND expires_at > NOW() ${scope}`,
+      params
+    );
+    if (rows.length) return rows[0].challenge;
+    return null;
+  }
+
+  if (!userId) return null;
+  const { rows } = await pool.query(
+    `SELECT challenge FROM webauthn_challenges
+     WHERE user_id = $1 AND type = $2 AND expires_at > NOW()
+     ORDER BY created_at DESC LIMIT 1`,
+    [userId, type]
+  );
+  return rows.length ? rows[0].challenge : null;
 }
 
 async function consumeChallenge(challenge, type, userId) {
@@ -199,13 +356,10 @@ router.post('/register/verify', auth, async (req, res, next) => {
     const { registration, deviceName, deviceType: clientDeviceType } = req.body;
     if (!registration) return res.status(400).json({ error: 'registration payload is required' });
 
-    const { rows: chs } = await pool.query(
-      `SELECT challenge FROM webauthn_challenges
-       WHERE user_id = $1 AND type = 'registration' AND expires_at > NOW()
-       ORDER BY created_at DESC LIMIT 1`,
-      [user.id]
-    );
-    if (!chs.length) {
+    const challenge = await findChallenge({
+      signed: signedChallenge(registration), type: 'registration', userId: user.id,
+    });
+    if (!challenge) {
       return res.status(400).json({ error: 'No valid challenge. Please restart registration.' });
     }
 
@@ -214,7 +368,7 @@ router.post('/register/verify', auth, async (req, res, next) => {
     try {
       verification = await verifyRegistrationResponse({
         response: registration,
-        expectedChallenge: chs[0].challenge,
+        expectedChallenge: challenge,
         expectedOrigin: getExpectedOrigin(req),
         expectedRPID: getEffectiveRpId(req),
         requireUserVerification: false,
@@ -228,7 +382,7 @@ router.post('/register/verify', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'Verification failed' });
     }
 
-    await consumeChallenge(chs[0].challenge, 'registration', user.id);
+    await consumeChallenge(challenge, 'registration', user.id);
 
     const regInfo = verification.registrationInfo;
     const { credential } = regInfo;
@@ -334,14 +488,15 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
     const cred = credRows[0];
     if (!cred.is_active) return res.status(403).json({ error: 'This passkey has been disabled' });
 
-    const { rows: chs } = await pool.query(
-      `SELECT challenge FROM webauthn_challenges
-       WHERE type = 'authentication' AND expires_at > NOW()
-         AND (user_id = $1 OR user_id IS NULL)
-       ORDER BY created_at DESC LIMIT 1`,
-      [cred.user_id]
-    );
-    if (!chs.length) {
+    // Bound to the challenge this assertion actually signed. The previous query
+    // took the newest row matching `user_id = $1 OR user_id IS NULL`, and
+    // /login/options writes an anonymous row whenever the email is unknown — so
+    // two people signing in at once could each pick up the other's challenge and
+    // both fail.
+    const challenge = await findChallenge({
+      signed: signedChallenge(authentication), type: 'authentication', userId: cred.user_id,
+    });
+    if (!challenge) {
       return res.status(400).json({ error: 'No valid challenge. Please restart authentication.' });
     }
 
@@ -350,7 +505,7 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
     try {
       verification = await verifyAuthenticationResponse({
         response: authentication,
-        expectedChallenge: chs[0].challenge,
+        expectedChallenge: challenge,
         expectedOrigin: getExpectedOrigin(req),
         expectedRPID: getEffectiveRpId(req),
         credential: {
@@ -368,7 +523,7 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
 
     if (!verification.verified) return res.status(401).json({ error: 'Verification failed' });
 
-    await consumeChallenge(chs[0].challenge, 'authentication', cred.user_id);
+    await consumeChallenge(challenge, 'authentication', cred.user_id);
     await pool.query(
       `UPDATE user_webauthn_credentials
        SET counter = $1, last_used_at = NOW(), updated_at = NOW()
@@ -466,20 +621,17 @@ router.post('/action/verify', auth, async (req, res, next) => {
     if (!credRows.length) return res.status(404).json({ error: 'Credential not found' });
     const cred = credRows[0];
 
-    const { rows: chs } = await pool.query(
-      `SELECT challenge FROM webauthn_challenges
-       WHERE user_id = $1 AND type = 'action' AND expires_at > NOW()
-       ORDER BY created_at DESC LIMIT 1`,
-      [user.id]
-    );
-    if (!chs.length) return res.status(400).json({ error: 'No valid challenge. Please restart.' });
+    const challenge = await findChallenge({
+      signed: signedChallenge(authentication), type: 'action', userId: user.id,
+    });
+    if (!challenge) return res.status(400).json({ error: 'No valid challenge. Please restart.' });
 
     const { verifyAuthenticationResponse } = wauthn();
     let verification;
     try {
       verification = await verifyAuthenticationResponse({
         response: authentication,
-        expectedChallenge: chs[0].challenge,
+        expectedChallenge: challenge,
         expectedOrigin: getExpectedOrigin(req),
         expectedRPID: getEffectiveRpId(req),
         credential: {
@@ -497,7 +649,7 @@ router.post('/action/verify', auth, async (req, res, next) => {
 
     if (!verification.verified) return res.status(401).json({ error: 'Verification failed' });
 
-    await consumeChallenge(chs[0].challenge, 'action', user.id);
+    await consumeChallenge(challenge, 'action', user.id);
     await pool.query(
       `UPDATE user_webauthn_credentials
        SET counter = $1, last_used_at = NOW(), updated_at = NOW()
@@ -596,6 +748,45 @@ function requireAdminOrManager(req, res, next) {
   }
   next();
 }
+
+// GET /admin/config — what rpId and origin this instance will actually use for
+// the caller, and whether the browser can accept them.
+//
+// This exists because the failure it diagnoses is otherwise invisible from the
+// server: a wrong rpId makes /register/options return 200 with a valid
+// challenge, and the refusal happens inside the browser, which reports it to
+// nobody. One authenticated GET now answers "why does nothing happen when I
+// tap Add Passkey" without shell access to the box.
+//
+// Returns hostnames the caller's own browser already knows and booleans about
+// whether two env vars are set — never their values beyond the host, and no
+// secrets.
+router.get('/admin/config', auth, requireAdminOrManager, (req, res) => {
+  const hostname = requestHostname(req);
+  const rpId = getEffectiveRpId(req);
+  const expectedOrigin = getExpectedOrigin(req);
+  const configuredRpId = process.env.RP_ID || null;
+  const usable = isRegistrableSuffix(rpId, hostname);
+  const honoured = configuredRpId && isRegistrableSuffix(configuredRpId, hostname);
+
+  res.json({
+    requestHostname: hostname,
+    requestOrigin: requestOrigin(req),
+    effectiveRpId: rpId,
+    expectedOrigin,
+    configuredRpId,
+    frontendHostname: frontendHostname(),
+    rpIdSource: honoured ? 'RP_ID'
+      : configuredRpId ? 'FRONTEND_URL (RP_ID rejected — see problem)'
+      : rpId === 'localhost' ? 'fallback' : 'FRONTEND_URL',
+    webauthnOriginConfigured: Boolean(process.env.WEBAUTHN_ORIGIN),
+    // false here means passkeys cannot work from this host, full stop.
+    browserWillAcceptRpId: usable,
+    problem: usable ? null
+      : `rpId "${rpId}" is not equal to, nor a registrable suffix of, "${hostname}" — `
+        + 'the browser will reject every enrolment with SecurityError.',
+  });
+});
 
 // GET /admin/stats — tenant-scoped: platform super_admin sees all orgs;
 // a tenant admin/manager sees only their own organization's passkeys.
@@ -708,3 +899,11 @@ router.get('/admin/audit-logs', auth, requireAdminOrManager, async (req, res, ne
 });
 
 module.exports = router;
+
+// Exported for tests. These four decide whether passkeys work at all and none
+// of them touches the database, so they are worth pinning directly rather than
+// through a route that would need a pool to reach them.
+module.exports.isRegistrableSuffix = isRegistrableSuffix;
+module.exports.getEffectiveRpId    = getEffectiveRpId;
+module.exports.getExpectedOrigin   = getExpectedOrigin;
+module.exports.signedChallenge     = signedChallenge;
