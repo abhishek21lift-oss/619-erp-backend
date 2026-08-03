@@ -1,0 +1,80 @@
+name: Deploy — Hostinger VPS
+
+# Production deploy. Every push to main lands on the VPS, so main is the
+# release branch, not an integration branch.
+#
+# The workflow does not build anything: deploy.sh on the VPS owns the build,
+# the compose restart and any migrations. This file's only job is to reach the
+# box and run it, and to fail loudly if that does not work.
+on:
+  push:
+    branches: [main]
+  # A deploy you cannot re-run by hand is a deploy you cannot recover with.
+  workflow_dispatch:
+
+# Never let two deploys touch the box at once — the second would restart
+# containers mid-way through the first. cancel-in-progress is deliberately
+# false: killing a half-finished deploy is worse than queueing behind it.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    # A deploy that has hung for 15 minutes is not going to finish. Without a
+    # ceiling a stuck SSH session holds the concurrency lock for six hours.
+    timeout-minutes: 15
+    environment: production
+
+    steps:
+      - name: Install the deploy key
+        # Written to disk rather than piped through ssh-agent so the key never
+        # appears in a process argument list. `set -x` is off by default, but
+        # even so nothing here echoes the secret: printf reads it from the env,
+        # not from an inlined expression.
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          # Fail here, with a clear message, rather than 30 lines later with
+          # "Load key: error in libcrypto".
+          ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null
+
+      - name: Run deploy.sh on the VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT || '22' }}
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=20 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            -p "$VPS_PORT" \
+            "$VPS_USER@$VPS_HOST" \
+            'bash -s' <<'REMOTE'
+          # -e so a failing command aborts, -u so an unset variable is an error
+          # rather than an empty string, pipefail so a failure mid-pipeline is
+          # not masked by a successful tail. Without these, deploy.sh could die
+          # and this step would still report success.
+          set -euo pipefail
+          cd /opt/myptstudio/619-erp-backend
+          ./deploy.sh
+          REMOTE
+
+      - name: Report
+        if: failure()
+        run: |
+          echo "::error::Deploy failed. The VPS may be mid-restart — check" \
+               "'docker compose ps' and 'docker compose logs --tail=100' on the box."
