@@ -114,6 +114,7 @@ describe('super-admin API — the H-03 split', () => {
     'GET /features/:key/overrides',
     'GET /invitations',
     'GET /invitations/:id/events',
+    'GET /mail/status',
     'GET /organizations',
     'GET /organizations/:id',
     'GET /organizations/:id/billing-profile',
@@ -155,6 +156,10 @@ describe('super-admin API — the H-03 split', () => {
     'POST /invitations/:id/cancel',
     'POST /invitations/:id/link',
     'POST /invitations/:id/resend',
+    // Mail health, added so an invisible SMTP outage can be diagnosed without
+    // shell access to the box. GET verifies credentials without sending;
+    // POST sends one real message and reports the SMTP dialogue.
+    'POST /mail/test',
     'POST /organizations',
     'POST /organizations/:id/impersonate',
     'POST /organizations/:id/logo',

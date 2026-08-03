@@ -229,8 +229,8 @@ async function approveHandler(req, res, next) {
 
     await client.query('COMMIT');
 
-    await audit(req, 'registration_approved', {
-      registration_id: app.id, organization_id: org.id, email: app.email,
+    await audit(req, 'registration_approved', 'studio_registration', app.id, {
+      organization_id: org.id, email: app.email,
     }).catch(() => {});
 
     // Best-effort: a mail failure must not undo an approval that already
@@ -273,7 +273,7 @@ async function rejectHandler(req, res, next) {
         error: { code: 'NOT_PENDING', message: 'That application is no longer pending.' },
       });
     }
-    await audit(req, 'registration_rejected', { registration_id: rows[0].id, email: rows[0].email }).catch(() => {});
+    await audit(req, 'registration_rejected', 'studio_registration', rows[0].id, { email: rows[0].email }).catch(() => {});
     res.json({ data: rows[0] });
   } catch (err) { next(err); }
 }
@@ -295,11 +295,11 @@ router.get('/registrations', list);
 // reads each mutating route's body looking for `await audit(`, and a reference
 // hides it. Both delegate immediately; the audit lives in the handler.
 router.post('/registrations/:id/approve', async (req, res, next) => {
-  await audit(req, 'registration_approve_attempt', { registration_id: req.params.id }).catch(() => {});
+  await audit(req, 'registration_approve_attempt', 'studio_registration', req.params.id, {}).catch(() => {});
   return approveHandler(req, res, next);
 });
 router.post('/registrations/:id/reject', async (req, res, next) => {
-  await audit(req, 'registration_reject_attempt', { registration_id: req.params.id }).catch(() => {});
+  await audit(req, 'registration_reject_attempt', 'studio_registration', req.params.id, {}).catch(() => {});
   return rejectHandler(req, res, next);
 });
 

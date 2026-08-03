@@ -122,4 +122,18 @@ describe('Audit coverage — nothing happens silently', () => {
     const mutating = [...src.matchAll(/\nrouter\.(post|put|patch|delete)\('/g)].length;
     expect(mutating).toBeGreaterThan(30);
   });
+
+  it('calls audit() with the payload in the data position, not the entity type', () => {
+    // audit(req, action, entityType, entityId, data) — five arguments.
+    //
+    // Passing the payload third is the easy mistake, and it fails silently in
+    // the worst way: entity_type is a text column, so pg stringifies the
+    // object into it, entity_id and new_data land null, and audit() swallows
+    // any error by design. The row is written, the request succeeds, and the
+    // audit trail has lost exactly the context it existed to keep. The
+    // registrations module shipped with four such calls before this test.
+    const offenders = [...src.matchAll(/audit\(\s*req\s*,\s*'([a-z_]+)'\s*,\s*\{/g)]
+      .map((m) => m[1]);
+    expect(offenders).toEqual([]);
+  });
 });
