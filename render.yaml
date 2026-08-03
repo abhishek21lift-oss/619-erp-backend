@@ -28,6 +28,23 @@ services:
         value: production
       - key: PORT
         value: 5000
+      # ── Queue infrastructure (BullMQ) ────────────────────────────────────
+      # Backed by the Render Redis instance declared under `databases` below.
+      # When set, the API enqueues email/whatsapp/AI/notification work and
+      # drains those queues with in-process workers (see src/workers/index.js).
+      # When unset, every send falls back to its pre-queue inline path, so a
+      # deploy without Redis still boots and still delivers — just without
+      # retries or backgrounding. The producer queues connect lazily, so a
+      # single-process Render free instance is fine.
+      - key: REDIS_URL
+        fromDatabase:
+          name: 619-erp-redis
+          property: connectionString
+      # In-process workers are on by default. Set to "0" only when running the
+      # workers in a separate service (see the "worker:*" scripts in
+      # package.json) so the two processes do not both drain every queue.
+      - key: RUN_WORKERS
+        value: "1"
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET
@@ -82,3 +99,10 @@ services:
       # rather than a noreply. Falls back to SMTP_FROM when unset.
       - key: EMAIL_FROM
         sync: false
+
+databases:
+  # Backs the BullMQ queues (see REDIS_URL above). Free tier has enough for
+  # a demo deployment's email/notification volume.
+  - name: 619-erp-redis
+    plan: free
+    type: redis

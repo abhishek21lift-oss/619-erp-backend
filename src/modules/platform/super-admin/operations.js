@@ -405,6 +405,18 @@ router.get('/system-health', async (req, res, next) => {
     } catch { /* non-fatal: health must still render if this query fails */ }
 
     const mem = process.memoryUsage();
+
+    // BullMQ queue snapshot (Redis-backed workers). Measured at request time
+    // like everything else here; never fatal — an unreachable queue shows up
+    // as status 'unknown' rather than failing the whole health endpoint.
+    let queues = null;
+    try {
+      const { collectQueueStats, summarize } = require('../../../lib/queueHealth');
+      queues = summarize(await collectQueueStats());
+    } catch {
+      queues = { status: 'unknown', detail: 'unavailable' };
+    }
+
     res.json({
       checked_at: new Date().toISOString(),
       check_duration_ms: Date.now() - started,
@@ -425,6 +437,7 @@ router.get('/system-health', async (req, res, next) => {
           heap_total_bytes: mem.heapTotal,
         },
       },
+      queues,
       errors_24h: errors24h,
     });
   } catch (err) { next(err); }

@@ -22,6 +22,19 @@ async function getHealthPayload() {
     }
   }
 
+  // Queue snapshot — defensive by construction (collectQueueStats never
+  // throws): a down queue must appear as a health field, not as a probe that
+  // crashes. Only meaningful when Redis is actually reachable.
+  let queues = null;
+  if (redisState === 'connected') {
+    try {
+      const { collectQueueStats, summarize } = require('./queueHealth');
+      queues = summarize(await collectQueueStats());
+    } catch (err) {
+      queues = { status: 'unknown', detail: err.message };
+    }
+  }
+
   if (dbState === 'connected' && redisState === 'connected') {
     return {
       status: 'ok',
@@ -29,6 +42,7 @@ async function getHealthPayload() {
       time: new Date().toISOString(),
       db: 'connected',
       redis: 'connected',
+      queues,
     };
   }
 
@@ -36,6 +50,7 @@ async function getHealthPayload() {
     status: 'error',
     db: dbState,
     redis: redisState,
+    queues,
     error: errorMessage,
   };
 }
