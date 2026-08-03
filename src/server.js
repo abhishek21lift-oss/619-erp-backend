@@ -466,6 +466,7 @@ app.use('/api/bookings',          require('./modules/bookings/bookings.routes'))
 // We now enforce auth + adminOnly at the mount level as defense-in-depth.
 // Individual handlers may still include the middleware; it is a no-op.
 app.use('/api/admin',             auth, adminOnly, require('./routes/admin-reset'));
+app.use('/api/debug',             auth, adminOnly, require('./routes/debug'));
 
 // Platform Super Admin portal (multi-tenant SaaS). Guarded at the mount with
 // auth + requireSuperAdmin — inaccessible to tenant admins and everyone else.
