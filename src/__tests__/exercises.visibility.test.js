@@ -41,7 +41,7 @@ jest.mock('../db/pool', () => ({
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
 const ORG_A = '11111111-1111-1111-1111-111111111111';
-let mockUser = { id: 'trainer-a', role: 'trainer', organization_id: ORG_A };
+const mockUser = { id: 'trainer-a', role: 'trainer', organization_id: ORG_A };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
   adminOnly: (_req, _res, next) => next(),
