@@ -1,0 +1,122 @@
+# Production topology: API, queue worker, Redis.
+#
+# ── Read this before deploying ──────────────────────────────────────────────
+#
+# The compose file that actually runs lives on the VPS at
+# /opt/myptstudio/619-erp-backend/, outside this repository. This file is the
+# version-controlled description of what that one needs to become. It is not
+# picked up automatically — reconcile it by hand, or replace the file on the
+# box with this one after checking the volume and network names match what is
+# already there.
+#
+# ── Redis is new ────────────────────────────────────────────────────────────
+#
+# Nothing in this project used Redis before BullMQ. Until the `redis` service
+# below is running AND REDIS_URL is set on the api service, every queue falls
+# back to running its work inline, exactly as the code did before queueing
+# existed. That is a supported state, not a broken one — so this can be rolled
+# out in two steps rather than as a flag day.
+#
+# ── Secrets ─────────────────────────────────────────────────────────────────
+#
+# Nothing here carries a value. Every variable is read from the environment or
+# the .env file sitting next to this on the box; the `${VAR}` form with no
+# default means compose fails loudly on a missing one rather than starting the
+# API with a blank database URL.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Bound to loopback: the queue is internal, and a Redis reachable from the
+    # internet is how a box gets mined for cryptocurrency. Nginx does not
+    # proxy to it and nothing outside this compose network needs it.
+    ports:
+      - '127.0.0.1:6379:6379'
+    # appendonly so a restart does not lose queued jobs. A queue that empties
+    # on reboot is not a queue.
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --maxmemory
+      - '256mb'
+      # noeviction, NOT allkeys-lru. Evicting a key under memory pressure
+      # would silently delete jobs; BullMQ would rather be told it is full.
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:5000:5000'
+    environment:
+      NODE_ENV: production
+      PORT: '5000'
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      FRONTEND_URL: ${FRONTEND_URL}
+      # Service name, not localhost: inside the compose network `redis`
+      # resolves to the container.
+      REDIS_URL: redis://redis:6379
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # The workers, as their own service.
+  #
+  # Not inside the API: embedding a PDF pins a core for tens of seconds, and
+  # doing that in the process serving requests degrades every studio at once.
+  # WORKER_INLINE=on exists for a deploy that cannot run this second service.
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ['node', 'src/workers/queue/index.js']
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      FRONTEND_URL: ${FRONTEND_URL}
+      REDIS_URL: redis://redis:6379
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    # 30s, not the default 10. The worker drains in-flight jobs on SIGTERM
+    # (QUEUE_SHUTDOWN_TIMEOUT_MS, default 8s) and being SIGKILLed mid-drain is
+    # exactly what the drain exists to prevent.
+    stop_grace_period: 30s
+
+volumes:
+  redis-data:

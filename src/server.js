@@ -623,6 +623,34 @@ runMigrationsWithRetry()
       logger.info({ interval: '6h' }, 'Subscription sweep scheduled');
     }
 
+    // Membership renewals, on the queue when there is one.
+    //
+    // src/workers/renewal.worker.js already existed and was documented as
+    // "run via cron, BullMQ, or a Vercel cron route" — in practice nothing
+    // ran it, so expiry reminders and auto-renew charges only happened when
+    // somebody invoked it by hand. A BullMQ repeatable job is that missing
+    // scheduler, and unlike an interval it survives a restart mid-run and
+    // will not double-fire when two API containers are up.
+    //
+    // Silently does nothing without REDIS_URL, which is the state today.
+    // Disable with RENEWAL_SCHEDULE=off.
+    if (process.env.RENEWAL_SCHEDULE !== 'off') {
+      const { scheduleRenewals } = require('./lib/queue/schedule');
+      scheduleRenewals()
+        .then((r) => { if (r.scheduled) logger.info(r, 'Renewal sweep scheduled on the queue'); })
+        .catch((err) => logger.warn({ err: err.message }, 'Renewal schedule failed'));
+    }
+
+    // Workers in this process, for a deploy that cannot run a second
+    // container. Off by default: embedding a PDF pins a core for tens of
+    // seconds, and doing that inside the process serving requests degrades
+    // every studio at once. The compose file runs `npm run queue:worker` as
+    // its own service instead.
+    if (process.env.WORKER_INLINE === 'on') {
+      require('./workers/queue').startAll();
+      logger.warn('WORKER_INLINE=on — queue workers are running inside the API process');
+    }
+
     // Scheduled platform announcements. Each send is guarded by its own row
     // lock and status check (lib/announcements.js), so an overlapping tick
     // cannot deliver twice — which is what makes a plain interval safe here.
@@ -659,11 +687,20 @@ runMigrationsWithRetry()
     }
 
     const pool = require('./db/pool');
+    // Order matters, and it is the reverse of startup: stop accepting
+    // requests, then drain any in-flight jobs, then close the pool the jobs
+    // were using. Ending the pool first would fail every job mid-flight —
+    // which for a renewal means a card charged and no membership row.
     function shutdown(sig) {
       return function() {
         logger.info({ signal: sig }, 'Received signal — shutting down');
         server.close(function() {
-          pool.end(function() { process.exit(0); });
+          const queue = require('./lib/queue');
+          const workers = require('./workers/queue');
+          workers.stopAll()
+            .catch(function() {})
+            .then(function() { return queue.close().catch(function() {}); })
+            .then(function() { pool.end(function() { process.exit(0); }); });
         });
         setTimeout(function() { process.exit(1); }, 10_000).unref();
       };

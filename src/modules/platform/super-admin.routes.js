@@ -47,5 +47,6 @@ router.use(require('./super-admin/support'));
 router.use(require('./super-admin/storage'));
 router.use(require('./super-admin/registrations'));
 router.use(require('./super-admin/mail'));
+router.use(require('./super-admin/queues'));
 
 module.exports = router;

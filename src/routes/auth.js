@@ -10,6 +10,7 @@ const jwt    = require('jsonwebtoken');
 // `epochTolerance` is in SECONDS; 30 is one TOTP step either side, matching
 // what v12's `{ window: 1 }` meant.
 const { verifySync } = require('otplib');
+const { enqueue, QUEUES } = require('../lib/queue');
 const pool   = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, invalidateUserCache } = require('../middleware/auth');
@@ -311,7 +312,17 @@ router.post('/forgot-password', async (req, res) => {
       'UPDATE users SET password_reset_token = $1, password_reset_expires = NOW() + INTERVAL \'15 minutes\' WHERE id = $2',
         [hashedToken, rows[0].id]
       );
-      sendPasswordReset(email, rawToken)
+      // Queued, with the same .then/.catch as before so the logging is
+      // unchanged. This endpoint must answer identically whether or not the
+      // address exists, so it never waits on the send either way — the queue
+      // adds a retry budget that survives a restart, which a bare promise
+      // did not have.
+      enqueue(
+        QUEUES.EMAIL, 'password_reset',
+        { kind: 'password_reset', to: email, token: rawToken },
+        () => sendPasswordReset(email, rawToken),
+      )
+        .then((out) => (out.queued ? { sent: true } : out.result))
         .then(function(result) {
           if (result && result.sent === false) {
             logger.error({ email, outcome: 'smtp_not_configured' },

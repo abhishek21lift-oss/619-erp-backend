@@ -6,6 +6,7 @@ const { auth, adminOnly } = require('../middleware/auth');
 const logger  = require('../lib/logger');
 const { escapeIdentifier } = require('pg');
 const { sendAdminResetOtp } = require('../lib/email');
+const { enqueue, QUEUES } = require('../lib/queue');
 
 const ALLOWED_TABLES = new Set([
   'attendance_logs', 'payments', 'subscriptions', 'invoices', 'outstanding_dues',
@@ -63,7 +64,19 @@ router.post('/initiate-reset', auth, adminOnly, async (req, res) => {
     const { rows } = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
     const email = rows[0]?.email;
     if (email) {
-      await sendAdminResetOtp(email, otp);
+      // Queued rather than awaited. This was the one send left sitting in
+      // front of a response: the admin waited on the full SMTP round trip —
+      // three retries with backoff on a bad day — before being told the OTP
+      // was on its way. The OTP row is already committed above, so the code
+      // is valid whether the mail leaves now or in two seconds.
+      //
+      // Awaited only far enough to hand it over; with no Redis this still
+      // sends inline exactly as before.
+      await enqueue(
+        QUEUES.EMAIL, 'admin_reset_otp',
+        { kind: 'admin_reset_otp', to: email, otp },
+        () => sendAdminResetOtp(email, otp),
+      );
     } else {
       logger.warn({ adminId: req.user.id }, 'Admin reset OTP could not be sent — email not found');
     }

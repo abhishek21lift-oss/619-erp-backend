@@ -124,6 +124,9 @@ describe('super-admin API — the H-03 split', () => {
     'GET /organizations/:id/subscription/change-quote',
     'GET /overview',
     'GET /platform-payment-settings',
+    // Queue health, added with BullMQ so a worker that has stopped consuming
+    // is visible without shelling into the box.
+    'GET /queues/status',
     'GET /registrations',
     'GET /security/login-events',
     'GET /security/overview',

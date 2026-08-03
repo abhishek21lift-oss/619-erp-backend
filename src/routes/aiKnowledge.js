@@ -13,6 +13,7 @@ const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { saveFile } = require('../lib/fileStorage');
 const { SUPPORTED_MIME_TYPES } = require('../lib/ai/textExtract');
 const { ingestDocument, deleteDocument } = require('../lib/ai/knowledgeBase');
+const { enqueue, QUEUES } = require('../lib/queue');
 const logger = require('../lib/logger');
 
 const router = express.Router();
@@ -70,11 +71,18 @@ router.post('/', auth, requireRole('admin', 'manager'), (req, res, next) => {
 
     res.status(201).json({ data: rows[0] });
 
-    // Fire-and-forget: extraction + chunking + embedding can easily exceed a
-    // typical request timeout for anything beyond a couple of pages, so it
-    // must not sit in front of the response. Errors are caught and recorded
-    // on the document row itself (status='failed') for the UI to surface.
-    ingestDocument(id).catch((err) => logger.error({ documentId: id, err: err.message }, 'ai_knowledge_ingest_uncaught'));
+    // Queued rather than fire-and-forget. Extraction + chunking + embedding
+    // can easily exceed a typical request timeout for anything beyond a
+    // couple of pages, so it must not sit in front of the response — but
+    // fire-and-forget also meant a container restart mid-ingestion lost the
+    // work silently, leaving the document on status='processing' with nothing
+    // to retry it. jobId is the document id so a double-tap on Upload cannot
+    // enqueue the same ingestion twice.
+    //
+    // Falls back to running inline when there is no Redis, which is exactly
+    // what this line did before.
+    enqueue(QUEUES.AI, 'ingest', { documentId: id }, () => ingestDocument(id), { jobId: `ingest:${id}` })
+      .catch((err) => logger.error({ documentId: id, err: err.message }, 'ai_knowledge_ingest_uncaught'));
   } catch (err) {
     logger.error({ err: err.message }, 'ai_knowledge_upload_error');
     res.status(500).json({ error: { code: 'SERVER_ERROR', message: 'Failed to upload document' } });
@@ -132,7 +140,10 @@ router.post('/:id/reindex', auth, requireRole('admin', 'manager'), async (req, r
   await pool.query(`UPDATE ai_documents SET status = 'processing', error_message = NULL, updated_at = NOW() WHERE id = $1`, [req.params.id]);
   res.json({ message: 'Reindexing started' });
 
-  ingestDocument(req.params.id).catch((err) => logger.error({ documentId: req.params.id, err: err.message }, 'ai_knowledge_reindex_uncaught'));
+  // No jobId here: a reindex is a deliberate "do it again", and de-duplicating
+  // it against the original ingestion would make the button do nothing.
+  enqueue(QUEUES.AI, 'reindex', { documentId: req.params.id }, () => ingestDocument(req.params.id))
+    .catch((err) => logger.error({ documentId: req.params.id, err: err.message }, 'ai_knowledge_reindex_uncaught'));
 });
 
 module.exports = router;
