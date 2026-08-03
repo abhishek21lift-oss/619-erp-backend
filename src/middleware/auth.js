@@ -91,6 +91,7 @@ async function auth(req, res, next) {
           // SECURITY: filter out soft-deleted users (deleted_at IS NOT NULL).
           `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
                   u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
+                  o.is_founder, o.founder_number,
                   o.status AS organization_status, o.subscription_status,
                   o.trial_ends_at, o.current_period_end,
                   u.is_active, u.token_version
@@ -106,6 +107,7 @@ async function auth(req, res, next) {
         const result = await pool.query(
           `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
                   u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
+                  o.is_founder, o.founder_number,
                   u.is_active, u.token_version
              FROM users u
              LEFT JOIN organizations o ON o.id = u.organization_id

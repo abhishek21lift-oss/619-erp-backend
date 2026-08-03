@@ -80,7 +80,13 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
       const result = await pool.query(
         `SELECT u.id, u.name, u.email, u.role, u.password, u.token_version,
                 u.trainer_id, u.member_id, u.is_active,
-                u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url
+                u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
+                -- Founder status rides along on the session rather than being
+                -- fetched separately. The badge appears beside the studio name
+                -- in the sidebar, on the dashboard, on every profile and team
+                -- screen — six places that would otherwise each need their own
+                -- request for two columns that change roughly once, ever.
+                o.is_founder, o.founder_number
            FROM users u
            LEFT JOIN organizations o ON o.id = u.organization_id
           WHERE LOWER(u.email) = LOWER($1) AND u.is_active = true`,
@@ -210,6 +216,8 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         organization_id:       user.organization_id,
         organization_name:     user.organization_name,
         organization_logo_url: user.organization_logo_url,
+        is_founder:            Boolean(user.is_founder),
+        founder_number:        user.founder_number ?? null,
         mfaSetupRequired,
       },
       token,
