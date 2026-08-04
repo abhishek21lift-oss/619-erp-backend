@@ -509,10 +509,44 @@ router.post('/', auth, validate(clientSchemas.create), async (req, res, next) =>
 });
 
 // PUT /api/clients/:id
+// PUT /api/clients/:id
+//
+// Reads and writes pt_clients, like the rest of this router.
+//
+// This handler used to touch the legacy `clients` table while GET / and
+// GET /:id had already been moved to pt_clients. `clients` has been empty
+// since the PT-OS enrolment flow shipped, so the first statement here found
+// nothing and the handler answered 404 "Client not found" for EVERY client —
+// including the one the page had just rendered from pt_clients a moment
+// earlier. Visible symptom: the client profile's Save Notes button failing
+// permanently with "Failed to save notes"
+// (app/pt-os/clients/[id]/page.tsx).
+//
+// The tenant scope below is new and is not optional. The old query was
+// `WHERE id=$1` with no organization filter — harmless only because the table
+// was empty. Pointing that same query at pt_clients, which holds every
+// studio's clients, would have let any studio edit any other studio's client
+// by id. This mirrors GET /:id above.
+//
+// payment_method, payment_date, biometric_added and member_code are dropped
+// rather than carried across: they are gym-membership columns that pt_clients
+// does not have, and this product is personal training. A payment method
+// belongs on the payment (pt_payments), not on the client row. None of the
+// four is accepted by clientSchemas.update anyway, so zod was already
+// stripping them and they only ever wrote their defaults.
 router.put('/:id', auth, validate(clientSchemas.update), async (req, res, next) => {
   try {
     const d = req.body;
-    const { rows: existing } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
+    const scope = tenantScope(req);
+    const findParams = [req.params.id];
+    let orgClause = '';
+    if (scope.applyFilter) {
+      findParams.push(scope.orgId);
+      orgClause = ` AND organization_id = $${findParams.length}`;
+    }
+    const { rows: existing } = await pool.query(
+      `SELECT * FROM pt_clients WHERE id=$1${orgClause}`, findParams
+    );
     if (!existing[0]) return res.status(404).json({ error: 'Client not found' });
     if (req.user.role === 'trainer' &&
         (!req.user.trainer_id || existing[0].trainer_id !== req.user.trainer_id))
@@ -535,30 +569,50 @@ router.put('/:id', auth, validate(clientSchemas.update), async (req, res, next) 
       trainer_name = tr[0]?.name || null;
     }
 
+    // Every field falls back to its CURRENT value, never to null.
+    //
+    // This is a full-row UPDATE driven by a partial body, and the previous
+    // version wrote `d.mobile||null`, `d.address||null`, `d.pt_start_date||null`
+    // and so on. The client profile calls this with a single key —
+    // api.clients.update(id, { notes }) — so saving a note would have blanked
+    // that client's mobile, email, gender, dob, address, PT dates, weight and
+    // photo in one statement. It never fired only because the handler was
+    // reading the empty `clients` table and 404ing first; repointing it at
+    // pt_clients without this change would have turned a dead endpoint into a
+    // data-loss one.
+    //
+    // `??` rather than `||` so a deliberate empty string still clears a field
+    // (notes, address) and 0 stays 0 — with `||` both would silently revert.
+    // pt_start_date, pt_end_date, weight and photo_url are not part of
+    // clientSchemas.update at all, so zod strips them and they can only ever
+    // be preserved here.
     await pool.query(`
-      UPDATE clients SET
+      UPDATE pt_clients SET
         name=$1, mobile=$2, email=$3, gender=$4, dob=$5, address=$6,
         trainer_id=$7, trainer_name=$8, pt_start_date=$9, pt_end_date=$10,
         package_type=$11, base_amount=$12, discount=$13, final_amount=$14,
-        paid_amount=$15, balance_amount=$16, payment_method=$17, payment_date=$18,
-        weight=$19, notes=$20, status=$21, photo_url=$22, biometric_code=$23,
-        biometric_added=$24, updated_at=NOW()
-      WHERE id=$25`,
-      [d.name?.trim()||existing[0].name,
-       d.mobile||null, d.email?.toLowerCase()||null,
-       d.gender||null, d.dob||null, d.address||null,
+        paid_amount=$15, balance_amount=$16,
+        weight=$17, notes=$18, status=$19, photo_url=$20, biometric_code=$21,
+        updated_at=NOW()
+      WHERE id=$22`,
+      [d.name?.trim() ?? existing[0].name,
+       d.mobile ?? existing[0].mobile,
+       d.email?.toLowerCase() ?? existing[0].email,
+       d.gender ?? existing[0].gender,
+       d.dob ?? existing[0].dob,
+       d.address ?? existing[0].address,
        trainer_id, trainer_name,
-       d.pt_start_date||null, d.pt_end_date||null,
-       d.package_type||null, base, disc, final, paid, Math.max(0, final-paid),
-       d.payment_method||'CASH', d.payment_date||null,
-       num(d.weight, null), d.notes||null,
-       d.status||existing[0].status,
-       d.photo_url || null,
-       d.biometric_code || existing[0].biometric_code || existing[0].client_id,
-       Boolean(d.biometric_code || existing[0].biometric_code || existing[0].client_id),
+       existing[0].pt_start_date, existing[0].pt_end_date,
+       d.package_type ?? existing[0].package_type,
+       base, disc, final, paid, Math.max(0, final - paid),
+       existing[0].weight,
+       d.notes ?? existing[0].notes,
+       d.status ?? existing[0].status,
+       existing[0].photo_url,
+       existing[0].biometric_code ?? existing[0].client_id,
        req.params.id]
     );
-    const { rows } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT * FROM pt_clients WHERE id=$1', [req.params.id]);
     res.json({ message: 'Updated', client: rows[0] });
   } catch (err) {
     next(err);
