@@ -1,0 +1,134 @@
+# infra/nginx
+
+The reverse-proxy configuration for the VPS, version-controlled so a migration
+is a copy rather than an archaeology exercise.
+
+> **These files are a template, not the live config.** Nothing in this repo is
+> deployed to nginx automatically — `deploy.yml` only rebuilds containers. The
+> live files are on the box and may already differ. **Diff before replacing.**
+
+## Why this folder exists
+
+Everything about how requests reach this app lived in one place: a box. The
+repo's own files actively contradicted it — a `render.yaml` describing a host
+the app does not run on, and a `vercel.json` describing a frontend deployment
+that does not happen. Both have been deleted for exactly that reason. This
+folder is the replacement: the routing written down where it can be reviewed,
+diffed and restored.
+
+## The topology
+
+```
+                         ┌──────────────────────────────────────┐
+  myptstudio.com     ──► │ nginx (host)                          │
+  www.myptstudio.com ──► │   443 TLS, routes on the Host header  │
+  api.myptstudio.com ──► │                                       │
+                         └───────┬───────────────────┬──────────┘
+                                 │                   │
+                    127.0.0.1:3000                127.0.0.1:5000
+                    frontend container            backend container
+                                                        │
+                                              127.0.0.1:6379  redis
+                                                     worker container
+```
+
+All three names resolve to the same address. Both app containers bind to
+**loopback only** (`docker-compose.yml`), so nginx is the only route in — do not
+"fix" a connection problem by exposing a container on `0.0.0.0`.
+
+## The request path has two shapes
+
+```
+API calls    browser → nginx → frontend container → Next rewrite → backend
+WebSocket    browser → nginx ──────────────────────────────────→ backend
+```
+
+Ordinary API calls use relative URLs (`apiBase()` returns `''` in production)
+and are forwarded by the Next.js rewrite in the frontend's `next.config.js`.
+**That hop cannot carry a WebSocket** — it is an HTTP proxy and does not pass an
+`Upgrade`. So realtime traffic addresses `api.myptstudio.com` directly, derived
+from `NEXT_PUBLIC_API_URL` by `wsBase()` in the frontend's `src/lib/http.ts`
+(`https` → `wss`), which keeps one variable as the source of truth for both.
+
+If you ever see the Command Center silently fall back to polling, check this
+first: it is far more often the proxy than the code.
+
+## Files
+
+| File | Goes where | Purpose |
+|---|---|---|
+| `websocket.conf` | `http {}` block | the `$connection_upgrade` map and the shared proxy headers |
+| `myptstudio.conf` | `sites-available/` | both vhosts |
+
+## Installing
+
+```bash
+# 1. See what is actually there before changing anything.
+sudo nginx -T > /tmp/nginx-before.conf
+sudo cp -a /etc/nginx /etc/nginx.bak.$(date +%F)
+
+# 2. The map and shared headers. The map MUST be in the http {} block, not
+#    inside a server {} — nginx rejects it there.
+sudo mkdir -p /etc/nginx/snippets
+sudo cp websocket.conf /etc/nginx/conf.d/websocket.conf
+
+#    myptstudio.conf includes the proxy headers as a snippet. Split them out:
+sudo sed -n '/^proxy_set_header Host/,$p' websocket.conf \
+  | sudo tee /etc/nginx/snippets/myptstudio-proxy.conf
+
+# 3. The vhosts. DIFF FIRST — the live file may carry certificate paths,
+#    redirects or rate limits this template does not know about.
+diff /etc/nginx/sites-available/myptstudio.conf myptstudio.conf
+
+# 4. Validate, then reload. Never restart: reload keeps existing connections.
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+If `nginx -t` fails, nothing has been applied yet — fix and re-test. Restore
+with `sudo rm -rf /etc/nginx && sudo mv /etc/nginx.bak.<date> /etc/nginx`.
+
+## Verifying the WebSocket path
+
+A plain `curl` gets a `426` or `400`, which is nginx doing the right thing. To
+see a real upgrade:
+
+```bash
+curl -isS -m 10 https://api.myptstudio.com/api/command-center/stream \
+  -H "Connection: Upgrade" \
+  -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" \
+  -H "Sec-WebSocket-Key: $(head -c16 /dev/urandom | base64)" | head -20
+```
+
+| You get | Means |
+|---|---|
+| `101 Switching Protocols` | the proxy is correct |
+| `400`/`426` from the app | the proxy is correct, the app rejected the handshake (auth) |
+| `502` | nginx reached nothing — is the backend container up? |
+| `200` with HTML | the request went to the **frontend**, not the API — wrong vhost |
+| hangs, then `504` | `proxy_read_timeout` is still the 60s default |
+
+## Certificates
+
+Issued by certbot. `api.myptstudio.com` needs its own certificate (or a SAN on
+the main one) — a certificate for `myptstudio.com` does **not** cover a
+subdomain, and a browser refuses a `wss://` to a host whose certificate does not
+match, with an error that looks like a WebSocket bug and is not.
+
+```bash
+sudo certbot --nginx -d myptstudio.com -d www.myptstudio.com
+sudo certbot --nginx -d api.myptstudio.com
+sudo certbot renew --dry-run
+```
+
+## What deliberately is NOT here
+
+**Security headers.** The frontend's `src/lib/security-headers.js` is the single
+source of truth and Next.js applies them. Setting them in nginx too is how they
+drift, and how a CSP ends up quietly weaker than the file claiming to define it.
+
+**Caching rules.** A deleted `vercel.json` carried a `no-store` policy that was
+never actually applied, because nothing served the app from Vercel. Reinstating
+it here would be introducing a caching change under the heading of a cleanup.
+If that policy is wanted, it should be a deliberate decision — Next.js already
+sets `immutable` on `/_next/static` itself.

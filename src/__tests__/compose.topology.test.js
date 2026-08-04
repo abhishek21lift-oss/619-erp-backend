@@ -4,8 +4,9 @@
  * The deployment topology, as a contract rather than a comment.
  *
  * BullMQ arrived with everything it needs in the application. What it did not
- * have was a Redis service on the box it runs on: render.yaml describes the
- * topology for Render, and nothing described it for the VPS. Without a `redis`
+ * have was a Redis service on the box it runs on: the only file describing a
+ * topology described a hosting platform this app does not run on, and nothing
+ * described the VPS. Without a `redis`
  * service, REDIS_URL stays unset there and every queue silently degrades to
  * the pre-queue inline path — safe, and completely inert.
  *

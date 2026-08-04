@@ -635,18 +635,28 @@ runMigrationsWithRetry()
       }, 'MY PT STUDIO API listening on port %d (%s)', PORT, NODE_ENV);
     });
 
-    // Render free tier sleeps after 15 min without inbound traffic — ping every
-    // 14 min, during studio hours only. See lib/keepalive.js for why the ping
-    // has to go to the public URL rather than localhost, and why it stops
-    // overnight instead of running around the clock.
+    // Keepalive — a leftover from a sleep-on-idle host, INERT on this VPS.
+    //
+    // The containers run under `restart: unless-stopped` and nothing spins them
+    // down, so there is nothing to keep awake. It stays because a future
+    // deployment might sleep again and because ripping out a working feature is
+    // not a cleanup; it is disabled simply by leaving KEEPALIVE_URL unset,
+    // which is the state on this box.
+    //
+    // The message below used to say the service "will sleep after 15 minutes
+    // idle" whenever the variable was absent. On a VPS that is false, and it is
+    // exactly the kind of line that sends someone chasing a problem that does
+    // not exist — so it now states what is true and leaves the judgement open.
     if (isProd) {
       const { resolveKeepalive, isWithinActiveHours } = require('./lib/keepalive');
       const PING_INTERVAL_MS = 14 * 60 * 1000;
       const ka = resolveKeepalive(process.env);
 
       if (!ka.url) {
-        logger.warn(
-          'Keepalive disabled — no RENDER_EXTERNAL_URL or KEEPALIVE_URL. The service will sleep after 15 minutes idle and the next visitor pays a cold start.'
+        logger.info(
+          'Keepalive not configured (no KEEPALIVE_URL). Expected on a VPS, where the '
+          + 'containers do not sleep; only set this if the app is ever moved to a host '
+          + 'that spins down when idle.'
         );
       } else {
         setInterval(() => {

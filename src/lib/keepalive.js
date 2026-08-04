@@ -1,7 +1,17 @@
 'use strict';
 
 /**
- * Keepalive scheduling for Render's free tier.
+ * Keepalive scheduling for a host that sleeps when idle.
+ *
+ * ── Status: INERT on the current deployment ─────────────────────────────────
+ *
+ * Production is a VPS running docker compose with `restart: unless-stopped`.
+ * Nothing spins the containers down, so there is nothing to keep awake, and the
+ * box leaves KEEPALIVE_URL unset — which disables all of this. It is kept
+ * because the scheduling logic is correct and tested, and a future move to a
+ * sleeping host would want it back. The reasoning below is written against the
+ * free-tier host this was originally built for: read it as history, not as a
+ * description of where the app runs today.
  *
  * Two things make this work that the previous self-ping got wrong.
  *

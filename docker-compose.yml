@@ -4,7 +4,8 @@
 #
 # BullMQ landed in #38 with everything it needs in the application — queues,
 # five workers, health checks, graceful shutdown, and a fallback to inline
-# sends when Redis is absent. render.yaml describes that topology for Render.
+# sends when Redis is absent. The only topology file this repo ever had described
+# a hosting platform the app does not run on.
 # Nothing described it for the VPS, which is where the app actually runs.
 #
 # Without a `redis` service, REDIS_URL stays unset on the box and every queue

@@ -48,7 +48,7 @@ describe('describeConfig', () => {
   });
 
   it('treats an empty string as unset', () => {
-    // An env var declared in render.yaml but left blank arrives as '' rather
+    // An env var declared in a deployment file but left blank arrives as '' rather
     // than undefined. isConfigured() is falsy on it, so this must agree —
     // otherwise the check reports "configured" for a server that cannot send.
     const r = describeConfig(ENV({ SMTP_HOST: 'h', SMTP_USER: 'u', SMTP_PASS: '' }));

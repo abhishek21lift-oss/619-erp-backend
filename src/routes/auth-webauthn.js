@@ -116,7 +116,7 @@ function getEffectiveRpId(req) {
   // /options and /verify, leaving only an orphaned challenge, which is
   // indistinguishable from a user who changed their mind. Turning that into a
   // named error is the difference between "passkeys don't work" and "RP_ID is
-  // not set". RP_ID / WEBAUTHN_ORIGIN are sync:false in render.yaml, so a
+  // not set". RP_ID / WEBAUTHN_ORIGIN are set per-deployment, so a
   // fresh deployment has neither until someone sets them by hand.
   if (isProd) throw new WebAuthnConfigError('rpId');
 

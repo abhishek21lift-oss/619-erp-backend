@@ -13,7 +13,7 @@
 // the signature: 6 challenges, 0 credentials, 0 login_events with a passkey
 // method, and not one webauthn row in activity_log.
 //
-// RP_ID and WEBAUTHN_ORIGIN are sync:false in render.yaml — deliberately not in
+// RP_ID and WEBAUTHN_ORIGIN are set per-deployment — deliberately not in
 // the repo — so a fresh deployment has neither until someone sets them by hand.
 // Making that a named 503 is the difference between "passkeys don't work" and
 // "RP_ID is not set on this deployment".

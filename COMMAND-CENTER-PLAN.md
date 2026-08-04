@@ -7,12 +7,22 @@ Written after searching the repository (the brief's §18) and after establishing
 what production actually is. Roughly 40% of the requested surface already exists
 in some form and must be reused rather than rebuilt (§1).
 
-**Correction on record:** the first draft of §2 claimed VPS monitoring and
-Docker control were impossible, because it took `render.yaml` for the
-deployment. It is not — production is a Hostinger VPS running docker compose,
-and `docker-compose.yml` says so in its own header. Everything in the brief is
-buildable. §2 is rewritten; the wrong version is not kept, but the mistake is
-noted here because it changed the shape of the plan.
+**Two corrections on record**, both the same mistake: reading a stale hosting
+artefact as a description of production.
+
+1. The first draft of §2 claimed VPS monitoring and Docker control were
+   impossible, because it took `render.yaml` for the deployment. Production is a
+   Hostinger VPS running docker compose, and `docker-compose.yml` says so in its
+   own header. Everything in the brief is buildable.
+2. §3's D1 then claimed Vercel sat in the request path and would block a
+   WebSocket, because the frontend carried a `vercel.json` and a Vercel-specific
+   error message. **The frontend also deploys to the same VPS** — its own
+   `.github/workflows/deploy.yml` runs `docker compose build frontend`. Vercel is
+   nowhere in the request path.
+
+Both stale files have since been deleted, and the routing that actually exists
+is version-controlled in `infra/nginx/`. That folder is the fix for the class of
+error, not just for the two instances.
 
 ---
 
@@ -49,15 +59,12 @@ app, and not a second health stack.
 
 **The first version of this section was wrong.** It read `render.yaml` and
 concluded the platform runs on Render free, and therefore that VPS monitoring
-and Docker control were impossible. `docker-compose.yml` says otherwise, in its
-own header:
+and Docker control were impossible. That file has since been **deleted** — it
+described a host this app does not run on and had already misled one reader.
 
-> "render.yaml describes that topology for Render. Nothing described it for the
-> VPS, **which is where the app actually runs**."
-
-Production is a **Hostinger VPS running docker compose**. `render.yaml` is the
-stale artefact. Confirmed by `.github/workflows/deploy.yml`: push to `main` →
-SSH → `cd /opt/myptstudio` → `docker compose build backend && up -d backend`.
+Production is a **Hostinger VPS running docker compose**, for BOTH halves.
+Confirmed by each repo's own `.github/workflows/deploy.yml`: push to `main` →
+SSH → `cd /opt/myptstudio` → `docker compose build backend|frontend && up -d`.
 
 Live topology:
 
@@ -66,6 +73,11 @@ Live topology:
 | `redis` | `redis:7-alpine` | bound to `127.0.0.1:6379`, appendonly, `maxmemory 256mb`, `noeviction`, compose healthcheck |
 | `api` | the Express app | `127.0.0.1:5000`, `RUN_WORKERS=0` |
 | `worker` | `node src/workers/index.js` | `RUN_WORKERS=1`, `stop_grace_period: 30s` |
+| `frontend` | Next.js standalone | `127.0.0.1:3000` |
+
+In front of all of it, on the host, sits **nginx** — routing on the Host header,
+now version-controlled in `infra/nginx/`. It was the one part of production
+nothing in either repo described.
 
 **Everything the brief asked for is buildable.** Host CPU/RAM/disk/load/
 temperature/process count come from `/proc` and `/sys`; Docker Center comes from
@@ -131,12 +143,42 @@ needs to be applied on the box (decision D6 below).
 
 | # | Decision | Consequence |
 |---|---|---|
-| **D1** | **WebSocket** | Adds `ws` to the backend. Nginx in front of the VPS needs `Upgrade`/`Connection` headers proxied for `/api/command-center/stream`. Polling every 5s remains the fallback. |
-| **D2** | **Real VPS monitoring. Ignore Render.** | `/proc` + `/sys` + Docker Engine API. `render.yaml` should be deleted or marked stale so nobody reads it as truth again. |
+| **D1** | **WebSocket** | Adds `ws` to the backend. nginx needs an `Upgrade`/`Connection` map for `/api/command-center/stream` — config in `infra/nginx/`. Polling every 5s remains the fallback. See D7/D8 for how the browser reaches it and how it authenticates. |
+| **D2** | **Real VPS monitoring. Ignore Render.** | `/proc` + `/sys` + Docker Engine API. ✅ `render.yaml` deleted, along with the frontend's `vercel.json`, so neither can be read as truth again. |
 | **D3** | **No Render API key** | Nothing lost — Render is not production. |
 | **D4** | **Hybrid logs** | ring buffer (hot, in-memory) → critical lines → `system_logs` table → archive/retention. |
 | **D5** | **Escalation ladder for recovery** | pause → drain in-flight → resume → if still unhealthy restart worker → if still unhealthy restart container. Never jump straight to a restart. |
 | **D6** | **OPEN — needs action on the VPS** | The compose changes in §2. Until then Docker/VPS cards report "not mounted" rather than guessing. |
+| **D7** | **One env var, scheme-derived** | `NEXT_PUBLIC_API_URL` is the single source of truth. `wsBase()` swaps `https`→`wss`, so a domain change is one edit and the two origins cannot disagree. No second `NEXT_PUBLIC_WS_URL`. |
+| **D8** | **Ticket auth for the socket** | Login → JWT cookie → `GET /api/ws-ticket` (authenticated, ~30s, single-use) → `wss://api.myptstudio.com/...?ticket=…` → verify → connected. |
+| **D9** | **Do NOT widen the cookie to `.myptstudio.com`** | Rejected deliberately: it would work, but it puts the session cookie on every subdomain forever to serve one transport. D8 achieves the same thing scoped to a 30-second, single-use credential. |
+
+### D7–D9 in detail — why the socket cannot just reuse the session
+
+The browser reaches the API two different ways, and only one of them can carry a
+WebSocket:
+
+```
+API calls    browser → nginx → frontend container → Next rewrite → backend
+WebSocket    browser → nginx ──────────────────────────────────→ backend
+```
+
+The Next.js rewrite is an HTTP proxy and does not pass an `Upgrade`, so realtime
+traffic must address `api.myptstudio.com` directly (**D7**).
+
+That creates the auth problem. `setTokenCookie` in `src/routes/auth.js` sets no
+`domain` attribute, so the cookie is **host-only** on `myptstudio.com` and is
+never sent to the `api` subdomain. Browsers also cannot set headers on a
+WebSocket, so `Authorization: Bearer` is unavailable. Two ways out, and the
+cheaper one is the wrong one:
+
+* Add `domain: '.myptstudio.com'` — one line, and it permanently broadens the
+  session cookie to every present and future subdomain to serve a single
+  feature. **Rejected (D9).**
+* Issue a short-lived ticket (**D8**). The ticket is minted over the path that
+  already works and authenticates, is worth ~30 seconds, is single-use, and
+  carries only the identity the socket needs. A leaked ticket is worth almost
+  nothing; a leaked session cookie is worth everything.
 
 ### D5 in detail — the recovery ladder
 
