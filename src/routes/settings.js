@@ -163,6 +163,45 @@ router.put('/branches/:id', auth, adminOnly, async (req, res, next) => {
   }
 });
 
+// DELETE /api/settings/branches/:id
+//
+// The client has always had a Delete Branch button; there was no route behind
+// it, so it 404'd and the row stayed on screen.
+//
+// Refuses rather than orphans. `clients.branch_id` holds the full
+// system_settings key (see the member_count subquery on GET /branches), and
+// there is no FK to cascade or null it out — deleting a branch with members
+// would leave those rows pointing at a key that no longer resolves, and they
+// would silently vanish from every per-branch view. A studio that wants the
+// branch out of the way without moving its members can PUT status:'inactive'.
+router.delete('/branches/:id', auth, adminOnly, async (req, res, next) => {
+  try {
+    const branchKey = 'branch_' + req.params.id;
+
+    const { rows: ex } = await pool.query(
+      'SELECT key FROM system_settings WHERE key=$1', [branchKey]
+    );
+    if (!ex[0]) return res.status(404).json({ error: 'Branch not found' });
+
+    const { rows: [{ member_count }] } = await pool.query(
+      `SELECT COUNT(*)::int AS member_count
+         FROM clients WHERE branch_id=$1 AND deleted_at IS NULL`,
+      [branchKey]
+    );
+    if (member_count > 0) {
+      return res.status(409).json({
+        error: `Cannot delete a branch with ${member_count} member${member_count === 1 ? '' : 's'}. `
+             + 'Move them to another branch first, or set this one to inactive.',
+      });
+    }
+
+    await pool.query('DELETE FROM system_settings WHERE key=$1', [branchKey]);
+    res.json({ message: 'Branch deleted' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── GYM / BIOMETRIC SETTINGS ─────────────────────────────────────────────────
 const GYM_KEYS = [
   'geofence_lat', 'geofence_lng', 'geofence_radius',

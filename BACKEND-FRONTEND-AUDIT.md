@@ -18,13 +18,17 @@ param semantics (`/:id` matches a literal segment).
 
 Five call sites reach an endpoint that does not exist. All five 404.
 
-| Verb | Path | Frontend origin | Live in UI? |
-|---|---|---|---|
-| `DELETE` | `/api/settings/branches/:id` | `lib/api/endpoints/studio.ts` | **Yes** |
-| `GET` | `/api/finance/dues` | `components/sidebar/Sidebar.tsx` | **Yes** |
-| `GET` | `/api/admin/export-database` | `lib/api/endpoints/platform.ts` | No |
-| `POST` | `/api/admin/backup-database` | `lib/api/endpoints/platform.ts` | No |
-| `GET` | `/api/reports/members` | `lib/api/endpoints/insights.ts` | No |
+| Verb | Path | Frontend origin | Live in UI? | Status |
+|---|---|---|---|---|
+| `DELETE` | `/api/settings/branches/:id` | `lib/api/endpoints/studio.ts` | **Yes** | Fixed — route added |
+| `GET` | `/api/finance/dues` | `components/sidebar/Sidebar.tsx` | **Yes** | Fixed — now `/api/reports/dues` |
+| `GET` | `/api/admin/export-database` | `lib/api/endpoints/platform.ts` | No | Open |
+| `POST` | `/api/admin/backup-database` | `lib/api/endpoints/platform.ts` | No | Open |
+| `GET` | `/api/reports/members` | `lib/api/endpoints/insights.ts` | No | Open |
+
+A sixth call, `GET /api/trainers/leave?status=pending` (also
+`Sidebar.tsx`), does not appear above because it *matches* a route — see
+§1.2. It has been fixed alongside the dues counter.
 
 ### 1.1 Delete Branch is a broken button
 
@@ -276,32 +280,84 @@ knowing that no server-side validation exists on those blobs.
 `pt_parq_documents` all confirmed: the FK column is `parq_form_id` in every
 case (see §5).
 
-**Security — RLS disabled on two tables.** Supabase advisors report
-`public.staff` and `public.staff_targets` have Row Level Security **off**,
-while all 168 other public tables have it on. Both are fully readable and
-writable by the `anon` and `authenticated` roles used by Supabase client
-libraries. Both are currently empty (0 rows), so nothing has leaked yet.
+**RLS disabled on two tables — lower severity than first reported.** `staff`
+and `staff_targets` are the only two public tables with Row Level Security
+off. The first version of this document repeated the Supabase advisor's
+wording — "fully exposed to anon and authenticated, anyone with the anon key
+can read or modify every row" — and that is **not accurate for this project**.
+Two checks against the live database corrected it:
 
-Enabling RLS with no policies blocks all access, so this needs policies
-written alongside — the other tables' `organization_id`-scoped policies are
-the pattern to copy:
+- Neither table grants anything to `anon` or `authenticated`. Only 14 objects
+  in `public` do, and these are not among them. Without a GRANT, PostgREST
+  cannot reach them whatever RLS says.
+- Both tables are empty.
 
-```sql
-ALTER TABLE public.staff        ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.staff_targets ENABLE ROW LEVEL SECURITY;
--- plus tenant policies matching the organization_id pattern used elsewhere
-```
+So there is no exposure today. It is still worth closing, because the only
+thing protecting these two is the *absence of a grant* — a future
+`GRANT ... ON ALL TABLES IN SCHEMA public`, or a Supabase default-privilege
+change, would quietly make them readable while the other 168 stayed protected
+by their policies.
+
+The fix is also not what this document first suggested. There are **no
+`organization_id`-scoped policies anywhere in this database** — all 241
+policies are deny-all (`USING false WITH CHECK false`). That is deliberate:
+the API connects as the table owner and bypasses RLS, so tenant isolation is
+enforced in application SQL via `tenantScope()`, and RLS exists only to make
+the anon/authenticated keys inert. A tenant-scoped policy here would be the
+outlier. Migration `148_staff_tables_rls.sql` follows the house pattern
+(deny-all + `REVOKE`), matching `130_admin_invitations.sql`.
+
+That migration is **written but deliberately not applied** to the Supabase
+project — applying DDL to the live database is the operator's call. It was
+verified against a throwaway local Postgres 16 instead: it applies cleanly, is
+idempotent on a second run, and — with grants deliberately restored to simulate
+the future blanket-`GRANT` scenario it defends against — `anon` reads 0 rows
+and its `INSERT` is rejected by the policy, while the owner connection the API
+uses still sees everything. Run it through the normal `npm run migrate` path.
+
+**The 14 anon-granted objects are safe, and worth recording as checked.** All
+14 are views (`v_clients`, `v_outstanding_dues`, `v_pt_balance_sheet`,
+`v_trainer_monthly_earnings`, …) and all have RLS off with no policies, which
+looks alarming in isolation. They are fine: every one of them is
+`security_invoker = true`, so a view runs with the *querying* role's
+privileges and the deny-all RLS on the underlying base tables applies. Had any
+been left at the default (`security_invoker` off), it would have run as its
+`postgres` owner and handed anon a cross-tenant read of every studio's client
+list and revenue. Worth not regressing — a new view added without
+`security_invoker = true` would be a genuine breach.
 
 ---
 
 ## Priority
 
-1. **PAR-Q `medical_clearance` / `consent` shape** (§2) — silent data loss plus
-   duplicate-row writes on every re-save.
-2. **RLS on `staff` / `staff_targets`** (§6) — open tables; cheap to fix while
-   they are still empty.
-3. **Sidebar badge paths** (§1.2) — two nav counters permanently zero.
-4. **`DELETE /api/settings/branches/:id`** (§1.1) — visibly broken button.
-5. **Six unenforced feature gates** (§3) — plan gating that gates only the UI.
-6. **Duplicate members/reports/sessions implementations** (§4.1) — drift risk.
-7. Dead client methods (§1.3), renewal endpoint sprawl (§4.2), type drift (§5).
+| # | Item | Status |
+|---|---|---|
+| 1 | **PAR-Q `medical_clearance` / `consent` shape** (§2) — silent data loss plus duplicate-row writes on every re-save | **Fixed** |
+| 2 | **Sidebar badge paths** (§1.2) — two nav counters permanently zero | **Fixed** |
+| 3 | **`DELETE /api/settings/branches/:id`** (§1.1) — visibly broken button | **Fixed** |
+| 4 | **RLS on `staff` / `staff_targets`** (§6) — hygiene, not exposure (see §6) | Migration `148` written, **not applied** |
+| 5 | **Six unenforced feature gates** (§3) — plan gating that gates only the UI | Open — needs a product decision |
+| 6 | **Duplicate members/reports/sessions implementations** (§4.1) — drift risk | Open — needs a direction call |
+| 7 | Dead client methods (§1.3), renewal endpoint sprawl (§4.2), type drift (§5) | Open — cleanup |
+
+Two items are deliberately left open because they are decisions rather than
+defects. §3 turns on whether those six flags are commercial plan gating (in
+which case six sellable features are unenforced) or nav tidying (in which case
+the registry entries should go). §4.1 turns on whether `/api/v1/*` is the
+intended direction or a stalled migration.
+
+### Found while fixing, not yet addressed
+
+**Branches are platform-global in a multi-tenant product.** `system_settings`,
+where branches live as `branch_<uuid>` keys, has **no `organization_id`
+column** — so the branch list is shared across every studio on the platform.
+`GET/POST/PUT /api/settings/branches` are all unscoped, and the new `DELETE`
+matches them rather than inventing scoping the table cannot express. If more
+than one studio is live, they are seeing and editing each other's branches.
+That is a schema change (`organization_id` on `system_settings`, backfill, then
+scoping all four routes), not a route patch.
+
+**Post-fix cleanup: duplicate PAR-Q clearance rows.** Forms saved under the old
+behaviour may carry duplicate `pt_medical_clearances` rows. The fix stops new
+ones and always shows the newest, so nothing is visibly wrong going forward,
+but a dedupe (keep newest per `parq_form_id`) would tidy the history.
