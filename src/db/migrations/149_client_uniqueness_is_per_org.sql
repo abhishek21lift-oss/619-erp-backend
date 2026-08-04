@@ -69,7 +69,25 @@
 -- login identity and must stay globally unique; trainers resolve to users, so
 -- the same reasoning applies. Only client records are per-studio data.
 
+-- The two old objects are NOT the same kind of thing, and dropping them takes
+-- two different statements.
+--
+--   pt_clients_mobile_unique  is a UNIQUE CONSTRAINT — `UNIQUE (mobile)`.
+--   pt_clients_email_unique   is a plain partial index, `WHERE email IS NOT
+--                             NULL`, which a constraint cannot express.
+--
+-- DROP INDEX cannot remove a constraint-backed index; Postgres refuses with
+-- "cannot drop index … because constraint … requires it". The first attempt to
+-- apply this migration failed on exactly that, because the local rehearsal had
+-- created mobile as a plain index rather than mirroring production's
+-- constraint. Both forms are handled below so this works against either shape:
+-- ALTER TABLE removes the constraint and its index together, and the following
+-- DROP INDEX is a no-op there but the real drop on a database where the object
+-- was only ever an index.
+ALTER TABLE pt_clients DROP CONSTRAINT IF EXISTS pt_clients_mobile_unique;
 DROP INDEX IF EXISTS pt_clients_mobile_unique;
+
+ALTER TABLE pt_clients DROP CONSTRAINT IF EXISTS pt_clients_email_unique;
 DROP INDEX IF EXISTS pt_clients_email_unique;
 
 CREATE UNIQUE INDEX IF NOT EXISTS pt_clients_org_mobile_unique
