@@ -1,12 +1,18 @@
 # MY PT STUDIO — Command Center: Implementation Plan
 
-**Status:** plan only, nothing built yet.
+**Status:** decisions locked (§3). Phase 1 in progress.
 **Survey date:** 2026-08-04, against `main` @ `b86b9db`.
 
 Written after searching the repository (the brief's §18) and after establishing
-what this deployment can actually observe. Both matter: roughly 40% of the
-requested surface already exists in some form, and two whole modules cannot be
-built on the current infrastructure at all.
+what production actually is. Roughly 40% of the requested surface already exists
+in some form and must be reused rather than rebuilt (§1).
+
+**Correction on record:** the first draft of §2 claimed VPS monitoring and
+Docker control were impossible, because it took `render.yaml` for the
+deployment. It is not — production is a Hostinger VPS running docker compose,
+and `docker-compose.yml` says so in its own header. Everything in the brief is
+buildable. §2 is rewritten; the wrong version is not kept, but the mistake is
+noted here because it changed the shape of the plan.
 
 ---
 
@@ -39,47 +45,140 @@ app, and not a second health stack.
 
 ---
 
-## 2. Infrastructure reality — what cannot be built as specified
+## 2. Infrastructure reality — CORRECTED
 
-`render.yaml` declares `runtime: node`, `plan: free`,
-`startCommand: node src/server.js`. **This is not a VPS and not a Docker
-deployment.** No Docker socket, no host filesystem, no useful `/proc`, no
-container API. Grepping confirms the codebase has never touched `dockerode`,
-`docker.sock`, `os.cpus()` or `/proc/stat`.
+**The first version of this section was wrong.** It read `render.yaml` and
+concluded the platform runs on Render free, and therefore that VPS monitoring
+and Docker control were impossible. `docker-compose.yml` says otherwise, in its
+own header:
 
-| Brief | Verdict | Why |
+> "render.yaml describes that topology for Render. Nothing described it for the
+> VPS, **which is where the app actually runs**."
+
+Production is a **Hostinger VPS running docker compose**. `render.yaml` is the
+stale artefact. Confirmed by `.github/workflows/deploy.yml`: push to `main` →
+SSH → `cd /opt/myptstudio` → `docker compose build backend && up -d backend`.
+
+Live topology:
+
+| Container | Role | Notes |
 |---|---|---|
-| §2 VPS Monitor — CPU %, RAM %, Disk %, network, load average, temperature, process count | **Not buildable** | Render exposes no host metrics. `os.totalmem()` inside the container reports the *host's* memory, not this service's share — printing it would be a confident lie on an ops screen. Disk, network and temperature have no source at all. |
-| §3 Docker Center — containers, image version, restart count, logs button, restart button | **Not buildable** | `runtime: node`. There are no containers to enumerate and no socket to enumerate them with. The repo's `Dockerfile` / `docker-compose.yml` are local-development only. |
-| §7 Workers — per-worker restart / restart count | **Partial** | Workers run **in-process** (`server.js:605`, `RUN_WORKERS !== '0'`). There is no separate worker process, so "restart the AI worker" means restarting the whole service. Job counts, concurrency and per-queue state are all real. |
-| §13 Live Logs | **Partial** | `pino` writes to stdout; Render keeps them, the app cannot query them. Needs a deliberate sink — decision D4. |
-| §14 Commands — restart backend, restart Redis | **Not buildable in-process** | A process cannot restart its own host. Possible only via the Render API with a key — decision D3. Clear queue, flush cache, run health check, test SMTP / AI / DB are all fine. |
-| §2/§10 CPU % | **Substitutable** | `process.cpuUsage()` gives this process's own CPU time, and event-loop lag is the number that actually predicts user-visible slowness. Both are honest; a host CPU gauge is not. |
+| `redis` | `redis:7-alpine` | bound to `127.0.0.1:6379`, appendonly, `maxmemory 256mb`, `noeviction`, compose healthcheck |
+| `api` | the Express app | `127.0.0.1:5000`, `RUN_WORKERS=0` |
+| `worker` | `node src/workers/index.js` | `RUN_WORKERS=1`, `stop_grace_period: 30s` |
 
-**Proposed rule for this build: the Command Center never renders a number it
-cannot actually measure.** An ops console showing a plausible fabricated CPU %
-is worse than one showing "not available on this host", because someone will
-make a 3am decision on it. Every panel that cannot be fed will say what it needs
-— a VPS, a Docker socket, a Render API key — instead of rendering a placebo.
+**Everything the brief asked for is buildable.** Host CPU/RAM/disk/load/
+temperature/process count come from `/proc` and `/sys`; Docker Center comes from
+the Docker Engine API; the `worker` container is genuinely separate, so
+per-worker restart is real, not a euphemism for restarting everything.
+
+### Three things that must be resolved on the box
+
+**A. The repo's compose file is not the one that runs.** Its own header says the
+live file is at `/opt/myptstudio/docker-compose.yml`, outside this repository,
+and the deploy script targets a service called **`backend`** while the repo file
+defines **`api`**. Service names, mounts and volumes must be read off the box
+before the Docker collector can name anything correctly.
+
+**B. The API container cannot see Docker or the host today.** Nothing mounts
+`/var/run/docker.sock`, `/proc` or `/sys` into it. Without those mounts the
+collectors return "unavailable" — correctly, but uselessly.
+
+**C. The container runs as a non-root user.** `Dockerfile` line 12 is
+`USER express` (uid 1001). Even with the socket mounted, `/var/run/docker.sock`
+is normally `root:docker 0660`, so uid 1001 cannot read it.
+
+### How to grant access — recommended shape
+
+Mounting the raw Docker socket into an internet-facing API container is
+effectively handing out root on the VPS: anything that can talk to that socket
+can start a privileged container and own the host. So:
+
+```yaml
+  # Allow-listed Docker access. The API never touches the raw socket.
+  dockerproxy:
+    image: tecnativa/docker-socket-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1       # list + inspect
+      POST: 1             # needed for restart
+      IMAGES: 1
+      INFO: 1
+      # everything else stays 0: no EXEC, no VOLUMES, no SECRETS, no SWARM
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - '127.0.0.1:2375:2375'
+
+  api:
+    environment:
+      DOCKER_HOST: tcp://dockerproxy:2375
+    volumes:
+      - /proc:/host/proc:ro     # host CPU, memory, load, process count
+      - /sys:/host/sys:ro       # thermal zones, block devices
+```
+
+With `EXEC: 0` the socket proxy cannot be used to run commands inside
+containers, which is the escalation path that matters. Host `/proc` and `/sys`
+are read-only mounts and expose no write surface.
+
+This is a change to the **live** compose file, which this repo cannot make. It
+needs to be applied on the box (decision D6 below).
 
 ---
 
-## 3. What replaces the impossible modules
+## 3. Decisions — LOCKED
 
-Not less ambition — a substitution of things that are true.
+| # | Decision | Consequence |
+|---|---|---|
+| **D1** | **WebSocket** | Adds `ws` to the backend. Nginx in front of the VPS needs `Upgrade`/`Connection` headers proxied for `/api/command-center/stream`. Polling every 5s remains the fallback. |
+| **D2** | **Real VPS monitoring. Ignore Render.** | `/proc` + `/sys` + Docker Engine API. `render.yaml` should be deleted or marked stale so nobody reads it as truth again. |
+| **D3** | **No Render API key** | Nothing lost — Render is not production. |
+| **D4** | **Hybrid logs** | ring buffer (hot, in-memory) → critical lines → `system_logs` table → archive/retention. |
+| **D5** | **Escalation ladder for recovery** | pause → drain in-flight → resume → if still unhealthy restart worker → if still unhealthy restart container. Never jump straight to a restart. |
+| **D6** | **OPEN — needs action on the VPS** | The compose changes in §2. Until then Docker/VPS cards report "not mounted" rather than guessing. |
 
-**Runtime Monitor** (replaces §2 VPS Monitor)
-`process.memoryUsage()` RSS / heap used / heap total / external;
-`process.cpuUsage()` as a share of wall time between samples; **event-loop lag**
-p50/p99 via `perf_hooks.monitorEventLoopDelay`; active handles and requests;
-`process.uptime()`; GC pause time via `PerformanceObserver`; Node and app
-version; pg pool total / idle / waiting. This is the real health of the service.
+### D5 in detail — the recovery ladder
 
-**Platform Monitor** (replaces §3 Docker Center)
-Render service state, latest deploy id / status / commit, instance restart count
-and "running since" — from the Render API when a key is supplied, otherwise the
-panel says so. Plus Supabase project health and Vercel deployment state, both of
-which have APIs.
+Each rung has an explicit health verdict and a stop condition. Nothing escalates
+on its own without either an operator click or an explicit auto-recover policy.
+
+```
+unhealthy signal
+  └─ 1. PAUSE queue          BullMQ pause(), in-flight jobs keep running
+     └─ 2. DRAIN             wait for active == 0, bounded (30s, matches
+                             stop_grace_period — a renewal job killed mid-flight
+                             is a card charged with no membership row)
+        └─ 3. RESUME         re-check health
+           └─ 4. RESTART WORKER    docker restart <worker>  (SIGTERM, 30s grace)
+              └─ 5. RESTART CONTAINER  the api/backend container
+                 └─ 6. STOP + PAGE     never loop; hand to a human
+```
+
+### One Click Recovery
+
+The flow the brief asks for, made safe:
+
+```
+detect  →  Guardian produces a finding with a confidence score
+        →  finding maps to a NAMED, allow-listed remediation
+        →  operator sees: what is wrong, why, what will run, blast radius
+        →  ONE CLICK  (typed confirmation for anything destructive)
+        →  pre-flight snapshot captured
+        →  remediation runs, streamed live over the WebSocket
+        →  post-flight health check
+        →  success → notify owner  |  failure → auto-rollback to previous rung
+        →  the whole run written to activity_log with actor + before/after
+```
+
+Rules, because this button can take production down:
+- **Never auto-executes below 95% confidence.** Default is suggest-only;
+  auto-recover is opt-in per remediation.
+- Every remediation is **idempotent** and has a **declared blast radius**
+  (which containers, expected downtime).
+- **Circuit breaker:** the same remediation may not fire twice within 10
+  minutes, and 3 failures in an hour disables auto-recovery until cleared.
+- A **dry-run** mode renders the exact commands without executing.
 
 ---
 
@@ -155,33 +254,7 @@ restart-actions in 5 depend on the decisions below.
 
 ---
 
-## 6. Decisions needed
-
-**D1 — Transport.** SSE (recommended) or WebSocket? SSE needs no dependency and
-fits the existing stack; WS adds `ws` and buys nothing for one-way push.
-
-**D2 — The impossible modules.** For VPS Monitor and Docker Center:
-(a) replace with Runtime Monitor + Platform Monitor as in §3;
-(b) keep the cards visible but permanently "requires a VPS / Docker host";
-(c) plan a migration off Render free onto a real VPS, at which point both become
-buildable exactly as specified.
-
-**D3 — Render API key.** With a `RENDER_API_KEY`, Platform Monitor gains deploy
-status, instance restarts and "running since", and "Restart Backend" becomes a
-real button. Without it, those stay unavailable.
-
-**D4 — Logs.** (a) in-memory ring of the last ~2000 lines: zero cost, lost on
-restart, current instance only; (b) a `system_logs` table with retention:
-durable and queryable, costs writes; (c) ship to an external sink (Better Stack,
-Axiom) and link out. Leaning (a) for Phase 8, with (b) for `error` level only.
-
-**D5 — Worker restart semantics.** Workers are in-process, so should "Restart
-Worker" mean pause+resume the BullMQ workers (safe, in-process), or a full
-service restart via the Render API (D3)?
-
----
-
-## 7. Explicit non-goals
+## 6. Explicit non-goals
 
 - No fabricated metrics. A card with no source says so.
 - No second Redis client, no second BullMQ registry, no second health endpoint.

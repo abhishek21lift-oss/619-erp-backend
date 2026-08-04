@@ -108,6 +108,12 @@ describe('super-admin API — the H-03 split', () => {
     'GET /billing/invoices/:id/pdf',
     'GET /billing/invoices/export',
     'GET /billing/settings',
+    // Command Center (Phase 1). Deliberate additions, not refactor drift —
+    // mounted under super-admin so the console inherits this mount's
+    // auth -> requireSuperAdmin -> requireSuperAdminMfa chain rather than
+    // standing up a second door to guard.
+    'GET /command-center/cards',
+    'GET /command-center/snapshot',
     'GET /coupons',
     'GET /coupons/:id/redemptions',
     'GET /features',

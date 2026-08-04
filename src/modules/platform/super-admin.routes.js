@@ -47,5 +47,10 @@ router.use(require('./super-admin/support'));
 router.use(require('./super-admin/storage'));
 router.use(require('./super-admin/registrations'));
 router.use(require('./super-admin/mail'));
+// Command Center. Mounted here rather than on its own /api path so it inherits
+// this mount's auth -> requireSuperAdmin -> requireSuperAdminMfa chain. The
+// console grows container-restart buttons in a later phase and must not have a
+// second door to guard.
+router.use(require('../command-center/command-center.routes'));
 
 module.exports = router;
