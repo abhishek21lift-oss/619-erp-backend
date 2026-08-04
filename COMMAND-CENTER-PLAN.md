@@ -247,7 +247,7 @@ Nothing merges that breaks an existing feature.
 | **5** | Commands: run health check, test SMTP, test AI, test DB, clear queue, flush cache — allow-listed, audited, confirm-gated; destructive ones behind a typed confirmation. | Control | ✅ done — rungs 1–3; 4–5 blocked on D6 |
 | **6** | Alert Center: thresholds → findings → alert lifecycle, history table, channels (browser first; email/WhatsApp reuse existing senders). | Alerting | ✅ done |
 | **7** | AI Guardian: deterministic rules engine first (correlations such as "queue depth rising **and** Redis latency rising → worker starvation"), then optional LLM narration over the *finding*, never over raw metrics. Confidence shown; recommendations advisory only. | Diagnosis | ✅ done |
-| **8** | Live Logs, per decision D4. | Logs | next |
+| **8** | Live Logs, per decision D4. | Logs | ✅ done |
 
 Phases 3, 8 and the restart-actions in 5 depend on the decisions below.
 
@@ -425,3 +425,70 @@ queue *collector* whether it worked rather than keeping its own idea of
 "healthy", so it can never disagree with the card. When it does not recover it
 names rung 4 and says plainly that rung 4 needs the Docker socket, instead of
 finishing at rung 3 and reporting success.
+
+
+### Phase 8 as built — the loop, and the two halves that stay separate
+
+**The bug this phase is mostly written to avoid.** Persisting error logs means
+that when the database is unhealthy, the INSERT fails. The obvious thing to do
+with a failed INSERT is log an error — which is at `error` level, so it is
+captured, so it is queued, so it fails, so it logs an error. That loop pins the
+CPU and floods the disk during exactly the incident the feature exists to
+investigate. Three guards, because any one alone is insufficient:
+
+1. **Re-entrancy flag** around the flush, so a line emitted *while* flushing is
+   never itself queued.
+2. **Failures go to `process.stderr` directly, never through the logger.** The
+   logger is what feeds this module. A test asserts against the real stderr,
+   because the whole point is that this path bypasses the logging stack.
+3. **The pending queue is bounded.** A database that stays down costs a fixed
+   amount of heap and a counter, not an OOM — otherwise the process dies of the
+   monitoring rather than of the problem. Dropped lines are counted and the
+   console shows the number, so the gap in the record is visible.
+
+All three were verified by mutation.
+
+**The two halves answer different questions and are not merged.**
+
+| | Ring (memory) | `system_logs` (Postgres) |
+|---|---|---|
+| Holds | everything recent | `error` and above only |
+| Survives restart | no | yes |
+| Covers | **this process only** | api **and worker** |
+| Cost | one array slot | one batched INSERT per 5s |
+
+Persisting every line would be a row for roughly every request — a tax on a
+database already carrying the product's load, paid forever, to store text that
+is interesting for four minutes. The ring is fast and lossy by design; the table
+is slow and durable by design; the UI never presents one as the other.
+
+**Why `source` exists.** Production runs two node processes in separate
+containers. Each has its own ring, and the console is served by the API — so the
+live tail can only ever show API lines. Without saying so, an operator watching
+a queue incident sees nothing from the worker and concludes the worker is dead.
+It is not: its errors are in `system_logs` and nowhere else. The worker gets its
+own flush interval (and a flush on SIGTERM, since the errors immediately
+preceding a shutdown are the interesting ones).
+
+**Capture is a pino multistream, not a wrapper.** Wrapping the logger's methods
+would miss child loggers and anything using pino directly, and would put a
+function call in front of every log statement in the app. stdout receives
+exactly what it did before, so `docker logs` is unaffected — this adds a reader,
+it does not move the output. `LOG_CAPTURE=off` restores the original
+single-stream logger, because this is the most widely required module in the app
+and a change here should be revertible by an environment variable rather than a
+deploy.
+
+**One thing the phase added that the brief did not ask for.** `lib/logger.js`
+redacts by *path* — authorization headers, passwords, emails. That covers
+structured fields and misses a secret sitting inside a free-text message or an
+error string. It did not matter much when those lines went to a VPS's stdout; it
+matters now that they are stored in a table and rendered in a browser. So the
+capture scrubs connection-string credentials, bearer tokens, JWTs and
+prefixed provider keys on the way in — conservatively, since over-masking costs
+an operator one ssh and under-masking puts a live credential in a database row.
+Verified end-to-end against the real logger: `postgres://admin:hunter2@…` reaches
+the ring as `postgres://admin:[REDACTED]@…` with the hostname intact.
+
+Migration 151 and every query the module issues were run against a real
+PostgreSQL 16, including the retention sweep deleting only the aged row.

@@ -15,6 +15,9 @@ const { registerCollectors, registry, snapshot } = require('./index');
 const commands = require('./commands.service');
 const alerts = require('./alerts.service');
 const guardian = require('./guardian.service');
+const logBuffer = require('./logBuffer');
+const logCapture = require('./logCapture');
+const pool = require('../../db/pool');
 
 registerCollectors();
 
@@ -152,6 +155,100 @@ router.post('/command-center/guardian/:id/explain', wrap(async (req, res, next) 
     if (!err.status) return next(err);
     res.status(err.status).json({ error: { code: 'FINDING_NOT_ACTIVE', message: err.message } });
   }
+}));
+
+// ── Live Logs (D4) ──────────────────────────────────────────────────────────
+//
+// Two reads, because the two halves of the hybrid answer different questions
+// and merging them would misrepresent both.
+//
+//   /logs          the in-memory ring: everything recent, THIS process only,
+//                  empty after a deploy. This is the live tail.
+//   /logs/history  `system_logs`: errors and above, durable, and covering the
+//                  worker container as well as this one.
+
+const LEVELS = logBuffer.LEVELS;
+
+/** Map a level name to its numeric floor. Unknown names mean "no floor". */
+function minLevelOf(name) {
+  const n = LEVELS[String(name || '').toLowerCase()];
+  return typeof n === 'number' ? n : 0;
+}
+
+/**
+ * GET /api/super-admin/command-center/logs
+ *   ?level=warn   floor, inclusive
+ *   ?q=           substring of the message
+ *   ?since=       epoch ms — only lines strictly newer, for cheap polling
+ *   ?limit=
+ */
+router.get('/command-center/logs', wrap(async (req, res) => {
+  const lines = logBuffer.tail({
+    minLevel: minLevelOf(req.query.level),
+    q: req.query.q,
+    since: Number(req.query.since) || 0,
+    limit: Number(req.query.limit) || 200,
+  });
+
+  res.json({
+    data: {
+      lines,
+      stats: logBuffer.stats(),
+      capture: logCapture.stats(),
+      // Said explicitly, because an operator who does not know this will look
+      // at a tail with no worker lines and conclude the worker is not logging.
+      scope_note: `In-memory ring for the '${logCapture.SOURCE}' process only, `
+        + 'cleared on restart. Worker errors are under History.',
+    },
+  });
+}));
+
+/**
+ * GET /api/super-admin/command-center/logs/history
+ *   ?level=error  floor (defaults to error — nothing below it is persisted)
+ *   ?source=api|worker
+ *   ?q=
+ *   ?limit=
+ */
+router.get('/command-center/logs/history', wrap(async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+  const minLevel = minLevelOf(req.query.level) || logCapture.PERSIST_FROM_LEVEL;
+
+  const where = ['level >= $1'];
+  const params = [minLevel];
+
+  if (req.query.source === 'api' || req.query.source === 'worker') {
+    params.push(req.query.source);
+    where.push(`source = $${params.length}`);
+  }
+  if (req.query.q) {
+    // Parameterised, never interpolated. These rows are read by a super admin
+    // but the value still arrives from a query string.
+    params.push(`%${String(req.query.q)}%`);
+    where.push(`msg ILIKE $${params.length}`);
+  }
+  params.push(limit);
+
+  const { rows } = await pool.query(
+    `SELECT id, level, level_label, logged_at, msg, source, pid, hostname, context
+       FROM system_logs
+      WHERE ${where.join(' AND ')}
+      ORDER BY logged_at DESC
+      LIMIT $${params.length}`,
+    params,
+  );
+
+  const { rows: counts } = await pool.query(
+    `SELECT
+       COUNT(*)::int                                          AS total,
+       COUNT(*) FILTER (WHERE source = 'worker')::int          AS from_worker,
+       COUNT(*) FILTER (WHERE level >= 60)::int                AS fatal,
+       COUNT(*) FILTER (WHERE logged_at > NOW() - INTERVAL '24 hours')::int AS last_24h,
+       MIN(logged_at)                                          AS oldest
+     FROM system_logs`,
+  );
+
+  res.json({ data: { lines: rows, stats: counts[0] } });
 }));
 
 module.exports = router;

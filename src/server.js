@@ -722,6 +722,29 @@ runMigrationsWithRetry()
       logger.info({ interval: '15min' }, 'UPI expiry sweeps scheduled');
     }
 
+    // Command Center log persistence (D4). The ring buffer needs no scheduling
+    // — it is filled synchronously by the logger — but the critical lines it
+    // queues are written in batches, and the table needs a retention sweep or
+    // it grows forever.
+    //
+    // Deliberately NOT wrapped in a logger call on failure: logCapture writes
+    // its own errors straight to stderr, because logging a failure to persist
+    // logs is how that feature turns into an infinite loop.
+    // Disable with LOG_CAPTURE=off (which also disables the capture itself).
+    if (process.env.LOG_CAPTURE !== 'off') {
+      const logCapture = require('./modules/command-center/logCapture');
+      // 5s: long enough to batch a burst into one statement, short enough that
+      // a crash loses only a few seconds of error lines — and they are still on
+      // stdout regardless, which Docker has already collected.
+      setInterval(() => { logCapture.flush(); }, 5 * 1000).unref();
+      // Retention. Hourly rather than daily so the delete is always small.
+      setInterval(() => { logCapture.prune(); }, 60 * 60 * 1000).unref();
+      logger.info(
+        { flush: '5s', retention_days: Number(process.env.LOG_RETENTION_DAYS) || 30 },
+        'Command Center log capture active',
+      );
+    }
+
     // Command Center alerting. Without this the Alert Center only notices a
     // problem while somebody has the console open, which is the opposite of
     // what alerting is for — the point is being told when you are NOT looking.

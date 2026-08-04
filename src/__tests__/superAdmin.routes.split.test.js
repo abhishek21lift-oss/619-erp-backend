@@ -118,6 +118,8 @@ describe('super-admin API — the H-03 split', () => {
     'GET /command-center/cards',
     'GET /command-center/commands',
     'GET /command-center/guardian',
+    'GET /command-center/logs',
+    'GET /command-center/logs/history',
     'GET /command-center/snapshot',
     'GET /coupons',
     'GET /coupons/:id/redemptions',
