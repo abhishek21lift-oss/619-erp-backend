@@ -442,11 +442,25 @@ app.use('/api/payments/upi',      userApiLimiter, require('./routes/upi-payments
 app.use('/api/payments',          userApiLimiter, require('./routes/payments'));
 app.use('/api/attendance',        ...gate('attendance'), require('./routes/attendance'));
 
-// ROUTE INTEGRITY NOTE (R-03):
-// Legacy /api/reports (routes/reports.js) and v3 /api/v1/reports
-// (modules/reports) coexist. Frontend pages must call the correct version.
-// New pages should use /api/v1/reports. Do not add endpoints to the legacy
-// router — it will be removed once all consumers are migrated.
+// ROUTE INTEGRITY NOTE (R-03) — SUPERSEDED, and deliberately reversed.
+//
+// This note used to read: "New pages should use /api/v1/reports. Do not add
+// endpoints to the legacy router — it will be removed once all consumers are
+// migrated." That direction is no longer correct and following it would be a
+// tenant-isolation regression, so /api/v1/reports has been deleted and THIS
+// router is the one to build on.
+//
+// What changed is that the v3 model underneath /api/v1/reports was abandoned.
+// It read members, payments and member_memberships; all three are empty, none
+// has an organization_id column, and modules/reports carried no tenant filter
+// of any kind — `GET /api/v1/reports/revenue` was `FROM payments p WHERE
+// p.deleted_at IS NULL` behind auth + admin/manager, i.e. every studio's
+// revenue to any studio's admin. This router scopes every query (see orgParam)
+// and reads the clients / pt_* tables the product actually writes to.
+//
+// So "legacy" had it backwards: /api/reports is the tenant-safe, live
+// implementation, and the migration target was the unsafe one. Do not
+// reintroduce a v1 reports router without organization_id on its tables.
 app.use('/api/reports',           userApiLimiter, ...gate('insights'), require('./routes/reports'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
@@ -530,10 +544,30 @@ app.use('/api/automation',       require('./modules/automation/automation.routes
 // ────────────────────────
 // v3 MODULE ROUTES
 // ────────────────────────
+//
+// /api/v1/pt-sessions and /api/v1/reports were removed along with
+// modules/sessions and modules/reports. Both were unreachable from the client
+// and duplicated live implementations (/api/pt-os/sessions and /api/reports),
+// but the reason they had to go rather than be left alone is tenant isolation:
+// neither carried any. `GET /api/v1/reports/revenue` was auth + admin/manager
+// with `FROM payments p WHERE p.deleted_at IS NULL` and no organization filter,
+// so any studio's admin could read every studio's revenue. routes/reports.js,
+// which the client actually calls, scopes every query.
+//
+// They were harmless in practice only because they read the abandoned v3
+// tables — members, payments and member_memberships are all empty, and none of
+// the three even has an organization_id column to filter on. That is precisely
+// what made them dangerous to keep: the day anyone populated those tables, five
+// endpoints would have started serving cross-tenant data with no code change
+// and nothing to notice it. They cannot be fixed in place without a schema
+// change to tables holding no data, so deleting them is the honest option.
+//
+// /api/v1/members is still mounted because the client calls two of its routes,
+// and /api/v1/notifications because it backs the notification bell. See
+// BACKEND-FRONTEND-AUDIT.md §4.1 — members has the same missing-org-column
+// problem and needs the same decision.
 app.use('/api/v1/members',        require('./modules/members/members.routes'));
-app.use('/api/v1/pt-sessions',    require('./modules/sessions/sessions.routes'));
 app.use('/api/v1/notifications',  require('./modules/notifications/notifications.routes'));
-app.use('/api/v1/reports',        require('./modules/reports/reports.routes'));
 
 // ────────────────────────
 // 404 + GLOBAL ERROR HANDLER
