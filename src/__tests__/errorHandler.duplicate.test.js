@@ -56,7 +56,7 @@ describe('duplicate-key responses', () => {
     expect(res.body.error).toMatch(/email/i);
   });
 
-  test('the legacy clients table constraints map too', () => {
+  test('the legacy clients table constraints map too (if it is ever scoped)', () => {
     expect(run(dupe('clients_org_mobile_uniq')).body.error).toMatch(/mobile number/i);
     expect(run(dupe('clients_org_email_uniq')).body.error).toMatch(/email/i);
   });

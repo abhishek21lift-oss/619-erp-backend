@@ -1,6 +1,6 @@
 -- 149_client_uniqueness_is_per_org.sql
 --
--- Client mobile/email uniqueness was PLATFORM-WIDE, not per studio.
+-- Client mobile/email uniqueness on pt_clients was PLATFORM-WIDE, not per studio.
 --
 --   CREATE UNIQUE INDEX pt_clients_mobile_unique ON pt_clients (mobile);
 --
@@ -14,37 +14,61 @@
 --
 -- From inside ADVENTURE PT STUDIO the client list was empty, so "this record
 -- already exists" was not just unhelpful, it was untrue as far as that user
--- could see. It reads as a broken button. The studio owner reasonably blamed
--- the device they were on, because the retry happened to be on another one.
+-- could see. It reads as a broken button.
 --
--- This is not an edge case. A person who trains at two studios, a shared family
--- number, a couple using one mobile, or the same test number reused during
--- onboarding all hit it. It is also a cross-tenant information leak: the error
--- lets any studio probe whether a phone number or email exists ANYWHERE on the
--- platform, which is a fact about someone else's client list.
+-- Not an edge case: a person training at two studios, a shared family number, a
+-- couple on one mobile, or a reused onboarding number all hit it. It is also a
+-- cross-tenant information leak — the error let any studio probe whether a
+-- phone number or email exists ANYWHERE on the platform, which is a fact about
+-- someone else's client list.
 --
--- Uniqueness is now scoped to (organization_id, …). Within one studio a
--- duplicate mobile is still rejected, which is the rule that was actually
--- wanted; across studios it is none of their business.
+-- ── Why this does NOT weaken tenant isolation ────────────────────────────────
 --
--- Two other corrections while replacing these:
+-- Isolation here is enforced by tenantScope() in application SQL (every read
+-- and write ANDs organization_id), plus deny-all RLS that makes the anon and
+-- authenticated keys inert. A unique index governs what may be WRITTEN, never
+-- who may READ. Dropping a global constraint cannot widen anyone's visibility.
+-- The global index was itself the leak; removing it narrows the surface.
+--
+-- Verified before writing this: no code path looks a client up by mobile or
+-- email and assumes a single global row. Every by-email lookup in the codebase
+-- targets `users`, whose global uniqueness is untouched below.
+--
+-- ── Scope: pt_clients only ───────────────────────────────────────────────────
+--
+-- An earlier draft also rewrote clients_mobile_uniq / clients_email_uniq on the
+-- legacy `clients` table. That was wrong and would have aborted the migration:
+-- `clients` has NO organization_id column, so the CREATE INDEX referenced a
+-- column that does not exist. It slipped through local validation because the
+-- throwaway test schema was hand-written WITH an organization_id rather than
+-- mirrored from production — the check confirmed the SQL against a table that
+-- does not exist anywhere real.
+--
+-- The migration runner wraps each file in BEGIN/COMMIT and rolls back on error,
+-- so the failure would have been clean rather than destructive. It would simply
+-- not have fixed anything.
+--
+-- `clients` is left exactly as it is: it holds 0 rows, it is the superseded
+-- roster (the product writes pt_clients), and without an organization_id column
+-- its uniqueness cannot be scoped anyway. Making it per-org is part of giving
+-- that table a tenant boundary at all — a separate change, and only worth doing
+-- if the table is ever revived. See BACKEND-FRONTEND-AUDIT.md §4.0.
+--
+-- ── Two incidental corrections to the pt_clients indexes ─────────────────────
 --
 --   * pt_clients_mobile_unique had no WHERE clause, so two clients with an
---     empty-string mobile collided ('' is not NULL). The clients table already
---     guarded against that; pt_clients did not. Both now exclude '' and NULL.
---   * pt_clients_email_unique compared email verbatim while clients_email_uniq
---     used lower(email). Both now use lower(), so Ravi@x.com and ravi@x.com are
---     the same address everywhere.
+--     empty-string mobile collided ('' is not NULL). Now excluded.
+--   * pt_clients_email_unique compared email verbatim, so Ravi@x.com and
+--     ravi@x.com were different addresses. Now lower().
 --
--- Safe to apply to existing data: the indexes being dropped were STRICTLY
--- stronger than the ones replacing them, so anything that satisfied the global
--- constraint satisfies the per-org one. No duplicates can be waiting.
+-- Safe on existing data: the indexes being dropped were STRICTLY stronger than
+-- the ones replacing them, so anything that satisfied the global constraint
+-- satisfies the per-org one. No duplicates can be waiting.
 --
 -- NOT touched: users_email_key and trainers_email_uniq. A user's email is their
 -- login identity and must stay globally unique; trainers resolve to users, so
 -- the same reasoning applies. Only client records are per-studio data.
 
--- ── pt_clients ───────────────────────────────────────────────────────────────
 DROP INDEX IF EXISTS pt_clients_mobile_unique;
 DROP INDEX IF EXISTS pt_clients_email_unique;
 
@@ -54,16 +78,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS pt_clients_org_mobile_unique
 
 CREATE UNIQUE INDEX IF NOT EXISTS pt_clients_org_email_unique
   ON pt_clients (organization_id, lower(email))
-  WHERE email IS NOT NULL AND email <> '';
-
--- ── clients (legacy roster) ──────────────────────────────────────────────────
-DROP INDEX IF EXISTS clients_mobile_uniq;
-DROP INDEX IF EXISTS clients_email_uniq;
-
-CREATE UNIQUE INDEX IF NOT EXISTS clients_org_mobile_uniq
-  ON clients (organization_id, mobile)
-  WHERE mobile IS NOT NULL AND mobile <> '';
-
-CREATE UNIQUE INDEX IF NOT EXISTS clients_org_email_uniq
-  ON clients (organization_id, lower(email))
   WHERE email IS NOT NULL AND email <> '';
