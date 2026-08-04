@@ -176,6 +176,59 @@ from the registry and nav if they were only ever cosmetic.
 Of 573 routes, 109 are never called. Most are legitimate; the ones worth
 acting on are grouped below.
 
+### 4.0 The v1 modules had no tenant isolation — two are now deleted
+
+Investigating §4.1 turned up something more serious than duplication. None of
+the `/api/v1` module routers carried any tenant filter:
+
+| Module | org-scoping references | Status |
+|---|---|---|
+| `routes/reports.js` (live, client-facing) | **23** | correct — the benchmark |
+| `modules/reports` | **0** | **deleted** |
+| `modules/sessions` | **0** | **deleted** |
+| `modules/members` | **0** | still mounted — see below |
+| `modules/bookings` | **0** | still mounted — see below |
+| `modules/notifications` | 0 | safe — scopes by `user_id` |
+
+The clearest case:
+
+```js
+router.get('/revenue', auth, requireRole('admin','manager'), wrap(async (req, res) => {
+  const where = ['p.deleted_at IS NULL'];        // …and nothing else
+  //  FROM payments p LEFT JOIN trainers t ON t.id = p.trainer_id
+```
+
+Any studio's admin or manager could call `GET /api/v1/reports/revenue` and
+receive every studio's revenue, grouped by trainer or plan. `/dues`,
+`/retention`, `/trainer-payouts` and `/export` were the same, as were the
+pt-sessions routes.
+
+**Why it had not leaked, and why that was the danger.** These routers read the
+abandoned v3 tables: `members`, `payments` and `member_memberships` are all
+empty, so the endpoints returned nothing. None of those three tables even has
+an `organization_id` column — the v3 model predates multi-tenancy and was
+dropped in favour of the `clients` / `pt_*` tables, which are scoped. The
+exposure was therefore latent, not active: the day anyone populated those
+tables, five endpoints would have begun serving cross-tenant data with no code
+change and nothing to notice. They could not be fixed in place without a schema
+change to tables holding no data, so they were deleted.
+
+**This reverses a documented direction.** `server.js` carried ROUTE INTEGRITY
+NOTE R-03: *"New pages should use /api/v1/reports. Do not add endpoints to the
+legacy router — it will be removed once all consumers are migrated."* Following
+that today would have migrated live, tenant-scoped reporting onto an unscoped
+implementation over empty tables. The note has been rewritten in place to
+record the reversal so nobody restores the old plan.
+
+**Still open, same problem.** `/api/v1/members` (client calls `GET /:id` and
+`GET /:id/metrics`) authorises by role only — `ctx()` does not even carry
+`organization_id` — so an admin of studio A can fetch a member of studio B by
+id. It reads the empty `members` table, so it 404s today, and the member
+dashboard swallows that into a permanent empty state. `/api/v1/bookings` is
+likewise unscoped over a `bookings` table with no `organization_id` and 0 rows.
+Both need the same call as the deleted pair: delete and migrate the two client
+call sites, or add `organization_id` to those tables and scope them.
+
 ### 4.1 Three modules that are entirely dead
 
 Mounted only under `/api/v1`, with a parallel non-v1 implementation the
@@ -338,7 +391,7 @@ list and revenue. Worth not regressing — a new view added without
 | 4 | **RLS on `staff` / `staff_targets`** (§6) — hygiene, not exposure (see §6) | Migration `148` written, **not applied** |
 | 5 | Dead client methods (§1.3) and PAR-Q type drift (§5) | **Fixed** |
 | 6 | **Six unenforced feature gates** (§3) | Open — **product decision, by design** |
-| 7 | **Duplicate members/reports/sessions implementations** (§4.1) — drift risk | Open — needs a direction call |
+| 7 | **Unscoped v1 modules** (§4.0) — cross-tenant reads, latent | `reports` + `sessions` **deleted**; `members` + `bookings` open |
 | 8 | Renewal endpoint sprawl (§4.2) | Open — cleanup |
 
 **On §3, this document was wrong to call it a gap.** `requireFeature` in
