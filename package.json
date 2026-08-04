@@ -23,6 +23,7 @@
     "migrate": "node src/db/migrate.js",
     "verify:smtp": "node scripts/verify-smtp.js",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --forceExit --detectOpenHandles",
+    "diagnose:redis": "node --require ./diagnostics/redis-trace.js src/server.js",
     "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch --forceExit",
     "verify:embeddings": "node scripts/verify-embeddings.js",
     "verify:indexes": "node scripts/verify-indexes.js"
