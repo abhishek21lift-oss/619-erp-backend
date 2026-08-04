@@ -237,20 +237,75 @@ treated as one.
 Each phase ends with: tests green, lint clean, a verification note, one commit.
 Nothing merges that breaks an existing feature.
 
-| Phase | Scope | Deliverable |
-|---|---|---|
-| **0** | This document + decisions D1–D5 | agreed scope |
-| **1** | Collector framework: `registry`, `snapshot.service`, timeout/cache harness, plus `runtime` + `database` + `redis` + `queue` collectors. `GET /api/command-center/snapshot`. Refactor `system-health` onto it. | Real data, one endpoint, no UI |
-| **2** | Remaining collectors: `ai`, `smtp`, `security`, `http` request-timing ring, `platform`. Per-domain endpoints from §16. | Full backend surface |
-| **3** | SSE `GET /api/command-center/stream` + per-card diffing so only changed cards re-render. Polling fallback. | Live updates |
-| **4** | Frontend `CommandCenterTab` on `/platform`: card grid, status colours, sparklines, skeleton and unavailable states, framer-motion transitions. Built from the existing `ui/` kit. | The console |
-| **5** | Commands: run health check, test SMTP, test AI, test DB, clear queue, flush cache — allow-listed, audited, confirm-gated; destructive ones behind a typed confirmation. | Control |
-| **6** | Alert Center: thresholds → findings → alert lifecycle, history table, channels (browser first; email/WhatsApp reuse existing senders). | Alerting |
-| **7** | AI Guardian: deterministic rules engine first (correlations such as "queue depth rising **and** Redis latency rising → worker starvation"), then optional LLM narration over the *finding*, never over raw metrics. Confidence shown; recommendations advisory only. | Diagnosis |
-| **8** | Live Logs, per decision D4. | Logs |
+| Phase | Scope | Deliverable | Status |
+|---|---|---|---|
+| **0** | This document + decisions D1–D5 | agreed scope | ✅ done |
+| **1** | Collector framework: `registry`, `snapshot.service`, timeout/cache harness, plus `runtime` + `database` + `redis` + `queue` collectors. `GET /api/command-center/snapshot`. Refactor `system-health` onto it. | Real data, one endpoint, no UI | ✅ done |
+| **2** | Remaining collectors: `ai`, `smtp`, `security`, `http` request-timing ring, `platform`. Per-domain endpoints from §16. | Full backend surface | ✅ done |
+| **3** | WebSocket `/api/command-center/stream` (D1) + per-card diffing so only changed cards re-render. Polling fallback. | Live updates | ⏸ needs nginx `Upgrade` headers on the VPS |
+| **4** | Frontend `CommandCenterTab` on `/platform`: card grid, status colours, sparklines, skeleton and unavailable states, framer-motion transitions. Built from the existing `ui/` kit. | The console | ✅ done |
+| **5** | Commands: run health check, test SMTP, test AI, test DB, clear queue, flush cache — allow-listed, audited, confirm-gated; destructive ones behind a typed confirmation. | Control | ✅ done — rungs 1–3; 4–5 blocked on D6 |
+| **6** | Alert Center: thresholds → findings → alert lifecycle, history table, channels (browser first; email/WhatsApp reuse existing senders). | Alerting | next |
+| **7** | AI Guardian: deterministic rules engine first (correlations such as "queue depth rising **and** Redis latency rising → worker starvation"), then optional LLM narration over the *finding*, never over raw metrics. Confidence shown; recommendations advisory only. | Diagnosis | pending |
+| **8** | Live Logs, per decision D4. | Logs | pending |
 
-**Phase 1 is unblocked and can start immediately.** Phases 3, 8 and the
-restart-actions in 5 depend on the decisions below.
+Phases 3, 8 and the restart-actions in 5 depend on the decisions below.
+
+### Phase 5 as built — and the one thing it deliberately does not do
+
+The brief asks for a **Flush Cache** button. Implemented the obvious way, that
+button is a data-loss bug on this deployment, and it took reading the compose
+file to see it: **Redis here holds nothing but BullMQ.** A grep across `src/`
+finds no `set`/`get`/`hset` outside the queue modules, and the Redis service is
+deliberately configured `appendonly yes` + `maxmemory-policy noeviction` because,
+as `docker-compose.yml` puts it, *"a queue that empties on reboot is not a
+queue"*. A `FLUSHDB` behind that button would not clear a cache. It would delete
+every pending invitation email and every scheduled membership renewal, and
+report success.
+
+So `cache.flush` clears the Command Center's **own collector TTL cache** — a real
+cache, safe to drop, and the thing an operator actually wants when they ask for
+fresh numbers. Its description says so on the card, and a test asserts it never
+reaches Redis.
+
+The rest of the allow-list, with rungs 1–3 of the D5 ladder runnable:
+
+| Command | Destructive | Notes |
+|---|---|---|
+| `health.check` | no | Re-probes every collector, bypassing the TTL cache |
+| `cache.flush` | no | Collector cache only. Never touches Redis |
+| `database.test` | no | Round-trips a query; reports latency and pool state |
+| `redis.test` | no | PING through the shared client |
+| `smtp.test` | no | The live handshake the 30s tick deliberately never makes |
+| `ai.test` | no | One minimal prompt. Costs money, hence a 15s cooldown |
+| `queue.pause` | no | Rung 1 |
+| `queue.drain` | no | Rung 2. Waits ≤30s, matching the worker's `stop_grace_period` |
+| `queue.resume` | no | Rung 3 |
+| `queue.retryFailed` | **yes** | Side effects repeat — an email may send twice |
+| `queue.clearFailed` | **yes** | Irreversible: the payloads go too |
+| `worker.restart` | **yes** | Rung 4 — **UNAVAILABLE**, needs the Docker socket (D6) |
+| `container.restart` | **yes** | Rung 5 — **UNAVAILABLE**, needs the Docker socket (D6) |
+
+Safety properties, each covered by a test verified to fail against a mutated
+implementation:
+
+* Destructive commands require a typed confirmation **equal to the command
+  name**. A generic truthy `"yes"` is refused, so a click-through cannot satisfy
+  the gate.
+* Availability is checked **ahead of** confirmation — an operator never types
+  the name of a command that was never going to run.
+* Queue names are validated up front against `QUEUE_NAMES`: a clean 400 that
+  never constructs a queue and never burns the cooldown, because a typo must not
+  lock you out of the command you meant.
+* Every run is audited, **failures included** — a failed restart is the more
+  interesting row. An audit-write failure cannot mask the result.
+* Per-command cooldowns stop a double-click firing twice.
+* Dry run describes without executing, without auditing, without consuming the
+  cooldown — and **without bypassing confirmation**, since a preview that
+  skipped the gate would be a bypass.
+
+Rungs 4–5 are declared rather than hidden, so the console shows the whole ladder
+and names exactly what is missing instead of looking complete.
 
 ---
 
