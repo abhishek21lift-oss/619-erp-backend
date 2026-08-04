@@ -14,6 +14,7 @@ const router = require('express').Router();
 const { registerCollectors, registry, snapshot } = require('./index');
 const commands = require('./commands.service');
 const alerts = require('./alerts.service');
+const guardian = require('./guardian.service');
 
 registerCollectors();
 
@@ -119,6 +120,37 @@ router.post('/command-center/alerts/:id/resolve', wrap(async (req, res, next) =>
   } catch (err) {
     if (!err.status) return next(err);
     res.status(err.status).json({ error: { code: 'ALERT_NOT_LIVE', message: err.message } });
+  }
+}));
+
+// ── AI Guardian ─────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/super-admin/command-center/guardian
+ *
+ * Deterministic correlations across cards. No AI is called here — this is the
+ * rules engine, and it answers in single-digit milliseconds off the cached
+ * snapshot. An empty `findings` with a `note` means the rules RAN and matched
+ * nothing, which is a different claim from the Guardian not having run.
+ */
+router.get('/command-center/guardian', wrap(async (req, res) => {
+  res.json({ data: await guardian.analyse({ fresh: req.query.fresh === '1' }) });
+}));
+
+/**
+ * POST /api/super-admin/command-center/guardian/:id/explain
+ *
+ * Narrates ONE finding. Separate from the read above, and a POST, because it
+ * costs money: narrating on every poll would spend tokens restating text
+ * already on screen. The model is given the finding and its evidence, never the
+ * raw snapshot, and it cannot change the diagnosis, severity or confidence.
+ */
+router.post('/command-center/guardian/:id/explain', wrap(async (req, res, next) => {
+  try {
+    res.json({ data: await guardian.explain(req.params.id) });
+  } catch (err) {
+    if (!err.status) return next(err);
+    res.status(err.status).json({ error: { code: 'FINDING_NOT_ACTIVE', message: err.message } });
   }
 }));
 

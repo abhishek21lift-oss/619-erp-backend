@@ -246,8 +246,8 @@ Nothing merges that breaks an existing feature.
 | **4** | Frontend `CommandCenterTab` on `/platform`: card grid, status colours, sparklines, skeleton and unavailable states, framer-motion transitions. Built from the existing `ui/` kit. | The console | ✅ done |
 | **5** | Commands: run health check, test SMTP, test AI, test DB, clear queue, flush cache — allow-listed, audited, confirm-gated; destructive ones behind a typed confirmation. | Control | ✅ done — rungs 1–3; 4–5 blocked on D6 |
 | **6** | Alert Center: thresholds → findings → alert lifecycle, history table, channels (browser first; email/WhatsApp reuse existing senders). | Alerting | ✅ done |
-| **7** | AI Guardian: deterministic rules engine first (correlations such as "queue depth rising **and** Redis latency rising → worker starvation"), then optional LLM narration over the *finding*, never over raw metrics. Confidence shown; recommendations advisory only. | Diagnosis | next |
-| **8** | Live Logs, per decision D4. | Logs | pending |
+| **7** | AI Guardian: deterministic rules engine first (correlations such as "queue depth rising **and** Redis latency rising → worker starvation"), then optional LLM narration over the *finding*, never over raw metrics. Confidence shown; recommendations advisory only. | Diagnosis | ✅ done |
+| **8** | Live Logs, per decision D4. | Logs | next |
 
 Phases 3, 8 and the restart-actions in 5 depend on the decisions below.
 
@@ -370,3 +370,58 @@ correct would stop the API container from starting.
   performs allow-listed operational actions only.
 - Not a replacement for Sentry. Sentry stays the error tracker; this correlates
   and controls.
+
+
+### Phase 7 as built — a confident wrong answer is the thing to design against
+
+The demo-friendly build is: serialise the snapshot, hand it to a model, ask
+"what is wrong". It always answers — including when nothing is wrong, and
+including when the real cause is not in the data — and **nothing in the output
+separates "found it" from "wrote something that reads like finding it".** An
+operator acting on the second at 3am is worse off than one with no guidance.
+
+So the diagnosis is decided by rules that can be read, argued with and tested.
+The model's only job is to reword a finding the codebase already stands behind.
+It cannot create a finding, change a severity, or move a confidence number — and
+a test asserts exactly that, by having the model reply *"Actually the database is
+the problem and I am 100% certain"* and checking the finding is unchanged.
+
+**The rules are correlations, never thresholds.** Collectors own thresholds and
+already do them well; a rule that re-checked one would be a second place for the
+number to go stale. What a collector *cannot* do is look at another card:
+
+| Rule | The correlation, and the misdiagnosis it prevents |
+|---|---|
+| `worker.starvation` | jobs waiting **and** nothing active **and Redis healthy**. Without the Redis half, the queue card is red and somebody restarts Redis — which is fine. |
+| `redis.enqueue_failure_imminent` | memory high **and policy is noeviction**. On an eviction policy the same number is normal operation; here writes get *rejected*, so renewals fail to enqueue. |
+| `mail.silently_discarded` | mail critical **and the email queue is accumulating failures** — sends are being attempted and rejected at the transport. Mail failing with a *clean* email queue is a different bug in a different file. |
+| `runtime.event_loop_blocked` | lag high **and CPU low**. High lag with high CPU is a busy process wanting capacity; low CPU means something synchronous is holding the loop, and scaling would not help. Opposite fixes. |
+| `database.connections_held` | pool waiting **and** idle-in-transaction **and requests slowing**. Waiters with no user-visible effect is a headroom question; waiters slowing requests is an incident. |
+| `http.slow_because_database` | API p95 high **and** DB latency high **and** the loop healthy. The anti-symptom-chasing rule: without it, an hour goes into profiling request handlers. |
+| `ai.provider_degraded` | fallback rate high **and** the ai queue backing up. A rate alone cannot tell a degraded provider from simply sending fewer requests. |
+
+A structural test enforces this — every rule must read more than one card. It
+**failed on first run** and caught three of these rules reading a single card;
+they were strengthened with the cross-card signal each was missing rather than
+the test being weakened.
+
+**Confidence is computed, and shown next to the list it summarises.** A model
+asked "how confident are you" emits a number with nothing behind it. Here it is
+derived from which signals fired, and the UI prints all of them — including a
+section most versions of this screen omit: **what could not be checked**. "Redis
+is healthy" and "we cannot see Redis" are different states; an engine that
+conflated them would confidently blame the worker on a box where Redis was never
+configured. An unknown *trigger* never satisfies a rule at all; an unknown
+*corroborating* signal lowers confidence and says so by name.
+
+Confidence is capped below 1.0. A rules engine claiming certainty about a system
+it observes through eight sampled probes is lying.
+
+**One Click Recovery** (D5) ships here as `recovery.run`: assess → pause → drain
+→ resume → verify, on one queue, **stopping as soon as the queue is healthy**.
+Stopping early is the point — a routine that always runs to the end restarts a
+healthy worker, and that is how ops teams stop trusting the button. It asks the
+queue *collector* whether it worked rather than keeping its own idea of
+"healthy", so it can never disagree with the card. When it does not recover it
+names rung 4 and says plainly that rung 4 needs the Docker socket, instead of
+finishing at rung 3 and reporting success.

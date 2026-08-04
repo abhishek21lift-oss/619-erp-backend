@@ -295,6 +295,81 @@ const COMMANDS = {
     },
   },
 
+  // ── One Click Recovery ────────────────────────────────────────────────────
+  //
+  // The D5 ladder as one action: pause -> wait for in-flight work -> resume,
+  // re-checking health at each step and STOPPING as soon as the queue recovers.
+  //
+  // Stopping early is the point. A recovery routine that always runs to the end
+  // is a routine that restarts a healthy worker, and the reason ops teams stop
+  // trusting the button. Each rung is only climbed because the one below it did
+  // not work.
+  //
+  // Rungs 4-5 (restart worker, restart container) are part of the ladder and
+  // are NOT reached here, because they need the Docker socket. The result says
+  // so rather than quietly finishing at rung 3 and reporting success.
+  'recovery.run': {
+    label: 'One Click Recovery',
+    description:
+      'Runs the recovery ladder on one queue: pause, let in-flight jobs finish, resume — '
+      + 'stopping as soon as the queue is healthy again.',
+    blastRadius:
+      'The queue stops accepting new work for up to 30 seconds while jobs already running '
+      + 'finish. Nothing is lost — work accumulates and drains on resume. If the queue does '
+      + 'not recover, the next rung needs the Docker socket and will be reported, not run.',
+    destructive: true,
+    cooldownMs: 30_000,
+    acceptsQueue: true,
+    get unavailable() {
+      return redis.isConfigured() ? null : 'REDIS_URL is not set — there is no queue to recover.';
+    },
+    async run({ queue: name }) {
+      const { getQueue } = require('../../jobs/queue');
+      const q = getQueue(assertQueue(name));
+      const steps = [];
+
+      const health = async () => {
+        // Reuse the collector rather than a second definition of "healthy" —
+        // a recovery routine that disagreed with the console about whether it
+        // worked would be worse than no routine.
+        const { collect } = require('./collectors/queue.collector');
+        const card = await collect();
+        const mine = (card.data?.queues ?? []).find((x) => x.name === name) ?? null;
+        return { status: card.status, queue: mine };
+      };
+
+      const before = await health();
+      steps.push({ step: 'assess', ...before });
+
+      steps.push({ step: 'pause', done: true });
+      await q.pause();
+
+      const drained = await drainQueue(q);
+      steps.push({ step: 'drain', ...drained });
+
+      await q.resume();
+      steps.push({ step: 'resume', done: true });
+
+      const after = await health();
+      steps.push({ step: 'verify', ...after });
+
+      const recovered = after.status === 'healthy'
+        || (after.queue && after.queue.waiting === 0);
+
+      return {
+        queue: name,
+        recovered: Boolean(recovered),
+        steps,
+        // Honest about where the ladder stops on this deployment.
+        next_rung: recovered ? null : {
+          command: 'worker.restart',
+          available: false,
+          reason: DOCKER_REASON,
+        },
+      };
+    },
+  },
+
   // ── Recovery ladder, rungs 4–5 — declared, not yet runnable ───────────────
   // Present so the console shows the whole ladder and says exactly what is
   // missing, rather than hiding the rungs and looking complete.

@@ -47,6 +47,10 @@ const mockPoolQuery = jest.fn(async () => ({ rows: [{ db: 'myptstudio', version:
 const mockVerifyConnection = jest.fn(async () => ({ ok: true }));
 const mockSnapshotInvalidate = jest.fn();
 const mockSnapshotCollect = jest.fn(async () => ({ cards: {} }));
+const mockQueueCollect = jest.fn(async () => ({
+  name: 'queues', status: 'healthy',
+  data: { queues: [{ name: 'email', waiting: 0, active: 0, failed: 0 }] },
+}));
 
 jest.mock('../lib/logger', () => ({
   info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn(),
@@ -61,6 +65,12 @@ jest.mock('../db/pool', () => ({
 jest.mock('../modules/command-center/snapshot.service', () => ({
   invalidate: mockSnapshotInvalidate,
   collect: mockSnapshotCollect,
+}));
+// One Click Recovery asks the queue COLLECTOR whether it worked, rather than
+// keeping its own idea of "healthy". A recovery routine that disagreed with the
+// console about whether it succeeded would be worse than no routine.
+jest.mock('../modules/command-center/collectors/queue.collector', () => ({
+  NAME: 'queues', collect: mockQueueCollect,
 }));
 
 const commands = require('../modules/command-center/commands.service');
@@ -306,6 +316,84 @@ describe('cooldown', () => {
   test('cooldowns are per command, not global', async () => {
     await commands.run('smtp.test', { req });
     await expect(commands.run('database.test', { req })).resolves.toBeTruthy();
+  });
+});
+
+// ── One Click Recovery ──────────────────────────────────────────────────────
+describe('recovery.run', () => {
+  const confirm = 'recovery.run';
+
+  test('is destructive and refuses a bare press', async () => {
+    await expect(commands.run('recovery.run', { req, queue: 'email' }))
+      .rejects.toMatchObject({ status: 428 });
+    expect(mockQueue.pause).not.toHaveBeenCalled();
+  });
+
+  test('climbs the ladder in order: assess, pause, drain, resume, verify', async () => {
+    const out = await commands.run('recovery.run', { req, queue: 'email', confirm });
+
+    expect(out.output.steps.map((s) => s.step))
+      .toEqual(['assess', 'pause', 'drain', 'resume', 'verify']);
+    // Pause before drain, resume after — a drain that ran before the pause
+    // would be waiting on a queue still accepting new work.
+    expect(mockQueue.pause).toHaveBeenCalled();
+    expect(mockQueue.resume).toHaveBeenCalled();
+  });
+
+  test('reports success when the queue comes back healthy', async () => {
+    const out = await commands.run('recovery.run', { req, queue: 'email', confirm });
+    expect(out.output.recovered).toBe(true);
+    // Nothing further is proposed, because nothing further is needed.
+    expect(out.output.next_rung).toBeNull();
+  });
+
+  test('when it does NOT recover, it names the next rung and says it cannot run it', async () => {
+    // The honesty that makes the button trustworthy. Finishing at rung 3 and
+    // reporting success would be the version an operator stops believing.
+    mockQueueCollect.mockResolvedValue({
+      name: 'queues', status: 'critical',
+      data: { queues: [{ name: 'email', waiting: 500, active: 0, failed: 0 }] },
+    });
+
+    const out = await commands.run('recovery.run', { req, queue: 'email', confirm });
+
+    expect(out.output.recovered).toBe(false);
+    expect(out.output.next_rung.command).toBe('worker.restart');
+    expect(out.output.next_rung.available).toBe(false);
+    expect(out.output.next_rung.reason).toMatch(/docker\.sock/);
+
+    mockQueueCollect.mockResolvedValue({
+      name: 'queues', status: 'healthy',
+      data: { queues: [{ name: 'email', waiting: 0, active: 0, failed: 0 }] },
+    });
+  });
+
+  test('it asks the collector whether it worked, not itself', async () => {
+    // Twice: once to assess, once to verify. Reusing the collector is what
+    // stops "recovered" meaning something different here than on the card.
+    await commands.run('recovery.run', { req, queue: 'email', confirm });
+    expect(mockQueueCollect).toHaveBeenCalledTimes(2);
+  });
+
+  test('it still resumes the queue when the drain times out', async () => {
+    // The failure that would turn a recovery button into an outage: pausing a
+    // queue and leaving it paused because the drain gave up waiting.
+    //
+    // Fake timers rather than a real 30s wait — the drain bound is matched to
+    // the worker's stop_grace_period and is not something to shorten for a
+    // test, but neither is it something to sit through on every run.
+    jest.useFakeTimers();
+    mockQueue.getActiveCount.mockResolvedValue(3);
+
+    const run = commands.run('recovery.run', { req, queue: 'email', confirm });
+    await jest.advanceTimersByTimeAsync(35_000);
+    const out = await run;
+
+    expect(out.output.steps.find((s) => s.step === 'drain').drained).toBe(false);
+    expect(mockQueue.resume).toHaveBeenCalled();
+
+    jest.useRealTimers();
+    mockQueue.getActiveCount.mockResolvedValue(0);
   });
 });
 
