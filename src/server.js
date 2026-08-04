@@ -293,11 +293,29 @@ app.use(requestId);
 // ────────────────────────
 // STRUCTURED REQUEST LOGGER
 // ────────────────────────
+const httpMetrics = require('./modules/command-center/httpMetrics');
+
 app.use(function(req, res, next) {
   const start = Date.now();
   res.on('finish', function() {
     const ms = Date.now() - start;
     if (req.path.startsWith('/api/')) {
+      // Feed the Command Center's latency ring from the timing that already
+      // happens here rather than adding a second middleware doing the same
+      // work — two timers would double the cost and could disagree with these
+      // logs the moment someone edits one of them.
+      //
+      // req.route?.path is the MATCHED route ('/:id'), so the key is
+      // '/api/clients/:id' and not a distinct endpoint per client id. Falls
+      // back to the raw path for 404s, which have no matched route. Never
+      // allowed to break the response.
+      try {
+        const matched = req.route?.path
+          ? `${req.baseUrl || ''}${req.route.path}`
+          : req.path;
+        httpMetrics.record(req.method, matched, res.statusCode, ms);
+      } catch { /* metrics must never affect a response */ }
+
       logger.info({
         method: req.method,
         url: req.originalUrl,

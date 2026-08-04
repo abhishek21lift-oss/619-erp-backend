@@ -29,6 +29,10 @@ const runtime = require('./collectors/runtime.collector');
 const redisCollector = require('./collectors/redis.collector');
 const queueCollector = require('./collectors/queue.collector');
 const databaseCollector = require('./collectors/database.collector');
+const aiCollector = require('./collectors/ai.collector');
+const smtpCollector = require('./collectors/smtp.collector');
+const securityCollector = require('./collectors/security.collector');
+const httpCollector = require('./collectors/http.collector');
 
 let registered = false;
 
@@ -39,6 +43,15 @@ function registerCollectors() {
   registry.register(redisCollector.NAME, redisCollector.collect, { timeoutMs: 3000, ttlMs: 1000 });
   registry.register(queueCollector.NAME, queueCollector.collect, { timeoutMs: 5000, ttlMs: 2000 });
   registry.register(databaseCollector.NAME, databaseCollector.collect, { timeoutMs: 5000, ttlMs: 5000 });
+  // http reads an in-memory ring — free, so no cache.
+  registry.register(httpCollector.NAME, httpCollector.collect, { timeoutMs: 1000, ttlMs: 0 });
+  // ai/security aggregate over log tables; 10s is well inside a useful window
+  // and keeps the console off the product's own database load.
+  registry.register(aiCollector.NAME, aiCollector.collect, { timeoutMs: 5000, ttlMs: 10_000 });
+  registry.register(securityCollector.NAME, securityCollector.collect, { timeoutMs: 5000, ttlMs: 10_000 });
+  // smtp's default probe is config + delivery history, no handshake; 30s
+  // because none of that changes second to second.
+  registry.register(smtpCollector.NAME, smtpCollector.collect, { timeoutMs: 5000, ttlMs: 30_000 });
   registered = true;
 }
 
