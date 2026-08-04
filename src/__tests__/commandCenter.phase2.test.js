@@ -11,8 +11,15 @@
 //   security calling failed logins from one address an attack.
 'use strict';
 
+// The security collector reaches db/pool, which calls logger.fatal and
+// process.exit(1) when DATABASE_URL is absent. There is no global jest setup
+// file in this repo, so each suite supplies its own env — without this the
+// suite passed or failed depending on what happened to be exported in the
+// shell, which is not a test result.
+process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://u:p@127.0.0.1:1/none';
+
 jest.mock('../lib/logger', () => ({
-  info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn(),
+  info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn(), fatal: jest.fn(),
 }));
 
 const { STATUS } = require('../modules/command-center/registry');
