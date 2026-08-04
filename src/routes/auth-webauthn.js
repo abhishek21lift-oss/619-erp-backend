@@ -124,25 +124,66 @@ function getEffectiveRpId(req) {
   return 'localhost';
 }
 
+/**
+ * Every origin we will accept, given one we already trust — the origin itself
+ * plus its `www`-toggled sibling.
+ *
+ * This exists because of a real failure. WEBAUTHN_ORIGIN was set to the apex,
+ * `https://myptstudio.com`, while the browser was served from
+ * `https://www.myptstudio.com`. The ceremony then failed at the last possible
+ * moment, in /register/verify:
+ *
+ *   Unexpected registration response origin "https://www.myptstudio.com",
+ *   expected "https://myptstudio.com"
+ *
+ * Note this got as far as step 3, so nothing was wrong with rpId: the browser
+ * had already accepted `myptstudio.com` because an RP ID only has to be a
+ * registrable suffix of the page's domain, and the apex is a suffix of `www.`.
+ * Only the origin comparison, which is exact, rejected it. So the two checks
+ * disagreed about the same deployment — the RP ID spanned www and apex while
+ * the origin did not.
+ *
+ * Toggling exactly one `www` label is the narrowest way to close that gap. It
+ * cannot widen trust beyond what rpId already permits, and it deliberately
+ * does NOT accept arbitrary subdomains — `evil.myptstudio.com` stays rejected.
+ */
+function withWwwSibling(origins) {
+  const out = [];
+  for (const o of origins) {
+    if (!out.includes(o)) out.push(o);
+    let u;
+    try { u = new URL(o); } catch { continue; }
+    u.hostname = u.hostname.startsWith('www.')
+      ? u.hostname.slice(4)
+      : `www.${u.hostname}`;
+    // href on a bare origin gains a trailing slash; WebAuthn origins have none.
+    const sibling = u.origin;
+    if (!out.includes(sibling)) out.push(sibling);
+  }
+  return out;
+}
+
 function getExpectedOrigin(req) {
   if (process.env.WEBAUTHN_ORIGIN) {
     const list = process.env.WEBAUTHN_ORIGIN.split(',').map(o => o.trim()).filter(Boolean);
-    return list.length === 1 ? list[0] : list;
+    return withWwwSibling(list);
   }
 
   const origin = req.headers.origin;
-  if (origin) return origin;
+  if (origin) return withWwwSibling([origin]);
 
   // Reconstruct from x-forwarded-host + x-forwarded-proto (Vercel proxy)
   const fwdHost = req.headers['x-forwarded-host'];
   if (fwdHost) {
     const host = String(fwdHost).split(',')[0].trim();
     const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
-    if (host && host !== 'localhost') return `${proto}://${host}`;
+    if (host && host !== 'localhost') return withWwwSibling([`${proto}://${host}`]);
   }
 
   const rpId = getEffectiveRpId(req);
-  return rpId === 'localhost' ? 'http://localhost:3000' : `https://${rpId}`;
+  return rpId === 'localhost'
+    ? 'http://localhost:3000'
+    : withWwwSibling([`https://${rpId}`]);
 }
 
 // Lazy-load @simplewebauthn/server so a missing module only fails at call-time
