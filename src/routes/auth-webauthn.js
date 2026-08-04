@@ -27,6 +27,57 @@ const authnLimiter = rateLimit({
 const RP_NAME = process.env.RP_NAME || 'MY PT STUDIO';
 const isProd  = process.env.NODE_ENV === 'production';
 
+/**
+ * Raised when neither the env vars nor the request headers can tell us which
+ * domain this instance serves, so no honest WebAuthn ceremony is possible.
+ * Carries its own HTTP shape because the generic error handler would render it
+ * as an opaque 500 — and an opaque 500 is exactly the failure mode this is
+ * here to eliminate.
+ */
+class WebAuthnConfigError extends Error {
+  constructor(what) {
+    super(
+      `WebAuthn is not configured on this deployment: cannot determine the ${what}. ` +
+      'Set RP_ID to the bare domain the frontend is served from (no scheme, no port) ' +
+      'and WEBAUTHN_ORIGIN to its full origin, then redeploy. ' +
+      'Both are per-deployment values and are intentionally not in the repo.'
+    );
+    this.name = 'WebAuthnConfigError';
+    this.status = 503;
+    this.code = 'WEBAUTHN_NOT_CONFIGURED';
+  }
+}
+
+/**
+ * Wraps a route so a WebAuthnConfigError becomes its own 503 with an
+ * actionable message instead of falling through to the generic handler.
+ *
+ * Intercepts BOTH exits, because every route in this file already wraps its
+ * body in `try { … } catch (err) { next(err) }`. That inner catch swallows the
+ * throw before it can reach this function, so catching alone never fires — the
+ * error reaches the app's generic handler and renders as an opaque 500, which
+ * is precisely the failure mode this exists to replace. Hence the wrapped
+ * `next`: it is the path that actually runs, and the try/catch is the backstop
+ * for any future route that lets an error escape instead.
+ */
+function withConfigCheck(handler) {
+  return async function configChecked(req, res, next) {
+    const render = (err) => {
+      logger.error({ code: err.code }, err.message);
+      return res.status(err.status).json({ error: err.message, code: err.code });
+    };
+    const guardedNext = (err) =>
+      (err instanceof WebAuthnConfigError ? render(err) : next(err));
+
+    try {
+      return await handler(req, res, guardedNext);
+    } catch (err) {
+      if (err instanceof WebAuthnConfigError) return render(err);
+      return next(err);
+    }
+  };
+}
+
 // Derive rpId and expectedOrigin when env vars are not set.
 // Priority: RP_ID env var > Origin header > x-forwarded-host (Vercel proxy) > localhost.
 // When the frontend is on Vercel and rewrites /api/* to this backend, the browser
@@ -56,6 +107,18 @@ function getEffectiveRpId(req) {
       return host;
     }
   }
+
+  // In production this fallback cannot work, and failing here is the whole
+  // point. rpId='localhost' served to a browser on a real domain makes
+  // navigator.credentials.create() throw SecurityError ("not a registrable
+  // domain suffix of the current domain") — client-side, with nothing logged
+  // server-side and no row written anywhere. The ceremony dies between
+  // /options and /verify, leaving only an orphaned challenge, which is
+  // indistinguishable from a user who changed their mind. Turning that into a
+  // named error is the difference between "passkeys don't work" and "RP_ID is
+  // not set". RP_ID / WEBAUTHN_ORIGIN are sync:false in render.yaml, so a
+  // fresh deployment has neither until someone sets them by hand.
+  if (isProd) throw new WebAuthnConfigError('rpId');
 
   logger.warn('RP_ID env var not set and no usable origin header — falling back to localhost');
   return 'localhost';
@@ -146,7 +209,7 @@ async function logEvent(req, action, detail) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /register/options
-router.post('/register/options', auth, async (req, res, next) => {
+router.post('/register/options', auth, withConfigCheck(async (req, res, next) => {
   try {
     const user = req.user;
     const rpId = getEffectiveRpId(req);
@@ -190,10 +253,10 @@ router.post('/register/options', auth, async (req, res, next) => {
     logger.error({ err: err.message }, 'register/options unexpected error');
     next(err);
   }
-});
+}));
 
 // POST /register/verify
-router.post('/register/verify', auth, async (req, res, next) => {
+router.post('/register/verify', auth, withConfigCheck(async (req, res, next) => {
   try {
     const user = req.user;
     const { registration, deviceName, deviceType: clientDeviceType } = req.body;
@@ -271,14 +334,14 @@ router.post('/register/verify', auth, async (req, res, next) => {
 
     res.json({ success: true, credential: { id: rows[0].id } });
   } catch (err) { next(err); }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AUTHENTICATION — login with passkey (no session required)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /login/options
-router.post('/login/options', authnLimiter, async (req, res, next) => {
+router.post('/login/options', authnLimiter, withConfigCheck(async (req, res, next) => {
   try {
     const email = String(req.body?.email || '').trim().toLowerCase();
     let userId = null;
@@ -313,10 +376,10 @@ router.post('/login/options', authnLimiter, async (req, res, next) => {
     await saveChallenge(options.challenge, userId, 'authentication');
     res.json(options);
   } catch (err) { next(err); }
-});
+}));
 
 // POST /login/verify
-router.post('/login/verify', authnLimiter, async (req, res, next) => {
+router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next) => {
   try {
     const { authentication } = req.body;
     if (!authentication) return res.status(400).json({ error: 'authentication payload is required' });
@@ -414,7 +477,7 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
       },
     });
   } catch (err) { next(err); }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ACTION VERIFICATION — logged-in user re-verifying for a sensitive action
@@ -422,7 +485,7 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /action/options
-router.post('/action/options', auth, async (req, res, next) => {
+router.post('/action/options', auth, withConfigCheck(async (req, res, next) => {
   try {
     const user = req.user;
     const { rows: creds } = await pool.query(
@@ -447,10 +510,10 @@ router.post('/action/options', auth, async (req, res, next) => {
     await saveChallenge(options.challenge, user.id, 'action');
     res.json(options);
   } catch (err) { next(err); }
-});
+}));
 
 // POST /action/verify
-router.post('/action/verify', auth, async (req, res, next) => {
+router.post('/action/verify', auth, withConfigCheck(async (req, res, next) => {
   try {
     const user = req.user;
     const { authentication } = req.body;
@@ -513,7 +576,7 @@ router.post('/action/verify', auth, async (req, res, next) => {
 
     res.json({ actionToken });
   } catch (err) { next(err); }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CREDENTIAL MANAGEMENT — user's own passkeys
