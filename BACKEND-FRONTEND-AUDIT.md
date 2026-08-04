@@ -336,15 +336,31 @@ list and revenue. Worth not regressing — a new view added without
 | 2 | **Sidebar badge paths** (§1.2) — two nav counters permanently zero | **Fixed** |
 | 3 | **`DELETE /api/settings/branches/:id`** (§1.1) — visibly broken button | **Fixed** |
 | 4 | **RLS on `staff` / `staff_targets`** (§6) — hygiene, not exposure (see §6) | Migration `148` written, **not applied** |
-| 5 | **Six unenforced feature gates** (§3) — plan gating that gates only the UI | Open — needs a product decision |
-| 6 | **Duplicate members/reports/sessions implementations** (§4.1) — drift risk | Open — needs a direction call |
-| 7 | Dead client methods (§1.3), renewal endpoint sprawl (§4.2), type drift (§5) | Open — cleanup |
+| 5 | Dead client methods (§1.3) and PAR-Q type drift (§5) | **Fixed** |
+| 6 | **Six unenforced feature gates** (§3) | Open — **product decision, by design** |
+| 7 | **Duplicate members/reports/sessions implementations** (§4.1) — drift risk | Open — needs a direction call |
+| 8 | Renewal endpoint sprawl (§4.2) | Open — cleanup |
 
-Two items are deliberately left open because they are decisions rather than
-defects. §3 turns on whether those six flags are commercial plan gating (in
-which case six sellable features are unenforced) or nav tidying (in which case
-the registry entries should go). §4.1 turns on whether `/api/v1/*` is the
-intended direction or a stalled migration.
+**On §3, this document was wrong to call it a gap.** `requireFeature` in
+`src/lib/features.js` carries an explicit note from its author: *"Express
+guard. Deliberately NOT applied to any existing route. Wiring an existing Admin
+Studio route to a flag changes that studio's behaviour, which is a product
+decision, not a side effect of building the control plane."* The nine gates
+that exist are nine decisions someone made; the six that do not are six
+decisions not yet made. That is a staging choice, not an oversight.
+
+Adding them would be safe *today* — every feature currently resolves to on for
+every studio (0 rows in `organization_features`, 0 with `default_enabled` or
+`global_enabled` false, 0 disabled `plan_features`, across 5 organizations), so
+the six gates would be a behavioural no-op until someone toggles a flag. But
+"safe today" is not the same as "correct", and which of the six should become
+gateable is a commercial question.
+
+§4.1 turns on whether `/api/v1/*` is the intended direction or a stalled
+migration. Note `/api/v1/members` cannot simply be deleted — the frontend calls
+`GET /:id` and `GET /:id/metrics` from it — so that one needs a migration of
+those two call sites first, while `modules/sessions` and `modules/reports` have
+zero callers and could go today.
 
 ### Found while fixing, not yet addressed
 
@@ -357,7 +373,11 @@ than one studio is live, they are seeing and editing each other's branches.
 That is a schema change (`organization_id` on `system_settings`, backfill, then
 scoping all four routes), not a route patch.
 
-**Post-fix cleanup: duplicate PAR-Q clearance rows.** Forms saved under the old
-behaviour may carry duplicate `pt_medical_clearances` rows. The fix stops new
-ones and always shows the newest, so nothing is visibly wrong going forward,
-but a dedupe (keep newest per `parq_form_id`) would tidy the history.
+**Post-fix cleanup: not needed after all.** An earlier draft flagged that forms
+saved under the old behaviour would carry duplicate `pt_medical_clearances`
+rows and suggested a dedupe migration. Checked against the live database:
+`pt_medical_clearances` holds **0 rows**, and `pt_consent_records` holds 4 rows
+across 4 distinct `parq_form_id`s — **no duplicates anywhere**. The duplicate
+path needed an existing clearance to be reopened and re-saved, and with no
+clearance ever created it was never taken. The defect was real and the fix
+stands; it simply had not corrupted anything yet. No migration required.
