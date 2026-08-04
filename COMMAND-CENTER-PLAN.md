@@ -245,8 +245,8 @@ Nothing merges that breaks an existing feature.
 | **3** | WebSocket `/api/command-center/stream` (D1) + per-card diffing so only changed cards re-render. Polling fallback. | Live updates | ⏸ needs nginx `Upgrade` headers on the VPS |
 | **4** | Frontend `CommandCenterTab` on `/platform`: card grid, status colours, sparklines, skeleton and unavailable states, framer-motion transitions. Built from the existing `ui/` kit. | The console | ✅ done |
 | **5** | Commands: run health check, test SMTP, test AI, test DB, clear queue, flush cache — allow-listed, audited, confirm-gated; destructive ones behind a typed confirmation. | Control | ✅ done — rungs 1–3; 4–5 blocked on D6 |
-| **6** | Alert Center: thresholds → findings → alert lifecycle, history table, channels (browser first; email/WhatsApp reuse existing senders). | Alerting | next |
-| **7** | AI Guardian: deterministic rules engine first (correlations such as "queue depth rising **and** Redis latency rising → worker starvation"), then optional LLM narration over the *finding*, never over raw metrics. Confidence shown; recommendations advisory only. | Diagnosis | pending |
+| **6** | Alert Center: thresholds → findings → alert lifecycle, history table, channels (browser first; email/WhatsApp reuse existing senders). | Alerting | ✅ done |
+| **7** | AI Guardian: deterministic rules engine first (correlations such as "queue depth rising **and** Redis latency rising → worker starvation"), then optional LLM narration over the *finding*, never over raw metrics. Confidence shown; recommendations advisory only. | Diagnosis | next |
 | **8** | Live Logs, per decision D4. | Logs | pending |
 
 Phases 3, 8 and the restart-actions in 5 depend on the decisions below.
@@ -306,6 +306,59 @@ implementation:
 
 Rungs 4–5 are declared rather than hidden, so the console shows the whole ladder
 and names exactly what is missing instead of looking complete.
+
+### Phase 6 as built — the Alert Center is a noise problem, not a detection one
+
+The collectors already detect; Phase 2 spent its effort making those grades
+honest. So the tempting version of Phase 6 is four lines: on every tick, insert
+a row for every card that is not healthy.
+
+That version is worse than nothing. **SMTP on this platform has been broken
+continuously since launch.** At a 60s tick it produces 1,440 rows a day
+describing one fact, the Alert Center opens on a wall of them, and an operator
+learns inside a week to ignore the screen — taking the genuine alerts with it.
+
+So an alert here is the **condition**, and it has a lifetime:
+
+| Property | Mechanism |
+|---|---|
+| Dedup | Partial unique index on `(fingerprint) WHERE status <> 'resolved'` (migration 150). At most one live alert per source — a *database* guarantee, not a convention the service has to remember. |
+| Recurrence | Resolved rows fall out of that partial index, so the same condition next week opens a **new** alert while the old one stays in history. Only a partial index can express "unique among the live ones". |
+| Damping | 2 consecutive bad observations to open, 3 good to close. Asymmetric: a 3s probe timeout during a deploy is not an incident, and an alert that closes on the first green reading re-notifies every time it flaps. |
+| Escalation | warning → critical clears `notified_at` and re-announces. The reverse updates quietly — improving is not worth a second interruption. |
+| Auto-close | A condition that fixes itself closes itself, marked `auto`. Manual closures are marked `manual`, because a history full of manual closures means the *detection* is wrong and nothing else would reveal it. |
+| Notify-once | `notified_at` is a column, not a promise. |
+
+**`unavailable` never alerts.** Same rule the console renders by: a probe that
+could not run (no `REDIS_URL`, no Docker socket) is a gap in observability, not
+an outage. Alerting on it would page someone about a box that was never wired
+up. An `unavailable` reading also counts as *clear*, so an alert is never held
+open by a probe that stopped running.
+
+**The channel self-reference rule.** A channel is never used to deliver an alert
+about that channel's own subsystem — an alert about SMTP does not go by SMTP.
+That is not merely futile: the send fails, and a failed send is itself
+observable, so it can feed the very condition it was reporting. In-app is the
+primary channel and always attempted (one INSERT on the pool everything else
+already needs; if Postgres is gone, no alerting mechanism would have helped);
+email is best-effort on top and suppressed for `smtp` alerts.
+
+**Where it runs.** `setInterval(…).unref()` in the API process, following the
+same pattern as the announcement dispatcher, disabled with `ALERT_EVALUATION=off`.
+The API process rather than the worker because the `runtime` and `http`
+collectors measure *this* process — event-loop lag, heap, the request-timing
+ring — and the worker can see none of it. Overlapping ticks are safe because the
+partial unique index makes double-opening impossible.
+
+There is no "evaluate now" route. Forcing an evaluation is an operator action
+with a cost, and Phase 5 already built the machinery for those, so it is
+`alerts.evaluate` in the allow-list rather than a fourth door on the router.
+
+Verified beyond the unit tests: migration 150 and every query the service issues
+were run against a real PostgreSQL 16 — the `ON CONFLICT … WHERE` inference, the
+recurrence-after-resolve behaviour, and a raw duplicate insert being rejected by
+the index. Migrations run automatically at boot, so a migration that only *looks*
+correct would stop the API container from starting.
 
 ---
 

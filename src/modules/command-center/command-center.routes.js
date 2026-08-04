@@ -13,6 +13,7 @@
 const router = require('express').Router();
 const { registerCollectors, registry, snapshot } = require('./index');
 const commands = require('./commands.service');
+const alerts = require('./alerts.service');
 
 registerCollectors();
 
@@ -77,6 +78,47 @@ router.post('/command-center/commands/:name', wrap(async (req, res, next) => {
     res.status(err.status).json({
       error: { code: err.code || 'COMMAND_FAILED', message: err.message },
     });
+  }
+}));
+
+// ── Alert Center ────────────────────────────────────────────────────────────
+//
+// There is no "evaluate now" route. Forcing an evaluation is an operator action
+// with a cost, and the Command Center already has the machinery for those —
+// allow-listed, audited, cooldown-guarded. It is `alerts.evaluate` in
+// commands.service.js rather than a fourth door here.
+
+/**
+ * GET /api/super-admin/command-center/alerts
+ *   ?scope=live|resolved|all   default live
+ *   ?limit=                    capped server-side
+ *
+ * Returns the alerts plus the counts the badge needs, in one call — the console
+ * would otherwise ask for both on every poll.
+ */
+router.get('/command-center/alerts', wrap(async (req, res) => {
+  const scope = ['live', 'resolved', 'all'].includes(String(req.query.scope))
+    ? String(req.query.scope) : 'live';
+  res.json({ data: await alerts.list({ scope, limit: req.query.limit }) });
+}));
+
+/** Acknowledge: "seen, I am on it". Does not stop the alert tracking. */
+router.post('/command-center/alerts/:id/ack', wrap(async (req, res, next) => {
+  try {
+    res.json({ data: await alerts.acknowledge(req.params.id, req) });
+  } catch (err) {
+    if (!err.status) return next(err);
+    res.status(err.status).json({ error: { code: 'ALERT_NOT_OPEN', message: err.message } });
+  }
+}));
+
+/** Close by hand. Recorded as `manual`, which is how bad detection stays visible. */
+router.post('/command-center/alerts/:id/resolve', wrap(async (req, res, next) => {
+  try {
+    res.json({ data: await alerts.resolve(req.params.id, req) });
+  } catch (err) {
+    if (!err.status) return next(err);
+    res.status(err.status).json({ error: { code: 'ALERT_NOT_LIVE', message: err.message } });
   }
 }));
 

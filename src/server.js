@@ -722,6 +722,42 @@ runMigrationsWithRetry()
       logger.info({ interval: '15min' }, 'UPI expiry sweeps scheduled');
     }
 
+    // Command Center alerting. Without this the Alert Center only notices a
+    // problem while somebody has the console open, which is the opposite of
+    // what alerting is for — the point is being told when you are NOT looking.
+    //
+    // Runs in the API process rather than the worker on purpose: the runtime
+    // and http collectors measure THIS process (event-loop lag, heap, the
+    // request-timing ring), and the worker can see none of it.
+    //
+    // A plain interval is safe for the same reason it is safe for the
+    // announcement dispatcher above: the writes are idempotent. Overlapping
+    // ticks cannot double-open an alert, because migration 150 puts a partial
+    // unique index on (fingerprint) WHERE status <> 'resolved'.
+    // Disable with ALERT_EVALUATION=off.
+    if (process.env.ALERT_EVALUATION !== 'off') {
+      const alerts = require('./modules/command-center/alerts.service');
+      const alertTick = () => alerts.evaluate()
+        .then((r) => {
+          if (r.opened.length || r.escalated.length || r.resolved.length) {
+            logger.info({
+              opened: r.opened.map((a) => a.source),
+              escalated: r.escalated.map((a) => a.source),
+              resolved: r.resolved.map((a) => a.source),
+            }, 'Alert evaluation changed state');
+          }
+        })
+        // evaluate() already swallows per-card failures; this is the belt for
+        // anything outside them, so a bad tick never becomes an unhandled
+        // rejection once a minute for the life of the process.
+        .catch((err) => logger.warn({ err: err.message }, 'Alert evaluation failed'));
+      // First pass only once boot has settled. Evaluating while the pool is
+      // still warming would open a database alert about our own cold start.
+      setTimeout(alertTick, 120 * 1000).unref();
+      setInterval(alertTick, 60 * 1000).unref();
+      logger.info({ interval: '60s' }, 'Command Center alert evaluation scheduled');
+    }
+
     const pool = require('./db/pool');
     function shutdown(sig) {
       return function() {

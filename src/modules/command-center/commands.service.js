@@ -103,6 +103,30 @@ const COMMANDS = {
     },
   },
 
+  'alerts.evaluate': {
+    label: 'Evaluate alerts now',
+    description:
+      'Runs an alerting pass immediately instead of waiting for the 60s tick. '
+      + 'Opens, escalates and auto-resolves exactly as the tick would.',
+    blastRadius:
+      'Can open or close alerts, and announce a new one to every platform operator. '
+      + 'It cannot change anything the tick would not have changed a minute later.',
+    cooldownMs: 10_000,
+    async run() {
+      // Required lazily to keep the alerting module out of the boot path of a
+      // process that only ever reads snapshots.
+      const alerts = require('./alerts.service');
+      const out = await alerts.evaluate({ fresh: true });
+      return {
+        evaluated: out.evaluated,
+        opened: out.opened.map((a) => a.source),
+        escalated: out.escalated.map((a) => a.source),
+        resolved: out.resolved.map((a) => a.source),
+        ongoing: out.ongoing,
+      };
+    },
+  },
+
   'database.test': {
     label: 'Test database',
     description: 'Round-trips a trivial query and reports latency and pool state.',
