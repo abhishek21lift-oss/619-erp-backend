@@ -209,7 +209,12 @@ function nextBirthday(birthMonth, birthDay, birthYear, todayUTC) {
 router.get('/clients/birthdays', auth, wrap(async (req, res) => {
   const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : req.query.trainer_id;
   const params = [];
-  const orgClause = orgWhere(req, params);
+  // Qualified, because this query joins trainers and BOTH tables carry an
+  // organization_id. Unqualified, Postgres cannot resolve which one is meant
+  // and throws "column reference organization_id is ambiguous" — a 500 on
+  // every single call. It threw 49 times in one day before anybody noticed,
+  // because the only thing it broke was a page nobody had open.
+  const orgClause = orgWhere(req, params, 'c.organization_id');
   let trainerClause = '';
   if (trainerId) {
     params.push(trainerId);

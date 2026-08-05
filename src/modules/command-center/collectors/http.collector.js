@@ -23,6 +23,24 @@ const ERROR_RATE_CRIT = 0.10;
 // Below this, percentiles are noise — three requests make a p95 meaningless.
 const MIN_SAMPLES_TO_GRADE = 20;
 
+// A rate needs a numerator, not just a ratio.
+//
+// This guard was applied to latency and not to the error rate, and the
+// consequence was a console full of red. At a quiet hour the five-minute
+// window holds about six requests, so ONE failing endpoint reads as 16.7% —
+// over the 10% critical line — and pages. It then "clears itself" when the
+// next window happens not to contain that request. Forty-nine of those in a
+// day teaches an operator to ignore the card, which is worse than not having
+// it.
+//
+// Deliberately an absolute floor on the ERROR COUNT rather than reusing
+// MIN_SAMPLES_TO_GRADE. A sample gate would suppress the alert that matters
+// most: six requests in the window and all six failing is a total outage at
+// 3am, and "too few samples to grade" is exactly the wrong answer to it.
+// A floor keeps that case red (6 >= 5) and drops 1-in-6 (1 < 5).
+const MIN_ERRORS_WARN = 2;
+const MIN_ERRORS_CRIT = 5;
+
 async function collect() {
   const data = httpMetrics.summarise({ windowMs: 5 * 60 * 1000 });
 
@@ -33,21 +51,22 @@ async function collect() {
   }
 
   const p95 = data.latency_ms.p95;
-  const serverErrorRate = data.status.server_errors / data.samples;
+  const serverErrors = data.status.server_errors;
+  const serverErrorRate = serverErrors / data.samples;
   const thin = data.samples < MIN_SAMPLES_TO_GRADE;
 
   let status = STATUS.HEALTHY;
   let reason = null;
 
-  if (serverErrorRate >= ERROR_RATE_CRIT) {
+  if (serverErrors >= MIN_ERRORS_CRIT && serverErrorRate >= ERROR_RATE_CRIT) {
     status = STATUS.CRITICAL;
-    reason = `${data.status.server_errors} server errors in ${data.samples} requests`;
+    reason = `${serverErrors} server errors in ${data.samples} requests`;
   } else if (!thin && p95 >= P95_CRIT_MS) {
     status = STATUS.CRITICAL;
     reason = `API p95 ${p95}ms${data.slowest_endpoints[0] ? ` — slowest: ${data.slowest_endpoints[0].endpoint}` : ''}`;
-  } else if (serverErrorRate >= ERROR_RATE_WARN) {
+  } else if (serverErrors >= MIN_ERRORS_WARN && serverErrorRate >= ERROR_RATE_WARN) {
     status = STATUS.WARNING;
-    reason = `${data.status.server_errors} server error(s) in ${data.samples} requests`;
+    reason = `${serverErrors} server error(s) in ${data.samples} requests`;
   } else if (!thin && p95 >= P95_WARN_MS) {
     status = STATUS.WARNING;
     reason = `API p95 ${p95}ms${data.slowest_endpoints[0] ? ` — slowest: ${data.slowest_endpoints[0].endpoint}` : ''}`;
@@ -55,9 +74,21 @@ async function collect() {
 
   // Say when a percentile is not worth trusting rather than hiding the sample
   // size and letting someone act on a p95 drawn from four requests.
-  if (thin) data.note = `Only ${data.samples} requests in window — latency not graded below ${MIN_SAMPLES_TO_GRADE}`;
+  const notes = [];
+  if (thin) notes.push(`Only ${data.samples} requests in window — latency not graded below ${MIN_SAMPLES_TO_GRADE}`);
+  // Errors under the floor are not an alert, but they are not nothing either.
+  // Saying so is what keeps "we stopped alerting on it" from becoming "we
+  // stopped showing it" — the count is right there for anyone looking.
+  if (serverErrors > 0 && status !== STATUS.CRITICAL) {
+    notes.push(`${serverErrors} server error(s) in ${data.samples} requests`);
+  }
+  if (notes.length) data.note = notes.join(' · ');
 
   return result(NAME, { status, data, reason });
 }
 
-module.exports = { NAME, collect, P95_WARN_MS, P95_CRIT_MS, ERROR_RATE_WARN, ERROR_RATE_CRIT, MIN_SAMPLES_TO_GRADE };
+module.exports = {
+  NAME, collect, P95_WARN_MS, P95_CRIT_MS,
+  ERROR_RATE_WARN, ERROR_RATE_CRIT, MIN_SAMPLES_TO_GRADE,
+  MIN_ERRORS_WARN, MIN_ERRORS_CRIT,
+};
