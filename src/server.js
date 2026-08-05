@@ -577,6 +577,11 @@ app.use('/api/communication',     ...gate('communication'), require('./routes/co
 // guard fails open if the check itself errors — a cost control must not be
 // able to take the AI Suite down. See lib/aiQuota.js.
 app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), requireAiQuota(), require('./routes/aiKnowledge'));
+// Executable actions. Mounted BEFORE routes/ai so /api/ai/actions/* is not
+// swallowed by anything there, and deliberately outside requireAiQuota():
+// these endpoints run no model. Confirming a WhatsApp send must not fail
+// because the studio is over its token allowance for the month.
+app.use('/api/ai',               userApiLimiter, ...gate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
 app.use('/api/ai',               ...gate('ai_suite'), requireAiQuota(), require('./routes/ai'));
 
 // ────────────────────────
