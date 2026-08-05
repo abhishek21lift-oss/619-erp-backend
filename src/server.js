@@ -635,6 +635,25 @@ runMigrationsWithRetry()
       }, 'MY PT STUDIO API listening on port %d (%s)', PORT, NODE_ENV);
     });
 
+    // ── Command Center realtime stream (Phase 3) ──────────────────────────
+    //
+    // Attached to the http.Server, not to Express: an Upgrade is an event on
+    // the server and never enters the middleware stack, so `auth` cannot see
+    // it. The socket is authenticated by a single-use ticket minted over the
+    // already-authenticated HTTPS channel instead — the browser addresses
+    // api.myptstudio.com directly here (the frontend's Next.js rewrite cannot
+    // carry an Upgrade) and the session cookie belongs to myptstudio.com.
+    // See modules/command-center/tickets.js for the alternatives and why.
+    //
+    // Nothing degrades when this is off: the console falls back to polling the
+    // same snapshot endpoint, which is what it did before Phase 3.
+    // Disable with COMMAND_CENTER_STREAM=off.
+    let commandCenterStream = null;
+    if (process.env.COMMAND_CENTER_STREAM !== 'off') {
+      commandCenterStream = require('./modules/command-center/stream');
+      commandCenterStream.attach(server, { allowedOrigins });
+    }
+
     // Keepalive — a leftover from a sleep-on-idle host, INERT on this VPS.
     //
     // The containers run under `restart: unless-stopped` and nothing spins them
@@ -795,6 +814,14 @@ runMigrationsWithRetry()
     function shutdown(sig) {
       return function() {
         logger.info({ signal: sig }, 'Received signal — shutting down');
+
+        // Before server.close(), not inside its callback. `close()` stops
+        // accepting new connections and then waits for the open ones to end —
+        // and a WebSocket never ends on its own. Left running, every deploy
+        // would sit out the full 10s force-exit below for as long as one
+        // operator had the console open.
+        if (commandCenterStream) commandCenterStream.close(server);
+
         server.close(async function() {
           try {
             if (workers.length) {

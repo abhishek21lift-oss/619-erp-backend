@@ -50,8 +50,17 @@ and are forwarded by the Next.js rewrite in the frontend's `next.config.js`.
 from `NEXT_PUBLIC_API_URL` by `wsBase()` in the frontend's `src/lib/http.ts`
 (`https` → `wss`), which keeps one variable as the source of truth for both.
 
-If you ever see the Command Center silently fall back to polling, check this
-first: it is far more often the proxy than the code.
+If you ever see the Command Center silently fall back to polling, there are two
+usual suspects and neither is the application code:
+
+1. **This proxy** — no `Upgrade` block on the `api.` vhost, or a 60s
+   `proxy_read_timeout` cutting an idle stream. Verify with the curl below.
+2. **The frontend's CSP.** `connect-src` must list the **`wss://`** origin, not
+   just the `https://` one — an `https:` source expression does not permit a
+   `wss:` URL. Built from `NEXT_PUBLIC_API_URL` in the frontend's
+   `src/lib/security-headers.js`. A CSP block shows up in the browser console as
+   `Refused to connect to 'wss://…'` and nowhere in these logs at all, which is
+   why it is worth ruling out early.
 
 ## Files
 
@@ -102,11 +111,37 @@ curl -isS -m 10 https://api.myptstudio.com/api/command-center/stream \
 
 | You get | Means |
 |---|---|
-| `101 Switching Protocols` | the proxy is correct |
-| `400`/`426` from the app | the proxy is correct, the app rejected the handshake (auth) |
+| `401 Unauthorized` | **the proxy is correct.** The app received the handshake and refused it because the curl carried no ticket — see below. This is the success case for this test. |
+| `101 Switching Protocols` | the proxy is correct *and* the ticket was valid |
 | `502` | nginx reached nothing — is the backend container up? |
 | `200` with HTML | the request went to the **frontend**, not the API — wrong vhost |
+| `404` | reached the app, wrong path — it serves exactly `/api/command-center/stream` |
 | hangs, then `504` | `proxy_read_timeout` is still the 60s default |
+
+## How the stream authenticates
+
+The socket does **not** present the session cookie, and that is deliberate.
+
+The cookie belongs to `myptstudio.com`; the socket must address
+`api.myptstudio.com`, because the Next.js rewrite cannot carry an `Upgrade`.
+Different host, so the browser sends no cookie — and `new WebSocket()` gives
+JavaScript no way to set an `Authorization` header either.
+
+Widening the cookie to `.myptstudio.com` would fix it, and was rejected: that
+sends the session to every present and future subdomain, forever, so that one
+operator console can live-update.
+
+Instead the console `POST`s to
+`/api/super-admin/command-center/stream-ticket` over the ordinary authenticated
+channel and spends the returned ticket in the handshake query string. The ticket
+is **single-use** and expires in 30 seconds, which is what makes a query string
+an acceptable place to put one — by the time it reaches this access log it is
+already spent. The alternatives and why each was rejected are written up in
+`src/modules/command-center/tickets.js`.
+
+Consequence for debugging: the `401` above is the proxy working. For a real
+`101`, mint a ticket with the browser's session first and append `?ticket=…`
+within 30 seconds.
 
 ## Certificates
 

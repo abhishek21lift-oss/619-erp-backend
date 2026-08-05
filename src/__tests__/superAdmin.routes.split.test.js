@@ -169,6 +169,7 @@ describe('super-admin API — the H-03 split', () => {
     'POST /command-center/alerts/:id/resolve',
     'POST /command-center/commands/:name',
     'POST /command-center/guardian/:id/explain',
+    'POST /command-center/stream-ticket',
     'POST /coupons',
     'POST /invitations/:id/cancel',
     'POST /invitations/:id/link',

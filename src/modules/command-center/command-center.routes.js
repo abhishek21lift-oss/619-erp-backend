@@ -17,6 +17,8 @@ const alerts = require('./alerts.service');
 const guardian = require('./guardian.service');
 const logBuffer = require('./logBuffer');
 const logCapture = require('./logCapture');
+const tickets = require('./tickets');
+const stream = require('./stream');
 const pool = require('../../db/pool');
 
 registerCollectors();
@@ -37,6 +39,26 @@ router.get('/command-center/snapshot', wrap(async (req, res) => {
     .split(',').map((s) => s.trim()).filter(Boolean);
   const data = await snapshot.collect({ only, fresh: req.query.fresh === '1' });
   res.json({ data });
+}));
+
+/**
+ * POST /api/super-admin/command-center/stream-ticket
+ *
+ * Mints the single-use ticket that authenticates the realtime socket (Phase 3).
+ * See tickets.js for why the socket cannot simply present the session cookie.
+ *
+ * A POST rather than a GET because minting a credential is a state change and
+ * should look like one: a GET's full URL is the kind of thing that gets
+ * prefetched, cached and pasted into a chat window.
+ *
+ * It returns the PATH, not a full URL. The origin is the client's to decide
+ * (the frontend derives it from NEXT_PUBLIC_API_URL in `wsBase()`), and a
+ * server that guesses its own public URL guesses wrong the first time it sits
+ * behind a proxy — which it does here.
+ */
+router.post('/command-center/stream-ticket', wrap(async (req, res) => {
+  const { ticket, expires_in_ms } = tickets.issue(req.user);
+  res.json({ data: { ticket, expires_in_ms, path: stream.PATH, tick_ms: stream.TICK_MS } });
 }));
 
 /** The card names this build knows about, for the client to render a grid. */
