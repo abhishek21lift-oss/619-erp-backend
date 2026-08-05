@@ -195,15 +195,15 @@ router.get('/dues', auth, async (req, res, next) => {
     params.push(orgParam(req));
     const orgIdx = params.length;
     const { rows } = await pool.query(`
-      SELECT id, client_id, name, mobile, trainer_name,
+      SELECT id, client_id, name, mobile, trainer_name, photo_url,
              balance_amount, pt_end_date, status
       FROM (
-        SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name,
+        SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name, c.photo_url,
                c.balance_amount, c.pt_end_date, c.status, c.trainer_id
         FROM clients c
         WHERE c.balance_amount > 0 AND c.deleted_at IS NULL
         UNION ALL
-        SELECT ptc.id, NULL AS client_id, ptc.name, ptc.mobile, ptc.trainer_name,
+        SELECT ptc.id, NULL AS client_id, ptc.name, ptc.mobile, ptc.trainer_name, ptc.photo_url,
                ptc.balance_amount, ptc.pt_end_date, ptc.status, ptc.trainer_id
         FROM pt_clients ptc
         WHERE ptc.balance_amount > 0 AND ptc.deleted_at IS NULL

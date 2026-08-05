@@ -34,6 +34,7 @@ router.get('/', auth, async (req, res, next) => {
 
     const { rows } = await pool.query(`
       SELECT i.*,
+        pc.photo_url AS client_photo,
         COALESCE((SELECT json_agg(json_build_object(
           'id', ii.id,
           'description', ii.description,
@@ -43,6 +44,15 @@ router.get('/', auth, async (req, res, next) => {
           'type', ii.type
         )) FROM invoice_items ii WHERE ii.invoice_id = i.id), '[]'::json) AS items
       FROM invoices i
+      -- Only for the client's face on the list. The org equality is part of
+      -- the join rather than assumed from i.client_id: an invoice carries a
+      -- denormalised client_name and a nullable client_id, and this must not
+      -- become a way to read a row from another tenant. Legacy rows with a
+      -- NULL organization_id match nothing and fall back to initials.
+      LEFT JOIN pt_clients pc
+        ON pc.id = i.client_id
+       AND pc.organization_id = i.organization_id
+       AND pc.deleted_at IS NULL
       ${where}
       ORDER BY i.issue_date DESC, i.created_at DESC
       LIMIT $${p++} OFFSET $${p++}`,

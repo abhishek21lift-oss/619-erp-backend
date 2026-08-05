@@ -371,7 +371,7 @@ async function getOpsSummary(scope = {}) {
 
   const { rows: renewals_due } = await pool.query(`
     SELECT
-      id, name, mobile, trainer_name, package_type,
+      id, name, mobile, trainer_name, package_type, photo_url,
       pt_end_date::TEXT,
       (pt_end_date::DATE - CURRENT_DATE)::INT AS days_left,
       balance_amount,
@@ -387,7 +387,7 @@ async function getOpsSummary(scope = {}) {
 
   const { rows: top_dues } = await pool.query(`
     SELECT
-      id, name, mobile, trainer_name, balance_amount,
+      id, name, mobile, trainer_name, balance_amount, photo_url,
       pt_end_date::TEXT,
       CASE WHEN pt_end_date IS NOT NULL AND pt_end_date::DATE < CURRENT_DATE THEN 'overdue' ELSE 'due' END AS due_status
     FROM pt_clients
