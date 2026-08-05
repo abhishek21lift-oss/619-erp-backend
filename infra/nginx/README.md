@@ -66,32 +66,62 @@ usual suspects and neither is the application code:
 
 | File | Goes where | Purpose |
 |---|---|---|
+| `install-websocket.sh` | run on the VPS | does the whole install, safely |
+| `patch-vhost.py` | called by the script | inserts the location block into the right `server{}` |
 | `websocket.conf` | `http {}` block | the `$connection_upgrade` map and the shared proxy headers |
-| `myptstudio.conf` | `sites-available/` | both vhosts |
+| `myptstudio.conf` | `sites-available/` | reference: what a correct config looks like |
 
 ## Installing
 
 ```bash
-# 1. See what is actually there before changing anything.
+cd /opt/myptstudio/619-erp-backend && git pull origin main
+cd infra/nginx
+
+sudo ./install-websocket.sh --dry-run     # prints the exact diff, changes nothing
+sudo ./install-websocket.sh               # applies it
+```
+
+That is the whole thing. The script:
+
+* refuses to start if the config is **already** invalid, so a pre-existing
+  error cannot be blamed on this change;
+* finds the API vhost by `server_name`, not by filename, and only the one that
+  also listens on **443** — the `:80` block names the host too, and patching it
+  would put the handshake behind a 301;
+* reuses an existing `$connection_upgrade` map instead of adding a second one.
+  Two maps for the same variable is a fatal error, and it is the most common
+  way this particular change takes a box down;
+* **inserts only.** It never replaces the vhost, so certificate paths, redirects
+  and rate limits the template knows nothing about survive untouched;
+* backs up `/etc/nginx`, runs `nginx -t`, and **puts everything back** if the
+  test or the reload fails;
+* is idempotent — the second run says `nothing to do`;
+* then proves it from outside with the handshake curl below.
+
+Nothing rolls back after a successful reload. If the final check comes back
+unhappy the config is still applied, and the script prints the revert command —
+undoing a valid config because a curl could not resolve DNS would be the worse
+outcome.
+
+<details>
+<summary>Doing it by hand instead</summary>
+
+```bash
 sudo nginx -T > /tmp/nginx-before.conf
 sudo cp -a /etc/nginx /etc/nginx.bak.$(date +%F)
 
-# 2. The map and shared headers. The map MUST be in the http {} block, not
-#    inside a server {} — nginx rejects it there.
+# The map MUST be in http {}, not inside a server {} — nginx rejects it there.
 sudo mkdir -p /etc/nginx/snippets
 sudo cp websocket.conf /etc/nginx/conf.d/websocket.conf
-
-#    myptstudio.conf includes the proxy headers as a snippet. Split them out:
 sudo sed -n '/^proxy_set_header Host/,$p' websocket.conf \
   | sudo tee /etc/nginx/snippets/myptstudio-proxy.conf
 
-# 3. The vhosts. DIFF FIRST — the live file may carry certificate paths,
-#    redirects or rate limits this template does not know about.
+# DIFF FIRST — the live file may carry things this template does not know about.
 diff /etc/nginx/sites-available/myptstudio.conf myptstudio.conf
 
-# 4. Validate, then reload. Never restart: reload keeps existing connections.
 sudo nginx -t && sudo systemctl reload nginx
 ```
+</details>
 
 If `nginx -t` fails, nothing has been applied yet — fix and re-test. Restore
 with `sudo rm -rf /etc/nginx && sudo mv /etc/nginx.bak.<date> /etc/nginx`.
