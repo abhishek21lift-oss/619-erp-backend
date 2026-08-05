@@ -265,7 +265,41 @@ app.use('/api/webhooks/razorpay', require('./routes/razorpay-webhook'));
 // ────────────────────────
 // BODY PARSING
 // ────────────────────────
-// L-06: 100kb default
+// ── The three endpoints that carry an image inside JSON ─────────────────────
+//
+// 100kb is the right default and stays the default. But three endpoints take a
+// base64 data URL in the body, and base64 inflates bytes by a third:
+//
+//   POST /api/pt-os/clients/:id/photo        the client's profile photo
+//   POST /api/progress/progress-photos       progress photos
+//   POST /api/pt-os/informed-consent/:id/sign  the signature image
+//
+// The client photo is cropped and re-encoded browser-side to 800px JPEG at
+// q0.8 before it is sent, which sounds small and is not. Measured in Chromium
+// on an 800x800 canvas, as the JSON body actually posted:
+//
+//   smooth gradient   14 KB     (best case for JPEG)
+//   detailed / noisy  529 KB    (worst case)
+//
+// A photograph of a person — hair, skin texture, a background — sits near the
+// noisy end. So this limit rejected the request with 413 before the route ran,
+// and it had done so since the feature shipped: the new-client flow posts to
+// the same endpoint, which is why no client in the database has a photo.
+//
+// Raised only for these paths, matched exactly. Everything else keeps 100kb.
+const imageJson = express.json({ limit: '4mb' });
+const IMAGE_JSON_PATHS = [
+  /^\/api\/pt-os\/clients\/[^/]+\/photo$/,
+  /^\/api\/progress\/progress-photos$/,
+  /^\/api\/pt-os\/informed-consent\/[^/]+\/sign$/,
+];
+app.use((req, res, next) => (
+  req.method === 'POST' && IMAGE_JSON_PATHS.some((re) => re.test(req.path))
+    ? imageJson(req, res, next)
+    : next()
+));
+
+// L-06: 100kb default for everything else
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use(cookieParser());
