@@ -229,16 +229,45 @@ fi
 # 401 is the SUCCESS case: the handshake reached the app and the app refused it
 # for having no ticket. A 101 here would mean the app accepted an unauthenticated
 # socket, which would be a much worse problem than a missing proxy line.
+#
+# ── Why this retries ────────────────────────────────────────────────────────
+#
+# `systemctl reload nginx` returns when the SIGNAL has been sent, not when the
+# new workers are serving. The old workers keep handling connections until they
+# drain, so a check fired microseconds later can be answered by a worker still
+# running the previous config — and report a confident, completely wrong
+# diagnosis about a change that was in fact applied correctly.
+#
+# Seen exactly once, on the first real box this ran against: the config was
+# right, `nginx -t` was clean, and the app answered 401 when asked directly, but
+# the immediate check came back 404. Retrying settles it.
+probe() {
+  local code
+  # No -k, deliberately. The browser will not open a wss:// to a host whose
+  # certificate does not match, and that failure looks exactly like a WebSocket
+  # bug — so a check that skipped verification would pass while the feature
+  # stayed broken. A 000 here with everything else green is worth reading as
+  # "the certificate", not "the proxy".
+  code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
+    "https://${API_HOST}${STREAM_PATH}" \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H "Sec-WebSocket-Key: $(head -c16 /dev/urandom | base64)" 2>/dev/null || true)"
+  # curl already writes 000 through -w when it never got a response, and it also
+  # exits non-zero — so a `|| echo 000` here appends a SECOND 000 and the case
+  # below falls through to "unexpected HTTP 000000". Normalise instead.
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+  printf '%s' "$code"
+}
+
 say "verifying https://${API_HOST}${STREAM_PATH}"
-CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
-  "https://${API_HOST}${STREAM_PATH}" \
-  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-  -H 'Sec-WebSocket-Version: 13' \
-  -H "Sec-WebSocket-Key: $(head -c16 /dev/urandom | base64)" 2>/dev/null || true)"
-# curl already writes 000 through -w when it never got a response, and it also
-# exits non-zero — so a `|| echo 000` here appends a SECOND 000 and the case
-# below falls through to "unexpected HTTP 000000". Normalise instead.
-[[ "$CODE" =~ ^[0-9]{3}$ ]] || CODE=000
+CODE=000
+for attempt in 1 2 3 4; do
+  CODE="$(probe)"
+  # 401 and 101 are settled answers; anything else may just be a draining worker.
+  [[ "$CODE" == 401 || "$CODE" == 101 ]] && break
+  [[ $attempt -lt 4 ]] && { say "  got ${CODE}, waiting for the reload to settle…"; sleep 2; }
+done
 
 bad() { printf '\033[33mCHECK:\033[0m %s\n' "$*" >&2; exit 1; }
 
