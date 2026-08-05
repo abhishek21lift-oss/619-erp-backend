@@ -10,6 +10,7 @@ const svc = require('./pt-os.service');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
+const { buildEnrollmentPdf } = require('../../lib/ptEnrollmentPdf');
 const { buildSnapshot } = require('./client-snapshot');
 const { generateCoach } = require('./coach-ai');
 const { buildRecovery } = require('./recovery');
@@ -58,6 +59,15 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 // super admin operating platform-wide it returns '' (no filter, sees all).
 // Every read/write that targets a client by id must AND this in, otherwise one
 // studio can read, edit, or delete another studio's rows (cross-tenant IDOR).
+/**
+ * How an enrolling payment was taken.
+ *
+ * A closed set rather than free text: this column is read back by finance
+ * screens that group by it, and "UPI", "upi" and "Upi " are three payment
+ * methods to a GROUP BY and one to a human.
+ */
+const PAYMENT_METHODS = ['CASH', 'UPI', 'CARD', 'BANK_TRANSFER', 'SPLIT'];
+
 function orgWhere(req, params, col = 'organization_id') {
   const scope = tenantScope(req);
   if (!scope.applyFilter) return '';
@@ -245,6 +255,33 @@ router.get('/clients/birthdays', auth, wrap(async (req, res) => {
 }));
 
 // ─── Single client details ──────────────────────────────────
+// ─── Enrolment form as a PDF (MUST be before /clients/:id) ──────────
+//
+// Streamed, not stored. The document is built from live client columns, so a
+// saved copy would be a stale copy of a query and the studio would eventually
+// download last month's version of this month's enrolment.
+router.get('/clients/:id/enrollment-pdf', auth, wrap(async (req, res) => {
+  const params = [req.params.id];
+  const orgClause = orgWhere(req, params, 'c.organization_id');
+  const { rows } = await pool.query(
+    `SELECT c.* FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL${orgClause}`,
+    params,
+  );
+  const client = rows[0];
+  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+
+  const buffer = await buildEnrollmentPdf(client, req.user?.organization_name);
+
+  // A filename the studio can find again in a downloads folder six weeks
+  // later. Non-filename characters out, because a client called "Priya
+  // (Mon/Wed)" would otherwise produce a path, not a name.
+  const safeName = String(client.name || 'client').replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '');
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Length', buffer.length);
+  res.setHeader('Content-Disposition', `attachment; filename="pt-enrolment-${safeName || 'client'}.pdf"`);
+  res.send(buffer);
+}));
+
 router.get('/clients/:id', auth, wrap(async (req, res) => {
   const params = [req.params.id];
   const orgClause = orgWhere(req, params, 'c.organization_id');
@@ -532,14 +569,28 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
        'duration_months','status','notes','monthly_pt_amount',
        'goal','height','body_fat','health_conditions','injuries','frequency',
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week',
-       'workout_experience_level','previous_trainer_experience']
+       'workout_experience_level','previous_trainer_experience',
+       'agreement_accepted_at','agreement_signature','agreement_text']
     : ['package_type','base_amount','discount',
        'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes',
        'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact','emergency_phone',
        'goal','height','body_fat','health_conditions','injuries','frequency',
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week',
-       'workout_experience_level','previous_trainer_experience'];
+       'workout_experience_level','previous_trainer_experience',
+       'agreement_accepted_at','agreement_signature','agreement_text',
+       // Money-adjacent, so admin/manager only — same boundary as
+       // final_amount and paid_amount above it.
+       'payment_method'];
+
+  // A free-text payment method is a reporting column nobody can group by.
+  if (req.body.payment_method !== undefined && req.body.payment_method !== null) {
+    if (!PAYMENT_METHODS.includes(String(req.body.payment_method))) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION', message: `payment_method must be one of: ${PAYMENT_METHODS.join(', ')}` },
+      });
+    }
+  }
 
   const wantsFinalAmount = !isTrainer && req.body.final_amount !== undefined;
   const wantsPaidAmount  = !isTrainer && req.body.paid_amount !== undefined;
