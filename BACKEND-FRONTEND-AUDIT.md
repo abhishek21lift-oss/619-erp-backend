@@ -254,20 +254,26 @@ the other.
 If `/api/v1/*` is the intended direction, migrate the frontend; if not, remove
 the three modules. Leaving both is how the two `dues` numbers drift apart.
 
-### 4.2 Six overlapping client-renewal endpoints
+### 4.2 Six overlapping client-renewal endpoints — RESOLVED
 
-```
-POST /api/clients/:id/renew                 (routes/clients.js)
-POST /api/clients/:id/pt-renew              (routes/clients.js)
-POST /api/clients/:id/renew-pt              (routes/client-actions.js)
-POST /api/clients/:id/renew-subscription    (routes/client-actions.js)
-POST /api/clients/:id/add-subscription      (routes/client-actions.js)
-POST /api/clients/:id/extension             (routes/client-actions.js)
-```
+All six are gone, along with the rest of `routes/client-actions.js` (thirteen
+endpoints) and its mount. The frontend renews exclusively through
+`POST /api/pt-os/clients/:id/renew`, which is org-scoped.
 
-None are called. The frontend renews exclusively through
-`POST /api/pt-os/clients/:id/renew`. Note `pt-renew` and `renew-pt` are two
-different handlers in two different files for the same operation.
+Two things found while removing them, neither visible from the route list:
+
+* Every one of them read and wrote the legacy `clients` table, which has **no
+  `organization_id` column**. Nothing on that mount could be tenant-scoped —
+  not "was missing a filter", but had nothing to filter on — while sitting
+  behind plain `auth`. The table has held 0 rows since PT-OS enrolment shipped,
+  so every handler 404'd before its UPDATE; the safety came from the data, not
+  the code.
+* Four of them `INSERT INTO renewals` or `subscriptions`. **Neither table
+  exists** in this database. They would have 500'd had the 404 not stopped them
+  first.
+
+`src/__tests__/clients.legacy-table.test.js` now fails if anything mounted at
+`/api/clients` reads that table again.
 
 ### 4.3 Built but never surfaced
 

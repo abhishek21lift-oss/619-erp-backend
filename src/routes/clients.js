@@ -273,181 +273,25 @@ router.get('/:id', auth, async (req, res, next) => {
   }
 });
 
-// POST /api/clients/:id/renew  — renew an existing client's membership.
-// Wrapped in a transaction so the client row, the renewal row, and (optionally)
-// the payment row all succeed together — or none of them do.
-router.post('/:id/renew', auth, async (req, res, next) => {
-  const tx = await pool.connect();
-  try {
-    const d = req.body || {};
-    const id = req.params.id;
-
-    if (!d.package_type) return res.status(400).json({ error: 'Package type is required' });
-    if (!d.pt_start_date || !d.pt_end_date) return res.status(400).json({ error: 'Start and end dates are required' });
-
-    await tx.query('BEGIN');
-
-    const { rows: existing } = await tx.query(
-      'SELECT * FROM clients WHERE id=$1 FOR UPDATE', [id]
-    );
-    if (!existing[0]) {
-      await tx.query('ROLLBACK');
-      return res.status(404).json({ error: 'Client not found' });
-    }
-    const c = existing[0];
-
-    // Trainers can only renew their own clients
-    if (req.user.role === 'trainer' &&
-        (!req.user.trainer_id || c.trainer_id !== req.user.trainer_id)) {
-      await tx.query('ROLLBACK');
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    const base    = num(d.base_amount,  0);
-    const disc    = num(d.discount,     0);
-    const final   = num(d.final_amount, base - disc);
-    const paid    = num(d.paid_amount,  0);
-    const balance = Math.max(0, final - paid);
-
-    if (final <= 0) {
-      await tx.query('ROLLBACK');
-      return res.status(400).json({ error: 'Final amount must be greater than zero' });
-    }
-
-    // 1. Insert renewal record (history)
-    await tx.query(`
-      INSERT INTO renewals (id, client_id, client_name, trainer_id, trainer_name,
-        old_package, new_package, old_end_date, new_end_date,
-        amount, paid_amount, payment_method, renewed_on, notes)
-      VALUES (gen_random_uuid()::TEXT, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-      [id, c.name, c.trainer_id, c.trainer_name,
-       c.package_type, d.package_type,
-       c.pt_end_date, d.pt_end_date,
-       final, paid, d.payment_method || 'CASH',
-       d.renewed_on || new Date().toISOString().split('T')[0],
-       d.notes || null]
-    );
-
-    // 2. Update the client to reflect the new membership
-    await tx.query(`
-      UPDATE clients SET
-        package_type   = $1,
-        pt_start_date  = $2,
-        pt_end_date    = $3,
-        base_amount    = $4,
-        discount       = $5,
-        final_amount   = $6,
-        paid_amount    = $7,
-        balance_amount = $8,
-        payment_method = $9,
-        payment_date   = $10,
-        status         = 'active',
-        updated_at     = NOW()
-      WHERE id = $11`,
-      [d.package_type, d.pt_start_date, d.pt_end_date,
-       base, disc, final, paid, balance,
-       d.payment_method || 'CASH',
-       d.renewed_on || new Date().toISOString().split('T')[0],
-       id]
-    );
-
-    // 3. If they paid anything today, create a payment record + incentive
-    if (paid > 0) {
-      let incentiveRate = 0.5;
-      if (c.trainer_id) {
-        const { rows: tr } = await tx.query(
-          'SELECT incentive_rate FROM trainers WHERE id=$1', [c.trainer_id]
-        );
-        incentiveRate = tr[0]?.incentive_rate ?? 0.5;
-      }
-      const receiptNo = await genReceiptNo(tx);
-      await tx.query(`
-        INSERT INTO payments (id, client_id, client_name, trainer_id, trainer_name,
-          amount, method, date, receipt_no, package_type, incentive_amt, notes)
-        VALUES (gen_random_uuid()::TEXT, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [id, c.name, c.trainer_id, c.trainer_name, paid,
-         d.payment_method || 'CASH',
-         d.renewed_on || new Date().toISOString().split('T')[0],
-         receiptNo, d.package_type,
-         Math.round(paid * incentiveRate),
-         (d.notes ? `Renewal: ${d.notes}` : `Renewal — ${d.package_type}`)]
-      );
-    }
-
-    await tx.query('COMMIT');
-
-    // Re-fetch the updated client + history to send back
-    const { rows: fresh } = await pool.query('SELECT * FROM clients WHERE id=$1', [id]);
-    const { rows: payments } = await pool.query(
-      'SELECT * FROM payments WHERE client_id=$1 ORDER BY date DESC LIMIT 50', [id]
-    );
-    const { rows: renewals } = await pool.query(
-      'SELECT * FROM renewals WHERE client_id=$1 ORDER BY renewed_on DESC LIMIT 20', [id]
-    );
-
-    res.json({ message: 'Membership renewed', client: { ...fresh[0], payments, renewals } });
-  } catch (err) {
-    await tx.query('ROLLBACK').catch(() => {});
-    next(err);
-  } finally {
-    tx.release();
-  }
-});
-
-// POST /api/clients/:id/pt-renew - renew personal training dates/amount.
-router.post('/:id/pt-renew', auth, async (req, res, next) => {
-  const tx = await pool.connect();
-  try {
-    const d = req.body || {};
-    if (!d.pt_start_date || !d.pt_end_date) {
-      return res.status(400).json({ error: 'PT start and end dates are required' });
-    }
-
-    await tx.query('BEGIN');
-    const { rows: existing } = await tx.query('SELECT * FROM clients WHERE id=$1 FOR UPDATE', [req.params.id]);
-    const c = existing[0];
-    if (!c) {
-      await tx.query('ROLLBACK');
-      return res.status(404).json({ error: 'Client not found' });
-    }
-    if (req.user.role === 'trainer' && (!req.user.trainer_id || c.trainer_id !== req.user.trainer_id)) {
-      await tx.query('ROLLBACK');
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    const amount = num(d.amount, 0);
-    await tx.query(`
-      UPDATE clients SET
-        package_type = COALESCE($1, package_type),
-        pt_start_date=$2,
-        pt_end_date=$3,
-        final_amount = CASE WHEN $4 > 0 THEN $4 ELSE final_amount END,
-        balance_amount = CASE WHEN $4 > 0 THEN GREATEST(0, $4 - COALESCE(paid_amount,0)) ELSE balance_amount END,
-        status='active',
-        updated_at=NOW()
-      WHERE id=$5`,
-      [d.package_type || 'PT', d.pt_start_date, d.pt_end_date, amount, req.params.id]
-    );
-
-    await tx.query(`
-      INSERT INTO renewals (id, client_id, client_name, trainer_id, trainer_name,
-        old_package, new_package, old_end_date, new_end_date, amount, paid_amount,
-        payment_method, renewed_on, notes)
-      VALUES (gen_random_uuid()::TEXT,$1,$2,$3,$4,$5,$6,$7,$8,$9,0,'PT_RENEWAL',CURRENT_DATE,$10)`,
-      [req.params.id, c.name, c.trainer_id, c.trainer_name, c.package_type,
-       d.package_type || 'PT', c.pt_end_date, d.pt_end_date, amount, d.reason || d.notes || null]
-    );
-
-    await tx.query('COMMIT');
-    const { rows } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
-    res.json({ message: 'Personal training renewed', client: rows[0] });
-  } catch (err) {
-    await tx.query('ROLLBACK').catch(() => {});
-    next(err);
-  } finally {
-    tx.release();
-  }
-});
+// POST /api/clients/:id/renew  — REMOVED.
+// POST /api/clients/:id/pt-renew — REMOVED.
+//
+// The same story as POST /api/clients below, and removed for the same reason.
+// Both read `SELECT * FROM clients WHERE id=$1` and wrote back to that table.
+// `clients` has held 0 rows since the PT-OS enrolment flow shipped, so both
+// handlers 404'd on every call — and neither was reachable from the client
+// anyway.
+//
+// Repointing them at pt_clients was not an option worth taking:
+//
+//   * `clients` has NO organization_id column, so neither handler could be
+//     tenant-scoped. They sat behind plain `auth`, which means any logged-in
+//     user of any studio could have renewed any row in that table. That was
+//     harmless only because the table is empty — an accident, not a design.
+//   * Both INSERT INTO `renewals`, a table that does not exist in this
+//     database. Had the 404 not stopped them first, they would have 500'd.
+//   * The org-scoped equivalent already exists and is what the app calls:
+//     POST /api/pt-os/clients/:id/renew.
 
 // POST /api/clients
 // POST /api/clients — REMOVED. Create clients via POST /api/pt-os/clients.

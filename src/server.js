@@ -445,12 +445,17 @@ app.use('/api/subscription',      require('./routes/subscription'));
 // otherwise consume the shared per-user budget that real API calls need.
 app.use('/api/search',            require('./routes/search'));
 
-// ROUTE INTEGRITY NOTE (R-02):
-// /api/clients mounts two separate routers. Express resolves in registration
-// order — if both files define the same METHOD+PATH, client-actions.js will
-// be shadowed. Audit both files for overlapping routes before adding new ones.
+// ONE router, deliberately. This mount used to carry a second file,
+// routes/client-actions.js, whose thirteen endpoints read and wrote the legacy
+// `clients` table — a table with no organization_id column, so nothing mounted
+// on it could be tenant-scoped at all. It was unreachable in practice (the
+// table is empty, so every handler 404'd, and two of the tables it wrote to no
+// longer exist) and nothing called it, but "unreachable" was an accident of
+// there being no rows rather than a property of the code. Deleted; the
+// org-scoped equivalents live under /api/pt-os/clients.
+// See src/__tests__/clients.legacy-table.test.js, which fails if anything
+// mounted here starts reading that table again.
 app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
-app.use('/api/clients',           userApiLimiter, require('./routes/client-actions'));
 
 app.use('/api/trainers',          require('./routes/trainers'));
 // Manual UTR verification payments. MUST be mounted before the finance ledger
