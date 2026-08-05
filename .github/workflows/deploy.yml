@@ -1,29 +1,83 @@
 name: Deploy Backend to VPS
 
+# On every push to main — and on demand.
+#
+# `workflow_dispatch` is here because a deploy that can only be triggered by a
+# commit is a deploy you cannot repeat. When an infrastructure blip fails the
+# run, main stays undeployed until somebody happens to push again; the "Run
+# workflow" button redeploys whatever main currently is.
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+# The script lives here so the two attempts below cannot drift apart. It is
+# idempotent — pull, build, up -d — so running it twice is the same as running
+# it once.
+env:
+  DEPLOY_SCRIPT: |
+    cd /opt/myptstudio/619-erp-backend
+    git pull origin main
+
+    cd /opt/myptstudio
+
+    docker compose build backend
+    docker compose up -d backend
+
+    docker image prune -f
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
+      # ── Why there are two attempts ──────────────────────────────────────
+      #
+      # The runner intermittently cannot reach the VPS on 22:
+      #
+      #   2026/08/05 06:14:53 dial tcp ***:22: i/o timeout
+      #
+      # Four such failures across the two repositories, each one bracketed by
+      # successful runs minutes either side, so it is a transient network or
+      # firewall condition rather than a broken key or a wrong host. The blip
+      # outlasts a single 30s dial but not a minute and a half.
+      #
+      # `continue-on-error` keeps the first failure from ending the job; the
+      # retry decides the outcome. If both fail, the job is red — this hides a
+      # blip, not an outage.
       - name: Deploy to VPS via SSH
+        id: attempt
+        continue-on-error: true
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
+          # Default is 30s. The observed failures took the full 30 and then
+          # gave up; the box answers again shortly after.
+          timeout: 60s
+          # A cold `docker compose build` is minutes, and the default 10m has
+          # no margin on a busy box.
+          command_timeout: 20m
+          # Default is OFF, which means the run's exit code is the LAST
+          # command's — `docker image prune -f` — so a failed `git pull` would
+          # report a green deploy that shipped nothing. Stop at the first error.
+          script_stop: true
+          script: ${{ env.DEPLOY_SCRIPT }}
 
-          script: |
-            cd /opt/myptstudio/619-erp-backend
-            git pull origin main
+      - name: Wait for the box to answer again
+        if: steps.attempt.outcome == 'failure'
+        run: sleep 90
 
-            cd /opt/myptstudio
-
-            docker compose build backend
-            docker compose up -d backend
-
-            docker image prune -f
+      - name: Deploy to VPS via SSH (retry)
+        if: steps.attempt.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 20m
+          script_stop: true
+          script: ${{ env.DEPLOY_SCRIPT }}
