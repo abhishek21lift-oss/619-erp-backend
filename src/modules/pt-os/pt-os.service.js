@@ -159,6 +159,13 @@ async function getDashboardStats(scope = {}) {
       COUNT(*) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL)::INT AS active_pt_clients,
       COUNT(*) FILTER (WHERE status = 'expired')::INT AS expired_clients,
       COUNT(*) FILTER (WHERE balance_amount > 0)::INT AS clients_with_balance,
+      -- Owed AND past the end of the package they owe it for. "Pending" and
+      -- "overdue" are different sentences to say to somebody on the phone.
+      COUNT(*) FILTER (
+        WHERE balance_amount > 0
+          AND pt_end_date IS NOT NULL
+          AND pt_end_date::DATE < CURRENT_DATE
+      )::INT AS overdue_clients,
       COALESCE(SUM(trainer_commission) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL), 0) AS total_monthly_commission,
       COALESCE(SUM(balance_amount), 0) AS total_outstanding
     FROM pt_clients
@@ -175,6 +182,17 @@ async function getDashboardStats(scope = {}) {
       AND deleted_at IS NULL${orgBare}
   `, orgParams);
   totals.total_monthly_pt_revenue = revenueRow.total_monthly_pt_revenue;
+
+  // What actually came in today. Same source as the monthly figure above —
+  // pt_payments, the money that was collected — rather than the contracted
+  // amounts on pt_clients, which are what was promised.
+  const { rows: [todayRow] } = await pool.query(`
+    SELECT COALESCE(SUM(amount), 0) AS collected, COUNT(*)::INT AS payments
+    FROM pt_payments
+    WHERE date = CURRENT_DATE AND deleted_at IS NULL${orgBare}
+  `, orgParams);
+  totals.today_collected = todayRow.collected;
+  totals.today_payments = todayRow.payments;
 
   const { rows: trainerStats } = await pool.query(`
     SELECT
