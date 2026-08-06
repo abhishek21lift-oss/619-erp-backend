@@ -5,6 +5,15 @@ on:
     branches: [main, staging]
   pull_request:
     branches: [main]
+  # Manual re-run.
+  #
+  # GitHub does not trigger `push` workflows for pushes authenticated with an
+  # app or bot token — it is a recursion guard. So a commit landed that way
+  # gets no CI run at all, and since deploy.yml now waits on CI's conclusion,
+  # that means no deploy either: the commit is on main and nothing happens.
+  # This button is how such a commit gets a result without an empty commit
+  # pushed by hand.
+  workflow_dispatch:
 
 # Cancel in-progress runs on the same branch to save CI minutes
 concurrency:
