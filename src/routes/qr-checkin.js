@@ -271,13 +271,31 @@ router.post('/scan', auth, scanLimiter, async (req, res) => {
        LIMIT 1`,
       [userId, refType, orgId]
     );
+    // The same shape on every outcome. The scanner draws the person's face on
+    // the result card, and the branch that most needs a face is a rejection —
+    // "membership expired" is a conversation the desk has to have with a
+    // specific human standing in front of them, not with a name on a screen.
+    // Nothing here is more sensitive than what the success branch already
+    // returns, and `user` is only reached after resolveUser() has confirmed
+    // the person belongs to the caller's org.
+    const publicUser = (status) => ({
+      id: userId,
+      name: user.name,
+      status,
+      photo_url: user.photo_url || null,
+      member_code: user.member_code || user.client_id || null,
+      package_type: user.package_type || null,
+      role: user.role || userType,
+    });
+
     if (recent[0]) {
       return res.json({
         success: true,
         duplicate: true,
         message: `Already checked in (${new Date(recent[0].check_in_time).toLocaleTimeString()})`,
-        user: { id: userId, name: user.name, status: 'active' },
+        user: publicUser('active'),
         attendance_id: recent[0].id,
+        check_in_time: recent[0].check_in_time,
       });
     }
 
@@ -286,7 +304,7 @@ router.post('/scan', auth, scanLimiter, async (req, res) => {
       return res.json({
         success: false,
         message: `Membership ${status}`,
-        user: { id: userId, name: user.name, status },
+        user: publicUser(status),
       });
     }
 
@@ -295,15 +313,7 @@ router.post('/scan', auth, scanLimiter, async (req, res) => {
     return res.json({
       success: true,
       message: `Welcome, ${user.name}!`,
-      user: {
-        id: userId,
-        name: user.name,
-        status: status,
-        photo_url: user.photo_url || null,
-        member_code: user.member_code || user.client_id || null,
-        package_type: user.package_type || null,
-        role: user.role || userType,
-      },
+      user: publicUser(status),
       attendance_id: att?.id,
       check_in_time: att?.check_in_time,
     });
