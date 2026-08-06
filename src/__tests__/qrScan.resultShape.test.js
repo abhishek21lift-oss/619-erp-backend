@@ -18,7 +18,6 @@ process.env.JWT_SECRET = 'test-secret-at-least-32-characters-long!!';
 
 jest.mock('../db/pool', () => ({ query: jest.fn() }));
 
-const ORG_A = '11111111-1111-1111-1111-111111111111';
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => {
     req.user = { id: 'usr-1', role: 'admin', organization_id: '11111111-1111-1111-1111-111111111111', trainer_id: null };

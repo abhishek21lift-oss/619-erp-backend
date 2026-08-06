@@ -1,7 +1,6 @@
 // src/routes/clients.js
 const router = require('express').Router();
 const pool   = require('../db/pool');
-const { genReceiptNo } = require('../db/receipts');
 const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { clientSchemas } = require('../lib/validation');

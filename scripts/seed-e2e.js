@@ -115,13 +115,11 @@ async function main() {
       GROUP BY o.name ORDER BY o.name`,
     [[ORG_A, ORG_B]]
   );
-  // eslint-disable-next-line no-console
   console.log(JSON.stringify({ seeded: rows, password: PASSWORD }, null, 2));
   await pool.end();
 }
 
 main().catch((err) => {
-  // eslint-disable-next-line no-console
   console.error('seed failed:', err.message);
   process.exit(1);
 });
