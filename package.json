@@ -26,7 +26,9 @@
     "diagnose:redis": "node --require ./diagnostics/redis-trace.js src/server.js",
     "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch --forceExit",
     "verify:embeddings": "node scripts/verify-embeddings.js",
-    "verify:indexes": "node scripts/verify-indexes.js"
+    "verify:indexes": "node scripts/verify-indexes.js",
+    "e2e:setup": "bash scripts/e2e-setup.sh",
+    "seed:e2e": "node scripts/seed-e2e.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1090.0",
