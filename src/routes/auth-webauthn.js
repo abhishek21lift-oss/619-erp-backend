@@ -15,10 +15,13 @@ const { tenantScope } = require('../lib/tenant-db');
 const logger   = require('../lib/logger');
 const loginEvents = require('../lib/loginEvents');
 const rateLimit = require('express-rate-limit');
+const { makeStore } = require('../lib/rateLimitStore');
 
 const router = express.Router();
 
 const authnLimiter = rateLimit({
+  store: makeStore('webauthn'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000, max: 20,
   standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many authentication attempts. Please wait 15 minutes.' },

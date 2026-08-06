@@ -145,6 +145,7 @@ const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
 const rateLimit     = require('express-rate-limit');
+const { makeStore } = require('./lib/rateLimitStore');
 const cookieParser  = require('cookie-parser');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
@@ -383,6 +384,8 @@ app.get('/api/health', async function(req, res) {
 // ────────────────────────
 // Global IP-based limiter (catches unauthenticated traffic)
 const apiLimiter = rateLimit({
+  store: makeStore('api'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: isProd ? 2000 : 5000,
   standardHeaders: true,
@@ -391,6 +394,8 @@ const apiLimiter = rateLimit({
 
 // M-05: per-user limiter applied after auth so shared IPs don't block each other
 const userApiLimiter = rateLimit({
+  store: makeStore('user'),
+  passOnStoreError: true,
   windowMs: 60 * 1000,
   max: 200,
   standardHeaders: true,
@@ -401,6 +406,8 @@ const userApiLimiter = rateLimit({
 });
 
 const loginLimiter = rateLimit({
+  store: makeStore('login'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: 30,
   standardHeaders: true,
@@ -409,6 +416,8 @@ const loginLimiter = rateLimit({
 });
 
 const registerLimiter = rateLimit({
+  store: makeStore('register'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: 10,
   standardHeaders: true,

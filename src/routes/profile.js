@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
+const { makeStore } = require('../lib/rateLimitStore');
 // otplib v13 removed the `authenticator` singleton that v12 exported and
 // replaced it with these functions. Verification now returns a RESULT OBJECT
 // ({ valid, delta, ... }), not a boolean — reading it as a boolean would make
@@ -724,6 +725,8 @@ router.post('/mfa/setup', async (req, res, next) => {
 // A 6-digit TOTP code is a 1M-value space; throttle harder than the general
 // per-user API limit so it can't be brute-forced from a single account.
 const mfaVerifyLimiter = rateLimit({
+  store: makeStore('mfa'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: 15,
   standardHeaders: true,

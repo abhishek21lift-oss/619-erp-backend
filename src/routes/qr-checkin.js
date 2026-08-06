@@ -18,8 +18,16 @@ const logger   = require('../lib/logger');
 const { auth } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const rateLimit = require('express-rate-limit');
+const { makeStore } = require('../lib/rateLimitStore');
 
-const qrLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+const qrLimiter = rateLimit({
+  store: makeStore('qr'),
+  passOnStoreError: true,
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -237,7 +245,14 @@ router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
 // ── POST /api/qr/scan ─────────────────────────────────────────────────────────
 // Validate signed QR payload and mark attendance. Called by scanner.
 // Auth required (reception, kiosk, trainer, admin) OR kiosk token.
-const scanLimiter = rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false });
+const scanLimiter = rateLimit({
+  store: makeStore('qrscan'),
+  passOnStoreError: true,
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 router.post('/scan', auth, scanLimiter, async (req, res) => {
   try {

@@ -18,6 +18,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
+const { makeStore } = require('../lib/rateLimitStore');
 const pool = require('../db/pool');
 const logger = require('../lib/logger');
 const invitations = require('../lib/invitations');
@@ -29,6 +30,8 @@ const router = express.Router();
 // riding the general API one. Generous enough that a person re-reading their
 // email and clicking twice is never blocked.
 const inviteLimiter = rateLimit({
+  store: makeStore('invite'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: 30,
   standardHeaders: true,
