@@ -21,6 +21,11 @@ const OUTCOMES = {
   INACTIVE: 'inactive',
   MFA_REQUIRED: 'mfa_required',
   MFA_FAILED: 'mfa_failed',
+  // Right password, wrong sign-in page: a client on Admin Login, or a studio
+  // account on Member Login. Kept distinct from bad_password because it is not
+  // a failed credential — lumping the two together would make an ordinary
+  // mix-up look like an attack in the audit trail.
+  WRONG_PORTAL: 'wrong_portal',
 };
 
 /**

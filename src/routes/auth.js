@@ -125,6 +125,50 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
+    // ── Which door did they come through? ──────────────
+    //
+    // Two sign-in screens: Admin Login (/login) for the people who run a
+    // studio, Member Login (/member-login) for clients. Each refuses the
+    // other's accounts, and it is refused HERE rather than in the UI, because
+    // a screen that merely looks separate is not separate at all — the same
+    // POST works from either page, or from curl.
+    //
+    // ── Why this check sits AFTER the password ──
+    //
+    // Put it before, and the endpoint becomes an oracle: send any address with
+    // a junk password and the difference between "invalid email or password"
+    // and "this is the wrong sign-in page" tells an attacker the account
+    // exists AND which side it is on. Running it here means the caller has
+    // already proved they know the password, at which point their own role is
+    // not a secret from them.
+    //
+    // Defaults to 'staff' when absent so every existing caller — the mobile
+    // app on /api/v1/auth/login, a saved bookmark, the operator portal —
+    // behaves exactly as it did. A member has never been able to sign in
+    // through any of those, so nothing that works today changes.
+    const portal = req.body.portal === 'member' ? 'member' : 'staff';
+    const isMemberAccount = user.role === 'member';
+    if (portal === 'member' && !isMemberAccount) {
+      loginEvents.record(req, {
+        outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
+        userId: user.id, orgId: user.organization_id,
+      });
+      return res.status(403).json({
+        error: { code: 'WRONG_PORTAL', portal: 'staff',
+          message: 'This is the member sign-in. Use Admin Login for a studio account.' },
+      });
+    }
+    if (portal === 'staff' && isMemberAccount) {
+      loginEvents.record(req, {
+        outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
+        userId: user.id, orgId: user.organization_id,
+      });
+      return res.status(403).json({
+        error: { code: 'WRONG_PORTAL', portal: 'member',
+          message: 'This is the studio sign-in. Use Member Login for your client account.' },
+      });
+    }
+
     // ── 2FA enforcement for platform super admins ──────
     // A super_admin operates the whole platform, so their account MUST be
     // second-factor protected. If they have TOTP enabled, a valid 6-digit code

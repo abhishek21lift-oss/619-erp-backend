@@ -12,6 +12,15 @@ const authSchemas = {
       // Optional TOTP code — required at login for platform super admins who
       // have 2FA enabled (enforced in the login handler, not here).
       mfa_code: z.string().trim().regex(/^\d{6}$/, 'MFA code must be 6 digits').optional(),
+      // Which door the person came through: the staff sign-in or the member
+      // one. Enforced in the login handler, AFTER the password check — see
+      // routes/auth.js for why the order matters.
+      //
+      // Optional and defaulting to 'staff' so existing callers (the mobile
+      // app on /api/v1/auth/login, any saved bookmark) keep working exactly
+      // as before. A member has never been able to sign in through those, so
+      // defaulting this way changes nothing for anyone who works today.
+      portal: z.enum(['staff', 'member']).optional(),
     }),
   },
   changePassword: {
