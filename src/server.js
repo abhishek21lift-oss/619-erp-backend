@@ -145,6 +145,7 @@ const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
 const rateLimit     = require('express-rate-limit');
+const { makeStore } = require('./lib/rateLimitStore');
 const cookieParser  = require('cookie-parser');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
@@ -383,6 +384,8 @@ app.get('/api/health', async function(req, res) {
 // ────────────────────────
 // Global IP-based limiter (catches unauthenticated traffic)
 const apiLimiter = rateLimit({
+  store: makeStore('api'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: isProd ? 2000 : 5000,
   standardHeaders: true,
@@ -391,6 +394,8 @@ const apiLimiter = rateLimit({
 
 // M-05: per-user limiter applied after auth so shared IPs don't block each other
 const userApiLimiter = rateLimit({
+  store: makeStore('user'),
+  passOnStoreError: true,
   windowMs: 60 * 1000,
   max: 200,
   standardHeaders: true,
@@ -401,6 +406,8 @@ const userApiLimiter = rateLimit({
 });
 
 const loginLimiter = rateLimit({
+  store: makeStore('login'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: 30,
   standardHeaders: true,
@@ -409,6 +416,8 @@ const loginLimiter = rateLimit({
 });
 
 const registerLimiter = rateLimit({
+  store: makeStore('register'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: 10,
   standardHeaders: true,
@@ -535,13 +544,21 @@ app.use('/api/expenses',          ...gate('finance'), require('./routes/expenses
 app.use('/api/v1/bookings',       require('./modules/bookings/bookings.routes'));
 app.use('/api/bookings',          require('./modules/bookings/bookings.routes'));
 
-// FIX (Route Integrity R-10):
+// FIX (Route Integrity R-10, tightened by audit finding C-1):
 // /api/admin previously relied solely on individual route handlers to apply
 // auth + adminOnly middleware. This left the mount unguarded — any handler
 // that forgot to include the middleware chain would be publicly accessible.
-// We now enforce auth + adminOnly at the mount level as defense-in-depth.
-// Individual handlers may still include the middleware; it is a no-op.
-app.use('/api/admin',             auth, adminOnly, require('./routes/admin-reset'));
+// We enforce auth at the mount level as defense-in-depth. Individual handlers
+// may still include their own middleware; it is a no-op.
+//
+// C-1: admin-reset.js performs platform-wide, unscoped destructive operations
+// (DELETE/DROP across every tenant's data, no organization_id filter — these
+// are irreversible bulk-wipe tools, not ordinary tenant-admin actions). Gating
+// them behind `adminOnly` (role==='admin', the ordinary Studio Owner role
+// auto-granted to every self-serve trial signup) let any trial signup wipe
+// every tenant on the platform. This must be `requireSuperAdmin` +
+// `requireSuperAdminMfa`, matching every other platform-destructive route.
+app.use('/api/admin',             auth, requireSuperAdmin, requireSuperAdminMfa, require('./routes/admin-reset'));
 app.use('/api/debug',             auth, adminOnly, require('./routes/debug'));
 
 // Platform Super Admin portal (multi-tenant SaaS). Guarded at the mount with

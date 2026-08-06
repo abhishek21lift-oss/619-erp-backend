@@ -357,13 +357,32 @@ router.put('/feature-flags', auth, adminOnly, async (req, res, next) => {
     if (!updates || typeof updates !== 'object')
       return res.status(400).json({ error: 'Body must be a key-value object' });
 
-    for (const [key, val] of Object.entries(updates)) {
-      await pool.query(
-        `UPDATE feature_flags SET value=$1, updated_at=NOW() WHERE key=$2`,
-        [Boolean(val), key]
-      );
-    }
-    res.json({ message: 'Feature flags updated' });
+    const keys = Object.keys(updates);
+    if (!keys.length) return res.json({ message: 'Feature flags updated', updated: 0, requested: 0 });
+
+    // One statement, atomic by construction — the same shape PUT /permissions
+    // above uses for the same class of bulk key/value write.
+    //
+    // This was a `for` loop issuing one UPDATE per key with no transaction
+    // around it. A failure partway through (dropped connection, constraint
+    // error on flag 3 of 5) left flags 1-2 committed, 4-5 never attempted, and
+    // returned a single 500 that read as "nothing happened" — so the operator's
+    // next move was to retry a write that had already half-applied. Feature
+    // flags gate real functionality, so a half-applied set is a half-configured
+    // product, not a cosmetic problem.
+    const vals = keys.map((k) => Boolean(updates[k]));
+    const { rowCount } = await pool.query(
+      `UPDATE feature_flags AS f
+          SET value = v.value, updated_at = NOW()
+         FROM unnest($1::text[], $2::boolean[]) AS v(key, value)
+        WHERE f.key = v.key`,
+      [keys, vals]
+    );
+
+    // Report what actually changed. Unknown keys match no row and are skipped
+    // silently — true of the loop too — so returning the count lets a caller
+    // notice a typo instead of reading "updated" and believing it.
+    res.json({ message: 'Feature flags updated', updated: rowCount, requested: keys.length });
   } catch (err) {
     next(err);
   }

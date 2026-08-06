@@ -2,10 +2,17 @@ const express = require('express');
 const router  = express.Router();
 const crypto  = require('crypto');
 const pool    = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
 const logger  = require('../lib/logger');
 const { escapeIdentifier } = require('pg');
 const { sendAdminResetOtp } = require('../lib/email');
+
+// SECURITY (audit finding C-1): this router performs platform-wide, unscoped
+// destructive operations (DELETE/DROP with no organization_id filter, across
+// every tenant). It must only ever be reachable by the platform super admin.
+// That is enforced at the mount point in server.js: `auth, requireSuperAdmin,
+// requireSuperAdminMfa`. Do NOT re-add a per-route `adminOnly` check here —
+// `adminOnly` matches role==='admin', the ordinary tenant Studio Owner role,
+// which is exactly the access this file must never grant.
 
 const ALLOWED_TABLES = new Set([
   'attendance_logs', 'payments', 'subscriptions', 'invoices', 'outstanding_dues',
@@ -43,7 +50,7 @@ async function dropIfExists(client, tableName) {
    Step 1 — POST /admin/initiate-reset  → emails a 6-digit OTP
    Step 2 — POST /admin/reset-all-data  → Body: { otp: "123456" }
 ══════════════════════════════════════════════════════════════════════ */
-router.post('/initiate-reset', auth, adminOnly, async (req, res) => {
+router.post('/initiate-reset', async (req, res) => {
   try {
     const action = String(req.body?.action || 'reset-all');
     const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit
@@ -79,7 +86,7 @@ router.post('/initiate-reset', auth, adminOnly, async (req, res) => {
    POST /admin/reset-all-data
    Body: { otp: "123456" }
 ══════════════════════════════════════════════════════════════════════ */
-router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
+router.post('/reset-all-data', async (req, res) => {
   const otp = String(req.body?.otp || '');
   if (!otp) {
     return res.status(400).json({ error: 'OTP required. Call /admin/initiate-reset first to receive a code.' });
@@ -143,7 +150,7 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
    POST /admin/reset-outstanding-dues
    Body: { otp: "123456" }  (OTP from /initiate-reset?action=reset-dues)
 ══════════════════════════════════════════════════════════════════════ */
-router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
+router.post('/reset-outstanding-dues', async (req, res) => {
   const otp = String(req.body?.otp || '');
   if (!otp) {
     return res.status(400).json({ error: 'OTP required. Call /admin/initiate-reset with action=reset-dues first.' });

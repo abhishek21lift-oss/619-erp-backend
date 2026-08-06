@@ -29,30 +29,67 @@
 --
 -- Safe to apply while the app is running: it cannot lock out the backend, which
 -- does not go through these roles.
-
-ALTER TABLE staff         ENABLE ROW LEVEL SECURITY;
-ALTER TABLE staff_targets ENABLE ROW LEVEL SECURITY;
-
-REVOKE ALL ON staff         FROM anon, authenticated;
-REVOKE ALL ON staff_targets FROM anon, authenticated;
+--
+-- ── Why every statement below is guarded on to_regclass ─────────────────────
+--
+-- These two tables do not exist on a database built from this repo. 030b
+-- creates them, 064_drop_staff_module.sql drops them, and no tracked migration
+-- ever creates them again — the `staff.sql` recorded in `_migrations` on the
+-- live database is not a file in this repo, so the recreation happened out of
+-- band.
+--
+-- Unguarded, `ALTER TABLE staff ENABLE ROW LEVEL SECURITY` therefore aborted a
+-- fresh `npm run migrate` right here with
+--
+--     ERROR: 42P01: relation "staff" does not exist
+--
+-- (reproduced against a real Postgres, not assumed) and because migrate.js
+-- stops on the first failure, migrations 149-154 never applied either. Anyone
+-- standing up a new environment got a database silently six migrations behind,
+-- and the error pointed at RLS rather than at the missing table.
+--
+-- 101_perf_fk_indexes_and_rls_initplan.sql hit exactly this with gym_settings
+-- and solved it the same way; this matches that pattern deliberately.
+--
+-- Edited in place rather than shipped as a follow-up migration, because a
+-- follow-up would run AFTER this file and so could never stop this file from
+-- failing. migrate.js skips any filename already in `_migrations`, so on the
+-- live database — where this migration is recorded as applied — the edit is
+-- inert and re-applies nothing. On a fresh database it is the difference
+-- between a working bootstrap and a broken one.
+--
+-- Both tables are empty and no application code references them, so if the
+-- staff module stays retired the tidier end state is to drop them on the live
+-- database and delete this file. That is a product decision, not a migration
+-- fix, so it is left alone here.
 
 DO $$
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_policies
-     WHERE schemaname = 'public' AND tablename = 'staff'
-       AND policyname = 'deny_all_direct_access'
-  ) THEN
-    CREATE POLICY deny_all_direct_access ON staff
-      FOR ALL USING (false) WITH CHECK (false);
+  IF to_regclass('public.staff') IS NOT NULL THEN
+    ALTER TABLE staff ENABLE ROW LEVEL SECURITY;
+    REVOKE ALL ON staff FROM anon, authenticated;
+
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_policies
+       WHERE schemaname = 'public' AND tablename = 'staff'
+         AND policyname = 'deny_all_direct_access'
+    ) THEN
+      CREATE POLICY deny_all_direct_access ON staff
+        FOR ALL USING (false) WITH CHECK (false);
+    END IF;
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_policies
-     WHERE schemaname = 'public' AND tablename = 'staff_targets'
-       AND policyname = 'deny_all_direct_access'
-  ) THEN
-    CREATE POLICY deny_all_direct_access ON staff_targets
-      FOR ALL USING (false) WITH CHECK (false);
+  IF to_regclass('public.staff_targets') IS NOT NULL THEN
+    ALTER TABLE staff_targets ENABLE ROW LEVEL SECURITY;
+    REVOKE ALL ON staff_targets FROM anon, authenticated;
+
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_policies
+       WHERE schemaname = 'public' AND tablename = 'staff_targets'
+         AND policyname = 'deny_all_direct_access'
+    ) THEN
+      CREATE POLICY deny_all_direct_access ON staff_targets
+        FOR ALL USING (false) WITH CHECK (false);
+    END IF;
   END IF;
 END $$;

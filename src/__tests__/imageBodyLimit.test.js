@@ -26,7 +26,6 @@ function loadPatterns() {
   const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
   const block = src.match(/const IMAGE_JSON_PATHS = \[([\s\S]*?)\];/);
   if (!block) throw new Error('IMAGE_JSON_PATHS not found in server.js');
-  // eslint-disable-next-line no-eval
   return eval(`[${block[1]}]`);
 }
 
