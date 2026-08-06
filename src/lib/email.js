@@ -2,6 +2,7 @@ const nodemailer = require('nodemailer');
 const logger = require('./logger');
 const { frontendUrl } = require('./frontendUrl');
 const { invitationHtml, invitationText } = require('./emailTemplates/invitation');
+const { clientActivationHtml, clientActivationText } = require('./emailTemplates/clientActivation');
 
 // FRONTEND_URL is deliberately NOT checked here any more.
 //
@@ -256,6 +257,36 @@ async function sendAdminInvitation({ to, ownerName, studioName, actionUrl, pixel
 }
 
 /**
+ * The client activation email.
+ *
+ * Throws when SMTP is unconfigured rather than resolving quietly, the same as
+ * sendAdminInvitation. The caller has already created the account and the
+ * link by this point, so a silent no-op would leave a trainer looking at a
+ * card that says the client was invited when nothing was sent. The route
+ * turns the throw into a 502 that says exactly that and offers Resend.
+ */
+async function sendClientActivation({ to, clientName, studioName, actionUrl, expiryHours }) {
+  if (!isConfigured()) {
+    const err = new Error('SMTP is not configured on this deploy');
+    err.code = 'SMTP_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const vars = { clientName, studioName, actionUrl, expiryHours };
+  return sendWithRetry({
+    from: INVITE_FROM,
+    to,
+    subject: `Activate your ${studioName || 'MY PT STUDIO'} account`,
+    text: clientActivationText(vars),
+    html: clientActivationHtml(vars),
+    headers: {
+      // Not a marketing email, and mail clients treat it better when told so.
+      'X-Entity-Ref-ID': 'client-activation',
+    },
+  }, { to, kind: 'client_activation' });
+}
+
+/**
  * Generic send for callers that are not one of the named flows above (e.g.
  * the notification centre's email channel). Routes through the same
  * transporter, retry policy and FROM address as everything else in this
@@ -441,6 +472,7 @@ async function sendWelcomeInline({ to, name, studioName, trialDays }) {
 
 module.exports = {
   sendWelcome, sendPasswordReset, sendAdminResetOtp, sendAdminInvitation, sendRaw,
+  sendClientActivation,
   sendWelcomeInline, sendPasswordResetInline, sendAdminResetOtpInline,
   verifyConnection, diagnose,
   isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,

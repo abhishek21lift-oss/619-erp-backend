@@ -89,7 +89,14 @@ async function auth(req, res, next) {
           // organization_id carries the tenant boundary onto req.user for the
           // multi-tenant isolation layer (migration 078).
           // SECURITY: filter out soft-deleted users (deleted_at IS NOT NULL).
-          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
+          // pt_client_id is the client-account link, and it is a DIFFERENT
+          // column from member_id — member_id carries a foreign key to the
+          // legacy, empty `clients` table (migration 154 explains why).
+          // requireClient and every /api/me query read it off req.user, so it
+          // has to load here with role and organization_id: taking a client id
+          // from the request instead is the exact mistake the isolation layer
+          // exists to prevent.
+          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.pt_client_id, u.branch_id,
                   u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
                   o.is_founder, o.founder_number,
                   o.status AS organization_status, o.subscription_status,
@@ -103,9 +110,14 @@ async function auth(req, res, next) {
         );
         rows = result.rows;
       } catch {
-        // Fallback if deleted_at column doesn't exist (pre-migration)
+        // Fallback if deleted_at column doesn't exist (pre-migration).
+        // pt_client_id is selected here too: this branch runs on a database
+        // behind on migrations, and a client whose account silently loads
+        // without its link would be refused by requireClient with no clue why.
+        // If 154 has not run either, this query fails and the caller gets a
+        // clean 401 rather than a session missing its tenant identity.
         const result = await pool.query(
-          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
+          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.pt_client_id, u.branch_id,
                   u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
                   o.is_founder, o.founder_number,
                   u.is_active, u.token_version

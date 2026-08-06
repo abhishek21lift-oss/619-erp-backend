@@ -65,4 +65,68 @@ function requireTrainerOwnership(pool, paramName = 'id') {
   };
 }
 
-module.exports = { requireRole, requireSelfOrRole, requireTrainerOwnership };
+/**
+ * The roles that run a studio, as opposed to the people it trains.
+ *
+ * `member` is deliberately absent, and that absence is the point — see
+ * requireStaff.
+ */
+const STAFF_ROLES = ['super_admin', 'admin', 'manager', 'staff', 'trainer', 'reception', 'receptionist'];
+
+/**
+ * Everything behind a studio's back office.
+ *
+ * Written as an allow-list of staff rather than a deny-list of `member`
+ * because the failure modes are not symmetric. A role added later and
+ * forgotten here gets a 403 — visible, annoying, fixed in a minute. A role
+ * added to a deny-list-shaped check and forgotten gets the whole studio, and
+ * nobody finds out.
+ *
+ * ── Why this exists ──────────────────────────────────────────────────────
+ *
+ * Read routes across the staff modules were gated on `auth` alone. That was
+ * survivable only because no account had ever held the `member` role: there
+ * was nobody to abuse it. Client logins create those accounts by the hundred,
+ * and on the day the first one is activated `GET /api/pt-os/clients` would
+ * hand that client the studio's entire client list — names, phone numbers,
+ * balances — with a valid token and no exploit required. Same for
+ * /dashboard's revenue, and /clients/:id for anybody's record.
+ *
+ * So this ships WITH the activation feature, not after it. A client's own
+ * data is served by /api/me, which scopes to the caller.
+ */
+function requireStaff(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: { code: 'UNAUTH', message: 'Not authenticated' } });
+  }
+  if (!STAFF_ROLES.includes(req.user.role)) {
+    return res.status(403).json({
+      error: { code: 'FORBIDDEN', message: 'This area is for studio staff.' },
+    });
+  }
+  next();
+}
+
+/**
+ * The mirror of requireStaff: a client, acting on their own behalf.
+ *
+ * Requires the account to actually be linked to a client record. A `member`
+ * row with no pt_client_id is a half-built account, and serving it an empty
+ * profile is worse than refusing it — it looks like their data was lost.
+ */
+function requireClient(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: { code: 'UNAUTH', message: 'Not authenticated' } });
+  }
+  if (req.user.role !== 'member' || !req.user.pt_client_id) {
+    return res.status(403).json({
+      error: { code: 'FORBIDDEN', message: 'This area is for client accounts.' },
+    });
+  }
+  next();
+}
+
+module.exports = {
+  requireRole, requireSelfOrRole, requireTrainerOwnership,
+  requireStaff, requireClient, STAFF_ROLES,
+};

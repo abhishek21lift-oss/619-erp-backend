@@ -149,6 +149,7 @@ const cookieParser  = require('cookie-parser');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { auth, adminOnly }        = require('./middleware/auth');
+const { requireStaff, requireClient } = require('./middleware/rbac');
 const { requireSuperAdmin, requireSuperAdminMfa } = require('./middleware/tenant');
 const { branchScope }            = require('./middleware/branch-scope');
 const { requireFeature }         = require('./lib/features');
@@ -455,6 +456,10 @@ app.use('/api/public',            require('./routes/public'));
 // require one. The single-use hashed token IS the credential — see
 // routes/invitations.js for why every rejection returns the same shape.
 app.use('/api/invitations',       require('./routes/invitations'));
+// Public for the same reason: a client activating their login has no password
+// yet. The single-use hashed token IS the credential — see
+// routes/client-activation.js, which holds every rejection to one shape.
+app.use('/api/client-activation', require('./routes/client-activation'));
 // Self-serve trial signup. Deliberately unauthenticated: the whole point is
 // that the applicant does not have an account yet.
 app.use('/api/registrations',     require('./routes/registrations'));
@@ -592,10 +597,30 @@ app.use('/api/classes',           require('./routes/classes'));
 // ────────────────────────
 // PT OS — Personal Training Operating System
 // ────────────────────────
-app.use('/api/pt-os',            require('./modules/pt-os/pt-os.routes'));
-app.use('/api/pt-os',            require('./modules/pt-os/parq.routes'));
-app.use('/api/pt-os',            require('./modules/pt-os/informed-consent.routes'));
-app.use('/api/pt-os',            require('./modules/pt-os/workout-log.routes'));
+// The back office, and gated as such at the MOUNT rather than per route.
+//
+// Every handler inside already calls auth(); the pair here runs first so the
+// role check cannot be forgotten on a route added later — which is exactly how
+// the gap this closes came about. Read routes here were `auth`-only, harmless
+// only for as long as no account held the `member` role. Client logins end
+// that, and an ungated GET /api/pt-os/clients hands a client the studio's
+// whole client list. See requireStaff in middleware/rbac.js.
+//
+// auth() running twice is cheap: the second call is a user-cache hit.
+// A client's own data is served by /api/me, which scopes to the caller.
+app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/pt-os.routes'));
+app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/parq.routes'));
+app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/informed-consent.routes'));
+app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/workout-log.routes'));
+
+// The client's own surfaces. Mirror image of the block above: requireClient
+// refuses anyone who is not a `member` linked to a client record, and every
+// query inside is scoped to req.user.pt_client_id — never to an id from the
+// request.
+app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-portal.routes'));
+
+// Trainer-side control of client logins. Staff only, org-scoped.
+app.use('/api/client-login',     auth, requireStaff, require('./routes/client-login'));
 
 // ────────────────────────
 // BUSINESS FLOW ROUTES (v4 — Progress, Automation)
