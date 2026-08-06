@@ -319,8 +319,8 @@ router.get('/settings', auth, wrap(async (req, res) => {
 
 // PUT /api/payments/upi/settings — admin only.
 router.put('/settings', auth, adminOnly, validate(schemas.settings), wrap(async (req, res) => {
-  const orgId = requireOrg(req);
   try {
+    const orgId = requireOrg(req);
     const saved = await upi.upsertSettings(orgId, req.body);
     await logActivity(req, 'payment_settings.update', 'payment_settings', saved.id, {
       upi_id: saved.upi_id, is_enabled: saved.is_enabled, gst_percent: saved.gst_percent,
@@ -337,8 +337,8 @@ router.put('/settings', auth, adminOnly, validate(schemas.settings), wrap(async 
 
 // POST /api/payments/upi/create
 router.post('/create', auth, validate(schemas.createOrder), wrap(async (req, res) => {
-  const orgId = requireOrg(req);
   try {
+    const orgId = requireOrg(req);
     const member = await resolveTargetClient(req, req.body.client_id, orgId);
 
     // Price resolution. When the order names a real plan, the STORED price is
@@ -760,8 +760,8 @@ router.get('/:id/audit', auth, adminOnly, validate(schemas.idParam), wrap(async 
 
 // POST /api/payments/upi/:id/approve — admin only.
 router.post('/:id/approve', auth, adminOnly, validate(schemas.idParam), wrap(async (req, res) => {
-  const orgId = requireOrg(req);
   try {
+    const orgId = requireOrg(req);
     const result = await upi.approve({ orderId: req.params.id, orgId, actor: actorOf(req) });
 
     const memberUserId = await userIdForClient(result.member.id);
@@ -787,8 +787,8 @@ router.post('/:id/approve', auth, adminOnly, validate(schemas.idParam), wrap(asy
 
 // POST /api/payments/upi/:id/reject — admin only.
 router.post('/:id/reject', auth, adminOnly, validate(schemas.reject), wrap(async (req, res) => {
-  const orgId = requireOrg(req);
   try {
+    const orgId = requireOrg(req);
     const result = await upi.reject({
       orderId: req.params.id, orgId,
       reason: req.body.reason, note: req.body.note, actor: actorOf(req),
@@ -819,8 +819,8 @@ router.post('/:id/reject', auth, adminOnly, validate(schemas.reject), wrap(async
 // action differs so the trail records what the admin actually meant.
 router.post('/:id/request-correction', auth, adminOnly, validate(schemas.reject),
   wrap(async (req, res) => {
-    const orgId = requireOrg(req);
     try {
+      const orgId = requireOrg(req);
       const result = await upi.reject({
         orderId: req.params.id, orgId, reason: req.body.reason, note: req.body.note,
         actor: actorOf(req), correction: true,
