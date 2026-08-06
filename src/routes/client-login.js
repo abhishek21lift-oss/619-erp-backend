@@ -23,11 +23,10 @@ const logger = require('../lib/logger');
 const invites = require('../lib/clientInvitations');
 const email = require('../lib/email');
 const { tenantScope } = require('../lib/tenant-db');
+const { frontendUrl } = require('../lib/frontendUrl');
 const { invalidateUserCache } = require('../middleware/auth');
 
 const router = express.Router();
-
-const APP_URL = (process.env.APP_URL || process.env.FRONTEND_URL || 'https://myptstudio.com').replace(/\/$/, '');
 
 /**
  * Load a client, scoped to the caller's studio.
@@ -222,7 +221,15 @@ async function issueAndSend(req, res, c, { reactivate = false } = {}) {
 
   invalidateUserCache(userId);
 
-  const actionUrl = `${APP_URL}/client/activate?token=${token}`;
+  // frontendUrl(), not a hand-rolled env read. This originally used
+  // `process.env.APP_URL || FRONTEND_URL || 'https://myptstudio.com'`, which
+  // was wrong three ways: APP_URL is set nowhere — docker-compose passes only
+  // FRONTEND_URL — so it always fell through to the hardcoded string; that
+  // string being the right domain today is luck, and a staging deploy would
+  // have mailed clients a link to production; and it did not normalise a
+  // trailing slash, which is the exact defect frontendUrl was written for
+  // after "https://example.com//reset-password" reached real users.
+  const actionUrl = frontendUrl(`/client/activate?token=${token}`);
   let sent = false;
   let sendError = null;
   try {
