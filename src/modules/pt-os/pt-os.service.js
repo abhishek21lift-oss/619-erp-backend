@@ -495,6 +495,25 @@ async function getOpsSummary(scope = {}) {
     WHERE deleted_at IS NULL${orgBare1}
   `, bareParams);
 
+  // Per-trainer totals for the month — scoped, unlike every other query here.
+  //
+  // This one took no parameters at all: it listed every active trainer on the
+  // PLATFORM and their session counts, to every studio that loaded a
+  // dashboard. Names of other studios' staff, and how busy they are, is
+  // competitive information; it is also the exact class of bug the tenant
+  // filter exists to prevent, sitting in the middle of a function where every
+  // sibling query was already scoped.
+  //
+  // Both sides need the filter, for different reasons. On `t` it decides which
+  // trainers are listed at all. On `s` it stops a foreign session being
+  // COUNTED against a local trainer — the ids are per-table, so a collision is
+  // unlikely rather than impossible, and a count is exactly where a stray row
+  // would go unnoticed.
+  //
+  // The `s` filter belongs in the JOIN condition, not the WHERE clause. In the
+  // WHERE it would discard the NULL-extended rows a LEFT JOIN produces and
+  // silently turn this into an INNER JOIN, dropping every trainer who has no
+  // sessions this month — who are precisely the ones a manager is looking for.
   const { rows: trainer_sessions } = await pool.query(`
     SELECT
       t.name AS trainer_name,
@@ -507,10 +526,12 @@ async function getOpsSummary(scope = {}) {
       AND s.session_date >= DATE_TRUNC('month', CURRENT_DATE)
       AND s.session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
       AND s.deleted_at IS NULL
+      ${apply ? 'AND s.organization_id = $1' : ''}
     WHERE t.deleted_at IS NULL AND t.status = 'active'
+      ${apply ? 'AND t.organization_id = $1' : ''}
     GROUP BY t.id, t.name
     ORDER BY completed DESC
-  `);
+  `, bareParams);
 
   return {
     today_sessions, today_unscheduled, today_enrolled,
