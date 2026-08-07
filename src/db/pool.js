@@ -10,12 +10,50 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
+/**
+ * Is SSL explicitly turned OFF for this connection?
+ *
+ * Only `sslmode=disable` in the URL counts. Everything else — a different
+ * sslmode, a malformed URL, no sslmode at all — leaves SSL ON, so this can
+ * only ever be relaxed deliberately and never by an omission or a typo.
+ *
+ * It exists because a plain Postgres (a CI service container, a local docker)
+ * is not built with SSL, and node-postgres asked for it unconditionally: the
+ * server answers "not supported" and the driver fails the connection outright.
+ * That is what broke the E2E job — the isolation suite could not reach a
+ * database at all, so the one test that proves studios cannot read each
+ * other's data had never actually run.
+ *
+ * The signal is read from DATABASE_URL rather than a separate env var so that
+ * `psql` and this pool cannot disagree: libpq understands the same parameter,
+ * so one URL configures both.
+ *
+ * Note that node-postgres does not implement libpq's `prefer` fallback (try
+ * SSL, silently continue without it). Anything other than `disable` therefore
+ * behaves as `require` here, which is the safe direction to be wrong in.
+ */
+function sslDisabledByUrl() {
+  try {
+    return new URL(process.env.DATABASE_URL).searchParams.get('sslmode') === 'disable';
+  } catch {
+    return false; // unparseable → keep SSL on
+  }
+}
+
 // Build SSL config:
+//   - sslmode=disable in the URL → no SSL at all (local/CI Postgres only).
 //   - If DATABASE_SSL_CA is set, use that CA file with full cert verification.
 //     This is the secure path for production — Supabase publishes a CA bundle.
 //   - Otherwise fall back to rejectUnauthorized:false (Supabase-compatible
 //     but doesn't verify the cert chain). Logs a warning so it's visible.
 function buildSslConfig() {
+  if (sslDisabledByUrl()) {
+    // Loud on purpose. An unencrypted database connection is correct for a
+    // throwaway CI container and alarming anywhere else, so it should never be
+    // something you have to go looking for in a config file to discover.
+    logger.warn('DATABASE_URL sets sslmode=disable — connecting WITHOUT encryption');
+    return false;
+  }
   const caPath = process.env.DATABASE_SSL_CA;
   if (caPath) {
     try {
@@ -65,12 +103,20 @@ pool.on('error', (err) => {
 // queries and every `created_at::date` cast were all a day behind the studio
 // looking at them.
 //
-// Set on `connect` rather than in the connection string so it applies to
-// pooled connections opened later in the process's life, and so it stays in
-// one place with the JS half (src/lib/appTime.js) reading the same env var.
-// SET TIME ZONE takes a string literal, not a parameter, so the value is
-// validated by appTimeZone() before it gets here — it is one of a fixed set of
-// IANA names, never raw user input.
+// `SET TIME ZONE` on connect rather than an `options: '-c timezone=…'` startup
+// parameter, which would be tidier — it is part of the handshake, so there is
+// no window before it applies, and it does not trip node-postgres's warning
+// about querying a client the pool is handing over. It is not used because
+// production reaches Postgres through Supabase's Supavisor pooler, and poolers
+// in the PgBouncer lineage reject startup parameters they do not recognise
+// unless explicitly allowlisted. A rejected parameter is not a degraded
+// connection, it is no connection at all — the whole backend fails to reach the
+// database. A plain statement works through any pooler, so the deprecation
+// warning is the cheaper of the two costs.
+//
+// SET TIME ZONE takes a string literal, not a bind parameter, so the value is
+// validated by appTimeZone() before it gets here — one of a fixed set of IANA
+// names, never raw user input.
 pool.on('connect', (client) => {
   client.query(`SET TIME ZONE '${appTimeZone()}'`).catch((err) => {
     // A connection that failed to take the zone would silently serve UTC
