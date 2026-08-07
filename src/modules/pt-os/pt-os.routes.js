@@ -8,6 +8,7 @@ const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
+const { today: studioToday } = require('../../lib/appTime');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
 const { buildEnrollmentPdf } = require('../../lib/ptEnrollmentPdf');
@@ -385,7 +386,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
       }
     }
 
-    const startDate = pt_start_date || new Date().toISOString().slice(0, 10);
+    const startDate = pt_start_date || studioToday();
     let endDate = pt_end_date || null;
     if (!endDate && resolvedDurationMonths && resolvedDurationMonths > 0) {
       const d = new Date(startDate);

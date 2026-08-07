@@ -1,4 +1,5 @@
 const pool = require('../../db/pool');
+const { today: studioToday } = require('../../lib/appTime');
 
 async function calculateMonthlyCommissions(month) {
   const monthStart = `${month}-01`;
@@ -308,7 +309,9 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) 
  *   trainer_sessions — per-trainer session totals this month
  */
 async function getOpsSummary(scope = {}) {
-  const today = new Date().toISOString().slice(0, 10);
+  // Studio-local, not UTC. `toISOString()` here meant the panel showed
+  // yesterday's sessions between midnight and 05:30 IST — see src/lib/appTime.js.
+  const today = studioToday();
   // Tenant scope: $1 is always `today`; when filtering, $2 is the org id.
   const apply = Boolean(scope.applyFilter);
   const orgS = apply ? ' AND s.organization_id = $2' : '';   // aliased pt_sessions

@@ -23,6 +23,8 @@
 // acted on. A trainer told "weight loss is slowing" for a client nobody has
 // measured will change a programme that was working.
 
+const { today: studioToday } = require('../../lib/appTime');
+
 /** Alerts, worst first. Ordering is a claim about what to look at, so it is fixed. */
 const SEVERITY_RANK = { critical: 0, warning: 1, info: 2 };
 
@@ -327,7 +329,7 @@ function buildCoach({ lifestyle, weights, goal, prs, alerts }) {
 /** Everything the profile needs to stop relying on the trainer's memory. */
 function buildSnapshot({
   client, lifestyle, measurements = [], assessments = [], goal,
-  prRows = [], lastSession, today = new Date().toISOString().slice(0, 10),
+  prRows = [], lastSession, today = studioToday(),
 }) {
   const weights = weightSeries({ measurements, assessments });
   const alerts = buildAlerts({ client, lifestyle, weights, lastSession, today });
