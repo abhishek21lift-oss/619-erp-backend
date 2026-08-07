@@ -36,7 +36,19 @@ case "$DATABASE_URL" in
     ;;
 esac
 
-PSQL_URL="${DATABASE_URL}?sslmode=require"
+# psql gets DATABASE_URL unchanged.
+#
+# This used to append `?sslmode=require`, which broke the job in two ways. It
+# forced SSL onto a server that may not have it — a CI service container and a
+# local docker Postgres are both built without it, and libpq then refuses to
+# connect rather than falling back — and it appended a `?` blindly, so a URL
+# that already carried a query string became malformed.
+#
+# Passing the URL through means libpq's own default applies (`prefer`: use SSL
+# when the server offers it, plain otherwise), and an explicit `sslmode=` in
+# the URL is honoured for both psql and the Node pool, which reads the same
+# parameter. One URL, one answer.
+PSQL_URL="$DATABASE_URL"
 
 echo "==> Supabase-compatible roles"
 # The RLS migrations REVOKE from anon/authenticated, which errors if the roles
