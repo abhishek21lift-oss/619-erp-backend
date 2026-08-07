@@ -120,3 +120,47 @@ describe('getOpsSummary contract', () => {
     expect(SRC).toContain('apply ? [today, todayDay, scope.orgId] : [today, todayDay]');
   });
 });
+
+// ── Per-trainer session totals ─────────────────────────────────────────────
+//
+// This query took no parameters at all: it listed every active trainer on the
+// PLATFORM, with their session counts, to every studio that loaded a
+// dashboard. It sat in the middle of a function whose every other query was
+// already scoped, which is exactly how it survived — nothing about the code
+// around it looked wrong.
+describe('the per-trainer totals query', () => {
+  const trainerSessionsQuery = () => queryWith('FROM pt_trainers t', 'LEFT JOIN pt_sessions s');
+
+  it('lists only this organization\'s trainers', () => {
+    expect(trainerSessionsQuery()).toContain('t.organization_id = $1');
+  });
+
+  it('counts only this organization\'s sessions', () => {
+    // Separate from the trainer filter: without it a foreign session whose
+    // trainer_id happens to match a local trainer is COUNTED against them, and
+    // an inflated number is the last place anyone looks for a tenancy bug.
+    expect(trainerSessionsQuery()).toContain('s.organization_id = $1');
+  });
+
+  it('filters sessions in the JOIN, never in the WHERE', () => {
+    // In the WHERE clause the session filter discards the NULL-extended rows a
+    // LEFT JOIN produces, silently making it an INNER JOIN — every trainer
+    // with no sessions this month vanishes, which is precisely who a manager
+    // is scanning this list for. Asserted by position: the session's org
+    // filter must appear before the WHERE keyword.
+    const q = trainerSessionsQuery();
+    const joinFilter = q.indexOf('s.organization_id = $1');
+    const whereAt = q.indexOf('WHERE t.deleted_at');
+    expect(joinFilter).toBeGreaterThan(-1);
+    expect(whereAt).toBeGreaterThan(-1);
+    expect(joinFilter).toBeLessThan(whereAt);
+  });
+
+  it('is actually given the org id — it used to take no parameters', () => {
+    // pool.query(`…`) with no second argument is what the leak looked like.
+    // The template is interpolated with $1, so a missing bindings array would
+    // now throw rather than quietly return the platform.
+    const src = SRC.slice(SRC.indexOf('FROM pt_trainers t') - 900);
+    expect(src).toContain('`, bareParams);');
+  });
+});
