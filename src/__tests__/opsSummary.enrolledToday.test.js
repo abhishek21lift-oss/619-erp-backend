@@ -100,10 +100,22 @@ describe('the enrolled-today query', () => {
     expect(q).toContain("c.status = 'active'");
   });
 
-  it('orders by the time the client actually comes in', () => {
-    // NULLS LAST matters: a client with no preferred time must not sort to the
-    // top of the day ahead of the 6am regulars.
-    expect(enrolledQuery()).toContain('ORDER BY c.preferred_workout_time NULLS LAST');
+  it('orders by a PARSED time, never by the raw text', () => {
+    // preferred_workout_time is free text holding two formats — the enrolment
+    // dropdown writes '6:00 AM', its custom <input type="time"> writes '06:00'
+    // — and as strings '1:00 PM' < '5:00 AM', so a text sort puts the
+    // afternoon slot ahead of the dawn one. This shipped that way earlier
+    // today; the ordering looked deliberate and was wrong.
+    const q = enrolledQuery();
+    expect(q).toContain("to_timestamp(trim(c.preferred_workout_time), 'HH12:MI AM')::time");
+    expect(q).toContain("c.preferred_workout_time::time");
+    expect(q).not.toMatch(/ORDER BY\s+c\.preferred_workout_time NULLS LAST/);
+  });
+
+  it('sorts an unparseable time last instead of corrupting the order', () => {
+    // Somebody typing "Morning" into the column must not reorder the rows
+    // around them.
+    expect(enrolledQuery()).toMatch(/END NULLS LAST/);
   });
 });
 
