@@ -64,10 +64,12 @@ describe('GET /workout-log/today', () => {
       .mockResolvedValueOnce(DOW_ROW)
       .mockResolvedValueOnce({
         rows: [
-          { assignment_id: 'a1', client_id: 'c1', client_name: 'Rest Client', client_photo: null,
+          { source_rank: 2, start_time: null,
+            assignment_id: 'a1', client_id: 'c1', client_name: 'Rest Client', client_photo: null,
             plan_id: 'p1', plan_name: 'Upper / Lower', progress_pct: 0,
             session_id: null, session_status: null, planned_exercises: '0' },
-          { assignment_id: 'a2', client_id: 'c2', client_name: 'Training Client', client_photo: null,
+          { source_rank: 2, start_time: null,
+            assignment_id: 'a2', client_id: 'c2', client_name: 'Training Client', client_photo: null,
             plan_id: 'p1', plan_name: 'Full Body', progress_pct: 20,
             session_id: null, session_status: null, planned_exercises: '3' },
         ],
@@ -88,7 +90,12 @@ describe('GET /workout-log/today', () => {
     await request(app()).get('/api/pt-os/workout-log/today').expect(200);
 
     const [sql, params] = pool.query.mock.calls[1];
-    expect(sql).toMatch(/wa\.organization_id = \$3/);
+    // $3 is the weekday token now, so the org moved to $4 — and it is applied
+    // to each source inside the union rather than once at the end, or a
+    // foreign row could be grouped against a local client.
+    expect(sql).toMatch(/s\.organization_id = \$4/);
+    expect(sql).toMatch(/wa\.organization_id = \$4/);
+    expect(sql).toMatch(/c2\.organization_id = \$4/);
     expect(params).toContain('org-1');
   });
 
@@ -99,7 +106,7 @@ describe('GET /workout-log/today', () => {
     await request(app()).get('/api/pt-os/workout-log/today').expect(200);
 
     const [sql, params] = pool.query.mock.calls[1];
-    expect(sql).toMatch(/c\.trainer_id = \$4/);
+    expect(sql).toMatch(/c\.trainer_id = \$5/);
     expect(params).toContain('t-9');
   });
 
@@ -118,5 +125,78 @@ describe('GET /workout-log/today', () => {
     const passed = pool.query.mock.calls[0][1][0];
     expect(passed).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(passed).not.toBe('not-a-date');
+  });
+
+  // ── The three sources ────────────────────────────────────────────────────
+  //
+  // This endpoint was an INNER JOIN on workout_assignments, so it answered
+  // only for clients who already had a programme. A client enrolled yesterday
+  // with a 6am slot booked and no plan written yet — the commonest state for a
+  // new client — was absent from the one screen a trainer opens on the floor,
+  // and could not be started from it.
+
+  it('carries the time through to the client, normalised to HH:MM', async () => {
+    pool.query
+      .mockResolvedValueOnce(DOW_ROW)
+      .mockResolvedValueOnce({
+        rows: [
+          { source_rank: 1, start_time: '06:00:00', client_id: 'c1', client_name: 'Booked',
+            assignment_id: null, plan_id: null, plan_name: null, progress_pct: null,
+            session_id: null, session_status: null, planned_exercises: '0' },
+        ],
+      });
+
+    const res = await request(app()).get('/api/pt-os/workout-log/today').expect(200);
+    const [row] = res.body.data.clients;
+    // Postgres hands back a full TIME; the row shows a clock time.
+    expect(row.start_time).toBe('06:00');
+    expect(row.source).toBe('booked');
+  });
+
+  it('does not call a booked client with no plan a rest day', async () => {
+    // The narrowing that matters. `planned_exercises === 0` was safe while
+    // every row came from an assignment; a booked client with no programme
+    // also has zero, and greying that row out would hide the one person with
+    // a real appointment.
+    pool.query
+      .mockResolvedValueOnce(DOW_ROW)
+      .mockResolvedValueOnce({
+        rows: [
+          { source_rank: 1, start_time: '07:00:00', client_id: 'c1', client_name: 'No plan yet',
+            assignment_id: null, plan_id: null, plan_name: null, progress_pct: null,
+            session_id: null, session_status: null, planned_exercises: '0' },
+        ],
+      });
+
+    const [row] = (await request(app()).get('/api/pt-os/workout-log/today').expect(200))
+      .body.data.clients;
+    expect(row.is_rest_day).toBe(false);
+    expect(row.plan_name).toBeNull();
+  });
+
+  it('labels an enrolment-only client and leaves it untimed when no time is set', async () => {
+    pool.query
+      .mockResolvedValueOnce(DOW_ROW)
+      .mockResolvedValueOnce({
+        rows: [
+          { source_rank: 3, start_time: null, client_id: 'c1', client_name: 'Habit only',
+            assignment_id: null, plan_id: null, plan_name: null, progress_pct: null,
+            session_id: null, session_status: null, planned_exercises: '0' },
+        ],
+      });
+
+    const [row] = (await request(app()).get('/api/pt-os/workout-log/today').expect(200))
+      .body.data.clients;
+    expect(row.source).toBe('enrolled');
+    expect(row.start_time).toBeNull();
+    expect(row.is_rest_day).toBe(false);
+  });
+
+  it('passes the weekday token the enrolment column stores', async () => {
+    // dow 4 is Thursday, and the enrolment form writes 'Thu'. A mismatch here
+    // matches nothing and does it silently.
+    pool.query.mockResolvedValueOnce(DOW_ROW).mockResolvedValueOnce({ rows: [] });
+    await request(app()).get('/api/pt-os/workout-log/today').expect(200);
+    expect(pool.query.mock.calls[1][1][2]).toBe('Thu');
   });
 });

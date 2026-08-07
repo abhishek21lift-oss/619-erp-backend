@@ -444,7 +444,21 @@ async function getOpsSummary(scope = {}) {
           )
      )
      ${apply ? 'AND c.organization_id = $3' : ''}
-   ORDER BY c.preferred_workout_time NULLS LAST, c.name
+   -- Parsed to a real TIME, not sorted as text. The column is free text
+   -- holding two formats: the enrolment dropdown writes '6:00 AM' and its
+   -- custom field, an <input type="time">, writes '06:00'. As strings
+   -- '1:00 PM' < '5:00 AM', so the afternoon slot sorted before the dawn one.
+   -- Anything matching neither shape sorts last rather than corrupting the
+   -- order of the rows around it.
+   ORDER BY
+     CASE
+       WHEN c.preferred_workout_time ~* '^[0-9]{1,2}:[0-9]{2}\\s*(AM|PM)$'
+         THEN to_timestamp(trim(c.preferred_workout_time), 'HH12:MI AM')::time
+       WHEN c.preferred_workout_time ~ '^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$'
+         THEN c.preferred_workout_time::time
+       ELSE NULL
+     END NULLS LAST,
+     c.name
    LIMIT 25
   `, apply ? [today, todayDay, scope.orgId] : [today, todayDay]);
 
