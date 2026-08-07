@@ -1,4 +1,4 @@
-const { todayIn, today, appTimeZone, DEFAULT_TIME_ZONE } = require('../lib/appTime');
+const { todayIn, today, todayShortDay, appTimeZone, DEFAULT_TIME_ZONE } = require('../lib/appTime');
 
 const AT = (iso) => new Date(iso);
 
@@ -62,5 +62,36 @@ describe('today', () => {
   it('agrees with todayIn under the configured zone', () => {
     const at = AT('2026-08-07T18:30:00Z');
     expect(today(at)).toBe(todayIn(appTimeZone(), at));
+  });
+});
+
+// ── todayShortDay ──────────────────────────────────────────────────────────
+//
+// This is a STORAGE format, not a display one. pt_clients.preferred_training_days
+// holds what the enrolment form wrote — the keys Mon/Tue/Wed/Thu/Fri/Sat/Sun
+// joined with ', ' — and the dashboard matches against that string. A day name
+// spelled any other way matches nothing AND FAILS SILENTLY: the roster simply
+// comes back empty, which is the exact bug this was added to end.
+describe('todayShortDay', () => {
+  it('produces the three letters the enrolment form stores', () => {
+    // 2026-08-06 is a Thursday. 18:30Z is already Friday in IST, which is the
+    // case that would silently roster the wrong day's clients.
+    expect(todayShortDay(new Date('2026-08-06T06:00:00Z'))).toBe('Thu');
+    expect(todayShortDay(new Date('2026-08-06T18:30:00Z'))).toBe('Fri');
+  });
+
+  it('covers every day with exactly the enrolment form\'s spellings', () => {
+    // The form's own list, verbatim. If a runtime ever rendered 'Thurs' or
+    // 'Thu.' this fails here rather than in a studio's empty dashboard.
+    const FORM_KEYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    // 2026-08-03 is a Monday; walk a full week from it, at midday IST so the
+    // zone conversion cannot straddle a boundary.
+    const got = Array.from({ length: 7 }, (_, i) =>
+      todayShortDay(new Date(Date.UTC(2026, 7, 3 + i, 6, 30))));
+    expect(got).toEqual(FORM_KEYS);
+  });
+
+  it('is a three-letter token, never punctuated or localised', () => {
+    expect(todayShortDay(new Date('2026-08-06T06:00:00Z'))).toMatch(/^[A-Z][a-z]{2}$/);
   });
 });

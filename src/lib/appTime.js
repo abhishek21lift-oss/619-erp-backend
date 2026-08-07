@@ -82,4 +82,26 @@ function today(date = new Date()) {
   return todayIn(appTimeZone(), date);
 }
 
-module.exports = { DEFAULT_TIME_ZONE, appTimeZone, todayIn, today };
+/**
+ * Today as a three-letter weekday: 'Mon' … 'Sun'.
+ *
+ * This exact spelling is a storage format, not a display choice.
+ * pt_clients.preferred_training_days holds what the enrolment form wrote —
+ * `form.trainingDays.join(', ')` over the keys Mon/Tue/Wed/Thu/Fri/Sat/Sun —
+ * so "Mon, Wed, Fri" is a literal string in the column. Matching against it
+ * means producing the same three letters.
+ *
+ * `en-US` gives exactly those abbreviations. It is pinned rather than left to
+ * the server locale for that reason: a runtime that formatted 'Mon.' or a
+ * localised name would match nothing, and would do so silently — the roster
+ * would simply come back empty, which is the failure this whole function
+ * exists to end.
+ */
+function todayShortDay(date = new Date()) {
+  return new Intl.DateTimeFormat('en-US', {
+    weekday: 'short',
+    timeZone: appTimeZone(),
+  }).format(date);
+}
+
+module.exports = { DEFAULT_TIME_ZONE, appTimeZone, todayIn, today, todayShortDay };

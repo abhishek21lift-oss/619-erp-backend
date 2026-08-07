@@ -1,5 +1,5 @@
 const pool = require('../../db/pool');
-const { today: studioToday } = require('../../lib/appTime');
+const { today: studioToday, todayShortDay: studioShortDay } = require('../../lib/appTime');
 
 async function calculateMonthlyCommissions(month) {
   const monthStart = `${month}-01`;
@@ -303,6 +303,8 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) 
  * getOpsSummary — powers the "Today's Operations" and "Session Activity"
  * dashboard sections.  Returns:
  *   today_sessions   — all pt_sessions scheduled/completed today
+ *   today_unscheduled— clients whose PROGRAMME prescribes today's weekday
+ *   today_enrolled   — clients whose ENROLMENT says they train today
  *   renewals_due     — active clients whose pt_end_date is within 7 days
  *   top_dues         — up to 5 clients with the highest outstanding balance
  *   session_stats    — this-month vs last-month completed session counts
@@ -312,6 +314,7 @@ async function getOpsSummary(scope = {}) {
   // Studio-local, not UTC. `toISOString()` here meant the panel showed
   // yesterday's sessions between midnight and 05:30 IST — see src/lib/appTime.js.
   const today = studioToday();
+  const todayDay = studioShortDay();   // 'Mon' … 'Sun', matching the enrolment format
   // Tenant scope: $1 is always `today`; when filtering, $2 is the org id.
   const apply = Boolean(scope.applyFilter);
   const orgS = apply ? ' AND s.organization_id = $2' : '';   // aliased pt_sessions
@@ -390,6 +393,61 @@ async function getOpsSummary(scope = {}) {
    LIMIT 25
   `, sessParams);
 
+  // Clients whose ENROLMENT says they train today.
+  //
+  // The two lists above both assume the studio records its work somewhere the
+  // dashboard already looks: an appointment booked into pt_sessions, or a
+  // workout plan whose exercises name a weekday. A studio that does neither
+  // got "Nothing on today — no booked slots, and no client's programme falls
+  // on today" every single day, under a heading naming a day its clients were
+  // in fact training on. The panel was not wrong about its own two sources; it
+  // was blind to where the answer actually lived.
+  //
+  // It lives on the client. pt_clients.preferred_training_days is filled at
+  // enrolment, where the day picker is a REQUIRED, validated field — so every
+  // enrolled client has it — and it is written as the literal string
+  // "Mon, Wed, Fri" (the form's `trainingDays.join(', ')`). Until now nothing
+  // read it back except the enrolment PDF: the studio was asked which days its
+  // client trains, answered, and was then told nobody trains today.
+  //
+  // Matching strips spaces before splitting so "Mon,Wed" and "Mon, Wed" behave
+  // the same, and compares against a three-letter day produced in the studio's
+  // own zone (appTime.todayShortDay) rather than the database's locale.
+  //
+  // The two NOT EXISTS clauses keep a client from appearing twice. A booked
+  // slot is more specific than "they usually train Thursdays", and a programme
+  // day is more specific than an enrolment preference, so whichever of those
+  // exists wins and this list stays the fallback it is meant to be.
+  const { rows: today_enrolled } = await pool.query(`
+    SELECT
+      c.id AS client_id, c.name AS client_name, c.photo_url AS client_photo,
+      c.preferred_workout_time, c.preferred_training_days, c.trainer_name
+    FROM pt_clients c
+   WHERE c.deleted_at IS NULL
+     AND c.status = 'active'
+     AND c.preferred_training_days IS NOT NULL
+     AND $2 = ANY(string_to_array(replace(c.preferred_training_days, ' ', ''), ','))
+     AND NOT EXISTS (
+       SELECT 1 FROM pt_sessions s
+        WHERE s.client_id = c.id AND s.session_date = $1 AND s.deleted_at IS NULL
+     )
+     AND NOT EXISTS (
+       SELECT 1
+         FROM workout_assignments a
+         JOIN workout_plans wp ON wp.id = a.workout_plan_id
+        WHERE a.client_id = c.id AND a.status = 'active'
+          AND EXISTS (
+            SELECT 1 FROM workout_exercises we
+             WHERE we.workout_plan_id = wp.id
+               AND we.day_of_week = EXTRACT(ISODOW FROM $1::date)::int
+               AND we.week_number = 1
+          )
+     )
+     ${apply ? 'AND c.organization_id = $3' : ''}
+   ORDER BY c.preferred_workout_time NULLS LAST, c.name
+   LIMIT 25
+  `, apply ? [today, todayDay, scope.orgId] : [today, todayDay]);
+
   const { rows: renewals_due } = await pool.query(`
     SELECT
       id, name, mobile, trainer_name, package_type, photo_url,
@@ -455,7 +513,8 @@ async function getOpsSummary(scope = {}) {
   `);
 
   return {
-    today_sessions, today_unscheduled, renewals_due, top_dues, session_stats, trainer_sessions,
+    today_sessions, today_unscheduled, today_enrolled,
+    renewals_due, top_dues, session_stats, trainer_sessions,
   };
 }
 
