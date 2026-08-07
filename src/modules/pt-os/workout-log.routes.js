@@ -22,6 +22,7 @@ const { calc1RM } = require('../progress/fitness-scoring');
 const { checkScreeningGate } = require('../../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
+const { today: studioToday } = require('../../lib/appTime');
 const { weekOf, resolveWeek } = require('./progression');
 const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./training-analytics');
 const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
@@ -557,7 +558,7 @@ router.delete('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'tr
 router.get('/workout-log/today', auth, wrap(async (req, res) => {
   const date = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
     ? req.query.date
-    : new Date().toISOString().slice(0, 10);
+    : studioToday();
 
   // ISO weekday: Postgres ISODOW gives Monday=1, matching
   // workout_exercises.day_of_week and the WEEKDAYS array above.
@@ -765,7 +766,7 @@ router.get('/workout-log/analytics', auth, wrap(async (req, res) => {
   const weeks = Math.min(Math.max(parseInt(req.query.weeks, 10) || 12, 1), 52);
   const asOf = (req.query.as_of && /^\d{4}-\d{2}-\d{2}$/.test(req.query.as_of))
     ? req.query.as_of
-    : new Date().toISOString().slice(0, 10);
+    : studioToday();
 
   const scope = tenantScope(req);
   const orgId = scope.applyFilter ? scope.orgId : null;
@@ -987,7 +988,7 @@ router.post('/workout-log/weekly-report',
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
     }
 
-    const start = weekStart(week_start || new Date().toISOString().slice(0, 10));
+    const start = weekStart(week_start || studioToday());
     if (!start) return res.status(400).json({ error: { code: 'INVALID_WEEK' } });
     const endDate = new Date(`${start}T00:00:00Z`);
     endDate.setUTCDate(endDate.getUTCDate() + 6);

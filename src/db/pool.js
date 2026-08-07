@@ -3,6 +3,7 @@ require('dotenv').config();
 const fs = require('fs');
 const { Pool } = require('pg');
 const logger = require('../lib/logger');
+const { appTimeZone } = require('../lib/appTime');
 
 if (!process.env.DATABASE_URL) {
   logger.fatal('DATABASE_URL is not set. Check your .env file.');
@@ -52,6 +53,30 @@ const pool = new Pool({
 
 pool.on('error', (err) => {
   logger.error({ err: err.message }, 'Unexpected DB pool error');
+});
+
+// Every connection speaks the studio's local time, not UTC.
+//
+// `CURRENT_DATE` is evaluated in the DATABASE session's TimeZone. That was
+// never set, so it defaulted to the server's — UTC on Supabase. The studio is
+// in India (UTC+05:30), which meant `session_date = CURRENT_DATE` did not
+// become tomorrow at midnight IST; it became tomorrow at 05:30. For five and a
+// half hours every night the dashboard, the month boundaries in the revenue
+// queries and every `created_at::date` cast were all a day behind the studio
+// looking at them.
+//
+// Set on `connect` rather than in the connection string so it applies to
+// pooled connections opened later in the process's life, and so it stays in
+// one place with the JS half (src/lib/appTime.js) reading the same env var.
+// SET TIME ZONE takes a string literal, not a parameter, so the value is
+// validated by appTimeZone() before it gets here — it is one of a fixed set of
+// IANA names, never raw user input.
+pool.on('connect', (client) => {
+  client.query(`SET TIME ZONE '${appTimeZone()}'`).catch((err) => {
+    // A connection that failed to take the zone would silently serve UTC
+    // dates. Log it rather than swallow it; the query itself still works.
+    logger.error({ err: err.message, tz: appTimeZone() }, 'Failed to set session time zone');
+  });
 });
 
 // Instrument pool.query to log slow queries (> 1 second).
