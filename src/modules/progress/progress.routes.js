@@ -1051,7 +1051,12 @@ function computeMobilityAnalysis(b) {
 router.get('/mobility-performance-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
+  // Multi-tenant isolation: this table missed the 084 sweep (weekly_checkins/
+  // strength_logs/progress_photos) — client_id alone let a caller who knows or
+  // guesses another org's client_id list that org's mobility records.
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT * FROM pt_mobility_performance_assessments ${whereSql} ORDER BY assessment_date DESC`, params
@@ -1069,18 +1074,18 @@ router.post('/mobility-performance-assessments', auth, requireRole('admin', 'man
        client_id, assessment_number, assessment_date,
        body_regions, mobility_tests,
        grip_strength_kg, vertical_jump_cm, sit_reach_cm, balance_test_seconds, reaction_time_ms, performance_notes,
-       mobility_score, mobility_category, created_by
+       mobility_score, mobility_category, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_mobility_performance_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3::jsonb,$4::jsonb,
        $5,$6,$7,$8,$9,$10,
-       $11,$12,$13
+       $11,$12,$13,$14
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
       b.body_regions ? JSON.stringify(b.body_regions) : null, b.mobility_tests ? JSON.stringify(b.mobility_tests) : null,
       b.grip_strength_kg ?? null, b.vertical_jump_cm ?? null, b.sit_reach_cm ?? null, b.balance_test_seconds ?? null, b.reaction_time_ms ?? null, b.performance_notes || null,
-      analysis.mobilityScore, analysis.mobilityCategory, req.user.id,
+      analysis.mobilityScore, analysis.mobilityCategory, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -1092,7 +1097,12 @@ router.patch('/mobility-performance-assessments/:id', auth, wrap(async (req, res
     'grip_strength_kg', 'vertical_jump_cm', 'sit_reach_cm', 'balance_test_seconds', 'reaction_time_ms', 'performance_notes',
   ];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_mobility_performance_assessments WHERE id = $1', [req.params.id]);
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_mobility_performance_assessments WHERE id = $1${guard}`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -1140,7 +1150,11 @@ function computePostureAnalysis(b) {
 router.get('/posture-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
+  // Multi-tenant isolation: this table missed the 084 sweep the same way
+  // mobility-performance-assessments did — see that route for the finding.
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT * FROM pt_posture_assessments ${whereSql} ORDER BY assessment_date DESC`, params
@@ -1158,12 +1172,12 @@ router.post('/posture-assessments', auth, requireRole('admin', 'manager', 'train
        client_id, assessment_number, assessment_date,
        front_issues, side_issues, back_issues, other_issue_notes,
        posture_risk_score, posture_risk_level,
-       coach_notes, created_by
+       coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_posture_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,
        $7,$8,
-       $9::jsonb,$10
+       $9::jsonb,$10,$11
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
@@ -1172,7 +1186,7 @@ router.post('/posture-assessments', auth, requireRole('admin', 'manager', 'train
       b.back_issues && b.back_issues.length ? b.back_issues : null,
       b.other_issue_notes || null,
       analysis.postureRiskScore, analysis.postureRiskLevel,
-      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -1181,7 +1195,12 @@ router.post('/posture-assessments', auth, requireRole('admin', 'manager', 'train
 router.patch('/posture-assessments/:id', auth, wrap(async (req, res) => {
   const allowed = ['assessment_date', 'front_issues', 'side_issues', 'back_issues', 'other_issue_notes', 'coach_notes'];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_posture_assessments WHERE id = $1', [req.params.id]);
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_posture_assessments WHERE id = $1${guard}`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
