@@ -88,25 +88,35 @@ jobs:
           echo "CI result:  ${{ github.event.workflow_run.conclusion || 'n/a (manual dispatch)' }}"
           echo "Commit:     ${{ github.event.workflow_run.head_sha || github.sha }}"
 
-      # ── Why there are three attempts ────────────────────────────────────
+      # ── Why there are four attempts ─────────────────────────────────────
       #
       # The runner intermittently cannot reach the VPS on 22:
       #
       #   2026/08/05 06:14:53 dial tcp ***:22: i/o timeout
       #
-      # Six such failures across the two repositories, each one bracketed by
-      # successful runs minutes either side, so it is a transient network or
-      # firewall condition rather than a broken key or a wrong host.
+      # An `i/o timeout` means the TCP handshake never completed — the packets
+      # were dropped, not refused. A wrong key gives a rejection, a wrong host
+      # gives a DNS error; this is a filter or a box that is not answering.
       #
-      # Two attempts 90s apart were not enough — twice. Both times a manual
-      # re-run minutes later succeeded, which brackets the outage: on 05 Aug it
-      # swallowed 07:17 and 07:20 and was over by 07:27. So the window has to be
-      # measured in minutes, not seconds. Three attempts at 0s, +90s and +5min
-      # span about seven minutes, which covers every occurrence seen so far.
+      # The ladder has been widened twice by evidence, and the comment that
+      # used to sit here claimed seven minutes "covers every occurrence seen so
+      # far". That is no longer true, so it is corrected rather than kept:
       #
-      # `continue-on-error` keeps the first failure from ending the job; the
-      # retry decides the outcome. If both fail, the job is red — this hides a
-      # blip, not an outage.
+      #   05 Aug  outage swallowed 07:17 and 07:20, over by 07:27  (~10 min)
+      #   08 Aug  swallowed all three frontend attempts at 06:43, 06:46 and
+      #           06:52, on a box that had deployed fine at 06:05  (>10 min)
+      #
+      # Three attempts at 0s, +90s and +5min span about seven minutes, and the
+      # 08 Aug outage outlasted them. A fourth at +15min takes the ladder to
+      # roughly twenty-two, which covers both observed windows with margin. A
+      # job may run for six hours, so the cost of the extra wait is only paid
+      # on a day that was already broken.
+      #
+      # `continue-on-error` keeps each failure from ending the job; the last
+      # attempt has none, so it decides the outcome. This hides a blip, not an
+      # outage — and the diagnostic step below fires when the whole ladder
+      # fails, so the next occurrence says WHAT was unreachable instead of
+      # only that something was.
       - name: Deploy to VPS via SSH
         id: attempt
         continue-on-error: true
@@ -149,8 +159,9 @@ jobs:
         if: steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
         run: sleep 300
 
-      # The last attempt has no continue-on-error: it decides the job.
       - name: Deploy to VPS via SSH (retry 2)
+        id: retry2
+        continue-on-error: true
         if: steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -161,3 +172,52 @@ jobs:
           command_timeout: 20m
           script_stop: true
           script: ${{ env.DEPLOY_SCRIPT }}
+
+      - name: Wait out a longer outage
+        if: >-
+          steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
+          && steps.retry2.outcome == 'failure'
+        run: sleep 900
+
+      # The last attempt has no continue-on-error: it decides the job.
+      - name: Deploy to VPS via SSH (retry 3)
+        if: >-
+          steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
+          && steps.retry2.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 20m
+          script_stop: true
+          script: ${{ env.DEPLOY_SCRIPT }}
+
+      # ── What was actually unreachable ───────────────────────────────────
+      #
+      # `dial tcp ***:22: i/o timeout` says a port did not answer. It does not
+      # say whether the box is down, whether only 22 is filtered, or whether
+      # the runner's egress is the problem — and those have three different
+      # fixes. Every failure so far has left us guessing between them.
+      #
+      # This probes 22, 80 and 443 and prints the result. If 443 answers while
+      # 22 times out, the box is serving and something is filtering SSH
+      # (firewall rule, fail2ban, provider-side block) — check `ufw status`,
+      # `fail2ban-client status sshd` and the provider console. If nothing
+      # answers, the box or its network is down. It never fails the job: the
+      # deploy result above is the outcome, this is only evidence.
+      - name: Diagnose what the VPS is answering on
+        if: failure()
+        continue-on-error: true
+        run: |
+          for port in 22 80 443; do
+            if timeout 10 bash -c "cat < /dev/null > /dev/tcp/${{ secrets.HOST }}/$port" 2>/dev/null; then
+              echo "port $port: OPEN"
+            else
+              echo "port $port: no answer within 10s"
+            fi
+          done
+          echo "If 443 is open and 22 is not, the box is up and SSH is being filtered."
+          echo "If none are open, the box or its network is down."
+
