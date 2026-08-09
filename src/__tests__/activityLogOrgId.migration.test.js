@@ -45,6 +45,20 @@ describe('158_activity_log_organization_id.sql', () => {
     expect(body).toMatch(/UPDATE activity_log a[\s\S]*?SET organization_id = u\.organization_id[\s\S]*?FROM users u/);
   });
 
+  it('drops any stray trigger on activity_log before backfilling it', () => {
+    // Production carries a BEFORE UPDATE trigger on activity_log that no
+    // tracked migration created (001_v4_upgrade.sql's set_updated_at() loop
+    // does not include activity_log). It references a column the table has
+    // never had, so the backfill UPDATE above fails against real data unless
+    // this runs first — order matters, not just presence.
+    const dropAt = body.indexOf('DROP TRIGGER %I ON public.activity_log');
+    const backfillAt = body.indexOf('UPDATE activity_log a');
+    expect(dropAt).toBeGreaterThan(-1);
+    expect(backfillAt).toBeGreaterThan(dropAt);
+    expect(body).toContain("pg_trigger");
+    expect(body).toContain('NOT tgisinternal');
+  });
+
   it('re-runs the RLS discovery loop rather than hand-writing a second policy for one table', () => {
     expect(body).toContain("column_name = 'organization_id'");
     expect(body).toMatch(/FOR tbl IN[\s\S]*?LOOP/);

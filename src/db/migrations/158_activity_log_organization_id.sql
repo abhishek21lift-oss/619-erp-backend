@@ -10,6 +10,26 @@
 ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_activity_log_organization_id ON activity_log (organization_id, created_at DESC);
 
+-- Production has a BEFORE UPDATE trigger on activity_log that this repo's
+-- migrations never created (001_v4_upgrade.sql's set_updated_at() loop only
+-- covers users/trainers/clients/system_settings/leave_requests — activity_log
+-- is not in that list, and no other tracked migration touches it either).
+-- Whatever attached it did so out-of-band, and it references a column
+-- (updated_at) the table has never had, so the backfill UPDATE below fails
+-- with "record "new" has no field "updated_at"" the moment it runs. Dropped
+-- here rather than worked around: an append-only log table (see 120's own
+-- comment) has no legitimate reason to carry an updated_at trigger at all.
+DO $$
+DECLARE trg text;
+BEGIN
+  FOR trg IN
+    SELECT tgname FROM pg_trigger
+     WHERE tgrelid = 'public.activity_log'::regclass AND NOT tgisinternal
+  LOOP
+    EXECUTE format('DROP TRIGGER %I ON public.activity_log', trg);
+  END LOOP;
+END $$;
+
 -- Backfill from the acting user's own org, same shape as 084/156. Rows with
 -- no resolvable user (a deleted account) or a genuinely org-less actor (the
 -- platform super-admin) are left NULL rather than guessed at.
