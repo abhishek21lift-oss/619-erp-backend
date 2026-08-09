@@ -2,6 +2,15 @@
 const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
 const { computeAccess } = require('../lib/subscription');
+const { resolveOrgId } = require('./tenant');
+const { runWithTenantContext } = require('../lib/tenant-context');
+
+// Off by default — see TENANT-RLS-PLAN.md. Enabling this makes pool.js wrap
+// queries in a transaction that sets app.org_id for Postgres RLS to read; it
+// does nothing to what the app can reach until DATABASE_URL also points at
+// the app_tenant role (157_app_tenant_role_and_rls.sql), which is its own,
+// separately-tested deployment step.
+const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE === 'on';
 
 // Path prefixes that stay reachable even when a studio's subscription has lapsed,
 // so the studio can still authenticate, view its billing/frozen screen, manage
@@ -176,6 +185,17 @@ async function auth(req, res, next) {
           });
         }
       }
+    }
+
+    // Tenant context for db/pool.js's RLS query wrapper. Resolution failure
+    // must never block the request — this flag is for testing whether the
+    // wrapper works, not a new authorization gate, and NO_TENANT is already
+    // handled properly by requireRole/requireClient/etc. further down the
+    // chain for routes that actually need it.
+    if (TENANT_RLS_ENFORCE) {
+      let orgId = null;
+      try { orgId = resolveOrgId(req); } catch { /* see comment above */ }
+      return runWithTenantContext(orgId, next);
     }
 
     next();

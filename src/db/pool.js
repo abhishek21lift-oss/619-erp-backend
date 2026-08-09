@@ -4,6 +4,7 @@ const fs = require('fs');
 const { Pool } = require('pg');
 const logger = require('../lib/logger');
 const { appTimeZone } = require('../lib/appTime');
+const { currentOrgId } = require('../lib/tenant-context');
 
 if (!process.env.DATABASE_URL) {
   logger.fatal('DATABASE_URL is not set. Check your .env file.');
@@ -125,11 +126,62 @@ pool.on('connect', (client) => {
   });
 });
 
-// Instrument pool.query to log slow queries (> 1 second).
+// Off by default — see TENANT-RLS-PLAN.md and middleware/auth.js, which
+// gates on the exact same env var so the two can never disagree about
+// whether enforcement is "on". When on, a query running inside a request
+// that resolved an org id (see auth.js) is wrapped in its own transaction
+// that sets app.org_id via set_config() — the GUC the app_tenant RLS
+// policies (157_app_tenant_role_and_rls.sql) read. Until DATABASE_URL
+// actually points at app_tenant, this changes nothing observable: the
+// connecting role still bypasses RLS, so the extra transaction runs for
+// nothing but its own latency cost — which is precisely what flipping this
+// flag on in staging (before touching DATABASE_URL) is for measuring.
+const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE === 'on';
+
+/**
+ * Runs `run()` on `client` inside BEGIN … SET LOCAL (via set_config) …
+ * COMMIT, so app.org_id is visible to Postgres RLS for exactly this query's
+ * duration and no other request's.
+ *
+ * set_config($1, $2, true) rather than `SET LOCAL app.org_id = '<value>'`
+ * because SET does not accept a bind parameter — string-building an org id
+ * into SQL text is exactly the injection shape a scoping layer must not
+ * introduce, however well-formed org ids happen to be today.
+ *
+ * Exported so it is directly testable against a fake client, without
+ * exercising this module's own pool.connect() startup call or a real
+ * database.
+ */
+async function withOrgScope(client, orgId, run) {
+  await client.query('BEGIN');
+  try {
+    const result = await (async () => {
+      await client.query('SELECT set_config($1, $2, true)', ['app.org_id', String(orgId)]);
+      return run();
+    })();
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  }
+}
+
+// Instrument pool.query to log slow queries (> 1 second) and, when
+// TENANT_RLS_ENFORCE is on and the request resolved an org id, to run the
+// query inside the org-scoping transaction above. The two compose: timing
+// wraps the whole thing, so the added transaction's latency is exactly what
+// shows up in slow_query — which is the number the staging rollout in
+// TENANT-RLS-PLAN.md needs before this ever reaches production traffic.
 const _origQuery = pool.query.bind(pool);
 pool.query = function slowQueryInstrument(...args) {
   const start = Date.now();
-  const result = _origQuery(...args);
+  const orgId = TENANT_RLS_ENFORCE ? currentOrgId() : null;
+  const result = orgId == null
+    ? _origQuery(...args)
+    : pool.connect().then((client) =>
+        withOrgScope(client, orgId, () => client.query(...args)).finally(() => client.release())
+      );
   if (result && typeof result.then === 'function') {
     return result.then(
       (r) => {
@@ -145,6 +197,12 @@ pool.query = function slowQueryInstrument(...args) {
   }
   return result;
 };
+
+// Exposed on the pool instance (not a separate module export — every
+// existing call site does `const pool = require('../db/pool')` and expects
+// pool itself to be the Pool) so it's directly testable without exercising
+// this module's own pool.connect() startup call.
+pool.withOrgScope = withOrgScope;
 
 // Test connection on startup. Don't crash here — Render's healthcheck will
 // surface a 5xx and you can read the log. Crashing prevents redeploys from
