@@ -8,6 +8,8 @@ const svc = require('./members.service');
 function ctx(req) {
   return {
     user_id: req.user.id,
+    user_name: req.user.name,
+    organization_id: req.user.organization_id,
     role: req.user.role,
     trainer_id: req.user.trainer_id,
     member_id: req.user.member_id,

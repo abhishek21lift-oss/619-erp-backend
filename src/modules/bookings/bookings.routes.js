@@ -7,8 +7,8 @@ const cal = require('../../lib/google-calendar');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const ctx = (req) => ({
-  user_id: req.user.id, role: req.user.role,
-  trainer_id: req.user.trainer_id, member_id: req.user.member_id,
+  user_id: req.user.id, user_name: req.user.name, organization_id: req.user.organization_id,
+  role: req.user.role, trainer_id: req.user.trainer_id, member_id: req.user.member_id,
 });
 
 // GET /api/v1/bookings  — current user's bookings
