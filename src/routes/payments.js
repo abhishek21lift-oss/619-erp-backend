@@ -24,6 +24,7 @@ const { validate } = require('../middleware/validate');
 const { paymentSchemas } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
+const { logActivity } = require('../lib/activityLog');
 
 // Both ledgers, aliased to one shape. pt_payments has no branch_id — shimmed
 // NULL so the branch-scope clause (branch_id = $n OR branch_id IS NULL) keeps
@@ -184,6 +185,10 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
              c.name AS client_name
       FROM pt_payments p LEFT JOIN pt_clients c ON c.id = p.client_id
       WHERE p.id=$1`, [id]);
+    // After COMMIT, on pool.query rather than tx — logActivity opens its own
+    // connection, and a row logged before the transaction actually lands
+    // would describe a payment that, on rollback, never happened.
+    await logActivity(req, 'payment.create', 'pt_payment', id, rows[0]);
     res.status(201).json({ message: 'Payment recorded', payment: rows[0] });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
@@ -277,6 +282,7 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
         WHERE id = $2`, [ptRows[0].amount, ptRows[0].client_id]
       );
       await tx.query('COMMIT');
+      await logActivity(req, 'payment.delete', 'pt_payment', ptRows[0].id, null, ptRows[0]);
       return res.json({ message: 'Payment deleted' });
     }
 
@@ -314,6 +320,7 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
       );
     }
     await tx.query('COMMIT');
+    await logActivity(req, 'payment.delete', 'payment', payment.id, null, payment);
     res.json({ message: 'Payment deleted' });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});

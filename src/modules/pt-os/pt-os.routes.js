@@ -16,6 +16,7 @@ const { buildSnapshot } = require('./client-snapshot');
 const { generateCoach } = require('./coach-ai');
 const { buildRecovery } = require('./recovery');
 const { routedChat } = require('../../lib/ai/router');
+const { logActivity } = require('../../lib/activityLog');
 
 const ptClientCreateSchema = {
   body: z.object({
@@ -441,6 +442,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
       health_conditions || null, injuries || null, frequency || null,
     ]);
 
+    await logActivity(req, 'client.create', 'pt_client', rows[0].id, rows[0]);
     res.status(201).json({ data: rows[0] });
   } catch (err) {
     logger.error({ err: err.message, body: req.body, user: req.user?.id }, 'PT OS create client failed');
@@ -749,6 +751,11 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
     );
   }
 
+  // The resulting state only, not a before/after diff — this endpoint is a
+  // hot path (every client-profile save goes through it) and an extra SELECT
+  // purely to capture prior state on every edit isn't worth the round trip
+  // this record already gets from the UPDATE ... RETURNING above.
+  await logActivity(req, 'client.update', 'pt_client', rows[0].id, rows[0]);
   res.json({ data: rows[0] });
 }));
 
@@ -791,6 +798,7 @@ router.delete('/clients/:id', auth, requireRole('admin','manager'), wrap(async (
     RETURNING id
   `, params);
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  await logActivity(req, 'client.delete', 'pt_client', rows[0].id);
   res.json({ message: 'Client deleted' });
 }));
 
@@ -975,14 +983,35 @@ router.post('/commissions/calculate', auth, adminOnly, wrap(async (req, res) => 
 }));
 
 // Update trainer commission rate
+//
+// Had no tenant filter at all — same class of bug the GET /trainers comment
+// above documents ("one studio's commission terms readable by its
+// competitors"), except this one is a write: any admin could change any
+// trainer's commission rate platform-wide by id alone. Fixed with the same
+// orgWhere() every sibling write in this file already uses.
 router.put('/commissions/:trainerId', auth, adminOnly, wrap(async (req, res) => {
   const { commission_pct } = req.body;
-  if (commission_pct !== undefined) {
-    await pool.query(
-      'UPDATE pt_trainers SET incentive_rate = $1, updated_at = NOW() WHERE id = $2',
-      [Number(commission_pct), req.params.trainerId]
-    );
-  }
+  if (commission_pct === undefined) return res.json({ data: { success: true } });
+
+  const rate = Number(commission_pct);
+  const beforeParams = [req.params.trainerId];
+  const beforeOrg = orgWhere(req, beforeParams);
+  const { rows: before } = await pool.query(
+    `SELECT id, name, incentive_rate FROM pt_trainers WHERE id = $1${beforeOrg}`, beforeParams
+  );
+  if (before.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Trainer not found' } });
+
+  const updParams = [rate, req.params.trainerId];
+  const updOrg = orgWhere(req, updParams);
+  await pool.query(
+    `UPDATE pt_trainers SET incentive_rate = $1, updated_at = NOW() WHERE id = $2${updOrg}`,
+    updParams
+  );
+
+  await logActivity(
+    req, 'trainer.commission_update', 'pt_trainer', req.params.trainerId,
+    { incentive_rate: rate }, { incentive_rate: before[0].incentive_rate }
+  );
   res.json({ data: { success: true } });
 }));
 
@@ -1673,6 +1702,48 @@ router.post('/clients/:id/coach', auth, wrap(async (req, res) => {
   });
 
   res.json({ data: out });
+}));
+
+// ─── Activity log ──────────────────────────────────────────
+//
+// The studio-facing view of activity_log — who changed what, when. The
+// platform's own Audit Centre (mounted under /api/super-admin) reads the
+// same table across every organization for the platform operator; this is
+// the narrower, tenant-scoped read of it for a studio's own admin/manager,
+// who has no reason to see (and must never be able to request) another
+// studio's rows. Always filtered to the caller's own organization —
+// scope.applyFilter's "no filter" case (a platform super admin operating
+// platform-wide) is deliberately not offered here; that's what the Audit
+// Centre is for.
+router.get('/activity-log', auth, adminOrManager, wrap(async (req, res) => {
+  const scope = tenantScope(req);
+  const where = ['a.organization_id = $1'];
+  const params = [scope.orgId];
+  if (req.query.action) { params.push(req.query.action); where.push(`a.action = $${params.length}`); }
+  if (req.query.entity_type) { params.push(req.query.entity_type); where.push(`a.entity_type = $${params.length}`); }
+  if (req.query.entity_id) { params.push(req.query.entity_id); where.push(`a.entity_id = $${params.length}`); }
+
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  const whereSql = `WHERE ${where.join(' AND ')}`;
+
+  const [rowsRes, countRes] = await Promise.all([
+    pool.query(
+      `SELECT a.id, a.user_id, a.user_name, a.action, a.entity_type, a.entity_id,
+              a.old_data, a.new_data, a.created_at
+         FROM activity_log a
+        ${whereSql}
+        ORDER BY a.created_at DESC
+        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    ),
+    pool.query(`SELECT COUNT(*)::int AS total FROM activity_log a ${whereSql}`, params),
+  ]);
+
+  res.json({
+    data: rowsRes.rows,
+    paging: { limit, offset, total: countRes.rows[0].total, count: rowsRes.rows.length },
+  });
 }));
 
 module.exports = router;

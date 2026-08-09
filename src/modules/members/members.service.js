@@ -138,10 +138,15 @@ async function create(input, ctx) {
       input.tags || null,
     ]
   );
-  // Audit
+  // Audit. Previously targeted a differently-shaped legacy table and threw
+  // on every call — unreached in practice (this route has no frontend
+  // caller; see the members module's mount comment in server.js), which is
+  // the only reason it never surfaced as a 500. Now writes the table every
+  // other audited write in the app actually uses.
   await pool.query(
-    `INSERT INTO audit_log (user_id, action, entity, entity_id, after) VALUES ($1,'member.create','member',$2,$3)`,
-    [ctx.user_id, rows[0].id, rows[0]]
+    `INSERT INTO activity_log (user_id, user_name, action, entity_type, entity_id, new_data, organization_id)
+     VALUES ($1,$2,'member.create','member',$3,$4,$5)`,
+    [ctx.user_id, ctx.user_name || null, rows[0].id, JSON.stringify(rows[0]), ctx.organization_id || null]
   );
   return rows[0];
 }
@@ -174,9 +179,9 @@ async function update(id, patch, ctx) {
   );
 
   await pool.query(
-    `INSERT INTO audit_log (user_id, action, entity, entity_id, before, after)
-     VALUES ($1,'member.update','member',$2,$3,$4)`,
-    [ctx.user_id, id, before, rows[0]]
+    `INSERT INTO activity_log (user_id, user_name, action, entity_type, entity_id, old_data, new_data, organization_id)
+     VALUES ($1,$2,'member.update','member',$3,$4,$5,$6)`,
+    [ctx.user_id, ctx.user_name || null, id, JSON.stringify(before), JSON.stringify(rows[0]), ctx.organization_id || null]
   );
   return rows[0];
 }
@@ -184,8 +189,9 @@ async function update(id, patch, ctx) {
 async function softDelete(id, ctx) {
   await pool.query(`UPDATE members SET deleted_at = NOW(), status='cancelled' WHERE id = $1`, [id]);
   await pool.query(
-    `INSERT INTO audit_log (user_id, action, entity, entity_id) VALUES ($1,'member.delete','member',$2)`,
-    [ctx.user_id, id]
+    `INSERT INTO activity_log (user_id, user_name, action, entity_type, entity_id, organization_id)
+     VALUES ($1,$2,'member.delete','member',$3,$4)`,
+    [ctx.user_id, ctx.user_name || null, id, ctx.organization_id || null]
   );
 }
 

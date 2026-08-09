@@ -133,10 +133,16 @@ async function book({ session_id, member_id }, ctx) {
       );
     }
 
-    // 7. Audit + notification (queued; not awaited here in real impl)
+    // 7. Audit + notification (queued; not awaited here in real impl).
+    // Previously targeted a differently-shaped legacy table and threw on
+    // every call (unreached in practice — this module has no frontend
+    // caller). Fixed to the table every other audited write in the app
+    // uses, on the same client/transaction so a rollback also rolls this
+    // back.
     await client.query(
-      `INSERT INTO audit_log (user_id, action, entity, entity_id, after) VALUES ($1,'booking.create','booking',$2,$3)`,
-      [ctx.user_id, booking.id, booking]
+      `INSERT INTO activity_log (user_id, user_name, action, entity_type, entity_id, new_data, organization_id)
+       VALUES ($1,$2,'booking.create','booking',$3,$4,$5)`,
+      [ctx.user_id, ctx.user_name || null, booking.id, JSON.stringify(booking), ctx.organization_id || null]
     );
 
     await client.query('COMMIT');
@@ -224,8 +230,9 @@ async function cancel(bookingId, { reason } = {}, ctx) {
     }
 
     await client.query(
-      `INSERT INTO audit_log (user_id, action, entity, entity_id) VALUES ($1,'booking.cancel','booking',$2)`,
-      [ctx.user_id, bookingId]
+      `INSERT INTO activity_log (user_id, user_name, action, entity_type, entity_id, organization_id)
+       VALUES ($1,$2,'booking.cancel','booking',$3,$4)`,
+      [ctx.user_id, ctx.user_name || null, bookingId, ctx.organization_id || null]
     );
     await client.query('COMMIT');
 

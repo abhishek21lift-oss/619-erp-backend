@@ -116,6 +116,13 @@ const REVIEWED_EXCEPTIONS = {
     'Command Center SMTP health collector — reads admin_invitations delivery ' +
     'errors platform-wide, which is the operator console\'s purpose. Mounted ' +
     'under /api/super-admin behind requireSuperAdmin + requireSuperAdminMfa.',
+  'modules/platform/super-admin/shared.js':
+    'audit() logs super-admin actions (organisation suspend/activate, plan ' +
+    'changes, impersonation, invitations) that operate ON a tenant from ' +
+    'outside it, or across several — the action does not have one owning ' +
+    'organisation to filter by the way a business write does. Same shape as ' +
+    'the Command Centre alerting exception above. Mounted under ' +
+    '/api/super-admin behind requireSuperAdmin.',
 };
 
 /** Every route/module source file. */
