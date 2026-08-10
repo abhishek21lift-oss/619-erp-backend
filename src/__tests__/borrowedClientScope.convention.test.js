@@ -10,8 +10,11 @@
 // Silently, because RLS filters rather than errors.
 //
 // There was exactly one such path: members.service.js's member-code generator,
-// which held a SESSION-level advisory lock outside any transaction. It is now
-// inside create()'s transaction. This test is what stops the next one appearing.
+// which held a SESSION-level advisory lock outside any transaction. That module
+// has since been deleted along with the /api/v1/members endpoint it served (see
+// MEMBERS-TENANT-GAP.md), so the specific assertions about it are gone — but the
+// rule it existed to enforce is the point, and that stays. This test is what
+// stops the next such path appearing.
 //
 // Deliberately source-level. The alternative — asserting against a live
 // database — would only cover the paths a test happens to exercise, and the
@@ -93,27 +96,5 @@ describe('borrowed clients and the tenant wrapper', () => {
       expect(OUTSIDE_A_REQUEST[b.file]).toBeTruthy();
     }
     expect(Object.keys(OUTSIDE_A_REQUEST).sort()).toEqual(['src/db/migrate.js', 'src/db/pool.js']);
-  });
-
-  it('the member-code generator no longer runs outside a transaction', () => {
-    // The specific path this test was written for. It held pg_advisory_lock —
-    // session-scoped, so released only by an explicit unlock — on a pooled
-    // connection, outside any transaction.
-    const src = fs.readFileSync(path.join(SRC, 'modules/members/members.service.js'), 'utf8');
-    expect(src).not.toMatch(/pg_advisory_lock\(/);
-    expect(src).toMatch(/pg_advisory_xact_lock\(/);
-    // …and the code is allocated on the caller's client, so the lock is still
-    // held when the INSERT that uses it runs. Generating on one connection and
-    // inserting on another is what made the old version racy.
-    expect(src).toMatch(/async function nextMemberCode\(client\)/);
-    expect(src).not.toMatch(/await createMemberCode\(\)/);
-  });
-
-  it('the member code is a sequence, not a row count', () => {
-    // COUNT(*)+1 collides with an existing code the moment a member is
-    // deleted. MAX+1 over the existing codes survives deletions.
-    const src = fs.readFileSync(path.join(SRC, 'modules/members/members.service.js'), 'utf8');
-    expect(src).not.toMatch(/SELECT COUNT\(\*\) AS c FROM members/i);
-    expect(src).toMatch(/ORDER BY CAST\(SUBSTRING\(member_code FROM 3\) AS INTEGER\) DESC/);
   });
 });

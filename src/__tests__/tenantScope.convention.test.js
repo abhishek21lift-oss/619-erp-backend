@@ -103,8 +103,6 @@ const REVIEWED_EXCEPTIONS = {
   'modules/bookings/bookings.service.js':
     'Name-resolution join only. Note this module targets the legacy ' +
     'members/member_memberships tables that server.js documents as abandoned.',
-  'modules/members/members.service.js':
-    'Name-resolution join only. Same legacy-table caveat as bookings.',
   'modules/automation/automation.routes.js':
     'LEFT JOIN users u ON u.id = ar.created_by — resolves an author name for ' +
     'automation rows the surrounding query already filters. Join is on an FK.',

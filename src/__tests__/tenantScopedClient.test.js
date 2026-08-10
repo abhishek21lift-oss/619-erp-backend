@@ -115,7 +115,7 @@ describe('scopeClient', () => {
   });
 
   it('warns once, not per statement, about un-scoped work', async () => {
-    // members.service.js takes a session-level advisory lock outside any
+    // A borrowed client can take a session-level advisory lock outside any
     // transaction. Wrapping those in transactions would change locking
     // semantics, so they are reported instead — one line per borrow, so the
     // staging flag-on phase gets a list rather than a flood.

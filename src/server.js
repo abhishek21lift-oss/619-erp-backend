@@ -666,11 +666,19 @@ app.use('/api/automation',       require('./modules/automation/automation.routes
 // and nothing to notice it. They cannot be fixed in place without a schema
 // change to tables holding no data, so deleting them is the honest option.
 //
-// /api/v1/members is still mounted because the client calls two of its routes,
-// and /api/v1/notifications because it backs the notification bell. See
-// BACKEND-FRONTEND-AUDIT.md §4.1 — members has the same missing-org-column
-// problem and needs the same decision.
-app.use('/api/v1/members',        require('./modules/members/members.routes'));
+// /api/v1/members has now gone the same way, for the same reason and after the
+// same check. It was kept because the client appeared to call two of its
+// routes; both were dead — defined in the frontend's api barrel and invoked
+// from nowhere. A read-only count against production returned 0 rows, 0
+// organisations represented, 0 attributable rows, 0 duplicate member codes.
+// See src/db/migrations/MEMBERS-TENANT-GAP.md for the audit and the decision.
+//
+// The members TABLE is deliberately untouched: workers/renewal.worker.js still
+// joins it, member_memberships still has a foreign key to it, and dropping a
+// table was never part of this.
+//
+// /api/v1/notifications stays — it backs the notification bell and has a live
+// caller.
 app.use('/api/v1/notifications',  require('./modules/notifications/notifications.routes'));
 
 // ────────────────────────

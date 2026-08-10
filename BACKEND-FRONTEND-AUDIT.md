@@ -186,7 +186,7 @@ the `/api/v1` module routers carried any tenant filter:
 | `routes/reports.js` (live, client-facing) | **23** | correct — the benchmark |
 | `modules/reports` | **0** | **deleted** |
 | `modules/sessions` | **0** | **deleted** |
-| `modules/members` | **0** | still mounted — see below |
+| `modules/members` | **0** | **removed** — see MEMBERS-TENANT-GAP.md |
 | `modules/bookings` | **0** | still mounted — see below |
 | `modules/notifications` | 0 | safe — scopes by `user_id` |
 
@@ -220,7 +220,7 @@ that today would have migrated live, tenant-scoped reporting onto an unscoped
 implementation over empty tables. The note has been rewritten in place to
 record the reversal so nobody restores the old plan.
 
-**Still open, same problem.** `/api/v1/members` (client calls `GET /:id` and
+**RESOLVED — removed.** `/api/v1/members` (the client appeared to call `GET /:id` and
 `GET /:id/metrics`) authorises by role only — `ctx()` does not even carry
 `organization_id` — so an admin of studio A can fetch a member of studio B by
 id. It reads the empty `members` table, so it 404s today, and the member
@@ -238,7 +238,7 @@ frontend actually uses:
 |---|---|---|
 | `modules/sessions/sessions.routes.js` | `/api/v1/pt-sessions` (5 routes) | `/api/pt-os/sessions` |
 | `modules/reports/reports.routes.js` | `/api/v1/reports` (5 routes) | `/api/reports` (`routes/reports.js`) |
-| `modules/members/members.routes.js` | `/api/v1/members` (9 routes) | `/api/clients` |
+| ~~`modules/members/members.routes.js`~~ | ~~`/api/v1/members`~~ — **removed**, see MEMBERS-TENANT-GAP.md | `/api/clients` |
 
 `/api/v1/members` is partially alive — the frontend calls `GET
 /api/v1/members/:id` and `GET /api/v1/members/:id/metrics` only. The other
@@ -416,7 +416,7 @@ the six gates would be a behavioural no-op until someone toggles a flag. But
 gateable is a commercial question.
 
 §4.1 turns on whether `/api/v1/*` is the intended direction or a stalled
-migration. Note `/api/v1/members` cannot simply be deleted — the frontend calls
+migration. NOTE SUPERSEDED: `/api/v1/members` was deleted — the frontend calls
 `GET /:id` and `GET /:id/metrics` from it — so that one needs a migration of
 those two call sites first, while `modules/sessions` and `modules/reports` have
 zero callers and could go today.

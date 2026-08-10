@@ -225,7 +225,7 @@ pool.query = function slowQueryInstrument(...args) {
  * Three things it deliberately does NOT do:
  *
  *  · It does not scope queries run OUTSIDE a transaction. Those exist —
- *    members.service.js takes a session-level pg_advisory_lock — and silently
+ *    the app has had such a path before — and silently
  *    wrapping them in transactions would change locking and DDL semantics that
  *    cannot be verified from here. They are logged instead, once per client, so
  *    the staging flag-on phase surfaces them as a list to work through rather

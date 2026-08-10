@@ -1,12 +1,31 @@
 # `members` has no tenant column, and RLS cannot cover it
 
-Found while resolving the `createMemberCode()` scope gap for BUG-003. It is a
-bigger finding than the thing it was found under, so it is written down
-separately rather than buried in a commit message.
+**RESOLVED — Option 1. The `/api/v1/members` endpoint and its module were
+removed. The table was left untouched.**
 
-**Not fixed here.** Fixing it needs a schema decision that depends on what is
-actually in the table in production, which this work was explicitly not allowed
-to look at.
+Found while resolving the `createMemberCode()` scope gap for BUG-003. Kept as a
+record because the reasoning is what makes the removal reversible on purpose
+rather than by accident, and because the table is still there.
+
+The read-only production verification that decided it:
+
+| Measure | Result |
+|---|---|
+| `members` row count | **0** |
+| distinct organisations represented | 0 |
+| unattributable rows | 0 |
+| conflicting derivation | 0 |
+| duplicate member codes | 0 |
+| recent / active member data | none |
+
+Nothing to preserve, nothing to migrate, nothing to backfill. Option 2's entire
+cost was the backfill, and there was no data to back-fill.
+
+`src/__tests__/membersEndpointRemoved.test.js` fails the build if the endpoint
+comes back, so reinstating it means deleting those assertions — which is the
+explicit decision this note exists to inform. If it does return, it must return
+with a tenant boundary: the table still has no `organization_id`, so migration
+157 still cannot cover it.
 
 ## What was found
 
@@ -29,9 +48,9 @@ So `members` is not skipped by oversight — it is not eligible. Nothing that
 happens to the RLS rollout will protect it, at any stage, ever. Pointing
 `DATABASE_URL` at `app_tenant` changes nothing for this table.
 
-## Why it matters
+## Why it mattered
 
-The router is live. `src/server.js`:
+The router was live. `src/server.js`, before the removal:
 
 ```js
 app.use('/api/v1/members', require('./modules/members/members.routes'));
@@ -63,25 +82,24 @@ The other routes have the same shape: `getById`, `update`, `delete`,
 `/:id/payments`, `/:id/attendance`, `/:id/metrics`, `/:id/freeze` all address a
 member by id with no org predicate.
 
-This is already known, and recorded in the mount comment in `server.js` — the
+This was already known, and recorded in the mount comment in `server.js` — the
 sibling endpoints with the same defect were deleted, and this one was kept
-because the client calls two of its routes:
+because the client appeared to call two of its routes:
 
 > `/api/v1/members` is still mounted because the client calls two of its
 > routes … members has the same missing-org-column problem and needs the same
 > decision.
 
-That decision is still outstanding. This document is here so it is costed
-against the RLS rollout rather than discovered during it.
+That decision has now been taken — see the top of this note.
 
-## What is NOT claimed
+## What was never claimed
 
-Whether any of this is currently exploitable depends on whether the table holds
-rows for more than one studio, and that was not checked — production data was
-out of scope for this work. The mount comment says the deleted siblings held no
-data; `members` may be in the same state. **That is an assumption, not a
-finding.** Confirming it is a single read-only query and should be the first
-step of whichever option below is taken.
+Whether any of this was ever exploitable depended on whether the table held
+rows for more than one studio, and at the time of writing that had not been
+checked — production data was out of scope for that work. It was flagged as an
+assumption rather than a finding, and the read-only query that settled it was
+run before anything was removed. The answer was 0 rows, so the exposure was
+latent, never live.
 
 ## The options
 
@@ -106,10 +124,23 @@ step of whichever option below is taken.
 Option 1 unless the two frontend calls turn out to matter. Option 2 is the only
 one that ends with the table inside the same guarantee as the other 58.
 
-## What was fixed alongside this
+**Taken: Option 1.** The two frontend calls did not matter — `member.get` and
+`member.metrics` are defined in the api barrel and invoked from nowhere, so the
+cost was zero rather than two call sites. The production count then showed an
+empty table, which removed Option 2's only argument (preserving real data).
 
-`createMemberCode()` had three defects independent of the missing column, all
-now resolved (see `members.service.js`):
+What that leaves: the `members` TABLE is still outside RLS and still has no
+`organization_id`. That is now harmless, because nothing serves it over HTTP —
+`workers/renewal.worker.js` joins it and `member_memberships` has a foreign key
+to it, and neither is a tenant-crossing read path. If the table is ever
+repopulated or re-exposed, this note is the starting point again.
+
+## What was fixed alongside this, and then deleted with the module
+
+`createMemberCode()` had three defects independent of the missing column. They
+were fixed first, before the production count came back and made Option 1 the
+answer; the module was then removed, so the fixes went with it. Recorded because
+they are the reasons this code should not be restored as it was:
 
 - a **session-scoped** `pg_advisory_lock` on a pooled connection, released only
   by an explicit unlock in a `finally` — if that unlock failed, or the process
@@ -124,7 +155,12 @@ now resolved (see `members.service.js`):
   and the next code collides with one that already exists. Now `MAX + 1` over
   the existing codes, the pattern `src/db/id-gen.js` already documents.
 
-The lock key stays a single global constant. It would normally be keyed per org
-— `lib/subscription.js` keys its lock by `orgId` for exactly that reason — but
-there is no `organization_id` to key on, and a global sequence needs a global
-lock. That is one more thing option 2 would fix.
+The lock key stayed a single global constant. It would normally be keyed per
+org — `lib/subscription.js` keys its lock by `orgId` for exactly that reason —
+but there was no `organization_id` to key on, and a global sequence needs a
+global lock.
+
+The rule those fixes established outlives the module:
+`src/__tests__/borrowedClientScope.convention.test.js` fails the build if any
+borrowed client runs outside a transaction, because that is the shape the
+tenant wrapper cannot scope.
