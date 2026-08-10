@@ -1127,6 +1127,61 @@ router.get('/sessions', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
+// Every trainer profile that IS the caller, as a list of pt_sessions.trainer_id
+// values to match on.
+//
+// Two things make a single id wrong here.
+//
+// First, `users.trainer_id` is only ever populated by the studio-approval path
+// (super-admin/registrations.js, super-admin/organizations.js) — those create a
+// `trainers` row and link it in the same transaction. An account created any
+// other way (the /auth/register route leaves it null unless a trainer_id is
+// passed, and every pre-approval-flow studio predates it) has no link at all,
+// even when that person is the studio's only trainer and has a full diary.
+// Keying solely off the column reported "not linked" to the studio owner and
+// told them to ask an admin — which they are.
+//
+// Second, `pt_sessions.trainer_id` has had NO foreign key since migration
+// 018 dropped pt_sessions_trainer_id_fkey, and the Book Session picker is fed
+// by GET /trainers, a UNION of `trainers` and `pt_trainers`. So a booked
+// session's trainer_id can be an id from EITHER table, and the same human
+// routinely exists in both. Matching one id misses the other's sessions.
+//
+// Hence: the explicit link, plus an email match in both tables, all within the
+// caller's own organisation. Email is the join the two trainer tables already
+// share — 018 seeded pt_trainers FROM trainers carrying it across.
+//
+// The org filter mirrors GET /trainers exactly, including excluding NULL
+// organization_id rather than treating it as shared: an unattributable trainer
+// matched into someone's schedule is the same leak that route was fixed for.
+// This is defence in depth only — the session query below is independently
+// org-scoped, which is the boundary that actually holds.
+async function resolveMyTrainerIds(req) {
+  const ids = new Set();
+  if (req.user.trainer_id) ids.add(req.user.trainer_id);
+
+  const email = String(req.user.email || '').trim().toLowerCase();
+  if (email) {
+    const scope = tenantScope(req);
+    const params = [email];
+    let orgFilter = '';
+    if (scope.applyFilter) {
+      params.push(scope.orgId);
+      orgFilter = `AND organization_id = $${params.length}`;
+    }
+    const { rows } = await pool.query(`
+      SELECT id FROM trainers
+       WHERE deleted_at IS NULL AND LOWER(email) = $1 ${orgFilter}
+      UNION
+      SELECT id FROM pt_trainers
+       WHERE deleted_at IS NULL AND LOWER(email) = $1 ${orgFilter}
+    `, params);
+    for (const r of rows) ids.add(r.id);
+  }
+
+  return [...ids];
+}
+
 // ─── My Schedule — the caller's OWN sessions as a trainer ────
 // Distinct from GET /sessions, which is the studio-wide list and only
 // filters by trainer when the caller passes an explicit trainer_id.
@@ -1138,11 +1193,13 @@ router.get('/sessions', auth, wrap(async (req, res) => {
 // legitimate state, not an error — it returns no sessions and lets the
 // page say why, rather than showing a bare empty list that looks broken.
 router.get('/sessions/my', auth, wrap(async (req, res) => {
-  const trainerId = req.user.trainer_id;
-  if (!trainerId) return res.json({ data: [], total: 0, trainer_linked: false });
+  const trainerIds = await resolveMyTrainerIds(req);
+  if (!trainerIds.length) return res.json({ data: [], total: 0, trainer_linked: false });
 
-  const params = [trainerId];
-  const where = ['s.deleted_at IS NULL', `s.trainer_id = $1`];
+  // = ANY($1) rather than an IN-list built by string concatenation: one bound
+  // parameter regardless of how many profiles resolved.
+  const params = [trainerIds];
+  const where = ['s.deleted_at IS NULL', `s.trainer_id = ANY($1)`];
   const scope = tenantScope(req);
   if (scope.applyFilter) { params.push(scope.orgId); where.push(`s.organization_id = $${params.length}`); }
   if (req.query.from) { params.push(req.query.from); where.push(`s.session_date >= $${params.length}`); }
