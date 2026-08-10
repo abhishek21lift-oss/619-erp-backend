@@ -321,12 +321,29 @@ SELECT o.id, d.key, d.value, d.description, NOW()
  );
 
 -- ───────────────────────────────────────────────────────────────────────────
--- 7. Indexes. The primary key already covers (organization_id, key); this is
---    for the "all settings for my studio" read, which is every request the
---    Settings screen makes.
+-- 7. Indexes — deliberately NONE.
+--
+--    The new primary key is (organization_id, key), so its unique index
+--    already has organization_id as its LEADING column. That serves both
+--    shapes this router issues:
+--
+--      WHERE organization_id = $1                  → index scan, leading col
+--      WHERE organization_id = $1 AND key = $2     → index scan, both cols
+--
+--    A separate index on (organization_id) would be redundant with it, which
+--    is exactly the class of duplication migration 135 exists to remove — it
+--    dropped system_settings_key_idx and feature_flags_key_idx for duplicating
+--    the old (key) primary key. Adding one here would undo that lesson in the
+--    same file that changes the key.
+--
+--    NOTE for anyone adding a query later: after this migration there is no
+--    longer any index with `key` as its leading column, so a lookup by key
+--    ALONE (across organizations) is a sequential scan. Nothing in the
+--    application does that — every query in routes/settings.js filters on
+--    organization_id first — and at 51 rows per studio it would not matter if
+--    it did. It is written down because the old (key) index disappearing is
+--    the non-obvious consequence of this change.
 -- ───────────────────────────────────────────────────────────────────────────
-CREATE INDEX IF NOT EXISTS idx_system_settings_org ON system_settings (organization_id);
-CREATE INDEX IF NOT EXISTS idx_feature_flags_org   ON feature_flags   (organization_id);
 
 -- ───────────────────────────────────────────────────────────────────────────
 -- 8. Prove it worked, inside the same transaction.
