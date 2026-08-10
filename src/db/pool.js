@@ -167,19 +167,27 @@ async function withOrgScope(client, orgId, run) {
   }
 }
 
+// The pool's own methods, captured before either wrapper below replaces them.
+// pool.query borrows through _origConnect rather than the patched pool.connect
+// on purpose: it already scopes its borrowed client itself, via withOrgScope,
+// and going through the patched connect would have the client's BEGIN
+// interceptor emit set_config as well — the same value twice, one wasted round
+// trip on every query, and two mechanisms responsible for one invariant.
+const _origQuery = pool.query.bind(pool);
+const _origConnect = pool.connect.bind(pool);
+
 // Instrument pool.query to log slow queries (> 1 second) and, when
 // TENANT_RLS_ENFORCE is on and the request resolved an org id, to run the
 // query inside the org-scoping transaction above. The two compose: timing
 // wraps the whole thing, so the added transaction's latency is exactly what
 // shows up in slow_query — which is the number the staging rollout in
 // TENANT-RLS-PLAN.md needs before this ever reaches production traffic.
-const _origQuery = pool.query.bind(pool);
 pool.query = function slowQueryInstrument(...args) {
   const start = Date.now();
   const orgId = TENANT_RLS_ENFORCE ? currentOrgId() : null;
   const result = orgId == null
     ? _origQuery(...args)
-    : pool.connect().then((client) =>
+    : _origConnect().then((client) =>
         withOrgScope(client, orgId, () => client.query(...args)).finally(() => client.release())
       );
   if (result && typeof result.then === 'function') {
@@ -198,11 +206,117 @@ pool.query = function slowQueryInstrument(...args) {
   return result;
 };
 
+/**
+ * Puts app.org_id on a client the caller borrowed for its own transaction.
+ *
+ * pool.query's wrapper cannot reach these: 36 call sites do
+ * `pool.connect()` → `BEGIN` → several statements → `COMMIT`, and the GUC has
+ * to be set INSIDE that transaction, on that connection, or RLS sees nothing.
+ * Left alone, the day DATABASE_URL points at app_tenant every one of those
+ * paths — payments, invoices, enrolment — starts returning zero rows. Silently,
+ * because RLS filters rather than errors.
+ *
+ * Rather than edit 36 transaction bodies, connect() is wrapped the same way
+ * query() already is, so no call site changes. The client's own query method
+ * is patched to notice the caller's BEGIN and follow it immediately with
+ * set_config(..., true), which is transaction-scoped and therefore cannot
+ * outlive the transaction or leak to whoever borrows this connection next.
+ *
+ * Three things it deliberately does NOT do:
+ *
+ *  · It does not scope queries run OUTSIDE a transaction. Those exist —
+ *    members.service.js takes a session-level pg_advisory_lock — and silently
+ *    wrapping them in transactions would change locking and DDL semantics that
+ *    cannot be verified from here. They are logged instead, once per client, so
+ *    the staging flag-on phase surfaces them as a list to work through rather
+ *    than as a production incident.
+ *  · It does not touch callback-style query(), which pg still supports. Every
+ *    call site in this repo awaits, so this is a pass-through for completeness.
+ *  · It does not run at all outside a request. currentOrgId() is undefined for
+ *    migrations, the startup probe and cron, so those borrow an unpatched
+ *    client exactly as before.
+ *
+ * The patch is removed on release(), because the pool hands the same physical
+ * client out again — without that, each borrow would wrap the previous
+ * wrapper and the stack would grow for the life of the process.
+ */
+const PRISTINE = Symbol.for('tenantScope.pristine');
+
+function scopeClient(client, orgId, log = logger) {
+  // The pristine methods, remembered once per physical client. Capturing
+  // `client.query.bind(client)` instead would restore a BOUND COPY on release,
+  // so the next borrow would bind that copy, and the chain would grow one
+  // layer per borrow for the life of the process. Caught by the identity
+  // assertion in tenantScopedClient.test.js.
+  if (!client[PRISTINE]) {
+    client[PRISTINE] = { query: client.query, release: client.release };
+  }
+  const { query: pristineQuery, release: pristineRelease } = client[PRISTINE];
+  const origQuery = (...a) => pristineQuery.apply(client, a);
+  const origRelease = (...a) => pristineRelease.apply(client, a);
+  let inTransaction = false;
+  let warned = false;
+
+  const verbOf = (args) => {
+    const sql = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].text) || '';
+    return { sql, verb: sql.trimStart().slice(0, 24).toUpperCase() };
+  };
+
+  client.query = function scopedQuery(...args) {
+    if (typeof args[args.length - 1] === 'function') return origQuery(...args);
+    const { sql, verb } = verbOf(args);
+
+    if (/^(BEGIN|START\s+TRANSACTION)/.test(verb)) {
+      return origQuery(...args).then(async (res) => {
+        await origQuery('SELECT set_config($1, $2, true)', ['app.org_id', String(orgId)]);
+        inTransaction = true;
+        return res;
+      });
+    }
+
+    if (/^(COMMIT|ROLLBACK|END)\b/.test(verb)) {
+      inTransaction = false;
+      return origQuery(...args);
+    }
+
+    if (!inTransaction && !warned) {
+      warned = true;
+      log.warn(
+        { sql: sql.slice(0, 120), orgId },
+        'tenant_scope_gap: borrowed client ran a query outside a transaction, '
+        + 'so app.org_id is not set for it — this statement would see no rows '
+        + 'once DATABASE_URL points at app_tenant',
+      );
+    }
+    return origQuery(...args);
+  };
+
+  client.release = function scopedRelease(...args) {
+    client.query = pristineQuery;
+    client.release = pristineRelease;
+    return origRelease(...args);
+  };
+
+  return client;
+}
+
+// Same gate and the same source of truth as pool.query's wrapper above, so the
+// two can never disagree about whether enforcement is on.
+pool.connect = function tenantScopedConnect(...args) {
+  const borrowed = _origConnect(...args);
+  if (!TENANT_RLS_ENFORCE) return borrowed;
+  return Promise.resolve(borrowed).then((client) => {
+    const orgId = currentOrgId();
+    return orgId == null ? client : scopeClient(client, orgId);
+  });
+};
+
 // Exposed on the pool instance (not a separate module export — every
 // existing call site does `const pool = require('../db/pool')` and expects
 // pool itself to be the Pool) so it's directly testable without exercising
 // this module's own pool.connect() startup call.
 pool.withOrgScope = withOrgScope;
+pool.scopeClient = scopeClient;
 
 // Test connection on startup. Don't crash here — Render's healthcheck will
 // surface a 5xx and you can read the log. Crashing prevents redeploys from
