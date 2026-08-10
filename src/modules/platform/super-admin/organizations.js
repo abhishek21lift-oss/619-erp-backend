@@ -9,6 +9,11 @@ const router = require('express').Router();
 const {
   EMAIL_RE, TENANT_ROLES, TRIAL_DAYS, audit, bcrypt, crypto, deliverInvitation, detectLogoType, invalidateUserCache, invitations, logger, logoUpload, pool, saveFile, sendPasswordReset, slugify, smtpConfigured, uniqueSlug,
 } = require('./shared');
+// AUD-001: a new studio must be born with its own settings. Migration 159
+// seeds every organization that existed when it ran, and migrations run once —
+// so without this, the first studio created after that deploy opens Settings
+// to a blank screen and a check-in geofence at 0,0.
+const { seedOrganizationSettings } = require('../../../lib/settingsDefaults');
 // ── GET /organizations ───────────────────────────────────────────────────────
 router.get('/organizations', async (req, res, next) => {
   try {
@@ -104,6 +109,10 @@ router.post('/organizations', async (req, res, next) => {
       [orgName, slug, String(TRIAL_DAYS)]
     );
     const org = orgRows[0];
+    // Inside the transaction, so a studio can never be committed without its
+    // settings. Seeded with the studio's own name, so Settings opens showing
+    // the studio rather than a placeholder.
+    await seedOrganizationSettings(client, org.id, { studioName: orgName });
     await client.query(
       `INSERT INTO subscription_events (organization_id, event, data, actor_id, actor_name)
        VALUES ($1,'trial_started',$2,$3,$4)`,

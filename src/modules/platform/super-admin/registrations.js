@@ -18,6 +18,10 @@
 const {
   EMAIL_RE, audit, bcrypt, crypto, logger, pool, slugify, uniqueSlug,
 } = require('./shared');
+// AUD-001 — see the note on the same import in organizations.js. Self-serve
+// approval is the second path that creates an organization, and it needs the
+// seed for exactly the same reason.
+const { seedOrganizationSettings } = require('../../../lib/settingsDefaults');
 
 /** The trial the landing page advertises. Deliberately not the 7-day TRIAL_DAYS. */
 const SELF_SERVE_TRIAL_DAYS = parseInt(process.env.SELF_SERVE_TRIAL_DAYS, 10) || 3;
@@ -193,6 +197,10 @@ async function approveHandler(req, res, next) {
       [app.business_name, slug, String(SELF_SERVE_TRIAL_DAYS)]
     );
     const org = orgRows[0];
+
+    // Inside the transaction, so an approved studio can never be committed
+    // without its settings.
+    await seedOrganizationSettings(client, org.id, { studioName: app.business_name });
 
     await client.query(
       `INSERT INTO subscription_events (organization_id, event, data, actor_id, actor_name)

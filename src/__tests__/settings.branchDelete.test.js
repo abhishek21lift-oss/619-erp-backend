@@ -75,7 +75,10 @@ describe('DELETE /settings/branches/:id', () => {
     expect(res.status).toBe(200);
     // The client types this as { message: string } and shows it on success.
     expect(res.body).toEqual({ message: 'Branch deleted' });
-    expect(deleteQuery().params).toEqual([BRANCH_KEY]);
+    // AUD-001: the delete is now scoped to the caller's organization, so the
+    // statement carries the org id alongside the branch key. Without it, a
+    // branch id from another studio would still have matched a row.
+    expect(deleteQuery().params).toEqual(['org-1', BRANCH_KEY]);
   });
 
   test('addresses the row by its prefixed settings key, not the bare id', async () => {
