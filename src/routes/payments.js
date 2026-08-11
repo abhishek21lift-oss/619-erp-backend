@@ -203,7 +203,7 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
 // Avoids the 200-row paginated list being used for totals.
 router.get('/stats', auth, async (req, res, next) => {
   try {
-    const { from, to, trainer_id } = req.query;
+    const { from, to, trainer_id, client_id } = req.query;
     const conditions = ['p.deleted_at IS NULL'];
     const params = [];
     let p = 1;
@@ -212,6 +212,18 @@ router.get('/stats', auth, async (req, res, next) => {
       conditions.push(`p.trainer_id = $${p++}`); params.push(req.user.trainer_id);
     } else if (trainer_id) {
       conditions.push(`p.trainer_id = $${p++}`); params.push(trainer_id);
+    }
+    // Members see only their own payments — the same clamp GET / applies.
+    //
+    // This was missing here while the list endpoint had it, so a member
+    // calling /stats received org-wide totals: every rupee the studio had
+    // taken, from an endpoint any member session can reach. No screen asks
+    // for it, which is precisely why it went unnoticed. Closed here because
+    // this endpoint is now the authoritative source behind the money KPIs.
+    if (req.user.role === 'member') {
+      conditions.push(`p.client_id = $${p++}`); params.push(req.user.member_id);
+    } else if (client_id) {
+      conditions.push(`p.client_id = $${p++}`); params.push(client_id);
     }
     if (from) { conditions.push(`p.date >= $${p++}`); params.push(from); }
     if (to)   { conditions.push(`p.date <= $${p++}`); params.push(to); }
