@@ -85,6 +85,46 @@ describe('the settings catalogue and migration 159 agree', () => {
       .sort((a, b) => a.key.localeCompare(b.key));
     expect(mig).toEqual(cat);
   });
+
+  // ── The flag seed must PREFER the pre-migration value ─────────────────────
+  //
+  // Before 159, `feature_flags` was one global table read by all six studios,
+  // and production holds face_checkin=true and voice_feedback=true while the
+  // catalogue defaults for both are FALSE. Seeding the catalogue value would
+  // switch a live setting off for every studio on deploy day.
+  //
+  // The migration therefore seeds COALESCE(quarantined value, catalogue value).
+  // These assertions pin that down: the previous version of this migration read
+  // `SELECT o.id, d.key, d.value, ...` and would fail every one of them.
+  test('the flag seed prefers the quarantined production value over the default', () => {
+    const block = sql.slice(
+      sql.indexOf('INSERT INTO feature_flags (organization_id, key, value, description, updated_at)'),
+      sql.indexOf('-- 7. Indexes')
+    );
+    expect(block).toMatch(/COALESCE\(\s*q\.value\s*,\s*d\.value\s*\)/i);
+    expect(block).toMatch(/COALESCE\(\s*q\.description\s*,\s*d\.description\s*\)/i);
+    expect(block).toMatch(/LEFT\s+JOIN\s+feature_flags_unattributed\s+q\s+ON\s+q\.key\s*=\s*d\.key/i);
+    // The bare-default form must be gone, or the COALESCE above is decorative.
+    expect(block).not.toMatch(/SELECT\s+o\.id\s*,\s*d\.key\s*,\s*d\.value\s*,/i);
+  });
+
+  test('the seed still skips a studio that already has the key, so re-running is a no-op', () => {
+    const block = sql.slice(
+      sql.indexOf('INSERT INTO feature_flags (organization_id, key, value, description, updated_at)'),
+      sql.indexOf('-- 7. Indexes')
+    );
+    expect(block).toMatch(/WHERE\s+NOT\s+EXISTS/i);
+    expect(block).toMatch(/f\.organization_id\s*=\s*o\.id\s+AND\s+f\.key\s*=\s*d\.key/i);
+  });
+
+  test('the originals are still quarantined verbatim, not consumed by the seed', () => {
+    // Preserving the VALUE must not have turned into moving the ROW: the
+    // quarantine insert has to still copy value and description across.
+    expect(sql).toMatch(
+      /INSERT INTO feature_flags_unattributed \(key, value, description, updated_at, reason\)/
+    );
+    expect(sql).toMatch(/SELECT m\.key, m\.value, m\.description, m\.updated_at,/);
+  });
 });
 
 describe('the catalogue itself is coherent', () => {

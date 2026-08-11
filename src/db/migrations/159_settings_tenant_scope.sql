@@ -306,8 +306,35 @@ UPDATE system_settings s
    AND COALESCE(s.value, '') = ''
    AND COALESCE(o.name, '') <> '';
 
+-- Feature flags: carry the PRE-MIGRATION VALUE forward, fall back to the default.
+--
+-- Before this migration `feature_flags` was a single global table with no
+-- organization column, so all four rows applied to every studio at once: every
+-- one of the six saw face_checkin=true and voice_feedback=true. Seeding the
+-- repo defaults here would therefore not be "setting a default" — it would be
+-- silently FLIPPING a live setting off for six studios on deploy day.
+--
+-- So the value comes from the quarantined original when one exists (q.value),
+-- and from the catalogue default only when it does not (d.value). Two things
+-- this deliberately does NOT do:
+--
+--   · It does not invent ownership. The quarantined rows stay unattributed and
+--     stay in quarantine, verbatim. Their VALUE is applied to every studio
+--     because that is exactly who it applied to before — this preserves
+--     observed behaviour rather than asserting who owned it.
+--   · It does not touch a studio that already has the key (the NOT EXISTS
+--     guard), so re-running changes nothing.
+--
+-- On a fresh install the quarantine table is empty, the LEFT JOIN yields NULL,
+-- and every studio gets the catalogue default. Fresh installs and migrated
+-- production therefore converge on the same model, differing only where
+-- production had a real value worth keeping.
 INSERT INTO feature_flags (organization_id, key, value, description, updated_at)
-SELECT o.id, d.key, d.value, d.description, NOW()
+SELECT o.id,
+       d.key,
+       COALESCE(q.value, d.value),
+       COALESCE(q.description, d.description),
+       NOW()
   FROM organizations o
  CROSS JOIN (VALUES
     ('auto_expire',        TRUE,  'Auto-expire memberships past end date'),
@@ -315,6 +342,7 @@ SELECT o.id, d.key, d.value, d.description, NOW()
     ('face_checkin',       FALSE, 'Face recognition check-in (feature removed from the app)'),
     ('voice_feedback',     FALSE, 'Voice feedback on check-in (feature removed from the app)')
  ) AS d(key, value, description)
+  LEFT JOIN feature_flags_unattributed q ON q.key = d.key
  WHERE NOT EXISTS (
    SELECT 1 FROM feature_flags f
     WHERE f.organization_id = o.id AND f.key = d.key
