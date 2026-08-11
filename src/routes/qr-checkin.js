@@ -16,7 +16,35 @@ const QRCode   = require('qrcode');
 const pool     = require('../db/pool');
 const logger   = require('../lib/logger');
 const { auth } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+
+// ── AUD-004 (P1): this router is a MIXED surface ────────────────────────────
+//
+// Deliberately NOT gated at the mount, and that is the whole finding. Three
+// routes here derive their subject from req.user and are self-scoped by
+// construction — a client legitimately calls all three:
+//
+//   GET  /generate      the caller's OWN check-in QR
+//   POST /checkout      closes the caller's OWN open attendance row
+//   GET  /my-history    the caller's OWN attendance history
+//
+// Putting requireStaff on the mount (which is what the first pass at this
+// finding proposed) would 403 a member trying to display their own check-in
+// code — a client-facing outage introduced by a security fix.
+//
+// Two routes are studio-wide and get `requireStaff` individually, marked below:
+//   POST /scan          marks ANYONE present from a signed payload
+//   GET  /dashboard     live studio-wide attendance aggregates
+//
+// Two already carry their own RBAC and are left exactly as they are:
+//   GET /generate/:type/:id   admin/manager/owner, or trainer for own client
+//   GET /staff-report         inline admin check
+//
+// __tests__/security/qr.authz.test.js pins BOTH directions: the two staff
+// routes refuse a client, and the three client routes keep working and stay
+// self-scoped. The second half is what stops a future "just add requireStaff to
+// the mount" from shipping.
 const rateLimit = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
 
@@ -254,7 +282,10 @@ const scanLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-router.post('/scan', auth, scanLimiter, async (req, res) => {
+// AUD-004: staff only. A signed QR marks whoever it names present, so this is
+// the scanner's endpoint — reception, a kiosk, a trainer or an admin — never
+// the person being scanned.
+router.post('/scan', auth, requireStaff, scanLimiter, async (req, res) => {
   try {
     const { payload, device_info, location } = req.body;
     if (!payload) return res.status(400).json({ error: 'QR payload required' });
@@ -379,7 +410,9 @@ router.post('/checkout', auth, async (req, res) => {
 
 // ── GET /api/qr/dashboard ─────────────────────────────────────────────────────
 // Live attendance dashboard: currently inside, today's count, peak hours, breakdown.
-router.get('/dashboard', auth, async (req, res) => {
+// AUD-004: staff only. Studio-wide aggregates — who is inside right now,
+// today's totals, peak hours — across every client the studio has.
+router.get('/dashboard', auth, requireStaff, async (req, res) => {
   try {
     // Tenant scope: every aggregate below is limited to the caller's org.
     const scope = tenantScope(req);

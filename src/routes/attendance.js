@@ -13,7 +13,35 @@ const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+
+// ── AUD-004 (P1): this is the studio's back office ──────────────────────────
+//
+// Every route below was gated on `auth` alone. The mount in server.js adds
+// `gate('attendance')`, which is [auth, requireFeature('attendance')] — a
+// feature flag, not a role check. And the ownership check inside PUT and
+// DELETE is written `if (req.user.role === 'trainer')`, so an account with role
+// `member` falls straight through it.
+//
+// The result, with an ordinary session and no exploit: an activated client
+// could read the studio's entire attendance register — every other client's
+// name, dates and times — and create, edit or delete rows in it. Reproduced in
+// __tests__/security/attendance.authz.test.js, where a `member` got 201 from
+// POST /bulk and 200 from /stats, /gaps and /today-summary against the code
+// this comment replaces.
+//
+// Declared HERE rather than at the mount, matching offers.js / campaigns.js /
+// feedback.js / integrations.js: the guard travels with the router, so it
+// cannot be lost if the mount is edited or the router is mounted a second time.
+// `auth` runs twice as a result (once from the mount's gate, once here) and
+// that is deliberate and cheap — the second call is a user-cache hit, and the
+// same doubling already happens on every /api/pt-os mount.
+//
+// A client's own attendance is served by GET /api/me/attendance
+// (modules/client-portal/client-portal.routes.js), which scopes to
+// req.user.pt_client_id — so nothing member-facing is lost here.
+router.use(auth, requireStaff);
 
 // GET /api/attendance?date=YYYY-MM-DD&type=client&page=1&limit=100
 router.get('/', auth, async (req, res, next) => {
