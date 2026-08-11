@@ -467,9 +467,24 @@ router.post('/users/:id/reset-password', async (req, res, next) => {
       return res.status(400).json({ error: { code: 'VALIDATION', message: 'Password must be at least 8 characters' } });
     }
     const hashed = await bcrypt.hash(password, 12);
+    // AUD-005. This route's comment and its response both promised "existing
+    // sessions revoked", but it only bumped token_version — which expires the
+    // 15-minute access tokens and nothing else. The account's refresh tokens
+    // stayed live for the rest of their 7-day window, so an operator resetting a
+    // compromised account's password was told the sessions were gone while the
+    // attacker could still mint new access tokens. The claim is now true.
     const { rows } = await pool.query(
-      `UPDATE users SET password = $2, token_version = token_version + 1, updated_at = now()
-        WHERE id = $1 AND deleted_at IS NULL RETURNING id, email`,
+      `WITH pw AS (
+         UPDATE users SET password = $2, token_version = token_version + 1, updated_at = now()
+           WHERE id = $1 AND deleted_at IS NULL
+         RETURNING id, email
+       ), revoked AS (
+         UPDATE refresh_tokens
+            SET revoked_at = NOW()
+          WHERE user_id = (SELECT id FROM pw)
+            AND revoked_at IS NULL
+       )
+       SELECT id, email FROM pw`,
       [req.params.id, hashed]
     );
     if (!rows.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });

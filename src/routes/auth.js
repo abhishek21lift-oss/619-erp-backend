@@ -403,8 +403,32 @@ router.post('/reset-password', async (req, res) => {
     if (!rows.length) return res.status(400).json({ error: 'Invalid or expired reset token' });
 
     const hashed = await bcrypt.hash(password, 12);
+    // AUD-005. Bumping token_version kills the 15-minute ACCESS tokens, but
+    // refresh tokens live in their own table and /refresh never consults
+    // token_version — so without this, a stolen refresh token keeps minting new
+    // access tokens for the remaining 7 days, and rotation renews it each time.
+    //
+    // One statement, not two: the password write and the revocation have to
+    // succeed or fail together. If the revoke were a second query and it failed,
+    // the password would already have changed and the attacker's session would
+    // survive — exactly the bug this closes. A data-modifying CTE gives that
+    // atomicity without introducing transaction management into a handler that
+    // has never had any.
     await pool.query(
-      'UPDATE users SET password = $1, token_version = token_version + 1, password_reset_token = NULL, password_reset_expires = NULL, updated_at = NOW() WHERE id = $2',
+      `WITH pw AS (
+         UPDATE users
+            SET password = $1,
+                token_version = token_version + 1,
+                password_reset_token = NULL,
+                password_reset_expires = NULL,
+                updated_at = NOW()
+          WHERE id = $2
+         RETURNING id
+       )
+       UPDATE refresh_tokens
+          SET revoked_at = NOW()
+        WHERE user_id = (SELECT id FROM pw)
+          AND revoked_at IS NULL`,
       [hashed, rows[0].id]
     );
     invalidateUserCache(rows[0].id);
@@ -448,21 +472,49 @@ async function changePasswordHandler(req, res) {
     if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
 
     const hashed = await bcrypt.hash(newPassword, 12);
-    await pool.query(
-      'UPDATE users SET password = $1, token_version = token_version + 1, updated_at = NOW() WHERE id = $2',
+    // AUD-005, the change-password half. Same revocation as reset-password, but
+    // the contract here is different and deliberately so: this handler keeps the
+    // caller signed in (it sets a fresh access cookie and issues a replacement
+    // refresh token below). So every OTHER session dies and the caller's does
+    // not — which is why the revoke happens HERE, before issueRefreshToken(),
+    // rather than after it. Reversed, it would sign the user out of the very
+    // browser they just changed their password in.
+    //
+    // This replaces the previous single-token revoke, which only killed the
+    // refresh token presented in the caller's own cookie and left every other
+    // device signed in with the old password's session. It also now covers
+    // mobile clients, which send the token in the body rather than a cookie.
+    //
+    // RETURNING folds in the follow-up SELECT the old code needed, so the
+    // token_version stamped into the new JWT is the one this statement wrote —
+    // no window in which a concurrent bump could be missed.
+    const { rows: updated } = await pool.query(
+      `WITH pw AS (
+         UPDATE users
+            SET password = $1,
+                token_version = token_version + 1,
+                updated_at = NOW()
+          WHERE id = $2
+         RETURNING id, token_version
+       ), revoked AS (
+         UPDATE refresh_tokens
+            SET revoked_at = NOW()
+          WHERE user_id = (SELECT id FROM pw)
+            AND revoked_at IS NULL
+       )
+       SELECT token_version FROM pw`,
       [hashed, req.user.id]
     );
     invalidateUserCache(req.user.id);
-    const { rows: updated } = await pool.query(
-      'SELECT token_version FROM users WHERE id = $1', [req.user.id]
-    );
     const newToken = jwt.sign(
       { id: req.user.id, token_version: updated[0].token_version },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
     );
     setTokenCookie(res, newToken);
-    await revokeRefreshToken(req.cookies?.refresh_token);
+    // The caller's old refresh token was revoked by the statement above, along
+    // with every other session's. This issues the replacement that keeps THIS
+    // browser signed in.
     try { await issueRefreshToken(res, req.user.id); } catch { /* non-critical */ }
     res.json({ message: 'Password changed successfully' });
   } catch (err) {

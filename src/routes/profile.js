@@ -690,8 +690,26 @@ router.put('/password', async (req, res, next) => {
     if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
 
     const hashed = await bcrypt.hash(newPassword, 12);
+    // AUD-005. This is a SECOND password-change path, parallel to
+    // /api/auth/change-password, and it had no refresh-token revocation at all —
+    // so changing your password here left every refresh token alive for the rest
+    // of its 7-day window, including a stolen one. Bumping token_version only
+    // kills the 15-minute access tokens; /api/auth/refresh never reads it.
+    //
+    // Unlike the auth.js handler this route issues no replacement session, so
+    // every token goes, the caller's included — which matches what this route
+    // already did to the access token.
     await pool.query(
-      'UPDATE users SET password = $1, token_version = token_version + 1, updated_at = NOW() WHERE id = $2',
+      `WITH pw AS (
+         UPDATE users
+            SET password = $1, token_version = token_version + 1, updated_at = NOW()
+          WHERE id = $2
+         RETURNING id
+       )
+       UPDATE refresh_tokens
+          SET revoked_at = NOW()
+        WHERE user_id = (SELECT id FROM pw)
+          AND revoked_at IS NULL`,
       [hashed, req.user.id]
     );
     invalidateUserCache(req.user.id);
