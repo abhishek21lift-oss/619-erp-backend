@@ -314,6 +314,19 @@ const { originCheck } = require('./middleware/originCheck');
 app.use('/api/', originCheck);
 
 // ────────────────────────
+// FIRST-PARTY SERVICE ATTESTATION
+// ────────────────────────
+// The AI service (repo: mps-ai) relays the end user's own token and adds
+// X-Service-Auth to attest that the relay was it. Mounted here — after
+// originCheck, before auth — so a forged attestation is refused before any
+// user lookup or database work happens.
+//
+// It grants NOTHING: `auth` still resolves the user and tenantScope still
+// filters. Requests without the header — every browser — pass straight through.
+const { serviceAuth } = require('./middleware/serviceAuth');
+app.use('/api/', serviceAuth);
+
+// ────────────────────────
 // INPUT SANITIZATION
 // ────────────────────────
 const { sanitizeBody, sanitizeQuery } = require('./middleware/sanitize');
