@@ -13,6 +13,12 @@ name: Rollback Backend
 # deliberately unguarded by CI: you reach for it when main is broken, so
 # requiring main's pipeline to be green first would defeat the point.
 #
+# Like deploy.yml, this now runs ON the VPS via the self-hosted runner rather
+# than reaching in over SSH. That matters more here than there: a rollback is
+# what you run during an incident, and the SSH path was unavailable for ten
+# minutes at a stretch on at least two occasions. An incident tool that might
+# not connect is not an incident tool.
+#
 # ── What this does NOT do ───────────────────────────────────────────────────
 #
 # It does not roll the DATABASE back. Migrations are forward-only here, and
@@ -38,7 +44,8 @@ on:
 
 jobs:
   rollback:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, myptstudio]
+    timeout-minutes: 30
 
     steps:
       - name: Refuse unless explicitly confirmed
@@ -48,40 +55,42 @@ jobs:
           exit 1
 
       - name: Roll the box back to the requested commit
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          timeout: 60s
-          command_timeout: 20m
-          script_stop: true
-          script: |
-            set -e
-            cd /opt/myptstudio/619-erp-backend
+        # The SHA travels as an environment variable rather than being
+        # interpolated into the script text. `${{ inputs.sha }}` inside a run
+        # block is substituted BEFORE bash sees it, so a crafted input would be
+        # pasted in as shell source; "$SHA" is just a string to bash however it
+        # is spelled. Same value, no injection seam.
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          cd /opt/myptstudio/619-erp-backend
 
-            echo "Currently deployed: $(cat /opt/myptstudio/.backend-deployed-sha 2>/dev/null || echo unknown)"
-            echo "Rolling back to:    ${{ inputs.sha }}"
+          echo "Currently deployed: $(cat /opt/myptstudio/.backend-deployed-sha 2>/dev/null || echo unknown)"
+          echo "Rolling back to:    $SHA"
 
-            git fetch origin main
+          git fetch origin main
 
-            # Fail before touching anything if the SHA is not real. A typo here
-            # would otherwise leave the checkout in a detached, arbitrary state.
-            git cat-file -e "${{ inputs.sha }}^{commit}" || {
-              echo "No such commit: ${{ inputs.sha }}"
-              exit 1
-            }
+          # Fail before touching anything if the SHA is not real. A typo here
+          # would otherwise leave the checkout in a detached, arbitrary state.
+          git cat-file -e "$SHA^{commit}" || {
+            echo "No such commit: $SHA"
+            exit 1
+          }
 
-            git checkout --detach "${{ inputs.sha }}"
+          git checkout --detach "$SHA"
 
-            cd /opt/myptstudio
-            docker compose build backend
-            docker compose up -d backend
+          cd /opt/myptstudio
+          docker compose build backend
+          docker compose up -d backend
 
-            git -C /opt/myptstudio/619-erp-backend rev-parse HEAD \
-              > /opt/myptstudio/.backend-deployed-sha
+          git -C /opt/myptstudio/619-erp-backend rev-parse HEAD \
+            > /opt/myptstudio/.backend-deployed-sha
 
-            echo "Rolled back. The checkout is now DETACHED — the next normal"
-            echo "deploy runs 'git pull origin main', which will not move a"
-            echo "detached HEAD. Run:  git checkout main  on the box once main"
-            echo "carries the fix, or the next deploy will silently no-op."
+          echo "Rolled back. The checkout is now DETACHED at $SHA."
+          echo "The next normal deploy runs 'git checkout main' before pulling,"
+          echo "so it will move off this commit by itself once main carries the"
+          echo "fix — nothing needs doing on the box by hand."
+          echo
+          echo "NOTE: the database was NOT rolled back. See the header of this"
+          echo "file if the release you just undid applied a migration."
