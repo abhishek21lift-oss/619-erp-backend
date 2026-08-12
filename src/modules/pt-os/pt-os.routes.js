@@ -1071,7 +1071,21 @@ router.post('/payouts/:id/approve', auth, adminOnly, wrap(async (req, res) => {
 }));
 
 // ─── Revenue report ─────────────────────────────────────────
+//
+// Scoped by organization. This route had no tenant filter, so the monthly
+// figures behind /pt-os/reports were summed over every studio's pt_payments
+// on the platform — one studio's revenue, transaction count and incentive
+// spend, read by all of them. Same class of bug the GET /trainers comment
+// above documents, except aggregated, which is what made it invisible: a
+// number that is too big does not look like a leak.
+//
+// The predicate sits in WHERE, before GROUP BY, so the aggregate is computed
+// over this tenant's rows rather than computed platform-wide and filtered
+// afterwards. organization_id is NOT NULL on pt_payments (migration 155), so
+// no row can escape the filter by being unattributed.
 router.get('/revenue', auth, wrap(async (req, res) => {
+  const params = [];
+  const orgFilter = orgWhere(req, params);
   const { rows } = await pool.query(`
     SELECT
       DATE_TRUNC('month', date)::DATE AS month,
@@ -1081,15 +1095,51 @@ router.get('/revenue', auth, wrap(async (req, res) => {
       COUNT(*) FILTER (WHERE incentive_amt > 0)::INT AS incentive_count
     FROM pt_payments
     WHERE deleted_at IS NULL
-      AND date >= DATE_TRUNC('year', CURRENT_DATE)
+      AND date >= DATE_TRUNC('year', CURRENT_DATE)${orgFilter}
     GROUP BY DATE_TRUNC('month', date)
     ORDER BY month DESC
-  `);
+  `, params);
   res.json({ data: rows });
 }));
 
 // ─── Trainer performance ────────────────────────────────────
+//
+// Scoped by organization — on the driving table AND on both joins.
+//
+// Scoping only `pt_trainers` would not be enough here, and the reason is worth
+// stating because it is not obvious. Neither join is protected by a foreign
+// key that implies a shared tenant: pt_clients.trainer_id references
+// pt_trainers, but pt_payments.trainer_id references `trainers` (migration
+// 072), and migration 018 seeded pt_trainers from trainers preserving the
+// primary key — so the same id routinely names a row in both tables, and a
+// trainer id is not by itself proof of which studio's rows will match. A
+// client or a payment carrying another organization's id would join cleanly
+// and land inside this trainer's SUM. Each side is filtered on its own
+// organization_id instead of trusting the id to carry the tenant with it.
+//
+// The join predicates live in ON, not WHERE. In WHERE they would turn both
+// LEFT JOINs into inner joins and silently drop every trainer who has no
+// clients or no payments yet — a tenant fix that quietly deletes rows from a
+// report is not a tenant fix.
+//
+// pt_clients and pt_payments are NOT NULL on organization_id (migration 155).
+// pt_trainers is not — migration 143 added the column and backfills what it
+// can, reporting what it cannot — so `= $1` deliberately excludes the
+// unattributable rows, exactly as GET /trainers above does. An orphan trainer
+// hidden from every studio is the correct failure; shown to all of them is the
+// bug.
 router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) => {
+  const scope = tenantScope(req);
+  const params = [];
+  let orgT = '', orgC = '', orgP = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    const n = `$${params.length}`;
+    orgT = ` AND t.organization_id = ${n}`;
+    orgC = ` AND c.organization_id = ${n}`;
+    orgP = ` AND p.organization_id = ${n}`;
+  }
+
   const { rows } = await pool.query(`
     SELECT
       t.id, t.name, t.incentive_rate,
@@ -1099,12 +1149,12 @@ router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) =
       COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_payment_revenue,
       COALESCE(SUM(p.incentive_amt) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_incentives
     FROM pt_trainers t
-    LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL
-    LEFT JOIN pt_payments p ON p.trainer_id = t.id AND p.deleted_at IS NULL
-    WHERE t.deleted_at IS NULL AND t.status = 'active'
+    LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL${orgC}
+    LEFT JOIN pt_payments p ON p.trainer_id = t.id AND p.deleted_at IS NULL${orgP}
+    WHERE t.deleted_at IS NULL AND t.status = 'active'${orgT}
     GROUP BY t.id, t.name, t.incentive_rate
     ORDER BY monthly_pt_revenue DESC
-  `);
+  `, params);
   res.json({ data: rows });
 }));
 
