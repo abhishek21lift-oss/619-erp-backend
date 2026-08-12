@@ -49,10 +49,23 @@ jobs:
       NODE_ENV: test
       JWT_SECRET: ci-test-secret-not-real
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_619
+      # The one suite that proves tenant isolation against a REAL database
+      # rather than against SQL text. It self-skips when this is unset, and it
+      # was unset here — so from the day it was written until now it had never
+      # actually run in CI. Its own database, separate from test_619, stood up
+      # by the step below.
+      RLS_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rls_proof?sslmode=disable
+      # psql and node-postgres both read this; the service below is not on
+      # trust auth.
+      PGPASSWORD: postgres
 
     services:
       postgres:
-        image: postgres:15
+        # pgvector, not plain postgres:15 — migration 046 adds vector(128) and
+        # 116 adds vector(384), so `CREATE EXTENSION vector` has to succeed or
+        # the migrations cannot be applied at all. This image is postgres:15
+        # plus that extension, so nothing else about the job changes.
+        image: pgvector/pgvector:pg15
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -75,6 +88,17 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # Creates the rls_proof database on the service above: extensions, the
+      # Supabase-compatible roles, schema.sql, every migration, and the
+      # app_tenant role that 157 defines. The script is the same one the
+      # isolation suite's own header tells a developer to run locally, so CI
+      # and a laptop stand the database up exactly the same way.
+      - name: Stand up the RLS isolation database
+        run: ./scripts/rls-proof-setup.sh
+        env:
+          RLS_PG_HOST: localhost
+          RLS_PG_PORT: 5432
 
       - name: Run tests
         run: npm test -- --passWithNoTests
