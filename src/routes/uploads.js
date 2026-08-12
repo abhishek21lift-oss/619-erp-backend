@@ -17,10 +17,12 @@
 //   • PUBLIC tier — branding and avatars. Referenced from plain <img> tags
 //     (see components/StudioMark.tsx), carry no sensitive content, and must
 //     keep rendering without a session. Left open deliberately.
-//   • Everything else — requires a valid session. For the categories whose
-//     keys map to a tenant-owned row (parq, informed-consent) the record's
-//     organization is additionally checked, so a valid session in studio A
-//     cannot fetch studio B's consent PDFs.
+//   • Everything else — requires a valid session AND a registered category
+//     whose owning record belongs to the caller's organization, so a valid
+//     session in studio A cannot fetch studio B's consent PDFs. A category
+//     nobody registered is refused rather than served on the session alone:
+//     the default has to be the safe one, because the unsafe one is what you
+//     get by forgetting.
 const router = require('express').Router();
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
@@ -103,6 +105,13 @@ function normaliseKey(req, res) {
 async function callerOwnsRecord(req, category, key) {
   const scope = tenantScope(req);
 
+  // A platform super admin operating platform-wide is unrestricted, consistent
+  // with tenantScope() everywhere else. Hoisted here so it is stated once
+  // instead of repeated per branch, and so the unknown-category denial below
+  // cannot accidentally lock the platform console out of a category it is the
+  // only caller for.
+  if (!scope.applyFilter) return true;
+
   // Portfolio media is resolved by KEY, not by an id parsed out of the
   // filename. A before/after row owns two objects and each carries its own
   // UUID, so the generic "basename is the row id" resolver below cannot match
@@ -111,7 +120,6 @@ async function callerOwnsRecord(req, category, key) {
   // key could fetch it. Before/after client photos are the last thing that
   // should be readable across a tenant boundary.
   if (category === PORTFOLIO_CATEGORY) {
-    if (!scope.applyFilter) return true; // platform-wide super_admin
     const { rows } = await pool.query(
       `SELECT organization_id FROM user_portfolio_items
         WHERE file_key = $1 OR after_file_key = $1`,
@@ -124,9 +132,23 @@ async function callerOwnsRecord(req, category, key) {
   const isProof = category === PROOF_CATEGORY;
   const isReport = category === REPORT_CATEGORY;
   const table = isProof ? PROOF_TABLE : isReport ? REPORT_TABLE : OWNED_CATEGORIES[category];
-  if (!table) return true; // not an owned category — a valid session suffices
 
-  if (!scope.applyFilter) return true; // platform-wide super_admin
+  // Unknown category → denied.
+  //
+  // This used to `return true` — "not an owned category, so a valid session
+  // suffices" — which made the SAFE outcome the one you got by remembering.
+  // Every category written today is either public-tier or ownership-checked,
+  // so nothing relied on it; the defect was the default. The twelfth category
+  // somebody adds would have been readable by any authenticated user in any
+  // studio holding the key, and the things stored here are health screenings,
+  // payment proofs and photographs of somebody's client.
+  //
+  // Inverted, adding a category to saveFile() without registering it here
+  // fails visibly on the first read instead of silently serving it across the
+  // tenant boundary. If a category genuinely needs "any session may read it",
+  // that is the public tier above (servePublic) — an explicit decision with a
+  // route of its own, not a fallthrough.
+  if (!table) return false;
 
   // Keys are written as `<category>/pdf/<record-uuid>.pdf` by lib/parqPdf.js
   // and lib/informedConsentPdf.js — except payment proofs and progress
