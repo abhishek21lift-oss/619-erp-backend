@@ -266,14 +266,64 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
     );
     if (!inv[0]) { await tx.query('ROLLBACK'); return res.status(404).json({ error: 'Invoice not found or already paid' }); }
 
-    // Also record as a payment if not already recorded
+    // ── Record the payment in the canonical ledger ────────────────────────
+    //
+    // This used to INSERT INTO `payments`, the legacy ledger, which has no
+    // organization_id column at all — LEDGER_SQL synthesises `NULL::uuid` for
+    // that arm of its union. Every org-scoped aggregate therefore filtered the
+    // row straight back out, so marking an invoice paid produced revenue that
+    // was invisible to Collected Payments, Today's Sales and the revenue
+    // reports belonging to the tenant that had just earned it. Recorded, then
+    // unreadable.
+    //
+    // pt_payments is the canonical ledger: it carries organization_id, it is
+    // where the other five payment write paths go, and the migration that
+    // created it back-filled the legacy rows into it.
+    //
+    // The org comes from the invoice row, not from the request. That row was
+    // UPDATEd under the caller's tenant guard immediately above, so it is
+    // already proven to belong to them, and invoices.organization_id is NOT
+    // NULL (migration 155). Nothing here can invent or widen a tenant.
     const receiptNo = 'INV-' + inv[0].invoice_no;
+
+    // The two client_id columns do not point at the same table. invoices
+    // .client_id REFERENCES clients(id) (migration 006); pt_payments.client_id
+    // REFERENCES pt_clients(id). `clients` is the legacy client table and
+    // nothing in the codebase inserts into it, while the handlers either side
+    // of this one — the balance update below, and the lookup in POST / — read
+    // invoices.client_id as a pt_clients id. The value carried here may key
+    // into either space, or into neither.
+    //
+    // Passing it through unchecked would therefore be a category error, and a
+    // loud one: anything that is not a live pt_clients id violates the foreign
+    // key, aborts this transaction, and leaves the invoice permanently
+    // unpayable — worse than the orphan row the legacy insert used to write.
+    //
+    // Resolved rather than trusted. Attribution to a client is worth having;
+    // it is not worth blocking the recording of money on. An invoice whose
+    // client cannot be found still books its payment against the
+    // organization, with a null client, and stays where the totals can see it.
+    let payClientId = null;
+    if (inv[0].client_id) {
+      const { rows: pc } = await tx.query(
+        `SELECT id FROM pt_clients
+          WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+        [inv[0].client_id, inv[0].organization_id]
+      );
+      payClientId = pc[0] ? pc[0].id : null;
+    }
+
+    // trainer_id and incentive_amt stay null/0, exactly as the legacy insert
+    // left them. Attaching the client's trainer here would mint commission
+    // against an invoice that never carried any — a behaviour change wearing
+    // the clothes of a bug fix.
     await tx.query(`
-      INSERT INTO payments (id, client_id, client_name, trainer_id, amount, method, date, receipt_no, notes, created_at)
-      VALUES ($1, $2, $3, NULL, $4, $5, CURRENT_DATE, $6, $7, NOW())
-      ON CONFLICT DO NOTHING`,
-      [randomUUID(), inv[0].client_id, inv[0].client_name, inv[0].total_amount,
-       req.body.payment_method || 'CASH', receiptNo, 'Payment for invoice ' + inv[0].invoice_no]
+      INSERT INTO pt_payments (id, client_id, trainer_id, amount, incentive_amt,
+        payment_method, payment_ref, date, notes, organization_id)
+      VALUES ($1, $2, NULL, $3, 0, $4, $5, CURRENT_DATE, $6, $7)`,
+      [randomUUID(), payClientId, inv[0].total_amount,
+       String(req.body.payment_method || 'CASH').toUpperCase(), receiptNo,
+       'Payment for invoice ' + inv[0].invoice_no, inv[0].organization_id]
     );
 
     // Update the linked client's paid/balance fields so their financial record
