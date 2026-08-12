@@ -179,7 +179,86 @@ router.get('/revenue', auth, async (req, res, next) => {
   }
 });
 
+// GET /api/reports/dues/summary
+//
+// The authoritative outstanding figures, aggregated in the database.
+//
+// GET /dues below returns the top 100 debtors by balance — the right thing for
+// a table and the wrong thing for a total. The Outstanding Dues page was
+// summing those rows in the browser, so once a studio passed 100 debtors its
+// headline "Outstanding" silently became "outstanding among the hundred who
+// owe the most" while still being presented as the whole number. The risk-band
+// counts beside it had the same fault.
+//
+// This runs the IDENTICAL population as /dues — same union, same
+// balance_amount > 0, same soft-delete filter, same trainer scope, same org
+// scope — differing only in having no LIMIT and returning aggregates instead
+// of rows. It is a separate route rather than a change to /dues so the array
+// response stays untouched: three pages consume that (finance/dues, reports,
+// insights/revenue) and none of them have to change.
+//
+// The risk thresholds arrive as query params rather than being hard-coded
+// here. They are already defined in the page (riskLevel() in finance/dues),
+// and a second copy on the server is how the two drift apart later.
+router.get('/dues/summary', auth, async (req, res, next) => {
+  try {
+    const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
+    const params = [];
+    let trainerFilter = '';
+    if (tid) {
+      params.push(tid);
+      trainerFilter = ` AND trainer_id = $${params.length}`;
+    }
+
+    params.push(orgParam(req));
+    const orgIdx = params.length;
+
+    // Defaults match the page's current bands; a caller may override them.
+    const high = Number.isFinite(Number(req.query.high)) ? Number(req.query.high) : 10000;
+    const medium = Number.isFinite(Number(req.query.medium)) ? Number(req.query.medium) : 3000;
+    params.push(high);
+    const highIdx = params.length;
+    params.push(medium);
+    const medIdx = params.length;
+
+    const { rows } = await pool.query(`
+      SELECT
+        COALESCE(SUM(balance_amount), 0)                           AS total_outstanding,
+        COUNT(*)::int                                              AS debtor_count,
+        COUNT(*) FILTER (WHERE balance_amount >= $${highIdx})::int      AS high_risk_count,
+        COUNT(*) FILTER (WHERE balance_amount >= $${medIdx}
+                           AND balance_amount <  $${highIdx})::int      AS medium_risk_count
+      FROM (
+        SELECT c.balance_amount, c.trainer_id
+        FROM clients c
+        WHERE c.balance_amount > 0 AND c.deleted_at IS NULL
+        UNION ALL
+        SELECT ptc.balance_amount, ptc.trainer_id
+        FROM pt_clients ptc
+        WHERE ptc.balance_amount > 0 AND ptc.deleted_at IS NULL
+          AND ($${orgIdx}::uuid IS NULL OR ptc.organization_id = $${orgIdx})
+      ) combined
+      WHERE 1=1${trainerFilter}`,
+      params
+    );
+
+    const r = rows[0] || {};
+    res.json({
+      total_outstanding: Number(r.total_outstanding || 0),
+      debtor_count: Number(r.debtor_count || 0),
+      high_risk_count: Number(r.high_risk_count || 0),
+      medium_risk_count: Number(r.medium_risk_count || 0),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/reports/dues
+//
+// Capped at 100 rows (see the LIMIT below). Anything needing a TOTAL rather
+// than a page of rows must use /dues/summary above — summing what this returns
+// gives the top hundred debtors, not the studio.
 router.get('/dues', auth, async (req, res, next) => {
   try {
     const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;

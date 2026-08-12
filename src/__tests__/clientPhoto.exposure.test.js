@@ -56,7 +56,21 @@ describe('the queries behind a client avatar select photo_url', () => {
   });
 
   test('the dues report — both arms of the union, and the outer select', () => {
-    const sql = queryWith(read('routes', 'reports.js'), 'UNION ALL', 'FROM clients c');
+    // Three needles, not two. reports.js now holds TWO queries over this
+    // union: the row list this test guards, and /dues/summary, which
+    // aggregates the same population without a LIMIT so the Outstanding KPI
+    // stops being the sum of the top 100 debtors. That aggregate selects
+    // balance_amount and trainer_id and nothing else — no photo, nothing to
+    // expose — but it matched the old two-needle locator, and queryWith
+    // deliberately throws on an ambiguous match rather than quietly guarding
+    // whichever query it happened to find first. It did exactly that.
+    //
+    // `ORDER BY balance_amount DESC` is the discriminator: the list orders and
+    // caps, the aggregate does neither. Preferred over matching on photo_url,
+    // which is the thing being asserted — that would make the guard circular
+    // by locating the query via the column whose presence it then checks.
+    const sql = queryWith(read('routes', 'reports.js'),
+      'UNION ALL', 'FROM clients c', 'ORDER BY balance_amount DESC');
     // Three: legacy `clients`, `pt_clients`, and the outer SELECT that has to
     // carry it back out of the subquery. Miss the outer one and the column is
     // computed and thrown away.
