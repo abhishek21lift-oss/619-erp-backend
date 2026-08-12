@@ -1393,22 +1393,66 @@ router.post('/payments', auth, wrap(async (req, res) => {
     }
   }
 
-  const { rows } = await pool.query(
-    `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes, organization_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-    [client_id, resolvedTrainerId, numAmount, incentive_amt ?? 0, payment_method, payment_ref, date || new Date(), notes,
-     orgIdOf(req)]
-  );
-  // update client paid_amount and balance_amount
-  await pool.query(
-    `UPDATE pt_clients SET
-       paid_amount = paid_amount + $1,
-       balance_amount = GREATEST(balance_amount - $1, 0),
-       updated_at = NOW()
-     WHERE id = $2 AND deleted_at IS NULL`,
-    [numAmount, client_id]
-  );
-  res.status(201).json({ data: rows[0] });
+  // The ledger row and the client's balance move together, or not at all.
+  //
+  // These were two bare pool.query() calls. Both are individually correct —
+  // the balance update is relative (`paid_amount + $1`), so concurrent
+  // payments cannot lose each other's increments — but nothing tied them
+  // together. A failure between them (a constraint, a dropped connection, the
+  // 15s query_timeout in db/pool.js) left the payment recorded and the balance
+  // untouched: money in the ledger that the client's outstanding figure does
+  // not know about, silent, and surfacing much later as a reconciliation
+  // discrepancy nobody can account for.
+  //
+  // /api/payments has always done this correctly — BEGIN, lock the client row,
+  // insert, update, COMMIT — and this endpoint is the one the PT-OS client
+  // payments screen actually calls. The two paths write the same two tables
+  // and should not disagree about how.
+  //
+  // FOR UPDATE on the client, matching routes/payments.js: it serialises
+  // concurrent payments for one client so the row's balance cannot drift, and
+  // it is what makes a double-submitted "Record Payment" queue rather than
+  // interleave.
+  const tx = await pool.connect();
+  try {
+    await tx.query('BEGIN');
+
+    // Only lock when there is a client to lock. client_id is optional on this
+    // endpoint (a payment can be recorded without one), and `WHERE id = NULL`
+    // would match nothing while still costing a round trip.
+    if (client_id) {
+      await tx.query(
+        'SELECT 1 FROM pt_clients WHERE id = $1 AND deleted_at IS NULL FOR UPDATE',
+        [client_id]
+      );
+    }
+
+    const { rows } = await tx.query(
+      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes, organization_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [client_id, resolvedTrainerId, numAmount, incentive_amt ?? 0, payment_method, payment_ref, date || new Date(), notes,
+       orgIdOf(req)]
+    );
+
+    if (client_id) {
+      await tx.query(
+        `UPDATE pt_clients SET
+           paid_amount = paid_amount + $1,
+           balance_amount = GREATEST(balance_amount - $1, 0),
+           updated_at = NOW()
+         WHERE id = $2 AND deleted_at IS NULL`,
+        [numAmount, client_id]
+      );
+    }
+
+    await tx.query('COMMIT');
+    res.status(201).json({ data: rows[0] });
+  } catch (err) {
+    await tx.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    tx.release();
+  }
 }));
 
 // ─── Execute Duplicate Merge ─────────────────────────────────
