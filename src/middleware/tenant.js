@@ -9,6 +9,8 @@
 // Later phases wire `tenantContext` globally, add a tenant-scoped query guard,
 // and layer Postgres RLS underneath for defence in depth.
 
+const { targetOrgId } = require('../lib/tenant-db');
+
 // Platform operators have role 'super_admin' and no organization; they may act
 // across tenants (e.g. the hidden admin portal).
 function isSuperAdmin(req) {
@@ -17,12 +19,17 @@ function isSuperAdmin(req) {
 
 // Resolve the organization the current request operates within.
 //   - Normal users: their own organization_id — a hard, non-overridable boundary.
-//   - Super admins: may target a specific org via the `x-org-id` header or an
-//     explicit organization_id field, else operate platform-wide (null).
+//   - Super admins: may target a specific org via the `x-org-id` header,
+//     else operate platform-wide (null).
 // Throws a 403-worthy error only when a non-super-admin has no organization.
 function resolveOrgId(req) {
   if (isSuperAdmin(req)) {
-    return req.headers['x-org-id'] || req.query?.organization_id || req.body?.organization_id || null;
+    // Same rule as tenantScope(), from the same function, so the two cannot
+    // drift. This resolution feeds the RLS GUC (auth.js sets app.org_id from
+    // it) while handlers filter with tenantScope() — if they disagreed about
+    // the target org, the database and the application would be scoped to
+    // different tenants within one request. See targetOrgId's own comment.
+    return targetOrgId(req);
   }
   const orgId = req.user?.organization_id;
   if (!orgId) {
