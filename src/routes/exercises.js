@@ -553,7 +553,20 @@ router.post('/', auth, async (req, res, next) => {
 router.put('/:id', auth, async (req, res, next) => {
   const client = await pool.connect();
   try {
-    const { rows: existing } = await client.query(
+    // pool.query, not client.query: this read happens BEFORE the BEGIN below,
+    // and db/pool.js only sets app.org_id on a borrowed client when it sees
+    // that BEGIN. Left on the borrowed client, this lookup would carry no org
+    // once DATABASE_URL points at app_tenant — and because `exercises` is a
+    // SHARED table (its policy also admits organization_id IS NULL), it would
+    // still return the built-in library while silently hiding the studio's own
+    // custom exercises. Editing a built-in would work and editing your own
+    // would 404, which reads as data loss rather than a scoping bug.
+    //
+    // pool.query wraps its own scoping transaction, so this is scoped
+    // correctly. It stays outside the write transaction deliberately — that is
+    // where it already was, and moving BEGIN above it would leave an open
+    // transaction on every early return below.
+    const { rows: existing } = await pool.query(
       'SELECT id, created_by, is_custom, organization_id FROM exercises WHERE id = $1 AND deleted_at IS NULL',
       [req.params.id]
     );
@@ -652,7 +665,11 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
 
   const client = await pool.connect();
   try {
-    const { rows: src } = await client.query(
+    // pool.query for the same reason as PUT /:id above — this read precedes
+    // the BEGIN, so on a borrowed client it would carry no app.org_id and
+    // duplicating your own custom exercise would 404 while duplicating a
+    // built-in still worked.
+    const { rows: src } = await pool.query(
       'SELECT * FROM exercises WHERE id = $1 AND deleted_at IS NULL', [req.params.id]
     );
     if (!src[0]) return res.status(404).json({ error: 'Exercise not found' });
