@@ -31,6 +31,30 @@ const { Pool } = require('pg');
 const DB_URL = process.env.RLS_TEST_DATABASE_URL;
 const describeIf = DB_URL ? describe : describe.skip;
 
+// Skipping is right on a laptop and wrong in CI.
+//
+// This suite gates itself on RLS_TEST_DATABASE_URL so it never runs against
+// anything that has something to lose. CI never set that variable, so the
+// only test that proves one studio cannot read another's rows AT THE DATABASE
+// reported itself as 17 quiet skips at the bottom of a green run — from the
+// day it was written until the workflow was fixed. Nothing failed. Nothing
+// warned. The suite simply never executed.
+//
+// So in CI a missing URL is not a developer running the suite without a
+// database, it is the wiring having broken. Fail, loudly, naming the file
+// that has to be repaired.
+if (process.env.CI && !DB_URL) {
+  describe('cross-tenant isolation, against a real database', () => {
+    it('has a database to run against', () => {
+      throw new Error(
+        'RLS_TEST_DATABASE_URL is not set in CI, so the tenant-isolation proof '
+        + 'would silently skip. Restore the "Stand up the RLS isolation database" '
+        + 'step and the env var in .github/workflows/ci.yml.'
+      );
+    });
+  });
+}
+
 const ORG_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const ORG_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
