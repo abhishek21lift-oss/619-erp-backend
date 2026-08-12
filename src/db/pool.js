@@ -4,7 +4,7 @@ const fs = require('fs');
 const { Pool } = require('pg');
 const logger = require('../lib/logger');
 const { appTimeZone } = require('../lib/appTime');
-const { currentOrgId } = require('../lib/tenant-context');
+const { currentOrgId, isPlatformWide } = require('../lib/tenant-context');
 
 if (!process.env.DATABASE_URL) {
   logger.fatal('DATABASE_URL is not set. Check your .env file.');
@@ -139,6 +139,81 @@ pool.on('connect', (client) => {
 const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE === 'on';
 
 /**
+ * The owner connection — the deliberate, auditable way past RLS.
+ *
+ * Once DATABASE_URL points at app_tenant, a connection with no app.org_id
+ * matches no tenant policy and reads zero rows. That is correct for a tenant
+ * request whose org did not resolve, and catastrophic for everything that
+ * legitimately works across studios:
+ *
+ *   · the platform console under /api/super-admin,
+ *   · every background worker — the renewal sweep, subscription expiry,
+ *     notification fan-out — which run outside any request,
+ *   · migrations and the startup probe,
+ *   · and the unauthenticated routes, because login cannot scope itself to a
+ *     studio before it has found the user whose studio it is.
+ *
+ * None of those would have errored. They would have quietly returned nothing:
+ * renewals stopping, the operator console rendering empty, login failing to
+ * find accounts that exist.
+ *
+ * ADMIN_DATABASE_URL is that connection. It defaults to DATABASE_URL, so
+ * before the cutover both are the same `postgres` role and this whole
+ * mechanism is a no-op — the same property that let 157 and 159 land inert.
+ * At cutover, DATABASE_URL moves to app_tenant and ADMIN_DATABASE_URL keeps
+ * the owner credentials.
+ *
+ * Deliberately NOT a sentinel org id that policies honour. A magic value
+ * inside a security predicate leaks everything the moment anything sets it by
+ * mistake; a separate connection keeps the rule absolute — app_tenant can
+ * never see across tenants — and confines the exception to one pool whose
+ * every user is visible here.
+ *
+ * Lazily constructed: a second pool of idle connections is pure cost for a
+ * deployment that has not cut over, and Supabase's connection budget is not
+ * large enough to spend on one.
+ */
+const ADMIN_DATABASE_URL = process.env.ADMIN_DATABASE_URL || process.env.DATABASE_URL;
+const SEPARATE_ADMIN_CONNECTION = ADMIN_DATABASE_URL !== process.env.DATABASE_URL;
+
+let _ownerPool = null;
+function ownerPool() {
+  if (_ownerPool) return _ownerPool;
+  _ownerPool = new Pool({
+    connectionString: ADMIN_DATABASE_URL,
+    ssl: buildSslConfig(),
+    // Smaller than the main pool on purpose. This serves operator traffic,
+    // background jobs and pre-auth lookups — not the request path — and every
+    // connection it holds is one the tenant pool cannot have.
+    max: Math.max(2, Math.ceil(POOL_MAX / 4)),
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
+    statement_timeout: 20000,
+    query_timeout: 15000,
+  });
+  _ownerPool.on('error', (err) => {
+    logger.error({ err: err.message }, 'Unexpected owner DB pool error');
+  });
+  _ownerPool.on('connect', (client) => {
+    client.query(`SET TIME ZONE '${appTimeZone()}'`).catch((err) => {
+      logger.error({ err: err.message, tz: appTimeZone() }, 'Failed to set session time zone (owner pool)');
+    });
+  });
+  return _ownerPool;
+}
+
+/**
+ * Does this query belong on the owner connection rather than app_tenant?
+ *
+ * Only ever true when enforcement is on AND the two URLs actually differ —
+ * before the cutover there is one role and one pool, so routing anything
+ * elsewhere would add a second pool for no benefit.
+ */
+function useOwnerConnection() {
+  return TENANT_RLS_ENFORCE && SEPARATE_ADMIN_CONNECTION && isPlatformWide();
+}
+
+/**
  * Runs `run()` on `client` inside BEGIN … SET LOCAL (via set_config) …
  * COMMIT, so app.org_id is visible to Postgres RLS for exactly this query's
  * duration and no other request's.
@@ -184,12 +259,21 @@ const _origConnect = pool.connect.bind(pool);
 // TENANT-RLS-PLAN.md needs before this ever reaches production traffic.
 pool.query = function slowQueryInstrument(...args) {
   const start = Date.now();
-  const orgId = TENANT_RLS_ENFORCE ? currentOrgId() : null;
-  const result = orgId == null
-    ? _origQuery(...args)
-    : _origConnect().then((client) =>
-        withOrgScope(client, orgId, () => client.query(...args)).finally(() => client.release())
-      );
+  // Platform-wide work — operators, workers, migrations, pre-auth routes —
+  // goes to the owner connection, which is not subject to the tenant
+  // policies. Checked BEFORE the org id, because a platform-wide context
+  // deliberately has no org and would otherwise fall into the unscoped branch
+  // below and read nothing.
+  const result = useOwnerConnection()
+    ? ownerPool().query(...args)
+    : (() => {
+        const orgId = TENANT_RLS_ENFORCE ? currentOrgId() : null;
+        return orgId == null
+          ? _origQuery(...args)
+          : _origConnect().then((client) =>
+              withOrgScope(client, orgId, () => client.query(...args)).finally(() => client.release())
+            );
+      })();
   if (result && typeof result.then === 'function') {
     return result.then(
       (r) => {
@@ -303,6 +387,12 @@ function scopeClient(client, orgId, log = logger) {
 // Same gate and the same source of truth as pool.query's wrapper above, so the
 // two can never disagree about whether enforcement is on.
 pool.connect = function tenantScopedConnect(...args) {
+  // Same routing as query() above, for the call sites that borrow a client and
+  // run their own BEGIN … COMMIT. A platform-wide caller doing that — the
+  // subscription worker, a super-admin bulk operation — needs the owner
+  // connection for the whole transaction, not a scoped one it never sets an
+  // org on.
+  if (useOwnerConnection()) return ownerPool().connect(...args);
   const borrowed = _origConnect(...args);
   if (!TENANT_RLS_ENFORCE) return borrowed;
   return Promise.resolve(borrowed).then((client) => {
