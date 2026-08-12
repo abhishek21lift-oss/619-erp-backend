@@ -195,7 +195,18 @@ async function auth(req, res, next) {
     if (TENANT_RLS_ENFORCE) {
       let orgId = null;
       try { orgId = resolveOrgId(req); } catch { /* see comment above */ }
-      return runWithTenantContext(orgId, next);
+      // The ONLY place platform-wide status is granted, and the only reason
+      // it is safe: it requires the role loaded from the database on this
+      // request — never a header, a body field or anything the caller sent —
+      // AND that no target org was resolved. A super admin who named a studio
+      // via x-org-id is scoped to it like anybody else.
+      //
+      // Everything downstream (db/pool.js) treats this as "use the owner
+      // connection, which bypasses RLS", so a bug that set it for a tenant
+      // user would hand them the whole platform. That is why it is computed
+      // here, from req.user.role, and nowhere else.
+      const platformWide = req.user.role === 'super_admin' && orgId == null;
+      return runWithTenantContext(orgId, next, { platformWide });
     }
 
     next();

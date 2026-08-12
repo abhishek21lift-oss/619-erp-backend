@@ -45,6 +45,39 @@ describe('TENANT_RLS_ENFORCE — the two halves of the flag agree', () => {
 
   it("pool.js's wrapper is a straight pass-through when there is no org id, on or off", () => {
     const patch = poolSrc.slice(poolSrc.indexOf('pool.query = function slowQueryInstrument'));
-    expect(patch).toContain('orgId == null\n    ? _origQuery(...args)');
+    // Whitespace-collapsed, because this guards the CONTROL FLOW and not the
+    // layout. The original form pinned exact indentation and broke the day the
+    // owner-connection branch nested this one a level deeper — while the
+    // behaviour it exists to protect was completely unchanged. A guard that
+    // fails on reformatting trains people to edit the guard.
+    expect(patch.replace(/\s+/g, ' ')).toContain('orgId == null ? _origQuery(...args)');
+  });
+
+  it('sends platform-wide work to the owner connection BEFORE consulting the org id', () => {
+    // Once DATABASE_URL points at app_tenant, a connection with no app.org_id
+    // reads zero rows. Platform-wide work — the operator console, every
+    // background worker, migrations, and the pre-auth routes — deliberately
+    // has no org, so consulting the org id first would drop it into the
+    // unscoped branch and it would silently read nothing.
+    const patch = poolSrc.slice(poolSrc.indexOf('pool.query = function slowQueryInstrument'));
+    const flat = patch.replace(/\s+/g, ' ');
+    expect(flat).toContain('useOwnerConnection() ? ownerPool().query(...args)');
+    expect(flat.indexOf('useOwnerConnection()')).toBeLessThan(flat.indexOf('currentOrgId()'));
+  });
+
+  it('borrowed clients route the same way, so a transaction cannot land on the wrong role', () => {
+    const connect = poolSrc.slice(poolSrc.indexOf('pool.connect = function tenantScopedConnect'));
+    const flat = connect.replace(/\s+/g, ' ');
+    expect(flat).toContain('if (useOwnerConnection()) return ownerPool().connect(...args);');
+    expect(flat.indexOf('useOwnerConnection()')).toBeLessThan(flat.indexOf('currentOrgId()'));
+  });
+
+  it('keeps one owner connection, defaulting to DATABASE_URL so it is inert before cutover', () => {
+    // Before the cutover both URLs are the same `postgres` role, so
+    // SEPARATE_ADMIN_CONNECTION is false and no second pool is ever created —
+    // the same "lands inert" property that let migrations 157 and 159 ship.
+    expect(poolSrc).toContain("process.env.ADMIN_DATABASE_URL || process.env.DATABASE_URL");
+    expect(poolSrc).toMatch(/SEPARATE_ADMIN_CONNECTION\s*=\s*ADMIN_DATABASE_URL !== process\.env\.DATABASE_URL/);
+    expect(poolSrc).toMatch(/TENANT_RLS_ENFORCE && SEPARATE_ADMIN_CONNECTION && isPlatformWide\(\)/);
   });
 });
