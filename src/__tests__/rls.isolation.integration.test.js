@@ -272,4 +272,87 @@ describeIf('cross-tenant isolation, against a real database', () => {
       c.query(`SELECT id FROM pt_clients`));
     expect(rows).toEqual([]);
   });
+
+  // ── Migration 159: the tables 157's schema scan could not see ──────────
+  //
+  // 157 builds its policy list from tables carrying organization_id, so
+  // eleven tables that reach the tenant boundary some other way had RLS
+  // enabled and no policy naming app_tenant — which does not raise, it
+  // returns zero rows. Verified before the fix: `organizations` and
+  // `subscription_plans` were readable as postgres and empty as app_tenant.
+  //
+  // Each shape 159 introduces is exercised here, because "the count is right"
+  // is the assertion that catches a policy which is accidentally `USING
+  // (true)` as well as one that is accidentally denying everything.
+  describe('gap tables (migration 159)', () => {
+    beforeEach(async () => {
+      // Child rows hanging off the two studios' existing fixture clients.
+      await owner.query(`DELETE FROM pt_lifestyle_assessments WHERE id IN ('la-a','la-b')`);
+      await owner.query(
+        `INSERT INTO pt_lifestyle_assessments (id, client_id) VALUES ('la-a','client-a'), ('la-b','client-b')`);
+    });
+
+    afterEach(async () => {
+      await owner.query(`DELETE FROM pt_lifestyle_assessments WHERE id IN ('la-a','la-b')`);
+    });
+
+    it('organizations is scoped by its own id, not by organization_id', async () => {
+      // The boundary table itself. auth.js joins it on every authenticated
+      // request, so a policy that denied here would blank the studio name and
+      // logo everywhere at once.
+      const a = await asOrg(ORG_A, (c) => c.query(`SELECT id FROM organizations ORDER BY id`));
+      expect(a.rows.map((r) => r.id)).toEqual([ORG_A]);
+
+      const b = await asOrg(ORG_B, (c) => c.query(`SELECT id FROM organizations ORDER BY id`));
+      expect(b.rows.map((r) => r.id)).toEqual([ORG_B]);
+    });
+
+    it('a child row is reachable only through its own studio\'s parent', async () => {
+      const a = await asOrg(ORG_A, (c) =>
+        c.query(`SELECT id FROM pt_lifestyle_assessments WHERE id IN ('la-a','la-b') ORDER BY id`));
+      expect(a.rows.map((r) => r.id)).toEqual(['la-a']);
+
+      const b = await asOrg(ORG_B, (c) =>
+        c.query(`SELECT id FROM pt_lifestyle_assessments WHERE id IN ('la-a','la-b') ORDER BY id`));
+      expect(b.rows.map((r) => r.id)).toEqual(['la-b']);
+    });
+
+    it('a child row cannot be written against the other studio\'s parent', async () => {
+      // WITH CHECK, not USING: the insert names a client this studio cannot
+      // see, and the write must be refused rather than land unowned.
+      await expect(
+        asOrg(ORG_A, (c) =>
+          c.query(`INSERT INTO pt_lifestyle_assessments (id, client_id) VALUES ('smuggled','client-b')`))
+      ).rejects.toThrow(/row-level security/i);
+
+      const { rows } = await owner.query(`SELECT id FROM pt_lifestyle_assessments WHERE id = 'smuggled'`);
+      expect(rows).toEqual([]);
+    });
+
+    it('the platform catalogue stays readable by every studio', async () => {
+      // The trap TENANT-RLS-PLAN.md flagged with the 890-row exercise
+      // library: scoping shared platform content empties it for everyone.
+      const { rows: all } = await owner.query(`SELECT count(*)::int AS n FROM subscription_plans`);
+      for (const org of [ORG_A, ORG_B]) {
+        const { rows } = await asOrg(org, (c) =>
+          c.query(`SELECT count(*)::int AS n FROM subscription_plans`));
+        expect(rows[0].n).toBe(all[0].n);
+      }
+    });
+
+    it('leaves no table with RLS on and no policy, except the two unused agent_* tables', async () => {
+      // The check that found this in the first place. A new table that lands
+      // with the deny-all convention but no app_tenant policy goes quiet the
+      // day DATABASE_URL points at app_tenant, and nothing else would say so.
+      const { rows } = await owner.query(
+        `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity
+            AND NOT EXISTS (
+              SELECT 1 FROM pg_policies p
+               WHERE p.schemaname = 'public' AND p.tablename = c.relname
+                 AND ('app_tenant' = ANY(p.roles) OR 'public' = ANY(p.roles)))
+          ORDER BY 1`);
+      expect(rows.map((r) => r.relname)).toEqual(['agent_audit_log', 'agent_tasks']);
+    });
+  });
 });
