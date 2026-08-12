@@ -1071,7 +1071,16 @@ router.post('/payouts/:id/approve', auth, adminOnly, wrap(async (req, res) => {
 }));
 
 // ─── Revenue report ─────────────────────────────────────────
+//
+// The org filter is the whole point of this handler, not a detail of it.
+// Without it this is a SUM over pt_payments for every studio on the platform,
+// returned to any staff account that asks — which is what it did until now.
+// An aggregate leaks differently from a row read: there is no id to guess and
+// nothing to enumerate, so a single missing predicate hands over the entire
+// ledger in one call. Every sibling in this file scopes; see /sessions below.
 router.get('/revenue', auth, wrap(async (req, res) => {
+  const params = [];
+  const orgClause = orgWhere(req, params);
   const { rows } = await pool.query(`
     SELECT
       DATE_TRUNC('month', date)::DATE AS month,
@@ -1081,15 +1090,39 @@ router.get('/revenue', auth, wrap(async (req, res) => {
       COUNT(*) FILTER (WHERE incentive_amt > 0)::INT AS incentive_count
     FROM pt_payments
     WHERE deleted_at IS NULL
-      AND date >= DATE_TRUNC('year', CURRENT_DATE)
+      AND date >= DATE_TRUNC('year', CURRENT_DATE)${orgClause}
     GROUP BY DATE_TRUNC('month', date)
     ORDER BY month DESC
-  `);
+  `, params);
   res.json({ data: rows });
 }));
 
 // ─── Trainer performance ────────────────────────────────────
+//
+// adminOrManager is a ROLE gate, not a tenant gate: it answers "may this
+// person see a performance report", never "whose report". Until this filter
+// existed, an admin in any studio got every trainer on the platform — name,
+// incentive_rate, active client count and commission earned. That is the same
+// leak migration 143 fixed for GET /trainers, one table over.
+//
+// All THREE arms are scoped, not just the trainer. A correctly-scoped trainer
+// LEFT JOINed to an unscoped pt_payments still sums another studio's money
+// into this studio's row, which looks like a reconciliation bug rather than a
+// leak and would be believed for a long time.
+//
+// The joined filters go in the ON clauses, never in WHERE. A LEFT JOIN whose
+// right-hand table is constrained in WHERE silently becomes an INNER JOIN, so
+// every trainer with no clients yet — a new hire, the whole reason a studio
+// opens this screen — would drop out of the report entirely.
+//
+// Rows with a NULL organization_id stay hidden rather than shown to everyone.
+// That is migration 143's decision for exactly these tables, and pt_trainers
+// is not in 155's NOT NULL list, so unattributable rows can still exist.
 router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) => {
+  const params = [];
+  const tOrg = orgWhere(req, params, 't.organization_id');
+  const cOrg = orgWhere(req, params, 'c.organization_id');
+  const pOrg = orgWhere(req, params, 'p.organization_id');
   const { rows } = await pool.query(`
     SELECT
       t.id, t.name, t.incentive_rate,
@@ -1099,12 +1132,12 @@ router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) =
       COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_payment_revenue,
       COALESCE(SUM(p.incentive_amt) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_incentives
     FROM pt_trainers t
-    LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL
-    LEFT JOIN pt_payments p ON p.trainer_id = t.id AND p.deleted_at IS NULL
-    WHERE t.deleted_at IS NULL AND t.status = 'active'
+    LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL${cOrg}
+    LEFT JOIN pt_payments p ON p.trainer_id = t.id AND p.deleted_at IS NULL${pOrg}
+    WHERE t.deleted_at IS NULL AND t.status = 'active'${tOrg}
     GROUP BY t.id, t.name, t.incentive_rate
     ORDER BY monthly_pt_revenue DESC
-  `);
+  `, params);
   res.json({ data: rows });
 }));
 
