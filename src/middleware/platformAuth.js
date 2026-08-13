@@ -44,6 +44,7 @@
 
 const pool = require('../db/pool');
 const logger = require('../lib/logger');
+const { runAsPlatform } = require('../lib/tenant-context');
 
 /**
  * The audience claim values. A session is opened for exactly one plane.
@@ -119,10 +120,31 @@ async function hasPlatformGrant(userId) {
 
   let granted = false;
   try {
-    const { rows } = await pool.query(
+    // ── Always on the owner connection ────────────────────────────────────
+    //
+    // "May this person operate the platform" is an AUTHORIZATION question, not
+    // a tenant-data question, and it must be answered the same way regardless
+    // of which studio the request happens to name.
+    //
+    // Without runAsPlatform it is not. db/pool.js routes to the owner
+    // connection only when isPlatformWide() is true, and auth.js computes that
+    // as `role === 'super_admin' && orgId == null` — so the moment an operator
+    // has the org-switcher pinned, `x-org-id` is set, orgId is non-null, and
+    // this query runs as app_tenant instead. platform_owners has RLS on and no
+    // app_tenant policy, deliberately, so it would return zero rows, the grant
+    // would read as absent, and the operator would be locked out of their own
+    // console with PLATFORM_GRANT_REQUIRED. The frontend sends x-org-id from
+    // localStorage on EVERY request, so a pin set once, weeks earlier, is
+    // enough to trigger it.
+    //
+    // Latent until TENANT_RLS_ENFORCE is on and ADMIN_DATABASE_URL differs —
+    // which is exactly the deployment this whole mechanism exists for, and the
+    // worst moment to discover it. Caught by the CI-only RLS integration
+    // suite, which is the one place the two layers are exercised together.
+    const { rows } = await runAsPlatform(() => pool.query(
       'SELECT 1 FROM platform_owners WHERE user_id = $1 AND revoked_at IS NULL LIMIT 1',
       [userId]
-    );
+    ));
     granted = rows.length > 0;
   } catch (err) {
     // undefined_table — 161 has not been applied to this database yet.

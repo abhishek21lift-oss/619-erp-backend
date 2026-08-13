@@ -30,7 +30,9 @@ const request = require('supertest');
 const express = require('express');
 const pool = require('../db/pool');
 const platformAuth = require('../middleware/platformAuth');
-const { requirePlatformOwner, invalidatePlatformGrant, AUD_PLATFORM, AUD_TENANT } = platformAuth;
+const {
+  requirePlatformOwner, hasPlatformGrant, invalidatePlatformGrant, AUD_PLATFORM, AUD_TENANT,
+} = platformAuth;
 
 const OPERATOR = { id: 'usr-operator', role: 'super_admin', organization_id: null };
 const TENANT_ADMIN = { id: 'usr-owner', role: 'admin', organization_id: 'org-a' };
@@ -205,5 +207,48 @@ describe('requirePlatformOwner — impersonation', () => {
       user: OPERATOR, aud: AUD_PLATFORM, impersonation: { by: 'x', ro: true },
     })).get('/api/platform');
     expect(pool.query.mock.calls.some(([sql]) => /platform_owners/.test(sql))).toBe(false);
+  });
+});
+
+describe('the grant is read on the owner connection, whatever org is named', () => {
+  // The bug the CI-only RLS suite caught.
+  //
+  // "May this person operate the platform" is an authorization question, not a
+  // tenant-data question. db/pool.js routes to the owner connection only when
+  // isPlatformWide() is true, and auth.js computes that as
+  // `role === 'super_admin' && orgId == null` — so an operator with the
+  // org-switcher pinned sends x-org-id, orgId is non-null, and the lookup would
+  // run as app_tenant. platform_owners has RLS on and no app_tenant policy by
+  // design, so it would read zero rows and lock the operator out of their own
+  // console.
+  //
+  // The frontend sends x-org-id from localStorage on every request, so a pin
+  // set weeks earlier is enough. It stays latent until TENANT_RLS_ENFORCE is on
+  // AND ADMIN_DATABASE_URL differs — the exact deployment this mechanism exists
+  // for, and the worst possible moment to find out.
+  const { runWithTenantContext, isPlatformWide } = require('../lib/tenant-context');
+
+  it('runs the lookup platform-wide even inside a tenant-scoped context', async () => {
+    let sawPlatformWide = null;
+    pool.query.mockImplementation(async (sql) => {
+      if (/platform_owners/.test(sql)) sawPlatformWide = isPlatformWide();
+      return { rows: [{ ok: 1 }] };
+    });
+
+    // Exactly what auth.js opens for a super admin who named an org.
+    await runWithTenantContext('org-a', async () => {
+      expect(isPlatformWide()).toBe(false);   // the context really is scoped
+      await hasPlatformGrant('usr-operator');
+    }, { platformWide: false });
+
+    expect(sawPlatformWide).toBe(true);
+  });
+
+  it('still answers correctly for the ordinary platform-wide request', async () => {
+    invalidatePlatformGrant();
+    grantIs(true);
+    await runWithTenantContext(null, async () => {
+      expect(await hasPlatformGrant('usr-operator')).toBe(true);
+    }, { platformWide: true });
   });
 });
