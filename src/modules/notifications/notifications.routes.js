@@ -25,12 +25,29 @@ router.patch('/:id/read', auth, wrap(async (req, res) => {
 }));
 
 // POST /api/v1/notifications/broadcast  — admin only
+//
+// `member_ids` is caller-supplied, so every id is resolved INSIDE the caller's
+// own studio (recipientFromMember takes the organization from req.user, never
+// from the body). An id belonging to another studio resolves to nothing and
+// raises 'Recipient not found', identically to an id that does not exist.
+//
+// The same organization is stamped onto each queued job, so the worker verifies
+// it a second time against the recipient's own row before delivering. One check
+// at the boundary, one at the point of use.
 router.post('/broadcast', auth, requireRole('admin','manager'), wrap(async (req, res) => {
   const { type, member_ids, data, channels } = req.body;
+
+  const organizationId = req.user?.organization_id;
+  if (!organizationId) {
+    return res.status(403).json({
+      error: { code: 'NO_TENANT', message: 'This account has no studio to broadcast within.' },
+    });
+  }
+
   const sent = [];
   for (const mid of member_ids || []) {
-    const r = await svc.recipientFromMember(mid);
-    sent.push(await svc.send(type, r, data || {}, channels || ['inapp']));
+    const r = await svc.recipientFromMember(mid, organizationId);
+    sent.push(await svc.send(type, r, data || {}, channels || ['inapp'], { organizationId, scope: 'tenant' }));
   }
   res.json({ data: { count: sent.length } });
 }));

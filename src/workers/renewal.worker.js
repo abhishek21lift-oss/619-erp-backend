@@ -26,6 +26,20 @@ const razorpay = require('../lib/razorpay');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 
+// ── Every send in this file is a PLATFORM job, declared as one ──────────────
+//
+// The three sweeps below query member_memberships / bookings across every
+// studio on the platform — that is what a nightly renewal sweep IS, and none of
+// these rows carries an organization to scope to (members and member_memberships
+// have no organization_id column at all).
+//
+// So each notifier.send() passes scope:'platform'. Not decoration: the
+// notifications worker refuses a job whose stamped organization disagrees with
+// the recipient's own, and "no organization" would otherwise be indistinguishable
+// from "somebody forgot to stamp one". Declaring it means the absence is a
+// statement, and a tenant job that loses its organization still gets caught.
+const PLATFORM_SEND = { scope: 'platform' };
+
 const REMINDER_DAYS = [7, 3, 1];   // send reminder when this many days remain
 
 async function runReminders() {
@@ -44,7 +58,7 @@ async function runReminders() {
 
     for (const m of rows) {
       await notifier.send('membership_expiring', m, { days, plan: m.plan_name },
-        ['inapp', 'email', 'whatsapp']);
+        ['inapp', 'email', 'whatsapp'], PLATFORM_SEND);
     }
     logger.info({ count: rows.length, days }, 'sent expiry reminders');
   }
@@ -105,7 +119,7 @@ async function runAutoRenew() {
 
       // 5. Notify member
       await notifier.send('payment_received', m,
-        { amount: m.price, plan: m.plan_name }, ['inapp', 'email', 'whatsapp']);
+        { amount: m.price, plan: m.plan_name }, ['inapp', 'email', 'whatsapp'], PLATFORM_SEND);
 
       logger.info({ member: m.name }, 'auto-renew completed');
     } catch (err) {
@@ -113,7 +127,7 @@ async function runAutoRenew() {
       logger.error({ member: m.name, err: err.message }, 'auto-renew failed');
       try {
         await notifier.send('payment_failed', m,
-          { amount: m.price, error: err.message }, ['inapp', 'email']);
+          { amount: m.price, error: err.message }, ['inapp', 'email'], PLATFORM_SEND);
       } catch (_) { /* best-effort */ }
     } finally {
       client.release();
@@ -137,7 +151,7 @@ async function runClassReminders() {
   `);
   for (const r of rows) {
     await notifier.send('class_reminder', r,
-      { class_name: r.class_name, time: r.time }, ['inapp', 'whatsapp', 'push']);
+      { class_name: r.class_name, time: r.time }, ['inapp', 'whatsapp', 'push'], PLATFORM_SEND);
   }
 }
 

@@ -4,6 +4,7 @@ const pool = require('../db/pool');
 const { computeAccess } = require('../lib/subscription');
 const { resolveOrgId } = require('./tenant');
 const { runWithTenantContext } = require('../lib/tenant-context');
+const { recordImpersonatedWrite, appendOutcome } = require('./impersonationAudit');
 
 // Off by default — see TENANT-RLS-PLAN.md. Enabling this makes pool.js wrap
 // queries in a transaction that sets app.org_id for Postgres RLS to read; it
@@ -167,6 +168,26 @@ async function auth(req, res, next) {
           },
         });
       }
+
+      // Every write made inside somebody else's studio is recorded here, before
+      // it happens, and refused if it cannot be recorded. This sits in auth
+      // rather than in a mounted middleware because `req.impersonation` does not
+      // exist until this line — most routers call auth() per route, so anything
+      // mounted at /api/ would run first and see nothing to audit.
+      //
+      // It costs one INSERT, and only on a full-access impersonated write: the
+      // read-only default returned above never reaches it, and no ordinary
+      // tenant request has an `imp` claim at all.
+      const audit = await recordImpersonatedWrite(req);
+      if (!audit.ok) {
+        return res.status(503).json({
+          error: {
+            code: 'AUDIT_UNAVAILABLE',
+            message: 'This action cannot be recorded right now and has not been performed. Try again shortly.',
+          },
+        });
+      }
+      appendOutcome(res, audit.id);
     }
 
     // Subscription enforcement (SaaS billing). Compute the studio's access state

@@ -171,6 +171,13 @@ describe('super-admin API — the H-03 split', () => {
     'POST /command-center/guardian/:id/explain',
     'POST /command-center/stream-ticket',
     'POST /coupons',
+    // Closing an impersonation session on the record. Its counterpart,
+    // POST /organizations/:id/impersonate, has always been audited; the exit
+    // was purely client-side, so the log showed every entry into a studio and
+    // no exit from any of them. Belongs on THIS router — and therefore behind
+    // requireSuperAdmin — because it is the operator's own session that ends
+    // it, never the impersonated studio admin's.
+    'POST /impersonation/end',
     'POST /invitations/:id/cancel',
     'POST /invitations/:id/link',
     'POST /invitations/:id/resend',

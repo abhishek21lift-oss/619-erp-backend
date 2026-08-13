@@ -234,9 +234,19 @@ async function deliverChannel(ch, type, recipient, data) {
  * @param {object} recipient - { user_id, member_id, email, phone, device_token, name }
  * @param {object} data - template variables
  * @param {string[]} via - channels to use (default: ['inapp'])
+ * @param {object} [opts]
+ * @param {string} [opts.organizationId] - the studio this send belongs to,
+ *   taken from trusted server context (req.user.organization_id), NEVER from
+ *   anything the caller supplied. Stamped onto the job so the worker can check
+ *   it against the recipient's authoritative organization before delivering.
+ * @param {'tenant'|'platform'} [opts.scope] - 'platform' marks a send that
+ *   legitimately crosses studios (the renewal sweep). Declared, so that "no
+ *   organization" is a statement rather than an omission.
  */
-async function send(type, recipient, data, via = ['inapp']) {
+async function send(type, recipient, data, via = ['inapp'], opts = {}) {
   if (!templates[type]) throw new Error(`Unknown notification template: ${type}`);
+
+  const { organizationId = null, scope = organizationId ? 'tenant' : undefined } = opts;
 
   const results = {};
   for (const ch of via) {
@@ -247,7 +257,7 @@ async function send(type, recipient, data, via = ['inapp']) {
       const redis = require('../../lib/redis');
       if (await redis.ensureReady()) {
         const { enqueueNotification } = require('../../services/notificationFanout');
-        queued = await enqueueNotification(ch, type, recipient, data);
+        queued = await enqueueNotification(ch, type, recipient, data, {}, { organizationId, scope });
       }
     } catch (err) {
       logger.warn({ err: err.message, ch, type }, 'notify enqueue failed — sending inline');
@@ -261,6 +271,90 @@ async function send(type, recipient, data, via = ['inapp']) {
 }
 
 /**
+ * The tenant check a queued notification passes before it is delivered.
+ *
+ * The rule is the one knowledgeBase.js already follows for the AI queue: a job
+ * payload is not evidence of anything. The organization stamped on the job is
+ * compared against the organization the RECIPIENT actually belongs to, read
+ * back out of the database at processing time. They must agree.
+ *
+ * Three cases deliberately pass rather than throw, and each is a different
+ * thing:
+ *
+ *   · scope === 'platform' — the renewal sweep and its kin, which are supposed
+ *     to address every studio. Declared at enqueue, never inferred.
+ *   · no organizationId at all — a job enqueued by an older build that was
+ *     already on the queue when this shipped. Rejecting those would drop real
+ *     messages during a single deploy for no security gain, since the old jobs
+ *     are exactly as trustworthy as they were yesterday. Logged, not failed.
+ *   · nothing to re-derive from — a recipient that is only an email address or
+ *     a phone number has no row to look up, and delivering to an address is not
+ *     a tenant-scoped act. There is no mismatch to detect, so there is nothing
+ *     to refuse.
+ *
+ * A genuine mismatch — the payload says studio A, the recipient belongs to
+ * studio B — throws, which fails the job and puts it in the Command Center's
+ * failed list, and writes an audit row first so the attempt survives the retry.
+ */
+async function assertJobTenant(job) {
+  const { organizationId, scope, recipient = {}, ch, type } = job.data || {};
+
+  if (scope === 'platform') return;
+  if (!organizationId) {
+    logger.warn({ jobId: job.id, ch, type }, 'notification job carries no organization — legacy job, delivering unverified');
+    return;
+  }
+
+  // Re-derive from the most specific identifier available. A client id is
+  // preferred over a user id: the in-app channel addresses users, but the
+  // broadcast path names clients, and pt_clients is where the tenant boundary
+  // actually lives.
+  let actual;
+  if (recipient.member_id) {
+    const { rows } = await pool.query(
+      'SELECT organization_id FROM pt_clients WHERE id = $1', [recipient.member_id]
+    );
+    if (rows.length) actual = rows[0].organization_id;
+  }
+  if (actual === undefined && recipient.user_id) {
+    const { rows } = await pool.query(
+      'SELECT organization_id FROM users WHERE id = $1', [recipient.user_id]
+    );
+    if (rows.length) actual = rows[0].organization_id;
+  }
+
+  if (actual === undefined) return;               // nothing to compare against
+  if (String(actual) === String(organizationId)) return;
+
+  // Audited BEFORE the throw. A failed job is retried, and the retry would
+  // otherwise be the only trace left of a cross-tenant attempt.
+  try {
+    await pool.query(
+      `INSERT INTO activity_log
+         (user_id, user_name, action, entity_type, entity_id, new_data, organization_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        null,
+        'notifications worker',
+        'notification.tenant_mismatch_rejected',
+        'notification',
+        String(recipient.member_id || recipient.user_id || ''),
+        JSON.stringify({ job_organization_id: organizationId, recipient_organization_id: actual, channel: ch, template: type }),
+        organizationId,
+      ]
+    );
+  } catch (err) {
+    logger.error({ err: err.message }, 'failed to audit notification tenant mismatch');
+  }
+
+  logger.error(
+    { jobId: job.id, ch, type, job_org: organizationId, recipient_org: actual },
+    'notification_tenant_mismatch — refusing to deliver across studios',
+  );
+  throw new Error('Notification tenant mismatch: recipient belongs to a different organization');
+}
+
+/**
  * Worker processor: deliver a single queued notification job (one channel).
  * Throws on unknown template/channel so BullMQ marks the job failed instead of
  * silently completing it.
@@ -269,27 +363,59 @@ async function processNotificationJob(job) {
   const { ch, type, recipient, data } = job.data || {};
   if (!channels[ch]) throw new Error(`Unknown notification channel: ${ch}`);
   if (!templates[type]) throw new Error(`Unknown notification template: ${type}`);
+  await assertJobTenant(job);
   return deliverChannel(ch, type, recipient, data);
 }
 
 /**
- * Resolve a member into a recipient object with all contact info.
+ * Resolve a member into a recipient object with all contact info, within one
+ * studio. Throws if the id does not belong to `organizationId`.
  */
-async function recipientFromMember(memberId) {
-  // Try the clients table first (619 ERP schema), fall back to members
-  for (const table of ['clients', 'members']) {
-    try {
-      const { rows } = await pool.query(
-        `SELECT c.id AS member_id, c.name, c.email, c.mobile AS phone, NULL AS user_id
-         FROM ${table} c WHERE c.id = $1`,
-        [memberId]
-      );
-      if (rows.length > 0) return rows[0];
-    } catch {
-      // table may not exist, try next
-    }
+async function recipientFromMember(memberId, organizationId) {
+  // ── Why this takes an organization id, and why it reads pt_clients ─────────
+  //
+  // It used to loop over ['clients', 'members'] with `WHERE c.id = $1` and no
+  // tenant predicate of any kind. Its one caller is POST /api/v1/notifications/
+  // broadcast, which takes `member_ids` straight out of the request body behind
+  // requireRole('admin','manager') — the TENANT studio-owner role. So the id was
+  // caller-chosen and the lookup was platform-wide: a studio passing another
+  // studio's client id would have had that client's name, email and phone
+  // resolved, and a notification delivered to them.
+  //
+  // That was not exploitable, for a reason that is not reassuring: BOTH of those
+  // tables are the abandoned legacy ones, both are empty in production, and
+  // neither has an organization_id column to filter on even in principle (see
+  // __tests__/clients.legacy-table.test.js, and the note in server.js about the
+  // v3 routes deleted for exactly this shape). Every call threw 'Recipient not
+  // found'. It was safe by being dead, which lasts exactly until somebody
+  // populates a table.
+  //
+  // pt_clients is the table the product actually writes, it carries
+  // organization_id (079, NOT NULL since 155) and the user_id link (154) that
+  // the in-app channel needs to address a row at a person. So this resolves
+  // there, scoped, and fails closed when no organization is known rather than
+  // falling back to a platform-wide read.
+  if (!organizationId) {
+    const err = new Error('Cannot resolve a recipient without an organization context');
+    err.status = 403;
+    err.code = 'NO_TENANT';
+    throw err;
   }
-  throw new Error('Recipient not found');
+
+  const { rows } = await pool.query(
+    `SELECT c.id AS member_id, c.user_id, c.name, c.email, c.mobile AS phone,
+            c.organization_id
+       FROM pt_clients c
+      WHERE c.id = $1
+        AND c.organization_id = $2
+        AND c.deleted_at IS NULL`,
+    [memberId, organizationId]
+  );
+  // Deliberately the same error whether the id does not exist or belongs to
+  // another studio — telling those apart is exactly what a caller probing ids
+  // wants to learn.
+  if (!rows.length) throw new Error('Recipient not found');
+  return rows[0];
 }
 
 /**
@@ -320,4 +446,4 @@ async function markAllRead(userId) {
   );
 }
 
-module.exports = { send, deliverChannel, processNotificationJob, recipientFromMember, inbox, markRead, markAllRead, templates, channels };
+module.exports = { send, deliverChannel, processNotificationJob, assertJobTenant, recipientFromMember, inbox, markRead, markAllRead, templates, channels };

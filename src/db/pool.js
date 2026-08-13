@@ -327,15 +327,42 @@ pool.query = function slowQueryInstrument(...args) {
 const PRISTINE = Symbol.for('tenantScope.pristine');
 
 function scopeClient(client, orgId, log = logger) {
-  // The pristine methods, remembered once per physical client. Capturing
+  // `query` is remembered once per physical client. Capturing
   // `client.query.bind(client)` instead would restore a BOUND COPY on release,
   // so the next borrow would bind that copy, and the chain would grow one
   // layer per borrow for the life of the process. Caught by the identity
   // assertion in tenantScopedClient.test.js.
   if (!client[PRISTINE]) {
-    client[PRISTINE] = { query: client.query, release: client.release };
+    client[PRISTINE] = { query: client.query };
   }
-  const { query: pristineQuery, release: pristineRelease } = client[PRISTINE];
+  const { query: pristineQuery } = client[PRISTINE];
+
+  // `release`, by contrast, MUST be captured per borrow and must never be
+  // cached on the client — pg-pool installs a brand new single-use closure on
+  // every acquisition:
+  //
+  //     client.release = this._releaseOnce(client, idleListener)   (pg-pool)
+  //
+  // and _releaseOnce closes over its own `released` boolean, throwing
+  // "Release called on client which has already been released to the pool."
+  // the second time it is called.
+  //
+  // Caching it alongside `query` meant the FIRST borrow's release function was
+  // restored and invoked on every later borrow of the same physical
+  // connection. The first borrow worked; the second threw. With
+  // TENANT_RLS_ENFORCE on, that broke every one of the ~36 call sites that do
+  // pool.connect() -> BEGIN -> ... -> COMMIT (payments, invoices, enrolment)
+  // as soon as a connection was reused, which in any real workload is
+  // immediately.
+  //
+  // It survived because tenantScopedClient.test.js exercises scopeClient
+  // against a hand-rolled fake client, and a fake has no reason to reassign
+  // release per acquisition — so the one behaviour that matters here was the
+  // one the fake did not model. See
+  // tenantContext.concurrency.integration.test.js, which borrows the same
+  // physical connection repeatedly from a real pool and fails without this.
+  const pristineRelease = client.release;
+
   const origQuery = (...a) => pristineQuery.apply(client, a);
   const origRelease = (...a) => pristineRelease.apply(client, a);
   let inTransaction = false;

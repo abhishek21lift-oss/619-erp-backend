@@ -5,6 +5,7 @@
 // H-03). Route paths, order within this domain, and handler bodies are
 // unchanged; super-admin.routes.js now mounts this router.
 
+const crypto = require('crypto');
 const router = require('express').Router();
 const {
   IMPERSONATION_TTL, audit, jwt, pool,
@@ -52,25 +53,76 @@ router.post('/organizations/:id/impersonate', async (req, res, next) => {
     // (_impersonated_by) by the shared activity logger.
     const readonly = req.body.mode !== 'full';
 
+    // jti identifies THIS impersonation session, so the start event, every
+    // audited write inside it, and the end event can be stitched into one
+    // sequence afterwards — otherwise two sessions into the same studio in one
+    // afternoon are indistinguishable in the log.
+    //
+    // It also leaves the door open to real revocation later (a deny-list keyed
+    // on this id) without re-minting the token design. Not implemented now, and
+    // deliberately: the token already expires in IMPERSONATION_TTL, and a
+    // revocation store is a subsystem, not a line.
+    const jti = crypto.randomUUID();
+
     const token = jwt.sign(
       {
         id: target.id,
         token_version: target.token_version,
-        imp: { by: req.user.id, byName: req.user.name || 'Admin', ro: readonly, org: org.id },
+        jti,
+        imp: { by: req.user.id, byName: req.user.name || 'Admin', ro: readonly, org: org.id, jti },
       },
       process.env.JWT_SECRET,
       { expiresIn: IMPERSONATION_TTL }
     );
 
-    await audit(req, 'user_impersonated', 'user', target.id, { organization_id: org.id, readonly, mode: readonly ? 'read_only' : 'full' });
+    await audit(req, 'user_impersonated', 'user', target.id, { organization_id: org.id, readonly, mode: readonly ? 'read_only' : 'full', jti });
     res.json({
       data: {
         token,
         readonly,
+        jti,
         admin: { id: target.id, name: target.name, email: target.email, role: target.role },
         organization: { id: org.id, name: org.name, slug: org.slug, logo_url: org.logo_url },
       },
     });
+  } catch (err) { next(err); }
+});
+
+// ── POST /impersonation/end ───────────────────────────────────────────────────
+// Close an impersonation session, on the record.
+//
+// Until this existed, exiting was purely a client-side act: the browser dropped
+// the token out of sessionStorage and that was that. The log therefore showed
+// every entry into a studio and no exit from any of them, so "when did the
+// operator stop acting inside this studio" had no answer — only "the token
+// would have expired by now, at the latest".
+//
+// This is reached with the operator's OWN super-admin cookie session, which was
+// never replaced (the impersonation token rides as a Bearer on top of it), so it
+// inherits this router's auth -> requireSuperAdmin -> requireSuperAdminMfa mount
+// like every other platform route. The client must NOT send the impersonation
+// Bearer here — that identity is a studio admin and would be refused by
+// requireSuperAdmin, which is the correct outcome for the wrong reason.
+//
+// What this deliberately does NOT do is invalidate the token. It is a stateless
+// JWT; killing it needs a revocation store, which is a subsystem rather than a
+// line, and the token is already short-lived. So this records the end of the
+// session, and the ceiling on a token that outlives its recorded end is
+// IMPERSONATION_TTL — the same ceiling that existed before.
+router.post('/impersonation/end', async (req, res, next) => {
+  try {
+    const { organization_id: orgId, admin_id: adminId, jti, reason } = req.body || {};
+
+    await audit(req, 'user_impersonation_ended', 'user', adminId || null, {
+      organization_id: orgId || null,
+      jti: jti || null,
+      // 'expired' when the client noticed the token die, 'manual' when somebody
+      // pressed Exit. The difference is worth keeping: a session that always
+      // ends by expiry means operators are not exiting deliberately.
+      reason: reason === 'expired' ? 'expired' : 'manual',
+    });
+
+    res.json({ data: { ended: true } });
   } catch (err) { next(err); }
 });
 
