@@ -504,7 +504,30 @@ app.use('/api/subscription',      require('./routes/subscription'));
 // Global top-nav search. Carries its own rate limiter (see routes/search.js),
 // so it is deliberately NOT wrapped in userApiLimiter — debounced typing would
 // otherwise consume the shared per-user budget that real API calls need.
-app.use('/api/search',            require('./routes/search'));
+// ── Staff-only routers ──────────────────────────────────────────────────────
+//
+// requireStaff went in for /api/pt-os and stopped there. Its own comment in
+// middleware/rbac.js states the reason it exists: read routes were gated on
+// `auth` alone, "survivable only because no account had ever held the `member`
+// role... client logins create those accounts by the hundred."
+//
+// Those accounts carry their studio's organization_id, so tenantScope() lets
+// them through — the boundary that matters for tenancy is intact, and nothing
+// here is a cross-tenant leak. What it means is that a logged-in CLIENT could
+// read their own gym's staff data: GET /api/clients returns `c.*` for up to a
+// thousand rows (names, mobiles, emails, balances, notes), /api/reports/revenue
+// and /dues return the studio's finances, and the nine GETs on /api/progress
+// take an optional client_id that, omitted, returns the whole organisation.
+//
+// Verified before gating: the client portal calls exactly ONE endpoint,
+// /api/me. No screen under app/(bare)/member, /client or /member-login touches
+// any router below.
+//
+// auth() runs twice on the ...gate() lines and that is fine — the second call
+// is a user-cache hit, as the /api/pt-os mounts below already note. requireStaff
+// deliberately precedes the feature gate so a client cannot learn which
+// features a studio has by the shape of the refusal.
+app.use('/api/search',            auth, requireStaff, require('./routes/search'));
 
 // ONE router, deliberately. This mount used to carry a second file,
 // routes/client-actions.js, whose thirteen endpoints read and wrote the legacy
@@ -516,15 +539,15 @@ app.use('/api/search',            require('./routes/search'));
 // org-scoped equivalents live under /api/pt-os/clients.
 // See src/__tests__/clients.legacy-table.test.js, which fails if anything
 // mounted here starts reading that table again.
-app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
+app.use('/api/clients',           userApiLimiter, auth, requireStaff, require('./routes/clients'));
 
-app.use('/api/trainers',          require('./routes/trainers'));
+app.use('/api/trainers',          auth, requireStaff, require('./routes/trainers'));
 // Manual UTR verification payments. MUST be mounted before the finance ledger
 // router below: that one owns DELETE /:id and a bare /:id would otherwise
 // swallow /api/payments/upi/... before this router ever sees it.
 app.use('/api/payments/upi',      userApiLimiter, require('./routes/upi-payments'));
-app.use('/api/payments',          userApiLimiter, require('./routes/payments'));
-app.use('/api/attendance',        ...gate('attendance'), require('./routes/attendance'));
+app.use('/api/payments',          userApiLimiter, auth, requireStaff, require('./routes/payments'));
+app.use('/api/attendance',        auth, requireStaff, ...gate('attendance'), require('./routes/attendance'));
 
 // ROUTE INTEGRITY NOTE (R-03) — SUPERSEDED, and deliberately reversed.
 //
@@ -545,11 +568,11 @@ app.use('/api/attendance',        ...gate('attendance'), require('./routes/atten
 // So "legacy" had it backwards: /api/reports is the tenant-safe, live
 // implementation, and the migration target was the unsafe one. Do not
 // reintroduce a v1 reports router without organization_id on its tables.
-app.use('/api/reports',           userApiLimiter, ...gate('insights'), require('./routes/reports'));
+app.use('/api/reports',           userApiLimiter, auth, requireStaff, ...gate('insights'), require('./routes/reports'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
 app.use('/api/leave',             require('./routes/leave'));
-app.use('/api/expenses',          ...gate('finance'), require('./routes/expenses'));
+app.use('/api/expenses',          auth, requireStaff, ...gate('finance'), require('./routes/expenses'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.
@@ -586,7 +609,7 @@ app.use('/api/modules',           require('./modules/operations/operations.route
 app.use('/api/calendar',          require('./routes/calendar'));
 app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-checkin'));
 app.use('/api/settings',          require('./routes/settings'));
-app.use('/api/invoices',          ...gate('finance'), require('./routes/invoices'));
+app.use('/api/invoices',          auth, requireStaff, ...gate('finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
 // The Exercise Library. Sits behind the same 'programs' feature as the Workout
 // Builder it feeds — a studio with programmes always has the library, and one
@@ -602,7 +625,7 @@ app.use('/api/integrations',      ...gate('integrations'), require('./routes/int
 app.use('/api/campaigns',         ...gate('communication'), require('./routes/campaigns'));
 app.use('/api/offers',            require('./routes/offers'));
 app.use('/api/feedback',          require('./routes/feedback'));
-app.use('/api/communication',     ...gate('communication'), require('./routes/communication'));
+app.use('/api/communication',     auth, requireStaff, ...gate('communication'), require('./routes/communication'));
 // Mounted before /api/ai so /api/ai/knowledge/* is matched here first,
 // regardless of what routes/ai.js's own router does internally.
 // The AI mounts additionally carry a token-quota guard. It runs AFTER the
@@ -655,7 +678,7 @@ app.use('/api/client-login',     auth, requireStaff, require('./routes/client-lo
 // ────────────────────────
 // BUSINESS FLOW ROUTES (v4 — Progress, Automation)
 // ────────────────────────
-app.use('/api/progress',         require('./modules/progress/progress.routes'));
+app.use('/api/progress',         auth, requireStaff, require('./modules/progress/progress.routes'));
 app.use('/api/automation',       require('./modules/automation/automation.routes'));
 
 // ────────────────────────
