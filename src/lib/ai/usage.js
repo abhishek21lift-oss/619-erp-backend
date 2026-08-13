@@ -55,28 +55,17 @@ async function getUserUsage(user_id) {
   return rows[0];
 }
 
-/**
- * Per-model breakdown for the last 30 days (admin view).
- */
-async function getModelStats() {
-  const { rows } = await pool.query(
-    `SELECT
-       model,
-       provider,
-       intent_type,
-       COUNT(*)                                                   AS requests,
-       COALESCE(SUM(tokens_total),0)                             AS tokens_total,
-       COALESCE(SUM(tokens_prompt),0)                            AS tokens_prompt,
-       COALESCE(SUM(tokens_completion),0)                        AS tokens_completion,
-       COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE)        AS requests_today,
-       AVG(latency_ms)::INTEGER                                  AS avg_latency_ms,
-       COUNT(*) FILTER (WHERE used_fallback)                     AS fallback_count
-     FROM ai_usage_log
-     WHERE created_at >= NOW() - INTERVAL '30 days'
-     GROUP BY model, provider, intent_type
-     ORDER BY requests DESC`
-  );
-  return rows;
-}
+// getModelStats() was here — an unfiltered aggregate over the whole of
+// ai_usage_log, served to tenant studio owners by GET /api/ai/model-stats.
+//
+// Both are gone. The query could not be made tenant-safe in place: ai_usage_log
+// has no organization_id column, so a per-studio figure has to join through
+// users, and the platform console already does exactly that in
+// modules/platform/super-admin/ai.js behind requireSuperAdmin.
+//
+// If a per-studio AI usage figure is ever wanted on the TENANT side, it needs a
+// new function here that joins ai_usage_log -> users and filters on the caller's
+// own organization_id. Do not resurrect this one: an aggregate with no org
+// predicate is a cross-tenant read whatever route it is mounted on.
 
-module.exports = { logUsage, getUserUsage, getModelStats };
+module.exports = { logUsage, getUserUsage };

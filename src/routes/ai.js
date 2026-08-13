@@ -19,7 +19,7 @@ function orgParam(req) {
 const { routedChat, routedStream }     = require('../lib/ai/router');
 const { pingModel }                    = require('../lib/ai/openrouter');
 const { models }                       = require('../lib/ai/models');
-const { logUsage, getUserUsage, getModelStats } = require('../lib/ai/usage');
+const { logUsage, getUserUsage } = require('../lib/ai/usage');
 const { retrieveContext }              = require('../lib/ai/knowledgeBase');
 const { runTools }                     = require('../lib/ai/tools');
 const {
@@ -869,11 +869,39 @@ router.get('/usage', auth, async (req, res) => {
   res.json({ data: stats });
 });
 
-router.get('/model-stats', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const stats = await getModelStats();
-  res.json({ data: stats });
-});
+// GET /model-stats was here. It is gone, and must not come back on this mount.
+//
+// It answered with a per-model breakdown of `ai_usage_log` — requests, tokens,
+// latency and fallback counts — computed with NO tenant filter of any kind,
+// because that table has no organization_id at all to filter on (stated in
+// 126_ai_control_centre.sql: "ai_usage_log carries no organization_id, so every
+// per-studio figure joins through users"). So the numbers were platform-wide by
+// construction: every studio's AI consumption, aggregated.
+//
+// The gate was `req.user.role !== 'admin'`, and `admin` is the TENANT role — a
+// studio owner, auto-granted to every self-serve trial signup. Any one of them
+// could read the whole platform's AI usage. Not PII, but a studio could see how
+// much every other studio was using, which is somebody else's business.
+//
+// Deleted rather than re-gated to super_admin, because a platform endpoint does
+// not belong on this mount at all: /api/ai is tenant surface, sitting behind
+// gate('ai_suite') and requireAiQuota() — tenant feature machinery that is
+// meaningless for a platform operator. Keeping it here and tightening the role
+// check would have preserved exactly the boundary violation we are removing.
+//
+// The equivalent already exists, correctly placed and correctly guarded:
+//   GET /api/super-admin/ai/by-model    the per-model breakdown this returned
+//   GET /api/super-admin/ai/by-studio   the same numbers, split by tenant
+//   GET /api/super-admin/ai/overview    totals and cost
+// all mounted behind auth -> requireSuperAdmin -> requireSuperAdminMfa.
+//
+// Verified dead before removal: the frontend defined api.ai.modelStats() in its
+// endpoint barrel and called it from nowhere — the same "declared in the barrel,
+// invoked by no one" shape that /api/v1/members turned out to have (see the note
+// in server.js). That barrel entry has been removed alongside this route.
+//
+// See src/__tests__/ai.modelStats.authz.test.js, which fails if this route is
+// reintroduced here.
 
 /* ═══════════════════════════════════════════════════════════════════════════
    8. MODEL HEALTH CHECK  (admin)
