@@ -25,16 +25,35 @@ const EMAIL_TYPES = new Set([
  * Returns the BullMQ Job, or null when Redis is not ready so the caller can
  * fall back to the synchronous send path. Never throws for a queue outage —
  * that is exactly the condition that must degrade to inline, not to a 500.
+ *
+ * ── Why organizationId is carried but NOT enforced here ─────────────────────
+ *
+ * `tenant.organizationId` is stamped onto the job when the caller knows it, so
+ * a queued message can be traced to the studio it belongs to. It is not a gate,
+ * and this queue deliberately has none, because an email job resolves to an
+ * ADDRESS and delivering to an address is not a tenant-scoped act — there is no
+ * row to re-derive an organization from and therefore no mismatch to detect.
+ * (Contrast the notifications queue, whose recipients do have rows: see
+ * assertJobTenant in modules/notifications/notifications.service.js.)
+ *
+ * More importantly, requiring an organization here would break the three types
+ * that legitimately have none. password_reset, admin_otp and admin_invitation
+ * are all PRE-AUTHENTICATION: the recipient has no session, and in the
+ * invitation case no account yet, so there is no organization to resolve. A
+ * check that refused them would lock people out of their own accounts — the
+ * exact failure lib/email.js's boot-time verification exists to make loud.
  */
-async function enqueueEmail(type, data = {}, opts = {}) {
+async function enqueueEmail(type, data = {}, opts = {}, tenant = {}) {
   if (!EMAIL_TYPES.has(type)) throw new Error(`Unknown email job type: ${type}`);
 
   const redis = require('../lib/redis');
   if (!(await redis.ensureReady())) return null;
 
+  const { organizationId = null } = tenant;
+
   const { emailQueue } = require('../jobs/queue');
-  const job = await emailQueue.add(type, { type, ...data }, opts);
-  logger.info({ jobId: job.id, type, queue: 'email' }, 'email job enqueued');
+  const job = await emailQueue.add(type, { type, ...data, organizationId }, opts);
+  logger.info({ jobId: job.id, type, queue: 'email', organizationId }, 'email job enqueued');
   return job;
 }
 
