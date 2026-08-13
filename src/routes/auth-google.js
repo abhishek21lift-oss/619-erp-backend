@@ -6,6 +6,7 @@ const jwt    = require('jsonwebtoken');
 const pool   = require('../db/pool');
 const logger = require('../lib/logger');
 const loginEvents = require('../lib/loginEvents');
+const { AUD_TENANT } = require('../middleware/platformAuth');
 
 const isProd = process.env.NODE_ENV === 'production';
 
@@ -92,8 +93,13 @@ router.post('/google-login', async (req, res) => {
     // Sign JWT — identical shape to the regular login cookie
     let token;
     try {
+      // Tenant audience: this is the studio door. An operator who signs in
+      // with Google gets a session that runs the studio app and cannot drive
+      // the control plane — the Command Center has its own door, and that is
+      // the only thing that mints a platform session. See
+      // middleware/platformAuth.js.
       token = jwt.sign(
-        { id: user.id, token_version: user.token_version },
+        { id: user.id, token_version: user.token_version, aud: AUD_TENANT },
         process.env.JWT_SECRET,
         { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
       );

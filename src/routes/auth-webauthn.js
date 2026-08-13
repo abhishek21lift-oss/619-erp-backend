@@ -14,6 +14,7 @@ const { auth } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
 const logger   = require('../lib/logger');
 const loginEvents = require('../lib/loginEvents');
+const { AUD_TENANT } = require('../middleware/platformAuth');
 const rateLimit = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
 
@@ -496,8 +497,10 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
     }
     const user = users[0];
 
+    // Tenant audience — the passkey door is the studio door. See the same
+    // note in routes/auth-google.js and middleware/platformAuth.js.
     const token = jwt.sign(
-      { id: user.id, token_version: user.token_version ?? 0 },
+      { id: user.id, token_version: user.token_version ?? 0, aud: AUD_TENANT },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );

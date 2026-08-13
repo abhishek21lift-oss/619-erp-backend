@@ -9,6 +9,7 @@ const router = require('express').Router();
 const {
   IMPERSONATION_TTL, audit, jwt, pool,
 } = require('./shared');
+const { AUD_TENANT } = require('../../../middleware/platformAuth');
 // ── POST /organizations/:id/impersonate ───────────────────────────────────────
 // Mint a short-lived, READ-ONLY access token for a studio's admin so the operator
 // can enter the workspace and see exactly what that admin sees. The token carries
@@ -52,10 +53,20 @@ router.post('/organizations/:id/impersonate', async (req, res, next) => {
     // (_impersonated_by) by the shared activity logger.
     const readonly = req.body.mode !== 'full';
 
+    // TENANT audience, deliberately — this is the operator's sanctioned way
+    // INTO a studio, so the token it mints must be a studio token.
+    //
+    // It is also what makes impersonation the ONLY way in once
+    // PLATFORM_SESSION_ENFORCE is on: the operator's own platform session is
+    // refused by the tenant app (denyPlatformSession), and this one is refused
+    // by the control plane (requirePlatformOwner rejects any request carrying
+    // `imp`). Neither token can do both jobs, so every crossing between the
+    // planes goes through this handler — which writes the audit row below.
     const token = jwt.sign(
       {
         id: target.id,
         token_version: target.token_version,
+        aud: AUD_TENANT,
         imp: { by: req.user.id, byName: req.user.name || 'Admin', ro: readonly, org: org.id },
       },
       process.env.JWT_SECRET,
