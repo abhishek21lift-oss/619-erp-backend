@@ -4,13 +4,23 @@ Companion to `TENANT-RLS-PLAN.md`, which is the design and remains the source of
 truth. This document does not propose a different architecture. It answers one
 question the plan does not: **is the cutover safe to perform right now?**
 
-**Verdict: NOT READY.** Three blockers, listed at the bottom. None is a defect in
-the design — two are missing environment, and one is an inventory that cannot be
-trusted without a live database to check it against.
+**Verdict: NOT READY.**
 
-Audited against `main` @ `3c841d2`. Everything below is read out of the
-repository; nothing was run against a database, which is itself part of the
-finding.
+Audited against `main` @ `3c841d2`. The first pass was static. A second pass
+(Phase 1.5) built a real PostgreSQL 16 from `schema.sql` + all 160 migrations via
+`scripts/rls-proof-setup.sh`, connected as the real `app_tenant` role, and
+settled by query the things reading files could not. Two findings came out of
+that, and both are worse than the static pass suggested:
+
+- **77 tables**, not eleven, have RLS enabled with no `app_tenant` policy. 61 of
+  them are referenced by live code.
+- **`pool.connect()` was broken outright** under `TENANT_RLS_ENFORCE=on` — a
+  double-release on every reused connection. Found by the concurrency test, fixed
+  in the same pass. Had the flag been switched on without this, every
+  transactional write path would have started throwing.
+
+Sections marked **[verified]** were run against that database. Anything not so
+marked is still read from source.
 
 ---
 
@@ -52,10 +62,69 @@ valuable feature of the current design.
 
 ---
 
-## The inventory problem
+## The inventory problem — **[verified]**, and it is 77 tables
 
-This is the finding that most needs settling before anyone touches
-`DATABASE_URL`, and it cannot be settled by reading files.
+The static pass could not settle this. The query below was run against a real
+database built from all 160 migrations, connected as the real role. **It returns
+77 tables.** Migration 159's header — "Eleven tables in `public` have RLS ENABLED
+… and no policy naming app_tenant at all" — is wrong by a factor of seven, and
+that header is the reason the gap was believed closed.
+
+61 of the 77 are referenced by live source outside tests. The full list is
+reproducible with the query at the end of this section; the ones whose breakage
+would be most visible, with the connection each is reached on:
+
+| Table | Reached from | Connection at cutover | Effect |
+|---|---|---|---|
+| `notifications` | 11 files — `subscription`, `upi-payments`, `communication`, `client-activation`, plus platform/worker | **tenant** for the studio-facing ones | bell and in-app notices go empty |
+| `ai_usage_log` | `lib/aiQuota.js` on every AI request | **tenant** | quota reads 0 used ⇒ **enforcement fails open** |
+| `ai_conversations`, `ai_messages` | AI Coach history | **tenant** | conversation history vanishes |
+| `user_profiles` | `routes/profile.js` (tenant) and `requireSuperAdminMfa` (platform) | **both** | tenant profile empty; platform path safe on the owner pool |
+| `refresh_tokens` | `/api/auth/refresh` (no `auth` middleware ⇒ no ALS store ⇒ owner pool) and `routes/profile.js` session list | **mixed** | refresh itself is **safe**; the session list empties |
+| `feature_flags`, `system_settings` | `routes/settings.js` | **tenant** | settings screens empty |
+| `invoice_items`, `session_balance`, `pt_commissions`, `pt_packages`, `pt_payouts`, `pt_client_renewals`, `pt_client_subscriptions` | finance + PT OS | **tenant** | invoices without line items, balances and commissions blank |
+| `branches`, `integrations`, `campaigns`, `offers`, `feedback`, `automation_rules`, `communication_logs`, `leave_requests`, `weight_logs`, `meals`, `diet_plan_meals` | studio features | **tenant** | each screen silently empty |
+| `exercise_*`, `muscles`, `equipment_types` | shared exercise library | **tenant** | the 890-row library disappears — the exact trap `TENANT-RLS-PLAN.md` warns about |
+| `platform_*`, `ai_platform_settings`, `ai_model_rates`, `system_logs`, `system_alerts`, `storage_accounting_meta` | platform console, workers | owner | **safe** — but only because of the owner pool |
+| `clients`, `members`, `member_memberships`, `payments`, `attendance`, `bookings` | legacy v3 tables, empty in production | tenant | no effect today; a landmine if ever populated |
+
+The pattern that matters: **a table is only safe if every path that reads it is
+platform-wide or pre-auth.** Anything a studio user's request touches breaks, and
+breaks silently, because RLS filters rather than errors.
+
+### Ownership paths — **[verified]** (§6)
+
+None of these carries `organization_id`. Read off the live schema:
+
+```
+ai_messages      → conversation_id → ai_conversations → user_id  → users.organization_id
+ai_conversations → user_id                                       → users.organization_id
+ai_usage_log     → user_id                                       → users.organization_id
+notifications    → user_id                                       → users.organization_id
+user_profiles    → user_id                                       → users.organization_id
+refresh_tokens   → user_id                                       → users.organization_id
+invoice_items    → invoice_id      → invoices.organization_id
+session_balance  → client_id       → pt_clients.organization_id
+pt_commissions   → trainer_id / client_id → trainers / pt_clients .organization_id
+bookings         → client_id / member_id  → pt_clients / members
+attendance       → member_id / branch_id  → (legacy, empty)
+branches         → id only — no ownership path in the schema at all
+feature_flags, system_settings, notification_log — no *_id columns; catalogue/log shaped
+```
+
+Every one of those is expressible as an `EXISTS` policy in the shape migration
+159 already uses for its child tables, so **no schema change is required** for
+them — which is the answer to §7. `branches` is the exception worth a decision:
+it has no ownership path in the schema, and inventing one is a design question,
+not a migration.
+
+**Nothing here has been implemented.** Writing ~60 policies is a migration of its
+own, it needs each ownership path argued individually, and §7 says stop and
+report before touching schema. This is that report.
+
+### The query that settles it
+
+Run as any superuser against the target database.
 
 What is provable from the migrations:
 
@@ -150,31 +219,124 @@ other role does.
 
 ---
 
+## Connection selection — `ADMIN_DATABASE_URL` — **[verified]**
+
+```
+                    every query goes through db/pool.js
+                                   │
+                    useOwnerConnection() ?
+                    TENANT_RLS_ENFORCE          (env, boot-time)
+                  && SEPARATE_ADMIN_CONNECTION  (env, boot-time)
+                  && isPlatformWide()           (AsyncLocalStorage)
+                                   │
+              ┌────────── yes ─────┴───── no ──────────┐
+              ▼                                        ▼
+   PLATFORM / WORKER / PRE-AUTH                 TENANT REQUEST
+   ownerPool()                                  pool  (DATABASE_URL)
+   ADMIN_DATABASE_URL                           connects as app_tenant
+   owner role, BYPASSRLS                        BEGIN
+              │                                 set_config('app.org_id', …, true)
+              ▼                                 │
+   platform data, every studio                  ▼
+                                                RLS filters to one studio
+```
+
+`isPlatformWide()` is true in exactly two cases (`lib/tenant-context.js:86-89`):
+**no ALS store at all** — workers, cron, migrations, the startup probe, and every
+unauthenticated route, since only `auth` opens a store — or a store explicitly
+marked `platformWide`.
+
+**Can a tenant user reach the owner pool?** No, and the reason is structural.
+`platformWide` is set in exactly one place, `middleware/auth.js:208`:
+
+```js
+const platformWide = req.user.role === 'super_admin' && orgId == null;
+```
+
+`req.user.role` is loaded from the database on the request, never from the token
+body, a header or a query parameter. A `super_admin` who names a studio via
+`x-org-id` resolves a non-null `orgId` and is scoped like anyone else. There is
+no request-controlled input anywhere in the decision.
+
+| Question (§9) | Answer |
+|---|---|
+| Configured anywhere in the repo? | **No.** Absent from `.env.example`, `docker-compose.yml`, both workflow files. Read only at `db/pool.js:176`. |
+| Server-only? | **Yes.** Backend `process.env`, never `NEXT_PUBLIC_*`. Frontend cannot see it. |
+| Can a tenant user influence which connection is chosen? | **No** — see above. |
+| Can a request manipulate `useOwnerConnection()`? | **No.** All three inputs are boot-time env or server-derived role. |
+| If missing? | Falls back to `DATABASE_URL`, so `SEPARATE_ADMIN_CONNECTION` is false and `useOwnerConnection()` never fires. Harmless **today**; catastrophic **after** the role switch — see below. |
+| If equal to `DATABASE_URL`? | Identical to missing. This is the current state, and it is why the whole mechanism is inert. |
+| When `DATABASE_URL` becomes `app_tenant` and this is still unset? | **Every platform read returns zero rows.** The console, every worker, the renewal sweep and every pre-auth route fall onto `app_tenant` with no `app.org_id`, matching no policy. Login would fail to find accounts that exist. |
+| Safe as designed? | **Yes** — provided it is set *before* the role switch, never after. |
+
+**This is the single most likely way to turn the cutover into an outage**, and it
+is ordering, not code: `ADMIN_DATABASE_URL` must be live and proven (stage 7)
+while `DATABASE_URL` still points at the owner role.
+
+## Worker and queue context (§10) — **[verified]**
+
+Workers reach the owner pool by having no ALS store. That is correct **only
+because they are trusted infrastructure running server-authored jobs**, and it
+means a worker does not inherit the tenant identity of whoever enqueued the job.
+
+Phase 1 addressed that where it matters: the notifications queue now carries the
+organization from server context and the worker **re-derives the recipient's
+authoritative organization from the database** before delivering, refusing and
+auditing a mismatch (`assertJobTenant`). So a tenant-originated job does not
+silently become platform-wide — it is checked against the row, not the payload.
+
+| Queue | Kind | Tenant context | Verified by |
+|---|---|---|---|
+| `notifications` | tenant | stamped at enqueue, **re-derived at processing** | `queue.tenantContext.test.js`, `notifications.broadcast.integration.test.js` |
+| `ai` | tenant | re-derived from the document row (`knowledgeBase.js`) — the original good pattern | pre-existing |
+| `email`, `whatsapp` | tenant, address-shaped | carried for traceability, deliberately not gated: no row to re-derive from, and `password_reset` / `admin_otp` / `admin_invitation` are pre-auth with no organization | `queue.tenantContext.test.js` |
+| `membership-renewals` | **platform** | none, declared `scope: 'platform'` | `renewal.worker.js` |
+
+The distinction is now explicit rather than inferred: a job with no organization
+is either declared platform, or a legacy job from before the change — it is never
+an unmarked tenant job that quietly lost its scope.
+
 ## Blockers
 
-1. **No staging environment.** `STAGING-PLAN.md` Option A — an ephemeral
-   Supabase branch driven by the E2E suite that already exists — is the
-   recommended path, and its reasoning holds: the failures being hunted are
-   found by request coverage, and the existing suite has more of it than a human
-   clicking through a staging box would. Needs account access, not code.
-2. **The gap-table inventory is not trustworthy** (above). Needs one query
-   against a real database as the real role.
-3. **The `tenant_scope_gap` list has never been produced.** It is the known-
-   unknowns list, and it is empty only because nothing has run with the flag on.
+1. **~60 tables have no `app_tenant` policy** and are read by live tenant
+   traffic. This was blocker 2 ("the inventory is untrustworthy"); the inventory
+   has now been taken, and it turned a question into the largest piece of
+   remaining work. Ownership paths are proven; the migration is unwritten.
+2. **No staging environment.** `STAGING-PLAN.md` Option A — an ephemeral Supabase
+   branch driven by the E2E suite that already exists — remains the right path,
+   and its reasoning holds: the failures being hunted are found by request
+   coverage. Needs account access, not code. The local proof database built by
+   `rls-proof-setup.sh` substitutes for the *database* half of that rehearsal but
+   not for the *application* half: nothing here has run the API end to end
+   against an RLS-enforcing database.
+3. **The `tenant_scope_gap` list has never been produced.** Unchanged. It is the
+   known-unknowns list, and it stays empty until the API runs with the flag on
+   under real request coverage.
 
-## Conditions, if the blockers clear
+Blocker 1 is new information, not a new problem: it was always true, and
+159's header said otherwise.
 
-- **C1** — every table returned by the inventory query that the app queries has a
-  policy, in a migration, tested.
-- **C2** — `ADMIN_DATABASE_URL` is set and stage 7 proves platform reads work.
-- **C3** — a concurrency test demonstrates two simultaneous requests for
-  different organizations never see each other's `app.org_id`. The design makes
-  this safe by construction; nothing has yet shown it empirically, and this is
-  the assumption whose failure would be worst and quietest.
-- **C4** — the added per-query transaction latency is measured. `TENANT-RLS-PLAN.md`
-  step 3 asks for this and it has never been done; every read becoming a
-  transaction is not free, and the answer may narrow the wrapper to tenant-table
-  reads.
+## Conditions
+
+- **C1 — OPEN, and now the whole job.** ~60 tables need policies. Ownership paths
+  are proven above and all but `branches` fit migration 159's existing `EXISTS`
+  shape, so no schema change is required — but the migration itself is unwritten.
+- **C2 — OPEN.** `ADMIN_DATABASE_URL` set, and stage 7 proving platform reads.
+- **C3 — CLOSED.** `tenantContext.concurrency.integration.test.js` demonstrates it
+  against the real pool, the real ALS plumbing, the real `app_tenant` role and
+  the real policies: 40 interleaved requests, a 100-request random burst, a
+  2-connection pool forcing reuse, plus mid-transaction throws and failed
+  statements. No leakage. A context-less request reads **zero** rows rather than
+  everything, which is the fail-closed direction.
+
+  It also **found a real defect**: `scopeClient` cached pg-pool's per-acquisition
+  `release` closure on the client, so the second borrow of any reused connection
+  threw *"Release called on client which has already been released to the pool."*
+  With the flag on, that broke every `pool.connect()` → `BEGIN` … `COMMIT` path —
+  payments, invoices, enrolment. It survived because the existing unit test
+  exercises `scopeClient` against a hand-rolled fake, and a fake has no reason to
+  reassign `release` per acquisition. Fixed; mutation-verified.
+- **C4 — OPEN.** Per-query transaction latency still unmeasured.
 
 ## What guards the gap meanwhile
 
