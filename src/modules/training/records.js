@@ -33,11 +33,35 @@ const RECORD_TYPES = [
  */
 const LOWER_IS_BETTER = new Set(['BEST_TIME', 'BEST_PACE']);
 
+/**
+ * Decimal places personal_records.value actually stores — NUMERIC(12,3) in
+ * migration 166.
+ *
+ * Candidates are rounded to it before they are compared or written, and that
+ * is not tidiness. An Epley estimate of 110kg × 5 is 128.33333…; the column
+ * keeps 128.333; and on the next session the full-precision estimate reads as
+ * BEATING the value it produced last time. The client is congratulated on a
+ * new one-rep max for repeating the same set, every session, forever — and
+ * the record backfill never converges, because each run finds an improvement
+ * over its own last run.
+ *
+ * Rounding here rather than at the INSERT keeps the compared value and the
+ * stored value the same number, which is the only version of this that is
+ * stable.
+ */
+const VALUE_DECIMALS = 3;
+
+function quantise(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return n;
+  return Math.round(n * 10 ** VALUE_DECIMALS) / 10 ** VALUE_DECIMALS;
+}
+
 function isImprovement(recordType, candidate, current) {
-  const c = Number(candidate);
+  const c = quantise(candidate);
   if (!Number.isFinite(c)) return false;
   if (current == null) return true;              // no record yet — anything is one
-  const existing = Number(current);
+  const existing = quantise(current);
   if (!Number.isFinite(existing)) return true;
   return LOWER_IS_BETTER.has(recordType) ? c < existing : c > existing;
 }
@@ -220,14 +244,18 @@ function selectImprovements(candidates, current) {
   }
 
   for (const [key, c] of bestInBatch) {
-    if (isImprovement(c.record_type, c.value, map.get(key) ?? null)) wins.push(c);
+    // Emitted at the stored precision, so the number the caller writes is the
+    // same number the next comparison reads back.
+    if (isImprovement(c.record_type, c.value, map.get(key) ?? null)) {
+      wins.push({ ...c, value: quantise(c.value) });
+    }
   }
   return wins;
 }
 
 module.exports = {
-  RECORD_TYPES, LOWER_IS_BETTER, ONE_RM_MAX_REPS,
-  isImprovement, estimateOneRepMax,
+  RECORD_TYPES, LOWER_IS_BETTER, ONE_RM_MAX_REPS, VALUE_DECIMALS,
+  isImprovement, estimateOneRepMax, quantise,
   candidatesFromSets, candidatesFromCardio,
   recordKey, selectImprovements,
 };
