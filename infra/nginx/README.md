@@ -70,6 +70,15 @@ usual suspects and neither is the application code:
 | `patch-vhost.py` | called by the script | inserts the location block into the right `server{}` |
 | `websocket.conf` | `http {}` block | the `$connection_upgrade` map and the shared proxy headers |
 | `myptstudio.conf` | `sites-available/` | reference: what a correct config looks like |
+| `command-center.conf` | `sites-available/`, **only after the cert exists** | the `admin.myptstudio.com` vhost for the platform console |
+
+`command-center.conf` is deliberately a separate file rather than another block
+in `myptstudio.conf`. It references a certificate for `admin.myptstudio.com`,
+and `nginx -t` fails on a certificate that is not there — which means a
+`systemctl restart` would leave nginx **down**, taking `myptstudio.com` and
+`api.myptstudio.com` with it. Keeping it separate makes the order impossible to
+get wrong by accident: copy it only once `certbot` has issued that certificate.
+Its own header carries the full sequence.
 
 ## Installing
 

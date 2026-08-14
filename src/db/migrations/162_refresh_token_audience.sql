@@ -18,11 +18,28 @@
 --
 -- NULL means a session opened before this column existed. It is read as
 -- "legacy" rather than defaulted to 'tenant', for the same reason
--- platformAuth.js distinguishes a missing `aud` from a tenant one: while
--- PLATFORM_SESSION_ENFORCE is off, legacy sessions work on both planes; once
--- it is on, they work on neither and the holder signs in again. Defaulting
--- them to 'tenant' would instead silently downgrade the operator's live
--- session and look like a bug in the console.
+-- platformAuth.js distinguishes a missing `aud` from a tenant one.
+--
+-- What a legacy session can do, precisely, because an earlier version of this
+-- comment got it wrong and the error made turning the flag on look far more
+-- disruptive than it is:
+--
+--   flag OFF  both planes. Nothing changes for anyone.
+--   flag ON   the STUDIO APP still works. requirePlatformOwner refuses
+--             anything whose audience is not 'platform', so the CONSOLE is
+--             refused — but platformSessionBlocked only blocks sessions that
+--             ARE 'platform', so a legacy session passes every tenant route
+--             untouched.
+--
+-- So flipping the flag does not sign anybody out of the studio app. Its whole
+-- effect is that the operator must sign in at the Command Center's own door to
+-- reach the console. That is a much smaller blast radius than "every live
+-- session stops working", which is what this comment used to claim, and the
+-- difference decides whether the change needs a maintenance window (it does
+-- not).
+--
+-- Defaulting these to 'tenant' instead would silently downgrade the operator's
+-- live session and look like a bug in the console.
 ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS audience TEXT;
 
 COMMENT ON COLUMN refresh_tokens.audience IS
