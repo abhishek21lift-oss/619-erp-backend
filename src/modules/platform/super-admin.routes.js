@@ -32,6 +32,16 @@
 
 const router = require('express').Router();
 
+// Mounted before organizations, which owns PATCH/DELETE /users/:id.
+//
+// Nothing here actually collides — this module's routes are GET and the other's
+// are PATCH/DELETE, so Express would resolve them correctly in either order —
+// but /users/summary is a literal segment on a path where :param routes already
+// live, and that is the shape that becomes unreachable when somebody later adds
+// GET /users/:id without noticing. Ordering it first makes the answer right by
+// construction rather than by the current method mix.
+// superAdmin.routes.split.test.js asserts no route shadows another.
+router.use(require('./super-admin/users'));
 router.use(require('./super-admin/organizations'));
 router.use(require('./super-admin/operations'));
 router.use(require('./super-admin/impersonation'));
