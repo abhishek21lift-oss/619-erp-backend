@@ -268,3 +268,44 @@ describe('validation runs before anything is written', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('the meta endpoint publishes the vocabulary rather than duplicating it', () => {
+  // The builder changes its field set when a trainer switches an exercise
+  // from SETS_REPS to TIME_DISTANCE. Hard-coding that map in the frontend
+  // would put a second copy in another repository, and the two would drift
+  // the first time a type gained a field — quietly, into a UI that offers a
+  // field the API ignores.
+  test('every prescription type reports its fields and where it logs', async () => {
+    const res = await request(app()).get('/api/training/meta');
+    expect(res.status).toBe(200);
+    const types = res.body.data.prescription_types;
+    expect(types.length).toBeGreaterThan(10);
+    for (const t of types) {
+      expect([t.type, Array.isArray(t.fields)]).toEqual([t.type, true]);
+      expect([t.type, ['sets', 'cardio', 'either'].includes(t.logs_as)])
+        .toEqual([t.type, true]);
+    }
+  });
+
+  test('TIME_DISTANCE offers distance and incline, and does not offer sets', async () => {
+    const res = await request(app()).get('/api/training/meta');
+    const td = res.body.data.prescription_types.find((t) => t.type === 'TIME_DISTANCE');
+    expect(td.fields).toContain('target_distance');
+    expect(td.fields).toContain('target_incline');
+    expect(td.fields).not.toContain('target_sets');
+    expect(td.logs_as).toBe('cardio');
+  });
+
+  test('SETS_REPS is the mirror image', async () => {
+    const res = await request(app()).get('/api/training/meta');
+    const sr = res.body.data.prescription_types.find((t) => t.type === 'SETS_REPS');
+    expect(sr.fields).toContain('target_sets');
+    expect(sr.fields).not.toContain('target_distance');
+    expect(sr.logs_as).toBe('sets');
+  });
+
+  test('it reads no tables, so it cannot leak across studios', async () => {
+    await request(app()).get('/api/training/meta');
+    expect(allSql()).toBe('');
+  });
+});

@@ -524,6 +524,42 @@ router.patch('/cardio/:id', auth, STAFF, validate(schemas.cardioUpdate), wrap(as
   res.json({ data: rows[0] });
 }));
 
+// ═══ Meta ══════════════════════════════════════════════════════════════════
+//
+// The vocabulary, served rather than duplicated.
+//
+// The builder needs to know which fields a prescription type uses — that is
+// what makes the field set change when a trainer switches an exercise from
+// SETS_REPS to TIME_DISTANCE. Hard-coding that map in the frontend would put
+// a second copy of it in another repository, and the two would drift the
+// first time a type gained a field. The failure is quiet in the worst way:
+// the UI offers a field the API ignores, or hides one the API needs.
+//
+// So prescription.js stays the only definition and this endpoint publishes
+// it. Static per deploy, cacheable, and cheap.
+router.get('/meta', auth, STAFF, (_req, res) => {
+  res.json({
+    data: {
+      prescription_types: prescription.PRESCRIPTION_TYPES.map((type) => ({
+        type,
+        required: prescription.FIELDS[type].required,
+        optional: prescription.FIELDS[type].optional,
+        fields: prescription.fieldsFor(type),
+        logs_as: prescription.performanceKind(type),
+      })),
+      sections: prescription.SECTIONS,
+      progression_types: require('./progression').PROGRESSION_TYPES,
+      record_types: require('./records').RECORD_TYPES,
+      set_types: ['WARMUP', 'WORKING', 'BACKOFF', 'DROP', 'AMRAP', 'FAILURE', 'CUSTOM'],
+      cardio_types: [
+        'TREADMILL', 'RUNNING', 'CYCLING', 'STATIONARY_BIKE', 'ROWING', 'ELLIPTICAL',
+        'STAIRMASTER', 'SKI_ERG', 'SWIMMING', 'WALKING', 'HIIT', 'CIRCUIT', 'OTHER',
+      ],
+      units: { weight: ['kg', 'lb'], distance: ['m', 'km', 'mile'] },
+    },
+  });
+});
+
 // ═══ Records ═══════════════════════════════════════════════════════════════
 
 router.get('/records', auth, STAFF, wrap(async (req, res) => {
