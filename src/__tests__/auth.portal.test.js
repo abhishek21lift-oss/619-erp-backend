@@ -204,3 +204,75 @@ describe('the audit trail', () => {
     }
   });
 });
+
+describe('the Command Center door', () => {
+  // ── Why these post a real request ────────────────────────────────────────
+  //
+  // The platform door shipped broken. routes/auth.js understood
+  // portal:'platform', the frontend sent it, the TypeScript type allowed it —
+  // and lib/validation.js still declared z.enum(['staff','member']), so
+  // validate() answered 400 "Invalid request" before the handler ran. The new
+  // sign-in page was unusable from the moment it deployed.
+  //
+  // Every test covering the platform door asserted on the handler's SOURCE
+  // (`expect(src).toMatch(/portal === 'platform'/)`), which is true of code
+  // that never executes. These go through the mounted router, so the schema
+  // and the handler cannot drift apart again without something failing.
+
+  it('accepts portal=platform through the request validator', () => {
+    // The regression itself, stated as narrowly as possible: whatever the
+    // outcome of the sign-in, it must not be a schema rejection.
+    pool.query.mockResolvedValueOnce({ rows: [row('super_admin', { organization_id: null })] });
+    pool.query.mockResolvedValue({ rows: [] });
+    return signIn({ portal: 'platform' }).then((res) => {
+      expect(res.status).not.toBe(400);
+      expect(res.body?.error?.code).not.toBe('VALIDATION');
+    });
+  });
+
+  it('signs a platform operator in', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [row('super_admin', { organization_id: null })] });
+    pool.query.mockResolvedValue({ rows: [] });
+    const res = await signIn({ portal: 'platform' });
+    expect(res.status).toBe(200);
+    expect(res.body.user.role).toBe('super_admin');
+  });
+
+  it('refuses a studio account at the Command Center door', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [row('admin')] });
+    pool.query.mockResolvedValue({ rows: [] });
+    const res = await signIn({ portal: 'platform' });
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('WRONG_PORTAL');
+    expect(res.body.error.portal).toBe('staff');
+  });
+
+  it('refuses a client at the Command Center door, pointing at the member door', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [row('member')] });
+    pool.query.mockResolvedValue({ rows: [] });
+    const res = await signIn({ portal: 'platform' });
+    expect(res.status).toBe(403);
+    expect(res.body.error.portal).toBe('member');
+  });
+
+  it('rejects a portal nobody implements, rather than silently treating it as staff', async () => {
+    // The other side of widening the enum: it must widen by exactly one value.
+    const res = await signIn({ portal: 'nonsense' });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('VALIDATION');
+  });
+
+  it('still accepts every door the schema declares', async () => {
+    // Guards the specific failure mode: a value the handler knows about that
+    // the schema has never heard of. Posting each one proves the two agree.
+    for (const portal of ['staff', 'member', 'platform']) {
+      pool.query.mockReset();
+      pool.query.mockResolvedValueOnce({ rows: [] });   // no such user
+      pool.query.mockResolvedValue({ rows: [] });
+      const res = await signIn({ portal });
+      // 401 (unknown email) is fine — it means the request got PAST validation
+      // and into the handler, which is the only thing being asserted here.
+      expect([portal, res.body?.error?.code]).not.toEqual([portal, 'VALIDATION']);
+    }
+  });
+});
