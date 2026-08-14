@@ -186,6 +186,37 @@ describe('records — what counts, and which way is better', () => {
     expect(maxWeight.value).toBe(100);
   });
 
+  test('a repeated set does not read as beating itself', () => {
+    // personal_records.value is NUMERIC(12,3). An Epley estimate of 110 × 5 is
+    // 128.33333…, the column keeps 128.333, and an unrounded comparison finds
+    // the full-precision estimate BEATS the value it produced last time. The
+    // client is congratulated on a new one-rep max for repeating the same set,
+    // every session, forever, and the record backfill never converges.
+    const [win] = records.selectImprovements(
+      records.candidatesFromSets([set({ actual_weight: 110, actual_reps: 5 })])
+        .filter((c) => c.record_type === 'BEST_1RM_ESTIMATE'),
+      new Map(),
+    );
+    // What is written is what the column can hold...
+    expect(win.value).toBe(128.333);
+
+    // ...so reading it back and trying again finds nothing to improve.
+    const held = new Map([[records.recordKey(win), win.value]]);
+    const again = records.selectImprovements(
+      records.candidatesFromSets([set({ actual_weight: 110, actual_reps: 5 })])
+        .filter((c) => c.record_type === 'BEST_1RM_ESTIMATE'),
+      held,
+    );
+    expect(again).toEqual([]);
+  });
+
+  test('a real improvement smaller than the stored precision is still ignored', () => {
+    // Half a gram is not a personal best. Anything the column cannot represent
+    // must not count, or the same non-convergence returns by another route.
+    expect(records.isImprovement('MAX_WEIGHT', 100.0001, 100)).toBe(false);
+    expect(records.isImprovement('MAX_WEIGHT', 100.002, 100)).toBe(true);
+  });
+
   test('a heavy set carries the reps that qualify it', () => {
     // 100kg × 1 and 100kg × 5 are different records.
     const out = records.candidatesFromSets([set({ actual_weight: 120, actual_reps: 3 })]);
