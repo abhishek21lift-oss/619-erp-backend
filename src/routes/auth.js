@@ -15,6 +15,7 @@ const logger = require('../lib/logger');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { requireSuperAdmin } = require('../middleware/tenant');
+const platformAuth = require('../middleware/platformAuth');
 const { validate } = require('../middleware/validate');
 const { authSchemas } = require('../lib/validation');
 // Security Centre: one row per attempt. Fire-and-forget by design — see
@@ -47,14 +48,49 @@ function setRefreshCookie(res, rawToken) {
   });
 }
 
-async function issueRefreshToken(res, userId) {
+/**
+ * Mint an access token for `userId` on a given plane.
+ *
+ * Every access token in this file goes through here so that the audience
+ * cannot be forgotten at one of the four mint sites. `audience` is null for a
+ * legacy session being refreshed (migration 162), and a null claim is omitted
+ * rather than written, so those tokens keep exactly the shape they had.
+ */
+function signAccessToken(userId, tokenVersion, audience) {
+  const payload = { id: userId, token_version: tokenVersion };
+  if (audience) payload.aud = audience;
+  return jwt.sign(payload, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || '15m',
+  });
+}
+
+async function issueRefreshToken(res, userId, audience = null) {
   const rawToken = crypto.randomBytes(48).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
-  await pool.query(
-    'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
-    [userId, tokenHash, expiresAt]
-  );
+  // The audience rides on the refresh token because it is a property of the
+  // SESSION, and the refresh token is the only part of a session that outlives
+  // fifteen minutes. See migration 162.
+  //
+  // Falls back to the pre-162 shape on undefined_column. Migrations run at
+  // boot, so this window is narrow, but it covers the deployment where the new
+  // code is live for the seconds before its migration lands — and the cost of
+  // not covering it is that nobody can sign in during those seconds.
+  try {
+    await pool.query(
+      'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, audience) VALUES ($1, $2, $3, $4)',
+      [userId, tokenHash, expiresAt, audience]
+    );
+  } catch (err) {
+    if (err && err.code === '42703') {
+      await pool.query(
+        'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+        [userId, tokenHash, expiresAt]
+      );
+    } else {
+      throw err;
+    }
+  }
   setRefreshCookie(res, rawToken);
   // Returned (not just cookied) so mobile/native clients — which don't share
   // a browser cookie jar — can store it themselves and send it back via
@@ -146,8 +182,53 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // app on /api/v1/auth/login, a saved bookmark, the operator portal —
     // behaves exactly as it did. A member has never been able to sign in
     // through any of those, so nothing that works today changes.
-    const portal = req.body.portal === 'member' ? 'member' : 'staff';
+    //
+    // ── The third door ──
+    //
+    // 'platform' is the Command Center sign-in. It is a separate door for the
+    // same reason the member one is: the screens merely LOOKING separate is
+    // not separation, because the same POST works from either page or from
+    // curl. What it adds over the other two is that the door now decides the
+    // session's AUDIENCE — a token minted here may drive the control plane, a
+    // token minted at the studio door may not, whatever role the account
+    // holds. See middleware/platformAuth.js.
+    const requestedPortal = req.body.portal;
+    const portal = requestedPortal === 'member' ? 'member'
+      : requestedPortal === 'platform' ? 'platform'
+        : 'staff';
     const isMemberAccount = user.role === 'member';
+    const isPlatformAccount = user.role === 'super_admin';
+
+    if (portal === 'platform' && !isPlatformAccount) {
+      loginEvents.record(req, {
+        outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
+        userId: user.id, orgId: user.organization_id,
+      });
+      return res.status(403).json({
+        error: { code: 'WRONG_PORTAL', portal: isMemberAccount ? 'member' : 'staff',
+          message: 'This is the Command Center sign-in. Use your studio login.' },
+      });
+    }
+
+    // A platform operator at the studio door.
+    //
+    // Refused only once PLATFORM_SESSION_ENFORCE is on, and the flag is what
+    // makes this shippable: today the operator signs in at /login like anyone
+    // else, and turning that into a 403 on deploy would lock them out of the
+    // console with an error they cannot clear. Until the flag flips they get a
+    // tenant-audience session here, which already cannot reach the control
+    // plane — so the boundary is real before the refusal is.
+    if (portal === 'staff' && isPlatformAccount && platformAuth.sessionEnforced()) {
+      loginEvents.record(req, {
+        outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
+        userId: user.id, orgId: user.organization_id,
+      });
+      return res.status(403).json({
+        error: { code: 'WRONG_PORTAL', portal: 'platform',
+          message: 'This is the studio sign-in. Use the Command Center to sign in as the platform operator.' },
+      });
+    }
+
     if (portal === 'member' && !isMemberAccount) {
       loginEvents.record(req, {
         outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
@@ -224,13 +305,15 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     });
 
     // ── Sign JWT ───────────────────────────────────────
+    // The audience is the door, not the role: an operator who signs in at the
+    // studio door gets a tenant session and cannot drive the control plane
+    // with it.
+    const audience = portal === 'platform'
+      ? platformAuth.AUD_PLATFORM
+      : platformAuth.AUD_TENANT;
     let token;
     try {
-      token = jwt.sign(
-        { id: user.id, token_version: user.token_version },
-        process.env.JWT_SECRET,
-        { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
-      );
+      token = signAccessToken(user.id, user.token_version, audience);
     } catch (jwtErr) {
       logger.error({ err: jwtErr.message }, 'JWT sign error');
       return res.status(500).json({ error: 'Token generation failed. Contact administrator.' });
@@ -239,7 +322,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     setTokenCookie(res, token);
     let refreshToken;
     try {
-      refreshToken = await issueRefreshToken(res, user.id);
+      refreshToken = await issueRefreshToken(res, user.id, audience);
     } catch (rfErr) {
       logger.warn({ err: rfErr.message }, 'refresh_token issue failed (non-critical, table may not exist yet)');
     }
@@ -292,33 +375,53 @@ router.post('/refresh', async (req, res) => {
 
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   try {
-    const { rows } = await pool.query(
-      `SELECT rt.user_id, u.token_version, u.is_active, u.deleted_at
-         FROM refresh_tokens rt
-         JOIN users u ON u.id = rt.user_id
-        WHERE rt.token_hash = $1
-          AND rt.expires_at > NOW()
-          AND rt.revoked_at IS NULL`,
-      [tokenHash]
-    );
+    // `audience` is selected so the refreshed session stays on the plane it
+    // was opened for. Without it a refresh would launder the audience — a
+    // studio-door session would come back fifteen minutes later as whatever
+    // this handler chose to stamp, and the boundary would survive exactly one
+    // token lifetime. Coalesced through a column check so this still runs on a
+    // database that has not applied 162 (the value is then always NULL, i.e.
+    // legacy, which is what such a database's sessions genuinely are).
+    let rows;
+    try {
+      ({ rows } = await pool.query(
+        `SELECT rt.user_id, rt.audience, u.token_version, u.is_active, u.deleted_at
+           FROM refresh_tokens rt
+           JOIN users u ON u.id = rt.user_id
+          WHERE rt.token_hash = $1
+            AND rt.expires_at > NOW()
+            AND rt.revoked_at IS NULL`,
+        [tokenHash]
+      ));
+    } catch (err) {
+      if (err && err.code === '42703') {
+        ({ rows } = await pool.query(
+          `SELECT rt.user_id, NULL::text AS audience, u.token_version, u.is_active, u.deleted_at
+             FROM refresh_tokens rt
+             JOIN users u ON u.id = rt.user_id
+            WHERE rt.token_hash = $1
+              AND rt.expires_at > NOW()
+              AND rt.revoked_at IS NULL`,
+          [tokenHash]
+        ));
+      } else {
+        throw err;
+      }
+    }
 
     if (!rows[0] || !rows[0].is_active || rows[0].deleted_at) {
       res.clearCookie('refresh_token', { httpOnly: true, secure: isProd, sameSite: 'strict', path: '/api/auth' });
       return res.status(401).json({ error: 'Invalid or expired refresh token' });
     }
 
-    const { user_id, token_version } = rows[0];
+    const { user_id, token_version, audience } = rows[0];
 
     // Rotate: revoke old token, issue new ones
     await pool.query('UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1', [tokenHash]);
 
-    const newAccessToken = jwt.sign(
-      { id: user_id, token_version },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
-    );
+    const newAccessToken = signAccessToken(user_id, token_version, audience);
     setTokenCookie(res, newAccessToken);
-    const newRefreshToken = await issueRefreshToken(res, user_id);
+    const newRefreshToken = await issueRefreshToken(res, user_id, audience);
 
     res.json(isMobile ? { ok: true, token: newAccessToken, refresh_token: newRefreshToken } : { ok: true });
   } catch (err) {
@@ -506,16 +609,18 @@ async function changePasswordHandler(req, res) {
       [hashed, req.user.id]
     );
     invalidateUserCache(req.user.id);
-    const newToken = jwt.sign(
-      { id: req.user.id, token_version: updated[0].token_version },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
-    );
+    // Same plane the caller is already on. Changing a password must not move a
+    // session between the control plane and the tenant app in either
+    // direction — silently upgrading one here would be a privilege escalation
+    // reachable from a password form, and silently downgrading it would sign
+    // the operator out of the console for changing their password.
+    const sessionAud = platformAuth.sessionAudience(req);
+    const newToken = signAccessToken(req.user.id, updated[0].token_version, sessionAud);
     setTokenCookie(res, newToken);
     // The caller's old refresh token was revoked by the statement above, along
     // with every other session's. This issues the replacement that keeps THIS
     // browser signed in.
-    try { await issueRefreshToken(res, req.user.id); } catch { /* non-critical */ }
+    try { await issueRefreshToken(res, req.user.id, sessionAud); } catch { /* non-critical */ }
     res.json({ message: 'Password changed successfully' });
   } catch (err) {
     logger.error({ err: err.message }, 'Change password error');

@@ -152,6 +152,18 @@ const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { auth, adminOnly }        = require('./middleware/auth');
 const { requireStaff, requireClient } = require('./middleware/rbac');
 const { requireSuperAdmin, requireSuperAdminMfa } = require('./middleware/tenant');
+const { requirePlatformOwner } = require('./middleware/platformAuth');
+
+// The control plane's guard chain, named once.
+//
+// requireSuperAdmin is the ROLE check and stays where it was; requirePlatformOwner
+// is the BOUNDARY — explicit grant (platform_owners, migration 161), platform
+// session audience, and no impersonation. Both, in that order, so the cheap
+// synchronous check refuses the common case before the grant lookup runs.
+//
+// Written as one array rather than repeated at each mount so the platform
+// surface cannot end up with two different definitions of who may reach it.
+const PLATFORM_GUARD = [auth, requireSuperAdmin, requireSuperAdminMfa, requirePlatformOwner];
 const { branchScope }            = require('./middleware/branch-scope');
 const { requireFeature }         = require('./lib/features');
 const { requireAiQuota }         = require('./lib/aiQuota');
@@ -571,12 +583,28 @@ app.use('/api/bookings',          require('./modules/bookings/bookings.routes'))
 // auto-granted to every self-serve trial signup) let any trial signup wipe
 // every tenant on the platform. This must be `requireSuperAdmin` +
 // `requireSuperAdminMfa`, matching every other platform-destructive route.
-app.use('/api/admin',             auth, requireSuperAdmin, requireSuperAdminMfa, require('./routes/admin-reset'));
+app.use('/api/admin',             ...PLATFORM_GUARD, require('./routes/admin-reset'));
 app.use('/api/debug',             auth, adminOnly, require('./routes/debug'));
 
-// Platform Super Admin portal (multi-tenant SaaS). Guarded at the mount with
-// auth + requireSuperAdmin — inaccessible to tenant admins and everyone else.
-app.use('/api/super-admin',       auth, requireSuperAdmin, requireSuperAdminMfa, require('./modules/platform/super-admin.routes'));
+// ── The Command Center API — the platform control plane ─────────────────────
+//
+// One router, mounted at two paths, guarded identically.
+//
+// `/api/platform` is the name the boundary actually has. `/api/super-admin`
+// names a ROLE, and naming a security boundary after one of the facts that
+// happens to satisfy it is how the two planes got conflated in the first
+// place: every reader who saw the path concluded the rule was "is this user a
+// super admin", which is precisely the single-string check migration 161 and
+// middleware/platformAuth.js exist to stop being the whole story.
+//
+// The old path stays mounted, and stays mounted indefinitely rather than
+// behind a deprecation window, because it is not only this repo's frontend
+// that calls it — the mobile client ships compiled URLs, and an operator's
+// bookmark is not something this repo can migrate. Both go through
+// PLATFORM_GUARD, so there is one boundary with two names, not two doors.
+const platformRoutes = require('./modules/platform/super-admin.routes');
+app.use('/api/platform',          ...PLATFORM_GUARD, platformRoutes);
+app.use('/api/super-admin',       ...PLATFORM_GUARD, platformRoutes);
 
 app.use('/api/modules',           require('./modules/operations/operations.routes'));
 

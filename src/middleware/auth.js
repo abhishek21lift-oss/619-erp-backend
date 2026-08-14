@@ -4,6 +4,7 @@ const pool = require('../db/pool');
 const { computeAccess } = require('../lib/subscription');
 const { resolveOrgId } = require('./tenant');
 const { runWithTenantContext } = require('../lib/tenant-context');
+const { platformSessionBlocked, TENANT_SESSION_REQUIRED } = require('./platformAuth');
 
 // Off by default — see TENANT-RLS-PLAN.md. Enabling this makes pool.js wrap
 // queries in a transaction that sets app.org_id for Postgres RLS to read; it
@@ -17,7 +18,12 @@ const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE === 'on';
 // its own profile, and the platform operator can always get in.
 const SUBSCRIPTION_ALLOWLIST = [
   '/api/auth', '/api/v1/auth', '/api/profile',
-  '/api/subscription', '/api/super-admin', '/api/health',
+  '/api/subscription', '/api/health',
+  // Both names for the control plane. A lapsed subscription is a TENANT
+  // state; the platform operator has no subscription and must never be
+  // billing-gated out of the console — least of all when the reason they are
+  // opening it is that somebody's billing is broken.
+  '/api/platform', '/api/super-admin',
 ];
 
 // Returns the blocking access decision when a tenant user's studio may not use
@@ -151,6 +157,32 @@ async function auth(req, res, next) {
     }
 
     req.user = user;
+
+    // Which plane this session was opened for — see middleware/platformAuth.js.
+    //
+    // Read off the token rather than derived from req.user.role, and that is
+    // the entire point: the role says what this account IS, the audience says
+    // which door it came through. Deriving one from the other would collapse
+    // them back into the single check the platform boundary exists to replace.
+    //
+    // `aud` is absent on every token minted before audiences existed, and null
+    // is carried through as null rather than defaulted, so platformAuth.js can
+    // tell "legacy session" from "tenant session" and treat them differently
+    // during rollout.
+    req.session = { aud: decoded.aud ?? null };
+
+    // A Command Center session may not act inside a studio.
+    //
+    // Enforced here, once, rather than mounted onto the ~45 tenant route
+    // mounts in server.js — a boundary that has to be remembered forty-five
+    // times is a boundary with a hole in it. denyPlatformSession classifies by
+    // path and treats anything it does not recognise as tenant surface, so a
+    // route added later is covered without being added to a list.
+    //
+    // Dormant until PLATFORM_SESSION_ENFORCE is on; see platformAuth.js.
+    if (platformSessionBlocked(req)) {
+      return res.status(403).json(TENANT_SESSION_REQUIRED);
+    }
 
     // Super-admin impersonation: the token carries an `imp` claim minted by the
     // platform portal. req.user is already the impersonated admin (loaded above),

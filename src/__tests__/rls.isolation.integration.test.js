@@ -340,10 +340,30 @@ describeIf('cross-tenant isolation, against a real database', () => {
       }
     });
 
-    it('leaves no table with RLS on and no policy, except the two unused agent_* tables', async () => {
+    it('leaves no table with RLS on and no policy, except the three that mean it', async () => {
       // The check that found this in the first place. A new table that lands
       // with the deny-all convention but no app_tenant policy goes quiet the
       // day DATABASE_URL points at app_tenant, and nothing else would say so.
+      //
+      // The exceptions are listed with their reasons because the two kinds are
+      // not the same, and an unexplained allow-list is how the next one gets
+      // waved through:
+      //
+      //   agent_audit_log, agent_tasks — unused. They carry organization_id
+      //     and WILL need a tenant policy the day something writes them. They
+      //     are here because they are empty, not because they are correct.
+      //
+      //   platform_owners (migration 161) — deliberate, and permanent. It is
+      //     the platform-authorization grant: it has no organization_id and
+      //     never will, because a platform owner belongs to no studio. There
+      //     is no tenant-scoping policy to write, and app_tenant reading zero
+      //     rows IS the intended behaviour rather than a table gone quiet.
+      //     Every legitimate read of it goes over the owner connection —
+      //     middleware/platformAuth.js wraps the lookup in runAsPlatform
+      //     precisely so that stays true even when the operator has an org
+      //     pinned.
+      const EXPECTED_NO_POLICY = ['agent_audit_log', 'agent_tasks', 'platform_owners'];
+
       const { rows } = await owner.query(
         `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
           WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity
@@ -352,7 +372,20 @@ describeIf('cross-tenant isolation, against a real database', () => {
                WHERE p.schemaname = 'public' AND p.tablename = c.relname
                  AND ('app_tenant' = ANY(p.roles) OR 'public' = ANY(p.roles)))
           ORDER BY 1`);
-      expect(rows.map((r) => r.relname)).toEqual(['agent_audit_log', 'agent_tasks']);
+      expect(rows.map((r) => r.relname)).toEqual(EXPECTED_NO_POLICY);
+    });
+
+    it('keeps app_tenant out of platform_owners entirely', async () => {
+      // The other half of the exception above. "No policy" is only safe if the
+      // tenant role also holds no table privilege — a GRANT plus a future
+      // permissive policy would open it, and this is the platform's own
+      // authorization table.
+      const { rows } = await owner.query(
+        `SELECT count(*)::int AS n
+           FROM information_schema.role_table_grants
+          WHERE table_schema = 'public' AND table_name = 'platform_owners'
+            AND grantee = 'app_tenant'`);
+      expect(rows[0].n).toBe(0);
     });
   });
 });
