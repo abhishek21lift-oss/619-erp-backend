@@ -265,7 +265,17 @@ function requestIdentifiers(block) {
 }
 
 const SCOPE_HELPERS = /tenantScope|orgIdOf|orgWhere|resolveOrgId|organization_id|orgClause|requireOrg|scope\.orgId|req\.orgId|isSuperAdmin/;
-const OWNERSHIP_GUARDS = /clientInOrg|findClientForRequest|loadOrderForCaller|planReadFilter|loadEditablePlan|requireSuperAdmin|assertClientInOrg/;
+// The training domain's guards (modules/training/authz.js) are the same shape
+// as the ones above: each loads the row through the caller's org — and, for a
+// non-admin trainer, through the client's trainer_id — and returns null when
+// it is not theirs, so the handler answers 404 having established scope.
+//
+// Adding names to this list weakens the check unless the guards really do that,
+// so they are not taken on trust: training.authz.test.js attacks each of them
+// across a studio boundary with real requests, and is mutation-checked —
+// removing the org predicate fails 4 of those tests, removing the trainer
+// predicate fails 2, and dropping the walk back to pt_clients fails 1.
+const OWNERSHIP_GUARDS = /clientInOrg|findClientForRequest|loadOrderForCaller|planReadFilter|loadEditablePlan|requireSuperAdmin|assertClientInOrg|authz\.(loadOwned|loadSession|loadPerformance|loadSet|loadCardio|canAccessClient)/;
 const IDENTITY_COLUMN = /\b(user_id|member_id|pt_client_id|uploaded_by|created_by|changed_by|submitted_by|actor_id)\b/i;
 
 /** Does the handler reach rows only through the caller's own identity? */

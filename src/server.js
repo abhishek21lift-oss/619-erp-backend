@@ -620,6 +620,15 @@ app.use('/api/workouts',          ...gate('programs'), require('./routes/workout
 // Builder it feeds — a studio with programmes always has the library, and one
 // without it has no use for either.
 app.use('/api/exercises',         ...gate('programs'), require('./routes/exercises'));
+
+// The new training domain (migrations 164-166). Mounted BESIDE /api/workouts
+// rather than over it: the old routes still serve production, and this slice
+// is additive so the two can run together while the UI is rebuilt. Slice G
+// repoints /api/workouts once nothing reads it.
+//
+// Same feature gate as the old one — a studio without 'programs' does not get
+// a degraded builder, it does not get the route.
+app.use('/api/training',          ...gate('programs'), require('./modules/training/training.routes'));
 app.use('/api/diet',              require('./routes/diet'));
 // '/api/biometric-attend' and '/api/webauthn' were mounted here: a second
 // check-in path (fingerprint / GPS) writing the same attendance_logs rows as
