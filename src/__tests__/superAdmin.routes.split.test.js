@@ -153,6 +153,11 @@ describe('super-admin API — the H-03 split', () => {
     'GET /support/tickets',
     'GET /support/tickets/:id',
     'GET /system-health',
+    // Added deliberately — the platform user directory (super-admin/users.js).
+    // Not part of the H-03 split; the console had no cross-tenant view of
+    // accounts at all, only per-studio ones reached through an organization.
+    'GET /users',
+    'GET /users/summary',
     'PATCH /announcements/:id',
     'PATCH /coupons/:id',
     'PATCH /features/:key',
