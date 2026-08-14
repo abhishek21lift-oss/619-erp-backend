@@ -18,6 +18,24 @@ const { buildRecovery } = require('./recovery');
 const { routedChat } = require('../../lib/ai/router');
 const { logActivity } = require('../../lib/activityLog');
 
+/**
+ * Where a client found the studio.
+ *
+ * A closed set for the same reason PAYMENT_METHODS below is one: this column
+ * exists to be grouped by — "how many clients did Instagram bring us last
+ * quarter" — and "Instagram", "instagram" and "IG" are three channels to a
+ * GROUP BY and one to a human. The labels are stored verbatim so a report
+ * needs no lookup table.
+ *
+ * Kept here rather than as a CHECK constraint in migration 163: adding an
+ * option should be a one-line change, not a migration that must be deployed
+ * strictly before the code that writes the new value.
+ */
+const CLIENT_SOURCES = [
+  'Walk-in', 'Instagram', 'WhatsApp', 'Referral',
+  'Existing Member', 'Google', 'Website', 'Other',
+];
+
 const ptClientCreateSchema = {
   body: z.object({
     name: z.string().min(1).max(255),
@@ -50,7 +68,12 @@ const ptClientCreateSchema = {
     occupation: z.string().max(100).optional().nullable(),
     emergency_contact: z.string().max(255).optional().nullable(),
     emergency_phone: z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable(),
+    emergency_contact_relationship: z.string().max(100).optional().nullable(),
     address: z.string().max(1000).optional().nullable(),
+    // Closed set — see CLIENT_SOURCES. Empty string is accepted and stored as
+    // NULL below, because "not answered" is a real state and an enum that
+    // rejects '' makes the form unsubmittable when the operator skips it.
+    client_source: z.enum(CLIENT_SOURCES).or(z.literal('')).optional().nullable(),
   }),
 };
 
@@ -326,6 +349,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
           goal, height, body_fat, health_conditions, injuries, frequency,
           pt_package_id,
           whatsapp, occupation, emergency_contact, emergency_phone, address,
+          emergency_contact_relationship, client_source,
         } = req.body;
 
     let cid = client_id;
@@ -349,12 +373,14 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
       const { rows: [newCli] } = await pool.query(`
         INSERT INTO pt_clients
           (name, gender, mobile, email, dob, status, joining_date,
-           whatsapp, occupation, emergency_contact, emergency_phone, address, organization_id)
-        VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8,$9,$10,$11,$12)
+           whatsapp, occupation, emergency_contact, emergency_phone, address,
+           emergency_contact_relationship, client_source, organization_id)
+        VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8,$9,$10,$11,$12,$13,$14)
         RETURNING id
       `, [
         name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date(),
         whatsapp || null, occupation || null, emergency_contact || null, emergency_phone || null, address || null,
+        emergency_contact_relationship || null, client_source || null,
         orgIdOf(req),
       ]);
       cid = newCli.id;
@@ -578,6 +604,7 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
        'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes',
        'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact','emergency_phone',
+       'emergency_contact_relationship','client_source',
        'goal','height','body_fat','health_conditions','injuries','frequency',
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week',
        'workout_experience_level','previous_trainer_experience',
@@ -591,6 +618,22 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
     if (!PAYMENT_METHODS.includes(String(req.body.payment_method))) {
       return res.status(400).json({
         error: { code: 'VALIDATION', message: `payment_method must be one of: ${PAYMENT_METHODS.join(', ')}` },
+      });
+    }
+  }
+
+  // Same treatment for the acquisition channel, and for the same reason: this
+  // route has no zod schema, so without this check the closed set enforced on
+  // create is bypassable by editing the client afterwards. '' clears it.
+  if (req.body.client_source !== undefined && req.body.client_source !== null) {
+    if (req.body.client_source === '') {
+      // Normalized rather than stored, so "not answered" is NULL here exactly
+      // as it is on create. Two representations of unanswered would mean every
+      // report needs to remember both.
+      req.body.client_source = null;
+    } else if (!CLIENT_SOURCES.includes(String(req.body.client_source))) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION', message: `client_source must be one of: ${CLIENT_SOURCES.join(', ')}` },
       });
     }
   }
