@@ -141,6 +141,76 @@ if (isProd && r2Set.length === 0) {
   process.exit(1);
 }
 
+// ── Security controls must be ON in production ──────────────────────────────
+//
+// Three controls ship dark behind an env flag so they can be rolled out
+// deliberately (see db/migrations/TENANT-RLS-PLAN.md). Each is read as an
+// exact `=== 'on'` comparison at the point of use — deliberately strict, so
+// that a typo, an empty string, "true", "1" or "ON" all read as OFF rather
+// than being coerced into ON by a truthiness check. That strictness is the
+// right call and is preserved verbatim here (`!== 'on'` is its negation).
+//
+// What was missing is the other half: nothing noticed when they were off. The
+// process booted clean, passed its health check and served traffic with the
+// tenant data-plane guard, the platform session audience check and the
+// operator MFA gate all silently disabled. A security control that fails open
+// on a missing environment variable is a control you cannot claim to have —
+// the deployment either carries it or the deployment does not start.
+//
+// Production only. Local development and CI keep working with the flags unset,
+// which is what makes them usable for the staging rollout the plan calls for.
+//
+// The message names the control and what it protects, never a value: no
+// secret, connection string or token is read or printed here.
+//
+// ── Before deploying with these set ─────────────────────────────────────────
+//
+// Each flag has a prerequisite, and turning one on without it is the outage
+// this check is meant to prevent — so they are stated here rather than in a
+// runbook nobody opens at 2am:
+//
+//   TENANT_RLS_ENFORCE      Safe to turn on as-is. Until DATABASE_URL points
+//                           at the app_tenant role (migration 157), this only
+//                           wraps queries in a set_config transaction; the
+//                           connecting role still owns the tables and bypasses
+//                           RLS, so nothing changes but latency. That is
+//                           exactly what measuring it in staging is for.
+//
+//   PLATFORM_SESSION_ENFORCE  Refuses platform tokens that carry no `aud`
+//                           claim. Operators holding a session issued before
+//                           migration 162 are signed out and must log in
+//                           again — recoverable, but do it knowingly.
+//
+//   SUPER_ADMIN_REQUIRE_MFA The operator must have MFA enabled FIRST
+//                           (user_profiles.mfa_enabled), or the platform
+//                           console answers MFA_SETUP_REQUIRED to the only
+//                           account that can reach it. The enrolment routes
+//                           under /api/profile/mfa are never gated, so this
+//                           is a lockout to recover from, not a deadlock —
+//                           but it is still a lockout. Verify before enabling.
+const SECURITY_FLAGS = [
+  ['TENANT_RLS_ENFORCE', 'per-request tenant scoping of the data plane (app.org_id)'],
+  ['PLATFORM_SESSION_ENFORCE', 'platform session audience checks on operator tokens'],
+  ['SUPER_ADMIN_REQUIRE_MFA', 'two-factor requirement on the platform admin console'],
+];
+
+if (isProd) {
+  const disabled = SECURITY_FLAGS
+    .filter(function(f) { return process.env[f[0]] !== 'on'; })
+    .map(function(f) { return { flag: f[0], protects: f[1] }; });
+
+  if (disabled.length) {
+    logger.fatal(
+      { disabled },
+      'Refusing to start: security controls are not enabled in production. '
+      + 'Each listed flag must be set to exactly "on". '
+      + 'See the header of src/server.js for what each one requires before it is turned on — '
+      + 'SUPER_ADMIN_REQUIRE_MFA in particular needs the operator to have MFA enabled first.'
+    );
+    process.exit(1);
+  }
+}
+
 const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
