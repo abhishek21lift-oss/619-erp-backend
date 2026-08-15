@@ -230,7 +230,14 @@ router.get('/:id', auth, async (req, res, next) => {
     }
 
     // Member role can only see their own record.
-    if (req.user.role === 'member' && rows[0].id !== req.user.member_id) {
+    //
+    // Compared against pt_client_id: the row above is selected FROM pt_clients,
+    // and users.pt_client_id is the column that references that table.
+    // member_id points at the legacy `clients` table and is NULL on every real
+    // client account, so this compared a pt_clients id against NULL and 404'd
+    // a client asking for their own record. It fails closed, so it locked
+    // people out rather than letting anyone in — but it did lock them out.
+    if (req.user.role === 'member' && rows[0].id !== req.user.pt_client_id) {
       return res.status(404).json({ error: 'Client not found' });
     }
 

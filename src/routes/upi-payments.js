@@ -222,18 +222,33 @@ function sendPaymentError(res, err) {
 /**
  * Load an order the caller is entitled to see.
  *
- * Members are restricted to their own member_id. A member asking for someone
- * else's order gets 404, not 403 — 403 would confirm the order exists.
+ * Members are restricted to their own client record. A member asking for
+ * someone else's order gets 404, not 403 — 403 would confirm the order exists.
+ *
+ * ── Scoped by pt_client_id, not member_id ──────────────────────────────
+ *
+ * These are two different id spaces and this table is in the second one:
+ *
+ *   payment_orders.client_id  → pt_clients   (migration 112)
+ *   users.pt_client_id        → pt_clients   (migration 154)
+ *   users.member_id           → clients      (legacy v3, 0 rows)
+ *
+ * So filtering a pt_clients column by a clients-space id could only ever
+ * match nothing — and because member_id is NULL on every real client account
+ * (verified against production: the one live client account has pt_client_id
+ * set and member_id NULL), the guard below threw 404 for every client opening
+ * their own payment. Fails closed, so it was never a leak; it just meant the
+ * feature did not work for the people it is for.
  */
 async function loadOrderForCaller(req, orderId) {
   const orgId = requireOrg(req);
   const params = [orderId, orgId];
   let clause = '';
   if (req.user.role === 'member') {
-    if (!req.user.member_id) {
+    if (!req.user.pt_client_id) {
       throw new upi.PaymentError('NOT_FOUND', 'Payment not found', 404);
     }
-    params.push(req.user.member_id);
+    params.push(req.user.pt_client_id);
     clause = ` AND o.client_id = $${params.length}`;
   }
   const { rows } = await pool.query(
@@ -255,7 +270,9 @@ async function loadOrderForCaller(req, orderId) {
  * behalf (walk-in at the desk), which is why client_id is accepted at all.
  */
 async function resolveTargetClient(req, requestedClientId, orgId) {
-  const clientId = req.user.role === 'member' ? req.user.member_id : requestedClientId;
+  // pt_client_id, not member_id: the lookup below is against pt_clients, and
+  // member_id belongs to the legacy `clients` table. See loadOrderForCaller.
+  const clientId = req.user.role === 'member' ? req.user.pt_client_id : requestedClientId;
   if (!clientId) {
     throw new upi.PaymentError('NO_MEMBER', 'No member is linked to this account', 403);
   }
@@ -286,10 +303,20 @@ async function notify(userId, type, title, body, link) {
   }
 }
 
-/** The login attached to a member record, if there is one. */
+/**
+ * The login attached to a client record, if there is one.
+ *
+ * Matched on pt_client_id. Every caller passes a pt_clients id
+ * (order.client_id, result.member.id, rows[].client_id), and users.member_id
+ * references the legacy `clients` table — so this looked the id up in the
+ * wrong space and returned null every time. The result was not an error
+ * anywhere: notify() takes `if (!userId) return`, so every payment
+ * notification to a client was silently dropped, including the ones raised by
+ * admin-side verification.
+ */
 async function userIdForClient(clientId) {
   const { rows } = await pool.query(
-    `SELECT id FROM users WHERE member_id = $1 AND is_active = TRUE LIMIT 1`, [clientId]
+    `SELECT id FROM users WHERE pt_client_id = $1 AND is_active = TRUE LIMIT 1`, [clientId]
   );
   return rows[0]?.id || null;
 }
@@ -604,10 +631,11 @@ router.get('/history', auth, validate(schemas.history), wrap(async (req, res) =>
   const conditions = ['o.organization_id = $1'];
   const params = [orgId];
 
-  // A member sees only their own, whatever they ask for.
+  // A member sees only their own, whatever they ask for. pt_client_id, not
+  // member_id — o.client_id is a pt_clients id. See loadOrderForCaller.
   if (req.user.role === 'member') {
-    if (!req.user.member_id) return res.json({ data: [], total: 0 });
-    params.push(req.user.member_id);
+    if (!req.user.pt_client_id) return res.json({ data: [], total: 0 });
+    params.push(req.user.pt_client_id);
     conditions.push(`o.client_id = $${params.length}`);
   } else if (req.query.client_id) {
     params.push(req.query.client_id);
