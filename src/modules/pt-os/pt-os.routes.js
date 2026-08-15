@@ -1015,13 +1015,13 @@ router.get('/balance-sheet', auth, wrap(async (req, res) => {
 // ─── Commissions ────────────────────────────────────────────
 router.get('/commissions', auth, wrap(async (req, res) => {
   const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : req.query.trainer_id;
-  const rows = await svc.getCommissionHistory(trainerId);
+  const rows = await svc.getCommissionHistory(trainerId, tenantScope(req));
   res.json({ data: rows });
 }));
 
 router.post('/commissions/calculate', auth, adminOnly, wrap(async (req, res) => {
   const month = req.body.month || new Date().toISOString().slice(0, 7);
-  const result = await svc.calculateMonthlyCommissions(month);
+  const result = await svc.calculateMonthlyCommissions(month, tenantScope(req));
   res.json({ data: result });
 }));
 
@@ -1061,33 +1061,60 @@ router.put('/commissions/:trainerId', auth, adminOnly, wrap(async (req, res) => 
 // ─── Payouts ────────────────────────────────────────────────
 router.get('/payouts', auth, wrap(async (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
-  const rows = await svc.getTrainerPayouts(month);
+  const rows = await svc.getTrainerPayouts(month, tenantScope(req));
   res.json({ data: rows, month });
 }));
 
 router.post('/payouts', auth, adminOnly, wrap(async (req, res) => {
   const { trainer_id, month, deductions } = req.body;
-  const payout = await svc.createPayout(trainer_id, month, deductions || 0, req.user.id);
+  const payout = await svc.createPayout(trainer_id, month, deductions || 0, req.user.id, tenantScope(req));
   res.status(201).json({ data: payout });
 }));
 
 // Mark all pending payouts for a month as paid (MUST be before /:id/approve)
+//
+// Was a bare UPDATE over every studio's pt_payouts for the month — no
+// organization filter at all. An admin in any studio calling this marked
+// every other studio's pending payouts paid too. trainer_id is the only tie
+// back to a tenant (pt_payouts itself carries no organization_id), so the
+// filter is a subquery against pt_trainers, same pattern as markPayoutPaid.
 router.post('/payouts/mark-all-paid', auth, adminOnly, wrap(async (req, res) => {
   const month = req.body.month || new Date().toISOString().slice(0, 7);
   const monthStart = `${month}-01`;
+  const params = [monthStart];
+  const scope = tenantScope(req);
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND trainer_id IN (SELECT id FROM pt_trainers WHERE organization_id = $${params.length})`;
+  }
   const { rowCount } = await pool.query(
     `UPDATE pt_payouts SET status = 'paid', paid_at = NOW(), updated_at = NOW()
-     WHERE month = $1 AND status != 'paid'`,
-    [monthStart]
+     WHERE month = $1 AND status != 'paid'${orgClause}`,
+    params
   );
   res.json({ data: { updated: rowCount } });
 }));
 
 // Update payout status/amount for a specific trainer
+//
+// Had no role-tenant check on trainerId at all: any admin could rewrite any
+// other studio's payout by trainer id. Verify the trainer belongs to the
+// caller's org before touching pt_payouts; 404 rather than 403 to avoid
+// disclosing that a trainer id exists in another tenant, matching the
+// pattern used elsewhere in this file (see PUT /commissions/:trainerId).
 router.put('/payouts/:trainerId', auth, adminOnly, wrap(async (req, res) => {
   const { payout_status, paid_amount } = req.body;
   const month = req.query.month || req.body.month || new Date().toISOString().slice(0, 7);
   const monthStart = `${month}-01`;
+  const scope = tenantScope(req);
+  if (scope.applyFilter) {
+    const { rowCount } = await pool.query(
+      `SELECT 1 FROM pt_trainers WHERE id = $1 AND organization_id = $2`,
+      [req.params.trainerId, scope.orgId]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Trainer not found' } });
+  }
   const setParts = [];
   const vals = [];
   let idx = 1;
@@ -1109,7 +1136,8 @@ router.put('/payouts/:trainerId', auth, adminOnly, wrap(async (req, res) => {
 
 router.post('/payouts/:id/approve', auth, adminOnly, wrap(async (req, res) => {
   const { payment_method, payment_ref } = req.body;
-  const payout = await svc.markPayoutPaid(req.params.id, payment_method, payment_ref, req.user.id);
+  const payout = await svc.markPayoutPaid(req.params.id, payment_method, payment_ref, req.user.id, tenantScope(req));
+  if (!payout) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Payout not found' } });
   res.json({ data: payout });
 }));
 
