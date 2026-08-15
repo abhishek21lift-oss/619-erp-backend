@@ -14,6 +14,7 @@ const { generateSecret, verifySync } = require('otplib');
 const pool = require('../db/pool');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const { logActivity } = require('../lib/activityLog');
+const recovery = require('../lib/mfaRecoveryCodes');
 const logger = require('../lib/logger');
 const { saveFile, deleteFile } = require('../lib/fileStorage');
 const credentials = require('../lib/credentials');
@@ -770,7 +771,19 @@ router.post('/mfa/verify', mfaVerifyLimiter, async (req, res, next) => {
         WHERE user_id = $1`,
       [req.user.id]
     );
-    const recoveryCodes = Array.from({ length: 8 }, () => crypto.randomBytes(4).toString('hex').toUpperCase());
+    // Recovery codes are now STORED (hashed) and redeemable at login.
+    //
+    // They used to be eight random hex strings generated here, returned, and
+    // never written anywhere — while the dialog that shows them promises
+    // "each code can be used once to get back into your account". Nothing
+    // could check one, and login's validator rejected the format outright,
+    // so the promise was false twice over. For the platform super admin,
+    // whose second factor SUPER_ADMIN_REQUIRE_MFA makes mandatory, that was
+    // the difference between a lost phone and a lost platform.
+    //
+    // issueForUser replaces any previous set: re-enrolling is exactly when
+    // the old codes stop being trustworthy. See lib/mfaRecoveryCodes.js.
+    const recoveryCodes = await recovery.issueForUser(pool, req.user.id);
     await logActivity(req, 'profile.mfa.enable', 'user', req.user.id);
     res.json({ recoveryCodes });
   } catch (err) {
@@ -782,6 +795,10 @@ router.delete('/mfa', async (req, res, next) => {
   try {
     await ensureSchema();
     await pool.query('UPDATE user_profiles SET mfa_enabled = FALSE, mfa_secret = NULL, updated_at = NOW() WHERE user_id = $1', [req.user.id]);
+    // Codes outlive nothing. Leaving them behind would mean a re-enrolment
+    // later silently inherits credentials issued against a secret that no
+    // longer exists, and anyone holding an old printout keeps a way in.
+    await pool.query('DELETE FROM mfa_recovery_codes WHERE user_id = $1', [req.user.id]);
     await logActivity(req, 'profile.mfa.disable', 'user', req.user.id);
     res.json({ message: 'MFA disabled' });
   } catch (err) {
