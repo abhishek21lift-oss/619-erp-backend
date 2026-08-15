@@ -35,13 +35,28 @@
 //      for verification.
 //   3. Verifies the new hash actually validates the new password BEFORE
 //      writing, so a broken rotation cannot lock the account.
-//   4. Writes the hash and bumps token_version in ONE statement.
+//   4. Writes the hash, bumps token_version AND revokes every refresh token,
+//      in ONE statement.
 //
-// The token_version bump is not optional. middleware/auth.js compares a JWT's
-// token_version against the row and rejects a mismatch, so without it every
-// session issued under the old password keeps working — which is the entire
-// point of rotating after an exposure. Anyone holding a token minted from the
-// leaked hash is signed out the moment this runs.
+// ── Why all three, and why one statement ────────────────────────────────
+//
+// Bumping token_version alone is NOT enough, and an earlier version of this
+// script made exactly that mistake. middleware/auth.js compares a JWT's
+// token_version against the row, so the bump kills the 15-minute ACCESS
+// tokens — but refresh tokens live in their own table and POST /auth/refresh
+// never compares token_version. It checks only `is_active` and `deleted_at`,
+// then signs a NEW access token carrying whatever the current token_version
+// is. So a refresh token minted under the OLD password keeps minting valid
+// access tokens for its remaining 7 days, and rotation renews it each time.
+//
+// That is AUD-005, and routes/auth.js already solves it for
+// /auth/reset-password with the data-modifying CTE below. This mirrors it
+// rather than inventing a second answer.
+//
+// One statement, not two: the password write and the revocation have to
+// succeed or fail together. If the revoke were a separate query and it
+// failed, the password would already have changed while the attacker's
+// session survived — the precise bug this closes.
 //
 // ── After running ───────────────────────────────────────────────────────
 //
@@ -148,18 +163,35 @@ async function main() {
     return;
   }
 
+  // Password + token_version + refresh-token revocation, atomically. See the
+  // header: the bump alone leaves refresh tokens minting valid access tokens.
   const { rowCount } = await pool.query(
-    `UPDATE users
-        SET password = $1,
-            token_version = token_version + 1,
-            updated_at = NOW()
-      WHERE id = $2`,
+    `WITH pw AS (
+       UPDATE users
+          SET password = $1,
+              token_version = token_version + 1,
+              updated_at = NOW()
+        WHERE id = $2
+       RETURNING id
+     )
+     UPDATE refresh_tokens
+        SET revoked_at = NOW()
+      WHERE user_id = (SELECT id FROM pw)
+        AND revoked_at IS NULL`,
     [hash, target.id]
   );
 
-  if (rowCount !== 1) throw new Error(`Expected to update exactly 1 row, updated ${rowCount}.`);
+  // rowCount here is the refresh_tokens count — the CTE's UPDATE is the outer
+  // statement. Confirm the password actually changed by reading it back,
+  // rather than inferring it from a number that counts something else.
+  const { rows: after } = await pool.query(
+    'SELECT token_version FROM users WHERE id = $1', [target.id]
+  );
+  if (!after[0] || after[0].token_version !== target.token_version + 1) {
+    throw new Error('Password row did not update as expected — check the account and re-run.');
+  }
 
-  console.log('Password rotated and all existing sessions invalidated.');
+  console.log(`Password rotated. ${rowCount} refresh token(s) revoked; all existing sessions are dead.`);
   console.log('Next: enable MFA on this account before setting SUPER_ADMIN_REQUIRE_MFA=on.');
   console.log('See docs/SECURITY-INCIDENT-superadmin-credential.md for the remaining steps.');
 

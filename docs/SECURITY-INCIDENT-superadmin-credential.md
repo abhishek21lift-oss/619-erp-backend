@@ -116,11 +116,40 @@ Add `DRY_RUN=1` first if you want to see the target account and confirm the
 match before anything is written.
 
 The script refuses a weak password, verifies the new hash validates *before*
-writing it (so a broken rotation cannot lock the account), writes it, and
-**bumps `token_version`** — which is what actually signs out anyone already
-holding a session. `middleware/auth.js` compares the JWT's `token_version`
-against the row and rejects a mismatch, so every token minted under the old
-password stops working the moment this runs.
+writing it (so a broken rotation cannot lock the account), then writes the
+password, bumps `token_version`, **and revokes every refresh token** — all in
+one statement.
+
+**All three matter, and the first version of this script got it wrong.**
+Bumping `token_version` kills the 15-minute *access* tokens, because
+`middleware/auth.js` compares the JWT's version against the row. But refresh
+tokens live in their own table and **`POST /auth/refresh` never compares
+`token_version`** — it checks only `is_active` and `deleted_at`, then signs a
+new access token carrying whatever the current version is. A refresh token
+minted under the *old* password therefore keeps minting valid access tokens
+for its remaining 7 days, and rotation renews it each time.
+
+That is finding AUD-005, which `routes/auth.js` already solves for
+`/auth/reset-password` with a data-modifying CTE. The script now mirrors that
+statement rather than inventing a second answer.
+
+> **If you rotated with a version of this script from before that fix, or by
+> running an `UPDATE users` by hand, you are not done.** The password changed
+> and access tokens died, but pre-rotation refresh tokens are still live. Run
+> the script again (a second rotation is harmless), or revoke them directly:
+>
+> ```sql
+> UPDATE refresh_tokens SET revoked_at = NOW()
+>  WHERE user_id = 'usr-superadmin-001' AND revoked_at IS NULL;
+> ```
+>
+> Check what is outstanding first:
+>
+> ```sql
+> SELECT count(*) FROM refresh_tokens
+>  WHERE user_id = 'usr-superadmin-001'
+>    AND revoked_at IS NULL AND expires_at > NOW();
+> ```
 
 Generate the password with a manager, not by hand. It is the platform
 administrator credential for six businesses' data.
