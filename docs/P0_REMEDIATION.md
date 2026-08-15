@@ -144,13 +144,33 @@ already query. Full non-DB-dependent test suite is green.
 
 ---
 
-## Remaining phases
+## All phases — status
 
-Not yet started: Phase 1 (DR docs), Phase 3 (leave_requests migration),
-Phase 4 (super-admin credential exposure — needs live verification and is a
-live-credential change, flagged for explicit go-ahead), Phase 5 (fail-closed
-security flags), Phase 6 (RLS/BYPASSRLS role audit — flagged, changes DB
-role architecture), Phase 8 (member_id/pt_client_id audit), Phase 9
-(CI/CD — nested `workflows/workflows/deploy.yml` confirmed present, not yet
-investigated), Phase 10 (regression suite), Phase 12 (performance), Phase
-14–16 (final integrity check, audit, report).
+The full write-up, with before / verification / fix / migration / test /
+result / security impact / regression risk per finding, plus the scorecard
+and the GO/NO-GO call, is in **`docs/P0_REMEDIATION_FINAL.md`**. This table
+is the index.
+
+| Phase | Status | Where |
+|---|---|---|
+| 0 — Safety checkpoint | Done | Above |
+| 1 — Backup / recovery | **No backups existed at all** (free plan). Script added and verified end to end; **not yet scheduled anywhere** | `DISASTER-RECOVERY.md` |
+| 2 — `mark-all-paid` isolation | Fixed, tested | Above · FINAL §1 |
+| 3 — `leave_requests` tenancy | Fixed. Migration `168`, proven against a real database. **Not yet applied to production** | FINAL §3 |
+| 4 — Super-admin credential | **Contained in the tree; rotation is outstanding and is the operator's action** | `SECURITY-INCIDENT-superadmin-credential.md` |
+| 5 — Fail-closed flags | Fixed, verified by booting the server | FINAL §5 |
+| 6 — RLS / BYPASSRLS | Confirmed. `app_tenant` already exists in production and is correctly configured; the cutover is an operator action | FINAL §6 |
+| 7 — Commission/payout services | Fixed — the gap was the whole surface, not one route | FINAL §2 |
+| 8 — `member_id` / `pt_client_id` | Fixed in 3 files, 1 latent corrected. The prompt's hypothesis was wrong for `payments.js` | FINAL §7 |
+| 9 — CI/CD | Nested workflow was **inert**, not a live bypass. The real gap was `continue-on-error` on the isolation suite | FINAL §8 |
+| 10 — Isolation suite | Extended 8 → 23 tests, now blocking | FINAL §9 |
+| 11 — Testing gate | 2130/2131 backend · 1566/1566 frontend · 23/23 E2E | FINAL |
+| 12 — Performance | M-09 done · H-11 not reproduced · H-12 and M-10 not attempted | FINAL §11 |
+| 14 — Data integrity | 10 checks against production, all clean | FINAL §10 |
+| 15 — Independent re-audit | No new unscoped tenant operations found | FINAL |
+| 16 — Final report | Done | `P0_REMEDIATION_FINAL.md` |
+
+**Production status: 🔴 NO-GO**, for two reasons no commit can fix: the live
+super-admin credential is published in a public repository and still valid,
+and six studios' data has no backup. Both are operator actions. See the top
+of `P0_REMEDIATION_FINAL.md`.
