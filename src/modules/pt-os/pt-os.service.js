@@ -23,8 +23,17 @@ async function calculateMonthlyCommissions(month, scope = {}) {
       AND c.status IN ('active','frozen')
       AND c.trainer_id IS NOT NULL
       AND c.pt_start_date IS NOT NULL
-      AND (c.pt_end_date IS NULL OR NULLIF(c.pt_end_date, '')::DATE >= $1::DATE)
-      AND c.pt_start_date <= $2
+      -- NULLIF(c.pt_end_date, '') here made this endpoint 500 unconditionally.
+      -- pt_end_date is a DATE column, so Postgres has to coerce the '' literal
+      -- to date to type the NULLIF, and that fails at plan time — before any
+      -- row is examined, so it errored even with nothing to calculate:
+      --   invalid input syntax for type date: ""
+      -- The idiom belongs to a TEXT column (getActiveClients still reads
+      -- pt_end_date::TEXT != '' because it handles both shapes); this one was
+      -- left behind when the column became a date, and a NULL end date is
+      -- already covered by the IS NULL arm. Found by the E2E isolation suite.
+      AND (c.pt_end_date IS NULL OR c.pt_end_date >= $1::DATE)
+      AND c.pt_start_date <= $2::DATE
       AND c.monthly_pt_amount > 0${orgClause}
   `, params);
 

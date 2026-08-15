@@ -30,6 +30,9 @@ const FIXTURE = {
     clientName: 'ALPHA-ONLY-CLIENT',
     clientMobile: '9000000001',
     amount: 11111,
+    payoutId: 'pyt-e2e-alpha',
+    commissionId: 'cmm-e2e-alpha',
+    leaveId: 'lv-e2e-alpha',
   },
   b: {
     orgId: ORG_B,
@@ -42,6 +45,9 @@ const FIXTURE = {
     clientName: 'BRAVO-ONLY-CLIENT',
     clientMobile: '9000000002',
     amount: 22222,
+    payoutId: 'pyt-e2e-bravo',
+    commissionId: 'cmm-e2e-bravo',
+    leaveId: 'lv-e2e-bravo',
   },
 };
 
@@ -97,6 +103,49 @@ async function seedStudio(s, hash) {
      ON CONFLICT (id) DO NOTHING`,
     [`pay-e2e-${s.orgName.split(' ')[0].toLowerCase()}`, s.clientId, s.trainerId,
      s.amount, `RCPT-${s.orgName.split(' ')[0].toUpperCase()}`, s.orgId]
+  );
+
+  // ── Money and staffing rows the isolation suite attacks ────────────────
+  //
+  // pt_trainers is a separate table from trainers and is what the payout and
+  // commission queries join; the two share a primary key by migration 018's
+  // seed, so the same id is the same person.
+  await pool.query(
+    `INSERT INTO pt_trainers (id, name, status, organization_id, incentive_rate, created_at, updated_at)
+     VALUES ($1, $2, 'active', $3, 0.10, NOW(), NOW())
+     ON CONFLICT (id) DO UPDATE SET organization_id = EXCLUDED.organization_id`,
+    [s.trainerId, s.trainerName, s.orgId]
+  );
+
+  // A PENDING payout, so POST /payouts/mark-all-paid has something to move.
+  // Before the tenant filter landed, one studio calling it marked the other
+  // studio's row paid too — which is exactly what the suite now asserts
+  // cannot happen, by reading B's status back after A has called it.
+  await pool.query(
+    `INSERT INTO pt_payouts (id, trainer_id, trainer_name, month, total_commission,
+                             deductions, net_amount, status, created_at, updated_at)
+     VALUES ($1, $2, $3, date_trunc('month', CURRENT_DATE)::DATE, $4, 0, $4, 'pending', NOW(), NOW())
+     ON CONFLICT (id) DO UPDATE SET status = 'pending', paid_at = NULL`,
+    [s.payoutId, s.trainerId, s.trainerName, s.amount]
+  );
+
+  await pool.query(
+    `INSERT INTO pt_commissions (id, trainer_id, trainer_name, client_id, client_name,
+                                 month, commission_amt, incentive_rate, status, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, date_trunc('month', CURRENT_DATE)::DATE, $6, 0.10, 'pending', NOW(), NOW())
+     ON CONFLICT (id) DO NOTHING`,
+    [s.commissionId, s.trainerId, s.trainerName, s.clientId, s.clientName, s.amount]
+  );
+
+  // A PENDING leave request. leave_requests gained organization_id in
+  // migration 168; before it, any studio's admin could approve or reject
+  // another studio's trainer's leave by id.
+  await pool.query(
+    `INSERT INTO leave_requests (id, trainer_id, leave_type, from_date, to_date,
+                                 reason, status, organization_id, created_at, updated_at)
+     VALUES ($1, $2, 'sick', CURRENT_DATE, CURRENT_DATE + 1, $3, 'pending', $4, NOW(), NOW())
+     ON CONFLICT (id) DO UPDATE SET status = 'pending', approved_by = NULL, approved_at = NULL`,
+    [s.leaveId, s.trainerId, `${s.orgName} leave reason`, s.orgId]
   );
 }
 
