@@ -19,12 +19,33 @@
 -- the Control Centre. Guarding on the old address makes this a one-time
 -- move rather than a recurring reset.
 --
--- ── The password is a hash, and only a hash ─────────────────────────────
+-- ── The password is now a LOCKED PLACEHOLDER, not a credential ──────────
 --
--- bcrypt, cost 12, generated with the app's own bcryptjs — the same
--- parameters as POST /users/:id/reset-password, so this account is not a
--- special case for verification. The plaintext was delivered out of band
--- and is not in git, following 091.
+-- This said: "bcrypt, cost 12 … the plaintext was delivered out of band and
+-- is not in git, following 091." Both halves were true and both missed the
+-- risk. A bcrypt hash is not a public value — it is an offline-crackable
+-- copy of the credential — and this repository has been public, so the hash
+-- committed here published the live platform administrator's password to
+-- anyone who cloned it. It was verified during the P0 remediation as
+-- byte-identical to the hash still in production, on an active account with
+-- cross-tenant authority over every studio and MFA disabled.
+--
+-- The hash is replaced with a syntactically valid bcrypt string whose salt
+-- and digest are '.' padding, which no input produces, so this UPDATE now
+-- LOCKS the account rather than setting a known password on it. On a
+-- database where this migration has already run — production included — the
+-- edit changes nothing: the WHERE clause matches the OLD address and stops
+-- matching after the first run, which is the one-time-move property
+-- described above. It affects only databases built from scratch, which
+-- should not come up carrying a known-good platform credential anyway.
+--
+-- Set a password out of band with:
+--   node scripts/rotate-super-admin-password.js
+--
+-- Redacting this file does NOT un-publish the old hash: it remains in the
+-- git history of a repository that was public, so it must be assumed
+-- captured and crackable at leisure. Rotation is what removes its value.
+-- See docs/SECURITY-INCIDENT-superadmin-credential.md.
 --
 -- token_version is bumped for the same reason the reset-password route
 -- bumps it: middleware/auth.js compares the JWT's token_version against
@@ -59,7 +80,7 @@ BEGIN
 
   UPDATE public.users
      SET email         = 'abhishek@myptstudio.com',
-         password      = '$2a$12$S3lHdOXV9dS/5iYRrpaDi.r2KFFe90lioV26QK.LCh8hzsYu2BNJ.',
+         password      = '$2a$12$.....................................................',
          token_version = token_version + 1,
          updated_at    = now()
    WHERE role = 'super_admin'

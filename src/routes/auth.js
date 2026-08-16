@@ -21,6 +21,7 @@ const { authSchemas } = require('../lib/validation');
 // Security Centre: one row per attempt. Fire-and-forget by design — see
 // lib/loginEvents.js. Nothing below awaits it, and it cannot fail a login.
 const loginEvents = require('../lib/loginEvents');
+const recovery = require('../lib/mfaRecoveryCodes');
 const { sendPasswordReset } = require('../lib/email');
 
 const isProd = process.env.NODE_ENV === 'production';
@@ -279,8 +280,22 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
           });
           return res.status(401).json({ error: 'MFA code required', mfaRequired: true });
         }
-        const mfaOk = /^\d{6}$/.test(code)
+        // A 6-digit TOTP from the authenticator, OR a one-time recovery code
+        // for the case these exist to cover: the authenticator is gone.
+        //
+        // Recovery codes were unusable before this. They were minted at
+        // enrolment, never stored, and rejected here anyway because the only
+        // accepted shape was /^\d{6}$/ — so the "get back into your account"
+        // promise in the enrolment dialog could not be kept. redeem() spends
+        // the code atomically (see lib/mfaRecoveryCodes.js); TOTP is tried
+        // first so the ordinary path costs no extra query.
+        let mfaOk = /^\d{6}$/.test(code)
           && verifySync({ secret: mfaSecret, token: code, strategy: 'totp', epochTolerance: 30 }).valid;
+        let usedRecoveryCode = false;
+        if (!mfaOk && recovery.looksLikeRecoveryCode(code)) {
+          mfaOk = await recovery.redeem(pool, user.id, code);
+          usedRecoveryCode = mfaOk;
+        }
         if (!mfaOk) {
           // A wrong second factor against a CORRECT password is the loudest
           // signal in this table: the password is already compromised.
@@ -289,6 +304,18 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
             userId: user.id, orgId: user.organization_id,
           });
           return res.status(401).json({ error: 'Invalid MFA code', mfaRequired: true });
+        }
+        if (usedRecoveryCode) {
+          // Worth a line of its own. Spending a recovery code means the
+          // operator has lost their authenticator — or somebody else has a
+          // printout. Either way it is the one login worth reading later,
+          // and the remaining count is what says how close the account is to
+          // having no way back in at all.
+          const left = await recovery.remainingForUser(pool, user.id).catch(() => null);
+          logger.warn(
+            { userId: user.id, role: user.role, remaining: left },
+            'mfa_recovery_code_used — second factor satisfied by a recovery code, not the authenticator'
+          );
         }
       } else {
         mfaSetupRequired = true;

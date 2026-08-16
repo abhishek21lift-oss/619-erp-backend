@@ -25,8 +25,22 @@ function requireSelfOrRole(...roles) {
     if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH', message: 'Not authenticated' } });
     if (roles.includes(req.user.role)) return next();
 
-    // For members: id in URL must match their member_id
-    if (req.user.role === 'member' && req.params.id && req.params.id === req.user.member_id) {
+    // For members: the id in the URL must be one of their own client links.
+    //
+    // Both columns are checked because they are different id spaces and which
+    // one applies depends on the route this ends up mounted on:
+    // users.pt_client_id references pt_clients (the live model) and
+    // users.member_id references the legacy, empty `clients` table. Matching
+    // member_id alone would deny every real client account, because member_id
+    // is NULL on all of them.
+    //
+    // This factory is currently mounted nowhere — verified by search — so
+    // that is a latent trap rather than a live defect. Corrected here so that
+    // wiring it up does not silently 403 the people it exists to admit.
+    if (
+      req.user.role === 'member' && req.params.id
+      && (req.params.id === req.user.pt_client_id || req.params.id === req.user.member_id)
+    ) {
       return next();
     }
     return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot access this resource' } });

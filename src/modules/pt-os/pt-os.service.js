@@ -1,12 +1,18 @@
 const pool = require('../../db/pool');
 const { today: studioToday, todayShortDay: studioShortDay } = require('../../lib/appTime');
 
-async function calculateMonthlyCommissions(month) {
+async function calculateMonthlyCommissions(month, scope = {}) {
   const monthStart = `${month}-01`;
   const mStart = new Date(monthStart + 'T00:00:00Z');
   const mEnd = new Date(mStart.getFullYear(), mStart.getMonth() + 1, 1);
   const mEndStr = mEnd.toISOString().slice(0, 10);
 
+  const params = [mStart.toISOString().slice(0, 10), mEndStr];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND c.organization_id = $${params.length}`;
+  }
   const { rows: clients } = await pool.query(`
     SELECT c.id, c.name, c.trainer_id, c.trainer_name,
            c.monthly_pt_amount, c.trainer_commission,
@@ -17,10 +23,19 @@ async function calculateMonthlyCommissions(month) {
       AND c.status IN ('active','frozen')
       AND c.trainer_id IS NOT NULL
       AND c.pt_start_date IS NOT NULL
-      AND (c.pt_end_date IS NULL OR NULLIF(c.pt_end_date, '')::DATE >= $1::DATE)
-      AND c.pt_start_date <= $2
-      AND c.monthly_pt_amount > 0
-  `, [mStart.toISOString().slice(0, 10), mEndStr]);
+      -- NULLIF(c.pt_end_date, '') here made this endpoint 500 unconditionally.
+      -- pt_end_date is a DATE column, so Postgres has to coerce the '' literal
+      -- to date to type the NULLIF, and that fails at plan time — before any
+      -- row is examined, so it errored even with nothing to calculate:
+      --   invalid input syntax for type date: ""
+      -- The idiom belongs to a TEXT column (getActiveClients still reads
+      -- pt_end_date::TEXT != '' because it handles both shapes); this one was
+      -- left behind when the column became a date, and a NULL end date is
+      -- already covered by the IS NULL arm. Found by the E2E isolation suite.
+      AND (c.pt_end_date IS NULL OR c.pt_end_date >= $1::DATE)
+      AND c.pt_start_date <= $2::DATE
+      AND c.monthly_pt_amount > 0${orgClause}
+  `, params);
 
   const results = [];
   for (const cl of clients) {
@@ -45,8 +60,14 @@ async function calculateMonthlyCommissions(month) {
   return { count: results.length, total: results.reduce((s, r) => s + Number(r.commission_amt), 0) };
 }
 
-async function getTrainerPayouts(month) {
+async function getTrainerPayouts(month, scope = {}) {
   const monthStart = `${month}-01`;
+  const params = [monthStart];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND t.organization_id = $${params.length}`;
+  }
   const { rows } = await pool.query(`
     SELECT
       t.id AS trainer_id,
@@ -59,10 +80,10 @@ async function getTrainerPayouts(month) {
     FROM pt_trainers t
     LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
     LEFT JOIN pt_payouts pp ON pp.trainer_id = t.id AND pp.month = $1
-    WHERE t.deleted_at IS NULL AND t.status = 'active'
+    WHERE t.deleted_at IS NULL AND t.status = 'active'${orgClause}
     GROUP BY t.id, t.name, pp.net_amount, pp.status, pp.id
     ORDER BY total_commission DESC
-  `, [monthStart]);
+  `, params);
   return rows;
 }
 
@@ -224,12 +245,16 @@ async function getDashboardStats(scope = {}) {
   return { ...totals, trainers: trainerStats, revenueTrend };
 }
 
-async function getCommissionHistory(trainerId) {
+async function getCommissionHistory(trainerId, scope = {}) {
   const where = ['c.deleted_at IS NULL'];
   const params = [];
   if (trainerId) {
     params.push(trainerId);
     where.push(`pc.trainer_id = $${params.length}`);
+  }
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    where.push(`c.organization_id = $${params.length}`);
   }
   const { rows } = await pool.query(`
     SELECT pc.*, c.name AS client_name
@@ -242,17 +267,23 @@ async function getCommissionHistory(trainerId) {
   return rows;
 }
 
-async function createPayout(trainerId, month, deductions, processedBy) {
+async function createPayout(trainerId, month, deductions, processedBy, scope = {}) {
   const monthStart = `${month}-01`;
+  const params = [monthStart, trainerId];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND t.organization_id = $${params.length}`;
+  }
   const { rows: [commData] } = await pool.query(`
     SELECT
       t.name AS trainer_name,
       COALESCE(SUM(pc.commission_amt), 0) AS total_commission
     FROM pt_trainers t
     LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
-    WHERE t.id = $2 AND t.deleted_at IS NULL
+    WHERE t.id = $2 AND t.deleted_at IS NULL${orgClause}
     GROUP BY t.name
-  `, [monthStart, trainerId]);
+  `, params);
 
   if (!commData) throw new Error('Trainer not found');
 
@@ -275,7 +306,13 @@ async function createPayout(trainerId, month, deductions, processedBy) {
   return rows[0];
 }
 
-async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) {
+async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy, scope = {}) {
+  const params = [payoutId, paymentMethod, paymentRef, processedBy];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND trainer_id IN (SELECT id FROM pt_trainers WHERE organization_id = $${params.length})`;
+  }
   const { rows } = await pool.query(`
     UPDATE pt_payouts
     SET status = 'paid',
@@ -284,9 +321,9 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) 
         paid_at = NOW(),
         processed_by = COALESCE($4, processed_by),
         updated_at = NOW()
-    WHERE id = $1
+    WHERE id = $1${orgClause}
     RETURNING *
-  `, [payoutId, paymentMethod, paymentRef, processedBy]);
+  `, params);
 
   if (rows.length > 0) {
     const payout = rows[0];
