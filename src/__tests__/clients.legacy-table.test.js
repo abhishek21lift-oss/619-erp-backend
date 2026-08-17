@@ -82,7 +82,7 @@ describe('/api/clients and the un-scopable legacy table', () => {
           return;
         }
         // Also strip inline // comments
-        let code = line.replace(/\/\/.*$/, '');
+        const code = line.replace(/\/\/.*$/, '');
         if (LEGACY_SQL.test(code)) {
           offenders.push(`${rel}:${i + 1}  ${line.trim().slice(0, 90)}`);
         }

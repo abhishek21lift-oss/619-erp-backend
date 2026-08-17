@@ -7,15 +7,12 @@ const fs = require('fs');
 const path = require('path');
 
 const MIGRATION_157 = path.join(__dirname, '..', 'db', 'migrations', '157_app_tenant_role_and_rls.sql');
-const SCHEMA_FILE = path.join(__dirname, '..', 'db', 'schema.sql');
 
 describe('RLS Policy Verification - Migration 157', () => {
   let migration157;
-  let schemaSql;
 
   beforeAll(() => {
     migration157 = fs.readFileSync(MIGRATION_157, 'utf8');
-    schemaSql = fs.readFileSync(SCHEMA_FILE, 'utf8');
   });
 
   it('creates app_tenant role with NOBYPASSRLS', () => {
@@ -77,13 +74,6 @@ describe('RLS Policy Verification - Migration 157', () => {
 });
 
 describe('Schema Verification - Tenant Tables Have organization_id', () => {
-  // Migration files that ADD organization_id column with FK to tenant tables
-  const migrationFilesWithFk = [
-    '079_pt_clients_organization_id.sql',
-    '143_pt_trainers_organization_id.sql',
-    '156_mobility_posture_organization_id.sql',
-  ];
-
   it('migration files exist that add organization_id to tenant tables', () => {
     const migrationFiles = [
       '079_pt_clients_organization_id.sql',
