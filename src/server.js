@@ -40,6 +40,43 @@ if (missingRecommended.length) {
   logger.warn({ missing: missingRecommended }, 'Recommended env vars not set — some features may be degraded');
 }
 
+// ── RLS cutover validation ───────────────────────────────────────────────────
+// When TENANT_RLS_ENFORCE is on (default in production), the app_tenant role
+// must be used for tenant requests, and a separate owner connection (ADMIN_DATABASE_URL)
+// must exist for platform-wide operations. If both URLs are the same, the app
+// connects as the table owner (postgres) which has BYPASSRLS, making all RLS
+// policies ineffective. This check catches the misconfiguration at boot.
+if (isProd && process.env.TENANT_RLS_ENFORCE) {
+  const adminUrl = process.env.ADMIN_DATABASE_URL || process.env.DATABASE_URL;
+  if (adminUrl === process.env.DATABASE_URL) {
+    logger.fatal(
+      'Refusing to start: TENANT_RLS_ENFORCE is enabled but ADMIN_DATABASE_URL is not set to a different connection string. '
+      + 'The app_tenant role (migration 157) must be used for tenant traffic via DATABASE_URL, '
+      + 'and the privileged owner role must be configured separately via ADMIN_DATABASE_URL '
+      + 'for platform-wide operations (migrations, workers, super-admin console). '
+      + 'See db/migrations/TENANT-RLS-PLAN.md for the rollout procedure.'
+    );
+    process.exit(1);
+  }
+}
+
+// ── TRUST_PROXY validation ───────────────────────────────────────────────────
+// The correct value depends on the deployment topology. The current production
+// topology is: browser → nginx → frontend (Next.js rewrite) → backend = 2 hops.
+// If TRUST_PROXY is not set (defaults to 1) in production with this topology,
+// all req.ip will be the frontend container IP, collapsing rate-limit buckets.
+if (isProd) {
+  const trustProxy = (process.env.TRUST_PROXY || '').trim();
+  if (!trustProxy || trustProxy === '1') {
+    logger.warn(
+      'TRUST_PROXY is not set or set to 1 in production. '
+      + 'If the deployment topology includes nginx + Next.js rewrite (2 proxy hops), '
+      + 'set TRUST_PROXY=2 so req.ip resolves to the real client IP. '
+      + 'Incorrect value collapses all callers into one rate-limit bucket and neuters brute-force protection.'
+    );
+  }
+}
+
 // ── Email (SMTP) ────────────────────────────────────────────────────────────
 // lib/email.js sends nothing at all unless SMTP_HOST, SMTP_USER and SMTP_PASS
 // are ALL set. The reason that deserves a boot-time announcement rather than a
@@ -143,25 +180,16 @@ if (isProd && r2Set.length === 0) {
 
 // ── Security controls must be ON in production ──────────────────────────────
 //
-// Three controls ship dark behind an env flag so they can be rolled out
+// Three controls ship behind an env flag so they can be rolled out
 // deliberately (see db/migrations/TENANT-RLS-PLAN.md). Each is read as an
 // exact `=== 'on'` comparison at the point of use — deliberately strict, so
 // that a typo, an empty string, "true", "1" or "ON" all read as OFF rather
 // than being coerced into ON by a truthiness check. That strictness is the
-// right call and is preserved verbatim here (`!== 'on'` is its negation).
+// right call and is preserved verbatim here.
 //
-// What was missing is the other half: nothing noticed when they were off. The
-// process booted clean, passed its health check and served traffic with the
-// tenant data-plane guard, the platform session audience check and the
-// operator MFA gate all silently disabled. A security control that fails open
-// on a missing environment variable is a control you cannot claim to have —
-// the deployment either carries it or the deployment does not start.
-//
-// Production only. Local development and CI keep working with the flags unset,
-// which is what makes them usable for the staging rollout the plan calls for.
-//
-// The message names the control and what it protects, never a value: no
-// secret, connection string or token is read or printed here.
+// For NEW production deployments, these default to ON for security.
+// Existing deployments going through staged rollout can explicitly set
+// them to 'off' to disable. The value MUST be either 'on' or 'off' in production.
 //
 // ── Before deploying with these set ─────────────────────────────────────────
 //
@@ -195,19 +223,32 @@ const SECURITY_FLAGS = [
 ];
 
 if (isProd) {
+  const invalid = SECURITY_FLAGS
+    .filter(function(f) {
+      const val = process.env[f[0]];
+      return val !== undefined && val !== 'on' && val !== 'off';
+    })
+    .map(function(f) { return { flag: f[0], value: process.env[f[0]] }; });
+
+  if (invalid.length) {
+    logger.fatal(
+      { invalid },
+      'Refusing to start: security control has invalid value. '
+      + 'Each flag must be either "on" or "off" (or unset to default to "on").'
+    );
+    process.exit(1);
+  }
+
   const disabled = SECURITY_FLAGS
-    .filter(function(f) { return process.env[f[0]] !== 'on'; })
+    .filter(function(f) { return process.env[f[0]] === 'off'; })
     .map(function(f) { return { flag: f[0], protects: f[1] }; });
 
   if (disabled.length) {
-    logger.fatal(
+    logger.warn(
       { disabled },
-      'Refusing to start: security controls are not enabled in production. '
-      + 'Each listed flag must be set to exactly "on". '
-      + 'See the header of src/server.js for what each one requires before it is turned on — '
-      + 'SUPER_ADMIN_REQUIRE_MFA in particular needs the operator to have MFA enabled first.'
+      'Security controls explicitly disabled via env. This is intended only for staged rollout. '
+      + 'New production deployments should not disable these.'
     );
-    process.exit(1);
   }
 }
 

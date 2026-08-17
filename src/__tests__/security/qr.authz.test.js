@@ -158,8 +158,8 @@ describe('C. client-facing QR routes stay open and stay self-scoped', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.dataUrl).toMatch(/^data:image\/png;base64,/);
-    // Subject comes from req.user (member_id), never from the request.
-    expect(res.body.userId).toBe('mem-a');
+    // Subject comes from req.user (pt_client_id), never from the request.
+    expect(res.body.userId).toBe('ptc-a');
     expect(res.body.userType).toBe('client');
   });
 
@@ -170,7 +170,7 @@ describe('C. client-facing QR routes stay open and stay self-scoped', () => {
 
     expect(res.status).toBe(200);
     // Still their own — the handler reads req.user and nothing else.
-    expect(res.body.userId).toBe('mem-a');
+    expect(res.body.userId).toBe('ptc-a');
   });
 
   test('GET /my-history works for a client and queries only their own rows', async () => {
@@ -180,7 +180,7 @@ describe('C. client-facing QR routes stay open and stay self-scoped', () => {
     expect(res.status).toBe(200);
     const q = mockLog.find((x) => /FROM attendance_logs/i.test(x.sql));
     expect(q.sql).toMatch(/ref_id = \$1 AND ref_type = \$2/);
-    expect(q.params[0]).toBe('mem-a');
+    expect(q.params[0]).toBe('ptc-a');
     expect(q.params[0]).not.toBe('mem-b');
   });
 
@@ -189,7 +189,7 @@ describe('C. client-facing QR routes stay open and stay self-scoped', () => {
     await request(app()).get('/api/qr/my-history?ref_id=mem-b&member_id=mem-b&user_id=usr-client-b');
 
     const q = mockLog.find((x) => /FROM attendance_logs/i.test(x.sql));
-    expect(q.params[0]).toBe('mem-a');
+    expect(q.params[0]).toBe('ptc-a');
     expect(q.params).not.toContain('mem-b');
   });
 
@@ -199,7 +199,7 @@ describe('C. client-facing QR routes stay open and stay self-scoped', () => {
 
     expect(res.status).toBe(200);
     const q = mockLog.find((x) => /UPDATE attendance_logs/i.test(x.sql));
-    expect(q.params[0]).toBe('mem-a');
+    expect(q.params[0]).toBe('ptc-a');
     expect(q.params[1]).toBe('client');
   });
 
@@ -209,7 +209,7 @@ describe('C. client-facing QR routes stay open and stay self-scoped', () => {
       .send({ ref_id: 'mem-b', user_id: 'usr-client-b', organization_id: ORG_B });
 
     const q = mockLog.find((x) => /UPDATE attendance_logs/i.test(x.sql));
-    expect(q.params[0]).toBe('mem-a');
+    expect(q.params[0]).toBe('ptc-a');
     expect(q.params).not.toContain('mem-b');
     expect(q.params).not.toContain(ORG_B);
   });

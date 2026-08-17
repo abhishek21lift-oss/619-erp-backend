@@ -76,7 +76,13 @@ describe('/api/clients and the un-scopable legacy table', () => {
       lines.forEach((line, i) => {
         // Comments are the record of WHY these were removed; they quote the
         // very SQL this test forbids, and must not trip it.
-        const code = line.replace(/^\s*(\/\/|\*).*$/, '');
+        // Skip lines that are purely comments (start with // or /*)
+        const trimmed = line.trim();
+        if (trimmed.startsWith('//') || trimmed.startsWith('/*')) {
+          return;
+        }
+        // Also strip inline // comments
+        let code = line.replace(/\/\/.*$/, '');
         if (LEGACY_SQL.test(code)) {
           offenders.push(`${rel}:${i + 1}  ${line.trim().slice(0, 90)}`);
         }

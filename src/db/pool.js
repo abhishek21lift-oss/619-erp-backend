@@ -126,17 +126,9 @@ pool.on('connect', (client) => {
   });
 });
 
-// Off by default — see TENANT-RLS-PLAN.md and middleware/auth.js, which
-// gates on the exact same env var so the two can never disagree about
-// whether enforcement is "on". When on, a query running inside a request
-// that resolved an org id (see auth.js) is wrapped in its own transaction
-// that sets app.org_id via set_config() — the GUC the app_tenant RLS
-// policies (157_app_tenant_role_and_rls.sql) read. Until DATABASE_URL
-// actually points at app_tenant, this changes nothing observable: the
-// connecting role still bypasses RLS, so the extra transaction runs for
-// nothing but its own latency cost — which is precisely what flipping this
-// flag on in staging (before touching DATABASE_URL) is for measuring.
-const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE === 'on';
+// Defaults to ON in production for security. Explicitly set to 'off' to disable
+// (staged rollout only). Must match middleware/auth.js exactly.
+const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE !== 'off';
 
 /**
  * The owner connection — the deliberate, auditable way past RLS.

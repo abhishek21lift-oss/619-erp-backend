@@ -117,7 +117,7 @@ router.post('/google-login', async (req, res) => {
         email:      user.email,
         role:       user.role,
         trainer_id: user.trainer_id,
-        member_id:  user.member_id,
+        pt_client_id:  user.pt_client_id,
       },
     });
   } catch (err) {

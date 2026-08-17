@@ -44,8 +44,8 @@ router.get('/', auth, async (req, res, next) => {
         COALESCE(SUM(p.amount) FILTER (WHERE p.date >= DATE_TRUNC('month',NOW())),0) AS month_revenue,
         COALESCE(SUM(p.amount),0) AS all_time_revenue
       FROM trainers t
-      LEFT JOIN clients  c ON c.trainer_id = t.id
-      LEFT JOIN payments p ON p.trainer_id = t.id
+      LEFT JOIN pt_clients  c ON c.trainer_id = t.id
+      LEFT JOIN pt_payments p ON p.trainer_id = t.id
       WHERE ${where.join(' AND ')}
       GROUP BY t.id
       ORDER BY t.name
@@ -91,14 +91,14 @@ router.get('/:id', auth, async (req, res, next) => {
     // Aggregated stats for this trainer
     const { rows: stats } = await pool.query(`
       SELECT
-        (SELECT COUNT(*) FROM clients WHERE trainer_id=$1)::int                                  AS total_clients,
-        (SELECT COUNT(*) FROM clients WHERE trainer_id=$1 AND status='active')::int              AS active_clients,
-        (SELECT COUNT(*) FROM clients WHERE trainer_id=$1 AND status='expired')::int             AS expired_clients,
-        (SELECT COALESCE(SUM(balance_amount),0) FROM clients WHERE trainer_id=$1)::float          AS total_dues,
-        (SELECT COALESCE(SUM(amount),0) FROM payments WHERE trainer_id=$1)::float                 AS lifetime_revenue,
-        (SELECT COALESCE(SUM(amount),0) FROM payments
+        (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1)::int                                  AS total_clients,
+        (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1 AND status='active')::int              AS active_clients,
+        (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1 AND status='expired')::int             AS expired_clients,
+        (SELECT COALESCE(SUM(balance_amount),0) FROM pt_clients WHERE trainer_id=$1)::float          AS total_dues,
+        (SELECT COALESCE(SUM(amount),0) FROM pt_payments WHERE trainer_id=$1)::float                 AS lifetime_revenue,
+        (SELECT COALESCE(SUM(amount),0) FROM pt_payments
           WHERE trainer_id=$1 AND date >= DATE_TRUNC('month', NOW()))::float                       AS month_revenue,
-        (SELECT COALESCE(SUM(incentive_amt),0) FROM payments
+        (SELECT COALESCE(SUM(incentive_amt),0) FROM pt_payments
           WHERE trainer_id=$1 AND date >= DATE_TRUNC('month', NOW()))::float                       AS month_incentive
     `, [req.params.id]);
 
@@ -106,14 +106,14 @@ router.get('/:id', auth, async (req, res, next) => {
     const { rows: clients } = await pool.query(`
       SELECT id, client_id, name, mobile, package_type, pt_end_date,
              status, balance_amount, paid_amount, final_amount
-      FROM clients WHERE trainer_id=$1
+      FROM pt_clients WHERE trainer_id=$1
       ORDER BY created_at DESC LIMIT 100
     `, [req.params.id]);
 
     // Recent payments collected by this trainer
     const { rows: payments } = await pool.query(`
       SELECT id, client_name, amount, method, date, receipt_no, incentive_amt
-      FROM payments WHERE trainer_id=$1
+      FROM pt_payments WHERE trainer_id=$1
       ORDER BY date DESC, created_at DESC LIMIT 30
     `, [req.params.id]);
 
@@ -272,17 +272,12 @@ router.get('/:id/sessions', auth, async (req, res, next) => {
     let orgClause = '';
     if (scope.applyFilter) { sessParams.push(scope.orgId); orgClause = ` AND s.organization_id = $${sessParams.length}`; }
     const { rows } = await pool.query(
-      `WITH all_clients AS (
-         SELECT id, name, mobile FROM clients WHERE deleted_at IS NULL
-         UNION ALL
-         SELECT id, name, mobile FROM pt_clients WHERE deleted_at IS NULL
-       )
-       SELECT s.*, ac.name AS client_name, ac.mobile AS client_mobile
-       FROM pt_sessions s
-       LEFT JOIN all_clients ac ON ac.id = s.client_id
-       WHERE s.trainer_id = $1${orgClause}
-       ORDER BY s.session_date DESC, s.session_time DESC
-       LIMIT 50`,
+      `SELECT s.*, c.name AS client_name, c.mobile AS client_mobile
+        FROM pt_sessions s
+        LEFT JOIN pt_clients c ON c.id = s.client_id
+        WHERE s.trainer_id = $1${orgClause}
+        ORDER BY s.session_date DESC, s.session_time DESC
+        LIMIT 50`,
       sessParams
     );
     res.json(rows);

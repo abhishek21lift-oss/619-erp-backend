@@ -6,12 +6,9 @@ const { resolveOrgId } = require('./tenant');
 const { runWithTenantContext } = require('../lib/tenant-context');
 const { platformSessionBlocked, TENANT_SESSION_REQUIRED } = require('./platformAuth');
 
-// Off by default — see TENANT-RLS-PLAN.md. Enabling this makes pool.js wrap
-// queries in a transaction that sets app.org_id for Postgres RLS to read; it
-// does nothing to what the app can reach until DATABASE_URL also points at
-// the app_tenant role (157_app_tenant_role_and_rls.sql), which is its own,
-// separately-tested deployment step.
-const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE === 'on';
+// Defaults to ON in production for security. Explicitly set to 'off' to disable
+// (staged rollout only). See TENANT-RLS-PLAN.md and server.js startup validation.
+const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE !== 'off';
 
 // Path prefixes that stay reachable even when a studio's subscription has lapsed,
 // so the studio can still authenticate, view its billing/frozen screen, manage

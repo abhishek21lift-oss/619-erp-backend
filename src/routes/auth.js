@@ -366,7 +366,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         email:             user.email,
         role:              user.role,
         trainer_id:        user.trainer_id,
-        member_id:         user.member_id,
+        pt_client_id:      user.pt_client_id,
         organization_id:       user.organization_id,
         organization_name:     user.organization_name,
         organization_logo_url: user.organization_logo_url,

@@ -8,7 +8,7 @@
  */
 async function generateClientId(client) {
   const { rows: last } = await client.query(
-    `SELECT client_id FROM clients
+    `SELECT client_id FROM pt_clients
       WHERE client_id ~ '^FS[0-9]+$'
       ORDER BY CAST(SUBSTRING(client_id FROM 3) AS INTEGER) DESC
       LIMIT 1`
@@ -26,7 +26,7 @@ async function generateClientId(client) {
  */
 async function generateMemberCode(client) {
   const { rows: lastMc } = await client.query(
-    `SELECT member_code FROM clients
+    `SELECT member_code FROM pt_clients
       WHERE member_code ~ '^SIX19-[0-9]+$'
       ORDER BY CAST(SUBSTRING(member_code FROM 7) AS INTEGER) DESC
       LIMIT 1`

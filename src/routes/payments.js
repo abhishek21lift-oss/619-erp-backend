@@ -63,17 +63,11 @@ router.get('/', auth, async (req, res, next) => {
     // Members can only ever see their own payments — ignore any client_id
     // they pass and force it to their own client record.
     //
-    // Matched against BOTH id columns, because LEDGER_SQL is a UNION of two
-    // ledgers living in two id spaces: pt_payments.client_id references
-    // pt_clients (users.pt_client_id), while the legacy payments.client_id
-    // references `clients` (users.member_id). This clamped on member_id
-    // alone, which addresses only the legacy half — 0 rows, and NULL on every
-    // real client account — so a client's own payment list came back empty
-    // while all the live money sat in pt_payments. Nulls are filtered out, so
-    // an account linked to neither matches nothing rather than everything.
+    // pt_payments.client_id references pt_clients (users.pt_client_id).
+    // The legacy payments table is empty, so no need to union.
     if (req.user.role === 'member') {
       conditions.push(`p.client_id = ANY($${p++})`);
-      params.push([req.user.pt_client_id, req.user.member_id].filter(Boolean));
+      params.push([req.user.pt_client_id].filter(Boolean));
     } else if (client_id) {
       conditions.push(`p.client_id = $${p++}`); params.push(client_id);
     }
@@ -230,10 +224,10 @@ router.get('/stats', auth, async (req, res, next) => {
     // taken, from an endpoint any member session can reach. No screen asks
     // for it, which is precisely why it went unnoticed. Closed here because
     // this endpoint is now the authoritative source behind the money KPIs.
-    // Both id spaces, same reasoning as GET / above.
+    // PT client only, legacy table is empty.
     if (req.user.role === 'member') {
       conditions.push(`p.client_id = ANY($${p++})`);
-      params.push([req.user.pt_client_id, req.user.member_id].filter(Boolean));
+      params.push([req.user.pt_client_id].filter(Boolean));
     } else if (client_id) {
       conditions.push(`p.client_id = $${p++}`); params.push(client_id);
     }
@@ -336,7 +330,7 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
 
     if (!alreadyReversed) {
       await tx.query(`
-        UPDATE clients
+        UPDATE pt_clients
         SET paid_amount = GREATEST(0, paid_amount - $1),
             balance_amount = balance_amount + $1,
             updated_at = NOW()

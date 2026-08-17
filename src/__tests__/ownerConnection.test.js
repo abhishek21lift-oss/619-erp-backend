@@ -139,7 +139,8 @@ describe('auth.js is the only grant of platform-wide status', () => {
           const src = fs.readFileSync(p, 'utf8');
           // runAsPlatform is the sanctioned, self-documenting entry point for
           // background work; the raw option object is what must stay confined.
-          if (/platformWide\s*:\s*true/.test(src) && !p.endsWith('lib/tenant-context.js')) {
+          // Path comparison via path.join so it holds on Windows separators too.
+          if (/platformWide\s*:\s*true/.test(src) && !p.endsWith(path.join('lib', 'tenant-context.js'))) {
             offenders.push(path.relative(SRC, p));
           }
         }

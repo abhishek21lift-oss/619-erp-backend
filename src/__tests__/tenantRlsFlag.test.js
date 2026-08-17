@@ -10,6 +10,10 @@
 // live request, same reasoning as this repo's other tenant convention
 // tests: no live database in CI, and a source check catches the drift on
 // the branch instead of on a staging run.
+//
+// SECURITY FIX: The flag now defaults to ON in production for security.
+// Explicitly set to 'off' to disable (staged rollout only). Both files
+// must read the env var the exact same way.
 
 const fs = require('fs');
 const path = require('path');
@@ -18,23 +22,33 @@ const auth = fs.readFileSync(path.join(__dirname, '..', 'middleware', 'auth.js')
 const poolSrc = fs.readFileSync(path.join(__dirname, '..', 'db', 'pool.js'), 'utf8');
 
 describe('TENANT_RLS_ENFORCE — the two halves of the flag agree', () => {
-  it('both files gate on the exact same env var, read the exact same way', () => {
-    const FLAG = "process.env.TENANT_RLS_ENFORCE === 'on'";
+  it('both files gate on the exact same env var, read the exact same way (secure default: ON)', () => {
+    const FLAG = "process.env.TENANT_RLS_ENFORCE !== 'off'";
     expect(auth).toContain(FLAG);
     expect(poolSrc).toContain(FLAG);
   });
 
-  it('defaults off — unset or any value other than the literal string "on" stays off', () => {
-    // === 'on' rather than a truthy check: an operator setting
+  it('defaults ON in production — unset or any value other than the literal string "off" enables enforcement', () => {
+    // !== 'off' rather than a truthy check: an operator setting
     // TENANT_RLS_ENFORCE=true or =1 by habit from other flags in this repo
-    // must not silently turn on a transaction wrapper nobody meant to flip.
+    // must not silently turn off a security control.
+    // Only explicit 'off' disables (for staged rollout).
     expect(auth).not.toMatch(/TENANT_RLS_ENFORCE\s*\?\?/);
     expect(auth).not.toMatch(/Boolean\(process\.env\.TENANT_RLS_ENFORCE\)/);
+    // Ensure the strict comparison is used, not a loose truthy check
+    expect(auth).toMatch(/!==\s*'off'/);
+    expect(poolSrc).toMatch(/!==\s*'off'/);
   });
 
   it("auth.js never blocks a request when org-id resolution fails — it only feeds a query wrapper, it is not a new authorization gate", () => {
     const fn = auth.slice(auth.indexOf('async function auth('));
-    const guard = fn.slice(fn.indexOf('TENANT_RLS_ENFORCE) {'), fn.indexOf('next();\n  } catch'));
+    // The TENANT_RLS_ENFORCE block ends with `return runWithTenantContext(...);`
+    // then closes with `}` and `next();` before the outer catch.
+    const blockStart = fn.indexOf('TENANT_RLS_ENFORCE) {');
+    const blockEnd = fn.indexOf('return runWithTenantContext', blockStart);
+    // Include up to the closing brace of the if block
+    const afterReturn = fn.indexOf('}', blockEnd);
+    const guard = fn.slice(blockStart, afterReturn + 1);
     expect(guard).toContain('try { orgId = resolveOrgId(req); } catch');
     // No res.status(...) inside the enforcement branch — a failure to
     // resolve an org id here must fall through to orgId = null, not reject

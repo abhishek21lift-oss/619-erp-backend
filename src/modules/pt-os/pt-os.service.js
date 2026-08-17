@@ -3,8 +3,13 @@ const { today: studioToday, todayShortDay: studioShortDay } = require('../../lib
 
 async function calculateMonthlyCommissions(month, scope = {}) {
   const monthStart = `${month}-01`;
+  // UTC arithmetic only. The previous form built the next month from the
+  // LOCAL getFullYear()/getMonth() of a UTC-parsed date, so west of UTC the
+  // month-end collapsed onto the month start (e.g. [2026-08-01, 2026-08-01]
+  // on America/Los_Angeles), narrowing the window to a single day and
+  // under-counting commissions.
   const mStart = new Date(monthStart + 'T00:00:00Z');
-  const mEnd = new Date(mStart.getFullYear(), mStart.getMonth() + 1, 1);
+  const mEnd = new Date(Date.UTC(mStart.getUTCFullYear(), mStart.getUTCMonth() + 1, 1));
   const mEndStr = mEnd.toISOString().slice(0, 10);
 
   const params = [mStart.toISOString().slice(0, 10), mEndStr];

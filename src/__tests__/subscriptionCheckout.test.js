@@ -377,13 +377,16 @@ describe('openCheckout', () => {
 // ════════════════════════════════════════════════════════════════════════════
 
 describe('buildCheckoutView', () => {
+  // buildCheckoutView renders the QR via qrcode.toDataURL, whose PNG encoder
+  // runs ~50x slower inside Jest's VM than in plain node (~6.3s vs 116ms
+  // measured), so the default 5s timeout is not enough.
   test('the intent carries the stored payee and the stored amount', async () => {
     const view = await checkout.buildCheckoutView(aRequest());
     expect(view.intent_url).toContain(`pa=${encodeURIComponent(SETTINGS.upi_id)}`);
     expect(view.intent_url).toMatch(/[?&]am=2999(\.00)?(&|$)/);
     expect(view.intent_url).toMatch(/[?&]cu=INR(&|$)/);
     expect(view.qr_data_url).toMatch(/^data:image\/(png|svg\+xml)/);
-  });
+  }, 20000);
 
   test('a discounted request encodes the discounted amount, never the list price', async () => {
     const view = await checkout.buildCheckoutView(
@@ -391,7 +394,7 @@ describe('buildCheckoutView', () => {
     );
     expect(view.intent_url).toMatch(/[?&]am=2499(\.00)?(&|$)/);
     expect(view.intent_url).not.toMatch(/am=2999/);
-  });
+  }, 20000);
 });
 
 // ════════════════════════════════════════════════════════════════════════════

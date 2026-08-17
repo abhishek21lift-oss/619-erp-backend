@@ -78,7 +78,7 @@ router.get('/studio', auth, async (req, res, next) => {
     // Get branches
     const { rows: branches } = await pool.query(
       `SELECT s.key AS branch_id, s.value AS name,
-              COALESCE((SELECT COUNT(*) FROM clients WHERE branch_id = s.key AND deleted_at IS NULL), 0) AS member_count
+              COALESCE((SELECT COUNT(*) FROM pt_clients WHERE branch_id = s.key AND deleted_at IS NULL), 0) AS member_count
        FROM system_settings s
        WHERE s.key LIKE 'branch_%' AND s.type = 'json'
        ORDER BY s.key`
@@ -98,7 +98,7 @@ router.get('/branches', auth, async (req, res, next) => {
               (value::jsonb)->>'name' AS name,
               (value::jsonb)->>'location' AS location,
               (value::jsonb)->>'status' AS status,
-              COALESCE((SELECT COUNT(*) FROM clients WHERE branch_id = s.key AND deleted_at IS NULL), 0)::int AS member_count
+              COALESCE((SELECT COUNT(*) FROM pt_clients WHERE branch_id = s.key AND deleted_at IS NULL), 0)::int AS member_count
        FROM system_settings s
        WHERE s.key LIKE 'branch_%' AND s.type = 'json'
        ORDER BY s.key`
@@ -185,7 +185,7 @@ router.delete('/branches/:id', auth, adminOnly, async (req, res, next) => {
 
     const { rows: [{ member_count }] } = await pool.query(
       `SELECT COUNT(*)::int AS member_count
-         FROM clients WHERE branch_id=$1 AND deleted_at IS NULL`,
+         FROM pt_clients WHERE branch_id=$1 AND deleted_at IS NULL`,
       [branchKey]
     );
     if (member_count > 0) {

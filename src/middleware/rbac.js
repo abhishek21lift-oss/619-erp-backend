@@ -25,21 +25,12 @@ function requireSelfOrRole(...roles) {
     if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH', message: 'Not authenticated' } });
     if (roles.includes(req.user.role)) return next();
 
-    // For members: the id in the URL must be one of their own client links.
-    //
-    // Both columns are checked because they are different id spaces and which
-    // one applies depends on the route this ends up mounted on:
-    // users.pt_client_id references pt_clients (the live model) and
-    // users.member_id references the legacy, empty `clients` table. Matching
-    // member_id alone would deny every real client account, because member_id
-    // is NULL on all of them.
-    //
-    // This factory is currently mounted nowhere — verified by search — so
-    // that is a latent trap rather than a live defect. Corrected here so that
-    // wiring it up does not silently 403 the people it exists to admit.
+    // For members: the id in the URL must be their own pt_client_id.
+    // The legacy `member_id` column referenced the dropped `clients` table
+    // and is always NULL for real client accounts. Only pt_client_id is valid.
     if (
       req.user.role === 'member' && req.params.id
-      && (req.params.id === req.user.pt_client_id || req.params.id === req.user.member_id)
+      && req.params.id === req.user.pt_client_id
     ) {
       return next();
     }
@@ -49,35 +40,32 @@ function requireSelfOrRole(...roles) {
 
 // For trainers: only allow access to assigned members.
 //
-// IMPORTANT: this is a middleware FACTORY, so it must be a synchronous
-// function that returns the middleware. The previous version was declared
-// `async function`, which made `requireTrainerOwnership(pool)` resolve to
-// a Promise — Express then tried to use the Promise as middleware and
-// every request hung. Using a plain function fixes that.
-function requireTrainerOwnership(pool, paramName = 'id') {
-  return async (req, res, next) => {
-    if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH' } });
-    if (req.user.role === 'admin') return next();
-    if (req.user.role !== 'trainer') return res.status(403).json({ error: { code: 'FORBIDDEN' } });
+ // IMPORTANT: this is a middleware FACTORY, so it must be a synchronous
+ // function that returns the middleware. The previous version was declared
+ // `async function`, which made `requireTrainerOwnership(pool)` resolve to
+ // a Promise — Express then tried to use the Promise as middleware and
+ // every request hung. Using a plain function fixes that.
+ function requireTrainerOwnership(pool, paramName = 'id') {
+   return async (req, res, next) => {
+     if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH' } });
+     if (req.user.role === 'admin') return next();
+     if (req.user.role !== 'trainer') return res.status(403).json({ error: { code: 'FORBIDDEN' } });
 
-    const memberId = req.params[paramName];
-    try {
-      const { rows } = await pool.query(
-        `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
-         UNION
-         SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
-         LIMIT 1`,
-        [memberId, req.user.trainer_id]
-      );
-      if (rows.length === 0) {
-        return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Member not assigned to you' } });
-      }
-      next();
-    } catch (err) {
-      next(err);
-    }
-  };
-}
+     const memberId = req.params[paramName];
+     try {
+       const { rows } = await pool.query(
+         `SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2 LIMIT 1`,
+         [memberId, req.user.trainer_id]
+       );
+       if (rows.length === 0) {
+         return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Member not assigned to you' } });
+       }
+       next();
+     } catch (err) {
+       next(err);
+     }
+   };
+ }
 
 /**
  * The roles that run a studio, as opposed to the people it trains.

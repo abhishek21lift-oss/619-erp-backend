@@ -93,7 +93,7 @@ router.get('/session-balance', auth, wrap(async (req, res) => {
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT sb.*, c.name AS client_name, c.mobile AS client_mobile
-     FROM session_balance sb JOIN clients c ON c.id = sb.client_id ${whereSql}
+     FROM session_balance sb JOIN pt_clients c ON c.id = sb.client_id ${whereSql}
      ORDER BY sb.remaining_sessions ASC, sb.end_date ASC`, params
   );
   res.json({ data: rows });

@@ -37,8 +37,10 @@ jest.mock('../lib/logger', () => ({
 }));
 
 const ORG = '11111111-1111-1111-1111-111111111111';
-const MY_CLIENT = 'ptc-mine';
-const OTHER_CLIENT = 'ptc-theirs';
+// UUID-shaped ids: the clients router's member bypass for GET /:id matches
+// `/^\/[a-f0-9-]{36}$/`, which is what real pt_clients ids are.
+const MY_CLIENT = '11111111-2222-4333-8444-555555555555';
+const OTHER_CLIENT = '22222222-3333-4444-8555-666666666666';
 
 // A real client account: role 'member', pt_client_id set, member_id NULL.
 const CLIENT_USER = {

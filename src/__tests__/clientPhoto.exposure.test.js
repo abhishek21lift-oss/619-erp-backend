@@ -55,26 +55,28 @@ describe('the queries behind a client avatar select photo_url', () => {
     expect(queryWith(src, 'due_status', 'ORDER BY balance_amount DESC')).toMatch(/\bphoto_url\b/);
   });
 
-  test('the dues report — both arms of the union, and the outer select', () => {
-    // Three needles, not two. reports.js now holds TWO queries over this
-    // union: the row list this test guards, and /dues/summary, which
-    // aggregates the same population without a LIMIT so the Outstanding KPI
-    // stops being the sum of the top 100 debtors. That aggregate selects
-    // balance_amount and trainer_id and nothing else — no photo, nothing to
-    // expose — but it matched the old two-needle locator, and queryWith
-    // deliberately throws on an ambiguous match rather than quietly guarding
-    // whichever query it happened to find first. It did exactly that.
+  test('the dues report — the single pt_clients select', () => {
+    // Three needles would previously locate a two-arm union (legacy `clients`
+    // + `pt_clients` + an outer select carrying photo_url back out). The
+    // legacy arm is gone; reports.js now holds TWO queries over pt_clients:
+    // the row list this test guards, and /dues/summary, which aggregates the
+    // same population without a LIMIT so the Outstanding KPI stops being the
+    // sum of the top 100 debtors. That aggregate selects balance_amount and
+    // nothing else — no photo, nothing to expose — but it matches the old
+    // two-needle locator, and queryWith deliberately throws on an ambiguous
+    // match rather than quietly guarding whichever query it happened to find
+    // first. It did exactly that.
     //
-    // `ORDER BY balance_amount DESC` is the discriminator: the list orders and
-    // caps, the aggregate does neither. Preferred over matching on photo_url,
-    // which is the thing being asserted — that would make the guard circular
-    // by locating the query via the column whose presence it then checks.
+    // `ORDER BY balance_amount DESC LIMIT 100` is the discriminator: the list
+    // orders and caps, the aggregate does neither. Preferred over matching on
+    // photo_url, which is the thing being asserted — that would make the
+    // guard circular by locating the query via the column whose presence it
+    // then checks.
     const sql = queryWith(read('routes', 'reports.js'),
-      'UNION ALL', 'FROM clients c', 'ORDER BY balance_amount DESC');
-    // Three: legacy `clients`, `pt_clients`, and the outer SELECT that has to
-    // carry it back out of the subquery. Miss the outer one and the column is
-    // computed and thrown away.
-    expect(sql.match(/photo_url/g) || []).toHaveLength(3);
+      'FROM pt_clients', 'ORDER BY balance_amount DESC LIMIT 100');
+    // Once: photo_url is selected straight off the single pt_clients table.
+    // Miss it and the avatar silently falls back to initials.
+    expect(sql.match(/photo_url/g) || []).toHaveLength(1);
   });
 
   test('invoices — joined for the face, scoped so it cannot be a data leak', () => {

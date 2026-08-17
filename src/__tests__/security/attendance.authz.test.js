@@ -217,3 +217,70 @@ describe('C. a non-super-admin cannot change their effective organization', () =
     expect(dbTouched()).toBe(0);
   });
 });
+
+// ── D. GET /gaps emits exactly one WHERE clause ─────────────────────────────
+//
+// The /gaps query was flattened from a UNION subquery to a direct
+// `FROM pt_clients` in the clients→pt_clients remediation. The flattening
+// left BOTH a real `WHERE` and a leftover `WHERE 1=1` in the emitted SQL,
+// which PostgreSQL rejects with `syntax error at or near "WHERE"` — every
+// caller got a 500. The org-scope fragment also lost its `c.` qualifier,
+// which made `organization_id` ambiguous between pt_clients and
+// attendance_logs once both were in the same FROM. These tests pin the
+// emitted shape so a future edit cannot silently reintroduce either failure.
+describe('D. GET /gaps emits exactly one WHERE clause', () => {
+  const gapsSql = () => {
+    const q = mockLog.find((x) => /FROM pt_clients c/i.test(x.sql) && /absent_days/i.test(x.sql));
+    expect(q).toBeTruthy();
+    return q;
+  };
+
+  // The SELECT list legitimately contains `FILTER (WHERE ...)` and a
+  // correlated subquery with its own WHERE. The clause that matters is the
+  // one after the FROM/JOINs — it must appear exactly once, and it must be
+  // the only filter gate on the client identity list. Slicing from the FROM
+  // isolates exactly that clause.
+  const mainBodyWhereCount = (sql) => {
+    const body = sql.slice(sql.indexOf('FROM pt_clients'));
+    return (body.match(/\bWHERE\b/g) || []).length;
+  };
+
+  test('admin + organization: one WHERE, org-scoped, and 200', async () => {
+    mockUser = ADMIN_A;
+    const res = await request(app()).get('/api/attendance/gaps');
+
+    expect(res.status).toBe(200);
+    const q = gapsSql();
+    expect(mainBodyWhereCount(q.sql)).toBe(1);
+    expect(q.sql).not.toMatch(/WHERE 1=1/);
+    expect(q.sql).toMatch(/c\.organization_id = \$/);
+    expect(q.sql).toMatch(/a\.organization_id = \$/);
+    expect(q.sql).toMatch(/a2\.organization_id = \$/);
+    expect(q.params).toContain(ORG_A);
+  });
+
+  test('trainer + organization: one WHERE, own-client filter appended, and 200', async () => {
+    mockUser = TRAINER_A;
+    const res = await request(app()).get('/api/attendance/gaps');
+
+    expect(res.status).toBe(200);
+    const q = gapsSql();
+    expect(mainBodyWhereCount(q.sql)).toBe(1);
+    expect(q.sql).not.toMatch(/WHERE 1=1/);
+    expect(q.sql).toMatch(/c\.trainer_id = \$/);
+    expect(q.sql).toMatch(/c\.organization_id = \$/);
+    expect(q.params).toContain(ORG_A);
+    expect(q.params).toContain('trn-a');
+  });
+
+  test('admin, no organization scope: still exactly one WHERE', async () => {
+    mockUser = { id: 'usr-super', role: 'super_admin', trainer_id: null };
+    const res = await request(app()).get('/api/attendance/gaps');
+
+    expect(res.status).toBe(200);
+    const q = gapsSql();
+    expect(mainBodyWhereCount(q.sql)).toBe(1);
+    expect(q.sql).not.toMatch(/WHERE 1=1/);
+    expect(q.sql).not.toMatch(/organization_id/);
+  });
+});

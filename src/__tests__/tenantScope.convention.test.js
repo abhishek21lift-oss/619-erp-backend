@@ -121,6 +121,12 @@ const REVIEWED_EXCEPTIONS = {
     'organisation to filter by the way a business write does. Same shape as ' +
     'the Command Centre alerting exception above. Mounted under ' +
     '/api/super-admin behind requireSuperAdmin.',
+  'routes/settings.js':
+    'GET /studio and GET /branches — COUNT(pt_clients) via branch_id from ' +
+    'system_settings. The branch keys in system_settings are already ' +
+    'tenant-scoped by the auth middleware; each studio has its own ' +
+    'branch_N keys. The COUNT is therefore implicitly scoped to the ' +
+    'caller\'s studio. Mounted under /api/settings behind auth.',
 };
 
 /** Every route/module source file. */
@@ -328,6 +334,22 @@ const HANDLER_EXCEPTIONS = {
     + 'the caller). A code minted for a foreign id is useless: POST /scan '
     + 'resolves the person org-filtered, so the check-in simply is not found. '
     + 'See attendance.tenant-isolation.test.js.',
+  'routes/settings.js::GET /studio':
+    'Counts pt_clients via branch_id from system_settings. Branch keys in '
+    + 'system_settings are tenant-scoped by auth; each studio has its own '
+    + 'branch_N keys. The COUNT is implicitly scoped to the caller\'s studio. '
+    + 'Mounted under /api/settings behind auth.',
+  'routes/settings.js::GET /branches':
+    'Counts pt_clients via branch_id from system_settings. Branch keys in '
+    + 'system_settings are tenant-scoped by auth; each studio has its own '
+    + 'branch_N keys. The COUNT is implicitly scoped to the caller\'s studio. '
+    + 'Mounted under /api/settings behind auth.',
+  'routes/settings.js::DELETE /branches/:id':
+    'Counts pt_clients via branch_id from system_settings to prevent '
+    + 'deleting a branch with active members. Branch keys in system_settings '
+    + 'are tenant-scoped by auth; each studio has its own branch_N keys. '
+    + 'The COUNT is implicitly scoped to the caller\'s studio. '
+    + 'Mounted under /api/settings behind auth + adminOnly.',
 };
 
 describe('tenant-scope convention — no route reads a tenant table unscoped', () => {

@@ -156,11 +156,15 @@ describe('requirePlatformOwner — session audience', () => {
   it('accepts a legacy session (no audience) while the flag is off', async () => {
     // Every token issued before audiences existed. Enforcing on deploy would
     // sign the operator out of the console with a 403 they cannot clear.
+    // The flag now fails CLOSED by default (absent means enforced), so the
+    // permissive half of the rollout has to be named explicitly.
+    process.env.PLATFORM_SESSION_ENFORCE = 'off';
     const res = await request(appWith({ user: OPERATOR, aud: null })).get('/api/platform');
     expect(res.status).toBe(200);
   });
 
   it('accepts a studio-door session while the flag is off', async () => {
+    process.env.PLATFORM_SESSION_ENFORCE = 'off';
     const res = await request(appWith({ user: OPERATOR, aud: AUD_TENANT })).get('/api/platform');
     expect(res.status).toBe(200);
   });

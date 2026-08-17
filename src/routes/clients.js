@@ -2,10 +2,25 @@
 const router = require('express').Router();
 const pool   = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { validate } = require('../middleware/validate');
 const { clientSchemas } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
+
+// Apply requireStaff to all routes in this router.
+// GET /:id has its own member access check (lines 240-241), so we apply
+// requireStaff to all routes first, then re-allow member access for GET /:id
+// by checking the role before requireStaff runs.
+router.use(auth, (req, res, next) => {
+  // Allow member access to GET /:id (their own record) - this route has
+  // its own member check at lines 240-241.
+  if (req.method === 'GET' && req.path.match(/^\/[a-f0-9-]{36}$/)) {
+    return next();
+  }
+  // All other routes require staff role.
+  return requireStaff(req, res, next);
+});
 
 // Helper: parse a value as a finite number, or return fallback.
 // parseFloat('') is NaN — `??` does NOT catch that. Use this guard instead.
@@ -258,7 +273,7 @@ router.get('/:id', auth, async (req, res, next) => {
         [req.params.id]
       ),
       pool.query(
-        'SELECT * FROM pt_client_renewals WHERE client_id=$1 ORDER BY created_at DESC LIMIT 20',
+        'SELECT * FROM pt_client_renewals WHERE client_id=$1 ORDER BY renewed_at DESC LIMIT 20',
         [req.params.id]
       ),
     ]);

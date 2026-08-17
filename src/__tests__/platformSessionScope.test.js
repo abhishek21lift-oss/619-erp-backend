@@ -71,6 +71,9 @@ describe('which plane a path belongs to', () => {
 
 describe('a Command Center session inside the studio app', () => {
   it('is allowed while the flag is off, whatever the path', () => {
+    // The flag fails CLOSED by default (absent means enforced), so the
+    // permissive half of the rollout has to be named explicitly.
+    process.env.PLATFORM_SESSION_ENFORCE = 'off';
     expect(platformSessionBlocked(reqFor('/api/clients', AUD_PLATFORM))).toBe(false);
   });
 

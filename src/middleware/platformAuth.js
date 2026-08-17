@@ -63,9 +63,12 @@ const AUD_TENANT = 'tenant';
  * Read through a function rather than captured at module load so tests can
  * flip it without re-requiring the module, matching how tenantRlsFlag.test.js
  * exercises the data-plane flag.
+ *
+ * Defaults to ON in production for security. Explicitly set to 'off' to disable
+ * (staged rollout only).
  */
 function sessionEnforced() {
-  return process.env.PLATFORM_SESSION_ENFORCE === 'on';
+  return process.env.PLATFORM_SESSION_ENFORCE !== 'off';
 }
 
 /**

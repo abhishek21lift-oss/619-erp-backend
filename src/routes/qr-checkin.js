@@ -215,7 +215,9 @@ router.get('/generate', auth, qrLimiter, async (req, res) => {
     let userType = 'user';
 
     // Map auth role to QR user type
-    if (u.member_id) { userId = u.member_id; userType = 'client'; }
+    // PT clients use pt_client_id; gym members use member_id
+    if (u.pt_client_id) { userId = u.pt_client_id; userType = 'client'; }
+    else if (u.member_id) { userId = u.member_id; userType = 'client'; }
     else if (u.trainer_id) { userId = u.trainer_id; userType = 'trainer'; }
     else if (['admin', 'manager', 'staff', 'reception', 'receptionist'].includes(u.role)) {
       userType = 'staff';
@@ -245,13 +247,10 @@ router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
     const isTrainer = req.user.role === 'trainer';
     if (!isAdmin && !isTrainer) return res.status(403).json({ error: 'Not authorized' });
 
-    // Trainers can only generate for their own clients (gym and PT)
+    // Trainers can only generate for their own PT clients (legacy `clients` table is empty)
     if (isTrainer && type === 'client') {
       const { rows } = await pool.query(
-        `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
-         UNION
-         SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
-         LIMIT 1`,
+        `SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2 LIMIT 1`,
         [id, req.user.trainer_id]
       );
       if (!rows[0]) return res.status(403).json({ error: 'Client not assigned to you' });
@@ -377,7 +376,8 @@ router.post('/checkout', auth, async (req, res) => {
     let userId = u.id;
     let refType = 'staff';
 
-    if (u.member_id) { userId = u.member_id; refType = 'client'; }
+    if (u.pt_client_id) { userId = u.pt_client_id; refType = 'client'; }
+    else if (u.member_id) { userId = u.member_id; refType = 'client'; }
     else if (u.trainer_id) { userId = u.trainer_id; refType = 'trainer'; }
 
     const { rows } = await pool.query(
@@ -475,11 +475,10 @@ router.get('/dashboard', auth, requireStaff, async (req, res) => {
     const { rows: recent } = await pool.query(
       `SELECT a.id, a.ref_id, a.ref_type, a.ref_name, a.check_in_time, a.check_out_time,
               a.method, a.status,
-              COALESCE(c.photo_url, pc.photo_url) AS photo_url,
-              COALESCE(c.member_code, pc.client_id) AS member_code,
-              COALESCE(c.status, pc.status) AS membership_status
+              pc.photo_url AS photo_url,
+              pc.client_id AS member_code,
+              pc.status AS membership_status
          FROM attendance_logs a
-         LEFT JOIN clients c ON c.id = a.ref_id AND a.ref_type = 'client'
          LEFT JOIN pt_clients pc ON pc.id = a.ref_id AND a.ref_type = 'client' AND pc.deleted_at IS NULL
         WHERE a.date = CURRENT_DATE AND a.status = 'present'${ocA}
         ORDER BY a.check_in_time DESC NULLS LAST
@@ -525,7 +524,8 @@ router.get('/my-history', auth, async (req, res) => {
     let refId = u.id;
     let refType = 'staff';
 
-    if (u.member_id) { refId = u.member_id; refType = 'client'; }
+    if (u.pt_client_id) { refId = u.pt_client_id; refType = 'client'; }
+    else if (u.member_id) { refId = u.member_id; refType = 'client'; }
     else if (u.trainer_id) { refId = u.trainer_id; refType = 'trainer'; }
 
     const limit = Math.min(parseInt(req.query.limit || '90'), 365);

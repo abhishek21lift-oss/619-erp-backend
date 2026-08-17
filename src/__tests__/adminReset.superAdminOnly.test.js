@@ -29,7 +29,17 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
-jest.mock('../db/pool', () => ({ query: jest.fn(async () => ({ rows: [] })), connect: jest.fn() }));
+jest.mock('../db/pool', () => ({
+  query: jest.fn(async (sql) => {
+    // requireSuperAdminMfa (REQUIRE_SUPER_ADMIN_MFA defaults ON, fail-closed)
+    // looks up user_profiles.mfa_enabled before the handler may run. Give the
+    // super_admin an enrolled profile so the test reaches the route handler —
+    // the MFA gate itself is exercised by its own dedicated tests.
+    if (/FROM user_profiles/.test(String(sql))) return { rows: [{ mfa_enabled: true }] };
+    return { rows: [] };
+  }),
+  connect: jest.fn(),
+}));
 jest.mock('../lib/email', () => ({ sendAdminResetOtp: jest.fn(async () => {}) }));
 
 const request = require('supertest');

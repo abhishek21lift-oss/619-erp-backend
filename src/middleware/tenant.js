@@ -62,13 +62,11 @@ function requireSuperAdmin(req, res, next) {
 
 // Express guard: OPTIONAL 2FA requirement for the platform admin.
 //
-// Off by default so the super admin always has full access to the command
-// centre. Set SUPER_ADMIN_REQUIRE_MFA=on to require an enrolled authenticator
-// (enrolled under /api/profile/mfa/*, which is never gated here, so there is no
-// bootstrap deadlock). When required and MFA can't be confirmed it fails closed.
+// Defaults to ON in production for security. Explicitly set to 'off' to disable
+// (staged rollout only). When required and MFA can't be confirmed it fails closed.
 // Mount AFTER requireSuperAdmin.
 const pool = require('../db/pool');
-const REQUIRE_SUPER_ADMIN_MFA = process.env.SUPER_ADMIN_REQUIRE_MFA === 'on';
+const REQUIRE_SUPER_ADMIN_MFA = process.env.SUPER_ADMIN_REQUIRE_MFA !== 'off';
 async function requireSuperAdminMfa(req, res, next) {
   if (!REQUIRE_SUPER_ADMIN_MFA) return next();
   try {

@@ -520,7 +520,7 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
       success: true,
       user: {
         id: user.id, name: user.name, email: user.email,
-        role: user.role, trainer_id: user.trainer_id, member_id: user.member_id,
+        role: user.role, trainer_id: user.trainer_id, pt_client_id: user.pt_client_id,
       },
     });
   } catch (err) { next(err); }
