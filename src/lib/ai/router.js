@@ -1,14 +1,43 @@
 'use strict';
 const { chatCompletion, streamCompletion } = require('./openrouter');
-const { resolveModel, getFallbackModel }   = require('./models');
+const { resolveModel, getFallbackChain } = require('./models');
 const logger = require('../logger');
+
+/**
+ * Fallback chain for a tier, e.g. primary → secondary → fallback, with
+ * duplicate model IDs already removed (see models.js getFallbackChain).
+ * Logs when the configured chain was shortened by duplicates so operators
+ * can see the effective ordering without redeploying.
+ */
+function chainFor(tier, attemptedModel, intent) {
+  const chain = getFallbackChain(tier, attemptedModel);
+  const expected = tier === 'primary' ? 2 : tier === 'secondary' ? 1 : 0;
+  if (chain.length < expected) {
+    logger.warn(
+      { model: attemptedModel, intent, chain: chain.map((s) => s.model) },
+      'ai_model_duplicate_skipped'
+    );
+  }
+  return chain;
+}
+
+function buildAllModelsFailed(primaryErr, attempts) {
+  const final = new Error('AI service temporarily unavailable — all models failed');
+  final.code = 'ALL_MODELS_FAILED';
+  final.primary_error = primaryErr.message;
+  final.fallback_error = attempts[attempts.length - 1]?.err?.message;
+  final.errors = attempts.map((a) => ({ model: a.model, tier: a.tier, error: a.err.message }));
+  return final;
+}
 
 /**
  * Non-streaming chat completion with automatic fallback routing.
  * Returns { content, usage, model, tier, intent, latency_ms, used_fallback }
+ * Throws ALL_MODELS_FAILED with { primary_error, fallback_error, errors }.
  */
 async function routedChat({ intent, messages, temperature, max_tokens, timeout }) {
   const { model, tier } = resolveModel(intent);
+  const chain = chainFor(tier, model, intent);
 
   try {
     const result = await chatCompletion({ model, messages, temperature, max_tokens, timeout });
@@ -16,21 +45,19 @@ async function routedChat({ intent, messages, temperature, max_tokens, timeout }
   } catch (primaryErr) {
     logger.warn({ model, tier, intent, err: primaryErr.message }, 'ai_primary_failed');
 
-    const fb = getFallbackModel(tier);
-    if (!fb) throw primaryErr;
-
-    try {
-      const result = await chatCompletion({ model: fb.model, messages, temperature, max_tokens, timeout });
-      logger.info({ fallback: fb.model, intent }, 'ai_fallback_success');
-      return { ...result, intent, tier: fb.tier, used_fallback: true, original_error: primaryErr.message };
-    } catch (fbErr) {
-      logger.error({ fallback: fb.model, err: fbErr.message }, 'ai_fallback_failed');
-      const final = new Error('AI service temporarily unavailable — all models failed');
-      final.primary_error  = primaryErr.message;
-      final.fallback_error = fbErr.message;
-      final.code = 'ALL_MODELS_FAILED';
-      throw final;
+    const attempts = [{ model, tier, err: primaryErr }];
+    for (const step of chain) {
+      try {
+        const result = await chatCompletion({ model: step.model, messages, temperature, max_tokens, timeout });
+        logger.info({ model: step.model, tier: step.tier, intent }, 'ai_fallback_success');
+        return { ...result, intent, tier: step.tier, used_fallback: true, original_error: primaryErr.message };
+      } catch (fbErr) {
+        attempts.push({ model: step.model, tier: step.tier, err: fbErr });
+        logger.error({ model: step.model, tier: step.tier, err: fbErr.message }, 'ai_fallback_failed');
+      }
     }
+
+    throw buildAllModelsFailed(primaryErr, attempts);
   }
 }
 
@@ -40,6 +67,7 @@ async function routedChat({ intent, messages, temperature, max_tokens, timeout }
  */
 async function* routedStream({ intent, messages, temperature, max_tokens, timeout }) {
   const { model, tier } = resolveModel(intent);
+  const chain = chainFor(tier, model, intent);
 
   try {
     const gen = streamCompletion({ model, messages, temperature, max_tokens, timeout });
@@ -50,22 +78,24 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
   } catch (primaryErr) {
     logger.warn({ model, tier, intent, err: primaryErr.message }, 'ai_stream_primary_failed');
 
-    const fb = getFallbackModel(tier);
-    if (!fb) throw primaryErr;
+    const attempts = [{ model, tier, err: primaryErr }];
+    for (const step of chain) {
+      // Notify caller we're switching
+      yield '\n\n[Retrying with backup model…]\n\n';
 
-    // Notify caller we're switching
-    yield '\n\n[Retrying with backup model…]\n\n';
-
-    try {
-      const gen = streamCompletion({ model: fb.model, messages, temperature, max_tokens, timeout });
-      for await (const chunk of gen) {
-        yield chunk;
+      try {
+        const gen = streamCompletion({ model: step.model, messages, temperature, max_tokens, timeout });
+        for await (const chunk of gen) {
+          yield chunk;
+        }
+        return { model: step.model, tier: step.tier, intent, used_fallback: true };
+      } catch (fbErr) {
+        attempts.push({ model: step.model, tier: step.tier, err: fbErr });
+        logger.error({ model: step.model, tier: step.tier, err: fbErr.message }, 'ai_stream_fallback_failed');
       }
-      return { model: fb.model, tier: fb.tier, intent, used_fallback: true };
-    } catch (fbErr) {
-      logger.error({ fallback: fb.model, err: fbErr.message }, 'ai_stream_fallback_failed');
-      throw new Error('AI service unavailable — all models failed');
     }
+
+    throw buildAllModelsFailed(primaryErr, attempts);
   }
 }
 

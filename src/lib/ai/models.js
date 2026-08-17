@@ -95,4 +95,37 @@ function getFallbackModel(currentTier) {
   return null;
 }
 
-module.exports = { models, resolveModel, getFallbackModel, INTENT_ROUTES, DEFAULTS };
+/**
+ * Deterministic fallback order for a tier:
+ *   primary   → [secondary, fallback]
+ *   secondary → [fallback]
+ *   fallback  → []  (business intents have no retry)
+ *
+ * Duplicate model IDs are dropped, so a chain never calls the same model
+ * twice. The production config can legitimately set
+ * AI_PRIMARY_MODEL == AI_SECONDARY_MODEL; that configuration must not double
+ * the latency of every failure by asking the identical model again — it just
+ * shortens the chain to primary → fallback. Nothing here renames or replaces
+ * a configured model; the variables are read as-is, only the ORDER of calls
+ * is decided.
+ */
+function getFallbackChain(currentTier, attemptedModel) {
+  const raw = [];
+  if (currentTier === 'primary') {
+    raw.push({ model: models.secondary, tier: 'secondary' });
+  }
+  if (currentTier === 'primary' || currentTier === 'secondary') {
+    raw.push({ model: models.fallback, tier: 'fallback' });
+  }
+
+  const seen = new Set(attemptedModel ? [attemptedModel] : []);
+  const chain = [];
+  for (const step of raw) {
+    if (!step.model || seen.has(step.model)) continue;
+    seen.add(step.model);
+    chain.push(step);
+  }
+  return chain;
+}
+
+module.exports = { models, resolveModel, getFallbackModel, getFallbackChain, INTENT_ROUTES, DEFAULTS };
