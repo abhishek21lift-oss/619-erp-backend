@@ -103,7 +103,7 @@ services:
     build: .
     restart: unless-stopped
     command: ['node', 'src/workers/index.js']
-    # The image's HEALTHCHECK wgets /api/health, and this container runs no
+    # The image's HEALTHCHECK curls /api/health, and this container runs no
     # HTTP server — it would sit permanently unhealthy and make `docker
     # compose ps` useless for spotting a real problem. Liveness here is the
     # process being up, which restart:unless-stopped already covers.
