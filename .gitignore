@@ -1,6 +1,9 @@
 node_modules/
+
+# environment files - never track real secrets
 .env
 .env.*
+!.env.example
 *.log
 dist/
 coverage/
