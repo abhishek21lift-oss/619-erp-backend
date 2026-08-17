@@ -2,6 +2,14 @@
 // src/routes/aiKnowledge.js — AI Coach knowledge base (RAG document library)
 // Mounted at /api/ai/knowledge. Registered BEFORE /api/ai in server.js so it
 // is matched first regardless of what /api/ai's own router does internally.
+//
+// Tenant model: org admins/managers upload knowledge scoped to their own
+// organization (organization_id = caller's org). Platform super admins can
+// additionally upload GLOBAL 619 Fitness knowledge by sending
+// is_global=true — such documents get organization_id NULL and become
+// readable by every organization via the retrieval layer
+// (lib/ai/knowledgeBase.js). Global uploads are the ONLY way a document
+// becomes global; there is no inference or fallback anywhere.
 
 const express = require('express');
 const multer = require('multer');
@@ -47,7 +55,12 @@ router.post('/', auth, requireRole('admin', 'manager'), (req, res, next) => {
     const title = (req.body?.title || req.file.originalname || 'Untitled document').trim().slice(0, 255);
     const category = CATEGORIES.includes(req.body?.category) ? req.body.category : 'guide';
 
-    const organizationId = orgIdOf(req);
+    // Global documents: platform super admin only, and only when explicitly
+    // requested (is_global=true) — a super admin without that flag goes down
+    // the normal org path and still needs an x-org-id. A non-super-admin can
+    // never create a global document.
+    const isGlobal = req.user?.role === 'super_admin' && req.body?.is_global === 'true';
+    const organizationId = isGlobal ? null : orgIdOf(req);
     if (!organizationId) {
       return res.status(400).json({
         error: { code: 'NO_ORG', message: 'Select a target organization (x-org-id) before uploading a document.' },
@@ -62,10 +75,10 @@ router.post('/', auth, requireRole('admin', 'manager'), (req, res, next) => {
 
     const { rows } = await pool.query(
       `INSERT INTO ai_documents
-         (id, organization_id, title, category, filename, file_key, mime_type, file_size_bytes, uploaded_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       RETURNING id, title, category, filename, mime_type, file_size_bytes, status, chunk_count, created_at`,
-      [id, organizationId, title, category, req.file.originalname, fileKey, req.file.mimetype, req.file.size, req.user.id]
+         (id, organization_id, is_global, title, category, filename, file_key, mime_type, file_size_bytes, uploaded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING id, organization_id, is_global, title, category, filename, mime_type, file_size_bytes, status, chunk_count, created_at`,
+      [id, organizationId, isGlobal, title, category, req.file.originalname, fileKey, req.file.mimetype, req.file.size, req.user.id]
     );
 
     res.status(201).json({ data: rows[0] });
@@ -93,7 +106,7 @@ router.get('/', auth, requireRole('admin', 'manager'), async (req, res) => {
 
   const { rows } = await pool.query(
     `SELECT d.id, d.title, d.category, d.filename, d.mime_type, d.file_size_bytes,
-            d.status, d.error_message, d.chunk_count, d.created_at,
+            d.status, d.error_message, d.chunk_count, d.is_global, d.created_at,
             u.name AS uploaded_by_name
      FROM ai_documents d
      LEFT JOIN users u ON u.id = d.uploaded_by
