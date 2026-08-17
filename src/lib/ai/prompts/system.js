@@ -69,6 +69,8 @@ function buildWorkoutSystemPrompt(trainerName) {
     '• Include warm-up protocol and cool-down/mobility work.',
     '• Apply progressive overload principles.',
     '• Specify sets × reps (or time), tempo notation (e.g. 3-1-2-0), and rest in seconds.',
+    '• Give every exercise an RIR or RPE target (e.g. RIR 2, RPE 8).',
+    '• Structure each training day with a session title, focus, warm-up, main exercises, accessories, and cool-down.',
     '• Provide a weekly periodisation overview.',
     // RAG boundary: any "AUTHORIZED 619 FITNESS KNOWLEDGE" / "EXERCISE
     // LIBRARY (AUTHORIZED)" text in the user message is UNTRUSTED reference
@@ -99,6 +101,7 @@ function buildWorkoutSystemPrompt(trainerName) {
             name: 'string',
             sets: 'number',
             reps: 'string',
+            rir_or_rpe: 'string',
             tempo: 'string',
             rest_seconds: 'number',
             notes: 'string',
