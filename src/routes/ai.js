@@ -93,6 +93,172 @@ async function buildClientContext(client_id, org) {
   }
 }
 
+// First defined non-empty value, DB authority outranks the body's claim.
+const firstDefined = (...values) => values.find(
+  (v) => v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && v.length === 0)
+) ?? null;
+
+const ageFromDob = (dob) => {
+  if (!dob) return null;
+  const ms = Date.now() - new Date(dob).getTime();
+  return Number.isFinite(ms) && ms >= 0 ? Math.floor(ms / 31557600000) : null;
+};
+
+const arrayToText = (arr) => (Array.isArray(arr) && arr.length ? arr.join(', ') : null);
+
+// Authoritative client data for the plan generators.
+//
+// ── Why this exists ────────────────────────────────────────────────────────
+//
+// workout/generate and diet/generate used to take the client's profile
+// entirely from the request body — age, weight, height, goal — and trust
+// whatever the browser sent. The browser got those numbers from the same
+// database, but there was no server-side check that they matched, so the
+// generators were the one place a stale or hand-crafted client record could
+// silently poison a plan.
+//
+// This loader flips the dependency: the database is the authority. The body
+// is only consulted for values the database does not hold (equipment,
+// duration_weeks, and so on), so a client record edited after the page
+// loaded — or a request body hand-crafted by a caller — can no longer change
+// what the AI is told about the client.
+//
+// ── Tenant isolation ───────────────────────────────────────────────────────
+//
+// The parent pt_clients lookup is org-scoped and awaited FIRST. A client_id
+// belonging to another tenant yields no row and the loader returns null — the
+// caller 404s, and not one child query (all keyed by that client_id) has run.
+// This is deliberately stricter than buildClientContext above, which runs its
+// child queries in parallel with the parent and relies on the parent result
+// never being surfaced; here the child reads are skipped entirely, so a
+// cross-tenant probe leaves no trace at all.
+async function loadAuthoritativeClient(client_id, org) {
+  const { rows: clientRows } = await pool.query(
+    'SELECT * FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)',
+    [client_id, org]
+  );
+  const client = clientRows[0];
+  if (!client) return null;
+
+  const [
+    profileRes, goalsRes, assessRes, checkinsRes,
+    lifestyleRes, nutritionRes, workoutAssignRes, dietAssignRes,
+  ] = await Promise.all([
+    pool.query(
+      `SELECT goal, goal_other, height_cm, body_fat_pct, health_conditions, injuries,
+              fitness_level, sleep_hours, stress_level, diet_preference
+       FROM client_fitness_profiles WHERE client_id=$1 LIMIT 1`, [client_id]),
+    pool.query(
+      'SELECT goal_type, target_weight, target_body_fat, notes FROM pt_goals WHERE client_id=$1 AND is_active=true ORDER BY created_at DESC LIMIT 3', [client_id]),
+    pool.query(
+      'SELECT weight, body_fat_pct, bmi, chest_cm, waist_cm, hips_cm, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [client_id]),
+    pool.query(
+      'SELECT weight, mood, sleep_hours, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [client_id]),
+    pool.query(
+      `SELECT activity_level, workout_experience_level, meal_frequency, sleep_duration_hours,
+              stress_level, food_preferences
+       FROM pt_lifestyle_assessments WHERE client_id=$1
+       ORDER BY assessment_date DESC, created_at DESC LIMIT 1`, [client_id]),
+    pool.query(
+      `SELECT diet_preferences, food_allergies, foods_to_avoid, meals_per_day,
+              nutrition_budget, medical_conditions, medical_notes
+       FROM pt_nutrition_assessments WHERE client_id=$1
+       ORDER BY assessment_date DESC, created_at DESC LIMIT 1`, [client_id]),
+    pool.query(
+      `SELECT wp.name AS plan_name, wa.status, wa.start_date, wa.end_date
+       FROM workout_assignments wa LEFT JOIN workout_plans wp ON wp.id=wa.workout_plan_id
+       WHERE wa.client_id=$1 AND wa.status='active' ORDER BY wa.created_at DESC LIMIT 3`, [client_id]),
+    pool.query(
+      `SELECT dt.name AS template_name, da.status, da.start_date, da.end_date
+       FROM diet_assignments da LEFT JOIN diet_templates dt ON dt.id=da.diet_template_id
+       WHERE da.client_id=$1 AND da.status='active' ORDER BY da.created_at DESC LIMIT 3`, [client_id]),
+  ]);
+
+  return {
+    client,
+    profile:          profileRes.rows[0]   || null,
+    goals:            goalsRes.rows,
+    latestAssessment: assessRes.rows[0]    || null,
+    latestCheckin:    checkinsRes.rows[0]  || null,
+    lifestyle:        lifestyleRes.rows[0] || null,
+    nutrition:        nutritionRes.rows[0] || null,
+    workoutAssignments: workoutAssignRes.rows,
+    dietAssignments:  dietAssignRes.rows,
+  };
+}
+
+// Resolve the values that go into the workout prompt. Every value the
+// database holds wins over the request body; the body only fills gaps the
+// database does not hold. Weight prefers the latest assessment reading, then
+// the enrolment weight on pt_clients, then the latest weekly check-in.
+function resolveWorkoutInputs({ client, profile, goals, latestAssessment, latestCheckin, lifestyle, workoutAssignments }, body) {
+  const latestWeight = firstDefined(latestAssessment?.weight, client.weight, latestCheckin?.weight);
+  const height       = firstDefined(profile?.height_cm, client.height);
+  const goal         = firstDefined(profile?.goal, client.goal, goals[0]?.goal_type);
+  const experience   = firstDefined(client.workout_experience_level, profile?.fitness_level, lifestyle?.workout_experience_level);
+  const injuries     = firstDefined(profile?.injuries, client.injuries);
+  const frequency    = firstDefined(client.frequency);
+  const trainingDays = /^[1-7]$/.test(String(frequency ?? '')) ? Number(frequency) : (Number(body.training_days) || 4);
+  const active       = workoutAssignments[0] || null;
+  const durationWeeks = active?.start_date && active?.end_date
+    ? Math.max(1, Math.ceil((new Date(active.end_date) - new Date(active.start_date)) / 604800000))
+    : (Number(body.duration_weeks) || 8);
+
+  return {
+    age:      ageFromDob(client.dob) ?? (Number(body.age) || null),
+    gender:   firstDefined(client.gender, body.gender),
+    weight_kg: firstDefined(latestWeight, body.weight_kg),
+    height_cm: firstDefined(height, body.height_cm),
+    goal:     firstDefined(goal, body.goal),
+    experience_level: firstDefined(experience, body.experience_level),
+    injuries: firstDefined(injuries, body.injuries) || 'none',
+    equipment: body.equipment || 'full gym',
+    training_days:  trainingDays,
+    duration_weeks: durationWeeks,
+    health_conditions: firstDefined(client.health_conditions, arrayToText(profile?.health_conditions)),
+    previous_trainer_experience: client.previous_trainer_experience === true,
+    target: goals[0]?.target_weight ? `${goals[0].target_weight} kg`
+      : (goals[0]?.target_body_fat ? `${goals[0].target_body_fat}% body fat` : null),
+    assigned_plan: active
+      ? `${active.plan_name || 'Unnamed plan'} (since ${String(active.start_date).slice(0, 10)})`
+      : null,
+  };
+}
+
+// Same contract for the diet generator: DB-first, body fills gaps. Activity
+// level, dietary preference, allergies, budget and meal frequency all live in
+// the lifestyle/nutrition assessments when the studio recorded them.
+function resolveDietInputs({ client, profile, goals, latestAssessment, latestCheckin, lifestyle, nutrition, dietAssignments }, body) {
+  const latestWeight = firstDefined(latestAssessment?.weight, client.weight, latestCheckin?.weight);
+  const height       = firstDefined(profile?.height_cm, client.height);
+  const goal         = firstDefined(profile?.goal, client.goal, goals[0]?.goal_type);
+  const dietPrefs    = firstDefined(arrayToText(nutrition?.diet_preferences), arrayToText(lifestyle?.food_preferences), profile?.diet_preference);
+  const allergies    = firstDefined(arrayToText(nutrition?.food_allergies));
+  const mealsPerDay  = firstDefined(nutrition?.meals_per_day, lifestyle?.meal_frequency);
+  const active       = dietAssignments[0] || null;
+
+  return {
+    age:      ageFromDob(client.dob) ?? (Number(body.age) || null),
+    gender:   firstDefined(client.gender, body.gender),
+    weight_kg: firstDefined(latestWeight, body.weight_kg),
+    height_cm: firstDefined(height, body.height_cm),
+    activity_level: firstDefined(lifestyle?.activity_level, body.activity_level),
+    goal:     firstDefined(goal, body.goal),
+    dietary_preferences: firstDefined(dietPrefs, body.dietary_preferences) || 'none',
+    allergies: firstDefined(allergies, body.allergies) || 'none',
+    budget:   firstDefined(nutrition?.nutrition_budget, body.budget) || 'medium',
+    meal_frequency: Number(mealsPerDay) || Number(body.meal_frequency) || 4,
+    health_conditions: firstDefined(client.health_conditions, arrayToText(profile?.health_conditions)),
+    medical_conditions: arrayToText(nutrition?.medical_conditions),
+    foods_to_avoid: arrayToText(nutrition?.foods_to_avoid),
+    target: goals[0]?.target_weight ? `${goals[0].target_weight} kg`
+      : (goals[0]?.target_body_fat ? `${goals[0].target_body_fat}% body fat` : null),
+    assigned_plan: active
+      ? `${active.template_name || 'Unnamed plan'} (since ${String(active.start_date).slice(0, 10)})`
+      : null,
+  };
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    1. AI COACH CHAT  (SSE streaming)
    POST /api/ai/chat
@@ -252,28 +418,49 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
    POST /api/ai/workout/generate
    ═══════════════════════════════════════════════════════════════════════════ */
 router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
-  const {
-    age, gender, weight_kg, height_cm, goal, experience_level,
-    injuries = 'none', equipment = 'full gym', training_days = 4,
-    duration_weeks = 8,
-  } = req.body || {};
+  const { client_id } = req.body || {};
+  if (!client_id) return res.status(400).json({ error: 'client_id is required' });
 
-  const required = { age, gender, weight_kg, height_cm, goal, experience_level };
+  // The client record is the authority for age, gender, weight, height, goal
+  // and experience level; the request body only fills gaps the database does
+  // not hold. Loading happens BEFORE the SSE headers so that validation and
+  // tenant failures answer as ordinary JSON, exactly like progress/analyze.
+  const org = orgParam(req);
+  let ctx;
+  try {
+    ctx = await loadAuthoritativeClient(client_id, org);
+  } catch (err) {
+    logger.error({ err: err.message }, 'ai_workout_generate_load_failed');
+    return res.status(503).json({ error: 'AI workout generation failed', message: err.message });
+  }
+  if (!ctx) return res.status(404).json({ error: 'Client not found' });
+
+  const p = resolveWorkoutInputs(ctx, req.body || {});
+  const required = {
+    age: p.age, gender: p.gender, weight_kg: p.weight_kg,
+    height_cm: p.height_cm, goal: p.goal, experience_level: p.experience_level,
+  };
   const missing  = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
 
-  const userPrompt = `Generate a ${duration_weeks}-week workout plan for the following client:
-- Age: ${age}
-- Gender: ${gender}
-- Weight: ${weight_kg} kg
-- Height: ${height_cm} cm
-- Goal: ${goal}
-- Experience level: ${experience_level}
-- Injuries / limitations: ${injuries}
-- Available equipment: ${equipment}
-- Training days per week: ${training_days}
-
-Create a complete progressive programme with warm-up, cool-down, and progression strategy.`;
+  const userPrompt = [
+    `Generate a ${p.duration_weeks}-week workout plan for the following client:`,
+    `- Age: ${p.age}`,
+    `- Gender: ${p.gender}`,
+    `- Weight: ${p.weight_kg} kg`,
+    `- Height: ${p.height_cm} cm`,
+    `- Goal: ${p.goal}`,
+    `- Experience level: ${p.experience_level}`,
+    `- Injuries / limitations: ${p.injuries}`,
+    `- Available equipment: ${p.equipment}`,
+    `- Training days per week: ${p.training_days}`,
+  ];
+  if (p.health_conditions) userPrompt.push(`- Health conditions: ${p.health_conditions}`);
+  if (p.previous_trainer_experience) userPrompt.push('- Previously worked with a trainer: yes');
+  if (p.target) userPrompt.push(`- Goal target: ${p.target}`);
+  if (p.assigned_plan) userPrompt.push(`- Currently assigned plan: ${p.assigned_plan}`);
+  userPrompt.push('', 'Create a complete progressive programme with warm-up, cool-down, and progression strategy.');
+  const userPromptText = userPrompt.join('\n');
 
   res.setHeader('Content-Type',      'text/event-stream');
   res.setHeader('Cache-Control',     'no-cache');
@@ -292,7 +479,7 @@ Create a complete progressive programme with warm-up, cool-down, and progression
       intent:      'workout',
       messages:    [
         { role: 'system', content: buildWorkoutSystemPrompt(trainerName) },
-        { role: 'user',   content: userPrompt },
+        { role: 'user',   content: userPromptText },
       ],
       temperature: 0.6,
       max_tokens:  8000,
@@ -333,9 +520,13 @@ Create a complete progressive programme with warm-up, cool-down, and progression
     send({ type: 'done', data: plan, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_generate_error');
+    if (!res.headersSent) {
+      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+      return res.status(503).json({ error: 'AI workout generation failed', message: err.message });
+    }
     send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI workout generation failed. Please try again.' });
   } finally {
-    res.end();
+    if (!res.writableEnded) res.end();
   }
 });
 
@@ -344,29 +535,51 @@ Create a complete progressive programme with warm-up, cool-down, and progression
    POST /api/ai/diet/generate
    ═══════════════════════════════════════════════════════════════════════════ */
 router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
-  const {
-    age, gender, weight_kg, height_cm, activity_level, goal,
-    dietary_preferences = 'none', allergies = 'none',
-    budget = 'medium', meal_frequency = 4,
-  } = req.body || {};
+  const { client_id } = req.body || {};
+  if (!client_id) return res.status(400).json({ error: 'client_id is required' });
 
-  const required = { age, gender, weight_kg, height_cm, activity_level, goal };
+  // Same authority model as workout/generate: the client record and its
+  // lifestyle/nutrition assessments are the source of truth; the request
+  // body only fills gaps the database does not hold. Loading happens BEFORE
+  // the SSE headers so validation and tenant failures answer as JSON.
+  const org = orgParam(req);
+  let ctx;
+  try {
+    ctx = await loadAuthoritativeClient(client_id, org);
+  } catch (err) {
+    logger.error({ err: err.message }, 'ai_diet_generate_load_failed');
+    return res.status(503).json({ error: 'AI diet generation failed', message: err.message });
+  }
+  if (!ctx) return res.status(404).json({ error: 'Client not found' });
+
+  const p = resolveDietInputs(ctx, req.body || {});
+  const required = {
+    age: p.age, gender: p.gender, weight_kg: p.weight_kg,
+    height_cm: p.height_cm, activity_level: p.activity_level, goal: p.goal,
+  };
   const missing  = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
 
-  const userPrompt = `Generate a personalised nutrition plan for the following client:
-- Age: ${age}
-- Gender: ${gender}
-- Weight: ${weight_kg} kg
-- Height: ${height_cm} cm
-- Activity level: ${activity_level}
-- Goal: ${goal}
-- Dietary preferences: ${dietary_preferences}
-- Allergies / intolerances: ${allergies}
-- Budget: ${budget}
-- Preferred meals per day: ${meal_frequency}
-
-Calculate accurate TDEE, set appropriate calorie and macro targets, then create a practical meal plan with grocery list and supplement stack.`;
+  const userPrompt = [
+    `Generate a personalised nutrition plan for the following client:`,
+    `- Age: ${p.age}`,
+    `- Gender: ${p.gender}`,
+    `- Weight: ${p.weight_kg} kg`,
+    `- Height: ${p.height_cm} cm`,
+    `- Activity level: ${p.activity_level}`,
+    `- Goal: ${p.goal}`,
+    `- Dietary preferences: ${p.dietary_preferences}`,
+    `- Allergies / intolerances: ${p.allergies}`,
+    `- Budget: ${p.budget}`,
+    `- Preferred meals per day: ${p.meal_frequency}`,
+  ];
+  if (p.health_conditions) userPrompt.push(`- Health conditions: ${p.health_conditions}`);
+  if (p.medical_conditions) userPrompt.push(`- Medical conditions: ${p.medical_conditions}`);
+  if (p.foods_to_avoid) userPrompt.push(`- Foods to avoid: ${p.foods_to_avoid}`);
+  if (p.target) userPrompt.push(`- Goal target: ${p.target}`);
+  if (p.assigned_plan) userPrompt.push(`- Currently assigned diet plan: ${p.assigned_plan}`);
+  userPrompt.push('', 'Calculate accurate TDEE, set appropriate calorie and macro targets, then create a practical meal plan with grocery list and supplement stack.');
+  const userPromptText = userPrompt.join('\n');
 
   res.setHeader('Content-Type',      'text/event-stream');
   res.setHeader('Cache-Control',     'no-cache');
@@ -385,7 +598,7 @@ Calculate accurate TDEE, set appropriate calorie and macro targets, then create 
       intent:      'diet',
       messages:    [
         { role: 'system', content: buildDietSystemPrompt(trainerName) },
-        { role: 'user',   content: userPrompt },
+        { role: 'user',   content: userPromptText },
       ],
       temperature: 0.5,
       // Higher than workout's 8000: the diet schema nests a full macro
@@ -432,9 +645,13 @@ Calculate accurate TDEE, set appropriate calorie and macro targets, then create 
     send({ type: 'done', data: plan, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_diet_generate_error');
+    if (!res.headersSent) {
+      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+      return res.status(503).json({ error: 'AI diet generation failed', message: err.message });
+    }
     send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI diet generation failed. Please try again.' });
   } finally {
-    res.end();
+    if (!res.writableEnded) res.end();
   }
 });
 

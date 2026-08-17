@@ -1,0 +1,422 @@
+'use strict';
+// workout/generate and diet/generate draw the client profile from the
+// DATABASE, not from the request body. The browser can no longer hand the
+// AI a stale or hand-crafted age/weight/height/goal: the client record is
+// the authority, and the body only fills gaps the database does not hold.
+//
+// The ten scenarios the fix promised:
+//   1. workout loads the authoritative client
+//   2. diet loads the authoritative client
+//   3. client_id is required
+//   4. an unknown client 404s before any child data is read
+//   5. a cross-tenant client_id yields 404 and no child query ever runs
+//   6. browser-supplied values cannot override database values
+//   7. the workout response contract is unchanged (SSE shape + JSON errors)
+//   8. the diet response contract is unchanged
+//   9. streaming behaviour is unchanged (keep-alives, retry-discard, JSON)
+//  10. the OpenRouter fallback path is intact (routedStream + meta passthrough)
+
+jest.mock('../db/pool', () => ({ query: jest.fn() }));
+
+let mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+jest.mock('../middleware/auth', () => ({
+  auth: (req, _res, next) => { req.user = mockUser; next(); },
+  adminOnly: (_req, _res, next) => next(),
+  adminOrManager: (_req, _res, next) => next(),
+}));
+
+jest.mock('../lib/ai/router', () => ({ routedStream: jest.fn(), routedChat: jest.fn() }));
+jest.mock('../lib/ai/models', () => ({ models: { primary: 'primary-model' } }));
+jest.mock('../lib/ai/usage', () => ({
+  logUsage: jest.fn().mockResolvedValue(undefined),
+  getUserUsage: jest.fn(),
+  getModelStats: jest.fn(),
+}));
+
+const request = require('supertest');
+const express = require('express');
+const pool = require('../db/pool');
+const { routedStream } = require('../lib/ai/router');
+const { logUsage } = require('../lib/ai/usage');
+
+process.env.OPENROUTER_API_KEY = 'test-key';
+
+const app = express();
+app.use(express.json());
+app.use('/api/ai', require('../routes/ai'));
+
+const CLIENT = {
+  id: 'client-1', name: 'Priya Sharma', gender: 'female', dob: '1992-05-10',
+  weight: 65, height: 160, goal: 'weight_loss', injuries: null,
+  workout_experience_level: 'beginner', frequency: '4',
+  health_conditions: 'None', previous_trainer_experience: false,
+};
+
+const ASSESSMENT = { weight: 71.3, body_fat_pct: 24, bmi: 27.8, created_at: '2026-07-01T00:00:00Z' };
+const GOAL = { goal_type: 'weight_loss', target_weight: 68, target_body_fat: null, notes: null };
+
+const WORKOUT_PLAN = {
+  name: 'Strength Builder', description: '8-week progressive block', goal: 'weight_loss',
+  level: 'beginner', weeks: 8, days_per_week: 4, equipment: ['full gym'],
+  warm_up: '5 min dynamic', cool_down: 'stretch', progression_notes: 'add weight weekly',
+  weekly_schedule: { Monday: { name: 'Push', focus: 'Chest', exercises: [] } },
+  nutrition_notes: 'protein at 1.6g/kg',
+};
+const DIET_PLAN = {
+  name: 'Lean Fuel', description: 'deficit plan', goal: 'weight_loss',
+  total_calories: 1800, macros: { protein_g: 115, carbs_g: 200, fat_g: 50 },
+  meal_frequency: 5, meals: [], grocery_list: [], supplements: [],
+  hydration_ml: 3000, notes: '',
+};
+
+const DEFAULT_META = { model: 'primary-model', tier: 'primary', used_fallback: false };
+
+/** An async iterator that yields `chunks` then returns `meta` as its value. */
+function streamChunks(chunks, meta = DEFAULT_META) {
+  let i = 0;
+  let finished = false;
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next: () => {
+          if (finished) return Promise.resolve({ done: true, value: meta });
+          if (i < chunks.length) return Promise.resolve({ done: false, value: chunks[i++] });
+          finished = true;
+          return Promise.resolve({ done: true, value: meta });
+        },
+      };
+    },
+  };
+}
+
+/** Query needles → rows, keyed by substrings of the SQL. */
+function mockQueries(overrides = {}) {
+  const rowsBySql = {
+    'FROM pt_clients WHERE id=$1': [CLIENT],
+    'client_fitness_profiles': [],
+    'FROM pt_goals WHERE client_id=$1': [GOAL],
+    'FROM pt_assessments WHERE client_id=$1': [ASSESSMENT],
+    'FROM weekly_checkins WHERE client_id=$1': [],
+    'FROM pt_lifestyle_assessments WHERE client_id=$1': [],
+    'FROM pt_nutrition_assessments WHERE client_id=$1': [],
+    'FROM workout_assignments wa': [],
+    'FROM diet_assignments da': [],
+    ...overrides,
+  };
+  pool.query.mockImplementation((sql) => {
+    for (const [needle, rows] of Object.entries(rowsBySql)) {
+      if (sql.includes(needle)) return Promise.resolve({ rows });
+    }
+    return Promise.resolve({ rows: [] });
+  });
+}
+
+/** The values a stale/hostile browser would try to smuggle in. */
+const SPOOFED_BODY = {
+  client_id: 'client-1',
+  age: 99, gender: 'male', weight_kg: 999, height_cm: 999,
+  goal: 'muscle_gain', experience_level: 'advanced',
+  training_days: 6, duration_weeks: 12,
+};
+
+const promptOf = (call) => call.messages.find((m) => m.role === 'user').content;
+const expectedAge = () => Math.floor((Date.now() - new Date('1992-05-10').getTime()) / 31557600000);
+
+beforeEach(() => {
+  pool.query.mockReset();
+  routedStream.mockReset();
+  logUsage.mockClear();
+  mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+});
+
+describe('workout/generate', () => {
+  test('loads the authoritative client record into the prompt', async () => {
+    mockQueries({
+      'FROM workout_assignments wa': [
+        { plan_name: 'Foundation', status: 'active', start_date: '2026-01-05', end_date: '2026-03-02' },
+      ],
+    });
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(WORKOUT_PLAN)]));
+
+    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/text\/event-stream/);
+
+    const call = routedStream.mock.calls[0][0];
+    const prompt = promptOf(call);
+
+    // Database values, not the browser's.
+    expect(prompt).toContain(`Age: ${expectedAge()}`);
+    expect(prompt).toContain('Gender: female');
+    expect(prompt).toContain('Weight: 71.3 kg');      // latest assessment beats pt_clients.weight
+    expect(prompt).toContain('Height: 160 cm');
+    expect(prompt).toContain('Goal: weight_loss');
+    expect(prompt).toContain('Experience level: beginner');
+    expect(prompt).toContain('Training days per week: 4'); // pt_clients.frequency
+    expect(prompt).toContain('Goal target: 68 kg');        // active pt_goals
+    expect(prompt).toContain('Currently assigned plan: Foundation (since 2026-01-05)');
+    expect(prompt).toContain('Generate a 8-week workout plan'); // from active assignment dates
+
+    // Nothing from the spoofed body leaked in. (Never check bare 'male':
+    // 'female' contains it.)
+    for (const leak of ['99', '999', 'Gender: male', 'muscle_gain', 'advanced', 'Training days per week: 6', '12-week']) {
+      expect(prompt).not.toContain(leak);
+    }
+
+    // Routing configuration is untouched.
+    expect(call.intent).toBe('workout');
+    expect(call.temperature).toBe(0.6);
+    expect(call.max_tokens).toBe(8000);
+
+    // The done event carries the parsed plan + stream meta, like before.
+    expect(res.text).toContain('"type":"done"');
+    expect(res.text).toContain('"name":"Strength Builder"');
+    expect(res.text).toContain('"used_fallback":false');
+  });
+
+  test('browser-supplied values can never override database values', async () => {
+    mockQueries({
+      'FROM pt_clients WHERE id=$1': [{ ...CLIENT, workout_experience_level: null, health_conditions: null }],
+      'client_fitness_profiles': [{
+        goal: 'endurance', height_cm: 158.5, fitness_level: 'intermediate',
+        injuries: 'left knee', health_conditions: ['asthma'],
+      }],
+      'FROM pt_lifestyle_assessments WHERE client_id=$1': [{
+        workout_experience_level: 'advanced', activity_level: null,
+      }],
+    });
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(WORKOUT_PLAN)]));
+
+    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
+
+    expect(res.status).toBe(200);
+    const prompt = promptOf(routedStream.mock.calls[0][0]);
+
+    // profile.height_cm beats pt_clients.height; with no enrolment-level
+    // experience, profile.fitness_level beats the lifestyle assessment and
+    // the body's 'advanced' claim.
+    expect(prompt).toContain('Height: 158.5 cm');
+    expect(prompt).toContain('Experience level: intermediate');
+    expect(prompt).toContain('Injuries / limitations: left knee');
+    expect(prompt).toContain('Health conditions: asthma');
+    expect(prompt).not.toContain('999');
+    expect(prompt).not.toContain('advanced');
+  });
+
+  test('client_id is required', async () => {
+    const res = await request(app).post('/api/ai/workout/generate').send({ age: 30 });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('client_id is required');
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  test('an unknown client 404s before any child data is read', async () => {
+    mockQueries({ 'FROM pt_clients WHERE id=$1': [] });
+    const res = await request(app).post('/api/ai/workout/generate').send({ client_id: 'ghost' });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('Client not found');
+    expect(pool.query).toHaveBeenCalledTimes(1);
+    expect(routedStream).not.toHaveBeenCalled();
+  });
+
+  test('a cross-tenant client_id 404s and no child query ever runs', async () => {
+    // Another org's client: the org-scoped parent lookup yields no row.
+    mockQueries({ 'FROM pt_clients WHERE id=$1': [] });
+    const res = await request(app).post('/api/ai/workout/generate').send({ client_id: 'other-org-client' });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('Client not found');
+    // The tenant boundary is in the SQL itself…
+    expect(pool.query.mock.calls[0][0]).toContain('organization_id=$2');
+    expect(pool.query.mock.calls[0][1][1]).toBe('org-1');
+    // …and the child queries never ran at all, so nothing keyed by that
+    // client_id was even read into memory.
+    expect(pool.query).toHaveBeenCalledTimes(1);
+    expect(routedStream).not.toHaveBeenCalled();
+  });
+
+  test('a platform super admin can generate for any org (org filter off)', async () => {
+    mockUser = { id: 'sa-1', role: 'super_admin' };
+    mockQueries({});
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(WORKOUT_PLAN)]));
+    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
+
+    expect(res.status).toBe(200);
+    const [sql, params] = pool.query.mock.calls[0];
+    expect(sql).toContain('($2::uuid IS NULL OR organization_id=$2)');
+    expect(params[1]).toBeNull();
+  });
+
+  test('a client with no recorded profile and no body values still 400s with the same message shape', async () => {
+    mockQueries({
+      'FROM pt_clients WHERE id=$1': [{
+        id: 'client-1', name: 'Bare', gender: null, dob: null, weight: null,
+        height: null, goal: null, workout_experience_level: null, frequency: null,
+        health_conditions: null, previous_trainer_experience: false,
+      }],
+      'FROM workout_assignments wa': [],
+    });
+    const res = await request(app).post('/api/ai/workout/generate').send({ client_id: 'client-1' });
+
+    expect(res.status).toBe(400);
+    // weight and goal are still supplied by the (DB-authoritative) latest
+    // assessment and active goal rows; the record itself has no age source,
+    // gender, height or experience to fall back on.
+    expect(res.body.error).toBe('Missing required fields: age, gender, height_cm, experience_level');
+    expect(routedStream).not.toHaveBeenCalled();
+  });
+});
+
+describe('diet/generate', () => {
+  const dietDB = {
+    'FROM pt_lifestyle_assessments WHERE client_id=$1': [{
+      activity_level: 'moderate', meal_frequency: null, food_preferences: ['vegan_friendly'],
+    }],
+    'FROM pt_nutrition_assessments WHERE client_id=$1': [{
+      diet_preferences: ['vegetarian'], food_allergies: ['peanuts'],
+      foods_to_avoid: ['deep fried'], meals_per_day: 5,
+      nutrition_budget: 'high', medical_conditions: ['asthma'],
+    }],
+    'client_fitness_profiles': [{
+      goal: 'weight_loss', height_cm: 158.5, diet_preference: 'vegan',
+    }],
+  };
+
+  test('loads the authoritative client record into the prompt', async () => {
+    mockQueries(dietDB);
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(DIET_PLAN)]));
+
+    const res = await request(app).post('/api/ai/diet/generate').send({
+      ...SPOOFED_BODY,
+      activity_level: 'sedentary', dietary_preferences: 'non_vegetarian',
+      allergies: 'none', budget: 'low', meal_frequency: 3,
+    });
+
+    expect(res.status).toBe(200);
+    const call = routedStream.mock.calls[0][0];
+    const prompt = promptOf(call);
+
+    // Database values win; the nutrition assessment outranks the lifestyle
+    // assessment, which outranks the fitness profile.
+    expect(prompt).toContain(`Age: ${expectedAge()}`);
+    expect(prompt).toContain('Weight: 71.3 kg');
+    expect(prompt).toContain('Height: 158.5 cm');
+    expect(prompt).toContain('Activity level: moderate');
+    expect(prompt).toContain('Dietary preferences: vegetarian');
+    expect(prompt).toContain('Allergies / intolerances: peanuts');
+    expect(prompt).toContain('Budget: high');
+    expect(prompt).toContain('Preferred meals per day: 5');
+    expect(prompt).toContain('Medical conditions: asthma');
+    expect(prompt).toContain('Foods to avoid: deep fried');
+
+    for (const leak of ['999', 'Gender: male', 'sedentary', 'non_vegetarian', 'Budget: low', 'Preferred meals per day: 3']) {
+      expect(prompt).not.toContain(leak);
+    }
+
+    expect(call.intent).toBe('diet');
+    expect(call.temperature).toBe(0.5);
+    expect(call.max_tokens).toBe(14000);
+  });
+
+  test('falls back to the body only for values the database does not hold', async () => {
+    mockQueries({});
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(DIET_PLAN)]));
+
+    const res = await request(app).post('/api/ai/diet/generate').send({
+      client_id: 'client-1', age: 41, gender: 'male', weight_kg: 88, height_cm: 178,
+      goal: 'muscle_gain', activity_level: 'high', dietary_preferences: 'eggetarian',
+      allergies: 'shellfish', budget: 'high', meal_frequency: 6,
+    });
+
+    expect(res.status).toBe(200);
+    const prompt = promptOf(routedStream.mock.calls[0][0]);
+    // Still DB-authoritative where the record holds data…
+    expect(prompt).toContain('Gender: female');
+    expect(prompt).toContain('Weight: 71.3 kg');
+    expect(prompt).toContain('Goal: weight_loss');
+    // …and the body fills what the record does not hold.
+    expect(prompt).toContain('Activity level: high');
+    expect(prompt).toContain('Dietary preferences: eggetarian');
+    expect(prompt).toContain('Allergies / intolerances: shellfish');
+    expect(prompt).toContain('Budget: high');
+    expect(prompt).toContain('Preferred meals per day: 6');
+  });
+
+  test('client_id is required', async () => {
+    const res = await request(app).post('/api/ai/diet/generate').send({ age: 30 });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('client_id is required');
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  test('an unknown or cross-tenant client 404s before any child data is read', async () => {
+    mockQueries({ 'FROM pt_clients WHERE id=$1': [] });
+    const res = await request(app).post('/api/ai/diet/generate').send({ client_id: 'ghost' });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('Client not found');
+    expect(pool.query).toHaveBeenCalledTimes(1);
+    expect(routedStream).not.toHaveBeenCalled();
+  });
+});
+
+describe('streaming contract (both generators)', () => {
+  test('keep-alive pings and the done event are unchanged', async () => {
+    mockQueries({});
+    routedStream.mockReturnValue(streamChunks(['part-1 ', JSON.stringify(WORKOUT_PLAN)]));
+
+    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/text\/event-stream/);
+    expect(res.text).toContain(': ping');
+    expect(res.text).toContain('"type":"done"');
+    expect(res.text).toContain('"model":"primary-model"');
+    expect(res.text).toContain('"tier":"primary"');
+    expect(res.text).toContain('"used_fallback":false');
+    expect(res.text).toContain('"name":"Strength Builder"');
+  });
+
+  test('a fallback retry discards the failed primary output before parsing', async () => {
+    mockQueries({});
+    routedStream.mockReturnValue(streamChunks(['\n\n[Retrying primary model...]', JSON.stringify(WORKOUT_PLAN)]));
+
+    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('"type":"done"');
+    expect(res.text).toContain('"name":"Strength Builder"');
+  });
+
+  test('partial output followed by a retry still fails to parse as JSON', async () => {
+    mockQueries({});
+    routedStream.mockReturnValue(streamChunks([
+      '{"name":"Broken",', '\n\n[Retrying primary model...]', '"weeks":8}',
+    ]));
+
+    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('Could not parse AI response as JSON');
+    expect(res.text).not.toContain('"type":"done"');
+  });
+
+  test('the fallback meta from routedStream is passed through to the client', async () => {
+    mockQueries({});
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(DIET_PLAN)], {
+      model: 'fallback-model', tier: 'fallback', used_fallback: true,
+    }));
+
+    const res = await request(app).post('/api/ai/diet/generate').send({
+      client_id: 'client-1', activity_level: 'moderate', goal: 'weight_loss',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('"model":"fallback-model"');
+    expect(res.text).toContain('"tier":"fallback"');
+    expect(res.text).toContain('"used_fallback":true');
+    expect(logUsage).toHaveBeenCalledWith(expect.objectContaining({
+      intent_type: 'diet', used_fallback: true, user_id: 'u1',
+    }));
+  });
+});
