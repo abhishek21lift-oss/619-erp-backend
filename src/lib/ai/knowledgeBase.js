@@ -4,7 +4,7 @@
 //
 // Tenant isolation: every read and write here is scoped by organization_id —
 // except for documents explicitly marked is_global, which are the platform's
-// own 619 Fitness knowledge and are available to every organization.
+// own knowledge base documents and are available to every organization.
 // Retrieval filters at the DOCUMENT level (see retrieveContext), so a chunk is
 // only ever reachable through a parent document whose tenancy the caller is
 // authorized for.

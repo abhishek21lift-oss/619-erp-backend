@@ -35,13 +35,17 @@ function syncBookingToCalendar(action, memberId, bookingId) {
 
   (async () => {
     const { rows } = await pool.query(
-      'SELECT id FROM users WHERE member_id = $1 AND deleted_at IS NULL LIMIT 1',
+      `SELECT u.id, o.name AS organization_name
+       FROM users u
+       LEFT JOIN organizations o ON o.id = u.organization_id
+       WHERE u.member_id = $1 AND u.deleted_at IS NULL
+       LIMIT 1`,
       [memberId]
     );
     const userId = rows[0]?.id;
     if (!userId) return;
 
-    if (action === 'create') await cal.createBookingEvent(userId, bookingId);
+    if (action === 'create') await cal.createBookingEvent(userId, bookingId, rows[0].organization_name);
     else await cal.deleteBookingEvent(userId, bookingId);
   })().catch((err) => {
     logger.warn({ err: err.message, action, bookingId }, 'calendar sync failed (non-critical)');

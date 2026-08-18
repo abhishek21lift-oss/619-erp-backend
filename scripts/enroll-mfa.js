@@ -160,7 +160,7 @@ async function main() {
   console.log(`   ${dim('Google Authenticator, 1Password, Authy, Bitwarden — any TOTP app.')}\n`);
   console.log(qr);
   console.log(`   ${bold('Or enter this key by hand:')}  ${bold(secret)}`);
-  console.log(`   ${dim('Account will appear as 619-ERP: ' + email)}\n`);
+  console.log(`   ${dim('Account will appear as MY PT STUDIO: ' + email)}\n`);
 
   // ── 4. Prove possession ───────────────────────────────────────────────
   console.log(bold('2. Enter the 6-digit code your app is showing'));
@@ -187,7 +187,7 @@ async function main() {
   if (codes.length) {
     const file = path.join(os.homedir(), `619-mfa-recovery-codes-${new Date().toISOString().slice(0, 10)}.txt`);
     const contents = [
-      '619 ERP / MY PT STUDIO — MFA recovery codes',
+      'MY PT STUDIO — MFA recovery codes',
       `Account: ${email}`,
       `Issued:  ${new Date().toISOString()}`,
       '',

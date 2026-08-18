@@ -5,7 +5,7 @@
 //
 // Tenant model: org admins/managers upload knowledge scoped to their own
 // organization (organization_id = caller's org). Platform super admins can
-// additionally upload GLOBAL 619 Fitness knowledge by sending
+// additionally upload GLOBAL platform knowledge by sending
 // is_global=true — such documents get organization_id NULL and become
 // readable by every organization via the retrieval layer
 // (lib/ai/knowledgeBase.js). Global uploads are the ONLY way a document

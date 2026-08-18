@@ -61,7 +61,7 @@ function bookQueue({ confirmedCount = 0 } = {}) {
 describe('booking → Google Calendar sync', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    pool.query.mockResolvedValue({ rows: [{ id: 'usr-1' }] });
+    pool.query.mockResolvedValue({ rows: [{ id: 'usr-1', organization_name: 'Acme Fitness' }] });
     cal.isConfigured.mockReturnValue(true);
   });
 
@@ -70,7 +70,7 @@ describe('booking → Google Calendar sync', () => {
     await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9' });
     await flush();
 
-    expect(cal.createBookingEvent).toHaveBeenCalledWith('usr-1', 'bk-1');
+    expect(cal.createBookingEvent).toHaveBeenCalledWith('usr-1', 'bk-1', 'Acme Fitness');
 
     // The session row is locked FOR UPDATE for the whole transaction. Calling
     // Google before COMMIT would hold that lock across a network round-trip
@@ -88,8 +88,9 @@ describe('booking → Google Calendar sync', () => {
     // The user lookup must be by member_id — an admin booking on someone's
     // behalf must not get the class in their own diary.
     const [sql, params] = pool.query.mock.calls[0];
-    expect(sql).toMatch(/WHERE member_id = \$1/);
+    expect(sql).toMatch(/WHERE u\.member_id = \$1/);
     expect(params).toEqual(['mem-1']);
+    expect(sql).toMatch(/organizations/);
   });
 
   it('does not put a waitlist place in anyone diary', async () => {

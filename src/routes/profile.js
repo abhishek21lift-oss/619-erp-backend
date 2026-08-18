@@ -734,7 +734,7 @@ router.post('/mfa/setup', async (req, res, next) => {
     );
     res.json({
       secret,
-      qrUrl: `otpauth://totp/619-ERP:${encodeURIComponent(req.user.email)}?secret=${secret}&issuer=619-ERP`,
+      qrUrl: `otpauth://totp/${encodeURIComponent('MY PT STUDIO')}:${encodeURIComponent(req.user.email)}?secret=${secret}&issuer=${encodeURIComponent('MY PT STUDIO')}`,
     });
   } catch (err) {
     next(err);

@@ -283,7 +283,7 @@ describe('workout/generate', () => {
     expect(pool.query.mock.calls.every(([c]) => !c.includes('ai_document_chunks'))).toBe(true);
     expect(pool.query.mock.calls.every(([c]) => !c.includes('FROM exercises e'))).toBe(true);
     const prompt = promptOf(routedStream.mock.calls[0][0]);
-    expect(prompt).not.toContain('AUTHORIZED 619 FITNESS KNOWLEDGE');
+    expect(prompt).not.toContain('AUTHORIZED KNOWLEDGE BASE');
     expect(prompt).not.toContain('EXERCISE LIBRARY');
     // The observability event still fires — platform-wide, so it reports
     // organization_scoped: false with zero retrieval.
@@ -467,7 +467,7 @@ describe('streaming contract (both generators)', () => {
   });
 });
 
-describe('RAG: authorized 619 knowledge in workout/generate', () => {
+describe('RAG: authorized knowledge in workout/generate', () => {
   const chunkRows = [
     {
       content: 'Every session starts with a 10-minute dynamic warm-up, and leg work never precedes 48 hours of recovery for the same movement pattern.',
@@ -487,7 +487,7 @@ describe('RAG: authorized 619 knowledge in workout/generate', () => {
 
     // The four-section structure: facts, knowledge, library, instructions.
     expect(prompt).toContain('CLIENT AUTHORITATIVE DATA:');
-    expect(prompt).toContain('AUTHORIZED 619 FITNESS KNOWLEDGE:');
+    expect(prompt).toContain('AUTHORIZED KNOWLEDGE BASE:');
     expect(prompt).toContain('[1] (Workout SOP) Every session starts with a 10-minute dynamic warm-up');
     expect(prompt).toContain('INSTRUCTIONS:');
     // Knowledge guides but can never override the client facts.
@@ -654,7 +654,7 @@ describe('RAG: authorized 619 knowledge in workout/generate', () => {
 
     expect(res.status).toBe(200);
     const prompt = promptOf(routedStream.mock.calls[0][0]);
-    expect(prompt).not.toContain('AUTHORIZED 619 FITNESS KNOWLEDGE');
+    expect(prompt).not.toContain('AUTHORIZED KNOWLEDGE BASE');
     expect(prompt).not.toContain('[1] (');
     expect(prompt).not.toContain('EXERCISE LIBRARY');
     // The facts and instructions survive without the RAG sections.
@@ -684,7 +684,7 @@ describe('RAG: authorized 619 knowledge in workout/generate', () => {
 
     expect(res.status).toBe(200);
     const prompt = promptOf(routedStream.mock.calls[0][0]);
-    expect(prompt).not.toContain('AUTHORIZED 619 FITNESS KNOWLEDGE');
+    expect(prompt).not.toContain('AUTHORIZED KNOWLEDGE BASE');
     expect(res.text).toContain('"type":"done"');
   });
 
@@ -862,7 +862,7 @@ describe('workout quality & structure (prompt contract)', () => {
   });
 });
 
-describe('RAG: authorized 619 knowledge in diet/generate', () => {
+describe('RAG: authorized knowledge in diet/generate', () => {
   test('the diet prompt is grounded in the caller\'s authorized knowledge', async () => {
     mockQueries({
       'FROM pt_lifestyle_assessments WHERE client_id=$1': [{
@@ -889,7 +889,7 @@ describe('RAG: authorized 619 knowledge in diet/generate', () => {
     const prompt = promptOf(routedStream.mock.calls[0][0]);
 
     expect(prompt).toContain('CLIENT AUTHORITATIVE DATA:');
-    expect(prompt).toContain('AUTHORIZED 619 FITNESS KNOWLEDGE:');
+    expect(prompt).toContain('AUTHORIZED KNOWLEDGE BASE:');
     expect(prompt).toContain('[1] (Nutrition Guidelines) 619 Fitness standard: protein 1.6-2.2 g/kg');
     expect(prompt).toContain('checked against the client\'s listed allergens');
     expect(prompt).toContain('INSTRUCTIONS:');

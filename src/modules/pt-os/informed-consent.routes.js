@@ -348,7 +348,7 @@ router.post('/informed-consent/:id/sign', auth, requireRole('admin', 'manager', 
     // PDF generation failure shouldn't fail the signed record itself — it's
     // already durably stored and the PDF can be regenerated later.
     try {
-      const pdfUrl = await generateInformedConsentPdf(record);
+      const pdfUrl = await generateInformedConsentPdf(record, req.user?.organization_name);
       const { rows: withPdf } = await pool.query(
         'UPDATE pt_informed_consents SET pdf_url = $1 WHERE id = $2 RETURNING *', [pdfUrl, id]
       );

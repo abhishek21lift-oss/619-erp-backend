@@ -90,7 +90,8 @@ describe('POST /api/profile/mfa/setup — enrolment', () => {
     // The URI has to carry the secret and name the issuer, or an authenticator
     // app shows an unlabelled entry the user cannot identify later.
     expect(res.body.qrUrl).toContain(`secret=${res.body.secret}`);
-    expect(res.body.qrUrl).toContain('issuer=619-ERP');
+    expect(res.body.qrUrl).toContain(`issuer=${encodeURIComponent('MY PT STUDIO')}`);
+    expect(res.body.qrUrl).toContain(encodeURIComponent('MY PT STUDIO') + ':');
     expect(res.body.qrUrl).toContain(encodeURIComponent(USER.email));
   });
 
