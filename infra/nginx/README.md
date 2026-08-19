@@ -62,6 +62,27 @@ usual suspects and neither is the application code:
    `Refused to connect to 'wss://…'` and nowhere in these logs at all, which is
    why it is worth ruling out early.
 
+## Long-running AI generation (SSE) on the frontend vhost
+
+AI generation (`POST /api/ai/workout/generate`, `POST /api/ai/diet/generate`,
+and the AI coach chat stream) flows through the **frontend** vhost
+(`browser → nginx → frontend → Next rewrite → backend`), not `api.`. The 60s
+default `proxy_read_timeout` therefore applies to it, and it kills a stream that
+is still waiting for the model's first token — a full diet plan can take longer
+than that before producing anything, surfacing as a 504.
+
+The fix is two layers, both in this folder / the box:
+
+1. `myptstudio.conf` scopes `location /api/ai/` on the frontend vhost with
+   `proxy_read_timeout 300s` (above the backend's per-attempt AI timeout plus
+   the primary → fallback retry chain) and `proxy_buffering off`.
+2. The backend sends an SSE heartbeat (`: ping` every 15s, `src/lib/sse-heartbeat.js`)
+   during the wait for the first token, so the socket is never idle no matter
+   which timeout a proxy in the chain applies.
+
+Only `/api/ai/` is widened; ordinary requests keep the 60s default. Do not raise
+the timeout globally.
+
 ## Files
 
 | File | Goes where | Purpose |

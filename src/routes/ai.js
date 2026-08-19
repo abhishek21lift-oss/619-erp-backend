@@ -22,6 +22,7 @@ const { models }                       = require('../lib/ai/models');
 const { logUsage, getUserUsage, getModelStats } = require('../lib/ai/usage');
 const { retrieveContext }              = require('../lib/ai/knowledgeBase');
 const { runTools }                     = require('../lib/ai/tools');
+const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 const {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -655,6 +656,8 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
+  const stopHeartbeat = startSseHeartbeat(res);
+
   const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
   try {
@@ -713,6 +716,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     }
     send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI workout generation failed. Please try again.' });
   } finally {
+    stopHeartbeat();
     if (!res.writableEnded) res.end();
   }
 });
@@ -798,6 +802,8 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
+  const stopHeartbeat = startSseHeartbeat(res);
+
   const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
   try {
@@ -862,6 +868,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     }
     send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI diet generation failed. Please try again.' });
   } finally {
+    stopHeartbeat();
     if (!res.writableEnded) res.end();
   }
 });
