@@ -48,23 +48,72 @@ function requireConfigured(req, res, next) {
 /* ─── Helpers ───────────────────────────────────────────────────────────── */
 const { extractJson } = require('../lib/ai/jsonExtract');
 
+// Bounded history window for the AI Coach prompt. Long conversations must not
+// grow the model prompt without limit, so the chat handler sends only the most
+// recent messages (newest N, restored to chronological order) instead of the
+// whole thread. This is a MESSAGE-COUNT window, not a token budget — messages
+// vary in size. Configurable via AI_CHAT_HISTORY_LIMIT, mirroring the other
+// AI_* env bounds (see AI_OPENROUTER_TIMEOUT_MS in lib/ai/openrouter.js); an
+// invalid value warns and falls back to the default. The default of 20 matches
+// the chat handler's original "last 20 messages" intent that was never
+// enforced; the 1..50 bounds keep a typo from either dropping all context or
+// recreating an unbounded prompt.
+const HISTORY_DEFAULT = 20;
+const HISTORY_MIN     = 1;
+const HISTORY_MAX     = 50;
+function chatHistoryLimit() {
+  const raw = Number(process.env.AI_CHAT_HISTORY_LIMIT);
+  if (Number.isInteger(raw) && raw >= HISTORY_MIN && raw <= HISTORY_MAX) return raw;
+  if (process.env.AI_CHAT_HISTORY_LIMIT) {
+    logger.warn({ value: process.env.AI_CHAT_HISTORY_LIMIT }, 'ai_chat_history_limit_invalid');
+  }
+  return HISTORY_DEFAULT;
+}
+
+// Bounded progress-analysis windows (audit P2-1). The progress report prompt
+// must not grow with the client's entire history, so the newest-N of each
+// historical dataset is selected at the DATABASE (ORDER BY created_at DESC
+// LIMIT n) and reversed back into chronological order for the model — the
+// same bounded-window pattern as chat history above. The 20/12/20 defaults
+// follow the audit; each sits inside the same 1..50 safety corridor that
+// bounds AI_CHAT_HISTORY_LIMIT, so a window can never swallow the whole
+// history nor drop all context. Deliberately not env-configurable: three
+// independent knobs would be configuration infrastructure for no current
+// need, and the constants are the smallest safe form.
+const PROGRESS_ASSESSMENTS_LIMIT   = 20;
+const PROGRESS_CHECKINS_LIMIT      = 12;
+const PROGRESS_STRENGTH_LOGS_LIMIT = 20;
+
 // Tenant isolation: `org` is the caller's org id (null for a platform super
-// admin operating platform-wide). The parent pt_clients lookup is org-scoped,
-// so a client_id belonging to another tenant yields no row and the function
-// returns '' — the child goal/assessment/check-in rows (all keyed by that
-// client_id) are only ever read into the context after that in-org check.
+// admin operating platform-wide). The parent pt_clients lookup is org-scoped
+// and awaited FIRST — a client_id belonging to another tenant yields no row
+// and the function returns '' without ever running a child query, so a
+// cross-tenant probe leaves no trace at all. The child goal/assessment/
+// check-in rows (all keyed by that client_id) only run after that gate.
 async function buildClientContext(client_id, org) {
   if (!client_id) return '';
   try {
-    const [clientRes, goalsRes, assessRes, checkinsRes] = await Promise.all([
-      pool.query('SELECT name, dob, gender, mobile FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)', [client_id, org]),
+    // Parent-first authorization, mirroring loadAuthoritativeClient below:
+    // confirm the client exists, is not deleted, and passes the tenant
+    // predicate BEFORE any child query executes. Same columns as before.
+    const clientRes = await pool.query(
+      'SELECT name, dob, gender, mobile FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)',
+      [client_id, org]
+    );
+    const c = clientRes.rows[0];
+    if (!c) {
+      // Foreign, unknown, or deleted client — same empty-context behavior,
+      // and no child queries. No client id or PII is logged.
+      logger.warn('ai_context_missing_client');
+      return '';
+    }
+
+    const [goalsRes, assessRes, checkinsRes] = await Promise.all([
       pool.query('SELECT goal_type, target_weight, target_body_fat, notes FROM pt_goals WHERE client_id=$1 AND is_active=true LIMIT 3', [client_id]),
       pool.query('SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 2', [client_id]),
       pool.query('SELECT weight, mood, sleep_hours, client_notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at DESC LIMIT 4', [client_id]),
     ]);
 
-    const c      = clientRes.rows[0];
-    if (!c) return '';
     const age    = c.dob ? Math.floor((Date.now() - new Date(c.dob).getTime()) / 31557600000) : null;
     const latest = assessRes.rows[0] || {};
 
@@ -195,10 +244,8 @@ async function retrieveExerciseLibrary({ organizationId, userId, query, limit = 
 // The parent pt_clients lookup is org-scoped and awaited FIRST. A client_id
 // belonging to another tenant yields no row and the loader returns null — the
 // caller 404s, and not one child query (all keyed by that client_id) has run.
-// This is deliberately stricter than buildClientContext above, which runs its
-// child queries in parallel with the parent and relies on the parent result
-// never being surfaced; here the child reads are skipped entirely, so a
-// cross-tenant probe leaves no trace at all.
+// buildClientContext above follows the same parent-first ordering for the
+// AI Coach, so a cross-tenant probe leaves no trace in either path.
 //
 // ── Optional retrieval jobs (RAG + exercise library) ───────────────────────
 //
@@ -361,6 +408,26 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
   // there is no previous answer to replace, so it degrades to a normal send.
   const isRegenerate = Boolean(regenerate) && Boolean(conversation_id);
 
+  // Conversation ownership gate. A caller-supplied conversation_id must
+  // belong to the authenticated user — the same `WHERE id = $1 AND user_id = $2`
+  // convention as GET/PATCH/DELETE /conversations/:id below. It runs before
+  // the SSE headers so the failure is a JSON 404, and before any message
+  // read/write so a foreign conversation can never reach the prompt, RAG,
+  // tools, or the model. Unknown and foreign UUIDs answer identically.
+  let convId = conversation_id;
+  if (convId) {
+    try {
+      const { rows } = await pool.query(
+        'SELECT id FROM ai_conversations WHERE id = $1 AND user_id = $2',
+        [convId, req.user.id]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'Conversation not found' });
+    } catch (err) {
+      logger.error({ err: err.message }, 'ai_chat_ownership_check_failed');
+      return res.status(503).json({ error: 'AI chat unavailable', message: err.message });
+    }
+  }
+
   // SSE headers
   res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -368,11 +435,17 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
+  // Keep the connection alive through the silent pre-first-token window and
+  // any idle gaps — same canonical heartbeat as workout/diet. It runs from
+  // right after the SSE headers until the stream ends; the stop() below is
+  // the explicit cleanup on the happy/error/abort paths, and the helper also
+  // self-clears once the response ends.
+  const stopHeartbeat = startSseHeartbeat(res);
+
   const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
   try {
     // Resolve or create conversation
-    let convId = conversation_id;
     if (!convId) {
       const title = message.slice(0, 60).trim();
       const { rows } = await pool.query(
@@ -402,11 +475,23 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       );
     }
 
-    // Build conversation history (last 20 messages)
+    // Build bounded conversation history — the most recent N messages (the
+    // database applies the LIMIT), then reversed back into chronological
+    // order so the model reads oldest → newest. The current user message was
+    // inserted above and is already the newest row, so it lands at the end of
+    // this list exactly once; nothing is appended separately. The index
+    // ai_messages_conv_idx (conversation_id, created_at ASC) serves the
+    // DESC scan; `id` is a stable secondary sort so messages sharing a
+    // created_at still order deterministically.
     const histRes = await pool.query(
-      `SELECT role, content FROM ai_messages WHERE conversation_id=$1 ORDER BY created_at ASC`,
-      [convId]
+      `SELECT role, content
+         FROM ai_messages
+        WHERE conversation_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT $2`,
+      [convId, chatHistoryLimit()]
     );
+    histRes.rows.reverse();
 
     // Build system prompt with optional client context (org-scoped)
     const clientCtx = await buildClientContext(client_id, orgParam(req));
@@ -467,8 +552,18 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     try {
       const gen = routedStream({ intent: 'chat', messages, temperature: 0.75, max_tokens: 1024 });
       for await (const chunk of gen) {
-        fullContent += chunk;
-        send({ type: 'chunk', content: chunk });
+        if (chunk.startsWith('\n\n[Retrying')) {
+          // Fallback retry status: shown to the user while streaming (existing
+          // UX), but it is internal routing noise, not part of the answer.
+          // Discard the failed primary model's partial output so the persisted
+          // assistant message holds only the fallback model's reply — the same
+          // rule the workout/diet/progress/fitness-testing routes already use.
+          send({ type: 'chunk', content: chunk });
+          fullContent = '';
+        } else {
+          fullContent += chunk;
+          send({ type: 'chunk', content: chunk });
+        }
       }
     } catch (streamErr) {
       send({ type: 'error', message: streamErr.message });
@@ -500,7 +595,8 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     logger.error({ err: err.message }, 'ai_chat_error');
     send({ type: 'error', message: err.message || 'AI request failed' });
   } finally {
-    res.end();
+    stopHeartbeat();
+    if (!res.writableEnded) res.end();
   }
 });
 
@@ -881,6 +977,11 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
   const { client_id } = req.body || {};
   if (!client_id) return res.status(400).json({ error: 'client_id is required' });
 
+  // Heartbeat handle: assigned only after the SSE headers flush, which itself
+  // happens only after the client-authorization gate passes. The finally
+  // guards on null, so the early 404/validation paths never touch a timer.
+  let stopHeartbeat = null;
+
   try {
     // Tenant isolation: verify the client belongs to the caller's org before
     // reading any of their progress data. A wrong-org client_id yields no
@@ -890,10 +991,14 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
     // Fetch all progress data for this client
     const [clientRes, assessRes, goalsRes, checkinsRes, strengthRes, attRes, photosRes] = await Promise.all([
       pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)', [client_id, org]),
-      pool.query('SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, thigh_right_cm, thigh_left_cm, arm_right_cm, arm_left_cm, bmi, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
+      // Historical datasets are bounded at the DATABASE (audit P2-1):
+      // newest-first with LIMIT so the prompt cannot grow with the client's
+      // entire history; the rows are reversed below to restore the
+      // chronological order the model expects.
+      pool.query(`SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, thigh_right_cm, thigh_left_cm, arm_right_cm, arm_left_cm, bmi, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT ${PROGRESS_ASSESSMENTS_LIMIT}`, [client_id]),
       pool.query('SELECT goal_type, target_weight, target_body_fat, is_active, created_at FROM pt_goals WHERE client_id=$1 ORDER BY created_at DESC LIMIT 5', [client_id]),
-      pool.query('SELECT weight, mood, sleep_hours, water_glasses, client_notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
-      pool.query('SELECT exercise_name, weight_kg, reps_done, created_at FROM strength_logs WHERE client_id=$1 ORDER BY created_at ASC', [client_id]),
+      pool.query(`SELECT weight, mood, sleep_hours, water_glasses, client_notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at DESC LIMIT ${PROGRESS_CHECKINS_LIMIT}`, [client_id]),
+      pool.query(`SELECT exercise_name, weight_kg, reps_done, created_at FROM strength_logs WHERE client_id=$1 ORDER BY created_at DESC LIMIT ${PROGRESS_STRENGTH_LOGS_LIMIT}`, [client_id]),
       pool.query(`SELECT COUNT(*) AS total_sessions, COUNT(*) FILTER (WHERE created_at >= NOW()-INTERVAL '30 days') AS sessions_30d FROM pt_sessions WHERE client_id=$1`, [client_id]),
       pool.query('SELECT COUNT(*) AS total_photos FROM progress_photos WHERE client_id=$1', [client_id]),
     ]);
@@ -911,10 +1016,13 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
         gender: client.gender,
         days_since_start: daysSinceStart,
       },
-      assessments:  assessRes.rows,
+      // Bounded windows were fetched newest-first above; reverse them back
+      // into chronological order so the model reads the same shape it always
+      // did (oldest → newest).
+      assessments:  assessRes.rows.reverse(),
       goals:        goalsRes.rows,
-      weekly_checkins: checkinsRes.rows,
-      strength_logs: strengthRes.rows,
+      weekly_checkins: checkinsRes.rows.reverse(),
+      strength_logs: strengthRes.rows.reverse(),
       attendance:   attRes.rows[0],
       progress_photos: { total: photosRes.rows[0]?.total_photos || 0 },
     };
@@ -927,6 +1035,12 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
     res.setHeader('Connection',        'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
+
+    // Keep the connection alive through the silent pre-first-token window —
+    // same canonical heartbeat as chat/workout/diet (audit P2-2). The
+    // per-chunk ': ping' comments in the stream loop below only start once
+    // the model is actually producing tokens.
+    stopHeartbeat = startSseHeartbeat(res);
 
     const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
@@ -987,6 +1101,7 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
       res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Progress analysis failed. Please try again.' })}\n\n`);
     } catch { /* ignore write errors on closed connection */ }
   } finally {
+    if (stopHeartbeat) stopHeartbeat();
     try { if (!res.writableEnded) res.end(); } catch { /* ignore */ }
   }
 });
@@ -998,6 +1113,11 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
 router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res) => {
   const { assessment_id } = req.body || {};
   if (!assessment_id) return res.status(400).json({ error: 'assessment_id is required' });
+
+  // Heartbeat handle: assigned only after the SSE headers flush, which itself
+  // happens only after the org-scoped assessment gate passes. The finally
+  // guards on null, so the early 404/validation paths never touch a timer.
+  let stopHeartbeat = null;
 
   try {
     // Tenant isolation: the assessment must belong to the caller's org. A
@@ -1034,6 +1154,12 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
     res.setHeader('Connection',        'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
+
+    // Keep the connection alive through the silent pre-first-token window —
+    // same canonical heartbeat as chat/workout/diet (audit P2-2). The
+    // per-chunk ': ping' comments in the stream loop below only start once
+    // the model is actually producing tokens.
+    stopHeartbeat = startSseHeartbeat(res);
 
     const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
@@ -1094,6 +1220,7 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
       res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Fitness testing analysis failed. Please try again.' })}\n\n`);
     } catch { /* ignore write errors on closed connection */ }
   } finally {
+    if (stopHeartbeat) stopHeartbeat();
     try { if (!res.writableEnded) res.end(); } catch { /* ignore */ }
   }
 });
