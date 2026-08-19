@@ -274,12 +274,30 @@ const TOOLS = [
       const lower = msg.toLowerCase();
       return MUSCLE_KEYWORDS.find((k) => lower.includes(k)) || null;
     },
-    async run(_req, muscle) {
+    async run(req, muscle) {
+      // Same visibility rule as the exercise library's own reads
+      // (visibilityClause in routes/exercises.js, and retrieveExerciseLibrary
+      // in routes/ai.js): built-in exercises (organization_id IS NULL) are
+      // shared by every studio; a studio's custom exercises are visible only
+      // to the trainer who wrote them, inside their own org. Deleted and
+      // archived rows never surface. The legacy `visibility` column is dead —
+      // nothing reads it, and this query does not either.
+      //
+      // Org and user come from the authenticated request (tenantScope +
+      // req.user), never from the model or the message. Fail closed: without
+      // a trusted org or user (platform-wide super admin, org-less user) we
+      // return nothing rather than broadening the query.
+      const org = orgParam(req);
+      const userId = req.user?.id;
+      if (!org || !userId) return [];
       const { rows } = await pool.query(
-        `SELECT name, muscle_group, body_part, equipment, difficulty
-         FROM exercises WHERE is_active = true AND (muscle_group ILIKE $1 OR body_part ILIKE $1 OR target_muscle ILIKE $1)
-         ORDER BY name LIMIT 8`,
-        [`%${muscle}%`]
+        `SELECT e.name, e.muscle_group, e.body_part, e.equipment, e.difficulty
+         FROM exercises e
+         WHERE e.deleted_at IS NULL AND e.archived_at IS NULL
+           AND (e.organization_id IS NULL OR (e.organization_id = $2::uuid AND e.created_by = $3))
+           AND (e.muscle_group ILIKE $1 OR e.body_part ILIKE $1 OR e.target_muscle ILIKE $1)
+         ORDER BY e.name LIMIT 8`,
+        [`%${muscle}%`, org, userId]
       );
       return rows;
     },
