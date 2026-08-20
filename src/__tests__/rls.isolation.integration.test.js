@@ -287,9 +287,18 @@ describeIf('cross-tenant isolation, against a real database', () => {
   describe('gap tables (migration 159)', () => {
     beforeEach(async () => {
       // Child rows hanging off the two studios' existing fixture clients.
+      //
+      // organization_id is supplied because migration 174 gave this table the
+      // column and made it NOT NULL. It was a "gap table" when 159 was written
+      // — tenancy reachable only by walking client_id up to pt_clients — and
+      // it is now BOTH: it carries the column and keeps the parent walk, ANDed
+      // together in one policy. The insert therefore has to name an org, and
+      // has to name the one that owns the client.
       await owner.query(`DELETE FROM pt_lifestyle_assessments WHERE id IN ('la-a','la-b')`);
       await owner.query(
-        `INSERT INTO pt_lifestyle_assessments (id, client_id) VALUES ('la-a','client-a'), ('la-b','client-b')`);
+        `INSERT INTO pt_lifestyle_assessments (id, client_id, organization_id)
+         VALUES ('la-a','client-a',$1), ('la-b','client-b',$2)`,
+        [ORG_A, ORG_B]);
     });
 
     afterEach(async () => {
@@ -320,13 +329,34 @@ describeIf('cross-tenant isolation, against a real database', () => {
     it('a child row cannot be written against the other studio\'s parent', async () => {
       // WITH CHECK, not USING: the insert names a client this studio cannot
       // see, and the write must be refused rather than land unowned.
+      //
+      // The row stamps studio A's OWN org id, so the column half of the policy
+      // is satisfied and only the parent walk can refuse this. That is the
+      // point: after migration 174 gave this table an organization_id, a bare
+      // column check would have accepted this write and quietly created a row
+      // owned by studio A that points at studio B's client. The two halves are
+      // ANDed precisely so this stays refused.
       await expect(
         asOrg(ORG_A, (c) =>
-          c.query(`INSERT INTO pt_lifestyle_assessments (id, client_id) VALUES ('smuggled','client-b')`))
+          c.query(
+            `INSERT INTO pt_lifestyle_assessments (id, client_id, organization_id)
+             VALUES ('smuggled','client-b',$1)`, [ORG_A]))
       ).rejects.toThrow(/row-level security/i);
 
       const { rows } = await owner.query(`SELECT id FROM pt_lifestyle_assessments WHERE id = 'smuggled'`);
       expect(rows).toEqual([]);
+
+      // And the mirror: naming the other studio's org is refused by the column
+      // half, even though the client and the org agree with each other.
+      await expect(
+        asOrg(ORG_A, (c) =>
+          c.query(
+            `INSERT INTO pt_lifestyle_assessments (id, client_id, organization_id)
+             VALUES ('smuggled-2','client-b',$1)`, [ORG_B]))
+      ).rejects.toThrow(/row-level security/i);
+
+      const { rows: r2 } = await owner.query(`SELECT id FROM pt_lifestyle_assessments WHERE id = 'smuggled-2'`);
+      expect(r2).toEqual([]);
     });
 
     it('the platform catalogue stays readable by every studio', async () => {

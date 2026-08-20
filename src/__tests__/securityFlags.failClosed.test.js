@@ -83,12 +83,27 @@ describe('the strict comparison at every point of use is preserved (secure defau
     'middleware/platformAuth.js',
     'middleware/tenant.js',
     'db/pool.js',
+    'lib/tenantRlsFlag.js',
   ];
+
+  // A file satisfies this either by comparing the env var to 'off' itself, or
+  // by importing a shared module that does. TENANT_RLS_ENFORCE took the second
+  // route after auth.js, pool.js and server.js were found to be answering the
+  // same question three times, with server.js answering it wrongly — see
+  // lib/tenantRlsFlag.js. What must never appear is a THIRD way of reading it.
+  const SHARED_FLAG_MODULES = /require\((['"]).*tenantRlsFlag\1\)/;
 
   it.each(files)('%s reads its flag with !== \'off\' (defaults ON)', (rel) => {
     const src = fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
     const used = FLAGS.filter((f) => src.includes(`process.env.${f}`));
-    expect(used.length).toBeGreaterThan(0);
+
+    if (used.length === 0) {
+      // No direct env read — it must be delegating to the shared predicate,
+      // not simply having dropped the check.
+      expect(src).toMatch(SHARED_FLAG_MODULES);
+      return;
+    }
+
     for (const flag of used) {
       // Every read of the flag in this file compares it to the exact string.
       const reads = src.match(new RegExp(`process\\.env\\.${flag}[^\\n]*`, 'g')) || [];
@@ -96,6 +111,17 @@ describe('the strict comparison at every point of use is preserved (secure defau
         expect(read).toMatch(/!==\s*'off'/);
       }
     }
+  });
+
+  it('the shared predicate is fail-secure: only the exact string "off" disables', () => {
+    const { rlsEnforcementEnabled } = require('../lib/tenantRlsFlag');
+    // An operator setting =true or =1 out of habit must not silently disable a
+    // security control, and neither must leaving it unset.
+    expect(rlsEnforcementEnabled({})).toBe(true);
+    expect(rlsEnforcementEnabled({ TENANT_RLS_ENFORCE: 'true' })).toBe(true);
+    expect(rlsEnforcementEnabled({ TENANT_RLS_ENFORCE: '1' })).toBe(true);
+    expect(rlsEnforcementEnabled({ TENANT_RLS_ENFORCE: 'OFF' })).toBe(true);
+    expect(rlsEnforcementEnabled({ TENANT_RLS_ENFORCE: 'off' })).toBe(false);
   });
 });
 

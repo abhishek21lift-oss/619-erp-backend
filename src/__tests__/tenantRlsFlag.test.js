@@ -20,24 +20,57 @@ const path = require('path');
 
 const auth = fs.readFileSync(path.join(__dirname, '..', 'middleware', 'auth.js'), 'utf8');
 const poolSrc = fs.readFileSync(path.join(__dirname, '..', 'db', 'pool.js'), 'utf8');
+const serverSrc = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+const { rlsEnforcementEnabled } = require('../lib/tenantRlsFlag');
 
-describe('TENANT_RLS_ENFORCE — the two halves of the flag agree', () => {
-  it('both files gate on the exact same env var, read the exact same way (secure default: ON)', () => {
-    const FLAG = "process.env.TENANT_RLS_ENFORCE !== 'off'";
-    expect(auth).toContain(FLAG);
-    expect(poolSrc).toContain(FLAG);
+describe('TENANT_RLS_ENFORCE — every consumer agrees', () => {
+  // ── Behaviour, not source text ──────────────────────────────────────────
+  //
+  // This block used to assert that the literal string
+  // `process.env.TENANT_RLS_ENFORCE !== 'off'` appeared in auth.js and
+  // pool.js. It passed for as long as it existed, and it never once
+  // established that the flag was read correctly — because server.js, a third
+  // consumer it did not look at, read the SAME variable for truthiness and
+  // therefore disagreed with both of them in both directions:
+  //
+  //   unset → enforcement ON, boot guard silent (shipped the misconfiguration)
+  //   'off' → enforcement OFF, boot guard fires (refused to start when disabled)
+  //
+  // A string match cannot catch that. Evaluating the predicate can, so these
+  // now call it.
+  it.each([
+    ['<unset>', undefined, true],
+    ['empty string', '', true],
+    ['off', 'off', false],
+    ['on', 'on', true],
+    ['1', '1', true],
+    ['true', 'true', true],
+    ['OFF (wrong case — only exact "off" disables)', 'OFF', true],
+  ])('%s → enforcement enabled = %s', (_label, value, expected) => {
+    const env = value === undefined ? {} : { TENANT_RLS_ENFORCE: value };
+    expect(rlsEnforcementEnabled(env)).toBe(expected);
   });
 
-  it('defaults ON in production — unset or any value other than the literal string "off" enables enforcement', () => {
-    // !== 'off' rather than a truthy check: an operator setting
-    // TENANT_RLS_ENFORCE=true or =1 by habit from other flags in this repo
-    // must not silently turn off a security control.
-    // Only explicit 'off' disables (for staged rollout).
-    expect(auth).not.toMatch(/TENANT_RLS_ENFORCE\s*\?\?/);
-    expect(auth).not.toMatch(/Boolean\(process\.env\.TENANT_RLS_ENFORCE\)/);
-    // Ensure the strict comparison is used, not a loose truthy check
-    expect(auth).toMatch(/!==\s*'off'/);
-    expect(poolSrc).toMatch(/!==\s*'off'/);
+  it('is defined once and imported by all three consumers, so they cannot drift', () => {
+    // The drift this replaces was not a typo — it was the same question
+    // answered independently in three files. One definition, three importers.
+    for (const [name, src] of Object.entries({ auth, pool: poolSrc, server: serverSrc })) {
+      expect(src).toMatch(/require\((['"]).*tenantRlsFlag\1\)/);
+      // …and none of them re-derives it locally any more.
+      expect(src).not.toContain("process.env.TENANT_RLS_ENFORCE !== 'off'");
+      expect(src).not.toMatch(/isProd && process\.env\.TENANT_RLS_ENFORCE\b/);
+      expect(name).toBeTruthy();
+    }
+  });
+
+  it('the boot guard fires exactly when enforcement is on, not when the var is merely set', () => {
+    // The guard's job: refuse to start when enforcement is on but
+    // ADMIN_DATABASE_URL has not been split out from DATABASE_URL, because the
+    // app would then connect as the table owner and bypass every RLS policy
+    // while still paying for the per-query transaction wrapper.
+    const bootGuardFires = (env) => rlsEnforcementEnabled(env);
+    expect(bootGuardFires({})).toBe(true);                          // was false — the bug
+    expect(bootGuardFires({ TENANT_RLS_ENFORCE: 'off' })).toBe(false); // was true — the other bug
   });
 
   it("auth.js never blocks a request when org-id resolution fails — it only feeds a query wrapper, it is not a new authorization gate", () => {

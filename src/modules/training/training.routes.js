@@ -113,6 +113,15 @@ router.post('/programs', auth, STAFF, validate(schemas.programCreate), wrap(asyn
 
 router.patch('/programs/:id', auth, STAFF, validate(schemas.programUpdate), wrap(async (req, res) => {
   if (!await authz.loadOwned(req, 'training_programs', req.params.id)) return notFound(res, 'Program');
+  // client_id is in the patch list below, and POST /programs guards the same
+  // field with this exact check. Without it here, a programme this studio
+  // legitimately owns could be re-pointed at ANOTHER studio's client — not a
+  // read of foreign data, but a foreign key written across the tenant
+  // boundary, which leaves the row reachable from two studios' client views.
+  if (req.body.client_id !== undefined && req.body.client_id !== null
+      && !await authz.canAccessClient(req, req.body.client_id)) {
+    return notFound(res, 'Client');
+  }
   const { sets, values } = patchFrom(req.body, [
     'name', 'description', 'goal', 'program_type', 'duration_weeks',
     'status', 'start_date', 'end_date', 'notes', 'client_id',

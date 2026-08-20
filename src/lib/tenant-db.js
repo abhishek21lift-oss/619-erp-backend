@@ -54,4 +54,29 @@ function orgIdOf(req) {
   return tenantScope(req).orgId;
 }
 
-module.exports = { tenantScope, orgIdOf, targetOrgId };
+/**
+ * ` AND <col> = $N`, pushing the org id onto `params`.
+ *
+ * Returns '' for a platform super admin operating platform-wide, so the same
+ * handler serves both a studio and the operator console without branching.
+ *
+ * Four modules already had a private copy of exactly this function
+ * (pt-os.routes.js, training/authz.js, leave.js, client-portal.routes.js).
+ * This is that same contract, character for character, hoisted to the module
+ * that already owns tenantScope() so the routes fixed in migration 174's
+ * sweep do not each add a fifth, sixth and seventh copy. The existing four
+ * are deliberately left alone — they are correct, they are covered by tests,
+ * and rewriting working isolation code during a security fix is how a
+ * security fix introduces a regression.
+ *
+ * Intended to follow a `WHERE 1=1`, which is the idiom the rest of this
+ * codebase already uses for composable filters (see pt-os.routes.js).
+ */
+function orgWhere(req, params, col = 'organization_id') {
+  const scope = tenantScope(req);
+  if (!scope.applyFilter) return '';
+  params.push(scope.orgId);
+  return ` AND ${col} = $${params.length}`;
+}
+
+module.exports = { tenantScope, orgIdOf, targetOrgId, orgWhere };

@@ -476,8 +476,18 @@ describe('tenant-scope convention — no HANDLER reads a tenant table unscoped',
         'pool.query(`SELECT * FROM user_portfolio_items WHERE user_id = $1`, [req.user.id]);' },
       { file: 'c.js', verb: 'GET', route: '/guarded', body:
         'const client = await findClientForRequest(req); pool.query(`SELECT * FROM pt_payments WHERE client_id = $1`, [req.params.id]);' },
+      // The name-resolution join: `users` is only ever JOINed to put an author
+      // name on a row the surrounding query already selected, never read on its
+      // own, so joinOnly() clears it.
+      //
+      // This fixture used to select FROM automation_rules, which worked only
+      // because that table was not, at the time, a tenant table — the fixture
+      // was passing for the wrong reason, and migration 174 exposed it by
+      // giving automation_rules an organization_id. It now selects from a table
+      // that genuinely carries no tenancy, so the fixture tests joinOnly()
+      // rather than testing the size of the tenant-table list.
       { file: 'd.js', verb: 'GET', route: '/namejoin', body:
-        'pool.query(`SELECT r.id, u.name FROM automation_rules r LEFT JOIN users u ON u.id = r.created_by`);' },
+        'pool.query(`SELECT r.id, u.name FROM platform_announcements r LEFT JOIN users u ON u.id = r.created_by`);' },
     ];
     expect(unscopedHandlers(fine)).toEqual([]);
   });
