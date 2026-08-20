@@ -9,15 +9,30 @@ const { clientInOrg } = require('../lib/orgGuard');
 // ─── MEALS ───────────────────────────────────────────────────
 
 // GET /api/diet/meals
+//
+// `meals` is a reference library, so it takes the SHARED shape rather than the
+// strict one — the same rule routes/exercises.js already applies to its own
+// library: a row with no organization_id is platform-provided content every
+// studio draws from, and a row with one is that studio's own addition.
+//
+// Migration 174 added the column and attributed what it could. Legacy rows it
+// could not place stay NULL and therefore stay visible to everyone, which is
+// the correct outcome for a seeded food catalogue and the reason this endpoint
+// does not simply filter strictly: doing so would empty the meal picker for
+// every studio at once. Every row created from here on carries its studio.
 router.get('/meals', auth, async (req, res, next) => {
   try {
     const { meal_type, search } = req.query;
     const conds = ['is_active = true'];
     const params = [];
-    let p = 1;
 
-    if (meal_type) { conds.push(`meal_type = $${p++}`); params.push(meal_type); }
-    if (search)    { conds.push(`name ILIKE $${p++}`);   params.push(`%${search}%`); }
+    const scope = tenantScope(req);
+    if (scope.applyFilter) {
+      params.push(scope.orgId);
+      conds.push(`(organization_id IS NULL OR organization_id = $${params.length})`);
+    }
+    if (meal_type) { params.push(meal_type);      conds.push(`meal_type = $${params.length}`); }
+    if (search)    { params.push(`%${search}%`);  conds.push(`name ILIKE $${params.length}`); }
 
     const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
@@ -42,12 +57,12 @@ router.post('/meals', auth, adminOrManager, async (req, res, next) => {
 
     const { rows } = await pool.query(`
       INSERT INTO meals (id, name, description, meal_type, calories,
-        protein_g, carbs_g, fats_g, serving_size, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        protein_g, carbs_g, fats_g, serving_size, created_by, organization_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [randomUUID(), d.name.trim(), d.description || null, d.meal_type || 'breakfast',
        parseInt(d.calories) || 0, parseFloat(d.protein_g) || 0,
        parseFloat(d.carbs_g) || 0, parseFloat(d.fats_g) || 0,
-       d.serving_size || null, req.user.id]
+       d.serving_size || null, req.user.id, orgIdOf(req)]
     );
     res.status(201).json({ message: 'Meal created', meal: rows[0] });
   } catch (err) {

@@ -176,7 +176,15 @@ describe('Application Tenant Role Uses app_tenant Connection', () => {
   });
 
   it('TENANT_RLS_ENFORCE defaults to ON', () => {
-    expect(poolJs).toMatch(/TENANT_RLS_ENFORCE !== 'off'/);
+    // Behavioural, not textual: the predicate moved into
+    // lib/tenantRlsFlag.js so that server.js's boot guard, which used to read
+    // the same variable for truthiness and therefore disagreed with this
+    // file, shares one definition with it. Asserting on the string only ever
+    // proved somebody had typed it here, never that the flag was right.
+    const { rlsEnforcementEnabled } = require('../lib/tenantRlsFlag');
+    expect(rlsEnforcementEnabled({})).toBe(true);
+    expect(rlsEnforcementEnabled({ TENANT_RLS_ENFORCE: 'off' })).toBe(false);
+    expect(poolJs).toMatch(/require\((['"]).*tenantRlsFlag\1\)/);
   });
 
   it('pool.js routes platform-wide work to owner connection', () => {
@@ -205,6 +213,10 @@ describe('RLS Cutover Validation', () => {
   it('server.js validates ADMIN_DATABASE_URL differs from DATABASE_URL when RLS enforced', () => {
     expect(serverJs).toMatch(/const adminUrl = process\.env\.ADMIN_DATABASE_URL \|\| process\.env\.DATABASE_URL;/);
     expect(serverJs).toMatch(/adminUrl === process\.env\.DATABASE_URL/);
-    expect(serverJs).toMatch(/TENANT_RLS_ENFORCE/);
+    // The guard must be gated on the SHARED predicate, not on the raw env
+    // var. Gated on the raw var it was silent when the var was unset — the
+    // production default, and exactly the case it exists to catch.
+    expect(serverJs).toMatch(/if \(isProd && rlsEnforcementEnabled\(\)\)/);
+    expect(serverJs).not.toMatch(/if \(isProd && process\.env\.TENANT_RLS_ENFORCE\)/);
   });
 });

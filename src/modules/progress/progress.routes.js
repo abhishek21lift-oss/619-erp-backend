@@ -4,7 +4,7 @@ const { auth } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
-const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+const { tenantScope, orgIdOf, orgWhere } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
 const scoring = require('./fitness-scoring');
 const goalScoring = require('./goal-scoring');
@@ -661,15 +661,29 @@ function computeLifestyleAnalysis(b) {
   };
 }
 
+// GET /lifestyle-assessments
+//
+// client_id is REQUIRED, which it was not before. Called bare, this endpoint
+// used to return every lifestyle assessment on the platform — sleep, stress,
+// smoking status, alcohol intake, coach notes — for every studio, to any
+// authenticated account. A list endpoint over health records has no honest
+// use for "all of them", so the parameter is mandatory and the org filter is
+// applied whether or not it is supplied.
 router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
-  const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  if (!client_id) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'client_id is required' } });
+  }
+  if (!await clientInOrg(req, client_id)) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
+  const params = [client_id];
+  const org = orgWhere(req, params);
   const { rows } = await pool.query(
-    `SELECT * FROM pt_lifestyle_assessments ${whereSql} ORDER BY assessment_date DESC`, params
+    `SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC`,
+    params
   );
-  res.json({ data: rows });
+  return res.json({ data: rows });
 }));
 
 router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(lifestyleAssessmentCreateSchema), wrap(async (req, res) => {
@@ -732,7 +746,13 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
     'screen_time_bracket', 'travel_frequency', 'energy_level', 'motivation_to_exercise', 'recovery_quality', 'coach_notes',
   ];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_lifestyle_assessments WHERE id = $1', [req.params.id]);
+  // Scoped read before the write. Unscoped, this loaded — and the UPDATE below
+  // then rewrote — any studio's health record by id.
+  const exParams = [req.params.id];
+  const exOrg = orgWhere(req, exParams);
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_lifestyle_assessments WHERE id = $1${exOrg}`, exParams
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -777,7 +797,11 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
   }
 
   sets.push('updated_at = NOW()');
-  const { rows } = await pool.query(`UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  const upOrg = orgWhere(req, params);
+  const { rows } = await pool.query(
+    `UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1${upOrg} RETURNING *`, params
+  );
+  if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ data: rows[0] });
 }));
 
@@ -885,15 +909,26 @@ async function computeNutritionAnalysis(clientId, b) {
   };
 }
 
+// GET /nutrition-assessments
+//
+// Same shape, and the same reasoning, as /lifestyle-assessments above — this
+// table additionally holds food_allergies, medical_conditions and
+// medical_notes, so the bare call was the widest medical-data read in the API.
 router.get('/nutrition-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
-  const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  if (!client_id) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'client_id is required' } });
+  }
+  if (!await clientInOrg(req, client_id)) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
+  const params = [client_id];
+  const org = orgWhere(req, params);
   const { rows } = await pool.query(
-    `SELECT * FROM pt_nutrition_assessments ${whereSql} ORDER BY assessment_date DESC`, params
+    `SELECT * FROM pt_nutrition_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC`,
+    params
   );
-  res.json({ data: rows });
+  return res.json({ data: rows });
 }));
 
 router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(nutritionAssessmentCreateSchema), wrap(async (req, res) => {
@@ -971,7 +1006,12 @@ router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
     'meal_preparer', 'nutrition_budget', 'medical_conditions', 'medical_notes', 'coach_notes',
   ];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_nutrition_assessments WHERE id = $1', [req.params.id]);
+  // Scoped read before the write, as on the lifestyle PATCH above.
+  const exParams = [req.params.id];
+  const exOrg = orgWhere(req, exParams);
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_nutrition_assessments WHERE id = $1${exOrg}`, exParams
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -1016,7 +1056,11 @@ router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
   }
 
   sets.push('updated_at = NOW()');
-  const { rows } = await pool.query(`UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  const upOrg = orgWhere(req, params);
+  const { rows } = await pool.query(
+    `UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1${upOrg} RETURNING *`, params
+  );
+  if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ data: rows[0] });
 }));
 

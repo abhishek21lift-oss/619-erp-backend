@@ -1,7 +1,17 @@
 'use strict';
+// Discount offers and coupon codes.
+//
+// Scoped to the caller's studio throughout. Before migration 174 the offers
+// table had no organization_id, so every read returned the whole platform's
+// offers and `DELETE FROM offers WHERE id = $1` deleted any studio's. The
+// `code` column also carried a PLATFORM-WIDE unique constraint, which meant
+// the first studio to create "SUMMER20" took that code away from everyone
+// else; 174 replaces it with a per-studio unique index, so the 23505 handlers
+// below now mean "you already have that code" rather than "somebody does".
 const express = require('express');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { orgWhere, orgIdOf } = require('../lib/tenant-db');
 
 const router = express.Router();
 router.use(auth, adminOnly);
@@ -10,11 +20,12 @@ router.use(auth, adminOnly);
 router.get('/', async (req, res, next) => {
   try {
     const { status, audience } = req.query;
-    const conditions = [];
     const values = [];
-    if (status)   { conditions.push(`status = $${values.length + 1}`);   values.push(status); }
-    if (audience) { conditions.push(`audience = $${values.length + 1}`); values.push(audience); }
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const org = orgWhere(req, values);
+    const conditions = [];
+    if (status)   { values.push(status);   conditions.push(`status = $${values.length}`); }
+    if (audience) { values.push(audience); conditions.push(`audience = $${values.length}`); }
+    const extra = conditions.length ? ` AND ${conditions.join(' AND ')}` : '';
     const result = await pool.query(
       `SELECT id, code, status,
               title          AS name,
@@ -26,7 +37,7 @@ router.get('/', async (req, res, next) => {
               max_uses       AS "usageLimit",
               used_count     AS used,
               created_at
-       FROM offers ${where} ORDER BY created_at DESC`,
+       FROM offers WHERE 1=1${org}${extra} ORDER BY created_at DESC`,
       values
     );
     res.json(result.rows);
@@ -36,14 +47,16 @@ router.get('/', async (req, res, next) => {
 // GET /api/offers/stats
 router.get('/stats', async (req, res, next) => {
   try {
+    const values = [];
+    const org = orgWhere(req, values);
     const result = await pool.query(`
       SELECT
         COUNT(*)                                           AS total,
         COUNT(*) FILTER (WHERE status = 'active')         AS active,
         COUNT(*) FILTER (WHERE status = 'expired')        AS expired,
         COALESCE(SUM(used_count), 0)                      AS total_used
-      FROM offers
-    `);
+      FROM offers WHERE 1=1${org}
+    `, values);
     res.json(result.rows[0]);
   } catch (err) { next(err); }
 });
@@ -51,7 +64,9 @@ router.get('/stats', async (req, res, next) => {
 // GET /api/offers/:id
 router.get('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('SELECT * FROM offers WHERE id = $1', [req.params.id]);
+    const values = [req.params.id];
+    const org = orgWhere(req, values);
+    const result = await pool.query(`SELECT * FROM offers WHERE id = $1${org}`, values);
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json(result.rows[0]);
   } catch (err) { next(err); }
@@ -64,8 +79,8 @@ router.post('/', async (req, res, next) => {
     if (!title) return res.status(400).json({ error: 'title is required' });
     const result = await pool.query(
       `INSERT INTO offers
-         (title, description, discount_type, discount_value, code, audience, max_uses, valid_from, valid_until, status, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         (title, description, discount_type, discount_value, code, audience, max_uses, valid_from, valid_until, status, created_by, organization_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
         title,
@@ -79,11 +94,12 @@ router.post('/', async (req, res, next) => {
         valid_until || null,
         status || 'active',
         req.user?.id,
+        orgIdOf(req),
       ]
     );
     res.status(201).json({ offer: result.rows[0] });
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'Coupon code already exists' });
+    if (err.code === '23505') return res.status(409).json({ error: 'You already have an offer with this code' });
     next(err);
   }
 });
@@ -92,6 +108,8 @@ router.post('/', async (req, res, next) => {
 router.put('/:id', async (req, res, next) => {
   try {
     const { title, description, discount_type, discount_value, code, audience, max_uses, valid_from, valid_until, status } = req.body;
+    const values = [title, description, discount_type, discount_value, code, audience, max_uses || null, valid_from || null, valid_until || null, status, req.params.id];
+    const org = orgWhere(req, values);
     const result = await pool.query(
       `UPDATE offers
        SET title          = COALESCE($1, title),
@@ -105,14 +123,14 @@ router.put('/:id', async (req, res, next) => {
            valid_until    = $9,
            status         = COALESCE($10, status),
            updated_at     = NOW()
-       WHERE id = $11
+       WHERE id = $11${org}
        RETURNING *`,
-      [title, description, discount_type, discount_value, code, audience, max_uses || null, valid_from || null, valid_until || null, status, req.params.id]
+      values
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json({ offer: result.rows[0] });
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'Coupon code already exists' });
+    if (err.code === '23505') return res.status(409).json({ error: 'You already have an offer with this code' });
     next(err);
   }
 });
@@ -120,7 +138,9 @@ router.put('/:id', async (req, res, next) => {
 // DELETE /api/offers/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('DELETE FROM offers WHERE id = $1 RETURNING id', [req.params.id]);
+    const values = [req.params.id];
+    const org = orgWhere(req, values);
+    const result = await pool.query(`DELETE FROM offers WHERE id = $1${org} RETURNING id`, values);
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json({ message: 'Offer deleted' });
   } catch (err) { next(err); }
@@ -129,15 +149,17 @@ router.delete('/:id', async (req, res, next) => {
 // POST /api/offers/:id/redeem — increment used_count
 router.post('/:id/redeem', async (req, res, next) => {
   try {
+    const values = [req.params.id];
+    const org = orgWhere(req, values);
     const result = await pool.query(
       `UPDATE offers
        SET used_count = used_count + 1, updated_at = NOW()
-       WHERE id = $1
+       WHERE id = $1${org}
          AND status = 'active'
          AND (max_uses IS NULL OR used_count < max_uses)
          AND (valid_until IS NULL OR valid_until >= CURRENT_DATE)
        RETURNING *`,
-      [req.params.id]
+      values
     );
     if (!result.rows.length) return res.status(400).json({ error: 'Offer is not redeemable' });
     res.json({ success: true, offer: result.rows[0] });

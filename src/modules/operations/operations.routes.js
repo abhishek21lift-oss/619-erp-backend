@@ -1,7 +1,24 @@
+// Generic record workspace backing ModuleWorkspace on eight (chrome) tabs.
+//
+// ── The two things wrong here before migration 174 ──────────────────────────
+//
+// 1. module_records existed in no migration and no schema file. Whatever
+//    created it where it exists did so out of band, which is precisely why
+//    neither the RLS policy generator (157) nor the convention test could see
+//    it: both discover tables by reading these migrations. 174 now creates it
+//    with a tenant column, so the table is either properly formed or newly
+//    created, and the 503 branch below becomes unreachable rather than load-
+//    bearing.
+//
+// 2. The only filter was branch_id, and scopedClause() returned the literal
+//    'TRUE' for admins — so an admin's read, update and soft-delete addressed
+//    every studio's records on the platform. The branch clause is kept as a
+//    within-studio refinement; the org clause below is the boundary.
 const express = require('express');
 const pool = require('../../db/pool');
 const { auth } = require('../../middleware/auth');
 const { branchScope } = require('../../middleware/branch-scope');
+const { orgWhere, orgIdOf } = require('../../lib/tenant-db');
 
 const router = express.Router();
 
@@ -81,12 +98,13 @@ router.get('/:moduleKey', async (req, res, next) => {
   }
 
   const params = [moduleKey];
+  const org = orgWhere(req, params);
   const scope = scopedClause(req, params);
   try {
     const { rows } = await pool.query(
       `SELECT id, title, owner, status, priority, amount, due_date, channel, notes, created_at, updated_at
          FROM module_records
-        WHERE module_key = $1
+        WHERE module_key = $1${org}
           AND deleted_at IS NULL
           AND ${scope}
         ORDER BY due_date ASC, created_at DESC
@@ -108,8 +126,8 @@ router.post('/:moduleKey', async (req, res, next) => {
     const createdBy = req.user && req.user.id;
     const { rows } = await pool.query(
       `INSERT INTO module_records
-        (module_key, title, owner, status, priority, amount, due_date, channel, notes, branch_id, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        (module_key, title, owner, status, priority, amount, due_date, channel, notes, branch_id, created_by, organization_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        RETURNING id, title, owner, status, priority, amount, due_date, channel, notes, created_at, updated_at`,
       [
         moduleKey,
@@ -123,6 +141,7 @@ router.post('/:moduleKey', async (req, res, next) => {
         String(req.body.notes || '').trim(),
         branchId,
         createdBy || null,
+        orgIdOf(req),
       ]
     );
     res.status(201).json(recordFromRow(rows[0]));
@@ -148,6 +167,7 @@ router.put('/:moduleKey/:id', async (req, res, next) => {
       moduleKey,
       req.params.id,
     ];
+    const org = orgWhere(req, params);
     const scope = scopedClause(req, params);
     const { rows } = await pool.query(
       `UPDATE module_records
@@ -160,7 +180,7 @@ router.put('/:moduleKey/:id', async (req, res, next) => {
               channel = $7,
               notes = $8
         WHERE module_key = $9
-          AND id = $10
+          AND id = $10${org}
           AND deleted_at IS NULL
           AND ${scope}
         RETURNING id, title, owner, status, priority, amount, due_date, channel, notes, created_at, updated_at`,
@@ -178,12 +198,13 @@ router.delete('/:moduleKey/:id', async (req, res, next) => {
   try {
     const moduleKey = cleanModuleKey(req.params.moduleKey);
     const params = [moduleKey, req.params.id];
+    const org = orgWhere(req, params);
     const scope = scopedClause(req, params);
     const { rows } = await pool.query(
       `UPDATE module_records
           SET deleted_at = NOW()
         WHERE module_key = $1
-          AND id = $2
+          AND id = $2${org}
           AND deleted_at IS NULL
           AND ${scope}
         RETURNING id`,

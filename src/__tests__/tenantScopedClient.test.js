@@ -208,8 +208,13 @@ describe('the connect() wrapper is gated exactly like the query() one', () => {
   it('reads the same env var, so the two cannot disagree', () => {
     const src = require('node:fs')
       .readFileSync(require('node:path').join(__dirname, '..', 'db', 'pool.js'), 'utf8');
-    // One definition, both wrappers.
-    expect(src.match(/TENANT_RLS_ENFORCE\s*=\s*process\.env/g)).toHaveLength(1);
+    // One definition, both wrappers. The predicate itself now lives in
+    // lib/tenantRlsFlag.js — server.js's boot guard was found to be answering
+    // the same question a third time and getting it backwards — so what this
+    // asserts is that pool.js still derives the constant exactly once, from
+    // that shared module rather than from the environment directly.
+    expect(src.match(/const TENANT_RLS_ENFORCE\s*=\s*rlsEnforcementEnabled\(\);/g)).toHaveLength(1);
+    expect(src.match(/TENANT_RLS_ENFORCE\s*=\s*process\.env/g)).toBeNull();
     expect(src).toMatch(/pool\.connect = function tenantScopedConnect/);
     expect(src).toMatch(/if \(!TENANT_RLS_ENFORCE\) return borrowed;/);
   });

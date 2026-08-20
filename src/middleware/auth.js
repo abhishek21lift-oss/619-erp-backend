@@ -8,7 +8,9 @@ const { platformSessionBlocked, TENANT_SESSION_REQUIRED } = require('./platformA
 
 // Defaults to ON in production for security. Explicitly set to 'off' to disable
 // (staged rollout only). See TENANT-RLS-PLAN.md and server.js startup validation.
-const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE !== 'off';
+// Shared predicate — see lib/tenantRlsFlag.js for why it is not inlined here.
+const { rlsEnforcementEnabled } = require('../lib/tenantRlsFlag');
+const TENANT_RLS_ENFORCE = rlsEnforcementEnabled();
 
 // Path prefixes that stay reachable even when a studio's subscription has lapsed,
 // so the studio can still authenticate, view its billing/frozen screen, manage

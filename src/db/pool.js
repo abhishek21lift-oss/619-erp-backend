@@ -127,8 +127,12 @@ pool.on('connect', (client) => {
 });
 
 // Defaults to ON in production for security. Explicitly set to 'off' to disable
-// (staged rollout only). Must match middleware/auth.js exactly.
-const TENANT_RLS_ENFORCE = process.env.TENANT_RLS_ENFORCE !== 'off';
+// (staged rollout only). The predicate lives in lib/tenantRlsFlag.js so that
+// this file, middleware/auth.js and server.js's boot guard cannot disagree
+// about whether enforcement is on — they did, and the guard was the one that
+// was wrong. See that module for the truth table.
+const { rlsEnforcementEnabled } = require('../lib/tenantRlsFlag');
+const TENANT_RLS_ENFORCE = rlsEnforcementEnabled();
 
 /**
  * The owner connection — the deliberate, auditable way past RLS.

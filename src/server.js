@@ -9,6 +9,7 @@ const Sentry = require('./instrument');
 require('dotenv').config();
 
 const logger = require('./lib/logger');
+const { rlsEnforcementEnabled } = require('./lib/tenantRlsFlag');
 
 // Define isProd early — used in env checks below and throughout the file
 const isProd = (process.env.NODE_ENV || 'development') === 'production';
@@ -46,7 +47,22 @@ if (missingRecommended.length) {
 // must exist for platform-wide operations. If both URLs are the same, the app
 // connects as the table owner (postgres) which has BYPASSRLS, making all RLS
 // policies ineffective. This check catches the misconfiguration at boot.
-if (isProd && process.env.TENANT_RLS_ENFORCE) {
+//
+// The condition below must be the SAME predicate db/pool.js and
+// middleware/auth.js use to decide whether enforcement is on, and it was not:
+// this line tested the variable for truthiness while they test it against the
+// string 'off'. The two disagreed in both directions, and both directions were
+// wrong:
+//
+//   TENANT_RLS_ENFORCE | old guard fired? | enforcement actually on?
+//   <unset>            | no               | YES  ← shipped the misconfiguration
+//   'off'              | YES              | no   ← refused to boot when disabled
+//
+// Unset is the production default, so the check meant to catch "enforcement on
+// with a single owner connection" was silent in precisely the configuration it
+// existed to catch. The predicate now lives in lib/tenantRlsFlag.js and is
+// imported by all three call sites, so they cannot drift apart again.
+if (isProd && rlsEnforcementEnabled()) {
   const adminUrl = process.env.ADMIN_DATABASE_URL || process.env.DATABASE_URL;
   if (adminUrl === process.env.DATABASE_URL) {
     logger.fatal(
@@ -803,8 +819,22 @@ app.use('/api/client-login',     auth, requireStaff, require('./routes/client-lo
 // ────────────────────────
 // BUSINESS FLOW ROUTES (v4 — Progress, Automation)
 // ────────────────────────
-app.use('/api/progress',         require('./modules/progress/progress.routes'));
-app.use('/api/automation',       require('./modules/automation/automation.routes'));
+//
+// requireStaff, for the same reason /api/pt-os carries it: both modules serve
+// the studio's back office, and both were mounted on `auth` alone — which was
+// survivable only while no account held the `member` role. Client activation
+// creates those accounts by the hundred, and until this line existed a client
+// with a valid token could call GET /api/progress/lifestyle-assessments and
+// GET /api/automation/session-balance, which between them return health
+// records and other clients' names and phone numbers.
+//
+// A client's own data is served by /api/me, which scopes to the caller.
+//
+// userApiLimiter as well: these two mounts had only the 2000-per-15-minutes
+// global bucket, which is a generous ceiling for an endpoint that returns
+// health records a page at a time.
+app.use('/api/progress',   userApiLimiter, auth, requireStaff, require('./modules/progress/progress.routes'));
+app.use('/api/automation', userApiLimiter, auth, requireStaff, require('./modules/automation/automation.routes'));
 
 // ────────────────────────
 // v3 MODULE ROUTES
