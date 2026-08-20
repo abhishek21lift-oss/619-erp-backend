@@ -464,11 +464,105 @@ BEGIN
   END IF;
 END $$;
 
--- The twelve tables 174 retrofits are NOT given policies here. They get them
--- from 157's schema scan, which discovers every table carrying an
--- organization_id — and as of this migration, they all do. Re-running 157
--- after this one (it is idempotent) is what activates them; the RLS cutover
--- sequence in TENANT-RLS-PLAN.md covers that step.
+-- ── 5b. RLS policies for the twelve retrofitted tables ──────────────────────
+--
+-- An earlier draft of this migration left this out, on the reasoning that
+-- 157's schema scan discovers every table carrying an organization_id and
+-- would pick these up once they had one. That is wrong, and wrong in the
+-- quiet direction: MIGRATIONS RUN ONCE. 157 has already run, its scan saw
+-- eleven-and-a-bit fewer tables than it does now, and it will never run again.
+--
+-- Meanwhile migration 131 converged every table in `public` to RLS-enabled.
+-- So without this section, ten of the twelve would sit with RLS ON and no
+-- policy naming app_tenant — which does not raise, it returns zero rows. On
+-- the day DATABASE_URL points at app_tenant, campaigns, offers, feedback,
+-- integrations, plans, pt_packages, session_balance, automation_rules,
+-- communication_logs and meals would all go silently empty. That is precisely
+-- the failure 159 was written to fix, reintroduced one migration later.
+--
+-- rls.isolation.integration.test.js asserts exactly this ("leaves no table
+-- with RLS on and no policy, except the three that mean it").
+
+-- Ten strict tables: the row's own organization_id must match the connection.
+DO $$
+DECLARE
+  t TEXT;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_tenant') THEN
+    RAISE NOTICE '174: app_tenant absent, skipping policy creation';
+    RETURN;
+  END IF;
+  FOREACH t IN ARRAY ARRAY[
+    'session_balance', 'pt_packages', 'automation_rules', 'communication_logs',
+    'campaigns', 'offers', 'feedback', 'integrations', 'plans'
+  ]
+  LOOP
+    IF to_regclass('public.' || t) IS NULL THEN CONTINUE; END IF;
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON public.%I', t);
+    EXECUTE format(
+      'CREATE POLICY tenant_isolation ON public.%I FOR ALL TO app_tenant '
+      || 'USING (organization_id::text = current_setting(''app.org_id'', true)) '
+      || 'WITH CHECK (organization_id::text = current_setting(''app.org_id'', true))', t
+    );
+  END LOOP;
+END $$;
+
+-- meals takes the SHARED shape, like `exercises` in 157's shared_tables list
+-- and for the same reason: it is a reference library where a NULL org means
+-- platform-provided content every studio draws on. routes/diet.js reads it the
+-- same way. Scoping it strictly would empty the meal picker for everyone at
+-- once, which is the trap TENANT-RLS-PLAN.md flagged with the 890-row exercise
+-- library.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_tenant') THEN RETURN; END IF;
+  IF to_regclass('public.meals') IS NULL THEN RETURN; END IF;
+  ALTER TABLE public.meals ENABLE ROW LEVEL SECURITY;
+  DROP POLICY IF EXISTS tenant_isolation ON public.meals;
+  CREATE POLICY tenant_isolation ON public.meals FOR ALL TO app_tenant
+    USING (organization_id::text = current_setting('app.org_id', true) OR organization_id IS NULL)
+    WITH CHECK (organization_id::text = current_setting('app.org_id', true) OR organization_id IS NULL);
+END $$;
+
+-- The two assessment tables keep their PARENT WALK, ANDed with the new column.
+--
+-- 159 gave them a policy that reaches through client_id to pt_clients. Now
+-- that they carry organization_id directly, the obvious move is to replace it
+-- with the plain column check every other table gets. That would be a
+-- REGRESSION, and the isolation suite says so: a bare column check accepts an
+-- INSERT that stamps the caller's own org onto a row pointing at ANOTHER
+-- studio's client, because it never looks at the parent. 159's test "a child
+-- row cannot be written against the other studio's parent" exists for that.
+--
+-- So the predicate is both, ANDed. It has to be ONE policy rather than two:
+-- multiple permissive policies are OR'd in Postgres, which would make the pair
+-- weaker than either alone rather than stronger.
+DO $$
+DECLARE
+  t TEXT;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_tenant') THEN RETURN; END IF;
+  FOREACH t IN ARRAY ARRAY['pt_lifestyle_assessments', 'pt_nutrition_assessments']
+  LOOP
+    IF to_regclass('public.' || t) IS NULL THEN CONTINUE; END IF;
+    IF to_regclass('public.pt_clients') IS NULL THEN CONTINUE; END IF;
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON public.%I', t);
+    EXECUTE format(
+      'CREATE POLICY tenant_isolation ON public.%I FOR ALL TO app_tenant '
+      || 'USING ('
+      || '  organization_id::text = current_setting(''app.org_id'', true) '
+      || '  AND EXISTS (SELECT 1 FROM public.pt_clients p WHERE p.id = public.%I.client_id '
+      || '              AND p.organization_id::text = current_setting(''app.org_id'', true))) '
+      || 'WITH CHECK ('
+      || '  organization_id::text = current_setting(''app.org_id'', true) '
+      || '  AND EXISTS (SELECT 1 FROM public.pt_clients p WHERE p.id = public.%I.client_id '
+      || '              AND p.organization_id::text = current_setting(''app.org_id'', true)))',
+      t, t, t
+    );
+  END LOOP;
+END $$;
 
 
 -- ── 6. Tighten to NOT NULL where the backfill was complete ──────────────────

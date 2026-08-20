@@ -704,7 +704,7 @@ router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'tra
        smoking_status, cigarettes_per_day, years_smoking, alcohol_status, drinks_per_week,
        screen_time_bracket, travel_frequency, energy_level, motivation_to_exercise, recovery_quality, recovery_score,
        sedentary_risk, recovery_risk, habit_risk_score, risk_factors, lifestyle_score, lifestyle_readiness,
-       coach_notes, created_by
+       coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_lifestyle_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,$7,$8,
@@ -717,7 +717,7 @@ router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'tra
        $25,$26,$27,$28,$29,
        $30,$31,$32,$33,$34,$35,
        $36,$37,$38,$39,$40,$41,
-       $42::jsonb,$43
+       $42::jsonb,$43,$44
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
@@ -731,7 +731,7 @@ router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'tra
       b.smoking_status || null, b.cigarettes_per_day ?? null, b.years_smoking ?? null, b.alcohol_status || null, b.drinks_per_week ?? null,
       b.screen_time_bracket || null, b.travel_frequency || null, b.energy_level ?? null, b.motivation_to_exercise ?? null, b.recovery_quality || null, analysis.recoveryScore,
       analysis.sedentaryRisk, analysis.recoveryRisk, analysis.habitRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.lifestyleScore, analysis.lifestyleReadiness,
-      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -951,7 +951,7 @@ router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'tra
        meal_preparer, nutrition_budget, medical_conditions, medical_notes,
        diet_quality_score, protein_score, protein_assessment, hydration_score, digestive_health_score,
        supplement_score, nutrition_risk_score, risk_factors, nutrition_score, nutrition_readiness,
-       coach_notes, created_by
+       coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_nutrition_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,
@@ -966,7 +966,7 @@ router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'tra
        $30,$31,$32,$33,
        $34,$35,$36,$37,$38,
        $39,$40,$41,$42,$43,
-       $44::jsonb,$45
+       $44::jsonb,$45,$46
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
@@ -985,7 +985,7 @@ router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'tra
       b.meal_preparer || null, b.nutrition_budget || null, b.medical_conditions && b.medical_conditions.length ? b.medical_conditions : null, b.medical_notes || null,
       analysis.dietQualityScore, analysis.proteinScore, analysis.proteinAssessment, analysis.hydrationScore, analysis.digestiveHealthScore,
       analysis.supplementScore, analysis.nutritionRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.nutritionScore, analysis.nutritionReadiness,
-      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });

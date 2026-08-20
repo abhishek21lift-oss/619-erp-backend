@@ -264,6 +264,43 @@ describe('every table the API reads can name its owning studio', () => {
     }
   });
 
+  it('every INSERT into a table 174 retrofitted stamps organization_id', () => {
+    // Adding the column is half the job; the writes have to fill it. Migration
+    // 174 tightens each column to NOT NULL wherever the backfill left no NULLs
+    // — the ordinary case on a fresh database — so an INSERT that omits it does
+    // not degrade quietly, it 500s. Both assessment POST handlers did exactly
+    // that and shipped in the first push of this branch: the reads had been
+    // scoped, the writes had not, and nothing in this suite looked at writes.
+    //
+    // On a database left nullable it is worse than a 500, because it succeeds:
+    // the row lands with a NULL org and is then invisible to the org-filtered
+    // read that just created it.
+    const RETROFITTED = [
+      'pt_lifestyle_assessments', 'pt_nutrition_assessments', 'session_balance',
+      'pt_packages', 'automation_rules', 'communication_logs', 'campaigns',
+      'offers', 'feedback', 'integrations', 'plans', 'meals', 'module_records',
+    ];
+
+    const unstamped = [];
+    for (const file of sourceFiles()) {
+      const src = fs.readFileSync(file, 'utf8');
+      for (const table of RETROFITTED) {
+        // The column list of an INSERT runs from the table name to the VALUES
+        // keyword; that is the whole of what this needs to look at.
+        const re = new RegExp(`INSERT\\s+INTO\\s+${table}\\s*\\(([\\s\\S]*?)\\)\\s*(?:VALUES|SELECT)`, 'gi');
+        let m;
+        while ((m = re.exec(src)) !== null) {
+          if (!/\borganization_id\b/i.test(m[1])) {
+            const line = src.slice(0, m.index).split('\n').length;
+            unstamped.push(`${path.relative(SRC, file).split(path.sep).join('/')}:${line} → ${table}`);
+          }
+        }
+      }
+    }
+
+    expect(unstamped.sort()).toEqual([]);
+  });
+
   it('the debt list only ever shrinks', () => {
     // Pinned at the count established when this test was written. Fixing a gap
     // means deleting its entry AND lowering this number; nothing else should
