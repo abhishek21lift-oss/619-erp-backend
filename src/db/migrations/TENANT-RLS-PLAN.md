@@ -95,25 +95,76 @@ in payments/invoices) need to opt out of the wrapper rather than nest.
 
 ## Rollout order
 
-1. Land the ALS org-context plumbing behind an **off-by-default** flag, so it
-   ships dark and changes nothing.
-2. Create `app_tenant` + policies in a staging branch (Supabase branching), and
-   run the full suite against it with the flag on.
+1. ~~Land the ALS org-context plumbing behind an **off-by-default** flag, so it
+   ships dark and changes nothing.~~ **Done** — `lib/tenant-context.js` and the
+   `db/pool.js` wrappers. Note the flag is no longer off by default: it defaults
+   ON and is disabled only by the exact string `off`.
+2. ~~Create `app_tenant` + policies in a staging branch (Supabase branching), and
+   run the full suite against it with the flag on.~~ **Done** — migrations 157,
+   159, 161, 174. CI stands the whole thing up per run via
+   `scripts/rls-proof-setup.sh` and runs `rls.isolation.integration.test.js`
+   against it as a real `app_tenant` connection.
 3. Measure the added latency from per-query transactions. If it is material,
    consider scoping the wrapper to reads of tenant tables rather than all
-   queries.
-4. Switch staging's `DATABASE_URL` to `app_tenant`. Fix every permission error
+   queries. **Still outstanding, and now the main open question** — see
+   "What this costs today", below.
+4. **Set `ADMIN_DATABASE_URL` before touching `DATABASE_URL`.** This was not in
+   the original list and it is now a hard precondition: platform-wide work
+   (the operator console, every background worker, migrations, the pre-auth
+   routes) has no org and so matches no policy. Without a separate owner
+   connection those go silently empty rather than erroring. `server.js` refuses
+   to boot if enforcement is on and the two URLs are the same — that check
+   exists, but note it was inverted until recently and did not fire in the
+   default configuration, so do not treat a clean boot on an older build as
+   evidence of anything.
+5. Switch staging's `DATABASE_URL` to `app_tenant`. Fix every permission error
    that surfaces — this is the step that finds what the app quietly relied on.
-5. Only then, production.
+   Expect *silence* as well as errors: RLS denies by filtering, so the failure
+   mode to look for is a screen that renders empty, not a 500.
+6. Only then, production.
+
+## What this costs today
+
+Worth knowing before step 3, because the cost is currently being paid for
+nothing. With `TENANT_RLS_ENFORCE` defaulting on and `ADMIN_DATABASE_URL`
+unset, `db/pool.js` wraps every tenant query in `BEGIN → set_config → query →
+COMMIT` on a dedicated pooled client — four round trips instead of one, holding
+one of twenty connections for the whole transaction. Meanwhile the app still
+connects as `postgres`, which owns the tables and therefore bypasses every
+policy the wrapper is feeding.
+
+So the ordering matters in both directions: until the cutover, enforcement is
+pure overhead; after it, it is the backstop. The one configuration to avoid is
+the one that is currently the default.
 
 ## What guards the gap until then
 
+Two tests, and they ask opposite questions on purpose.
+
 `src/__tests__/tenantScope.convention.test.js` fails the build when a file
 queries a tenant table without referencing the tenant boundary. It is coarse by
-design (file-level, not per-query) so it does not cry wolf on correct code, and
-it was mutation-tested: a route added with `SELECT id, name, mobile FROM
-pt_clients` and no filter is caught. It derives its table list from the
-migrations, so tenant tables added later are covered automatically.
+design (file-level and per-handler, not per-query) so it does not cry wolf on
+correct code, and it was mutation-tested: a route added with `SELECT id, name,
+mobile FROM pt_clients` and no filter is caught.
 
-That is a ratchet against new mistakes, not a backstop under existing ones.
-It does not make the database safe; it makes the omission loud.
+**It derives its table list from the migrations by scanning for
+`organization_id` — which is a blind spot, not the coverage this document
+previously claimed.** A table that never received the column is not merely
+unprotected; it is, by that test's own definition, *not a tenant table*, so the
+test never looks at it. Migration 157's policy generator discovers its policy
+list exactly the same way and is blind in exactly the same place. Twelve tables
+sat in that gap — campaigns, offers, feedback, integrations, plans, meals,
+pt_packages, session_balance, automation_rules, communication_logs and the two
+assessment tables — every one of them read and written with no tenant filter at
+all, on every commit, past a green suite.
+
+`src/__tests__/tenantColumns.convention.test.js` closes that loop by asking the
+inverse: *for each table the application reads, does it carry `organization_id`
+— and if not, is it on a list where a human wrote down why that is safe?* A new
+table with neither fails the build. It also requires that every INSERT into a
+retrofitted table names the column, because scoping the reads and forgetting
+the writes is its own failure and happened once already.
+
+Together they are a ratchet against new mistakes, not a backstop under existing
+ones. They do not make the database safe; they make the omission loud. The
+backstop is step 6.
