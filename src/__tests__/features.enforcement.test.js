@@ -88,12 +88,25 @@ describe('server.js wiring', () => {
     expect(order).toBe('auth,requireFeature(key)');
   });
 
+  it('puts auth and requireStaff BEFORE requireFeature in staffGate', () => {
+    // Same reasoning as the gate() ordering test above, and one more: a
+    // feature flag is not an authorisation decision, so requireStaff has to
+    // run for the mounts whose data belongs to the studio rather than to the
+    // caller. If requireFeature moved first, turning a feature ON would be
+    // enough to expose it to a member.
+    const helper = server.match(/const staffGate = \(key\) => \[([^\]]+)\]/);
+    expect(helper).not.toBeNull();
+    expect(helper[1].replace(/\s/g, '')).toBe('auth,requireStaff,requireFeature(key)');
+  });
+
   it('gates the capabilities the Control Centre advertises', () => {
     for (const key of [
       'ai_suite', 'ai_knowledge_base', 'attendance', 'programs',
       'insights', 'communication', 'integrations', 'packages', 'finance',
     ]) {
-      expect(server).toMatch(new RegExp(`gate\\('${key}'\\)`));
+      // Either helper counts: staffGate() is gate() plus requireStaff, so a
+      // capability behind it is still feature-gated.
+      expect(server).toMatch(new RegExp(`(?:staffG|g)ate\\('${key}'\\)`));
     }
   });
 
@@ -101,7 +114,7 @@ describe('server.js wiring', () => {
     // A studio must always be able to sign in and pay us, whatever else an
     // operator has switched off. Gating these could lock a studio out of
     // fixing its own billing — the one thing that must never happen.
-    const gatedMounts = [...server.matchAll(/app\.use\('([^']+)'[^\n]*gate\(/g)].map((m) => m[1]);
+    const gatedMounts = [...server.matchAll(/app\.use\('([^']+)'[^\n]*(?:staffG|g)ate\(/g)].map((m) => m[1]);
     for (const mount of gatedMounts) {
       expect(mount).not.toMatch(/^\/api\/(auth|subscription|payments)/);
     }

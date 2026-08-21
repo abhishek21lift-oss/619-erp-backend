@@ -125,6 +125,7 @@ const NO_TENANT_COLUMN_BY_DESIGN = {
   diet_plan_meals: 'Join between diet_templates and meals; both now carry the column.',
   support_ticket_messages: 'Child of support_tickets, which carries organization_id.',
   ai_messages: 'Child of ai_conversations, which is keyed on the user who owns it.',
+  pt_os_measurements: 'Child of pt_clients via client_id. Both readers scope on a client id taken from the session, never the request; migration 177 gives it the parent-walk RLS policy 159 uses for this shape.',
   exercise_versions: 'Version history of an exercises row; follows that table\'s shared shape.',
   exercise_favorites: 'Keyed on the user who favourited the exercise, not on a studio.',
   exercise_recent_usage: 'Keyed on the user whose usage it records, not on a studio.',
@@ -166,6 +167,7 @@ const KNOWN_GAPS = {
   feature_flags: 'Studio feature toggles, admin-only, read through settings routes.',
   payments: 'Legacy payment rows. The live path is pt_payments (which carries the column) and payment_orders; this table is read by invoices.js and the Razorpay webhook.',
   clients: 'The legacy table migration 170 drops. Still referenced by admin-reset and clients.js.',
+  notification_log: 'Delivery log, WRITE-ONLY — nothing in the codebase SELECTs from it, so there is no read path to cross studios. It should carry the column (a delivery audit trail that cannot name the studio is a poor one), but adding it means changing the INSERT and deciding what an org-less system notification records.',
 };
 
 /** Every route/module source file. */
@@ -300,7 +302,7 @@ describe('every table the API reads can name its owning studio', () => {
     // Pinned at the count established when this test was written. Fixing a gap
     // means deleting its entry AND lowering this number; nothing else should
     // move it. An addition fails here rather than passing quietly.
-    expect(Object.keys(KNOWN_GAPS)).toHaveLength(4);
+    expect(Object.keys(KNOWN_GAPS)).toHaveLength(5);
   });
 
   it('no table is in both lists, which would make the reason meaningless', () => {
