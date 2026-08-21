@@ -1,3 +1,5 @@
+const dns = require('dns').promises;
+const net = require('net');
 const nodemailer = require('nodemailer');
 const logger = require('./logger');
 const { frontendUrl } = require('./frontendUrl');
@@ -63,7 +65,7 @@ async function sendWithRetry(message, ctx = {}) {
   let lastErr;
   for (let attempt = 1; attempt <= SEND_ATTEMPTS; attempt++) {
     try {
-      const info = await getTransport().sendMail(message);
+      const info = await (await getTransport()).sendMail(message);
       if (attempt > 1) logger.info({ ...ctx, attempt }, 'email sent after retry');
       return info;
     } catch (err) {
@@ -105,40 +107,117 @@ async function dispatchEmail(type, payload, inline) {
   return inline();
 }
 
-let transporter = null;
+/**
+ * The transport, and the DNS resolution that has to happen before it exists.
+ *
+ * Cached as a PROMISE rather than a transport. Building one now requires a DNS
+ * lookup, so a synchronous getter would either have to block or hand back a
+ * half-built object; caching the in-flight promise means concurrent senders
+ * all await the same resolution and exactly one transport is ever created. No
+ * caller can observe a transport that is not ready, because there is nothing
+ * to observe until the promise settles.
+ */
+let transportPromise = null;
 
-function getTransport() {
-  if (transporter) return transporter;
-  transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
+/**
+ * Resolve SMTP_HOST to a single IPv4 literal, or null if that is not possible.
+ *
+ * Never throws: a DNS failure must degrade to the previous behaviour, not take
+ * outgoing mail down with it.
+ */
+async function resolveIpv4() {
+  // An address configured directly needs no lookup, and resolve4() on a
+  // literal does not do what the name suggests.
+  if (net.isIP(SMTP_HOST)) return null;
+  try {
+    const addresses = await dns.resolve4(SMTP_HOST);
+    const ip = (addresses || []).find(Boolean) || null;
+    if (!ip) throw new Error('host has no A record');
+    return ip;
+  } catch (err) {
+    // Warn, not error: mail still gets attempted over the hostname below.
+    logger.warn(
+      { host: SMTP_HOST, err: err.message },
+      'SMTP IPv4 resolution failed — falling back to the hostname, which may '
+      + 'select an unreachable IPv6 address',
+    );
+    return null;
+  }
+}
+
+/**
+ * Build the transport, pinning the connection to IPv4 by resolving the host
+ * ourselves instead of asking nodemailer to prefer a family.
+ *
+ * ── Why `family: 4` never worked ───────────────────────────────────────────
+ *
+ * It was here for months, with a comment calling it "the whole reason no mail
+ * was leaving the deploy", and a test asserting it was present. It does
+ * nothing. nodemailer 9.0.3 never reads `options.family` — grep the package:
+ * the only matches are its own internal interface probing. `connect()` builds
+ * the socket options from scratch as `{ port, host, allowInternalNetworkInterfaces,
+ * timeout }` plus `localAddress`, so `family` is dropped before net.connect()
+ * is ever called.
+ *
+ * What it does instead (lib/shared/index.js) is resolve BOTH families,
+ * concatenate them IPv4-first, and then pick one with `Math.random()`. So a
+ * host publishing an A and an AAAA gets a coin flip per connection, and on a
+ * box with no IPv6 route the AAAA half fails with ENETUNREACH. That is why
+ * production kept logging ENETUNREACH against 2606:4700:… for ten days after
+ * the "fix" shipped, and why it never reproduced on a laptop.
+ *
+ * ── Why this works ────────────────────────────────────────────────────────
+ *
+ * `resolveHostname()` short-circuits on an IP literal — "nothing to do here" —
+ * so passing one skips the resolution and the random pick entirely. There is
+ * no code path left that can choose an AAAA.
+ *
+ * ── Why `servername` is mandatory, not decoration ─────────────────────────
+ *
+ * smtp-connection sets `this.servername = options.servername ? options.servername
+ * : !net.isIP(this.host) ? this.host : false`. Once `host` is an IP literal
+ * that middle branch is gone, so omitting `servername` yields `false` — no SNI,
+ * and certificate validation against an IP address, which fails against any
+ * normal SMTP certificate. It is carried into the TLS options on both paths:
+ * the STARTTLS upgrade for 587 and the implicit-TLS connect for 465.
+ */
+async function buildTransport() {
+  const ipv4 = await resolveIpv4();
+  if (ipv4) {
+    logger.info(
+      { host: SMTP_HOST, address: ipv4, port: SMTP_PORT },
+      'SMTP host resolved to IPv4 — connection pinned, no address-family selection',
+    );
+  }
+  const transport = nodemailer.createTransport({
+    // The IP when we have one; the hostname when we do not, which is exactly
+    // the behaviour that shipped before this change.
+    host: ipv4 || SMTP_HOST,
     port: SMTP_PORT,
     secure: SMTP_PORT === 465,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
-    // Force IPv4. This is the whole reason no mail was leaving the deploy.
-    //
-    // smtp.hostinger.com publishes both records:
-    //   AAAA  2606:4700:90:0:f225:a1af:129b:4ba1
-    //   A     172.65.255.143
-    //
-    // The deploy connected over IPv6 and had no route to it:
-    //   ENETUNREACH 2606:4700:90:0:f225:a1af:129b:4ba1:587 - Local (:::0)
-    // "Local (:::0)" is the tell — no local IPv6 address to source from.
-    //
-    // Exactly why it reached for the AAAA is not worth pinning down (verbatim
-    // resolver ordering, Happy Eyeballs, the container's own address setup —
-    // all of them produce this), and it does not change the fix. Note this
-    // does NOT reproduce everywhere: a host whose resolver already prefers
-    // IPv4 connects fine without this line, so "it works on my machine" is
-    // not evidence the option is unnecessary.
-    // Port 465 failed the same way and only looked different (ETIMEDOUT
-    // rather than ENETUNREACH), which is why changing the port did not help.
-    //
-    // Nothing was wrong with the host, credentials, TLS pairing or DNS. This
-    // is not Hostinger-specific either: any SMTP host with an AAAA record
-    // fails identically on an IPv4-only network.
-    family: 4,
+    // Always the hostname, never the address. See the note above — this is
+    // what keeps TLS validating against the certificate's real subject.
+    servername: SMTP_HOST,
   });
-  return transporter;
+  // `pinned` is reported rather than re-derived from the transport, so nothing
+  // here depends on nodemailer's internal shape.
+  return { transport, pinned: Boolean(ipv4) };
+}
+
+function getTransport() {
+  if (!transportPromise) {
+    transportPromise = buildTransport().then(({ transport, pinned }) => {
+      // A transport built on the fallback path is deliberately not cached, so
+      // the next send retries the lookup. A DNS blip at boot would otherwise
+      // pin the process to the hostname — and therefore to the random address
+      // pick — for the rest of its life. buildTransport() never rejects, so
+      // the cache can never hold a poisoned promise.
+      if (!pinned) transportPromise = null;
+      return transport;
+    });
+  }
+  return transportPromise;
 }
 
 /**
@@ -214,7 +293,7 @@ async function sendAdminResetOtp(email, otp) {
  */
 async function sendAdminResetOtpInline(email, otp) {
   if (!isConfigured()) return { sent: false, reason: 'SMTP_NOT_CONFIGURED' };
-  const t = getTransport();
+  const t = await getTransport();
   await t.sendMail({
     from: FROM_ADDR,
     to: email,
@@ -376,7 +455,7 @@ async function verifyConnection() {
     return { ok: false, reason: 'SMTP_NOT_CONFIGURED', missing: describeConfig().missing };
   }
   try {
-    await getTransport().verify();
+    await (await getTransport()).verify();
     return { ok: true, host: SMTP_HOST, port: SMTP_PORT, user: SMTP_USER, from: FROM_ADDR };
   } catch (err) {
     return {
