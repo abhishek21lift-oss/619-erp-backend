@@ -314,6 +314,25 @@ const { requireAiQuota }         = require('./lib/aiQuota');
 // the Control Centre — which is the point of the toggle existing.
 const gate = (key) => [auth, requireFeature(key)];
 
+// The same feature gate, plus a role gate.
+//
+// gate() checks that the STUDIO has a feature switched on. It does not check
+// who is asking, and a feature flag is not an authorisation decision. Handlers
+// behind gate() then scope by organization_id, which bounds the studio and
+// says nothing about the role — so a `member` (the account client activation
+// creates for a gym client) satisfied every check and read staff data.
+//
+// Found by memberEscalation.authz.test.js, which drives a real member session
+// at every mount. GET /api/invoices returned every invoice in the studio —
+// other clients' names, invoice numbers and amounts — and GET
+// /api/reports/monthly returned the studio's revenue: it self-scopes for a
+// trainer via `role === 'trainer'`, so a member fell through the branch with
+// no filter at all.
+//
+// Use this for any mount whose data belongs to the studio rather than to the
+// person asking.
+const staffGate = (key) => [auth, requireStaff, requireFeature(key)];
+
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
@@ -638,7 +657,20 @@ app.use('/api/features',          require('./routes/features'));
 // no request-controlled org parameter; internal operator notes are excluded by
 // lib/support.TENANT_MESSAGE_SQL. Deliberately NOT feature-gated — a studio
 // must always be able to reach us, whatever else is switched off.
-app.use('/api/support',           require('./routes/support'));
+// requireStaff, not bare auth. routes/support.js mounts `router.use(auth)` and
+// then scopes every handler by organization_id — which bounds the STUDIO but
+// says nothing about the ROLE. A `member` (the account client activation
+// creates for a gym client) passed that filter and could list every support
+// ticket the studio had raised — subject, category, priority, status and
+// created_by_name — and open new ones in the studio's name. These are the
+// studio's private correspondence with the platform: billing disputes,
+// operational complaints, and whatever a frustrated owner typed at midnight.
+//
+// Found by memberEscalation.authz.test.js, which drives a real member session
+// at every mount; the audit asked for that test by name (Section 11).
+// src/app/(chrome)/support/page.tsx is the only caller and lives in the staff
+// shell, so no client-facing screen loses anything.
+app.use('/api/support',           auth, requireStaff, require('./routes/support'));
 app.use('/api/subscription',      require('./routes/subscription'));
 // Global top-nav search. Carries its own rate limiter (see routes/search.js),
 // so it is deliberately NOT wrapped in userApiLimiter — debounced typing would
@@ -684,7 +716,7 @@ app.use('/api/attendance',        ...gate('attendance'), require('./routes/atten
 // So "legacy" had it backwards: /api/reports is the tenant-safe, live
 // implementation, and the migration target was the unsafe one. Do not
 // reintroduce a v1 reports router without organization_id on its tables.
-app.use('/api/reports',           userApiLimiter, ...gate('insights'), require('./routes/reports'));
+app.use('/api/reports',           userApiLimiter, ...staffGate('insights'), require('./routes/reports'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
 app.use('/api/leave',             require('./routes/leave'));
@@ -741,7 +773,7 @@ app.use('/api/modules',           require('./modules/operations/operations.route
 app.use('/api/calendar',          require('./routes/calendar'));
 app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-checkin'));
 app.use('/api/settings',          require('./routes/settings'));
-app.use('/api/invoices',          ...gate('finance'), require('./routes/invoices'));
+app.use('/api/invoices',          ...staffGate('finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
 // The Exercise Library. Sits behind the same 'programs' feature as the Workout
 // Builder it feeds — a studio with programmes always has the library, and one
