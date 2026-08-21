@@ -282,6 +282,15 @@ router.put('/tracker', auth, async (req, res, next) => {
 // GET /api/diet/fitness-profile/:clientId
 router.get('/fitness-profile/:clientId', auth, async (req, res, next) => {
   try {
+    // A member may only read their OWN profile. The org filter below bounds
+    // the studio and says nothing about which client inside it, so without
+    // this a gym client could read any other client's fitness profile by id —
+    // /api/diet is a member-reachable mount by design (the meal library their
+    // own plan is built from), which is what makes the id in the URL reachable.
+    if (req.user?.role === 'member') {
+      const own = req.user.pt_client_id || req.user.client_id || null;
+      if (!own || own !== req.params.clientId) return res.json(null);
+    }
     const scope = tenantScope(req);
     const orgGuard = scope.applyFilter ? ' AND organization_id=$2' : '';
     const { rows } = await pool.query(

@@ -104,6 +104,20 @@ const MEMBER_REACHABLE = {
 };
 
 /**
+ * Individual ROUTES a member may reach, on mounts that are otherwise staff-only.
+ *
+ * Separate from MEMBER_REACHABLE above, which is keyed by mount — and mount
+ * granularity is what let three findings hide: allowlisting /api/diet to
+ * permit the meal library also silently permitted
+ * /api/diet/fitness-profile/:clientId, which had no ownership check at all.
+ * An exemption should be no wider than the thing it excuses.
+ */
+const MEMBER_REACHABLE_ROUTES = {
+  '/api/payments/upi/history':
+    'A member reading their OWN payment history. The handler has an explicit `role === member` branch that narrows to req.user.pt_client_id and ignores any client_id in the query — the correct shape, and the opposite of the trainer fall-through: it narrows for the untrusted role rather than widening for it.',
+};
+
+/**
  * Routes found reachable by a member that have not yet been triaged.
  *
  * EMPTY, and that is the point of leaving it here. The first run of this test
@@ -174,34 +188,43 @@ describe('a member cannot reach staff mounts', () => {
       const routes = getRoutes(router);
       if (!routes.length) continue;
 
-      // Prefer a route with no parameters: a 404 from a bad id would be
-      // indistinguishable from a refusal.
-      const probe = routes.find((p) => !p.includes(':')) || routes[0];
-      const url = `${mount.mountPath}${probe}`.replace(/\/+/g, '/').replace(/:[A-Za-z_]+/g, '1');
+      // EVERY GET route, not just the first.
+      //
+      // The first version of this probed one route per router — `routes.find(p
+      // => !p.includes(':')) || routes[0]` — and that halved its coverage: the
+      // real reachable surface is 37 routes, not the 18 it reported. Three
+      // findings hid in the routes it never asked about, including
+      // /api/expenses/stats, /api/subscription/invoices and an unguarded
+      // /api/diet/fitness-profile/:clientId. A guard that samples is a guard
+      // whose blind spot is wherever it did not sample.
+      for (const probe of routes) {
+        const url = `${mount.mountPath}${probe}`.replace(/\/+/g, '/').replace(/:[A-Za-z_]+/g, '1');
 
-      const app = express();
-      app.use(express.json());
-      // The real chain: server.js's own gates where it has them, then the real
-      // router, which may gate internally instead.
-      const chain = mount.gated ? [auth, requireStaff, router] : [router];
-      app.use(mount.mountPath, ...chain);
+        const app = express();
+        app.use(express.json());
+        // The real chain: server.js's own gates where it has them, then the
+        // real router, which may gate internally instead.
+        const chain = mount.gated ? [auth, requireStaff, router] : [router];
+        app.use(mount.mountPath, ...chain);
 
-      let res;
-      try {
-        res = await request(app).get(url);
-      } catch {
-        continue;
-      }
+        let res;
+        try {
+          res = await request(app).get(url);
+        } catch {
+          continue;
+        }
 
-      if (res.status >= 200 && res.status < 300) {
-        reached.push(`${res.status} GET ${url}  [${mount.module}]`);
+        if (res.status >= 200 && res.status < 300) {
+          reached.push(`${res.status} GET ${url}  [${mount.module}]`);
+        }
       }
     }
 
     // /api/support/tickets sat here: 200, every ticket in the studio.
     const untracked = reached
       .map((r) => r.replace(/^\d+ GET /, '').replace(/\s+\[.*$/, ''))
-      .filter((url) => !UNREVIEWED.includes(url));
+      .filter((url) => !UNREVIEWED.includes(url))
+      .filter((url) => !MEMBER_REACHABLE_ROUTES[url]);
 
     expect(untracked.sort()).toEqual([]);
   }, 60000);
@@ -248,6 +271,12 @@ describe('a member cannot reach staff mounts', () => {
 
     const res = await request(app).get('/api/support/tickets');
     expect(res.status).toBe(200);
+  });
+
+  it('every route-level exemption carries a real reason', () => {
+    for (const [route, reason] of Object.entries(MEMBER_REACHABLE_ROUTES)) {
+      expect(`${route}: ${reason}`.length).toBeGreaterThan(route.length + 60);
+    }
   });
 
   it('every member-reachable entry carries a real reason', () => {

@@ -222,7 +222,16 @@ router.get('/plans', auth, async (req, res, next) => {
     let p = 1;
 
     if (goal)      { conds.push(`wp.goal = $${p++}`);           params.push(goal); }
-    if (client_id) { conds.push(`wa.client_id = $${p++}`);      params.push(client_id); }
+    // workout_assignments carries organization_id (migration 086) and the join
+    // below filtered only on client_id, so a caller passing another studio's
+    // client id read that client's assignment and progress. workout_plans
+    // itself stays global — 086 says so explicitly — but which client was
+    // ASSIGNED a plan is tenant data.
+    if (client_id) {
+      conds.push(`wa.client_id = $${p++}`); params.push(client_id);
+      const wscope = tenantScope(req);
+      if (wscope.applyFilter) { conds.push(`wa.organization_id = $${p++}`); params.push(wscope.orgId); }
+    }
 
     const joinClause = client_id
       ? `LEFT JOIN workout_assignments wa ON wa.workout_plan_id = wp.id AND wa.client_id = $${p-1}`

@@ -61,7 +61,10 @@ function requireStudioAdmin(req, res) {
 }
 
 // GET /api/subscription/checkout/settings — is self-checkout available at all?
-// requireStaff on this route only. /api/subscription carries the studio's own
+// requireStaff on the studio-billing reads (/checkout, /checkout/settings,
+// /invoices, /payments). These are the STUDIO's subscription relationship with
+// the platform — invoice numbers, plan codes, amounts, periods — not a gym
+// client's membership. /api/subscription carries the studio's own
 // checkout flow, and (bare)/subscription is the STUDIO-facing screen — a studio
 // owner is `admin`, which is staff, so this does not lock an owner out of
 // paying. A gym member has no business reading the platform's merchant
@@ -168,7 +171,7 @@ router.post('/checkout/:id/cancel', auth, validate(checkoutSchemas.idParam), asy
 });
 
 // GET /api/subscription/checkout — this studio's checkout history.
-router.get('/checkout', auth, async (req, res, next) => {
+router.get('/checkout', auth, requireStaff, async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
     if (!orgId) return res.json({ data: [] });
@@ -272,7 +275,7 @@ router.get('/plans', auth, async (req, res, next) => {
 });
 
 // GET /api/subscription/invoices — the studio's own invoice history.
-router.get('/invoices', auth, async (req, res, next) => {
+router.get('/invoices', auth, requireStaff, async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
     if (!orgId) return res.json({ data: [] });
@@ -286,7 +289,7 @@ router.get('/invoices', auth, async (req, res, next) => {
 });
 
 // GET /api/subscription/payments — the studio's own payment history.
-router.get('/payments', auth, async (req, res, next) => {
+router.get('/payments', auth, requireStaff, async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
     if (!orgId) return res.json({ data: [] });
