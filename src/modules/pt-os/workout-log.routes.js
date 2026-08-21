@@ -87,6 +87,25 @@ const exerciseAddSchema = {
   }),
 };
 
+// Cardio actuals, mirroring the Training OS cardio_performances vocabulary
+// (migrations 165/175/179). Nullable everywhere: a strength set leaves them
+// all NULL and a cardio set may fill only the fields its modality publishes.
+// PR flags stay weight/reps-based — a cardio set has no volume to beat.
+const cardioSetFields = {
+  duration_seconds: z.coerce.number().int().min(0).optional().nullable(),
+  distance: numOpt(),
+  distance_unit: z.enum(['m', 'km', 'mile']).optional().nullable(),
+  average_speed: numOpt(),
+  speed_unit: z.enum(['kmh', 'mph']).optional().nullable(),
+  calories_burned: z.coerce.number().int().min(0).optional().nullable(),
+  average_heart_rate: z.coerce.number().int().min(20).max(250).optional().nullable(),
+  cadence: z.coerce.number().int().min(0).optional().nullable(),
+  steps_completed: z.coerce.number().int().min(0).optional().nullable(),
+  floors_completed: z.coerce.number().int().min(0).optional().nullable(),
+  rounds_completed: z.coerce.number().int().min(0).optional().nullable(),
+};
+const CARDIO_SET_COLUMNS = Object.keys(cardioSetFields);
+
 const setCreateSchema = {
   body: z.object({
     set_number: z.coerce.number().int().min(1),
@@ -98,6 +117,7 @@ const setCreateSchema = {
     rest_seconds: z.coerce.number().int().optional().nullable(),
     completed: z.boolean().optional(),
     notes: z.string().max(500).optional().nullable(),
+    ...cardioSetFields,
   }),
 };
 
@@ -111,6 +131,7 @@ const setUpdateSchema = {
     rest_seconds: z.coerce.number().int().optional().nullable(),
     completed: z.boolean().optional(),
     notes: z.string().max(500).optional().nullable(),
+    ...cardioSetFields,
   }),
 };
 
@@ -184,12 +205,22 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   const [sessionRes, exercisesRes] = await Promise.all([
     pool.query(`SELECT * FROM workout_sessions WHERE id = $1${sessGuard}`, sessParams),
     pool.query(
-      `SELECT wse.*, COALESCE(
+      `SELECT wse.*,
+              -- What this exercise can be logged AS: the legacy logger renders
+              -- cardio actuals only when the exercise itself is Cardio, and
+              -- which of those fields show is the prescription vocabulary
+              -- published by /api/training/meta. NULL for ad-hoc rows whose
+              -- library exercise went away — the UI falls back to strength.
+              e.exercise_type,
+              e.prescription_mode_primary,
+              e.prescription_mode_allowed,
+              COALESCE(
                 (SELECT json_agg(s.* ORDER BY s.set_number)
                    FROM workout_sets s WHERE s.session_exercise_id = wse.id),
                 '[]'
               ) AS sets
          FROM workout_session_exercises wse
+    LEFT JOIN exercises e ON e.id = wse.exercise_id
         WHERE wse.session_id = $1
         ORDER BY wse.sort_order, wse.created_at`,
       [id]
@@ -462,11 +493,15 @@ router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireRole(
   const { rows } = await pool.query(
     `INSERT INTO workout_sets (
        session_exercise_id, set_number, weight_kg, reps, rpe, rir, tempo, rest_seconds, completed, notes,
+       duration_seconds, distance, distance_unit, average_speed, speed_unit,
+       calories_burned, average_heart_rate, cadence, steps_completed, floors_completed, rounds_completed,
        is_pr_weight, is_pr_reps, is_pr_volume
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+     RETURNING *`,
     [
       sessionExerciseId, b.set_number, b.weight_kg ?? null, b.reps ?? null, b.rpe ?? null, b.rir ?? null,
       b.tempo || null, b.rest_seconds ?? null, b.completed ?? false, b.notes || null,
+      ...CARDIO_SET_COLUMNS.map((key) => b[key] ?? null),
       prFlags.is_pr_weight, prFlags.is_pr_reps, prFlags.is_pr_volume,
     ]
   );
@@ -504,7 +539,7 @@ router.patch('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'tra
     prFlags = { is_pr_weight: false, is_pr_reps: false, is_pr_volume: false };
   }
 
-  const allowed = ['weight_kg', 'reps', 'rpe', 'rir', 'tempo', 'rest_seconds', 'completed', 'notes'];
+  const allowed = ['weight_kg', 'reps', 'rpe', 'rir', 'tempo', 'rest_seconds', 'completed', 'notes', ...CARDIO_SET_COLUMNS];
   const sets = [];
   const params = [id];
   for (const key of allowed) {
