@@ -2,6 +2,7 @@
 const router = require('express').Router();
 const { auth } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
+const { tenantScope } = require('../../lib/tenant-db');
 const svc = require('./bookings.service');
 const cal = require('../../lib/google-calendar');
 
@@ -16,7 +17,7 @@ router.get('/', auth, wrap(async (req, res) => {
   let memberId = req.query.member_id;
   if (req.user.role === 'member') memberId = req.user.member_id;
   if (!memberId) return res.json({ data: [] });
-  const data = await svc.listForMember(memberId, req.query);
+  const data = await svc.listForMember(memberId, req.query, tenantScope(req));
   res.json({ data });
 }));
 
