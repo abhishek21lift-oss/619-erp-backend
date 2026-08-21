@@ -731,7 +731,7 @@ router.get('/admin/stats', auth, requireAdminOrManager, async (req, res, next) =
 // GET /admin/credentials — tenant-scoped list.
 router.get('/admin/credentials', auth, requireAdminOrManager, async (req, res, next) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit,  10) || 100, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit,  10) || 100, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0,   0);
     const { orgId, applyFilter } = tenantScope(req);
 
@@ -789,7 +789,7 @@ router.delete('/admin/credentials/:id', auth, async (req, res, next) => {
 // authenticated actor). Platform super_admin sees everything.
 router.get('/admin/audit-logs', auth, requireAdminOrManager, async (req, res, next) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
     const { orgId, applyFilter } = tenantScope(req);
 
     const params = [];

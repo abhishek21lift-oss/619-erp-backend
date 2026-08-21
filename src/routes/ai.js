@@ -1346,8 +1346,11 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
    6. CONVERSATION MANAGEMENT
    ═══════════════════════════════════════════════════════════════════════════ */
 router.get('/conversations', auth, async (req, res) => {
-  const limit  = Math.min(parseInt(req.query.limit || '20', 10), 50);
-  const offset = parseInt(req.query.offset || '0', 10);
+  const limit  = Math.min(Math.max(parseInt(req.query.limit || '20', 10) || 20, 1), 50);
+  // Floored, like the limit above. `OFFSET -5` is not "start at the
+  // beginning" — Postgres rejects it outright, so an unclamped offset is a 500
+  // any caller can trigger from the query string.
+  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
 
   const { rows } = await pool.query(
     `SELECT c.id, c.title, c.client_id, c.pinned,

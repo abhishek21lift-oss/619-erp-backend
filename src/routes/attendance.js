@@ -75,7 +75,7 @@ router.get('/', auth, async (req, res, next) => {
     // Pagination: if page is provided use paginated response, otherwise fall back to legacy limit
     if (req.query.page !== undefined) {
       const page = parseInt(req.query.page) || 1;
-      const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
       const offset = (page - 1) * limit;
 
       const { rows: countRows } = await pool.query(

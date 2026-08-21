@@ -230,7 +230,45 @@ router.get('/command-center/logs', wrap(async (req, res) => {
  *   ?level=error  floor (defaults to error — nothing below it is persisted)
  *   ?source=api|worker
  *   ?q=
- *   ?limit=
+ *   ?limit=       page size, clamped 1..500
+ *   ?before=      keyset cursor: return rows with id strictly below this one
+ *   ?stats=0      skip the stats aggregate entirely
+ *   ?stats_hours= window the stats cover, clamped 1..720 (default 24)
+ *
+ * ── Why the stats query is windowed ────────────────────────────────────────
+ *
+ * It used to be an unwindowed aggregate over the whole table:
+ *
+ *     SELECT COUNT(*), COUNT(*) FILTER (…), MIN(logged_at) FROM system_logs
+ *
+ * with no WHERE at all, so it could only ever be a sequential scan. The rows
+ * beside it were capped at 500, which made the endpoint LOOK bounded; the cap
+ * was on the list and never on the aggregate.
+ *
+ * Measured on production (56,874 rows, 20MB):
+ *
+ *     unwindowed   Seq Scan        1824 buffers   21.1 ms
+ *     24h window   Index Scan         8 buffers    0.17 ms
+ *
+ * and the windowed form stays flat as the table grows, because the window is
+ * fixed and `system_logs_time_idx` is ordered by exactly it.
+ *
+ * The 21ms is not, by itself, alarming. Three things make it worth fixing:
+ *
+ *   1. The History tab polls. Every tick paid for a full scan of the largest
+ *      table on the box, evicting the product's own pages from a shared_buffers
+ *      that is not large.
+ *   2. The cost scales with the incident. This table is quiet when the platform
+ *      is healthy and enormous when it is not — the Redis outage of 4–14 Aug
+ *      put 55,584 rows in it, 97.7% of everything it holds. So the scan was
+ *      cheapest when nobody was looking at it and dearest on the one screen an
+ *      operator opens when the box is already in trouble.
+ *   3. It had no ceiling. Retention caps the window at 30 days, not the row
+ *      count, and 30 days of a bad week is what the number above is.
+ *
+ * `oldest` survives as a whole-table MIN because that one is an index-only
+ * scan backward — 3 buffers — and it is the honest answer to "how far back
+ * does this go", which a windowed count cannot give.
  */
 router.get('/command-center/logs/history', wrap(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
@@ -249,28 +287,73 @@ router.get('/command-center/logs/history', wrap(async (req, res) => {
     params.push(`%${String(req.query.q)}%`);
     where.push(`msg ILIKE $${params.length}`);
   }
+
+  // Keyset, not OFFSET. `id` is BIGSERIAL and monotonic with insertion, so
+  // "older than the last row you saw" is a single index seek regardless of how
+  // deep the operator has paged — measured at 23 buffers for a 100-row page at
+  // any depth. OFFSET would re-walk every skipped row, which is the same
+  // unbounded scan in a different costume; worse, it double-counts and skips
+  // lines when new errors arrive mid-page, which on a log viewer during an
+  // incident is not a rare case but the normal one.
+  //
+  // The ordering key moved from `logged_at` to `id` to make this work: keyset
+  // paging needs a UNIQUE key, and two lines can share a timestamp. The two
+  // orders are not identical — lines are batched and flushed on a timer, and
+  // the api and worker containers flush independently, so a line can be
+  // written a few seconds after one it preceded. The skew is bounded by the
+  // flush interval and the rows carry their own `logged_at`, which is what the
+  // operator actually reads.
+  const before = /^\d+$/.test(String(req.query.before || '')) ? String(req.query.before) : null;
+  if (before) {
+    params.push(before);
+    where.push(`id < $${params.length}`);
+  }
+
   params.push(limit);
 
   const { rows } = await pool.query(
     `SELECT id, level, level_label, logged_at, msg, source, pid, hostname, context
        FROM system_logs
       WHERE ${where.join(' AND ')}
-      ORDER BY logged_at DESC
+      ORDER BY id DESC
       LIMIT $${params.length}`,
     params,
   );
 
-  const { rows: counts } = await pool.query(
-    `SELECT
-       COUNT(*)::int                                          AS total,
-       COUNT(*) FILTER (WHERE source = 'worker')::int          AS from_worker,
-       COUNT(*) FILTER (WHERE level >= 60)::int                AS fatal,
-       COUNT(*) FILTER (WHERE logged_at > NOW() - INTERVAL '24 hours')::int AS last_24h,
-       MIN(logged_at)                                          AS oldest
-     FROM system_logs`,
-  );
+  // A full page means there is probably more behind it. Handing back the
+  // cursor rather than a total lets the client page without anyone counting
+  // the table.
+  const next_before = rows.length === limit ? String(rows[rows.length - 1].id) : null;
 
-  res.json({ data: { lines: rows, stats: counts[0] } });
+  // Skipped on poll ticks. The lines are what changes every few seconds; the
+  // stats strip is not, and recomputing it on every tick was most of the cost
+  // of having the tab open.
+  let stats = null;
+  if (req.query.stats !== '0') {
+    const hours = Math.min(Math.max(Number(req.query.stats_hours) || 24, 1), 720);
+    const { rows: counts } = await pool.query(
+      `SELECT
+         COUNT(*)::int                                   AS in_window,
+         COUNT(*) FILTER (WHERE source = 'worker')::int  AS from_worker,
+         COUNT(*) FILTER (WHERE level >= 60)::int        AS fatal,
+         MIN(logged_at)                                  AS window_oldest
+       FROM system_logs
+       WHERE logged_at > NOW() - ($1 || ' hours')::interval`,
+      [String(hours)],
+    );
+    // Separate statement so it can use the index-only scan backward; folding
+    // it into the aggregate above would drag the whole table back in.
+    const { rows: depth } = await pool.query('SELECT MIN(logged_at) AS oldest FROM system_logs');
+
+    stats = {
+      ...counts[0],
+      oldest: depth[0].oldest,
+      window_hours: hours,
+      retention_days: logCapture.retentionDays(),
+    };
+  }
+
+  res.json({ data: { lines: rows, stats, next_before } });
 }));
 
 module.exports = router;

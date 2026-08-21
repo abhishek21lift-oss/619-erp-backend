@@ -25,7 +25,7 @@ router.get('/', auth, async (req, res, next) => {
     const isAdmin = req.user.role === 'admin';
     const isManager = req.user.role === 'manager';
     const ownTid = req.user.trainer_id || null;
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
     // Tenant isolation: a tenant admin/trainer only ever sees their own

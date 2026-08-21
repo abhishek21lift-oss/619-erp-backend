@@ -134,7 +134,7 @@ router.put('/billing/settings', async (req, res, next) => {
 // "revenue in this range" must not change when the operator turns the page.
 router.get('/billing/invoices', async (req, res, next) => {
   try {
-    const limit = Math.min(Number(req.query.limit) || 50, INVOICE_PAGE_MAX);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), INVOICE_PAGE_MAX);
     const offset = Math.max(Number(req.query.offset) || 0, 0);
     const { clause, params } = buildInvoiceFilter(req.query);
 

@@ -1213,6 +1213,17 @@ router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) =
 }));
 
 // ─── Sessions ───────────────────────────────────────────────
+//
+// Capped. `trainer_id` and `date` are both optional, so the unfiltered call is
+// "every PT session this studio has ever run", and pt_sessions has no
+// retention: one row per session per client, kept forever. Three rows in
+// production today, and roughly ten thousand a year for a studio running
+// thirty sessions a day — the kind of number that is fine right up until the
+// studio you most want to keep is the one whose diary times out.
+//
+// The sibling in training.routes.js already had this exact clamp; this handler
+// did not, which is the only reason to mention it — the shape was already
+// agreed, it just was not applied here.
 router.get('/sessions', auth, wrap(async (req, res) => {
   const { trainer_id, date } = req.query;
   const where = ['s.deleted_at IS NULL'];
@@ -1221,12 +1232,15 @@ router.get('/sessions', auth, wrap(async (req, res) => {
   if (scope.applyFilter) { params.push(scope.orgId); where.push(`s.organization_id = $${params.length}`); }
   if (trainer_id) { params.push(trainer_id); where.push(`s.trainer_id = $${params.length}`); }
   if (date) { params.push(date); where.push(`s.session_date = $${params.length}`); }
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
+  params.push(limit);
   const { rows } = await pool.query(`
     SELECT s.*, c.name AS client_name
     FROM pt_sessions s
     LEFT JOIN pt_clients c ON c.id = s.client_id
     WHERE ${where.join(' AND ')}
     ORDER BY s.session_date DESC, s.start_time
+    LIMIT $${params.length}
   `, params);
   res.json({ data: rows });
 }));

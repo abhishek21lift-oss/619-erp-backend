@@ -256,6 +256,16 @@ router.put('/organizations/:id/notes', async (req, res, next) => {
 //  feed stays cheap (no COUNT) and its contract is unchanged.
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Ceiling on the pagination COUNT for the audit feeds.
+ *
+ * Not a page size — the page is already clamped separately. This bounds how
+ * far the COUNT is allowed to walk before it is entitled to answer "at least
+ * this many", so an unfiltered count over a table with no retention cannot
+ * become a scan whose cost is whatever history happens to have accumulated.
+ */
+const COUNT_CEILING = 10000;
+
 // Builds the shared WHERE clause + params for both the list and the export, so
 // a CSV can never disagree with the table it was exported from.
 function buildAuditFilter(query) {
@@ -297,17 +307,39 @@ router.get('/audit', async (req, res, next) => {
     // One round trip for the page and one for the total. The count is needed
     // for pagination; running it in parallel keeps the added latency off the
     // critical path rather than doubling it.
+    //
+    // The count stops at COUNT_CEILING rows. With no filters applied `clause`
+    // is empty, so this was a full scan of activity_log plus both joins, on a
+    // table that has no retention sweep and grows for as long as the platform
+    // is used — a cost with a history but no ceiling. Bounding the subquery
+    // gives the planner permission to stop early, and past the ceiling the
+    // honest answer to "how many" is "more than ten thousand" rather than an
+    // exact number nobody reads off a paginated table.
+    //
+    // Below the ceiling the response is byte-for-byte what it was. Both this
+    // table and login_events are in the hundreds today, so this changes
+    // nothing an operator sees and removes the scan that had no upper bound.
     const [rowsRes, countRes] = await Promise.all([
       pool.query(`${AUDIT_SELECT} ${clause} ORDER BY a.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]),
-      pool.query(`SELECT COUNT(*)::int AS total FROM activity_log a
-                    LEFT JOIN users u ON u.id = a.user_id
-                    LEFT JOIN organizations o ON o.id = u.organization_id ${clause}`, params),
+      pool.query(`SELECT COUNT(*)::int AS total FROM (
+                    SELECT 1 FROM activity_log a
+                      LEFT JOIN users u ON u.id = a.user_id
+                      LEFT JOIN organizations o ON o.id = u.organization_id ${clause}
+                    LIMIT ${COUNT_CEILING + 1}
+                  ) capped`, params),
     ]);
 
+    const counted = countRes.rows[0].total;
     res.json({
       data: rowsRes.rows,
-      paging: { limit, offset, total: countRes.rows[0].total, count: rowsRes.rows.length },
+      paging: {
+        limit,
+        offset,
+        total: Math.min(counted, COUNT_CEILING),
+        total_capped: counted > COUNT_CEILING,
+        count: rowsRes.rows.length,
+      },
     });
   } catch (err) { next(err); }
 });

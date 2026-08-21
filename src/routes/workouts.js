@@ -41,7 +41,7 @@ router.get('/exercises', auth, async (req, res, next) => {
     if (difficulty)     { conds.push(`difficulty = $${p++}`);      params.push(difficulty); }
     if (search)         { conds.push(`name ILIKE $${p++}`);        params.push(`%${search}%`); }
 
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 1000);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     params.push(limit, offset);
     const { rows } = await pool.query(
@@ -240,7 +240,7 @@ router.get('/plans', auth, async (req, res, next) => {
     const tenant = planReadFilter(req, p);
     if (tenant.sql) { conds.push(tenant.sql); params.push(...tenant.params); p += tenant.params.length; }
 
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     params.push(limit, offset);
     const { rows } = await pool.query(`

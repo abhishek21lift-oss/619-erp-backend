@@ -1,0 +1,56 @@
+-- 178_index_for_bounded_operator_aggregates.sql
+--
+-- One partial index, so the Alert Center's stats strip can be answered from an
+-- index instead of a scan of the whole table.
+--
+-- ── What was wrong ──────────────────────────────────────────────────────────
+--
+-- The Alert Center and the log History tab both cap the ROWS they return and
+-- then run an aggregate beside them that had no WHERE clause at all. The cap
+-- made both endpoints look bounded. It bounded the list and nothing else.
+--
+-- Both strips poll. So the unbounded half ran on a timer, over the two tables
+-- that grow fastest precisely when the platform is unhealthy — which is when
+-- an operator has the console open. Measured on production before this
+-- migration:
+--
+--     system_logs   unwindowed COUNT(*)        Seq Scan   1824 buffers  21.1 ms
+--     system_alerts unwindowed COUNT(*) …      Seq Scan    388 buffers
+--
+-- The application-side fix (windowing the log aggregate to 24h, bounding the
+-- alert aggregate to live-plus-a-day) is what makes those queries small. This
+-- migration is what makes them use an index rather than reading every row and
+-- discarding most of it.
+--
+-- ── Why `resolved_at` needs its own index ───────────────────────────────────
+--
+-- Three of the Alert Center's four counters are about alerts that are NOT
+-- resolved, and `system_alerts_live_idx` (migration 150) already serves those:
+-- 5 buffers, 0.2ms. The fourth — "resolved in the last 24 hours" — is the one
+-- with no index behind it, and it is the reason the bounded form of that query
+-- still fell back to a sequential scan.
+--
+-- Writing it as one query with `status <> 'resolved' OR resolved_at > …` is
+-- worse than either half: an OR across two columns cannot use either index, so
+-- the planner goes back to the seq scan it was supposed to be avoiding. That
+-- was measured too, at 194ms — slower than the unbounded version it replaced.
+-- Hence two statements in the service, and this one index for the arm that
+-- lacked one.
+--
+-- Idempotent. No table is rewritten and no lock is held beyond the index
+-- build, the table being small enough that the build is momentary.
+--
+-- The log history needed no index of its own: its keyset page reads the
+-- primary key backward with `level >= $1` as a filter, measured at 23 buffers
+-- for a 100-row page at any depth. A composite (level, id) index would not
+-- help it — that orders by id only WITHIN a level, so a `level >= $1` range
+-- could not be walked in global id order without a sort on top.
+-- ============================================================
+
+-- "What did we resolve today?" — the Alert Center's fourth counter.
+-- Partial on the resolved rows only: the live ones are already covered by
+-- system_alerts_live_idx, and excluding them keeps this index roughly the size
+-- of the history it describes.
+CREATE INDEX IF NOT EXISTS system_alerts_resolved_recent_idx
+  ON system_alerts (resolved_at DESC)
+  WHERE status = 'resolved';

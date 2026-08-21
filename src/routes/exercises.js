@@ -221,7 +221,7 @@ router.get('/', auth, async (req, res, next) => {
       ? `${relevance}, e.name ASC`
       : (SORTS[req.query.sort] || 'e.name ASC');
 
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
     // Count and page in one round trip. The window function counts the full
@@ -347,7 +347,7 @@ router.get('/favorites', auth, async (req, res, next) => {
 
 router.get('/recent', auth, async (req, res, next) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
     const { rows } = await pool.query(
       `SELECT ${EXERCISE_COLUMNS}, r.use_count, r.used_at,
               EXISTS (SELECT 1 FROM exercise_favorites f

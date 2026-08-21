@@ -456,7 +456,7 @@ router.get('/:id/attendance', auth, async (req, res, next) => {
         (!req.user.trainer_id || client.trainer_id !== req.user.trainer_id)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     const { rows } = await pool.query(
       `SELECT id, date, check_in_time, check_out_time, method, notes
@@ -482,7 +482,7 @@ router.get('/:id/payments', auth, async (req, res, next) => {
         (!req.user.trainer_id || client.trainer_id !== req.user.trainer_id)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     // pt_payments, not `payments` — the latter is the gym-era ledger and is
     // empty. Column names differ, so the old aliases are preserved for the

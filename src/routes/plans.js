@@ -20,7 +20,7 @@ router.get('/', auth, async (req, res, next) => {
     if (kind)              { params.push(kind); conds.push(`kind = $${params.length}`); }
     if (active !== undefined) { params.push(active !== 'false'); conds.push(`is_active = $${params.length}`); }
 
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     params.push(limit, offset);
     const { rows } = await pool.query(
