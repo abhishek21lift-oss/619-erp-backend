@@ -119,6 +119,7 @@ function referencedTables() {
   const NOT_A_TABLE = new Set([
     'lateral', 'unnest', 'generate_series', 'jsonb_array_elements',
     'jsonb_array_elements_text', 'json_array_elements', 'regexp_split_to_table',
+    'jsonb_to_recordset',
     'only', 'select', 'set',
   ]);
 

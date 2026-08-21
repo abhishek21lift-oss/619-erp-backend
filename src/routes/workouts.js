@@ -7,7 +7,7 @@ const pool = require('../db/pool');
 const { auth, adminManagerOrTrainer } = require('../middleware/auth');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
-const { resolveWeek, previewWeeks } = require('../modules/pt-os/progression');
+const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
 
 // ─── EXERCISES (COMPATIBILITY) ────────────────────────────────
 //
@@ -273,6 +273,132 @@ router.get('/plans', auth, async (req, res, next) => {
 });
 
 // GET /api/workouts/plans/:id — full detail, exercises ordered by day then slot.
+// ─── WEEKS ────────────────────────────────────────────────────
+//
+// A programme stores week 1 and a rule; weeks 2..N are computed. But every
+// week is EDITABLE, and an edit has to land somewhere — so the first edit to
+// a computed week writes that week out as real rows. From then on the week is
+// its own prescription, and the weeks after it derive from it rather than
+// from week 1.
+//
+// Two things make this harder than it looks:
+//
+//   · A week is materialised a DAY AT A TIME, and the whole day at once.
+//     resolveWeek treats a week's own rows as the complete answer for that
+//     day, so writing one row and leaving its four neighbours computed would
+//     delete them from that week — the trainer edits Monday's squat and the
+//     rest of Monday vanishes.
+//
+//   · The row id the client is holding may not be the row that ends up being
+//     edited. A card shown in week 6 carries week 1's id until the moment
+//     week 6 becomes real, and an autosave queued a keystroke earlier still
+//     carries it afterwards. So a week-scoped write RESOLVES the id to that
+//     week's counterpart instead of trusting it — otherwise a late-arriving
+//     save silently rewrites week 1.
+
+/** The week a request is addressing, or 1. Clamped to what a plan can run for. */
+function weekParam(source) {
+  const n = parseInt(source, 10);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(MAX_WEEKS, n);
+}
+
+/**
+ * Give a computed week real rows of its own, if it has none yet.
+ *
+ * Caller must hold the plan lock and be inside a transaction: two trainers
+ * editing week 6 at the same moment would otherwise both find it computed and
+ * both write it, leaving the day duplicated.
+ *
+ * @returns {boolean} whether rows were written
+ */
+async function materialiseWeek(client, planId, plan, day, week) {
+  if (week <= 1) return false;
+
+  const { rows: already } = await client.query(
+    `SELECT 1 FROM workout_exercises
+      WHERE workout_plan_id = $1 AND day_of_week = $2 AND week_number = $3 LIMIT 1`,
+    [planId, day, week]
+  );
+  if (already.length) return false;
+
+  const { rows: allWeeks } = await client.query(
+    `SELECT id, exercise_id, day_of_week, week_number, sort_order, sets, reps,
+            rest_seconds, notes, target_weight, tempo, rpe, warmup_sets,
+            superset_group, config
+       FROM workout_exercises
+      WHERE workout_plan_id = $1 AND day_of_week = $2
+      ORDER BY sort_order`,
+    [planId, day]
+  );
+  const { exercises } = resolveWeek(allWeeks, plan, week);
+  if (!exercises.length) return false;
+
+  // One statement, not a loop: a half-written week is a day with some
+  // exercises missing, and resolveWeek would report it as complete.
+  await client.query(
+    `INSERT INTO workout_exercises (id, workout_plan_id, exercise_id, day_of_week,
+       week_number, sort_order, sets, reps, rest_seconds, notes,
+       target_weight, tempo, rpe, warmup_sets, superset_group, config)
+     SELECT gen_random_uuid()::text, $1, r.exercise_id, $2, $3, r.sort_order,
+            r.sets, r.reps, r.rest_seconds, r.notes, r.target_weight, r.tempo,
+            r.rpe, r.warmup_sets, r.superset_group, r.config
+       FROM jsonb_to_recordset($4::jsonb) AS r(
+         exercise_id text, sort_order int, sets int, reps int, rest_seconds int,
+         notes text, target_weight numeric, tempo text, rpe numeric,
+         warmup_sets int, superset_group text, config jsonb)`,
+    [planId, day, week, JSON.stringify(exercises.map((ex) => ({
+      exercise_id: ex.exercise_id,
+      sort_order: ex.sort_order,
+      sets: ex.sets,
+      reps: ex.reps,
+      rest_seconds: ex.rest_seconds,
+      notes: ex.notes,
+      target_weight: ex.target_weight,
+      tempo: ex.tempo,
+      rpe: ex.rpe,
+      warmup_sets: ex.warmup_sets,
+      superset_group: ex.superset_group,
+      config: ex.config ?? null,
+    })))]
+  );
+  return true;
+}
+
+/**
+ * The row a week-scoped write should actually touch.
+ *
+ * `rowId` identifies the CARD, which may be any week's copy of it — most often
+ * the anchor week's, because that is the id the client was handed. Position in
+ * the day is what survives materialisation, so that is the identity; the
+ * exercise itself is the fallback for a week whose order has since changed.
+ */
+async function rowForWeek(client, planId, rowId, week) {
+  const { rows } = await client.query(
+    `SELECT id, day_of_week, week_number, sort_order, exercise_id
+       FROM workout_exercises WHERE id = $1 AND workout_plan_id = $2`,
+    [rowId, planId]
+  );
+  const row = rows[0];
+  if (!row) return null;
+  if (Number(row.week_number) === week) return row;
+
+  const { rows: sameWeek } = await client.query(
+    `SELECT id, day_of_week, week_number, sort_order, exercise_id
+       FROM workout_exercises
+      WHERE workout_plan_id = $1 AND day_of_week = $2 AND week_number = $3`,
+    [planId, row.day_of_week, week]
+  );
+  return sameWeek.find((r) => Number(r.sort_order) === Number(row.sort_order))
+    || sameWeek.find((r) => r.exercise_id && r.exercise_id === row.exercise_id)
+    || null;
+}
+
+/** Lock the plan so concurrent week writes cannot both materialise it. */
+async function lockPlan(client, planId) {
+  await client.query('SELECT id FROM workout_plans WHERE id = $1 FOR UPDATE', [planId]);
+}
+
 router.get('/plans/:id', auth, async (req, res, next) => {
   try {
     const tenant = planReadFilter(req, 2);
@@ -293,24 +419,42 @@ router.get('/plans/:id', auth, async (req, res, next) => {
         ORDER BY we.day_of_week, we.sort_order`,
       [req.params.id]
     );
+
+    // Which weeks the trainer has edited. The builder marks those tabs and
+    // offers to put them back on the rule, and it cannot work that out from
+    // one week's rows.
+    const overrideWeeks = [...new Set(
+      exercises.map((ex) => Number(ex.week_number) || 1).filter((w) => w > 1)
+    )].sort((a, b) => a - b);
+
+    const byDay = new Map();
+    for (const ex of exercises) {
+      if (!byDay.has(ex.day_of_week)) byDay.set(ex.day_of_week, []);
+      byDay.get(ex.day_of_week).push(ex);
+    }
+
     // ?week=N returns the prescription for that week rather than the stored
     // week-1 rows — the same resolution the client's log uses, so the builder
     // and the gym floor cannot disagree about what week 6 says.
     const requestedWeek = parseInt(req.query.week, 10);
     if (Number.isFinite(requestedWeek) && requestedWeek > 1) {
-      const byDay = new Map();
-      for (const ex of exercises) {
-        if (!byDay.has(ex.day_of_week)) byDay.set(ex.day_of_week, []);
-        byDay.get(ex.day_of_week).push(ex);
-      }
       const resolved = [];
       let source = 'derived';
+      let anchor = 1;
       for (const rows of byDay.values()) {
         const r = resolveWeek(rows, plan, requestedWeek);
         if (r.source === 'override') source = 'override';
+        if (r.anchor_week > anchor) anchor = r.anchor_week;
         resolved.push(...r.exercises);
       }
-      return res.json({ ...plan, week: requestedWeek, week_source: source, exercises: resolved });
+      return res.json({
+        ...plan,
+        week: requestedWeek,
+        week_source: source,
+        anchor_week: anchor,
+        override_weeks: overrideWeeks,
+        exercises: resolved,
+      });
     }
 
     // Where the rule lands, per exercise, without an extra round trip and
@@ -318,12 +462,31 @@ router.get('/plans/:id', auth, async (req, res, next) => {
     // from the server's. A rule is abstract until you see that +2.5kg/week
     // turns 60 into 87.5 by week 12 — which a trainer may well decide is too
     // much, and that is cheaper to learn here than in week 9.
-    const preview = plan.progression_type === 'none' ? null : exercises.map((ex) => {
-      const weeks = previewWeeks(ex, plan, plan.duration_weeks);
-      return { id: ex.id, first: weeks[0], last: weeks[weeks.length - 1] };
-    });
+    //
+    // Built from the day's real rows, not from the rule alone: once a trainer
+    // has edited week 9, "where the rule lands in week 12" is no longer where
+    // week 12 actually lands, and the number a trainer plans against has to be
+    // the one their client will be handed.
+    const weekOne = exercises.filter((ex) => (Number(ex.week_number) || 1) === 1);
+    const preview = plan.progression_type === 'none' && overrideWeeks.length === 0
+      ? null
+      : weekOne.map((ex) => {
+        const weeks = previewWeeks(ex, plan, plan.duration_weeks, byDay.get(ex.day_of_week));
+        return { id: ex.id, first: weeks[0], last: weeks[weeks.length - 1] };
+      });
 
-    res.json({ ...plan, week: 1, week_source: 'base', exercises, progression_preview: preview });
+    // Week 1's rows only. Without the filter, every week a trainer has edited
+    // would also appear here — the same exercise listed twice on the same day,
+    // one copy carrying week 6's numbers.
+    res.json({
+      ...plan,
+      week: 1,
+      week_source: 'base',
+      anchor_week: 1,
+      override_weeks: overrideWeeks,
+      exercises: weekOne,
+      progression_preview: preview,
+    });
   } catch (err) {
     next(err);
   }
@@ -562,48 +725,63 @@ router.get('/plans/:id/versions', auth, async (req, res, next) => {
 
 // POST /api/workouts/plans/:id/exercises — append one exercise to a day
 router.post('/plans/:id/exercises', auth, adminManagerOrTrainer, async (req, res, next) => {
+  const client = await pool.connect();
   try {
-    const plan = await loadEditablePlan(req, req.params.id);
+    const plan = await loadEditablePlan(req, req.params.id, client);
     if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
 
     const ex = req.body;
     if (!ex.exercise_id) return res.status(400).json({ error: 'exercise_id required' });
     const day = num(ex.day_of_week, 1);
+    // Adding to a computed week has to write that week out first. Otherwise
+    // the row lands in week 1 and appears in every week — the trainer adds a
+    // movement to week 6 and finds it in week 1's Monday.
+    const week = weekParam(ex.week_number ?? req.query.week);
 
-    // Append: one past the current last slot for that day. Computed in SQL so
-    // two trainers adding at once cannot both claim the same sort_order.
-    const { rows } = await pool.query(`
+    await client.query('BEGIN');
+    await lockPlan(client, req.params.id);
+    await materialiseWeek(client, req.params.id, plan, day, week);
+
+    // Append: one past the current last slot for that day and week. Computed
+    // in SQL so two trainers adding at once cannot both claim the same
+    // sort_order.
+    const { rows } = await client.query(`
       INSERT INTO workout_exercises (id, workout_plan_id, exercise_id, day_of_week,
-        sort_order, sets, reps, rest_seconds, notes,
+        week_number, sort_order, sets, reps, rest_seconds, notes,
         target_weight, tempo, rpe, warmup_sets, superset_group, config)
-      VALUES ($1,$2,$3,$4,
+      VALUES ($1,$2,$3,$4,$15,
         COALESCE((SELECT MAX(sort_order) + 1 FROM workout_exercises
-                   WHERE workout_plan_id = $2 AND day_of_week = $4), 0),
+                   WHERE workout_plan_id = $2 AND day_of_week = $4 AND week_number = $15), 0),
         $5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING id`,
       [randomUUID(), req.params.id, ex.exercise_id, day,
        num(ex.sets, 3), num(ex.reps, 12), num(ex.rest_seconds, 60), ex.notes || null,
-       ...exerciseParams(ex)]
+       ...exerciseParams(ex), week]
     );
+    await client.query('COMMIT');
 
     // Re-read through the same projection every other endpoint uses, so the
     // card the UI renders from this response is identical to the one it would
     // get from a reload.
-    const { rows: full } = await pool.query(
+    const { rows: full } = await client.query(
       `SELECT ${EXERCISE_SELECT} FROM workout_exercises we
          LEFT JOIN exercises e ON e.id = we.exercise_id WHERE we.id = $1`,
       [rows[0].id]
     );
     res.status(201).json({ message: 'Exercise added', exercise: full[0] });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     next(err);
+  } finally {
+    client.release();
   }
 });
 
 // PATCH /api/workouts/plans/:id/exercises/:rowId — edit fields in place
 router.patch('/plans/:id/exercises/:rowId', auth, adminManagerOrTrainer, async (req, res, next) => {
+  const client = await pool.connect();
   try {
-    const plan = await loadEditablePlan(req, req.params.id);
+    const plan = await loadEditablePlan(req, req.params.id, client);
     if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
 
     // Whitelist. A blind loop over req.body would let a caller rewrite id,
@@ -626,50 +804,144 @@ router.patch('/plans/:id/exercises/:rowId', auth, adminManagerOrTrainer, async (
     };
 
     const sets = [];
-    const params = [req.params.rowId, req.params.id];
+    const values = [];
     for (const [key, coerce] of Object.entries(EDITABLE)) {
       // `in` rather than a truthiness test: clearing a field to null and
       // setting a number to 0 are both legitimate edits.
       if (key in req.body) {
-        sets.push(`${key} = $${params.length + 1}`);
-        params.push(coerce(req.body[key]));
+        values.push(coerce(req.body[key]));
+        sets.push(`${key} = $${values.length + 2}`);
       }
     }
     if (!sets.length) return res.status(400).json({ error: 'No editable fields supplied' });
 
-    const { rows } = await pool.query(
+    // The week being edited. Editing a computed week writes it out first, and
+    // the edit lands on the new row rather than on the one the client named —
+    // which is week 1's, and rewriting that would move every week at once.
+    const week = weekParam(req.body.week_number ?? req.query.week);
+
+    await client.query('BEGIN');
+    await lockPlan(client, req.params.id);
+
+    let targetId = req.params.rowId;
+    if (week > 1) {
+      const { rows: found } = await client.query(
+        'SELECT day_of_week FROM workout_exercises WHERE id = $1 AND workout_plan_id = $2',
+        [req.params.rowId, req.params.id]
+      );
+      if (!found[0]) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Exercise not found in this plan' });
+      }
+      await materialiseWeek(client, req.params.id, plan, found[0].day_of_week, week);
+      const target = await rowForWeek(client, req.params.id, req.params.rowId, week);
+      if (!target) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Exercise not found in this week' });
+      }
+      targetId = target.id;
+    }
+
+    const { rows } = await client.query(
       `UPDATE workout_exercises SET ${sets.join(', ')}
         WHERE id = $1 AND workout_plan_id = $2 RETURNING id`,
-      params
+      [targetId, req.params.id, ...values]
     );
-    if (!rows[0]) return res.status(404).json({ error: 'Exercise not found in this plan' });
+    if (!rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Exercise not found in this plan' });
+    }
+    await client.query('COMMIT');
 
-    const { rows: full } = await pool.query(
+    const { rows: full } = await client.query(
       `SELECT ${EXERCISE_SELECT} FROM workout_exercises we
          LEFT JOIN exercises e ON e.id = we.exercise_id WHERE we.id = $1`,
-      [req.params.rowId]
+      [targetId]
     );
     res.json({ message: 'Exercise updated', exercise: full[0] });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     next(err);
+  } finally {
+    client.release();
   }
 });
 
 // DELETE /api/workouts/plans/:id/exercises/:rowId
 router.delete('/plans/:id/exercises/:rowId', auth, adminManagerOrTrainer, async (req, res, next) => {
+  const client = await pool.connect();
   try {
-    const plan = await loadEditablePlan(req, req.params.id);
+    const plan = await loadEditablePlan(req, req.params.id, client);
     if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
+
+    // Removing a movement from week 6 removes it from week 6 onwards, not from
+    // the whole programme. So the week is written out first and the deletion
+    // happens there; weeks 1-5 keep the exercise.
+    const week = weekParam(req.query.week ?? req.body?.week_number);
+
+    await client.query('BEGIN');
+    await lockPlan(client, req.params.id);
+
+    let targetId = req.params.rowId;
+    if (week > 1) {
+      const { rows: found } = await client.query(
+        'SELECT day_of_week FROM workout_exercises WHERE id = $1 AND workout_plan_id = $2',
+        [req.params.rowId, req.params.id]
+      );
+      if (!found[0]) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Exercise not found in this plan' });
+      }
+      await materialiseWeek(client, req.params.id, plan, found[0].day_of_week, week);
+      const target = await rowForWeek(client, req.params.id, req.params.rowId, week);
+      if (!target) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Exercise not found in this week' });
+      }
+      targetId = target.id;
+    }
 
     // A hard delete: a planned exercise is an editing artefact, not a record of
     // anything that happened. What the client actually performed lives in
     // workout_sessions and is untouched by this.
-    const { rows } = await pool.query(
+    const { rows } = await client.query(
       'DELETE FROM workout_exercises WHERE id = $1 AND workout_plan_id = $2 RETURNING id',
-      [req.params.rowId, req.params.id]
+      [targetId, req.params.id]
     );
-    if (!rows[0]) return res.status(404).json({ error: 'Exercise not found in this plan' });
+    if (!rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Exercise not found in this plan' });
+    }
+    await client.query('COMMIT');
     res.json({ message: 'Exercise removed' });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /api/workouts/plans/:id/weeks/:week — put an edited week back on the rule
+//
+// The way out of an edit. Deleting a week's own rows makes it computed again,
+// so it goes back to following the nearest earlier anchor — and so do the
+// weeks after it, unless they have edits of their own.
+router.delete('/plans/:id/weeks/:week', auth, adminManagerOrTrainer, async (req, res, next) => {
+  try {
+    const plan = await loadEditablePlan(req, req.params.id);
+    if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
+
+    const week = weekParam(req.params.week);
+    // Week 1 is the programme itself, not an edit of it. Deleting its rows
+    // here would empty the plan through an endpoint named "reset a week".
+    if (week <= 1) return res.status(400).json({ error: 'Week 1 is the programme itself and cannot be reset' });
+
+    const { rowCount } = await pool.query(
+      'DELETE FROM workout_exercises WHERE workout_plan_id = $1 AND week_number = $2',
+      [req.params.id, week]
+    );
+    res.json({ message: 'Week reset to the progression rule', week, removed: rowCount });
   } catch (err) {
     next(err);
   }
@@ -689,19 +961,32 @@ router.put('/plans/:id/days/:day/order', auth, adminManagerOrTrainer, async (req
 
     const day = num(req.params.day);
     if (day === null) return res.status(400).json({ error: 'Invalid day' });
+    // Reordering week 6's Monday reorders week 6 onwards. Weeks 1-5 keep the
+    // order they had, so the week has to be real before anything moves.
+    const week = weekParam(req.query.week ?? req.body?.week_number);
 
     await client.query('BEGIN');
+    await lockPlan(client, req.params.id);
+    await materialiseWeek(client, req.params.id, plan, day, week);
 
-    // Every id must already belong to this plan and this day. Without the
-    // check, a caller could pass an id from another day — or another plan —
-    // and the UPDATE would silently move it here.
+    // Every id must already belong to this plan, this day AND this week.
+    // Without the check, a caller could pass an id from another day — or
+    // another week, or another plan — and the UPDATE would silently move it
+    // here. After materialising, the ids the client is holding are the
+    // anchor's, so they are mapped to this week's rows first.
     const { rows: owned } = await client.query(
       `SELECT id FROM workout_exercises
-        WHERE workout_plan_id = $1 AND day_of_week = $2`,
-      [req.params.id, day]
+        WHERE workout_plan_id = $1 AND day_of_week = $2 AND week_number = $3`,
+      [req.params.id, day, week]
     );
     const ownedIds = new Set(owned.map((r) => r.id));
-    if (ids.length !== ownedIds.size || ids.some((id) => !ownedIds.has(id))) {
+    const mapped = [];
+    for (const id of ids) {
+      if (ownedIds.has(id)) { mapped.push(id); continue; }
+      const target = week > 1 ? await rowForWeek(client, req.params.id, id, week) : null;
+      if (target) mapped.push(target.id);
+    }
+    if (mapped.length !== ownedIds.size || new Set(mapped).size !== ownedIds.size) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         error: 'exercise_ids must list exactly the exercises already on this day',
@@ -716,11 +1001,11 @@ router.put('/plans/:id/days/:day/order', auth, adminManagerOrTrainer, async (req
          FROM (SELECT unnest($1::text[]) AS id,
                       generate_series(0, array_length($1::text[], 1) - 1) AS ord) AS v
         WHERE we.id = v.id AND we.workout_plan_id = $2`,
-      [ids, req.params.id]
+      [mapped, req.params.id]
     );
 
     await client.query('COMMIT');
-    res.json({ message: 'Order updated', count: ids.length });
+    res.json({ message: 'Order updated', count: mapped.length, week });
   } catch (err) {
     await client.query('ROLLBACK');
     next(err);
