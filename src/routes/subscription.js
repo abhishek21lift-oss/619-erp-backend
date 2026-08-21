@@ -6,6 +6,7 @@
 const router = require('express').Router();
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const sub = require('../lib/subscription');
 const checkout = require('../lib/subscriptionCheckout');
 const { validate } = require('../middleware/validate');
@@ -60,7 +61,12 @@ function requireStudioAdmin(req, res) {
 }
 
 // GET /api/subscription/checkout/settings — is self-checkout available at all?
-router.get('/checkout/settings', auth, async (req, res, next) => {
+// requireStaff on this route only. /api/subscription carries the studio's own
+// checkout flow, and (bare)/subscription is the STUDIO-facing screen — a studio
+// owner is `admin`, which is staff, so this does not lock an owner out of
+// paying. A gym member has no business reading the platform's merchant
+// configuration; the rest of the mount stays as it is.
+router.get('/checkout/settings', auth, requireStaff, async (req, res, next) => {
   try {
     const s = await checkout.getPlatformSettings();
     // The VPA itself is deliberately NOT returned here — it only ever travels

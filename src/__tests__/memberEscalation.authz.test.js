@@ -89,62 +89,32 @@ const MEMBER_REACHABLE = {
   '/api/me': 'The client portal. This IS the member surface; every handler scopes to the session\'s own client id.',
   '/api/client-login': 'Client portal sign-in. A member authenticating is the one thing that must work before any role check can apply.',
   '/api/webhooks/razorpay': 'Payment provider callback, authenticated by signature rather than session.',
+  '/api/bookings': 'A member listing their OWN bookings: the handler overrides member_id with the session\'s own for role === member, so the query string cannot widen it.',
+  '/api/v1/bookings': 'Versioned alias of the same bookings router.',
+  '/api/classes': 'The class timetable a member browses in order to book. Org-scoped by migration 176 and routes/classes.js.',
+  '/api/diet': 'The meal library a member\'s own diet plan is built from; shared-shape table, same as exercises.',
+  '/api/exercises': 'The exercise library a member\'s own workout is built from. Platform reference content.',
+  '/api/workouts': 'Same library, reached through the workouts router.',
+  '/api/ai': 'Conversations are keyed WHERE c.user_id = $1 — the member\'s own threads — and /actions returns only what canRun() permits for the caller\'s role.',
+  '/api/v1/notifications': 'svc.inbox(req.user.id) — the member\'s own notification inbox.',
+  '/api/qr': 'Generates the caller\'s OWN check-in QR, keyed from req.user.pt_client_id / member_id.',
+  '/api/plans': 'The studio\'s membership price list. Org-scoped by migration 174. A member seeing what their own studio charges is the renewal screen working, not a leak — reviewed and left reachable.',
   '/api/features':
     'Studio feature flags, fetched by FeaturesProvider in the ROOT layout — so it runs for members too, and its .catch() means a 403 would be silent but produce one on every member page load. The payload is which modules the studio has enabled: studio configuration, not client or staff data. Reviewed and left reachable deliberately; gating it needs the frontend provider to stop calling it for members in the same change.',
 };
 
 /**
- * Routes this test found a member can reach, that have NOT been triaged.
+ * Routes found reachable by a member that have not yet been triaged.
  *
- * ── Read this before adding to it ──────────────────────────────────────────
+ * EMPTY, and that is the point of leaving it here. The first run of this test
+ * produced eighteen entries; all eighteen have now been read and resolved —
+ * seven gated (five mounts, two individual routes), eleven moved into
+ * MEMBER_REACHABLE above with a written reason.
  *
- * This is not an allowlist and it is not an assertion that these are safe. It
- * is the raw output of the first run of this test, recorded honestly: 18
- * routes answered a member with 200, and verifying each one means reading its
- * handler to decide whether it returns the caller's own data or the studio's.
- * Three were verified and fixed in the same change as this file
- * (/api/support/tickets, /api/invoices, /api/reports/monthly), and the rest
- * are written down rather than quietly dropped.
- *
- * Some are near-certainly fine — a member listing their OWN bookings, or
- * reading the exercise library their workout is built from. Others look like
- * the same shape as the three that were fixed:
- *
- *   /api/settings/                      studio settings
- *   /api/trainers/                      staff roster
- *   /api/leave/                         staff leave requests
- *   /api/search/                        search across studio data
- *   /api/subscription/checkout/settings SaaS billing configuration
- *   /api/payments/upi/settings          payment configuration
- *   /api/qr/generate                    check-in QR generation
- *   /api/modules/:key                   operations workspace
- *   /api/ai/actions                     AI action plans
- *
- * The rule for this list is that it SHRINKS. Triage an entry, and it either
- * moves to MEMBER_REACHABLE with a reason or gets a gate and disappears. The
- * pinned count below fails if anything is added, which is the whole point: a
- * new ungated mount cannot join this list without somebody typing a number.
+ * The next ungated mount lands here rather than passing silently, and the
+ * pinned length below means it cannot grow without somebody typing a number.
  */
-const UNREVIEWED = [
-  '/api/ai/actions',
-  '/api/ai/conversations',
-  '/api/bookings/',
-  '/api/classes/sessions',
-  '/api/diet/meals',
-  '/api/exercises/',
-  '/api/leave/',
-  '/api/modules/1',
-  '/api/payments/upi/settings',
-  '/api/plans/',
-  '/api/qr/generate',
-  '/api/search/',
-  '/api/settings/',
-  '/api/subscription/checkout/settings',
-  '/api/trainers/',
-  '/api/v1/bookings/',
-  '/api/v1/notifications/',
-  '/api/workouts/exercises',
-];
+const UNREVIEWED = [];
 
 /** Every `app.use('/api/…', …, require('./router'))` line in server.js. */
 function mountsFromServer() {
@@ -240,7 +210,7 @@ describe('a member cannot reach staff mounts', () => {
     // Pinned at the count the first run produced, minus the three fixed in the
     // same change. Triaging an entry lowers this; nothing else should move it,
     // so a newly ungated mount fails rather than joining the list silently.
-    expect(UNREVIEWED).toHaveLength(18);
+    expect(UNREVIEWED).toHaveLength(0);
   });
 
   it('every untriaged entry is still reachable, so the list cannot go stale', async () => {

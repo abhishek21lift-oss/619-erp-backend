@@ -28,6 +28,7 @@ const multer = require('multer');
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { validate } = require('../middleware/validate');
 const { z } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
@@ -338,7 +339,12 @@ async function adminUserIds(orgId) {
 // GET /api/payments/upi/settings — what the payment page and the settings
 // screen both read. Safe for any authenticated user in the studio: it exposes
 // the studio's own public payee details and nothing else.
-router.get('/settings', auth, wrap(async (req, res) => {
+// requireStaff on this route only. The rest of this mount is the member-facing
+// payment flow (create, upload proof, submit UTR), which must stay open — but
+// this returns the studio's UPI configuration object, and the sibling endpoint
+// /api/subscription/checkout/settings deliberately withholds its VPA from its
+// own response for exactly that reason. Gating the mount would break paying.
+router.get('/settings', auth, requireStaff, wrap(async (req, res) => {
   const orgId = requireOrg(req);
   const settings = await upi.getSettings(orgId);
   res.json({ data: settings, configured: Boolean(settings), enabled: Boolean(settings?.is_enabled) });
