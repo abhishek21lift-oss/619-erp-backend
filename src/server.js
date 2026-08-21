@@ -1059,6 +1059,27 @@ runMigrationsWithRetry()
       );
     }
 
+    // Refresh token retention.
+    //
+    // Deliberately OUTSIDE the LOG_CAPTURE guard above: this has nothing to do
+    // with the Command Centre, and turning off log capture must not silently
+    // stop pruning the auth table. Hourly for the same reason — the first
+    // sweep on a database that has never been pruned drains a backlog in
+    // bounded batches rather than one large statement.
+    {
+      const refreshTokens = require('./lib/refreshTokenRetention');
+      const sweep = () => { refreshTokens.prune(); };
+      setInterval(sweep, 60 * 60 * 1000).unref();
+      // Once at boot too: a container that restarts more often than hourly
+      // would otherwise never reach the first interval tick.
+      sweep();
+      logger.info(
+        { retention_days: Number(process.env.REFRESH_TOKEN_RETENTION_DAYS)
+            || refreshTokens.DEFAULT_RETENTION_DAYS },
+        'Refresh token retention active',
+      );
+    }
+
     // Command Center alerting. Without this the Alert Center only notices a
     // problem while somebody has the console open, which is the opposite of
     // what alerting is for — the point is being told when you are NOT looking.
