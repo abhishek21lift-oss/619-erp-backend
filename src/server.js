@@ -675,7 +675,10 @@ app.use('/api/subscription',      require('./routes/subscription'));
 // Global top-nav search. Carries its own rate limiter (see routes/search.js),
 // so it is deliberately NOT wrapped in userApiLimiter — debounced typing would
 // otherwise consume the shared per-user budget that real API calls need.
-app.use('/api/search',            require('./routes/search'));
+// requireStaff: search fans out across the studio's clients, and its own
+// narrowing is `role === 'trainer' ? trainer_id : null` — so a member fell
+// through that branch with NO narrowing and searched the whole studio.
+app.use('/api/search',            auth, requireStaff, require('./routes/search'));
 
 // ONE router, deliberately. This mount used to carry a second file,
 // routes/client-actions.js, whose thirteen endpoints read and wrote the legacy
@@ -689,7 +692,9 @@ app.use('/api/search',            require('./routes/search'));
 // mounted here starts reading that table again.
 app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
 
-app.use('/api/trainers',          require('./routes/trainers'));
+// requireStaff: returns t.* per trainer PLUS month_revenue and
+// all_time_revenue. Staff earnings are not client-facing data.
+app.use('/api/trainers',          auth, requireStaff, require('./routes/trainers'));
 // Manual UTR verification payments. MUST be mounted before the finance ledger
 // router below: that one owns DELETE /:id and a bare /:id would otherwise
 // swallow /api/payments/upi/... before this router ever sees it.
@@ -719,7 +724,9 @@ app.use('/api/attendance',        ...gate('attendance'), require('./routes/atten
 app.use('/api/reports',           userApiLimiter, ...staffGate('insights'), require('./routes/reports'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
-app.use('/api/leave',             require('./routes/leave'));
+// requireStaff: staff leave requests — who is off, when, and why. HR data
+// about employees, org-scoped but not role-scoped.
+app.use('/api/leave',             auth, requireStaff, require('./routes/leave'));
 app.use('/api/expenses',          ...gate('finance'), require('./routes/expenses'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
@@ -765,14 +772,22 @@ const platformRoutes = require('./modules/platform/super-admin.routes');
 app.use('/api/platform',          ...PLATFORM_GUARD, platformRoutes);
 app.use('/api/super-admin',       ...PLATFORM_GUARD, platformRoutes);
 
-app.use('/api/modules',           require('./modules/operations/operations.routes'));
+// requireStaff: the operations workspace behind eight (chrome) tabs —
+// attendance, finance, settings, reports. Migration 174 gave module_records a
+// tenant column and Phase 1 added orgWhere(), which bounds the studio; this
+// bounds the role.
+app.use('/api/modules',           auth, requireStaff, require('./modules/operations/operations.routes'));
 
 // ────────────────────────
 // PREMIUM FEATURE ROUTES (v4)
 // ────────────────────────
 app.use('/api/calendar',          require('./routes/calendar'));
 app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-checkin'));
-app.use('/api/settings',          require('./routes/settings'));
+// requireStaff: the handler already hides internal_/geo_/biometric_/feature_
+// keys from non-admins, but system_settings carries NO organization_id at all
+// (it is on tenantColumns' KNOWN_GAPS as per-studio keys inside a shared
+// table), so the query is unfiltered by studio as well as by role.
+app.use('/api/settings',          auth, requireStaff, require('./routes/settings'));
 app.use('/api/invoices',          ...staffGate('finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
 // The Exercise Library. Sits behind the same 'programs' feature as the Workout
