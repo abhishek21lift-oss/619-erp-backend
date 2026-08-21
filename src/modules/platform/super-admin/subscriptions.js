@@ -618,7 +618,7 @@ router.get('/subscription-requests', async (req, res, next) => {
   try {
     const status = ['AWAITING_VERIFICATION', 'AWAITING_PAYMENT', 'APPROVED', 'ALL']
       .includes(req.query.status) ? req.query.status : 'AWAITING_VERIFICATION';
-    const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
     const conds = [];

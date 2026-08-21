@@ -397,7 +397,7 @@ router.get('/sessions', auth, STAFF, wrap(async (req, res) => {
   const filters = [];
   if (req.query.client_id) { params.push(req.query.client_id); filters.push(`s.client_id = $${params.length}`); }
   if (req.query.status)    { params.push(req.query.status);    filters.push(`s.status = $${params.length}`); }
-  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
   params.push(limit);
   const { rows } = await pool.query(
     `SELECT s.* FROM training_sessions s

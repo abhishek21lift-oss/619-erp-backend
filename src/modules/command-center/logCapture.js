@@ -212,11 +212,38 @@ async function flush() {
   }
 }
 
+/** Default days of history kept in `system_logs`. */
+const DEFAULT_RETENTION_DAYS = 30;
+
+/**
+ * The configured retention window, in days.
+ *
+ * Read through a function rather than computed once at require time so a
+ * deployment that changes the variable does not need a code change to pick it
+ * up, and so the history endpoint can report the same number the sweep uses
+ * instead of a second copy of `|| 30` that can drift from it.
+ *
+ * `Number(x) || DEFAULT` is deliberately NOT the test here: it treats 0 as
+ * unset, and it treats a non-numeric string as 30 rather than as the
+ * misconfiguration it is. Both are quiet. The floor of 1 is what stops a
+ * negative window, which would invert the interval in `prune` below and make
+ * `logged_at < NOW() - '-5 days'` delete everything up to five days in the
+ * FUTURE — that is, everything.
+ */
+function retentionDays() {
+  const raw = process.env.LOG_RETENTION_DAYS;
+  const n = Number(raw);
+  if (raw === undefined || raw === null || raw === '' || Number.isNaN(n)) {
+    return DEFAULT_RETENTION_DAYS;
+  }
+  return Math.max(1, Math.trunc(n));
+}
+
 /**
  * Delete rows older than the retention window.
  * @returns the number removed.
  */
-async function prune(days = Number(process.env.LOG_RETENTION_DAYS) || 30) {
+async function prune(days = retentionDays()) {
   try {
     const pool = require('../../db/pool');
     const { rowCount } = await pool.query(
@@ -251,6 +278,6 @@ function _reset({ persist = true } = {}) {
 }
 
 module.exports = {
-  stream, accept, flush, prune, stats, scrub, _reset,
-  PERSIST_FROM_LEVEL, MAX_PENDING, FLUSH_BATCH, SOURCE,
+  stream, accept, flush, prune, stats, scrub, _reset, retentionDays,
+  PERSIST_FROM_LEVEL, MAX_PENDING, FLUSH_BATCH, SOURCE, DEFAULT_RETENTION_DAYS,
 };

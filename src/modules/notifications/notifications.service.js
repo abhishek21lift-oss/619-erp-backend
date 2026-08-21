@@ -296,12 +296,19 @@ async function recipientFromMember(memberId) {
  * Inbox: fetch unread/recent notifications for current user.
  */
 async function inbox(userId, { unreadOnly = false, limit = 50 } = {}) {
+  // Clamped here rather than at the route. The only caller today passes no
+  // limit at all, so the default holds and nothing is currently at risk — but
+  // the default is the ONLY thing bounding this, and a default is not a bound.
+  // The next caller to forward `req.query.limit` would hand the page size to
+  // whoever asked, and `notifications` is one of the tables that grows per
+  // user forever.
+  const capped = Math.min(Math.max(Number(limit) || 50, 1), 200);
   const { rows } = await pool.query(
     `SELECT id, type, title, body, link, read_at, created_at
      FROM notifications
      WHERE user_id = $1 ${unreadOnly ? 'AND read_at IS NULL' : ''}
      ORDER BY created_at DESC LIMIT $2`,
-    [userId, limit]
+    [userId, capped]
   );
   return rows;
 }

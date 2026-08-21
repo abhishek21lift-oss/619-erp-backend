@@ -704,7 +704,7 @@ router.post('/users', auth, requireSuperAdmin, validate(authSchemas.createUser),
 // GET /api/auth/users  (admin only)
 router.get('/users', auth, requireSuperAdmin, async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     // Tenant isolation: a studio admin only ever sees users in their own org.
     // The platform super admin (null org) is naturally excluded from a tenant

@@ -10,6 +10,16 @@ const {
   pool,
 } = require('./shared');
 const SECURITY_PAGE_MAX = 200;
+
+/**
+ * Ceiling on the pagination COUNT, distinct from the page size above.
+ *
+ * The page size bounds what is RETURNED; this bounds what is COUNTED. They
+ * were conflated in the original: the list was clamped and the count beside it
+ * walked the whole table, which made the endpoint look paginated while half of
+ * it was not.
+ */
+const LOGIN_COUNT_CEILING = 10000;
 // A window long enough to catch a slow, distributed attempt but short enough
 // that yesterday's noise does not mask today's.
 const THREAT_WINDOW_HOURS = 24;
@@ -97,7 +107,11 @@ router.get('/security/overview', async (req, res, next) => {
 // ── GET /security/login-events ───────────────────────────────────────────────
 router.get('/security/login-events', async (req, res, next) => {
   try {
-    const limit = Math.min(Number(req.query.limit) || 50, SECURITY_PAGE_MAX);
+    // Clamped at BOTH ends. `Math.min(x, MAX)` alone let a negative through:
+    // `?limit=-5` reached Postgres as `LIMIT -5`, which is not an empty page
+    // but an error — "LIMIT must not be negative" — so any caller could turn
+    // this endpoint into a 500 from the query string.
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), SECURITY_PAGE_MAX);
     const offset = Math.max(Number(req.query.offset) || 0, 0);
     const { clause, params } = buildLoginFilter(req.query);
 
@@ -114,17 +128,34 @@ router.get('/security/login-events', async (req, res, next) => {
         `${SELECT} ${clause} ORDER BY e.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
       ),
+      // Bounded at LOGIN_COUNT_CEILING rows. `clause` is empty when the
+      // operator applies no filter, which made this a full scan of
+      // login_events plus a join — and login_events gains a row on every
+      // login attempt, successful or not, with nothing deleting them. A
+      // credential-stuffing run against the platform is therefore the event
+      // that both fills this table AND brings the operator to this screen.
+      //
+      // Below the ceiling the number is exact and the response is unchanged.
       pool.query(
-        `SELECT count(*)::int AS n FROM login_events e
-           LEFT JOIN organizations o ON o.id = e.organization_id
-           ${clause}`,
+        `SELECT count(*)::int AS n FROM (
+           SELECT 1 FROM login_events e
+             LEFT JOIN organizations o ON o.id = e.organization_id
+             ${clause}
+           LIMIT ${LOGIN_COUNT_CEILING + 1}
+         ) capped`,
         params
       ),
     ]);
 
+    const counted = total.rows[0].n;
     res.json({
       data: list.rows,
-      paging: { limit, offset, total: total.rows[0].n },
+      paging: {
+        limit,
+        offset,
+        total: Math.min(counted, LOGIN_COUNT_CEILING),
+        total_capped: counted > LOGIN_COUNT_CEILING,
+      },
     });
   } catch (err) { next(err); }
 });

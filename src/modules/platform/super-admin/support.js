@@ -71,7 +71,7 @@ router.get('/support/overview', async (req, res, next) => {
 // ── GET /support/tickets ─────────────────────────────────────────────────────
 router.get('/support/tickets', async (req, res, next) => {
   try {
-    const limit = Math.min(Number(req.query.limit) || 50, TICKET_PAGE_MAX);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), TICKET_PAGE_MAX);
     const where = []; const params = [];
     const add = (sql, v) => { params.push(v); where.push(sql.replace('$?', `$${params.length}`)); };
 

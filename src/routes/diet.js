@@ -34,7 +34,7 @@ router.get('/meals', auth, async (req, res, next) => {
     if (meal_type) { params.push(meal_type);      conds.push(`meal_type = $${params.length}`); }
     if (search)    { params.push(`%${search}%`);  conds.push(`name ILIKE $${params.length}`); }
 
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     params.push(limit, offset);
     const { rows } = await pool.query(
@@ -82,7 +82,7 @@ router.get('/templates', auth, async (req, res, next) => {
 
     if (goal) { conds.push(`goal = $${p++}`); params.push(goal); }
 
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     params.push(limit, offset);
     const { rows } = await pool.query(`

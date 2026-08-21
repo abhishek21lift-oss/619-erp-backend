@@ -528,7 +528,7 @@ router.get('/my-history', auth, async (req, res) => {
     else if (u.member_id) { refId = u.member_id; refType = 'client'; }
     else if (u.trainer_id) { refId = u.trainer_id; refType = 'trainer'; }
 
-    const limit = Math.min(parseInt(req.query.limit || '90'), 365);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '90', 10) || 90, 1), 365);
     const { rows } = await pool.query(
       `SELECT date, status, check_in_time, check_out_time, method, duration_minutes
          FROM attendance_logs

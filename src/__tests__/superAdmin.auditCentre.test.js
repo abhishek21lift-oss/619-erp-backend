@@ -37,7 +37,38 @@ describe('Audit Centre — GET /audit', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.data).toHaveLength(1);
-    expect(res.body.paging).toEqual({ limit: 50, offset: 0, total: 137, count: 1 });
+    expect(res.body.paging).toEqual({
+      limit: 50, offset: 0, total: 137, total_capped: false, count: 1,
+    });
+  });
+
+  // The count walks at most COUNT_CEILING+1 rows. Below the ceiling — which is
+  // every real number this table has held — the answer is exact and the
+  // response is what it always was. `activity_log` has no retention sweep, so
+  // without the ceiling the unfiltered count was a scan of however much
+  // history had accumulated, joined twice, with no upper bound at all.
+  it('counts to a ceiling rather than scanning an unbounded table', async () => {
+    pool.query.mockResolvedValue({ rows: [{ total: 0 }] });
+    await request(app()).get('/api/super-admin/audit');
+
+    const [sql] = callMatching(/SELECT COUNT\(\*\)::int AS total/);
+    expect(sql).toMatch(/LIMIT 10001/);
+    // The ceiling has to be INSIDE the subquery. A trailing LIMIT on the
+    // aggregate itself bounds the one row it returns and nothing underneath.
+    expect(sql).toMatch(/LIMIT 10001\s*\)\s*capped/);
+  });
+
+  it('reports the total as capped once the ceiling is reached', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ id: 'a1' }] })
+      .mockResolvedValueOnce({ rows: [{ total: 10001 }] });   // ceiling + 1
+
+    const res = await request(app()).get('/api/super-admin/audit');
+
+    // Reported as the ceiling, not as the sentinel: 10001 is an artefact of
+    // how the ceiling is measured and is not a count of anything.
+    expect(res.body.paging.total).toBe(10000);
+    expect(res.body.paging.total_capped).toBe(true);
   });
 
   it('selects old_data alongside new_data — the point of the audit view is what changed', async () => {
