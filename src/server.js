@@ -727,7 +727,12 @@ app.use('/api/plans',             ...gate('packages'), require('./routes/plans')
 // requireStaff: staff leave requests — who is off, when, and why. HR data
 // about employees, org-scoped but not role-scoped.
 app.use('/api/leave',             auth, requireStaff, require('./routes/leave'));
-app.use('/api/expenses',          ...gate('finance'), require('./routes/expenses'));
+// staffGate, not gate: routes/expenses.js narrows with `if (req.user.role ===
+// 'trainer')` and then applies the org filter — so a member fell through the
+// trainer branch and got the studio's whole expense stats. Third instance of
+// that fall-through after reports/monthly and search; a feature flag is not an
+// authorisation decision.
+app.use('/api/expenses',          ...staffGate('finance'), require('./routes/expenses'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.

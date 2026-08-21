@@ -10,6 +10,11 @@
 //                 clients assigned to them. A property of the CLIENT, so it
 //                 is applied once against pt_clients rather than repeated on
 //                 each child table.
+//   MEMBER        a gym client with a login may act on their OWN client row
+//                 and nothing else. This one was missing, and its absence did
+//                 not read as a gap: a member is neither an all-clients role
+//                 nor a trainer, so they fell through both tests into the
+//                 unconstrained default.
 //   CHILD ROWS    a set belongs to a performance belongs to a session belongs
 //                 to a client. None of those child tables carry an
 //                 organization_id, so reaching one safely means walking back
@@ -59,14 +64,37 @@ function orgWhere(req, params, col = 'organization_id') {
  * client's own trainer.
  */
 function trainerWhere(req, params, col = 'c.trainer_id') {
+  // A member is neither an all-clients role nor a trainer, so without this it
+  // fell through to '' — no narrowing at all. Matching nothing is the correct
+  // answer here: this clause constrains by TRAINER, and a member has no
+  // trainer relationship to constrain by. A member-facing list must scope on
+  // the client id itself rather than reach for this.
+  if (req.user?.role === 'member') return ' AND FALSE';
   if (seesAllClients(req) || !req.user?.trainer_id) return '';
   params.push(req.user.trainer_id);
   return ` AND ${col} = $${params.length}`;
 }
 
-/** True when this request may act on this client at all. */
+/**
+ * True when this request may act on this client at all.
+ *
+ * The member branch is the boundary the header above did not name, and its
+ * absence was a latent hole rather than a live one: `trainerWhere` returns ''
+ * when the caller has no trainer_id, and a member has none — so for a member
+ * this degraded to an ORG-ONLY check and any client in the studio passed.
+ *
+ * Every current caller sits behind requireRole('admin','manager','trainer'),
+ * so no member can reach one today. This closes it anyway, because the next
+ * caller added without that gate would inherit the hole silently, and "safe
+ * because of something in another file" is how the twelve untenanted tables
+ * happened.
+ */
 async function canAccessClient(req, clientId) {
   if (!clientId) return false;
+  if (req.user?.role === 'member') {
+    const own = req.user.pt_client_id || req.user.client_id || null;
+    return Boolean(own) && own === clientId;
+  }
   const params = [clientId];
   const org = orgWhere(req, params);
   const trainer = trainerWhere(req, params);
