@@ -36,7 +36,8 @@ BEGIN
    WHERE exercise_type = 'Cardio'
      AND deleted_at IS NULL
      AND progression_notes IS NOT NULL;
-  IF updated_count <> 14 THEN
-    RAISE EXCEPTION 'Expected progression notes for 14 cardio exercises, found %', updated_count;
+  -- Fresh schema-only installs may not have imported exercises yet.
+  IF updated_count NOT IN (0, 14) THEN
+    RAISE EXCEPTION 'Expected progression notes for 0 (fresh) or 14 cardio exercises, found %', updated_count;
   END IF;
 END $$;

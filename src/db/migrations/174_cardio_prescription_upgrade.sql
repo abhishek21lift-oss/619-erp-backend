@@ -234,7 +234,10 @@ BEGIN
    WHERE exercise_type = 'Cardio'
      AND deleted_at IS NULL
      AND prescription_mode_primary IS NOT NULL;
-  IF updated_count <> 14 THEN
-    RAISE EXCEPTION 'Expected 14 enriched cardio exercises, found %', updated_count;
+  -- Fresh schema-only installs may not have imported exercises yet. The
+  -- importer can run after migrations; an existing populated library must,
+  -- however, contain the complete 14-row cardio set.
+  IF updated_count NOT IN (0, 14) THEN
+    RAISE EXCEPTION 'Expected 0 (fresh) or 14 enriched cardio exercises, found %', updated_count;
   END IF;
 END $$;
