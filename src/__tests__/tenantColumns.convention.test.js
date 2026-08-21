@@ -166,11 +166,6 @@ const KNOWN_GAPS = {
   feature_flags: 'Studio feature toggles, admin-only, read through settings routes.',
   payments: 'Legacy payment rows. The live path is pt_payments (which carries the column) and payment_orders; this table is read by invoices.js and the Razorpay webhook.',
   clients: 'The legacy table migration 170 drops. Still referenced by admin-reset and clients.js.',
-  member_memberships: 'Legacy members feature; server.js documents the module as abandoned.',
-  attendance: 'Legacy; the live table is attendance_logs, which carries the column.',
-  bookings: 'Bookings module targets the legacy members tables.',
-  class_sessions: 'Classes module, not yet retrofitted.',
-  class_templates: 'Classes module, not yet retrofitted.',
 };
 
 /** Every route/module source file. */
@@ -305,7 +300,7 @@ describe('every table the API reads can name its owning studio', () => {
     // Pinned at the count established when this test was written. Fixing a gap
     // means deleting its entry AND lowering this number; nothing else should
     // move it. An addition fails here rather than passing quietly.
-    expect(Object.keys(KNOWN_GAPS)).toHaveLength(9);
+    expect(Object.keys(KNOWN_GAPS)).toHaveLength(4);
   });
 
   it('no table is in both lists, which would make the reason meaningless', () => {

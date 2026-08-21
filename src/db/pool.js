@@ -7,8 +7,15 @@ const { appTimeZone } = require('../lib/appTime');
 const { currentOrgId, isPlatformWide } = require('../lib/tenant-context');
 
 if (!process.env.DATABASE_URL) {
+  // Throw, do not exit. This is a library module: everything that touches the
+  // database requires it, so a process.exit() here kills whatever imported it
+  // — including a Jest worker that only wanted to mock the pool, which made
+  // `npm test` on a clean checkout die on an unrelated file. server.js
+  // validates DATABASE_URL in its REQUIRED_ENV block before anything pulls
+  // this in, so the friendly startup message is still what an operator sees;
+  // this line is the backstop for every other caller.
   logger.fatal('DATABASE_URL is not set. Check your .env file.');
-  process.exit(1);
+  throw new Error('DATABASE_URL is not set. Check your .env file.');
 }
 
 /**
@@ -61,7 +68,7 @@ function buildSslConfig() {
       return { ca: fs.readFileSync(caPath, 'utf8'), rejectUnauthorized: true };
     } catch (err) {
       logger.fatal({ caPath, err: err.message }, 'DATABASE_SSL_CA file could not be read');
-      process.exit(1);
+      throw new Error(`DATABASE_SSL_CA file could not be read: ${caPath}`);
     }
   }
   // Supabase's Supavisor pooler uses a certificate chain that is not in the
