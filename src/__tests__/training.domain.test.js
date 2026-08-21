@@ -91,6 +91,9 @@ describe('prescription — which fields a type makes sense of', () => {
     expect(p.performanceKind('SETS_REPS')).toBe('sets');
     expect(p.performanceKind('PERCENT_1RM')).toBe('sets');
     expect(p.performanceKind('TIME_DISTANCE')).toBe('cardio');
+    expect(p.performanceKind('TIME_SPEED')).toBe('cardio');
+    expect(p.performanceKind('DISTANCE_LOAD')).toBe('cardio');
+    expect(p.performanceKind('FLOORS')).toBe('cardio');
     expect(p.performanceKind('INTERVAL')).toBe('cardio');
   });
 
@@ -119,6 +122,16 @@ describe('prescription — which fields a type makes sense of', () => {
     const r = p.validate({ prescription_type: 'DISTANCE', target_distance: 5 });
     expect(r.valid).toBe(false);
     expect(r.errors.join(' ')).toMatch(/distance_unit/);
+  });
+
+  test('cardio modes do not require strength sets and reps', () => {
+    expect(p.validate({
+      prescription_type: 'TIME_SPEED', target_duration_seconds: 1200, target_speed: 8,
+    }).valid).toBe(true);
+    expect(p.validate({
+      prescription_type: 'DISTANCE_LOAD', target_distance: 20, distance_unit: 'm', target_weight: 80,
+    }).valid).toBe(true);
+    expect(p.validate({ prescription_type: 'FLOORS', target_floors: 12 }).valid).toBe(true);
   });
 
   test('an out-of-range RPE is refused', () => {
@@ -151,6 +164,11 @@ describe('prescription — which fields a type makes sense of', () => {
       prescription_type: 'TIME_DISTANCE', target_duration_seconds: 1200,
       target_distance: 3, distance_unit: 'km', target_incline: 5, target_rpe: 7,
     })).toBe('20 min · 3 km · 5% incline · RPE 7');
+
+    expect(p.describe({
+      prescription_type: 'DISTANCE_LOAD', target_distance: 20, distance_unit: 'm',
+      target_weight: 80, weight_unit: 'kg', target_rounds: 5,
+    })).toBe('5 rounds · 20 m · 80kg');
   });
 });
 

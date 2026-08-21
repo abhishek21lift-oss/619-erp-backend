@@ -232,14 +232,14 @@ async function logCardio(req, performanceId, body) {
   const cols = ['exercise_performance_id', 'cardio_type', 'duration_seconds', 'distance',
     'distance_unit', 'average_speed', 'max_speed', 'speed_unit', 'incline', 'resistance',
     'average_heart_rate', 'max_heart_rate', 'calories_burned', 'pace_seconds', 'pace_distance',
-    'cadence', 'elevation_gain', 'work_interval_seconds', 'rest_interval_seconds',
+    'cadence', 'floors_completed', 'steps_completed', 'elevation_gain', 'work_interval_seconds', 'rest_interval_seconds',
     'rounds_completed', 'rpe', 'completed', 'notes', 'client_token'];
   const values = [performanceId, body.cardio_type ?? 'OTHER', body.duration_seconds ?? null,
     body.distance ?? null, body.distance_unit ?? null, body.average_speed ?? null,
     body.max_speed ?? null, body.speed_unit ?? null, body.incline ?? null, body.resistance ?? null,
     body.average_heart_rate ?? null, body.max_heart_rate ?? null, body.calories_burned ?? null,
     body.pace_seconds ?? null, body.pace_distance ?? null, body.cadence ?? null,
-    body.elevation_gain ?? null, body.work_interval_seconds ?? null,
+    body.floors_completed ?? null, body.steps_completed ?? null, body.elevation_gain ?? null, body.work_interval_seconds ?? null,
     body.rest_interval_seconds ?? null, body.rounds_completed ?? null, body.rpe ?? null,
     body.completed ?? false, body.notes ?? null, body.client_token ?? null];
 

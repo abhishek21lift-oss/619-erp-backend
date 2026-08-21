@@ -199,7 +199,8 @@ async function retrieveExerciseLibrary({ organizationId, userId, query, limit = 
   try {
     const { rows } = await pool.query(
       `SELECT e.name, e.muscle_group, e.body_part, e.target_muscle, e.equipment, e.difficulty,
-              e.recommended_sets, e.recommended_reps, e.tempo_recommendation,
+               e.prescription_mode_primary, e.prescription_mode_allowed,
+               e.recommended_sets, e.recommended_reps, e.tempo_recommendation,
               e.coaching_cues, e.common_mistakes, e.safety_tips, e.contraindications,
               e.beginner_notes, e.advanced_notes
        FROM exercises e
@@ -698,8 +699,10 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
         `- ${x.name}${x.muscle_group || x.body_part ? ` (${x.muscle_group || x.body_part})` : ''}`,
         x.equipment ? `, ${x.equipment}` : '',
         x.difficulty ? `, ${x.difficulty}` : '',
-        x.recommended_sets ? `, ${x.recommended_sets} sets` : '',
-        x.recommended_reps ? ` x ${x.recommended_reps} reps` : '',
+         x.prescription_mode_primary ? `, primary mode ${x.prescription_mode_primary}` : '',
+         x.prescription_mode_allowed?.length ? `, allowed modes ${x.prescription_mode_allowed.join('|')}` : '',
+         x.recommended_sets ? `, ${x.recommended_sets} sets` : '',
+         x.recommended_reps ? ` x ${x.recommended_reps} reps` : '',
         x.tempo_recommendation ? `, tempo ${x.tempo_recommendation}` : '',
         txt(x.coaching_cues) ? ` | cues: ${txt(x.coaching_cues)}` : '',
         txt(x.safety_tips) ? ` | safety: ${txt(x.safety_tips)}` : '',
@@ -720,7 +723,8 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     'Each training day must contain: a session title, the training focus, a warm-up, main exercises, accessories, and cool-down/recovery guidance when appropriate.',
     '',
     'EVERY EXERCISE:',
-    'For every exercise, specify: the name, its order in the session, sets, reps or a rep range, an RIR or RPE target, the rest period, and tempo when the Exercise Library or knowledge provides one (or strength work requires it).',
+    'For every exercise, specify: the name, its order in the session, sets, reps or a rep range, an RIR or RPE target, the rest period, and tempo when the Exercise Library or knowledge provides one for strength work.',
+    'For cardio exercises, use the exercise primary/allowed prescription modes: specify duration, distance, speed, pace, incline, calories, heart-rate target, cadence, floors/steps, load, or intervals as applicable. Never force cardio into sets × reps.',
     'Add a short coaching/form cue only when the authorized knowledge supports it. Never invent exercise metadata — sets, reps, tempo, cues, or rest — that the authorized Exercise Library or knowledge does not support.',
     '',
     'CLIENT-SPECIFIC PROGRAMMING:',

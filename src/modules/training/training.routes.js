@@ -230,7 +230,8 @@ const PRESCRIPTION_COLS = [
   'target_sets', 'target_reps_min', 'target_reps_max', 'target_weight', 'weight_unit',
   'target_rpe', 'target_rir', 'target_tempo', 'target_rest_seconds', 'percentage_1rm',
   'percentage_metric', 'target_duration_seconds', 'target_distance', 'distance_unit',
-  'target_speed', 'target_incline', 'target_resistance', 'target_heart_rate', 'target_calories',
+  'target_speed', 'target_incline', 'target_resistance', 'target_cadence', 'target_floors',
+  'target_steps', 'target_heart_rate', 'target_calories',
   'target_pace_seconds', 'work_interval_seconds', 'rest_interval_seconds', 'target_rounds',
   'warmup', 'optional', 'notes',
 ];
@@ -522,7 +523,8 @@ router.patch('/cardio/:id', auth, STAFF, validate(schemas.cardioUpdate), wrap(as
   const { sets, values } = patchFrom(req.body, [
     'cardio_type', 'duration_seconds', 'distance', 'distance_unit', 'average_speed', 'max_speed',
     'speed_unit', 'incline', 'resistance', 'average_heart_rate', 'max_heart_rate',
-    'calories_burned', 'pace_seconds', 'pace_distance', 'cadence', 'elevation_gain',
+    'calories_burned', 'pace_seconds', 'pace_distance', 'cadence', 'floors_completed',
+    'steps_completed', 'elevation_gain',
     'work_interval_seconds', 'rest_interval_seconds', 'rounds_completed', 'rpe', 'completed', 'notes',
   ], 2);
   if (!sets.length) return notFound(res, 'Nothing to update');
@@ -562,7 +564,8 @@ router.get('/meta', auth, STAFF, (_req, res) => {
       set_types: ['WARMUP', 'WORKING', 'BACKOFF', 'DROP', 'AMRAP', 'FAILURE', 'CUSTOM'],
       cardio_types: [
         'TREADMILL', 'RUNNING', 'CYCLING', 'STATIONARY_BIKE', 'ROWING', 'ELLIPTICAL',
-        'STAIRMASTER', 'SKI_ERG', 'SWIMMING', 'WALKING', 'HIIT', 'CIRCUIT', 'OTHER',
+        'STAIRMASTER', 'STEP_MILL', 'SKI_ERG', 'SWIMMING', 'WALKING', 'SKATING',
+        'PROWLER', 'JUMP_ROPE', 'HIIT', 'CIRCUIT', 'OTHER',
       ],
       units: { weight: ['kg', 'lb'], distance: ['m', 'km', 'mile'] },
     },

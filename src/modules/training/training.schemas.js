@@ -155,6 +155,9 @@ const prescriptionBody = z.object({
   target_speed: nonNegative.max(100).optional().nullable(),
   target_incline: z.coerce.number().min(-30).max(100).optional().nullable(),
   target_resistance: nonNegative.max(100).optional().nullable(),
+  target_cadence: z.coerce.number().int().min(0).max(300).optional().nullable(),
+  target_floors: z.coerce.number().int().min(0).max(100000).optional().nullable(),
+  target_steps: z.coerce.number().int().min(0).max(1000000).optional().nullable(),
   target_heart_rate: z.coerce.number().int().min(20).max(250).optional().nullable(),
   target_calories: z.coerce.number().int().min(0).max(100000).optional().nullable(),
   target_pace_seconds: z.coerce.number().int().min(0).max(86400).optional().nullable(),
@@ -276,7 +279,8 @@ const setUpdate = { body: setCreate.body.partial() };
 const cardioBody = z.object({
     cardio_type: z.enum([
       'TREADMILL', 'RUNNING', 'CYCLING', 'STATIONARY_BIKE', 'ROWING', 'ELLIPTICAL',
-      'STAIRMASTER', 'SKI_ERG', 'SWIMMING', 'WALKING', 'HIIT', 'CIRCUIT', 'OTHER',
+      'STAIRMASTER', 'STEP_MILL', 'SKI_ERG', 'SWIMMING', 'WALKING', 'SKATING',
+      'PROWLER', 'JUMP_ROPE', 'HIIT', 'CIRCUIT', 'OTHER',
     ]).optional(),
     duration_seconds: durationSeconds.optional().nullable(),
     distance: distance.optional().nullable(),
@@ -292,6 +296,8 @@ const cardioBody = z.object({
     pace_seconds: z.coerce.number().int().min(0).max(86400).optional().nullable(),
     pace_distance: distance.optional().nullable(),
     cadence: z.coerce.number().int().min(0).max(300).optional().nullable(),
+    floors_completed: z.coerce.number().int().min(0).max(100000).optional().nullable(),
+    steps_completed: z.coerce.number().int().min(0).max(1000000).optional().nullable(),
     elevation_gain: z.coerce.number().min(-1000).max(30000).optional().nullable(),
     work_interval_seconds: z.coerce.number().int().min(0).max(86400).optional().nullable(),
     rest_interval_seconds: z.coerce.number().int().min(0).max(86400).optional().nullable(),

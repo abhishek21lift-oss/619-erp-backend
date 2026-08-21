@@ -20,8 +20,9 @@
 
 const PRESCRIPTION_TYPES = [
   'SETS_REPS', 'WEIGHT_REPS', 'RPE_BASED', 'RIR_BASED', 'PERCENT_1RM',
-  'TIME', 'DISTANCE', 'TIME_DISTANCE', 'PACE', 'SPEED',
-  'INTERVAL', 'AMRAP', 'EMOM', 'CIRCUIT', 'BODYWEIGHT', 'MOBILITY', 'CUSTOM',
+  'TIME', 'DISTANCE', 'TIME_DISTANCE', 'TIME_SPEED', 'DISTANCE_LOAD', 'TIME_LOAD',
+  'PACE', 'SPEED', 'CALORIES', 'HEART_RATE', 'RPE', 'RPM', 'STEPS', 'FLOORS', 'HOLD',
+  'INTERVAL', 'ROUNDS', 'AMRAP', 'EMOM', 'CIRCUIT', 'BODYWEIGHT', 'MOBILITY', 'CUSTOM',
 ];
 
 const SECTIONS = [
@@ -62,14 +63,44 @@ const FIELDS = {
   TIME_DISTANCE:{ required: ['target_duration_seconds', 'target_distance'],
                   optional: ['distance_unit', 'target_speed', 'target_incline', 'target_resistance',
                              'target_heart_rate', 'target_calories', 'target_rpe'] },
+  TIME_SPEED:   { required: ['target_duration_seconds'],
+                  optional: ['target_speed', 'target_incline', 'target_resistance',
+                             'target_heart_rate', 'target_calories', 'target_rpe'] },
+  DISTANCE_LOAD:{ required: ['target_distance'],
+                  optional: ['distance_unit', 'target_weight', 'weight_unit', 'target_rounds',
+                             'target_rest_seconds', 'target_rpe'] },
+  TIME_LOAD:    { required: ['target_duration_seconds'],
+                  optional: ['target_weight', 'weight_unit', 'target_resistance',
+                             'target_rounds', 'target_rest_seconds', 'target_rpe'] },
   PACE:         { required: ['target_pace_seconds'],
                   optional: ['target_distance', 'distance_unit', 'target_duration_seconds', 'target_rpe'] },
   SPEED:        { required: ['target_speed'],
                   optional: ['target_duration_seconds', 'target_distance', 'distance_unit',
                              'target_incline', 'target_resistance', 'target_rpe'] },
+  CALORIES:     { required: ['target_calories'],
+                  optional: ['target_duration_seconds', 'target_distance', 'distance_unit',
+                             'target_rpe', 'target_heart_rate'] },
+  HEART_RATE:   { required: ['target_heart_rate'],
+                  optional: ['target_duration_seconds', 'target_distance', 'distance_unit',
+                             'target_rpe'] },
+  RPE:          { required: ['target_rpe'],
+                  optional: ['target_duration_seconds', 'target_distance', 'distance_unit',
+                             'target_speed', 'target_heart_rate'] },
+  RPM:          { required: ['target_cadence'],
+                  optional: ['target_duration_seconds', 'target_distance', 'distance_unit',
+                             'target_resistance', 'target_rpe'] },
+  STEPS:        { required: ['target_steps'],
+                  optional: ['target_duration_seconds', 'target_rpe', 'target_heart_rate'] },
+  FLOORS:       { required: ['target_floors'],
+                  optional: ['target_duration_seconds', 'target_steps', 'target_rpe', 'target_heart_rate'] },
+  HOLD:         { required: ['target_duration_seconds'],
+                  optional: ['target_sets', 'target_rest_seconds', 'target_rpe'] },
 
   INTERVAL:     { required: ['work_interval_seconds', 'target_rounds'],
                   optional: ['rest_interval_seconds', 'target_rpe', 'target_heart_rate'] },
+  ROUNDS:       { required: ['target_rounds'],
+                  optional: ['target_duration_seconds', 'work_interval_seconds',
+                             'rest_interval_seconds', 'target_rpe'] },
   AMRAP:        { required: ['target_duration_seconds'],
                   optional: ['target_reps_min', 'target_weight', 'target_rpe'] },
   EMOM:         { required: ['target_rounds'],
@@ -96,7 +127,9 @@ const SET_BASED = new Set([
 
 /** Types whose performance is logged as a cardio effort. */
 const CARDIO_BASED = new Set([
-  'TIME', 'DISTANCE', 'TIME_DISTANCE', 'PACE', 'SPEED', 'INTERVAL', 'CIRCUIT', 'MOBILITY',
+  'TIME', 'DISTANCE', 'TIME_DISTANCE', 'TIME_SPEED', 'DISTANCE_LOAD', 'TIME_LOAD',
+  'PACE', 'SPEED', 'CALORIES', 'HEART_RATE', 'RPE', 'RPM', 'STEPS', 'FLOORS', 'HOLD',
+  'INTERVAL', 'ROUNDS', 'CIRCUIT', 'MOBILITY',
 ]);
 
 /**
@@ -224,9 +257,16 @@ function describe(row, exerciseName = '') {
     }
     if (isSet(row.target_duration_seconds)) bits.push(`${Math.round(row.target_duration_seconds / 60)} min`);
     if (isSet(row.target_distance)) bits.push(`${row.target_distance} ${row.distance_unit || ''}`.trim());
+    if (isSet(row.target_pace_seconds)) bits.push(`pace ${row.target_pace_seconds}s`);
     if (isSet(row.target_speed)) bits.push(`${row.target_speed} km/h`);
+    if (isSet(row.target_weight)) bits.push(`${row.target_weight}${row.weight_unit || 'kg'}`);
+    if (isSet(row.target_cadence)) bits.push(`${row.target_cadence} rpm`);
+    if (isSet(row.target_floors)) bits.push(`${row.target_floors} floors`);
+    if (isSet(row.target_steps)) bits.push(`${row.target_steps} steps`);
     if (isSet(row.target_incline)) bits.push(`${row.target_incline}% incline`);
     if (isSet(row.target_resistance)) bits.push(`resistance ${row.target_resistance}`);
+    if (isSet(row.target_calories)) bits.push(`${row.target_calories} kcal`);
+    if (isSet(row.target_heart_rate)) bits.push(`${row.target_heart_rate} bpm`);
   }
 
   if (isSet(row.target_rpe)) bits.push(`RPE ${row.target_rpe}`);
