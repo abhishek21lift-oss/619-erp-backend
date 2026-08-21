@@ -18,10 +18,43 @@ async function calculateMonthlyCommissions(month, scope = {}) {
     params.push(scope.orgId);
     orgClause = ` AND c.organization_id = $${params.length}`;
   }
-  const { rows: clients } = await pool.query(`
-    SELECT c.id, c.name, c.trainer_id, c.trainer_name,
-           c.monthly_pt_amount, c.trainer_commission,
-           t.incentive_rate
+  // ── One statement, not one per client ────────────────────────────────────
+  //
+  // This used to SELECT the eligible clients and then loop, issuing an
+  // INSERT … ON CONFLICT per client. Two problems, both of which get worse
+  // exactly where this function matters most — a studio with a lot of PT
+  // clients at month end:
+  //
+  //   · No transaction wrapped the loop. A failure partway through — a
+  //     timeout, a dropped connection, one bad row — left some commissions
+  //     written and the rest not, with no signal beyond the error. Re-running
+  //     recovers because the upsert is idempotent, but nothing said it needed
+  //     re-running.
+  //   · N+1 round trips. With TENANT_RLS_ENFORCE on, db/pool.js wraps every
+  //     query in BEGIN → set_config → … → COMMIT on a dedicated pooled client,
+  //     so each iteration costs four round trips and holds one of twenty
+  //     connections. A thousand PT clients is four thousand round trips, which
+  //     passes the 15s query_timeout somewhere in the hundreds.
+  //
+  // Folding the read into the write fixes both at once. A single statement is
+  // atomic in Postgres, so this needs no explicit BEGIN/COMMIT — adding one
+  // would suggest the atomicity came from the transaction rather than from
+  // there being one statement.
+  //
+  // The ON CONFLICT arbiter is (trainer_id, client_id, month). A multi-row
+  // upsert raises if the same arbiter appears twice in one statement, which
+  // cannot happen here: the source is one row per pt_clients.id and client_id
+  // is part of the key.
+  //
+  // COALESCE on trainer_commission preserves the loop's behaviour exactly —
+  // it read the value through Number(), and Number(null) is 0, where passing
+  // a SQL NULL into a NOT NULL column would now fail instead.
+  const { rows: written } = await pool.query(`
+    INSERT INTO pt_commissions
+      (trainer_id, trainer_name, client_id, client_name,
+       month, commission_amt, incentive_rate, status)
+    SELECT c.trainer_id, c.trainer_name, c.id, c.name,
+           $1::DATE, COALESCE(c.trainer_commission, 0), t.incentive_rate, 'pending'
     FROM pt_clients c
     JOIN pt_trainers t ON t.id = c.trainer_id
     WHERE c.deleted_at IS NULL
@@ -40,29 +73,14 @@ async function calculateMonthlyCommissions(month, scope = {}) {
       AND (c.pt_end_date IS NULL OR c.pt_end_date >= $1::DATE)
       AND c.pt_start_date <= $2::DATE
       AND c.monthly_pt_amount > 0${orgClause}
+    ON CONFLICT (trainer_id, client_id, month)
+    DO UPDATE SET commission_amt = EXCLUDED.commission_amt,
+                  incentive_rate = EXCLUDED.incentive_rate,
+                  updated_at = NOW()
+    RETURNING *
   `, params);
 
-  const results = [];
-  for (const cl of clients) {
-    const commission = Number(cl.trainer_commission);
-    const { rows } = await pool.query(`
-      INSERT INTO pt_commissions
-        (trainer_id, trainer_name, client_id, client_name,
-         month, commission_amt, incentive_rate, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
-      ON CONFLICT (trainer_id, client_id, month)
-      DO UPDATE SET commission_amt = EXCLUDED.commission_amt,
-                    incentive_rate = EXCLUDED.incentive_rate,
-                    updated_at = NOW()
-      RETURNING *
-    `, [
-      cl.trainer_id, cl.trainer_name,
-      cl.id, cl.name,
-      monthStart, commission, cl.incentive_rate,
-    ]);
-    results.push(rows[0]);
-  }
-  return { count: results.length, total: results.reduce((s, r) => s + Number(r.commission_amt), 0) };
+  return { count: written.length, total: written.reduce((s, r) => s + Number(r.commission_amt), 0) };
 }
 
 async function getTrainerPayouts(month, scope = {}) {

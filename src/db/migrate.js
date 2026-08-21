@@ -55,6 +55,23 @@ async function clearStaleLock(client) {
 
 async function runMigrations() {
   const client = await pool.connect();
+
+  // Surface what the migrations themselves say.
+  //
+  // node-postgres discards server NOTICE/WARNING unless something listens for
+  // them, so a migration's RAISE WARNING went nowhere: 174 reports the rows it
+  // could not attribute this way, and its output was silently dropped by the
+  // deploy that ran it. The result read as a clean success while four tables
+  // were left nullable. A migration that reports into a channel nobody reads
+  // has not reported.
+  const onNotice = (msg) => {
+    if (!msg || !msg.message) return;
+    const sev = String(msg.severity || 'NOTICE').toUpperCase();
+    const line = `     [${sev}] ${msg.message}`;
+    if (sev === 'WARNING' || sev === 'EXCEPTION') console.warn(line);
+    else console.log(line);
+  };
+  client.on('notice', onNotice);
   let holdsLock = false;
   try {
     // Acquire the advisory lock WITHOUT blocking. A blocking pg_advisory_lock()
@@ -116,6 +133,7 @@ async function runMigrations() {
     }
     console.log('✅ All migrations complete.');
   } finally {
+    client.removeListener('notice', onNotice);
     if (holdsLock) {
       await client.query('SELECT pg_advisory_unlock($1)', [LOCK_ID]).catch(function() {});
     }
