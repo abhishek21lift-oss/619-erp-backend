@@ -12,64 +12,37 @@
 //
 // Reads the same environment variables the server does. Nothing is written to
 // the database and no invitation row is created.
+//
+// ── It uses src/lib/email.js, and must keep doing so ───────────────────────
+//
+// This script used to build its OWN nodemailer transport and carry its OWN
+// copy of diagnose(). Both drifted, and a verification tool that does not
+// exercise the production path verifies nothing:
+//
+//   · The transport had no IPv4 pinning and no servername, so it kept the bug
+//     the library had just been fixed for — nodemailer resolves both address
+//     families and picks one with Math.random(), so this script would have
+//     failed at random against a host publishing an AAAA, while the server
+//     itself was fine. An operator checking the fix would have concluded it
+//     had not worked.
+//
+//   · Its diagnose() had no IPv6 case at all. For the exact failure that
+//     started this whole investigation it would have answered "some hosts
+//     block outbound SMTP" — the wrong diagnosis that sent the last
+//     investigation after the port for days. A wrong diagnosis is worse than
+//     none, because it is followed.
+//
+// So the transport and the diagnosis both come from the library now. If this
+// script ever needs behaviour the library does not have, add it to the
+// library.
 
 require('dotenv').config();
 
 const REQUIRED = ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS'];
 
-/** Explains what a given failure actually means, rather than echoing the code. */
-function diagnose(err) {
-  const code = err.code || '';
-  const response = err.response || '';
-
-  if (code === 'EAUTH' || /535|534|password|authenticat/i.test(response)) {
-    return [
-      'The host accepted the connection but rejected the credentials.',
-      '',
-      '  • SMTP_USER must be the FULL address (support@myptstudio.com), not "support".',
-      '  • SMTP_PASS is the MAILBOX password set in hPanel → Emails → the mailbox →',
-      '    Change password. It is not your hPanel account password.',
-      '  • The mailbox has to exist. Authenticating against an address that was',
-      '    never provisioned fails exactly like a wrong password.',
-    ].join('\n');
-  }
-  if (code === 'EDNS' || /ENOTFOUND|EAI_AGAIN/.test(err.message || '')) {
-    return [
-      `The hostname "${process.env.SMTP_HOST}" does not resolve — so this is a typo`,
-      'or a wrong host, not a credentials problem.',
-      '',
-      '  • Hostinger\'s is normally smtp.hostinger.com, but the mailbox\'s',
-      '    "Connect apps manually" panel is authoritative — it sometimes lists a',
-      '    numbered host instead.',
-      '  • Check for a stray space or a pasted "https://" prefix; this field is a',
-      '    bare hostname, not a URL.',
-    ].join('\n');
-  }
-  if (code === 'ETIMEDOUT' || code === 'ESOCKET' || code === 'ECONNREFUSED') {
-    const port = process.env.SMTP_PORT || '(unset, defaulting to 587)';
-    return [
-      `Could not establish a session on port ${port}.`,
-      '',
-      '  • 465 is implicit TLS, 587 is STARTTLS. The code sets secure=true only',
-      '    for 465, so those are the only two correct pairings — 465 with',
-      '    STARTTLS settings hangs rather than returning an error.',
-      '  • Check SMTP_HOST against the mailbox\'s "Connect apps manually" panel;',
-      '    Hostinger sometimes lists a numbered host rather than smtp.hostinger.com.',
-      '  • Some networks block outbound 465/587 entirely. If this works from your',
-      '    laptop but not from the deploy, that is the likely cause.',
-    ].join('\n');
-  }
-  if (code === 'EENVELOPE' || /550|553|relay/i.test(response)) {
-    return [
-      'The server refused the envelope — usually the From address.',
-      '',
-      '  • EMAIL_FROM / SMTP_FROM must be an address on a domain this mailbox is',
-      '    allowed to send as. Hostinger will not relay for a domain it does not',
-      '    host, even with valid credentials.',
-    ].join('\n');
-  }
-  return 'No specific diagnosis for this one — the raw error is above.';
-}
+// The same module the server sends through, so what is proved here is what
+// production does — including the IPv4 pin and the SNI servername.
+const email = require('../src/lib/email');
 
 async function main() {
   const missing = REQUIRED.filter((k) => !process.env[k]);
@@ -94,25 +67,21 @@ async function main() {
     console.warn('  ! SMTP_PASS contains whitespace — often a stray newline from a paste.\n');
   }
 
-  const nodemailer = require('nodemailer');
-  const transport = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port,
-    secure: port === 465,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-  });
-
-  try {
-    process.stdout.write('Verifying connection and credentials… ');
-    await transport.verify();
-    console.log('OK\n');
-  } catch (err) {
-    console.log('FAILED\n');
-    console.error(`${err.code || 'ERROR'}: ${err.message}`);
-    if (err.response) console.error(`Server said: ${err.response}`);
-    console.error(`\n${diagnose(err)}`);
+  // verifyConnection() opens a session and authenticates without sending, and
+  // never throws — it reports the failure as data with a diagnosis attached.
+  // A full line rather than a trailing write(): the library logs the DNS
+  // resolution while this runs, and a half-written line gets a JSON log record
+  // appended to it.
+  console.log('Verifying connection and credentials…');
+  const result = await email.verifyConnection();
+  if (!result.ok) {
+    console.log('\nFAILED\n');
+    console.error(`${result.reason || 'ERROR'}: ${result.message || ''}`);
+    if (result.response) console.error(`Server said: ${result.response}`);
+    if (result.diagnosis) console.error(`\n${result.diagnosis}`);
     process.exit(1);
   }
+  console.log('\nOK\n');
 
   const to = process.argv[2];
   if (!to) {
@@ -135,7 +104,9 @@ async function main() {
 
   try {
     process.stdout.write(`Sending a test invitation to ${to}… `);
-    const info = await transport.sendMail({
+    // sendWithRetry, not sendRaw: sendRaw swallows the error and returns
+    // {sent:false}, discarding the SMTP dialogue that IS the diagnosis here.
+    const info = await email.sendWithRetry({
       from: process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER,
       to,
       subject: '[TEST] You\'re invited to MY PT STUDIO — activate Test Studio',
@@ -156,7 +127,7 @@ async function main() {
     console.log('FAILED\n');
     console.error(`${err.code || 'ERROR'}: ${err.message}`);
     if (err.response) console.error(`Server said: ${err.response}`);
-    console.error(`\n${diagnose(err)}`);
+    console.error(`\n${email.diagnose(err)}`);
     process.exit(1);
   }
 }
