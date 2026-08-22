@@ -1,8 +1,9 @@
-# Siri integration — Phase 1
+# Siri integration — Phases 1–2
 
-Enables one voice command:
+Enables:
 
-> "Hey Siri, how many clients do I have in MY PT STUDIO?"
+> **Phase 1** — "Hey Siri, how many clients do I have in MY PT STUDIO?"
+> **Phase 2** — "Hey Siri, find Rahul in MY PT STUDIO."
 
 ## Architecture
 
@@ -17,6 +18,19 @@ Siri
       → Postgres               — COUNT(*) over pt_clients, fixed SQL
       → activity_log           — audit row, fire-and-forget
   → { count, scope, spoken }
+  → Siri speaks `spoken`
+
+Siri
+  → FindClientIntent (App Intent, on device)          [Phase 2]
+      → name spoken as a parameter; token from Keychain
+  → GET /api/voice/clients/search?q=…          (https, bearer token)
+      → auth → requireStaff
+      → zod validation        — q trimmed, 2-60 chars, else 400
+      → orgWhere(req, …)      — organization_id from the SESSION
+      → trainer narrowing     — a trainer sees only their own roster
+      → Postgres              — fixed SQL, q bound as $1, LIMIT 5
+      → activity_log          — audit row
+  → { query, count, results[], spoken }
   → Siri speaks `spoken`
 ```
 
@@ -72,6 +86,65 @@ an IP-keyed limit would let one device throttle unrelated studios.
 with the org id, the count and `channel: "voice"`. A voice request leaves no UI
 trace, so the audit row is the only record it happened.
 
+### `GET /api/voice/clients/search?q=Rahul` *(Phase 2)*
+
+**Auth / authorization:** as above, plus **a trainer sees only their own
+roster** — narrower than the org filter and applied *in addition* to it, the
+same rule as `routes/search.js` and `routes/clients.js`. A trainer account with
+no trainer record returns zero results rather than falling through to the whole
+studio.
+
+**Validation:** `q` is trimmed and must be 2–60 characters. One character
+matches most of a roster and turns search into enumeration; 60 is past any real
+name. It reaches SQL as a bound parameter (`$1`), never interpolated.
+
+**Response `200`**
+
+```json
+{
+  "query": "Rahul",
+  "count": 1,
+  "results": [{
+    "id": "ptc-1",
+    "client_id": "PT001",
+    "name": "Rahul Sharma",
+    "status": "active",
+    "package_type": "PT 3 Month",
+    "expires_on": "2026-01-01",
+    "expired": false
+  }],
+  "spoken": "Rahul Sharma is active until 2026-01-01."
+}
+```
+
+Capped at **5 results**.
+
+**What it deliberately does not return:** no mobile, no email, no address, no
+amounts — those columns are not even selected. Whatever comes back may be
+spoken aloud with other people in the room, and a phone number read out near a
+stranger cannot be un-said.
+
+**The spoken cases**
+
+| Case | Spoken |
+| --- | --- |
+| No match | "I could not find anyone matching Rahul." |
+| One match, active | "Rahul Sharma is active until 2026-01-01." |
+| One match, expired | "Rahul Sharma has an expired package, which ended on …" |
+| One match, inactive | "Rahul Sharma is frozen." |
+| Several matches | "I found 2 people matching Rahul: Rahul Sharma, Rahul Verma." |
+
+Several matches are **counted and named, never guessed between** — picking a
+"best" match would have Siri state one person's expiry with total confidence
+when it may be the other's, and the user cannot see that it chose.
+
+`expired` is `null`, not `false`, when a client has no `pt_end_date` on file:
+no date means unknown, and announcing "expired" would be a claim about the
+client rather than about the record.
+
+**Audit:** writes `voice.clients.search` with the query and the result count —
+what was asked, not the roster that came back.
+
 ## Backend — build and test
 
 ```bash
@@ -101,7 +174,9 @@ you use a separate one):
 
 - `Keychain.swift`
 - `VoiceAPIClient.swift`
-- `GetClientCountIntent.swift`
+- `GetClientCountIntent.swift` — also holds `MyPtStudioShortcuts`, which
+  registers the spoken phrases for **both** intents
+- `FindClientIntent.swift` *(Phase 2)*
 
 ### 2. Info.plist keys
 
@@ -154,10 +229,15 @@ The Keychain item is stored `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`:
 Build to a device (Siri does not work in the Simulator), sign in once, then:
 
 > "Hey Siri, how many clients do I have in MY PT STUDIO?"
+> "Hey Siri, find Rahul in MY PT STUDIO."
 
-The phrase is registered by `MyPtStudioShortcuts`, so no Shortcut has to be
+Both phrases are registered by `MyPtStudioShortcuts`, so no Shortcut has to be
 created first. Alternative phrasings are also registered — "client count in
-MY PT STUDIO", etc.
+MY PT STUDIO", "search for Rahul in MY PT STUDIO", "show Rahul PT details in
+MY PT STUDIO".
+
+`FindClientIntent` takes the name as a spoken parameter. A phrase with no name
+("find someone in MY PT STUDIO") prompts for one rather than failing.
 
 ## Security notes
 
@@ -178,21 +258,29 @@ MY PT STUDIO", etc.
 - **Siri never touches SQL.** It cannot express a query; it can only call a
   named endpoint whose SQL is fixed in this repository.
 
-## Phase 2 — exact next step
+## Phase 3 — exact next step
 
-Add a second read-only metric behind the same router, to prove the surface
-generalises before it grows:
+Phases 1–2 are both **read-only** and both answer with a sentence. Phase 3 is
+where that stops being enough, so the next step is deliberately still read-only
+— one more retrieval, with a richer result — before anything writes:
 
-1. `GET /api/voice/dashboard/sessions-today` in `src/routes/voice.js`, counting
-   today's sessions for the caller's organization with the same `orgWhere`
-   filter and the same `{ count, scope, spoken }` shape.
-2. Extend `voice.authz.test.js` with the same A/B/C boundaries for the new
-   route (staff-only, org-filtered, fails closed).
-3. Add `GetSessionsTodayIntent` alongside `GetClientCountIntent`, reusing
-   `VoiceAPIClient` — add one method, not a second client.
-4. Register its phrases in `MyPtStudioShortcuts`.
+1. `GET /api/voice/clients/:id/summary` in `src/routes/voice.js`, taking the
+   `id` Phase 2 already returns. Same `orgWhere` filter, same trainer
+   narrowing, and an ownership check on the id itself: a client id from
+   another studio must 404, never 403, so the API does not confirm that the id
+   exists somewhere.
+2. Return the next session, sessions remaining and the balance — the three
+   things a trainer asks after finding someone. Still no contact details.
+3. Extend the Swift client with `clientSummary(id:)` — one more method on
+   `VoiceAPIClient`, not a second client.
+4. Add `GetClientSummaryIntent` that accepts the `VoiceClient` from
+   `FindClientIntent` as its parameter, so "find Rahul" → "how many sessions
+   does he have left" chains without a second search.
+5. Extend `voice.clientSearch.authz.test.js`'s pattern into a new
+   `voice.clientSummary.authz.test.js`, with the cross-organization test
+   asserting the 404-not-403 behaviour.
 
-Deliberately **not** in Phase 2: anything that writes, anything taking a
-free-text parameter, and anything returning a client's name. Those need a
-separate decision about what is safe to say out loud near other people, and
-Phase 1's boundaries do not cover them.
+Deliberately **not** in Phase 3: anything that writes (booking, cancelling,
+marking attendance), and anything returning contact details. A write reachable
+from a locked phone needs a separate decision about confirmation and replay,
+and it should not ride in on a retrieval phase.

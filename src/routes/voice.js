@@ -28,8 +28,10 @@ const router = require('express').Router();
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 const { requireStaff } = require('../middleware/rbac');
+const { validate } = require('../middleware/validate');
 const { orgWhere } = require('../lib/tenant-db');
 const { logActivity } = require('../lib/activityLog');
+const { z } = require('../lib/validation');
 const logger = require('../lib/logger');
 
 // Staff only, on the whole router.
@@ -96,5 +98,161 @@ router.get('/dashboard/client-count', async (req, res, next) => {
     next(err);
   }
 });
+
+/** Max rows a spoken answer can usefully carry. See the handler's note. */
+const SEARCH_LIMIT = 5;
+
+const searchSchema = {
+  query: z.object({
+    // Bounded on both ends. A single character matches most of a roster and
+    // makes the endpoint an enumeration tool; 60 is far past any real name and
+    // stops a pathological ILIKE pattern being sent at all.
+    q: z.string()
+      .transform((v) => v.trim())
+      .refine((v) => v.length >= 2, 'Search term must be at least 2 characters')
+      .refine((v) => v.length <= 60, 'Search term is too long'),
+  }),
+};
+
+/**
+ * GET /api/voice/clients/search?q=Rahul
+ *
+ * → { query, count, results: [{ id, client_id, name, status, package_type,
+ *     expires_on, expired }], spoken }
+ *
+ * ── What it deliberately does not return ──────────────────────────────────
+ *
+ * No mobile, no email, no address, no amounts. Phase 1's rule still holds:
+ * whatever comes back may be spoken aloud with other people in the room, and
+ * a phone number read out near a stranger cannot be un-said. A name, the
+ * package and when it expires is what "find Rahul" actually needs; a contact
+ * card is a different request, made while looking at a screen.
+ *
+ * ── Why it returns several matches rather than guessing ───────────────────
+ *
+ * Two clients called Rahul is the ordinary case, not the edge one. Picking
+ * the "best" match server-side would have Siri state one person's expiry date
+ * with total confidence when it may be the other's, and the user has no way
+ * to see that it chose. So the count is returned, the intent says how many
+ * there are, and it reads out the one match only when there is exactly one.
+ */
+router.get('/clients/search', validate(searchSchema), async (req, res, next) => {
+  try {
+    // A trainer sees only their own roster — narrower than the org filter and
+    // applied in addition to it, never instead of it. Admins and managers get
+    // the whole studio, which is the existing rule everywhere else (see
+    // routes/search.js and routes/clients.js).
+    const trainerId = req.user.role === 'trainer' ? (req.user.trainer_id || null) : null;
+    if (req.user.role === 'trainer' && !trainerId) {
+      // A trainer account with no trainer record must not fall through to the
+      // whole studio. Fail closed, and say the honest thing rather than
+      // reporting an error the user cannot act on.
+      return res.json({
+        query: req.query.q,
+        count: 0,
+        results: [],
+        spoken: `I could not find anyone matching ${req.query.q}.`,
+      });
+    }
+
+    const params = [`%${req.query.q}%`];
+    const orgClause = orgWhere(req, params, 'organization_id');
+
+    let trainerClause = '';
+    if (trainerId) {
+      params.push(trainerId);
+      trainerClause = ` AND trainer_id = $${params.length}`;
+    }
+
+    params.push(SEARCH_LIMIT);
+
+    // Fixed SQL. The only variables are the bounded search term, the org id
+    // resolved from the session, and the trainer id resolved from the role —
+    // none of which the caller can widen. Matching name and client_id only:
+    // mobile and email are searchable in the web UI, but a voice surface that
+    // matches on a phone number is one that can be used to check whether a
+    // given number is on the roster.
+    const { rows } = await pool.query(
+      `SELECT id, client_id, name, status, package_type, pt_end_date
+         FROM pt_clients
+        WHERE deleted_at IS NULL
+          AND (name ILIKE $1 OR client_id ILIKE $1)
+          ${orgClause}
+          ${trainerClause}
+        ORDER BY (status = 'active') DESC, name
+        LIMIT $${params.length}`,
+      params
+    );
+
+    const today = new Date().toISOString().slice(0, 10);
+    const results = rows.map((r) => ({
+      id: r.id,
+      client_id: r.client_id,
+      name: r.name,
+      status: r.status,
+      package_type: r.package_type,
+      expires_on: r.pt_end_date,
+      // Only a real date can be expired. A client with no pt_end_date on file
+      // is unknown, not lapsed, and must not be announced as lapsed.
+      expired: r.pt_end_date ? r.pt_end_date < today : null,
+    }));
+
+    // Names are being read aloud, so the audit row records that a search
+    // happened and what was typed — not the roster it returned.
+    logActivity(req, 'voice.clients.search', 'organization',
+      req.user?.organization_id || null,
+      { query: req.query.q, count: results.length, channel: 'voice' });
+
+    res.json({
+      query: req.query.q,
+      count: results.length,
+      results,
+      spoken: spokenFor(req.query.q, results),
+    });
+  } catch (err) {
+    logger.error({ err: err.message }, 'voice client search failed');
+    next(err);
+  }
+});
+
+/**
+ * The sentence Siri reads.
+ *
+ * Built server-side for the same reason as Phase 1's: the phrasing is product
+ * copy and should be correctable without an App Store release. Three cases,
+ * because they need three different sentences — "none" is not an error,
+ * "several" must not pretend to have picked one, and an expired client is the
+ * one fact a trainer most needs volunteered rather than asked for.
+ */
+function spokenFor(query, results) {
+  if (results.length === 0) return `I could not find anyone matching ${query}.`;
+
+  if (results.length === 1) {
+    const c = results[0];
+    const parts = [c.name];
+
+    if (c.status && c.status !== 'active') {
+      parts.push(`is ${c.status}`);
+    } else if (c.expired === true) {
+      // Said first and plainly: a lapsed package is the reason a trainer is
+      // usually looking someone up in the first place.
+      parts.push(`has an expired package${c.expires_on ? `, which ended on ${c.expires_on}` : ''}`);
+    } else if (c.expires_on) {
+      parts.push(`is active until ${c.expires_on}`);
+    } else {
+      parts.push('is active');
+    }
+
+    return `${parts.join(' ')}.`;
+  }
+
+  // Several. State the count and the names, and stop — choosing one for the
+  // user is the thing this must not do.
+  const names = results.map((r) => r.name);
+  const list = names.length <= 3
+    ? names.join(', ')
+    : `${names.slice(0, 3).join(', ')} and others`;
+  return `I found ${results.length} people matching ${query}: ${list}.`;
+}
 
 module.exports = router;

@@ -79,5 +79,25 @@ struct MyPtStudioShortcuts: AppShortcutsProvider {
             shortTitle: "Client Count",
             systemImageName: "person.3.fill"
         )
+
+        // Phase 2. `\(\.$name)` is the spoken parameter, so "find Rahul in
+        // MY PT STUDIO" fills it from the phrase itself; a phrase without a
+        // name prompts for one via requestValueDialog rather than failing.
+        //
+        // Several phrasings because people do not say the one sentence a
+        // developer thought of. Apple requires the app name in each phrase,
+        // which is also what keeps "find Rahul" from colliding with Contacts.
+        AppShortcut(
+            intent: FindClientIntent(),
+            phrases: [
+                "Find \(\.$name) in \(.applicationName)",
+                "Search for \(\.$name) in \(.applicationName)",
+                "Look up \(\.$name) in \(.applicationName)",
+                "Show \(\.$name) PT details in \(.applicationName)",
+                "\(.applicationName) find \(\.$name)",
+            ],
+            shortTitle: "Find Client",
+            systemImageName: "magnifyingglass"
+        )
     }
 }

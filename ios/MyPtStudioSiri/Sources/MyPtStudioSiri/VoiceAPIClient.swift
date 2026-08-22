@@ -11,6 +11,38 @@ struct ClientCountResponse: Decodable {
     let spoken: String
 }
 
+/// One client, as the voice surface is willing to describe them.
+///
+/// Four facts and no contact details — the server does not select mobile,
+/// email or address at all, so there is nothing here to leak by accident.
+struct VoiceClient: Decodable, Identifiable {
+    let id: String
+    let clientId: String?
+    let name: String
+    let status: String?
+    let packageType: String?
+    let expiresOn: String?
+    /// `nil` when the client has no end date on file: unknown, not lapsed.
+    let expired: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case clientId = "client_id"
+        case name
+        case status
+        case packageType = "package_type"
+        case expiresOn = "expires_on"
+        case expired
+    }
+}
+
+struct ClientSearchResponse: Decodable {
+    let query: String
+    let count: Int
+    let results: [VoiceClient]
+    let spoken: String
+}
+
 /// Every way this can fail, phrased as something Siri can say.
 ///
 /// The distinction that matters is `unauthorized` vs `network`: one is fixed
@@ -21,6 +53,7 @@ enum VoiceAPIError: LocalizedError {
     case notConfigured
     case notSignedIn
     case unauthorized
+    case invalidQuery
     case rateLimited
     case server(status: Int)
     case network(underlying: Error)
@@ -32,6 +65,10 @@ enum VoiceAPIError: LocalizedError {
             return "MY PT STUDIO is not set up on this device yet."
         case .notSignedIn, .unauthorized:
             return "Please sign in to MY PT STUDIO first."
+        case .invalidQuery:
+            // The server bounds `q` at 2–60 characters. Say what to do about
+            // it rather than reporting a validation failure.
+            return "Please say at least two letters of the name."
         case .rateLimited:
             return "Too many requests just now. Please try again in a moment."
         case .server:
@@ -94,11 +131,48 @@ struct VoiceAPIClient {
 
     /// GET /api/voice/dashboard/client-count
     func clientCount() async throws -> ClientCountResponse {
+        try await get("api/voice/dashboard/client-count")
+    }
+
+    /// GET /api/voice/clients/search?q=…
+    ///
+    /// The term is percent-encoded into the query string; it is the only thing
+    /// this client ever sends besides the token. No organization id, no
+    /// trainer id, no field list — every decision about what may be returned
+    /// belongs to the server.
+    func searchClients(matching term: String) async throws -> ClientSearchResponse {
+        let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Checked here as well as on the server so an obviously-empty phrase
+        // is answered instantly instead of costing a round trip and a 400.
+        guard trimmed.count >= 2 else { throw VoiceAPIError.invalidQuery }
+
+        var components = URLComponents(
+            url: baseURL.appendingPathComponent("api/voice/clients/search"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "q", value: trimmed)]
+        guard let url = components?.url else { throw VoiceAPIError.invalidQuery }
+
+        return try await get(url)
+    }
+
+    // MARK: - Transport
+
+    /// One request path for every voice endpoint.
+    ///
+    /// Both callers above go through this, so authentication, timeouts and the
+    /// status-code mapping exist once. A third endpoint adds a method here,
+    /// not a second client.
+    private func get<T: Decodable>(_ path: String) async throws -> T {
+        try await get(baseURL.appendingPathComponent(path))
+    }
+
+    private func get<T: Decodable>(_ url: URL) async throws -> T {
         guard let token = Keychain.get(account: Self.tokenAccount, accessGroup: accessGroup) else {
             throw VoiceAPIError.notSignedIn
         }
 
-        var request = URLRequest(url: baseURL.appendingPathComponent("api/voice/dashboard/client-count"))
+        var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -121,6 +195,10 @@ struct VoiceAPIClient {
         switch http.statusCode {
         case 200:
             break
+        case 400:
+            // The server rejected the term's length. Distinct from a server
+            // fault: the user can fix it by saying more of the name.
+            throw VoiceAPIError.invalidQuery
         case 401:
             // The token expired or was revoked. Nothing is retried and nothing
             // is refreshed here: re-authentication belongs to the host app,
@@ -137,7 +215,7 @@ struct VoiceAPIClient {
         }
 
         do {
-            return try JSONDecoder().decode(ClientCountResponse.self, from: data)
+            return try JSONDecoder().decode(T.self, from: data)
         } catch {
             throw VoiceAPIError.malformedResponse
         }
