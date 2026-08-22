@@ -49,6 +49,7 @@ const { randomUUID } = require('crypto');
 const {
   loadClientContext, loadHistory, buildDraft, clampDays, DEFAULT_DAYS,
 } = require('../lib/workoutDraft');
+const { recomputeAssignmentProgress } = require('../lib/assignmentProgress');
 const logger = require('../lib/logger');
 
 // Staff only, on the whole router.
@@ -1163,6 +1164,17 @@ router.post('/workouts/confirm', adminManagerOrTrainer, validate(confirmSchema),
       const parsed = typeof row.draft === 'string' ? JSON.parse(row.draft) : row.draft;
       const { plan, exercises } = parsed;
 
+      // The client's name is read LIVE rather than taken from the draft: the
+      // sentence names a person out loud, and a name corrected between
+      // preparing and saving should be the corrected one. Falls back to the
+      // plan name's own prefix if the row has gone — the save still happened
+      // and still has to be reported.
+      const { rows: whoRows } = await db.query(
+        'SELECT name FROM pt_clients WHERE id = $1',
+        [row.client_id]
+      );
+      const clientName = whoRows[0]?.name || null;
+
       // Re-run the safety gate against LIVE data, not the reading taken at
       // preparation. A PAR-Q filed in the last half hour must stop this save;
       // a draft is a proposal, never a clearance that has already been given.
@@ -1266,9 +1278,14 @@ router.post('/workouts/confirm', adminManagerOrTrainer, validate(confirmSchema),
       res.status(201).json({
         saved: true,
         workout_plan_id: planId,
+        // The NAME as well as the id. An id identifies the plan to software;
+        // the name is what a Shortcut can show and a person can recognise,
+        // and returning only the id makes every caller fetch it back.
+        workout_plan_name: plan.name,
         assignment_id: assignmentId,
+        client_name: clientName,
         exercise_count: valid.length,
-        spoken: `Saved. ${plan.name} is now assigned.`,
+        spoken: spokenForConfirm(clientName, plan),
       });
     } catch (err) {
       await db.query('ROLLBACK').catch(() => {});
@@ -1278,6 +1295,23 @@ router.post('/workouts/confirm', adminManagerOrTrainer, validate(confirmSchema),
       db.release();
     }
   });
+
+/**
+ * "Done. Rahul's workout has been saved."
+ *
+ * Short on purpose. The long sentence was the QUESTION — what was prepared,
+ * what was withheld, whether the paperwork is short. By the time this is
+ * spoken the user has already heard all of it and said yes; repeating any of
+ * it buries the one thing they now need, which is that it worked.
+ */
+function spokenForConfirm(clientName, plan) {
+  const first = String(clientName || '').trim().split(/\s+/)[0];
+  return first
+    ? `Done. ${first}'s workout has been saved.`
+    // No name on file any more — say what happened rather than an empty
+    // possessive ("'s workout has been saved").
+    : `Done. ${plan.name} has been saved.`;
+}
 
 /**
  * "I prepared a 4-day workout for Rahul based on his current programme.
@@ -1317,5 +1351,179 @@ function spokenForPrepare(client, built, days, warnings) {
   sentences.push('Shall I save it?');
   return sentences.join(' ');
 }
+
+
+/* ========================================================================== *
+ * Phase 6 — "Hey Siri, mark Rahul's workout as completed."
+ *
+ * The second write, and a much smaller one than Phase 5's: it changes a
+ * status that already exists rather than creating anything. That is why it
+ * does not need the prepare/confirm dance — there is nothing to preview,
+ * because the whole effect fits in the sentence Siri says back.
+ *
+ * What it needs instead is IDEMPOTENCE. Siri repeats itself when it mishears,
+ * a phrase can fire twice from a stuck button, and a request that double-
+ * applies is one that cannot be trusted. So completing an already-completed
+ * session is a 200 that says "that was already marked done" — not an error,
+ * and not a second write.
+ * ========================================================================== */
+
+const completeSchema = {
+  body: z.object({
+    client_id: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/),
+    // Optional, and bounded to a real calendar date. Present so "mark
+    // yesterday's workout done" can be added later without changing the
+    // contract; absent means today, in the STUDIO's zone.
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  }).strict(),
+};
+
+/**
+ * POST /api/voice/workouts/complete
+ *
+ * → { completed, already_completed, session_id, client_name, date, spoken }
+ *
+ * Verifies, in this order: the caller may write, the client is theirs, a
+ * session exists on that date, and it is not already done. Only then does it
+ * write — and the write itself is conditional, so two requests racing produce
+ * one completion.
+ */
+router.post('/workouts/complete', adminManagerOrTrainer, validate(completeSchema),
+  async (req, res, next) => {
+    try {
+      const { client_id: clientId } = req.body;
+      const date = req.body.date || studioToday();
+
+      // 1. Ownership first, as everywhere else on this surface. 404, never
+      //    403 — a foreign client id must not be confirmed to exist.
+      if (!await clientInOrg(req, clientId)) return notFoundClient(res);
+
+      // 2. A trainer may only complete their own client's session.
+      if (req.user.role === 'trainer') {
+        const { rows: mine } = await pool.query(
+          'SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2',
+          [clientId, req.user.trainer_id || '']
+        );
+        if (!mine[0]) return notFoundClient(res);
+      }
+
+      const { rows: whoRows } = await pool.query(
+        'SELECT name FROM pt_clients WHERE id = $1', [clientId]
+      );
+      const clientName = whoRows[0]?.name || null;
+      // `null` rather than a placeholder pronoun: every sentence below reads
+      // "<name>'s workout", and a fallback of "They" produces "They's".
+      const first = String(clientName || '').trim().split(/\s+/)[0] || null;
+      const whose = first ? `${first}'s workout` : 'The workout';
+
+      // 3. The session must exist. This endpoint marks a workout done; it does
+      //    not invent one. A client with no session logged for the date has
+      //    not trained — saying "done" would write a completion for a workout
+      //    that never happened, which is exactly the record a trainer later
+      //    relies on.
+      const findParams = [clientId, date];
+      const findOrg = orgWhere(req, findParams, 'organization_id');
+      const { rows: sessions } = await pool.query(
+        `SELECT id, status, workout_assignment_id, program_name
+           FROM workout_sessions
+          WHERE client_id = $1
+            AND session_date = $2
+            ${findOrg}
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        findParams
+      );
+
+      const session = sessions[0];
+      if (!session) {
+        logActivity(req, 'voice.workouts.complete.missing', 'pt_client', clientId,
+          { channel: 'voice', date });
+        return res.status(404).json({
+          error: { code: 'NO_SESSION', message: 'No workout logged for that date' },
+          completed: false,
+          spoken: first
+            ? `I could not find a workout for ${first} on that day, so there `
+              + 'was nothing to mark completed.'
+            : 'I could not find a workout on that day, so there was nothing '
+              + 'to mark completed.',
+        });
+      }
+
+      // 4. Already done. Reported as success, because it IS the state the
+      //    caller asked for — and reported as a DIFFERENT sentence, because
+      //    "done" when nothing changed teaches a trainer that the command
+      //    works when it may not have.
+      if (session.status === 'completed') {
+        logActivity(req, 'voice.workouts.complete.duplicate', 'workout_session', session.id,
+          { channel: 'voice', client_id: clientId, date });
+        return res.json({
+          completed: true,
+          already_completed: true,
+          session_id: session.id,
+          client_name: clientName,
+          date,
+          spoken: `${whose} was already marked completed.`,
+        });
+      }
+
+      // 5. The write, guarded on the status it expects to find. Two requests
+      //    racing produce one completion: the second matches no row, falls
+      //    through to the duplicate branch's meaning, and writes nothing.
+      const updParams = [session.id];
+      const updOrg = orgWhere(req, updParams, 'organization_id');
+      const { rows: updated } = await pool.query(
+        `UPDATE workout_sessions
+            SET status = 'completed', updated_at = NOW()
+          WHERE id = $1
+            AND status <> 'completed'
+            ${updOrg}
+        RETURNING id, workout_assignment_id`,
+        updParams
+      );
+
+      if (!updated[0]) {
+        // Someone else completed it between the read and the write. The state
+        // the caller wanted is the state that exists, so this is not a failure
+        // — but it is not a second completion either.
+        logActivity(req, 'voice.workouts.complete.duplicate', 'workout_session', session.id,
+          { channel: 'voice', client_id: clientId, date, raced: true });
+        return res.json({
+          completed: true,
+          already_completed: true,
+          session_id: session.id,
+          client_name: clientName,
+          date,
+          spoken: `${whose} was already marked completed.`,
+        });
+      }
+
+      // 6. The SAME progress recomputation the app runs when a session's
+      //    status changes on screen (workout-log.routes.js PATCH). Skipping it
+      //    would leave the client's assignment showing yesterday's percentage
+      //    — the completion would be real and invisible.
+      await recomputeAssignmentProgress(updated[0].workout_assignment_id)
+        .catch((err) => logger.warn({ err: err.message }, 'voice complete: progress recompute failed'));
+
+      logActivity(req, 'voice.workouts.complete', 'workout_session', session.id, {
+        channel: 'voice',
+        client_id: clientId,
+        date,
+        program_name: session.program_name || null,
+        workout_assignment_id: updated[0].workout_assignment_id || null,
+      });
+
+      res.json({
+        completed: true,
+        already_completed: false,
+        session_id: session.id,
+        client_name: clientName,
+        date,
+        spoken: `Done. ${whose} is marked completed.`,
+      });
+    } catch (err) {
+      logger.error({ err: err.message }, 'voice workout complete failed');
+      next(err);
+    }
+  });
 
 module.exports = router;

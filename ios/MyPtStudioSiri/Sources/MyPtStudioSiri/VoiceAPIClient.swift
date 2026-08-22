@@ -244,13 +244,45 @@ struct WorkoutDraftResponse: Decodable {
 struct WorkoutSavedResponse: Decodable {
     let saved: Bool
     let workoutPlanId: String
+    /// The plan's NAME as well as its id. An id identifies the plan to
+    /// software; the name is what a Shortcut can show and a person can
+    /// recognise, and returning only the id makes every caller fetch it back.
+    let workoutPlanName: String
+    let clientName: String?
     let exerciseCount: Int
     let spoken: String
 
     enum CodingKeys: String, CodingKey {
         case saved
         case workoutPlanId = "workout_plan_id"
+        case workoutPlanName = "workout_plan_name"
+        case clientName = "client_name"
         case exerciseCount = "exercise_count"
+        case spoken
+    }
+}
+
+/// What `/workouts/complete` returns.
+///
+/// `alreadyCompleted` is the field that matters. The endpoint is idempotent,
+/// so a second request succeeds without writing — and the caller has to be
+/// able to tell "I marked it done" from "it was already done", because saying
+/// "done" when nothing changed teaches a trainer the command works when it
+/// may not have.
+struct WorkoutCompletedResponse: Decodable {
+    let completed: Bool
+    let alreadyCompleted: Bool
+    let sessionId: String
+    let clientName: String?
+    let date: String
+    let spoken: String
+
+    enum CodingKeys: String, CodingKey {
+        case completed
+        case alreadyCompleted = "already_completed"
+        case sessionId = "session_id"
+        case clientName = "client_name"
+        case date
         case spoken
     }
 }
@@ -438,6 +470,21 @@ struct VoiceAPIClient {
     /// contraindications when it prepared the draft.
     func confirmWorkout(draftId: String) async throws -> WorkoutSavedResponse {
         try await post("api/voice/workouts/confirm", body: ["draft_id": draftId])
+    }
+
+    /// POST /api/voice/workouts/complete
+    ///
+    /// Marks an existing session done. It does NOT create one: a client with
+    /// nothing logged has not trained, and the server answers 404 rather than
+    /// writing a completion for a workout that never happened.
+    ///
+    /// No date is sent for the ordinary case. "Today" is resolved server-side
+    /// in the studio's own zone, so a handset with a wrong clock — or one in
+    /// another country — cannot complete the wrong day's session.
+    func completeWorkout(clientId: String, date: String? = nil) async throws -> WorkoutCompletedResponse {
+        var body: [String: Any] = ["client_id": clientId]
+        if let date { body["date"] = date }
+        return try await post("api/voice/workouts/complete", body: body)
     }
 
     // MARK: - Transport

@@ -1,4 +1,4 @@
-# Siri integration — Phases 1–5
+# Siri integration — Phases 1–6
 
 Enables:
 
@@ -7,6 +7,7 @@ Enables:
 > **Phase 3** — "Hey Siri, show me Rahul's details in MY PT STUDIO."
 > **Phase 4** — "Hey Siri, show me today's workouts in MY PT STUDIO."
 > **Phase 5** — "Hey Siri, create a workout for Rahul." *(the first write)*
+> **Phase 6** — "Hey Siri, mark Rahul's workout as completed."
 
 ## Architecture
 
@@ -95,7 +96,26 @@ Siri
       → INSERT workout_plans / workout_exercises / workout_assignments
       → COMMIT
       → activity_log
-  → { saved: true, workout_plan_id, spoken }
+  → { saved: true, workout_plan_id, workout_plan_name, client_name, spoken }
+  → Siri speaks "Done. Rahul's workout has been saved."
+
+Siri
+  → CompleteWorkoutIntent (App Intent, on device)     [Phase 6]
+      → NOT available from the lock screen; no confirmation step
+      → client resolved via ClientEntityQuery (disambiguates first)
+  → POST /api/voice/workouts/complete   body: { client_id }
+      → auth → requireStaff → adminManagerOrTrainer
+      → voiceWriteLimiter     — 12/min
+      → clientInOrg()         — ownership, 404 not 403
+      → trainer narrowing     — a trainer completes only their own client's
+      → SELECT the session for the STUDIO's today, org-filtered
+          → none          → 404, nothing written, no session invented
+          → already done  → 200, nothing written, DIFFERENT sentence
+      → UPDATE … SET status='completed' WHERE id AND status <> 'completed'
+      → recomputeAssignmentProgress()  ← the app's own business logic
+      → activity_log
+  → { completed, already_completed, session_id, client_name, date, spoken }
+  → Siri speaks "Done. Rahul's workout is marked completed."
 ```
 
 The intent sends a **path and a token**. It never sends an organization id, a
@@ -484,7 +504,25 @@ an API does teaches people not to rely on it.
 
 #### Confirm is the only thing that persists
 
-`POST /api/voice/workouts/confirm` → `201 { saved: true, workout_plan_id, … }`
+`POST /api/voice/workouts/confirm` → `201`
+
+```json
+{
+  "saved": true,
+  "workout_plan_id": "…",
+  "workout_plan_name": "Rahul's 4-day plan",
+  "client_name": "Rahul Sharma",
+  "assignment_id": "…",
+  "exercise_count": 20,
+  "spoken": "Done. Rahul's workout has been saved."
+}
+```
+
+The plan's **name** is returned alongside its id — an id identifies the plan to
+software, the name is what a Shortcut can show and a person can recognise. The
+client's name is read **live** inside the transaction rather than taken from the
+draft: the sentence names a person out loud, and a name corrected between
+preparing and saving should be the corrected one.
 
 Inside one transaction:
 
@@ -544,6 +582,76 @@ built from facts read at one moment; a confirmation arriving a week later would
 save a plan built from a week-old reading of all three. Nothing deletes lapsed
 drafts — a workout somebody was offered and did not save is worth keeping.
 
+### `POST /api/voice/workouts/complete` *(Phase 6)*
+
+**Auth / authorization:** staff **plus** `adminManagerOrTrainer`, the same as
+the Phase 5 writes, on the same `voiceWriteLimiter` (12/min). A trainer may
+complete only their own client's session. Ownership is `clientInOrg()`, 404 not
+403.
+
+**Body**
+
+```json
+{ "client_id": "ptc-rahul" }
+```
+
+`.strict()`, so `status`, `session_id` or `organization_id` is a `400`. `date`
+is optional and must be `YYYY-MM-DD`; absent means **today in the studio's
+zone**, never the phone's.
+
+#### Why there is no prepare/confirm step here
+
+Phase 5 asks before saving because it CREATES a programme, and what is being
+agreed to — four days of exercises, minus whatever the safety filter withheld —
+does not fit in one spoken sentence. This flips one status on a session that
+already exists. The whole effect fits in the sentence Siri says back, so a
+confirmation would be a second question about something the first already
+described completely.
+
+#### It does not invent a session
+
+A client with nothing logged for the date has not trained. The endpoint answers
+`404 NO_SESSION` and writes nothing — no `INSERT`, ever. Writing a completion
+for a workout that never happened corrupts exactly the record a trainer later
+relies on, and it would do so invisibly.
+
+#### Idempotence is the point
+
+| State | Response | Written? |
+| --- | --- | --- |
+| in progress | `200` `already_completed: false` — "Done. Rahul's workout is marked completed." | yes |
+| already completed | `200` `already_completed: true` — "Rahul's workout was already marked completed." | **no** |
+| completed by someone else mid-request | `200` `already_completed: true` | **no** |
+| no session that day | `404 NO_SESSION` | no |
+
+Siri repeats itself when it mishears a phrase, so the second request must not
+write again — and must not say "done" either. A command that reports success
+when nothing changed teaches a trainer it works when it may not have.
+
+The `UPDATE` is guarded on `status <> 'completed'`, so two requests racing
+produce one completion: the loser matches no row and falls through to the
+already-done answer.
+
+#### It reuses the app's own completion logic
+
+After the status changes, `recomputeAssignmentProgress()` runs — the same
+function `PATCH /pt-os/workout-log/sessions/:id` calls when a trainer completes
+a session on screen. It was extracted to `src/lib/assignmentProgress.js` so
+both paths share one implementation rather than drifting. Without it the
+completion is real and invisible: the client's assignment keeps yesterday's
+percentage.
+
+A progress failure does not fail the completion — the session is done either
+way, and the percentage is derived.
+
+#### Audit
+
+| Action | When |
+| --- | --- |
+| `voice.workouts.complete` | a session was marked done — records client, date, programme, assignment |
+| `voice.workouts.complete.duplicate` | it was already done (including the lost-race case) |
+| `voice.workouts.complete.missing` | no session existed on that date |
+
 ## Backend — build and test
 
 ```bash
@@ -570,7 +678,7 @@ app target that will host them.
 
 ### 1. Add the sources
 
-Add all six to the app target (and to the App Intents extension target, if
+Add all seven to the app target (and to the App Intents extension target, if
 you use a separate one):
 
 - `Keychain.swift`
@@ -581,7 +689,8 @@ you use a separate one):
 - `GetClientDetailIntent.swift` *(Phase 3)* — also holds `ClientEntity` and
   `ClientEntityQuery`, which are what make Siri ask *which* Rahul
 - `GetTodaysWorkoutsIntent.swift` *(Phase 4)*
-- `PrepareWorkoutIntent.swift` *(Phase 5)* — the only intent that writes
+- `PrepareWorkoutIntent.swift` *(Phase 5)* — writes; asks first
+- `CompleteWorkoutIntent.swift` *(Phase 6)* — writes; idempotent
 
 ### 2. Info.plist keys
 
@@ -638,8 +747,9 @@ Build to a device (Siri does not work in the Simulator), sign in once, then:
 > "Hey Siri, show me Rahul's details in MY PT STUDIO."
 > "Hey Siri, show me today's workouts in MY PT STUDIO."
 > "Hey Siri, create a workout for Rahul in MY PT STUDIO." *(asks before saving)*
+> "Hey Siri, mark Rahul's workout as completed in MY PT STUDIO."
 
-All five phrases are registered by `MyPtStudioShortcuts`, so no Shortcut has
+All six phrases are registered by `MyPtStudioShortcuts`, so no Shortcut has
 to be created first. Alternative phrasings are also registered — "client count
 in MY PT STUDIO", "search for Rahul in MY PT STUDIO", "how is Rahul doing in
 MY PT STUDIO", "what workouts do I have today in MY PT STUDIO", "who has a
@@ -675,7 +785,7 @@ value cached on the device, so a saved Shortcut pointing at a client who has
 since been deleted, transferred, or who was never this account's to read
 resolves to nothing. **A saved Shortcut is not a standing grant.**
 
-## Security notes — what holds across all five phases
+## Security notes — what holds across all six phases
 
 - **Siri never touches SQL.** It cannot express a query. It calls one of three
   named endpoints whose SQL is fixed in this repository; the only caller-supplied
@@ -701,11 +811,18 @@ resolves to nothing. **A saved Shortcut is not a standing grant.**
 - **Unknown is never spoken as zero.** A missing balance is left out of the
   sentence rather than announced as "0 sessions left"; an unreadable workout log
   is spoken as unchecked rather than as "nothing logged".
-- **Only one thing writes, and it asks first.** Phases 1–4 are `GET`s. Phase 5
-  is a `POST` pair where preparing saves nothing and confirming accepts a
-  single draft id — so no one voice command changes anything, and the second
-  step cannot describe what to change. The write intent is the one intent that
-  will not run from a locked device.
+- **Writes are the exception, and they are shaped to their blast radius.**
+  Phases 1–4 are `GET`s. Phase 5 CREATES a programme, so it is a `POST` pair
+  where preparing saves nothing and confirming accepts a single draft id — no
+  one voice command changes anything, and the second step cannot describe what
+  to change. Phase 6 flips one status on a session that already exists, so it
+  is a single idempotent `POST` that refuses to create anything. Neither write
+  intent runs from a locked device; both are on a 12/min limit rather than the
+  read surface's 200.
+- **Nothing writes twice.** Phase 5's draft claim and Phase 6's guarded
+  `UPDATE` are both conditional statements, so a repeated request — which is
+  what Siri produces when it mishears a confirmation — changes nothing the
+  second time and says so.
 - **Safety gates cannot be routed around.** The voice write calls the same
   `checkScreeningGate()` the app's own assign route calls, and calls it twice:
   once before generating and once against live data before saving.
@@ -718,40 +835,40 @@ resolves to nothing. **A saved Shortcut is not a standing grant.**
   trace, so the audit row is the only record it happened.
 
 
-## Phase 6 — exact next step
+## Phase 7 — exact next step
 
-Phase 5 established the shape a voice write has to take: prepare, describe,
-confirm, and accept nothing on the confirm but an id. Phase 6 should **use that
-shape rather than extend the surface**, because the thing most likely to go
-wrong now is not a missing command — it is that a plan saved by voice is
-invisible to everyone who did not hear it.
+Phases 5 and 6 both write, and the same gap now applies to both: **a change
+made by voice is invisible to everyone who did not hear it.** A plan saved by
+Siri appears in the Workout Plans list looking like any other, and a session
+completed by voice looks identical to one a trainer ticked off on screen. The
+audit rows exist; nothing reads them back.
 
-1. **Surface voice-created plans in the app.** A plan whose only record is an
-   `activity_log` row and a `description` reading "Prepared by voice" is one a
-   studio owner cannot review. Add a `created_via` column (or read the draft
-   join) and mark these plans in the Workout Plans list, with the draft's
-   `excluded` list visible on the plan itself. A trainer who was told out loud
-   that three exercises were withheld is the only person who currently knows.
-2. **Then, and only then, a second write:** `POST /api/voice/workouts/:id/discard`
-   — the counterpart to confirm, so "no, throw that away" is an action rather
-   than an expiry. It is the safest possible second write: it destroys a
-   proposal, never a plan, and it makes the decline path explicit in the audit
-   trail instead of inferring it from a draft that quietly lapsed.
+That is Phase 7, and it is deliberately not another command:
+
+1. **Mark voice-originated changes in the app.** A `created_via` column on
+   `workout_plans` (and the draft join that already exists) surfaced in the
+   plans list and on the session, so a studio owner can see which programmes
+   were authored by speaking. The trainer who heard "I left out three
+   exercises" is currently the only person who knows it happened — the draft's
+   `excluded` list should be visible on the plan itself.
+2. **A studio-visible voice activity feed**, reading the `voice.*` actions
+   already in `activity_log`. Six phases have written audit rows that no
+   screen displays. A voice surface whose history can only be read with SQL is
+   one nobody audits.
 3. **A `voice.write` scope on the token**, so a studio can allow voice reads
-   without allowing voice writes. Today the two are separated only by role.
-   Some studios will want a trainer who can ask questions from the gym floor
-   but cannot author a programme by speaking.
-4. **Draft retention and cleanup.** Nothing deletes lapsed drafts today, which
-   is right for audit and wrong for growth. A retention job with an explicit
-   policy — keep confirmed drafts indefinitely, expire pending ones after
-   90 days — is a decision to make deliberately rather than discover.
-5. **Tests for the discard path** plus one this phase could not have: a
-   **concurrency test** proving two simultaneous confirmations of the same
-   draft produce exactly one plan. The claim is written to guarantee it and the
-   guarantee is currently argued rather than demonstrated, because the pool is
-   mocked.
+   without voice writes. Today the two are separated only by role, and some
+   studios will want a trainer who can ask questions from the gym floor but
+   cannot author or complete by speaking.
+4. **The concurrency tests both writes now deserve.** Phase 5's draft claim and
+   Phase 6's guarded `UPDATE` are each written to make a double-apply
+   impossible, and in both cases the guarantee is currently argued from the SQL
+   rather than demonstrated, because the pool is mocked. An integration test
+   against a real database, firing two simultaneous confirmations and two
+   simultaneous completions, is the only thing that actually proves it.
+5. **Draft retention.** Nothing deletes lapsed drafts — right for audit, wrong
+   for growth. Keep confirmed drafts, expire pending ones after 90 days.
 
-Deliberately **not** in Phase 6: booking, cancelling, payments, deleting a
-saved plan, or anything returning contact details. Destroying a *proposal* is
-the right size for a second write; destroying a *plan* is not, and should never
-be reachable by voice at all.
+Deliberately **not** in Phase 7: booking, cancelling, payments, deleting a
+saved plan, or un-completing a session. Reversal is a harder problem than
+completion — it needs to say who reversed what and why — and it should not ride
+in on a phase about visibility.

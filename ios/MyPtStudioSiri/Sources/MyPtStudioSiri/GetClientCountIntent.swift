@@ -154,5 +154,21 @@ struct MyPtStudioShortcuts: AppShortcutsProvider {
             shortTitle: "Create Workout",
             systemImageName: "figure.strengthtraining.traditional"
         )
+
+        // Phase 6. Writes, so it also requires authentication — but unlike
+        // Create Workout it needs no confirmation step: the whole effect is
+        // one status, and it is described completely by the sentence Siri
+        // says back.
+        AppShortcut(
+            intent: CompleteWorkoutIntent(),
+            phrases: [
+                "Mark \(\.$client) workout as completed in \(.applicationName)",
+                "Mark \(\.$client) workout done in \(.applicationName)",
+                "\(\.$client) finished their workout in \(.applicationName)",
+                "\(.applicationName) complete \(\.$client) workout",
+            ],
+            shortTitle: "Complete Workout",
+            systemImageName: "checkmark.circle.fill"
+        )
     }
 }

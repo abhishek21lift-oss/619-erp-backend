@@ -22,6 +22,7 @@ const { calc1RM } = require('../progress/fitness-scoring');
 const { checkScreeningGate } = require('../../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
+const { recomputeAssignmentProgress } = require('../../lib/assignmentProgress');
 const { today: studioToday } = require('../../lib/appTime');
 const { weekOf, resolveWeek } = require('./progression');
 const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./training-analytics');
@@ -37,23 +38,6 @@ const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Satur
 // completed sessions have been logged against it, relative to the plan's
 // target (sessions_per_week * duration_weeks). The only writer of
 // progress_pct outside the trainer's manual PUT /assignments/:id/progress.
-async function recomputeAssignmentProgress(assignmentId) {
-  if (!assignmentId) return;
-  const { rows } = await pool.query(
-    `SELECT wp.sessions_per_week, wp.duration_weeks,
-            (SELECT COUNT(DISTINCT ws.id) FROM workout_sessions ws
-              WHERE ws.workout_assignment_id = wa.id AND ws.status = 'completed') AS completed_count
-       FROM workout_assignments wa
-       JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-      WHERE wa.id = $1`,
-    [assignmentId]
-  );
-  const row = rows[0];
-  if (!row) return;
-  const target = (row.sessions_per_week || 0) * (row.duration_weeks || 0);
-  const pct = target > 0 ? Math.min(100, Math.round((row.completed_count / target) * 100)) : 0;
-  await pool.query('UPDATE workout_assignments SET progress_pct = $1, updated_at = NOW() WHERE id = $2', [pct, assignmentId]);
-}
 
 // ─── Schemas ────────────────────────────────────────────────
 

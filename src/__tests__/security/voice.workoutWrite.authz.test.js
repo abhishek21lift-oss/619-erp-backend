@@ -150,6 +150,7 @@ function world(o = {}) {
   } = o;
 
   return (sql) => {
+    if (/^SELECT name FROM pt_clients/i.test(sql)) return [{ name: 'Rahul Sharma' }];
     if (/SELECT 1 FROM pt_clients WHERE id = \$1 AND trainer_id/i.test(sql)) return trainerOwns ? [{ '?column?': 1 }] : [];
     if (/SELECT 1 FROM pt_clients/i.test(sql)) return owned ? [{ '?column?': 1 }] : [];
     if (/FROM pt_parq_forms/i.test(sql)) return parq;
@@ -208,6 +209,46 @@ describe('A. prepare never persists a workout', () => {
     mockResponder = world({ client: { ...CLIENT_ROW, plan_name: null, plan_id: null, plan_difficulty: null } });
     const res = await prepare();
     expect(res.body.spoken).not.toMatch(/based on/i);
+  });
+});
+
+// ── A2. What a confirmation returns ───────────────────────────────────────
+describe('A2. the confirmation result', () => {
+  test('returns the plan id AND its name, not just the id', async () => {
+    const res = await confirm();
+    expect(res.status).toBe(201);
+    expect(res.body.saved).toBe(true);
+    expect(res.body.workout_plan_id).toEqual(expect.any(String));
+    expect(res.body.workout_plan_name).toBe("Rahul's 4-day plan");
+  });
+
+  test('names the client it was saved for', async () => {
+    const res = await confirm();
+    expect(res.body.client_name).toBe('Rahul Sharma');
+  });
+
+  test('the spoken sentence is short and confirms the outcome', async () => {
+    const res = await confirm();
+    expect(res.body.spoken).toBe("Done. Rahul's workout has been saved.");
+  });
+
+  test('the client name is read LIVE, not taken from the draft', async () => {
+    mockResponder = (sql) => {
+      if (/^SELECT name FROM pt_clients/i.test(sql)) return [{ name: 'Rahul S. Sharma' }];
+      return world()(sql);
+    };
+    const res = await confirm();
+    expect(res.body.client_name).toBe('Rahul S. Sharma');
+  });
+
+  test('a client whose row has gone still reports the save', async () => {
+    mockResponder = (sql) => {
+      if (/^SELECT name FROM pt_clients/i.test(sql)) return [];
+      return world()(sql);
+    };
+    const res = await confirm();
+    expect(res.status).toBe(201);
+    expect(res.body.spoken).toBe("Done. Rahul's 4-day plan has been saved.");
   });
 });
 
