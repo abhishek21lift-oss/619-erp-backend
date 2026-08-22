@@ -50,6 +50,7 @@ const {
   loadClientContext, loadHistory, buildDraft, clampDays, DEFAULT_DAYS,
 } = require('../lib/workoutDraft');
 const { recomputeAssignmentProgress } = require('../lib/assignmentProgress');
+const { recordPayment } = require('../lib/paymentService');
 const logger = require('../lib/logger');
 
 // Staff only, on the whole router.
@@ -1525,5 +1526,505 @@ router.post('/workouts/complete', adminManagerOrTrainer, validate(completeSchema
       next(err);
     }
   });
+
+
+/* ========================================================================== *
+ * Phase 7 — payments.
+ *
+ *   "Hey Siri, does Rahul have any pending payment?"
+ *   "Hey Siri, record 3,000 rupees payment from Rahul."
+ *
+ * The read is the most sensitive read on this surface and the write is the
+ * most sensitive write, and they are shaped by two different worries.
+ *
+ * The READ says a number out loud in a room. So it answers what is owed and
+ * when the last payment was, and nothing else: no ledger, no receipt numbers,
+ * no payment methods, no history. A balance overheard is bad; a payment
+ * history read aloud is a client's finances narrated to whoever is standing
+ * there.
+ *
+ * The WRITE creates money. It uses Phase 5's prepare/confirm shape, with the
+ * amount held SERVER-SIDE between the two calls — if /confirm accepted an
+ * amount, the sentence Siri read out and the figure actually recorded would be
+ * two independent values and the confirmation would guarantee nothing.
+ * ========================================================================== */
+
+const paymentStatusSchema = {
+  params: z.object({
+    clientId: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/),
+  }),
+};
+
+const paymentPrepareSchema = {
+  body: z.object({
+    client_id: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/),
+    // Money. Bounded at both ends: zero and negatives are not payments, and
+    // the ceiling catches a misheard number before it reaches a ledger —
+    // "thirty thousand" and "three thousand" are one vowel apart, and the
+    // person confirming is listening rather than reading.
+    amount: z.coerce.number().positive().max(1_000_000)
+      // Two decimal places, matching NUMERIC(12,2). A third would be silently
+      // rounded by Postgres, so the amount confirmed and the amount stored
+      // would differ — by a rounding error, which is exactly the kind of
+      // discrepancy nobody can later account for.
+      .refine((n) => Number.isInteger(Math.round(n * 100)) && Math.abs(n * 100 - Math.round(n * 100)) < 1e-9,
+        { message: 'At most two decimal places' }),
+    method: z.enum(['CASH', 'UPI', 'CARD', 'BANK', 'CHEQUE']).optional(),
+    notes: z.string().max(500).optional(),
+  }).strict(),
+};
+
+const paymentConfirmSchema = {
+  body: z.object({
+    // The ONLY input. No amount, no client, no method — see the file header.
+    draft_id: z.string().uuid(),
+  }).strict(),
+};
+
+/** Shorter than the workout draft's 30. Money goes stale faster. */
+const PAYMENT_DRAFT_TTL_MINUTES = 10;
+
+/** How far back to look for an identical payment when warning about repeats. */
+const DUPLICATE_WINDOW_MINUTES = 10;
+
+/**
+ * GET /api/voice/payments/client/:clientId/status
+ *
+ * → { client_name, outstanding, currency, last_payment, package, spoken }
+ */
+router.get('/payments/client/:clientId/status', validate(paymentStatusSchema),
+  async (req, res, next) => {
+    try {
+      const { clientId } = req.params;
+
+      if (!await clientInOrg(req, clientId)) return notFoundClient(res);
+
+      const params = [clientId];
+      const orgClause = orgWhere(req, params, 'organization_id');
+
+      let trainerClause = '';
+      if (req.user.role === 'trainer') {
+        if (!req.user.trainer_id) return notFoundClient(res);
+        params.push(req.user.trainer_id);
+        trainerClause = ` AND trainer_id = $${params.length}`;
+      }
+
+      const { rows } = await pool.query(
+        `SELECT id, name, balance_amount, paid_amount, final_amount,
+                package_type, pt_end_date
+           FROM pt_clients
+          WHERE id = $1
+            AND deleted_at IS NULL
+            ${orgClause}
+            ${trainerClause}`,
+        params
+      );
+
+      const client = rows[0];
+      if (!client) return notFoundClient(res);
+
+      // Best-effort, and only the LATEST one. A voice answer that could recite
+      // a payment history is a voice answer that will, in a room, to whoever
+      // is in it.
+      const last = await lastPaymentFor(clientId).catch(() => null);
+
+      const outstanding = toMoney(client.balance_amount);
+
+      logActivity(req, 'voice.payments.status', 'pt_client', clientId,
+        { channel: 'voice' });
+
+      res.json({
+        client_name: client.name,
+        currency: 'INR',
+        outstanding,
+        last_payment: last,
+        package: {
+          type: client.package_type || null,
+          expires_on: client.pt_end_date || null,
+        },
+        spoken: spokenForPaymentStatus(client.name, outstanding, last, client),
+      });
+    } catch (err) {
+      logger.error({ err: err.message }, 'voice payment status failed');
+      next(err);
+    }
+  });
+
+/**
+ * POST /api/voice/payments/prepare
+ *
+ * Records NOTHING. Writes a draft and returns the question to ask.
+ */
+router.post('/payments/prepare', adminManagerOrTrainer, validate(paymentPrepareSchema),
+  async (req, res, next) => {
+    try {
+      const { client_id: clientId } = req.body;
+      const amount = round2(req.body.amount);
+      const method = req.body.method || 'CASH';
+
+      if (!await clientInOrg(req, clientId)) return notFoundClient(res);
+
+      // A trainer may only take payment for their own client — the same rule
+      // routes/payments.js enforces, so recording by voice is no looser than
+      // recording at the desk.
+      if (req.user.role === 'trainer') {
+        const { rows: mine } = await pool.query(
+          'SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2',
+          [clientId, req.user.trainer_id || '']
+        );
+        if (!mine[0]) return notFoundClient(res);
+      }
+
+      const orgId = orgIdOf(req);
+      if (!orgId) {
+        return res.status(403).json({
+          error: { code: 'NO_ORGANIZATION', message: 'No studio on this account' },
+          spoken: 'Your account is not attached to a studio, so I cannot record a payment.',
+        });
+      }
+
+      const { rows: clientRows } = await pool.query(
+        `SELECT id, name, balance_amount FROM pt_clients
+          WHERE id = $1 AND deleted_at IS NULL`,
+        [clientId]
+      );
+      const client = clientRows[0];
+      if (!client) return notFoundClient(res);
+
+      // The duplicate protection that actually catches the real mistake.
+      //
+      // The claim below stops the same DRAFT being confirmed twice. It does
+      // nothing about the human saying "record three thousand from Rahul"
+      // twice, which produces two different drafts and two legitimate
+      // payments. So an identical amount recorded for this client in the last
+      // few minutes is surfaced in the QUESTION — the one moment where the
+      // person can still say no.
+      const recent = await recentIdenticalPayment(clientId, amount).catch(() => null);
+
+      const expiresAt = new Date(Date.now() + PAYMENT_DRAFT_TTL_MINUTES * 60_000);
+      const { rows: draftRows } = await pool.query(
+        `INSERT INTO voice_payment_drafts
+           (organization_id, client_id, created_by, amount, payment_method,
+            notes, balance_at_prepare, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         RETURNING id, expires_at`,
+        [orgId, clientId, req.user.id, amount, method,
+         req.body.notes || null, client.balance_amount, expiresAt]
+      );
+      const draft = draftRows[0];
+
+      logActivity(req, 'voice.payments.prepare', 'voice_payment_draft', draft.id, {
+        channel: 'voice',
+        client_id: clientId,
+        amount,
+        method,
+        recent_duplicate: Boolean(recent),
+      });
+
+      res.status(201).json({
+        draft_id: draft.id,
+        expires_at: draft.expires_at,
+        client_name: client.name,
+        amount,
+        currency: 'INR',
+        method,
+        outstanding_before: toMoney(client.balance_amount),
+        recent_duplicate: recent,
+        recorded: false,
+        spoken: spokenForPaymentPrepare(client.name, amount, recent),
+      });
+    } catch (err) {
+      logger.error({ err: err.message }, 'voice payment prepare failed');
+      next(err);
+    }
+  });
+
+/**
+ * POST /api/voice/payments/confirm
+ *
+ * The only endpoint on this surface that records money.
+ */
+router.post('/payments/confirm', adminManagerOrTrainer, validate(paymentConfirmSchema),
+  async (req, res, next) => {
+    const db = await pool.connect();
+    try {
+      const { draft_id: draftId } = req.body;
+      const orgId = orgIdOf(req);
+
+      await db.query('BEGIN');
+
+      // Claim: single-use, and the authorization at the same time. The draft
+      // must be this studio's and this user's, pending, and unexpired.
+      const { rows: claimed } = await db.query(
+        `UPDATE voice_payment_drafts
+            SET status = 'confirmed', confirmed_at = NOW()
+          WHERE id = $1
+            AND status = 'pending'
+            AND expires_at > NOW()
+            AND organization_id = $2
+            AND created_by = $3
+        RETURNING id, client_id, amount, payment_method, notes`,
+        [draftId, orgId, req.user.id]
+      );
+
+      if (!claimed[0]) {
+        await db.query('ROLLBACK');
+        logActivity(req, 'voice.payments.confirm.rejected', 'voice_payment_draft', draftId,
+          { channel: 'voice' });
+        return res.status(409).json({
+          error: { code: 'DRAFT_NOT_CONFIRMABLE', message: 'No payment to confirm' },
+          recorded: false,
+          spoken: 'I do not have that payment to record any more. Please ask me '
+                + 'to start it again.',
+        });
+      }
+
+      const draft = claimed[0];
+
+      // Lock the client row. This is what serialises concurrent payments so
+      // the balance cannot drift, and it is the same lock the finance UI takes
+      // — see lib/paymentService.js for what it assumes of its caller.
+      const { rows: clientRows } = await db.query(
+        `SELECT * FROM pt_clients
+          WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
+        [draft.client_id]
+      );
+      const client = clientRows[0];
+
+      // Re-checked against LIVE data inside the transaction, not taken from
+      // the draft. A client deleted or moved between preparing and confirming
+      // must not receive a payment on the strength of a ten-minute-old read.
+      if (!client || (orgId && client.organization_id !== orgId)) {
+        await db.query('ROLLBACK');
+        logActivity(req, 'voice.payments.confirm.invalid', 'voice_payment_draft', draftId,
+          { channel: 'voice', client_id: draft.client_id });
+        return res.status(404).json({
+          error: { code: 'NOT_FOUND', message: 'Client not found' },
+          recorded: false,
+          spoken: 'I could not record that payment — the client is no longer available.',
+        });
+      }
+
+      if (req.user.role === 'trainer' && client.trainer_id !== req.user.trainer_id) {
+        await db.query('ROLLBACK');
+        logActivity(req, 'voice.payments.confirm.forbidden', 'voice_payment_draft', draftId,
+          { channel: 'voice', client_id: draft.client_id });
+        return res.status(404).json({
+          error: { code: 'NOT_FOUND', message: 'Client not found' },
+          recorded: false,
+          spoken: 'I could not record that payment.',
+        });
+      }
+
+      const amount = Number(draft.amount);
+
+      // The app's own payment logic — the ledger row, the receipt number, the
+      // incentive and the balance move, together. Voice records money through
+      // the SAME function the finance UI does.
+      const result = await recordPayment(db, {
+        client,
+        amount,
+        method: draft.payment_method,
+        date: studioToday(),
+        notes: draft.notes || 'Recorded by voice',
+      });
+
+      await db.query(
+        'UPDATE voice_payment_drafts SET pt_payment_id = $1 WHERE id = $2',
+        [result.id, draftId]
+      );
+
+      await db.query('COMMIT');
+
+      // After COMMIT, like routes/payments.js: a row logged before the
+      // transaction lands would describe a payment that, on rollback, never
+      // happened.
+      logActivity(req, 'voice.payments.confirm', 'pt_payment', result.id, {
+        channel: 'voice',
+        draft_id: draftId,
+        client_id: client.id,
+        amount,
+        method: draft.payment_method,
+        receipt_no: result.receiptNo,
+      });
+
+      const remaining = Math.max(0, round2(Number(client.balance_amount || 0) - amount));
+
+      res.status(201).json({
+        recorded: true,
+        payment_id: result.id,
+        receipt_no: result.receiptNo,
+        client_name: client.name,
+        amount,
+        currency: 'INR',
+        outstanding_after: remaining,
+        spoken: spokenForPaymentConfirm(client.name, amount, remaining),
+      });
+    } catch (err) {
+      await db.query('ROLLBACK').catch(() => {});
+      logger.error({ err: err.message }, 'voice payment confirm failed');
+      next(err);
+    } finally {
+      db.release();
+    }
+  });
+
+/**
+ * The latest payment, and only the latest.
+ *
+ * Four fields, chosen for what a spoken answer needs: how much, when, whether
+ * it went through. No receipt number, no method, no notes, no id — none of
+ * which help the question being asked and all of which would be read aloud.
+ */
+async function lastPaymentFor(clientId) {
+  const { rows } = await pool.query(
+    `SELECT amount, status, date::TEXT AS date
+       FROM pt_payments
+      WHERE client_id = $1 AND deleted_at IS NULL
+      ORDER BY date DESC, created_at DESC
+      LIMIT 1`,
+    [clientId]
+  );
+  if (!rows[0]) return null;
+  return {
+    amount: toMoney(rows[0].amount),
+    status: rows[0].status,
+    date: rows[0].date,
+  };
+}
+
+/** An identical amount already recorded for this client, very recently. */
+async function recentIdenticalPayment(clientId, amount) {
+  const { rows } = await pool.query(
+    `SELECT id, amount, created_at
+       FROM pt_payments
+      WHERE client_id = $1
+        AND deleted_at IS NULL
+        AND amount = $2
+        AND created_at > NOW() - ($3 || ' minutes')::interval
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [clientId, amount, String(DUPLICATE_WINDOW_MINUTES)]
+  );
+  if (!rows[0]) return null;
+  return {
+    amount: toMoney(rows[0].amount),
+    minutes_ago: Math.max(0, Math.round((Date.now() - new Date(rows[0].created_at)) / 60000)),
+  };
+}
+
+/**
+ * NUMERIC comes back from pg as a string. Never spoken as "3000.00".
+ *
+ * The null check is explicit and comes FIRST because `Number(null)` is `0`,
+ * not NaN — so the obvious `Number.isFinite(Number(v))` reports a missing
+ * balance as a settled account, and the sentence becomes "Rahul has no
+ * pending payment" on the strength of an empty column. Unmeasured is not
+ * zero, least of all about money.
+ */
+function toMoney(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? round2(n) : null;
+}
+
+function round2(n) {
+  return Math.round(Number(n) * 100) / 100;
+}
+
+/**
+ * "3000" → "3,000 rupees".
+ *
+ * Said as a word, not a symbol: "₹" is read differently by different voices
+ * and languages, and a number about money must not be ambiguous when heard.
+ * Grouping is Indian (1,00,000 rather than 100,000) because that is how the
+ * amount will be read back off a receipt in the same room.
+ */
+function speakMoney(n) {
+  const value = round2(n);
+  const whole = Math.floor(Math.abs(value));
+  const paise = Math.round((Math.abs(value) - whole) * 100);
+  const grouped = groupIndian(whole);
+  const noun = whole === 1 && paise === 0 ? 'rupee' : 'rupees';
+  return paise
+    ? `${grouped} rupees ${paise} paise`
+    : `${grouped} ${noun}`;
+}
+
+function groupIndian(n) {
+  const s = String(n);
+  if (s.length <= 3) return s;
+  const last3 = s.slice(-3);
+  const rest = s.slice(0, -3);
+  return `${rest.replace(/\B(?=(\d{2})+(?!\d))/g, ',')},${last3}`;
+}
+
+/**
+ * "Rahul has 3,000 rupees outstanding. His last payment was …"
+ *
+ * The outstanding figure leads, because it is the question. Everything else is
+ * context and is said only when it exists.
+ */
+function spokenForPaymentStatus(name, outstanding, last, client) {
+  const first = String(name || '').trim().split(/\s+/)[0] || 'They';
+  const sentences = [];
+
+  if (!Number.isFinite(outstanding)) {
+    // No figure on file is not the same as nothing owed, and must not be
+    // spoken as "no pending payment" — that is a claim about the client made
+    // from an empty column.
+    sentences.push(`I do not have an outstanding balance on file for ${first}.`);
+  } else if (outstanding > 0) {
+    sentences.push(`${first} has ${speakMoney(outstanding)} outstanding.`);
+  } else {
+    sentences.push(`${first} has no pending payment.`);
+  }
+
+  if (last) {
+    const when = speakDate(last.date);
+    sentences.push(last.status === 'completed'
+      ? `Their last payment was ${speakMoney(last.amount)} on ${when}.`
+      : `Their last payment of ${speakMoney(last.amount)} on ${when} is ${last.status}.`);
+  } else {
+    sentences.push('I have no payments on record for them.');
+  }
+
+  // Only volunteered when something is actually owed — a renewal date matters
+  // to the person chasing a balance, and is noise to everyone else.
+  if (outstanding > 0 && client.pt_end_date) {
+    sentences.push(`Their package runs to ${speakDate(client.pt_end_date)}.`);
+  }
+
+  return sentences.join(' ');
+}
+
+/**
+ * "Record 3,000 rupees payment for Rahul?"
+ *
+ * The question is the whole sentence. A warning about a possible repeat comes
+ * BEFORE it, because it is the reason someone might answer no.
+ */
+function spokenForPaymentPrepare(name, amount, recent) {
+  const first = String(name || '').trim().split(/\s+/)[0] || 'them';
+  const question = `Record ${speakMoney(amount)} payment for ${first}?`;
+
+  if (!recent) return question;
+
+  const ago = recent.minutes_ago <= 1
+    ? 'a moment ago'
+    : `${recent.minutes_ago} minutes ago`;
+  return `I already recorded ${speakMoney(recent.amount)} for ${first} ${ago}. `
+       + `${question}`;
+}
+
+/** "Done. 3,000 rupees recorded for Rahul. 2,000 rupees still outstanding." */
+function spokenForPaymentConfirm(name, amount, remaining) {
+  const first = String(name || '').trim().split(/\s+/)[0];
+  const who = first ? ` for ${first}` : '';
+  const head = `Done. ${speakMoney(amount)} recorded${who}.`;
+  return remaining > 0
+    ? `${head} ${speakMoney(remaining)} still outstanding.`
+    : `${head} Nothing outstanding now.`;
+}
 
 module.exports = router;

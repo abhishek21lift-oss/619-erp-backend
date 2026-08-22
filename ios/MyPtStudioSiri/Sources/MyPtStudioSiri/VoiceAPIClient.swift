@@ -287,6 +287,116 @@ struct WorkoutCompletedResponse: Decodable {
     }
 }
 
+/// The latest payment, and only the latest.
+///
+/// Three fields, chosen for what a spoken answer needs. There is deliberately
+/// no receipt number, method or note here — the server does not select them,
+/// because a payment history read aloud is a client's finances narrated to
+/// whoever happens to be standing there.
+struct LastPayment: Decodable {
+    let amount: Double
+    let status: String
+    let date: String
+}
+
+struct PackageInfo: Decodable {
+    let type: String?
+    let expiresOn: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case expiresOn = "expires_on"
+    }
+}
+
+/// What `/payments/client/:id/status` returns.
+///
+/// `outstanding` is optional because a missing balance is not a settled
+/// account. `Number(null)` being `0` is the trap this models around: reporting
+/// an empty column as "nothing owed" is a claim about the client made from no
+/// data at all.
+struct PaymentStatusResponse: Decodable {
+    let clientName: String
+    let currency: String
+    let outstanding: Double?
+    let lastPayment: LastPayment?
+    let package: PackageInfo
+    let spoken: String
+
+    enum CodingKeys: String, CodingKey {
+        case clientName = "client_name"
+        case currency
+        case outstanding
+        case lastPayment = "last_payment"
+        case package
+        case spoken
+    }
+}
+
+/// An identical amount already recorded for this client, very recently.
+///
+/// The draft claim stops the same DRAFT being confirmed twice. It does nothing
+/// about a person saying "record three thousand from Rahul" twice, which makes
+/// two legitimate drafts — so the server surfaces this in the QUESTION, at the
+/// one moment where somebody can still say no.
+struct RecentDuplicate: Decodable {
+    let amount: Double
+    let minutesAgo: Int
+
+    enum CodingKeys: String, CodingKey {
+        case amount
+        case minutesAgo = "minutes_ago"
+    }
+}
+
+/// What `/payments/prepare` returns. `recorded` is always false.
+struct PaymentDraftResponse: Decodable {
+    let draftId: String
+    let expiresAt: String
+    let clientName: String
+    let amount: Double
+    let currency: String
+    let method: String
+    let outstandingBefore: Double?
+    let recentDuplicate: RecentDuplicate?
+    let recorded: Bool
+    let spoken: String
+
+    enum CodingKeys: String, CodingKey {
+        case draftId = "draft_id"
+        case expiresAt = "expires_at"
+        case clientName = "client_name"
+        case amount
+        case currency
+        case method
+        case outstandingBefore = "outstanding_before"
+        case recentDuplicate = "recent_duplicate"
+        case recorded
+        case spoken
+    }
+}
+
+/// What `/payments/confirm` returns once money has actually been recorded.
+struct PaymentRecordedResponse: Decodable {
+    let recorded: Bool
+    let paymentId: String
+    let receiptNo: String
+    let clientName: String
+    let amount: Double
+    let outstandingAfter: Double?
+    let spoken: String
+
+    enum CodingKeys: String, CodingKey {
+        case recorded
+        case paymentId = "payment_id"
+        case receiptNo = "receipt_no"
+        case clientName = "client_name"
+        case amount
+        case outstandingAfter = "outstanding_after"
+        case spoken
+    }
+}
+
 /// Every way this can fail, phrased as something Siri can say.
 ///
 /// The distinction that matters is `unauthorized` vs `network`: one is fixed
@@ -485,6 +595,31 @@ struct VoiceAPIClient {
         var body: [String: Any] = ["client_id": clientId]
         if let date { body["date"] = date }
         return try await post("api/voice/workouts/complete", body: body)
+    }
+
+    /// GET /api/voice/payments/client/:clientId/status
+    func paymentStatus(clientId: String) async throws -> PaymentStatusResponse {
+        try await get("api/voice/payments/client/\(clientId)/status")
+    }
+
+    /// POST /api/voice/payments/prepare
+    ///
+    /// Records NOTHING. Returns a draft id and the question to ask.
+    func preparePayment(clientId: String, amount: Double, method: String?) async throws -> PaymentDraftResponse {
+        var body: [String: Any] = ["client_id": clientId, "amount": amount]
+        if let method { body["method"] = method }
+        return try await post("api/voice/payments/prepare", body: body)
+    }
+
+    /// POST /api/voice/payments/confirm
+    ///
+    /// Sends ONE id. There is deliberately no amount parameter: if this call
+    /// carried a figure, the sentence Siri read out and the number actually
+    /// written would be two independent values, and the confirmation would
+    /// guarantee nothing. The amount recorded is the one the server stored
+    /// when it composed the question.
+    func confirmPayment(draftId: String) async throws -> PaymentRecordedResponse {
+        try await post("api/voice/payments/confirm", body: ["draft_id": draftId])
     }
 
     // MARK: - Transport

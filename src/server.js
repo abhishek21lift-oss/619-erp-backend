@@ -714,6 +714,9 @@ app.use('/api/search',            auth, requireStaff, require('./routes/search')
 app.use('/api/voice/workouts/prepare', auth, voiceWriteLimiter);
 app.use('/api/voice/workouts/confirm', auth, voiceWriteLimiter);
 app.use('/api/voice/workouts/complete', auth, voiceWriteLimiter);
+// Money. Same tight limit as the workout writes — see voiceWriteLimiter.
+app.use('/api/voice/payments/prepare', auth, voiceWriteLimiter);
+app.use('/api/voice/payments/confirm', auth, voiceWriteLimiter);
 app.use('/api/voice',             userApiLimiter, auth, requireStaff, require('./routes/voice'));
 
 // ONE router, deliberately. This mount used to carry a second file,

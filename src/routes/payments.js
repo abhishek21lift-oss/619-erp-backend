@@ -16,9 +16,8 @@
 //   • DELETE handles rows from either ledger and reverses the balance on
 //     the owning client table.
 const router = require('express').Router();
-const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
-const { genReceiptNo } = require('../db/receipts');
+const { recordPayment } = require('../lib/paymentService');
 const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { paymentSchemas } = require('../lib/validation');
@@ -145,42 +144,17 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
       return res.status(404).json({ error: 'Client not found' });
     }
 
-    // Resolve trainer — verify the FK target exists; if the trainer was deleted
-    // without the cascade clearing the client's trainer_id, the INSERT would fail
-    // with a FK violation (23503). Fall back to NULL in that case.
-    let resolvedTrainerId = null;
-    let incentiveRate = 0.5;
-    if (cl[0].trainer_id) {
-      const { rows: tr } = await tx.query(
-        'SELECT id, incentive_rate FROM trainers WHERE id=$1', [cl[0].trainer_id]
-      );
-      if (tr[0]) {
-        resolvedTrainerId = tr[0].id;
-        incentiveRate     = tr[0].incentive_rate ?? 0.5;
-      }
-    }
-
-    const id = randomUUID();
-    const receiptNo = await genReceiptNo(tx);
-
-    await tx.query(`
-      INSERT INTO pt_payments (id, client_id, trainer_id, amount, incentive_amt,
-        payment_method, payment_ref, date, notes, organization_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [id, d.client_id, resolvedTrainerId,
-       amount, Math.round(amount * incentiveRate),
-       String(d.method || 'CASH').toUpperCase(), receiptNo, d.date,
-       d.notes || null, cl[0].organization_id]
-    );
-
-    // Update client balance
-    await tx.query(`
-      UPDATE pt_clients
-      SET paid_amount = paid_amount + $1,
-          balance_amount = GREATEST(0, balance_amount - $1),
-          updated_at = NOW()
-      WHERE id = $2`, [amount, d.client_id]
-    );
+    // The ledger row and the balance, together — see lib/paymentService.js.
+    // Shared with the voice surface so money is recorded by one code path.
+    // Everything it assumes (open transaction, locked client row, org checked,
+    // permission checked) has happened above.
+    const { id } = await recordPayment(tx, {
+      client: cl[0],
+      amount,
+      method: d.method,
+      date: d.date,
+      notes: d.notes,
+    });
 
     await tx.query('COMMIT');
 

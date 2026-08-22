@@ -1,4 +1,4 @@
-# Siri integration — Phases 1–6
+# Siri integration — Phases 1–7
 
 Enables:
 
@@ -8,6 +8,8 @@ Enables:
 > **Phase 4** — "Hey Siri, show me today's workouts in MY PT STUDIO."
 > **Phase 5** — "Hey Siri, create a workout for Rahul." *(the first write)*
 > **Phase 6** — "Hey Siri, mark Rahul's workout as completed."
+> **Phase 7** — "Hey Siri, does Rahul have any pending payment?" /
+>   "Hey Siri, record a payment from Rahul." *(money)*
 
 ## Architecture
 
@@ -116,6 +118,38 @@ Siri
       → activity_log
   → { completed, already_completed, session_id, client_name, date, spoken }
   → Siri speaks "Done. Rahul's workout is marked completed."
+
+Siri
+  → CheckPaymentStatusIntent (App Intent, on device)  [Phase 7]
+  → GET /api/voice/payments/client/:clientId/status
+      → auth → requireStaff → clientInOrg() → trainer narrowing
+      → pt_clients balance + the LATEST payment only (LIMIT 1)
+  → { client_name, outstanding, last_payment, package, spoken }
+
+Siri
+  → RecordPaymentIntent (App Intent, on device)       [Phase 7]
+      → NOT available from the lock screen
+  → POST /api/voice/payments/prepare   body: { client_id, amount }
+      → auth → requireStaff → adminManagerOrTrainer → voiceWriteLimiter
+      → clientInOrg() → trainer narrowing
+      → amount validated: > 0, <= 1,000,000, at most 2 decimals
+      → duplicate scan: identical amount in the last 10 minutes?
+      → INSERT voice_payment_drafts        ← the ONLY write; no money moves
+  → { draft_id, amount, outstanding_before, recent_duplicate, spoken }
+  → Siri ASKS "Record 3,000 rupees payment for Rahul?"
+      → no  → nothing happens, the draft expires in 10 minutes
+      → yes ↓
+  → POST /api/voice/payments/confirm   body: { draft_id }   ← NO amount
+      → BEGIN
+      → UPDATE … SET status='confirmed' WHERE id AND pending
+                     AND organization_id AND created_by     ← the claim
+      → SELECT … FROM pt_clients FOR UPDATE                 ← the lock
+      → re-check org and trainer against the LIVE row
+      → recordPayment()  ← lib/paymentService.js, shared with the finance UI
+          → INSERT pt_payments (receipt no, incentive)
+          → UPDATE pt_clients paid_amount / balance_amount
+      → COMMIT → activity_log
+  → { recorded: true, payment_id, receipt_no, outstanding_after, spoken }
 ```
 
 The intent sends a **path and a token**. It never sends an organization id, a
@@ -652,6 +686,129 @@ way, and the percentage is derived.
 | `voice.workouts.complete.duplicate` | it was already done (including the lost-race case) |
 | `voice.workouts.complete.missing` | no session existed on that date |
 
+### `GET /api/voice/payments/client/:clientId/status` *(Phase 7)*
+
+**Auth:** staff — including reception, who take payments at the desk and need
+to answer "what do I owe?". `clientInOrg()` first, 404 not 403, and a trainer
+sees only their own clients (fail-closed when unlinked).
+
+**Response `200`**
+
+```json
+{
+  "client_name": "Rahul Sharma",
+  "currency": "INR",
+  "outstanding": 5000,
+  "last_payment": { "amount": 2000, "status": "completed", "date": "2026-08-01" },
+  "package": { "type": "PT Gold", "expires_on": "2026-09-14" },
+  "spoken": "Rahul has 5,000 rupees outstanding. Their last payment was 2,000 rupees on 1 August. Their package runs to 14 September."
+}
+```
+
+**Only the latest payment, never a history.** `LIMIT 1`, and the query does not
+select `payment_ref`, `payment_method` or `notes` at all. A balance overheard
+is bad; a client's payment history narrated to whoever is standing in the room
+cannot be un-said.
+
+**`outstanding: null` is not zero.** A client with no balance on file is spoken
+as *"I do not have an outstanding balance on file for Rahul"* — never as *"no
+pending payment"*, which would be a claim about the client made from an empty
+column. (`Number(null)` is `0`, not `NaN`; that trap is a named test.)
+
+**Money is spoken as words, in Indian grouping** — "1,50,000 rupees", not
+"₹150000". A currency symbol is read differently by different voices and
+languages, and a figure about money must not be ambiguous when heard. Paise are
+only said when there are any.
+
+The package renewal date is volunteered **only when something is owed** — it
+matters to the person chasing a balance and is noise to everyone else.
+
+### `POST /api/voice/payments/prepare` and `/confirm` *(Phase 7 — money)*
+
+**Auth:** `adminManagerOrTrainer` on both, on the 12/min `voiceWriteLimiter`. A
+trainer may only take payment for **their own** client — the same rule
+`routes/payments.js` enforces, so recording by voice is no looser than
+recording at the desk. **Reception can check a balance and cannot record a
+payment.**
+
+#### The amount never travels back from the phone
+
+`/confirm` accepts exactly one field:
+
+```json
+{ "draft_id": "…" }
+```
+
+`.strict()`, so `amount`, `client_id` or `method` is a `400`. This is the whole
+point of the two-step: if `/confirm` carried a figure, the sentence Siri read
+out and the number written to the ledger would be two independent values with
+nothing tying them together, and the confirmation would be a formality rather
+than a control. What the user agreed to is what the server stored; what it
+stored is what it records.
+
+**Amount validation** (at prepare): greater than zero, at most 1,000,000, and
+at most two decimal places — rejected rather than rounded, because Postgres
+would silently round a third decimal and the amount confirmed would differ from
+the amount stored by exactly the kind of rounding error nobody can later
+account for. Method is an enum.
+
+#### Duplicate and replay protection, in four layers
+
+| Layer | Stops |
+| --- | --- |
+| The claim — `WHERE id AND status='pending' AND expires_at > NOW() AND organization_id AND created_by` | the same draft being confirmed twice; a leaked or guessed id; a colleague's draft |
+| `SELECT … FOR UPDATE` on the client | concurrent payments interleaving and the balance drifting |
+| 10-minute TTL (not the workout draft's 30) | a stale question about money being answered after the fact |
+| **The recent-duplicate warning** | *the actual human mistake* |
+
+The fourth is the one that matters in practice. The claim stops the same
+*draft* being confirmed twice — but a person saying "record three thousand from
+Rahul" twice produces two different drafts and two entirely legitimate
+payments. So an identical amount already recorded for that client in the last
+ten minutes is surfaced **in the question**, before it:
+
+> "I already recorded 3,000 rupees for Rahul 2 minutes ago. Record 3,000 rupees
+> payment for Rahul?"
+
+That is the one moment where somebody can still say no.
+
+#### Confirm re-checks against live data
+
+Inside the transaction, after the claim and the lock, before any money moves:
+the client must still exist, still belong to the caller's organization, and —
+for a trainer — still be theirs. A client deleted, transferred, or reassigned
+in the ten minutes since preparing must not receive a payment on the strength
+of a stale read.
+
+#### It records money through the app's own code
+
+`recordPayment()` in `src/lib/paymentService.js`, extracted from
+`routes/payments.js` (the canonical finance API) so voice and the finance UI
+record money by **one** code path: the ledger row with its sequence-drawn
+receipt number and the trainer incentive, and the client's `paid_amount` /
+`balance_amount`, in one transaction. `GREATEST(0, …)` keeps an overpayment
+from driving the outstanding figure negative, which the UI would render as a
+credit nobody granted.
+
+The header of `pt-os.routes.js` records what happened when this was two loose
+queries: "money in the ledger that the client's outstanding figure does not
+know about, silent, and surfacing much later as a reconciliation discrepancy
+nobody can account for."
+
+**Audit:** `voice.payments.status`, `voice.payments.prepare` (with the amount,
+method and whether a recent duplicate was seen), `voice.payments.confirm` (with
+the receipt number), plus `.rejected`, `.invalid` and `.forbidden`. The confirm
+row is written **after** `COMMIT` — a row logged before the transaction lands
+would describe a payment that, on rollback, never happened.
+
+#### The one new table
+
+`voice_payment_drafts` (migration `181`) — RLS enabled, `anon`/`authenticated`
+revoked, `deny_all_direct_access`. Direct write access would be a way to author
+a draft and confirm it through the API, recording money against any client with
+the organization and permission checks bypassed, because those run on the way
+*in*.
+
 ## Backend — build and test
 
 ```bash
@@ -665,9 +822,10 @@ npm test -- src/__tests__/security/voice
 npm test
 ```
 
-Phases 1–4 need no migration. **Phase 5 adds one** — `180_voice_workout_drafts.sql`
-— because the two-step confirmation needs somewhere server-side to hold a draft
-between preparing and saving. No other schema change and no new environment
+Phases 1–4 need no migration. **Phase 5 adds `180_voice_workout_drafts.sql`**
+and **Phase 7 adds `181_voice_payment_drafts.sql`** — both because a two-step
+confirmation needs somewhere server-side to hold the proposal between the
+question and the answer. No other schema change and no new environment
 variable.
 
 ## iOS — setup
@@ -678,7 +836,7 @@ app target that will host them.
 
 ### 1. Add the sources
 
-Add all seven to the app target (and to the App Intents extension target, if
+Add all eight to the app target (and to the App Intents extension target, if
 you use a separate one):
 
 - `Keychain.swift`
@@ -691,6 +849,8 @@ you use a separate one):
 - `GetTodaysWorkoutsIntent.swift` *(Phase 4)*
 - `PrepareWorkoutIntent.swift` *(Phase 5)* — writes; asks first
 - `CompleteWorkoutIntent.swift` *(Phase 6)* — writes; idempotent
+- `PaymentIntents.swift` *(Phase 7)* — `CheckPaymentStatusIntent` (read) and
+  `RecordPaymentIntent` (writes money; confirms the amount aloud first)
 
 ### 2. Info.plist keys
 
@@ -748,8 +908,10 @@ Build to a device (Siri does not work in the Simulator), sign in once, then:
 > "Hey Siri, show me today's workouts in MY PT STUDIO."
 > "Hey Siri, create a workout for Rahul in MY PT STUDIO." *(asks before saving)*
 > "Hey Siri, mark Rahul's workout as completed in MY PT STUDIO."
+> "Hey Siri, does Rahul have any pending payment in MY PT STUDIO?"
+> "Hey Siri, record a payment from Rahul in MY PT STUDIO." *(asks the amount, then confirms it)*
 
-All six phrases are registered by `MyPtStudioShortcuts`, so no Shortcut has
+All eight phrases are registered by `MyPtStudioShortcuts`, so no Shortcut has
 to be created first. Alternative phrasings are also registered — "client count
 in MY PT STUDIO", "search for Rahul in MY PT STUDIO", "how is Rahul doing in
 MY PT STUDIO", "what workouts do I have today in MY PT STUDIO", "who has a
@@ -785,7 +947,7 @@ value cached on the device, so a saved Shortcut pointing at a client who has
 since been deleted, transferred, or who was never this account's to read
 resolves to nothing. **A saved Shortcut is not a standing grant.**
 
-## Security notes — what holds across all six phases
+## Security notes — what holds across all seven phases
 
 - **Siri never touches SQL.** It cannot express a query. It calls one of three
   named endpoints whose SQL is fixed in this repository; the only caller-supplied
@@ -819,10 +981,16 @@ resolves to nothing. **A saved Shortcut is not a standing grant.**
   is a single idempotent `POST` that refuses to create anything. Neither write
   intent runs from a locked device; both are on a 12/min limit rather than the
   read surface's 200.
-- **Nothing writes twice.** Phase 5's draft claim and Phase 6's guarded
-  `UPDATE` are both conditional statements, so a repeated request — which is
-  what Siri produces when it mishears a confirmation — changes nothing the
-  second time and says so.
+- **Nothing writes twice.** Phase 5's draft claim, Phase 6's guarded `UPDATE`
+  and Phase 7's payment claim are all conditional statements, so a repeated
+  request — which is what Siri produces when it mishears a confirmation —
+  changes nothing the second time and says so. Phase 7 adds the layer the
+  others do not need: a warning about an identical payment recorded minutes
+  ago, because the mistake that actually happens with money is a person
+  repeating themselves, not a request replaying.
+- **A confirmed value cannot be substituted.** Neither confirm endpoint accepts
+  the thing being confirmed — not the exercises, not the amount. What was said
+  out loud is what the server stored, and what it stored is what it writes.
 - **Safety gates cannot be routed around.** The voice write calls the same
   `checkScreeningGate()` the app's own assign route calls, and calls it twice:
   once before generating and once against live data before saving.
@@ -835,40 +1003,44 @@ resolves to nothing. **A saved Shortcut is not a standing grant.**
   trace, so the audit row is the only record it happened.
 
 
-## Phase 7 — exact next step
+## Phase 8 — exact next step
 
-Phases 5 and 6 both write, and the same gap now applies to both: **a change
-made by voice is invisible to everyone who did not hear it.** A plan saved by
-Siri appears in the Workout Plans list looking like any other, and a session
-completed by voice looks identical to one a trainer ticked off on screen. The
-audit rows exist; nothing reads them back.
+Seven phases have added commands. **Phase 8 should add none**, and the reason
+is now concrete rather than tidy-minded: Siri can create a training programme,
+complete a session and record money, and none of those changes is visible to
+anyone who did not hear them. The `activity_log` rows exist for every one.
+No screen reads them.
 
-That is Phase 7, and it is deliberately not another command:
+That is the whole of Phase 8:
 
-1. **Mark voice-originated changes in the app.** A `created_via` column on
-   `workout_plans` (and the draft join that already exists) surfaced in the
-   plans list and on the session, so a studio owner can see which programmes
-   were authored by speaking. The trainer who heard "I left out three
-   exercises" is currently the only person who knows it happened — the draft's
-   `excluded` list should be visible on the plan itself.
-2. **A studio-visible voice activity feed**, reading the `voice.*` actions
-   already in `activity_log`. Six phases have written audit rows that no
-   screen displays. A voice surface whose history can only be read with SQL is
-   one nobody audits.
+1. **A studio-visible voice activity feed**, reading the `voice.*` actions
+   already written. Money first: a `voice.payments.confirm` row carries the
+   amount, the receipt number and who spoke, and a studio owner currently has
+   no way to see that a payment was taken by voice rather than at the desk.
+   A surface that records money and whose history needs SQL to read is one
+   nobody audits.
+2. **Mark voice-originated records in the app.** `created_via` on
+   `workout_plans` and `pt_payments`, surfaced in the plans list and the
+   payments ledger. Reconciliation is done against the ledger screen, and a
+   voice-recorded payment that looks identical to a desk-recorded one is
+   indistinguishable exactly when someone is trying to work out what happened.
 3. **A `voice.write` scope on the token**, so a studio can allow voice reads
-   without voice writes. Today the two are separated only by role, and some
-   studios will want a trainer who can ask questions from the gym floor but
-   cannot author or complete by speaking.
-4. **The concurrency tests both writes now deserve.** Phase 5's draft claim and
-   Phase 6's guarded `UPDATE` are each written to make a double-apply
-   impossible, and in both cases the guarantee is currently argued from the SQL
-   rather than demonstrated, because the pool is mocked. An integration test
-   against a real database, firing two simultaneous confirmations and two
-   simultaneous completions, is the only thing that actually proves it.
-5. **Draft retention.** Nothing deletes lapsed drafts — right for audit, wrong
-   for growth. Keep confirmed drafts, expire pending ones after 90 days.
+   without voice writes — and, separately, workout writes without *payment*
+   writes. Today all three are one role check. Some studios will want a trainer
+   who can complete sessions by speaking and cannot touch money.
+4. **The concurrency tests all three writes now deserve.** Every single-apply
+   guarantee on this surface is argued from the SQL rather than demonstrated,
+   because the pool is mocked. Two simultaneous payment confirmations against a
+   real database is the test that matters most — it is the one where being
+   wrong means a client is credited twice.
+5. **Draft retention.** Two draft tables now accumulate. Keep confirmed ones,
+   expire pending ones after 90 days.
 
-Deliberately **not** in Phase 7: booking, cancelling, payments, deleting a
-saved plan, or un-completing a session. Reversal is a harder problem than
-completion — it needs to say who reversed what and why — and it should not ride
-in on a phase about visibility.
+Also worth knowing before Phase 8 adds anything: `MyPtStudioShortcuts` now
+registers **8** AppShortcuts, and Apple's limit is 10. The next feature that
+wants a phrase needs a decision about which ones stay top-level.
+
+Deliberately **not** in Phase 8: refunds, reversing a payment, deleting a plan,
+or un-completing a session. Every one of them is a *correction*, which needs to
+record who corrected what and why — a harder design than the action it undoes,
+and one that should not ride in on a phase about visibility.

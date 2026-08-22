@@ -170,5 +170,30 @@ struct MyPtStudioShortcuts: AppShortcutsProvider {
             shortTitle: "Complete Workout",
             systemImageName: "checkmark.circle.fill"
         )
+
+        // Phase 7 — payments. The read runs anywhere; the write confirms the
+        // amount out loud first and will not run from a locked device.
+        AppShortcut(
+            intent: CheckPaymentStatusIntent(),
+            phrases: [
+                "Does \(\.$client) have any pending payment in \(.applicationName)",
+                "What does \(\.$client) owe in \(.applicationName)",
+                "Check \(\.$client) payment status in \(.applicationName)",
+                "\(.applicationName) balance for \(\.$client)",
+            ],
+            shortTitle: "Payment Status",
+            systemImageName: "indianrupeesign.circle"
+        )
+
+        AppShortcut(
+            intent: RecordPaymentIntent(),
+            phrases: [
+                "Record a payment from \(\.$client) in \(.applicationName)",
+                "Record payment for \(\.$client) in \(.applicationName)",
+                "\(.applicationName) record a payment from \(\.$client)",
+            ],
+            shortTitle: "Record Payment",
+            systemImageName: "indianrupeesign.square.fill"
+        )
     }
 }
