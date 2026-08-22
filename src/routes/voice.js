@@ -41,6 +41,14 @@ const { logActivity } = require('../lib/activityLog');
 const { z } = require('../lib/validation');
 const { today: studioToday, todayShortDay: studioShortDay, appTimeZone } = require('../lib/appTime');
 const { resolveMyTrainerIds } = require('../lib/trainerIdentity');
+const { adminManagerOrTrainer } = require('../middleware/auth');
+const { orgIdOf } = require('../lib/tenant-db');
+const { checkScreeningGate } = require('../lib/screeningGate');
+const { routedChat } = require('../lib/ai/router');
+const { randomUUID } = require('crypto');
+const {
+  loadClientContext, loadHistory, buildDraft, clampDays, DEFAULT_DAYS,
+} = require('../lib/workoutDraft');
 const logger = require('../lib/logger');
 
 // Staff only, on the whole router.
@@ -897,6 +905,417 @@ function spellCount(n) {
 function joinList(items) {
   if (items.length === 1) return items[0];
   return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
+}
+
+
+/* ========================================================================== *
+ * Phase 5 — "Hey Siri, create a workout for Rahul."
+ *
+ * The first WRITE on this surface, and it is deliberately two requests.
+ *
+ * ── Why preparing and saving are separate endpoints ──────────────────────
+ *
+ * Everything before this phase answered a question. This one changes a
+ * person's training programme, and it is reachable by anyone who can speak
+ * near an unlocked phone. So no single voice command saves anything:
+ * /prepare builds a draft and describes it, /confirm saves the draft that was
+ * described. The confirmation is not a politeness — it is the only point at
+ * which a human hears what is about to happen and can stop it.
+ *
+ * ── Why /confirm takes an ID and nothing else ────────────────────────────
+ *
+ * The tempting design returns the generated plan to the phone and has
+ * /confirm accept it back. That is not a confirmation step; it is an
+ * exercise-injection endpoint with an extra round trip, because whatever
+ * comes back is whatever the caller chose to send. Every safety decision made
+ * during preparation — the PAR-Q gate, the contraindication filter, the
+ * library check — would become advisory.
+ *
+ * So the draft lives in `voice_workout_drafts` and /confirm takes one id.
+ * There is no field on the confirm request that can name an exercise, so
+ * there is no request that can save one that was not generated and checked
+ * here.
+ * ========================================================================== */
+
+/**
+ * Writing is narrower than reading.
+ *
+ * The router-wide `requireStaff` admits reception and front-desk accounts,
+ * which is right for "how many clients do I have" and wrong for authoring
+ * somebody's training programme. These two routes use the same middleware the
+ * workout routes themselves use, so the permission to create a plan by voice
+ * is exactly the permission to create one in the app — not a second, looser
+ * rule that happens to live on a different surface.
+ */
+const prepareSchema = {
+  body: z.object({
+    client_id: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/),
+    // A voice command must not be able to ask for a 40-session plan. Clamped
+    // rather than rejected: "make it ten days" is a reasonable thing to say
+    // and a 6-day week is a reasonable thing to answer.
+    days: z.coerce.number().int().min(1).max(52).optional(),
+  }).strict(),
+};
+
+const confirmSchema = {
+  body: z.object({
+    // The ONLY input. Note what is absent: no exercises, no plan name, no
+    // client id, no day count. Adding any of them would reopen the hole this
+    // endpoint's shape exists to close.
+    draft_id: z.string().uuid(),
+  }).strict(),
+};
+
+/** How long a prepared draft stays confirmable. */
+const DRAFT_TTL_MINUTES = 30;
+
+/**
+ * POST /api/voice/workouts/prepare
+ *
+ * → { draft_id, expires_at, preview, screening_warnings, excluded, spoken }
+ *
+ * Saves NOTHING to the workout tables. The only row it writes is the draft
+ * itself, which is a record of what was proposed.
+ */
+router.post('/workouts/prepare', adminManagerOrTrainer, validate(prepareSchema),
+  async (req, res, next) => {
+    try {
+      const { client_id: clientId } = req.body;
+      const days = clampDays(req.body.days ?? DEFAULT_DAYS);
+
+      // 1. Ownership, before anything about this client is read. Same check,
+      //    same 404-not-403, as Phase 3 — a client id from another studio must
+      //    not be confirmed to exist by the way this endpoint refuses it.
+      if (!await clientInOrg(req, clientId)) return notFoundClient(res);
+
+      // 2. A trainer may only author for their own client. Mirrors
+      //    POST /api/workouts/assign, including answering 404.
+      if (req.user.role === 'trainer') {
+        const { rows: mine } = await pool.query(
+          'SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2',
+          [clientId, req.user.trainer_id || '']
+        );
+        if (!mine[0]) return notFoundClient(res);
+      }
+
+      const orgId = orgIdOf(req);
+      if (!orgId) {
+        // No organization means no library to read and no studio to own the
+        // result. Fail closed rather than authoring into NULL.
+        return res.status(403).json({
+          error: { code: 'NO_ORGANIZATION', message: 'No studio on this account' },
+          spoken: 'Your account is not attached to a studio, so I cannot create a workout.',
+        });
+      }
+
+      // 3. The PAR-Q / Informed Consent gate — the SAME function the app's own
+      //    assign route calls, so a medical block stops a voice-authored plan
+      //    exactly as it stops one authored on screen. A surface that can
+      //    route around a clearance rule is a surface that removes it.
+      const { blocked, warnings } = await checkScreeningGate(req, clientId);
+      if (blocked) {
+        logActivity(req, 'voice.workouts.prepare.blocked', 'pt_client', clientId,
+          { channel: 'voice', reason: 'parq_blocked' });
+        return res.status(blocked.status).json({
+          ...blocked.body,
+          spoken: 'I cannot create a workout for them. Their screening flags '
+                + 'them as medically blocked, so they need clearance first.',
+        });
+      }
+
+      // 4. Their programme and what they have actually done.
+      const client = await loadClientContext(clientId, orgId);
+      if (!client) return notFoundClient(res);
+      const history = await loadHistory(clientId).catch(() => ({ sessions: 0, last_session: null }));
+
+      // 5. Generate. Contraindicated exercises are removed from the candidate
+      //    list BEFORE either selector sees it, so nothing can choose one.
+      const built = await buildDraft({
+        client, history, orgId, days,
+        chat: routedChat,
+      });
+
+      if (built.error) {
+        logActivity(req, 'voice.workouts.prepare.failed', 'pt_client', clientId,
+          { channel: 'voice', reason: built.error, excluded: built.excluded?.length ?? 0 });
+        const spoken = built.error === 'NO_SAFE_EXERCISES'
+          // Worth saying plainly. An empty result here is not a glitch — it is
+          // the safety filter having removed everything, which a trainer needs
+          // to hear as a fact about this client rather than as a failure.
+          ? 'I could not build a safe workout for them. Every exercise in the '
+          + 'library conflicts with something on their medical record.'
+          : 'I could not build a workout for them just now. Please try again.';
+        return res.status(422).json({
+          error: { code: built.error, message: 'Could not generate a workout' },
+          spoken,
+        });
+      }
+
+      // 6. Store the draft. This is the only write, and it creates no plan,
+      //    no assignment and no exercise row.
+      const expiresAt = new Date(Date.now() + DRAFT_TTL_MINUTES * 60_000);
+      const { rows: draftRows } = await pool.query(
+        `INSERT INTO voice_workout_drafts
+           (organization_id, client_id, created_by, draft, source,
+            screening_warnings, excluded, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         RETURNING id, expires_at`,
+        [orgId, clientId, req.user.id,
+         JSON.stringify({ plan: built.plan, exercises: built.exercises }),
+         built.source, warnings, JSON.stringify(built.excluded), expiresAt]
+      );
+      const draft = draftRows[0];
+
+      // 7. Audit: who asked, for whom, what was generated, what was withheld
+      //    and why. The draft row holds the plan itself; this is the trail.
+      logActivity(req, 'voice.workouts.prepare', 'voice_workout_draft', draft.id, {
+        channel: 'voice',
+        client_id: clientId,
+        days,
+        source: built.source,
+        exercise_count: built.exercises.length,
+        excluded_count: built.excluded.length,
+        based_on_plan_id: built.plan.based_on_plan_id,
+        screening_warnings: warnings.length,
+      });
+
+      res.status(201).json({
+        draft_id: draft.id,
+        expires_at: draft.expires_at,
+        // Everything needed to show the draft on screen, and nothing about
+        // the client beyond the first name already spoken.
+        preview: {
+          client_name: client.name,
+          plan_name: built.plan.name,
+          days,
+          goal: built.plan.goal,
+          difficulty: built.plan.difficulty,
+          based_on_plan_name: built.plan.based_on_plan_name,
+          source: built.source,
+          exercises: built.exercises,
+        },
+        screening_warnings: warnings,
+        // Named, not hidden. A trainer told "I left out three exercises"
+        // can disagree; one told nothing cannot.
+        excluded: built.excluded,
+        saved: false,
+        spoken: spokenForPrepare(client, built, days, warnings),
+      });
+    } catch (err) {
+      logger.error({ err: err.message }, 'voice workout prepare failed');
+      next(err);
+    }
+  });
+
+/**
+ * POST /api/voice/workouts/confirm
+ *
+ * → { saved: true, workout_plan_id, assignment_id, spoken }
+ *
+ * The only endpoint on this surface that persists a workout.
+ */
+router.post('/workouts/confirm', adminManagerOrTrainer, validate(confirmSchema),
+  async (req, res, next) => {
+    const db = await pool.connect();
+    try {
+      const { draft_id: draftId } = req.body;
+      const orgId = orgIdOf(req);
+
+      await db.query('BEGIN');
+
+      // Claim the draft. This single statement is the whole single-use
+      // guarantee: the row moves out of 'pending' in the same transaction
+      // that inserts the plan, so two confirmations racing each other produce
+      // one plan and one 409 — the loser's UPDATE matches nothing and it
+      // never reaches the INSERT.
+      //
+      // The WHERE clause is also the authorization: the draft must be this
+      // studio's AND this user's. A draft id leaked to a colleague, or
+      // guessed, matches nothing.
+      const { rows: claimed } = await db.query(
+        `UPDATE voice_workout_drafts
+            SET status = 'confirmed', confirmed_at = NOW()
+          WHERE id = $1
+            AND status = 'pending'
+            AND expires_at > NOW()
+            AND organization_id = $2
+            AND created_by = $3
+        RETURNING id, client_id, draft, source`,
+        [draftId, orgId, req.user.id]
+      );
+
+      if (!claimed[0]) {
+        await db.query('ROLLBACK');
+        // One response for "no such draft", "not yours", "already saved" and
+        // "expired". Distinguishing them would let a caller probe which draft
+        // ids exist, and none of the four is separately actionable by voice.
+        logActivity(req, 'voice.workouts.confirm.rejected', 'voice_workout_draft', draftId,
+          { channel: 'voice' });
+        return res.status(409).json({
+          error: { code: 'DRAFT_NOT_CONFIRMABLE', message: 'No draft to confirm' },
+          saved: false,
+          spoken: 'I do not have that workout to save any more. Please ask me '
+                + 'to prepare it again.',
+        });
+      }
+
+      const row = claimed[0];
+      const parsed = typeof row.draft === 'string' ? JSON.parse(row.draft) : row.draft;
+      const { plan, exercises } = parsed;
+
+      // Re-run the safety gate against LIVE data, not the reading taken at
+      // preparation. A PAR-Q filed in the last half hour must stop this save;
+      // a draft is a proposal, never a clearance that has already been given.
+      const { blocked } = await checkScreeningGate(req, row.client_id);
+      if (blocked) {
+        await db.query('ROLLBACK');
+        logActivity(req, 'voice.workouts.confirm.blocked', 'voice_workout_draft', draftId,
+          { channel: 'voice', client_id: row.client_id, reason: 'parq_blocked' });
+        return res.status(blocked.status).json({
+          ...blocked.body,
+          saved: false,
+          spoken: 'I did not save it. Their screening now flags them as '
+                + 'medically blocked.',
+        });
+      }
+
+      // Re-validate every exercise against the live library. An exercise
+      // archived, made private or deleted since preparation must not be
+      // written into a plan on the strength of a thirty-minute-old read.
+      const ids = [...new Set(exercises.map((e) => e.exercise_id))];
+      const { rows: live } = await db.query(
+        `SELECT id FROM exercises
+          WHERE id = ANY($1)
+            AND is_active = TRUE
+            AND deleted_at IS NULL
+            AND archived_at IS NULL
+            AND visibility IN ('public','organization')
+            AND (organization_id IS NULL OR organization_id = $2)`,
+        [ids, orgId]
+      );
+      const liveIds = new Set(live.map((r) => r.id));
+      const valid = exercises.filter((e) => liveIds.has(e.exercise_id));
+
+      if (!valid.length) {
+        await db.query('ROLLBACK');
+        logActivity(req, 'voice.workouts.confirm.invalid', 'voice_workout_draft', draftId,
+          { channel: 'voice', client_id: row.client_id });
+        return res.status(422).json({
+          error: { code: 'EXERCISES_UNAVAILABLE', message: 'Draft exercises are no longer valid' },
+          saved: false,
+          spoken: 'I could not save it — those exercises are no longer '
+                + 'available. Please ask me to prepare it again.',
+        });
+      }
+
+      const planId = randomUUID();
+      await db.query(
+        `INSERT INTO workout_plans
+           (id, name, description, goal, difficulty, duration_weeks,
+            sessions_per_week, is_template, created_by, organization_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE,$8,$9)`,
+        [planId, plan.name,
+         `Prepared by voice for this client (${row.source}).`,
+         plan.goal, plan.difficulty, plan.duration_weeks, plan.sessions_per_week,
+         req.user.id, orgId]
+      );
+
+      for (const ex of valid) {
+        await db.query(
+          `INSERT INTO workout_exercises
+             (id, workout_plan_id, exercise_id, day_of_week, sort_order,
+              sets, reps, rest_seconds)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [randomUUID(), planId, ex.exercise_id, ex.day_of_week, ex.sort_order,
+           ex.sets, ex.reps, ex.rest_seconds]
+        );
+      }
+
+      // "A workout FOR Rahul" is attached to Rahul. A plan created and left
+      // unassigned would answer the command with something the client never
+      // receives.
+      const assignmentId = randomUUID();
+      await db.query(
+        `INSERT INTO workout_assignments
+           (id, workout_plan_id, client_id, trainer_id, start_date, status,
+            notes, organization_id)
+         VALUES ($1,$2,$3,$4,CURRENT_DATE,'active',$5,$6)
+         ON CONFLICT (workout_plan_id, client_id, status) DO NOTHING`,
+        [assignmentId, planId, row.client_id, req.user.trainer_id || null,
+         'Created by voice', orgId]
+      );
+
+      await db.query(
+        'UPDATE voice_workout_drafts SET workout_plan_id = $1 WHERE id = $2',
+        [planId, draftId]
+      );
+
+      await db.query('COMMIT');
+
+      logActivity(req, 'voice.workouts.confirm', 'workout_plan', planId, {
+        channel: 'voice',
+        draft_id: draftId,
+        client_id: row.client_id,
+        source: row.source,
+        exercise_count: valid.length,
+        // Named explicitly: an exercise that vanished between preparing and
+        // saving changed the plan the trainer agreed to.
+        dropped_since_prepare: exercises.length - valid.length,
+      });
+
+      res.status(201).json({
+        saved: true,
+        workout_plan_id: planId,
+        assignment_id: assignmentId,
+        exercise_count: valid.length,
+        spoken: `Saved. ${plan.name} is now assigned.`,
+      });
+    } catch (err) {
+      await db.query('ROLLBACK').catch(() => {});
+      logger.error({ err: err.message }, 'voice workout confirm failed');
+      next(err);
+    } finally {
+      db.release();
+    }
+  });
+
+/**
+ * "I prepared a 4-day workout for Rahul based on his current programme.
+ *  Shall I save it?"
+ *
+ * The question is the last clause on purpose: it is what the listener must
+ * answer, and a sentence that buries it behind caveats gets a "yes" to
+ * something nobody heard.
+ *
+ * "Based on his current programme" is said ONLY when there is one. Claiming a
+ * basis that does not exist is the kind of small false confidence that makes
+ * a trainer stop checking.
+ */
+function spokenForPrepare(client, built, days, warnings) {
+  const first = String(client.name || '').trim().split(/\s+/)[0] || 'them';
+  const parts = [`I prepared a ${days}-day workout for ${first}`];
+
+  if (built.plan.based_on_plan_name) {
+    parts.push(`based on their current programme, ${built.plan.based_on_plan_name}`);
+  }
+
+  const sentences = [`${parts.join(' ')}.`];
+
+  // Said before the question, not after: a trainer deciding whether to save
+  // needs to know something was withheld while they are still deciding.
+  if (built.excluded.length) {
+    const n = built.excluded.length;
+    sentences.push(n === 1
+      ? 'I left out one exercise that conflicts with their medical record.'
+      : `I left out ${n} exercises that conflict with their medical record.`);
+  }
+
+  if (warnings.length) {
+    sentences.push('Their screening paperwork is incomplete.');
+  }
+
+  sentences.push('Shall I save it?');
+  return sentences.join(' ');
 }
 
 module.exports = router;

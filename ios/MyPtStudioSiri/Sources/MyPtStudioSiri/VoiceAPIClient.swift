@@ -155,6 +155,106 @@ struct TodayWorkoutsResponse: Decodable {
     }
 }
 
+/// One exercise in a prepared draft.
+struct DraftExercise: Decodable, Identifiable {
+    let exerciseId: String
+    let name: String
+    let muscleGroup: String?
+    let dayOfWeek: Int
+    let sets: Int
+    let reps: Int
+
+    var id: String { "\(dayOfWeek)-\(exerciseId)" }
+
+    enum CodingKeys: String, CodingKey {
+        case exerciseId = "exercise_id"
+        case name
+        case muscleGroup = "muscle_group"
+        case dayOfWeek = "day_of_week"
+        case sets
+        case reps
+    }
+}
+
+/// An exercise the safety filter withheld, and why.
+///
+/// Surfaced rather than hidden: a trainer told "I left out three exercises"
+/// can disagree and go and look; one told nothing cannot.
+struct ExcludedExercise: Decodable {
+    let exerciseId: String
+    let name: String
+    let contraindication: String
+
+    enum CodingKeys: String, CodingKey {
+        case exerciseId = "exercise_id"
+        case name
+        case contraindication
+    }
+}
+
+struct DraftPreview: Decodable {
+    let clientName: String
+    let planName: String
+    let days: Int
+    let goal: String?
+    let difficulty: String?
+    let basedOnPlanName: String?
+    /// "ai" when a model chose the exercises, "derived" when the library did.
+    let source: String
+    let exercises: [DraftExercise]
+
+    enum CodingKeys: String, CodingKey {
+        case clientName = "client_name"
+        case planName = "plan_name"
+        case days
+        case goal
+        case difficulty
+        case basedOnPlanName = "based_on_plan_name"
+        case source
+        case exercises
+    }
+}
+
+/// What `/workouts/prepare` returns.
+///
+/// `saved` is always false here — that is the entire point of the endpoint,
+/// and it is decoded rather than assumed so the field cannot quietly change
+/// meaning without this failing to make sense.
+struct WorkoutDraftResponse: Decodable {
+    let draftId: String
+    let expiresAt: String
+    let preview: DraftPreview
+    let screeningWarnings: [String]
+    let excluded: [ExcludedExercise]
+    let saved: Bool
+    let spoken: String
+
+    enum CodingKeys: String, CodingKey {
+        case draftId = "draft_id"
+        case expiresAt = "expires_at"
+        case preview
+        case screeningWarnings = "screening_warnings"
+        case excluded
+        case saved
+        case spoken
+    }
+}
+
+/// What `/workouts/confirm` returns once something has actually been written.
+struct WorkoutSavedResponse: Decodable {
+    let saved: Bool
+    let workoutPlanId: String
+    let exerciseCount: Int
+    let spoken: String
+
+    enum CodingKeys: String, CodingKey {
+        case saved
+        case workoutPlanId = "workout_plan_id"
+        case exerciseCount = "exercise_count"
+        case spoken
+    }
+}
+
 /// Every way this can fail, phrased as something Siri can say.
 ///
 /// The distinction that matters is `unauthorized` vs `network`: one is fixed
@@ -167,6 +267,14 @@ enum VoiceAPIError: LocalizedError {
     case unauthorized
     case invalidQuery
     case notFound
+    /// The server refused, and wrote the sentence to say about it.
+    ///
+    /// Needed from Phase 5 on. A medically blocked client is a 403, and
+    /// mapping 403 to "please sign in" would tell a trainer to re-authenticate
+    /// when the real answer is that their client needs medical clearance. The
+    /// server already phrases every refusal it makes; when it does, that
+    /// sentence wins over anything inferred from a status code.
+    case refused(spoken: String)
     case rateLimited
     case server(status: Int)
     case network(underlying: Error)
@@ -182,6 +290,8 @@ enum VoiceAPIError: LocalizedError {
             // The server bounds `q` at 2–60 characters. Say what to do about
             // it rather than reporting a validation failure.
             return "Please say at least two letters of the name."
+        case .refused(let spoken):
+            return spoken
         case .notFound:
             // Also what the server returns for a client belonging to ANOTHER
             // studio, deliberately — so this sentence must not distinguish
@@ -308,6 +418,28 @@ struct VoiceAPIClient {
         try await get("api/voice/workouts/today")
     }
 
+    /// POST /api/voice/workouts/prepare
+    ///
+    /// Prepares a draft and SAVES NOTHING. The returned `draftId` is the only
+    /// thing `confirmWorkout` needs, and the only thing it accepts.
+    func prepareWorkout(clientId: String, days: Int?) async throws -> WorkoutDraftResponse {
+        var body: [String: Any] = ["client_id": clientId]
+        if let days { body["days"] = days }
+        return try await post("api/voice/workouts/prepare", body: body)
+    }
+
+    /// POST /api/voice/workouts/confirm
+    ///
+    /// The only call on this client that writes. It sends ONE id and nothing
+    /// else — no exercises, no plan name, no client id. There is deliberately
+    /// no parameter here through which this device could introduce an exercise
+    /// into somebody's programme: the plan that gets saved is the one the
+    /// server generated, checked against the library and filtered for
+    /// contraindications when it prepared the draft.
+    func confirmWorkout(draftId: String) async throws -> WorkoutSavedResponse {
+        try await post("api/voice/workouts/confirm", body: ["draft_id": draftId])
+    }
+
     // MARK: - Transport
 
     /// One request path for every voice endpoint.
@@ -319,15 +451,50 @@ struct VoiceAPIClient {
         try await get(baseURL.appendingPathComponent(path))
     }
 
+    /// The `spoken` field of an error body, when the server wrote one.
+    ///
+    /// Decoded defensively: an error page, an empty body or a proxy's HTML all
+    /// have to come back as nil rather than throwing inside error handling.
+    private static func spokenIn(_ data: Data) -> String? {
+        struct Envelope: Decodable { let spoken: String? }
+        guard let env = try? JSONDecoder().decode(Envelope.self, from: data),
+              let spoken = env.spoken,
+              !spoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return spoken
+    }
+
+    private func post<T: Decodable>(_ path: String, body: [String: Any]) async throws -> T {
+        let payload: Data
+        do {
+            payload = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            throw VoiceAPIError.malformedResponse
+        }
+        return try await send(
+            baseURL.appendingPathComponent(path), method: "POST", body: payload
+        )
+    }
+
     private func get<T: Decodable>(_ url: URL) async throws -> T {
+        try await send(url, method: "GET", body: nil)
+    }
+
+    private func send<T: Decodable>(
+        _ url: URL, method: String, body: Data?
+    ) async throws -> T {
         guard let token = Keychain.get(account: Self.tokenAccount, accessGroup: accessGroup) else {
             throw VoiceAPIError.notSignedIn
         }
 
         var request = URLRequest(url: url)
-        request.httpMethod = "GET"
+        request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let body {
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         // Siri gives an intent a short budget before it is considered stalled;
         // a request that outlives that is better failed than left hanging.
         request.timeoutInterval = 10
@@ -344,8 +511,15 @@ struct VoiceAPIClient {
             throw VoiceAPIError.malformedResponse
         }
 
+        // A refusal the server phrased itself wins over anything this switch
+        // would infer. It knows why it said no; a status code does not.
+        if !(200...299).contains(http.statusCode),
+           let spoken = Self.spokenIn(data) {
+            throw VoiceAPIError.refused(spoken: spoken)
+        }
+
         switch http.statusCode {
-        case 200:
+        case 200, 201:
             break
         case 400:
             // The server rejected the term's length. Distinct from a server

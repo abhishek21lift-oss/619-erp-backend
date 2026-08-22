@@ -137,5 +137,22 @@ struct MyPtStudioShortcuts: AppShortcutsProvider {
             shortTitle: "Today's Workouts",
             systemImageName: "calendar.day.timeline.left"
         )
+
+        // Phase 5 — the only phrase here that can change anything.
+        //
+        // It still goes through Siri's confirmation before saving, and unlike
+        // the four above it will not run from a locked device: the intent's
+        // authenticationPolicy requires the user to authenticate first.
+        AppShortcut(
+            intent: PrepareWorkoutIntent(),
+            phrases: [
+                "Create a workout for \(\.$client) in \(.applicationName)",
+                "Make a workout for \(\.$client) in \(.applicationName)",
+                "Prepare a plan for \(\.$client) in \(.applicationName)",
+                "\(.applicationName) create a workout for \(\.$client)",
+            ],
+            shortTitle: "Create Workout",
+            systemImageName: "figure.strengthtraining.traditional"
+        )
     }
 }

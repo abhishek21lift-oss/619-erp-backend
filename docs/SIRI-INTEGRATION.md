@@ -1,4 +1,4 @@
-# Siri integration — Phases 1–4
+# Siri integration — Phases 1–5
 
 Enables:
 
@@ -6,6 +6,7 @@ Enables:
 > **Phase 2** — "Hey Siri, find Rahul in MY PT STUDIO."
 > **Phase 3** — "Hey Siri, show me Rahul's details in MY PT STUDIO."
 > **Phase 4** — "Hey Siri, show me today's workouts in MY PT STUDIO."
+> **Phase 5** — "Hey Siri, create a workout for Rahul." *(the first write)*
 
 ## Architecture
 
@@ -66,6 +67,35 @@ Siri
   → { date, timezone, count, booked_count, sessions[], truncated,
       trainer_linked, spoken }
   → Siri speaks `spoken`
+
+Siri
+  → PrepareWorkoutIntent (App Intent, on device)      [Phase 5]
+      → NOT available from the lock screen
+      → client resolved via ClientEntityQuery (disambiguates first)
+  → POST /api/voice/workouts/prepare           (https, bearer token)
+      → auth → requireStaff → adminManagerOrTrainer
+      → voiceWriteLimiter     — 12/min, not the read surface's 200
+      → clientInOrg()         — ownership, 404 not 403
+      → trainer narrowing     — a trainer authors only for their own client
+      → checkScreeningGate()  — PAR-Q block stops it here
+      → contraindication filter REMOVES exercises from the candidate list
+      → selection (model, or deterministic when the model is unavailable)
+      → INSERT voice_workout_drafts        ← the ONLY write
+      → activity_log
+  → { draft_id, preview, excluded, saved: false, spoken }
+  → Siri SPEAKS the draft and ASKS
+      → user declines → nothing happens, the draft expires
+      → user confirms ↓
+  → POST /api/voice/workouts/confirm    body: { draft_id }  ← nothing else
+      → BEGIN
+      → UPDATE … SET status='confirmed' WHERE id AND pending
+                     AND organization_id AND created_by     ← the claim
+      → checkScreeningGate() AGAIN, against live data
+      → re-validate every exercise against the live library
+      → INSERT workout_plans / workout_exercises / workout_assignments
+      → COMMIT
+      → activity_log
+  → { saved: true, workout_plan_id, spoken }
 ```
 
 The intent sends a **path and a token**. It never sends an organization id, a
@@ -360,6 +390,160 @@ studio-approval path, so a studio owner who trains can easily have no link.
 
 **Audit:** writes `voice.workouts.today` with the date and the count.
 
+### `POST /api/voice/workouts/prepare` and `/confirm` *(Phase 5 — the first write)*
+
+**Auth / authorization:** staff, **plus** `adminManagerOrTrainer` — the same
+middleware `POST /api/workouts/plans` uses. The permission to author a plan by
+voice is exactly the permission to author one in the app, not a second looser
+rule that happens to live on a different surface. Reception can ask this
+surface questions and cannot create a workout.
+
+A trainer may author only for their own client (404, not 403). The client id is
+checked with `clientInOrg()` before anything about them is read.
+
+**Rate limit:** `voiceWriteLimiter` — **12/min**, not the read surface's 200. A
+read that runs away wastes a query; a write that runs away rewrites a client's
+programme.
+
+#### Why this is two endpoints
+
+The tempting design returns the generated plan to the phone and has `/confirm`
+accept it back. That is not a confirmation step — it is an exercise-injection
+endpoint with an extra round trip, because whatever comes back is whatever the
+caller chose to send. Every safety decision made during preparation (the PAR-Q
+gate, the contraindication filter, the library check) would become advisory:
+whatever they removed, the second call could put back.
+
+So the draft is written to `voice_workout_drafts` and **`/confirm` accepts one
+field**:
+
+```json
+{ "draft_id": "…" }
+```
+
+The body schema is `.strict()`, so `exercises`, `plan`, `client_id` or anything
+else is a `400`. There is no request that can save an exercise this server did
+not generate and check.
+
+#### Prepare saves nothing
+
+`POST /api/voice/workouts/prepare` → `201`
+
+```json
+{
+  "draft_id": "…",
+  "expires_at": "…",
+  "preview": { "client_name": "Rahul Sharma", "plan_name": "Rahul's 4-day plan",
+               "days": 4, "difficulty": "beginner", "source": "derived",
+               "based_on_plan_name": "Push Pull Legs", "exercises": [ … ] },
+  "screening_warnings": [],
+  "excluded": [{ "exercise_id": "…", "name": "Box Jump",
+                 "contraindication": "knee injury", "matched": "knee injury" }],
+  "saved": false,
+  "spoken": "I prepared a 4-day workout for Rahul based on their current programme, Push Pull Legs. I left out one exercise that conflicts with their medical record. Shall I save it?"
+}
+```
+
+The only row it writes is the draft (plus its audit row). No plan, no exercise
+row, no assignment — asserted directly against what reached the pool.
+
+#### The safety chain, in order
+
+1. **`clientInOrg()`** — ownership, before any client data is read.
+2. **Trainer narrowing** — a trainer authors only for their own roster.
+3. **`checkScreeningGate()`** — the *same function* `POST /api/workouts/assign`
+   calls. A client the PAR-Q flags as `blocked` gets a `403` and nothing is
+   generated. A surface that can route around a clearance rule is a surface
+   that removes it.
+4. **The contraindication filter** — `pt_clients.health_conditions` and
+   `.injuries` are tokenised and matched against `exercises.contraindications[]`
+   in **both** directions ("knee" in "knee injury", and "knee injury" in
+   "previous knee injury, cleared"). Conflicting exercises are removed from the
+   candidate list **before either selector sees it**, so nothing can choose one.
+5. **Selection** — a model chooses from the filtered list *by id*, or the
+   deterministic library selection does.
+6. **Re-validation at confirm** — see below.
+
+#### The model may choose an exercise; it may never name one
+
+The model is handed a numbered list of ids that already exist in this studio's
+library and asked to pick among them. Any id it returns that is not in that
+list is discarded: a hallucinated exercise resolves to nothing, because the
+only exercises that exist are the ones the library already had. Nothing from
+the model reaches the database as a name, a description or a set count.
+
+It also **never sees the client's medical text**. The contraindicated
+exercises are already gone from the list, so there is nothing to reason about
+— and a client's injuries are not something to hand to a third-party API when
+excluding server-side achieves the same result.
+
+If the model is unconfigured, over quota, down, returns unparseable output, or
+returns too few days, the deterministic selection runs instead and `source`
+says `"derived"`. Same posture as `coach-ai.js`: a feature that disappears when
+an API does teaches people not to rely on it.
+
+#### Confirm is the only thing that persists
+
+`POST /api/voice/workouts/confirm` → `201 { saved: true, workout_plan_id, … }`
+
+Inside one transaction:
+
+```sql
+UPDATE voice_workout_drafts SET status='confirmed', confirmed_at=NOW()
+ WHERE id = $1 AND status = 'pending' AND expires_at > NOW()
+   AND organization_id = $2 AND created_by = $3
+```
+
+That single statement is the whole single-use guarantee **and** the
+authorization. Two confirmations racing produce one plan and one `409`: the
+loser's `UPDATE` matches nothing and never reaches the `INSERT`. A draft id
+leaked to a colleague — even in the same studio — matches nothing either.
+
+Then, before writing anything:
+
+- **The screening gate runs again**, against live data. A PAR-Q filed in the
+  last half hour stops the save. A draft is a proposal, never a clearance
+  already granted.
+- **Every exercise is re-validated** against the live library. One archived,
+  made private or deleted since preparation is dropped; if all of them are
+  gone, the save is refused rather than writing an empty plan.
+
+Expired, already-confirmed, not-yours and nonexistent all return the same
+`409` with the same sentence. Distinguishing them would let a caller probe
+which draft ids exist, and none of the four is separately actionable by voice.
+
+A confirmed plan is **assigned** to the client, not left floating — "a workout
+for Rahul" that Rahul never receives does not answer the command.
+
+#### Audit
+
+| Action | When |
+| --- | --- |
+| `voice.workouts.prepare` | draft created — records the client, day count, `source`, exercise count, **excluded count**, the plan it was based on, and how many screening warnings |
+| `voice.workouts.prepare.blocked` | PAR-Q refused it |
+| `voice.workouts.prepare.failed` | nothing safe could be generated |
+| `voice.workouts.confirm` | plan saved — records the draft id, client, source, and **how many exercises vanished between preparing and saving** |
+| `voice.workouts.confirm.rejected` | a claim matched no draft |
+| `voice.workouts.confirm.blocked` | the re-run gate stopped it |
+| `voice.workouts.confirm.invalid` | the draft's exercises were all gone |
+
+The draft row itself keeps the generated plan, the withheld exercises and their
+reasons. "Who chose this exercise for this injured client" is the first
+question anyone will ask, and it is answerable.
+
+#### The one new table
+
+`voice_workout_drafts` (migration `180`) — RLS enabled, `anon` and
+`authenticated` revoked, `deny_all_direct_access` policy, per the repo
+convention. It matters more here than on most tables: direct **write** access
+would let someone author a draft and confirm it through the API, walking past
+the PAR-Q gate and the contraindication filter, which both run on the way *in*.
+
+Drafts expire after **30 minutes**. A draft is a proposal about a person's body
+built from facts read at one moment; a confirmation arriving a week later would
+save a plan built from a week-old reading of all three. Nothing deletes lapsed
+drafts — a workout somebody was offered and did not save is worth keeping.
+
 ## Backend — build and test
 
 ```bash
@@ -373,8 +557,10 @@ npm test -- src/__tests__/security/voice
 npm test
 ```
 
-No migration, no schema change, no new environment variable. The endpoint reads
-`pt_clients`, which already exists.
+Phases 1–4 need no migration. **Phase 5 adds one** — `180_voice_workout_drafts.sql`
+— because the two-step confirmation needs somewhere server-side to hold a draft
+between preparing and saving. No other schema change and no new environment
+variable.
 
 ## iOS — setup
 
@@ -384,7 +570,7 @@ app target that will host them.
 
 ### 1. Add the sources
 
-Add all five to the app target (and to the App Intents extension target, if
+Add all six to the app target (and to the App Intents extension target, if
 you use a separate one):
 
 - `Keychain.swift`
@@ -395,6 +581,7 @@ you use a separate one):
 - `GetClientDetailIntent.swift` *(Phase 3)* — also holds `ClientEntity` and
   `ClientEntityQuery`, which are what make Siri ask *which* Rahul
 - `GetTodaysWorkoutsIntent.swift` *(Phase 4)*
+- `PrepareWorkoutIntent.swift` *(Phase 5)* — the only intent that writes
 
 ### 2. Info.plist keys
 
@@ -450,8 +637,9 @@ Build to a device (Siri does not work in the Simulator), sign in once, then:
 > "Hey Siri, find Rahul in MY PT STUDIO."
 > "Hey Siri, show me Rahul's details in MY PT STUDIO."
 > "Hey Siri, show me today's workouts in MY PT STUDIO."
+> "Hey Siri, create a workout for Rahul in MY PT STUDIO." *(asks before saving)*
 
-All four phrases are registered by `MyPtStudioShortcuts`, so no Shortcut has
+All five phrases are registered by `MyPtStudioShortcuts`, so no Shortcut has
 to be created first. Alternative phrasings are also registered — "client count
 in MY PT STUDIO", "search for Rahul in MY PT STUDIO", "how is Rahul doing in
 MY PT STUDIO", "what workouts do I have today in MY PT STUDIO", "who has a
@@ -487,7 +675,7 @@ value cached on the device, so a saved Shortcut pointing at a client who has
 since been deleted, transferred, or who was never this account's to read
 resolves to nothing. **A saved Shortcut is not a standing grant.**
 
-## Security notes — what holds across all four phases
+## Security notes — what holds across all five phases
 
 - **Siri never touches SQL.** It cannot express a query. It calls one of three
   named endpoints whose SQL is fixed in this repository; the only caller-supplied
@@ -513,6 +701,14 @@ resolves to nothing. **A saved Shortcut is not a standing grant.**
 - **Unknown is never spoken as zero.** A missing balance is left out of the
   sentence rather than announced as "0 sessions left"; an unreadable workout log
   is spoken as unchecked rather than as "nothing logged".
+- **Only one thing writes, and it asks first.** Phases 1–4 are `GET`s. Phase 5
+  is a `POST` pair where preparing saves nothing and confirming accepts a
+  single draft id — so no one voice command changes anything, and the second
+  step cannot describe what to change. The write intent is the one intent that
+  will not run from a locked device.
+- **Safety gates cannot be routed around.** The voice write calls the same
+  `checkScreeningGate()` the app's own assign route calls, and calls it twice:
+  once before generating and once against live data before saving.
 - **Time is server-resolved.** No endpoint accepts a date, a timezone or the
   device's clock. "Today" is the studio's calendar day, computed server-side,
   so a wrong handset clock cannot shift which day is reported.
@@ -522,42 +718,40 @@ resolves to nothing. **A saved Shortcut is not a standing grant.**
   trace, so the audit row is the only record it happened.
 
 
-## Phase 5 — exact next step
+## Phase 6 — exact next step
 
-Phases 1–4 are all **read-only**, and Phase 4 completed the set: the studio can
-now be asked how many, who, about one person, and what today looks like.
-Everything a trainer can usefully be *told* is covered. Phase 5 is therefore
-where writing has to start, and a write reachable from a locked phone is a
-different security problem from a read, not a bigger one.
+Phase 5 established the shape a voice write has to take: prepare, describe,
+confirm, and accept nothing on the confirm but an id. Phase 6 should **use that
+shape rather than extend the surface**, because the thing most likely to go
+wrong now is not a missing command — it is that a plan saved by voice is
+invisible to everyone who did not hear it.
 
-The recommendation is **one narrow write, with confirmation**, and it follows
-directly from what Phase 4 now reports:
+1. **Surface voice-created plans in the app.** A plan whose only record is an
+   `activity_log` row and a `description` reading "Prepared by voice" is one a
+   studio owner cannot review. Add a `created_via` column (or read the draft
+   join) and mark these plans in the Workout Plans list, with the draft's
+   `excluded` list visible on the plan itself. A trainer who was told out loud
+   that three exercises were withheld is the only person who currently knows.
+2. **Then, and only then, a second write:** `POST /api/voice/workouts/:id/discard`
+   — the counterpart to confirm, so "no, throw that away" is an action rather
+   than an expiry. It is the safest possible second write: it destroys a
+   proposal, never a plan, and it makes the decline path explicit in the audit
+   trail instead of inferring it from a draft that quietly lapsed.
+3. **A `voice.write` scope on the token**, so a studio can allow voice reads
+   without allowing voice writes. Today the two are separated only by role.
+   Some studios will want a trainer who can ask questions from the gym floor
+   but cannot author a programme by speaking.
+4. **Draft retention and cleanup.** Nothing deletes lapsed drafts today, which
+   is right for audit and wrong for growth. A retention job with an explicit
+   policy — keep confirmed drafts indefinitely, expire pending ones after
+   90 days — is a decision to make deliberately rather than discover.
+5. **Tests for the discard path** plus one this phase could not have: a
+   **concurrency test** proving two simultaneous confirmations of the same
+   draft produce exactly one plan. The claim is written to guarantee it and the
+   guarantee is currently argued rather than demonstrated, because the pool is
+   mocked.
 
-1. `POST /api/voice/clients/:clientId/sessions/today/complete` in
-   `src/routes/voice.js`. Phase 4 already says "today's workout is pending";
-   marking it done is the one state change whose whole effect fits in a
-   sentence Siri can read back. Same `clientInOrg()` ownership check, same
-   `orgWhere`, same trainer narrowing, same 404-not-403.
-2. **Idempotent by date, not by request.** Completing an already-completed
-   session returns `200` with "that was already marked done" rather than
-   writing twice. Siri repeats itself when it mishears a confirmation, and a
-   voice write that double-applies is one that cannot be trusted.
-3. **A separate, much tighter rate limit** than `userApiLimiter`'s 200/min. A
-   read that runs away wastes a query; a write that runs away rewrites a day.
-4. `requestConfirmation(result:)` in the intent so Siri states what it is about
-   to do and waits, and `authenticationPolicy = .requiresAuthentication` — this
-   one must **not** run from the lock screen. A read spoken to a locked phone
-   leaks; a write accepts an instruction from anyone within earshot, and Face
-   ID is the difference.
-5. Chain it off Phase 4 rather than adding a second search: the intent takes
-   the `ClientEntity` Phase 3 already defines, so "show me today's workouts" →
-   "mark Rahul done" works without naming anyone twice.
-6. `voice.clientComplete.authz.test.js`, extending the Phase 3/4 pattern, plus
-   two tests that cannot exist yet because nothing has written before: **the
-   double-apply case**, and **an unauthorized caller must not change state** —
-   asserting the pool never saw an `UPDATE`, not merely that the response
-   was 403.
-
-Deliberately **not** in Phase 5: booking, cancelling, payments, or anything
-returning contact details. Each needs its own decision about confirmation and
-replay, and none should ride in on the first write.
+Deliberately **not** in Phase 6: booking, cancelling, payments, deleting a
+saved plan, or anything returning contact details. Destroying a *proposal* is
+the right size for a second write; destroying a *plan* is not, and should never
+be reachable by voice at all.

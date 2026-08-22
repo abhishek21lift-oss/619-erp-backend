@@ -42,7 +42,13 @@ jest.mock('../../lib/logger', () => ({
 // asserted separately in voice.mount.test.js.
 
 let mockUser;
+// Spread over the REAL module rather than replacing it. A bare object mock
+// silently drops every export the router also imports — when the router later
+// grew an `adminManagerOrTrainer` guard, that arrived here as `undefined`
+// middleware and every test in the file failed at router construction, naming
+// nothing useful. Only `auth` itself needs faking.
 jest.mock('../../middleware/auth', () => ({
+  ...jest.requireActual('../../middleware/auth'),
   auth: (req, res, next) => {
     // No token → 401 before anything else, the same shape the real middleware
     // produces. This is what an expired Keychain token looks like to the API.

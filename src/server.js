@@ -576,6 +576,25 @@ const userApiLimiter = rateLimit({
   message: { error: 'Too many requests. Please slow down.' },
 });
 
+// Siri Phase 5 — the voice WRITE routes.
+//
+// Much tighter than userApiLimiter's 200/min, because the failure is not the
+// same shape. A read that runs away wastes a query; a write that runs away
+// rewrites a client's training programme, once per request, from a surface
+// that anyone within earshot of an unlocked phone can trigger. Twelve a
+// minute is more preparing and saving than a real trainer does in an hour.
+const voiceWriteLimiter = rateLimit({
+  store: makeStore('voicewrite'),
+  passOnStoreError: true,
+  windowMs: 60 * 1000,
+  max: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id ?? req.ip,
+  skip: (req) => !req.user,
+  message: { error: 'Too many requests. Please slow down.' },
+});
+
 const loginLimiter = rateLimit({
   store: makeStore('login'),
   passOnStoreError: true,
@@ -689,6 +708,11 @@ app.use('/api/search',            auth, requireStaff, require('./routes/search')
 // noisy device throttle unrelated studios. The router applies auth +
 // requireStaff itself; both are named here too so the mount states its own
 // posture rather than requiring a reader to open the file to learn it.
+// The write routes get the tighter limiter FIRST, then fall through to the
+// voice router below. Mounted as a bare middleware on the two paths rather
+// than inside the router so the limit is visible here beside every other one.
+app.use('/api/voice/workouts/prepare', auth, voiceWriteLimiter);
+app.use('/api/voice/workouts/confirm', auth, voiceWriteLimiter);
 app.use('/api/voice',             userApiLimiter, auth, requireStaff, require('./routes/voice'));
 
 // ONE router, deliberately. This mount used to carry a second file,
