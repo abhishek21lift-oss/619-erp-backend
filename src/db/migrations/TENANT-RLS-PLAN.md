@@ -104,10 +104,33 @@ in payments/invoices) need to opt out of the wrapper rather than nest.
    159, 161, 174. CI stands the whole thing up per run via
    `scripts/rls-proof-setup.sh` and runs `rls.isolation.integration.test.js`
    against it as a real `app_tenant` connection.
-3. Measure the added latency from per-query transactions. If it is material,
-   consider scoping the wrapper to reads of tenant tables rather than all
-   queries. **Still outstanding, and now the main open question** — see
-   "What this costs today", below.
+3. ~~Measure the added latency from per-query transactions.~~ **Done** —
+   `src/__tests__/rls.overhead.integration.test.js`, against the same real
+   `app_tenant` database CI already stands up. The answer, and the reason it
+   is stated as a count rather than a duration:
+
+   > The wrapper turns one round trip into **four** — BEGIN, set_config, the
+   > query, COMMIT — and a tenant query takes about **3× as long**. Measured
+   > against the proof database: unwrapped 0.552 ms, wrapped 1.659 ms, added
+   > 1.107 ms, ratio 3.0×.
+   >
+   > The count is the part that travels. BEGIN and COMMIT are cheaper to
+   > execute than a real SELECT, so on a fast link the added cost is nearer 2×
+   > one query's time than 3× — but as RTT grows the three extra trips
+   > dominate and **added ≈ 3 × RTT** becomes the accurate model. Localhost is
+   > therefore the floor, not the estimate. At 1 ms RTT expect about +3 ms per
+   > tenant query; through a cross-region Supavisor hop at 15 ms, about +45 ms.
+
+   CI measures on localhost, where a round trip is tens of microseconds, so
+   the duration it prints understates production by roughly the ratio of the
+   two RTTs — which is exactly why the assertion is on the count and the
+   timings are printed with the caveat attached rather than asserted.
+
+   So step 3's "if it is material" resolves on one number the operator has and
+   CI does not: the app's RTT to the database. Measure that first. If it is
+   low single-digit milliseconds, the flat cost is tolerable and the wrapper
+   can stay as it is. If it is not, scope the wrapper to reads of tenant
+   tables before step 5 rather than after.
 4. **Set `ADMIN_DATABASE_URL` before touching `DATABASE_URL`.** This was not in
    the original list and it is now a hard precondition: platform-wide work
    (the operator console, every background worker, migrations, the pre-auth
@@ -125,17 +148,22 @@ in payments/invoices) need to opt out of the wrapper rather than nest.
 
 ## What this costs today
 
-Worth knowing before step 3, because the cost is currently being paid for
-nothing. With `TENANT_RLS_ENFORCE` defaulting on and `ADMIN_DATABASE_URL`
-unset, `db/pool.js` wraps every tenant query in `BEGIN → set_config → query →
-COMMIT` on a dedicated pooled client — four round trips instead of one, holding
-one of twenty connections for the whole transaction. Meanwhile the app still
-connects as `postgres`, which owns the tables and therefore bypasses every
-policy the wrapper is feeding.
+With `TENANT_RLS_ENFORCE` defaulting on and `ADMIN_DATABASE_URL` unset,
+`db/pool.js` wraps every tenant query in `BEGIN → set_config → query → COMMIT`
+on a dedicated pooled client — four round trips instead of one, holding one of
+twenty connections for the whole transaction. Meanwhile the app connects as
+`postgres`, which owns the tables and therefore bypasses every policy the
+wrapper is feeding. Pure overhead, buying nothing.
 
-So the ordering matters in both directions: until the cutover, enforcement is
-pure overhead; after it, it is the backstop. The one configuration to avoid is
-the one that is currently the default.
+**In production that state is now unreachable**: `server.js` refuses to boot
+when `isProd && rlsEnforcementEnabled()` and the two URLs are the same. So a
+production box is necessarily in one of two configurations — enforcement
+switched `off`, or `ADMIN_DATABASE_URL` already split out — and neither pays
+for nothing. The paragraph above still describes staging and development,
+where `isProd` is false and the guard does not run.
+
+The ordering matters in both directions: until the cutover, enforcement is
+overhead; after it, it is the backstop.
 
 ## What guards the gap until then
 
