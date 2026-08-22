@@ -1,9 +1,10 @@
-# Siri integration — Phases 1–2
+# Siri integration — Phases 1–3
 
 Enables:
 
 > **Phase 1** — "Hey Siri, how many clients do I have in MY PT STUDIO?"
 > **Phase 2** — "Hey Siri, find Rahul in MY PT STUDIO."
+> **Phase 3** — "Hey Siri, show me Rahul's details in MY PT STUDIO."
 
 ## Architecture
 
@@ -31,6 +32,23 @@ Siri
       → Postgres              — fixed SQL, q bound as $1, LIMIT 5
       → activity_log          — audit row
   → { query, count, results[], spoken }
+  → Siri speaks `spoken`
+
+Siri
+  → GetClientDetailIntent (App Intent, on device)     [Phase 3]
+      → the CLIENT is an entity parameter, not a name
+      → ClientEntityQuery resolves the spoken name via /clients/search
+      → several matches → Siri asks WHICH ONE, before any detail is read
+  → GET /api/voice/clients/:clientId           (https, bearer token)
+      → auth → requireStaff
+      → zod validation        — id shape and length bounded, else 400
+      → clientInOrg(req, id)  — OWNERSHIP FIRST, before any client read
+      → orgWhere(req, …)      — organization_id from the SESSION
+      → trainer narrowing     — a trainer sees only their own roster
+      → Postgres              — fixed SQL; two best-effort side reads
+      → activity_log          — audit row
+  → { id, name, status, active, package_type, expires_on, expired,
+      sessions_remaining, today, spoken }
   → Siri speaks `spoken`
 ```
 
@@ -145,6 +163,77 @@ client rather than about the record.
 **Audit:** writes `voice.clients.search` with the query and the result count —
 what was asked, not the roster that came back.
 
+### `GET /api/voice/clients/:clientId` *(Phase 3)*
+
+**Auth / authorization:** as above — staff only, org filter from the session,
+trainer narrowing — plus **an explicit ownership check on the id itself**,
+before any client data is read.
+
+This endpoint is the first on this surface that takes an id chosen by the
+caller rather than a term to match, so the id is checked against the caller's
+organization by `clientInOrg()` first. `src/modules/automation/` carries the
+header comment explaining why: handlers there once took a `client_id` from the
+request without that check and returned every studio's client names and mobile
+numbers to any authenticated account of any role.
+
+**404, never 403.** A client id belonging to another studio returns the same
+`404` as an id that does not exist anywhere. A `403` would confirm the id is
+real, which turns the endpoint into an existence oracle for anyone willing to
+guess ids. The `spoken` sentence is identical in both cases for the same
+reason.
+
+**Validation:** `clientId` is bounded at 64 characters and must match
+`^[A-Za-z0-9_-]+$`. It reaches SQL as a bound parameter (`$1`).
+
+**Response `200`**
+
+```json
+{
+  "id": "ptc-1",
+  "name": "Rahul Sharma",
+  "status": "active",
+  "active": true,
+  "package_type": "PT Gold",
+  "expires_on": "2026-09-14",
+  "expired": false,
+  "sessions_remaining": 8,
+  "today": { "status": "in_progress", "program_name": "Push Day" },
+  "spoken": "Rahul Sharma is on PT Gold. Their package expires on 14 September, they have 8 sessions left, and today's workout is pending."
+}
+```
+
+**What it deliberately does not return:** no mobile, no email, no address, no
+payment amounts, no trainer id, no organization id and no row ids from the
+joined tables. Those columns are not selected. The one identifier in the
+response is the `pt_clients` id the search endpoint already returned, and it
+is **never spoken** — it is there for the intent to pass back on the next call.
+
+**Unknown is not zero.** Two of the fields come from side reads that may find
+nothing:
+
+| Field | `null` means | `0` / `"none"` means |
+| --- | --- | --- |
+| `sessions_remaining` | no active balance on file | they have run out |
+| `today.status` | — | `"none"`: nothing logged today |
+
+`sessions_remaining: null` is left **out of the spoken sentence entirely**
+rather than spoken as zero — "they have 0 sessions left" is a claim about the
+client, and nothing was measured. Likewise `expired` is `null`, not `false`,
+when no `pt_end_date` is on file.
+
+Both side reads are best-effort: if the balance or the workout log cannot be
+read, the package facts still answer, and today's state is spoken as "today's
+workout could not be checked" rather than as "nothing logged".
+
+**The spoken sentence** is assembled server-side like the others, so wording is
+correctable without an App Store release. It is **gender-neutral** — the record
+has a `gender` column, but inferring a pronoun from it would be wrong for some
+clients and is not worth being wrong about out loud. "Their package" is always
+correct.
+
+**Audit:** writes `voice.clients.detail` with the client id and
+`channel: "voice"`. A retrieval that names one person is worth a row of its own.
+
 ## Backend — build and test
 
 ```bash
@@ -169,7 +258,7 @@ app target that will host them.
 
 ### 1. Add the sources
 
-Add all three to the app target (and to the App Intents extension target, if
+Add all four to the app target (and to the App Intents extension target, if
 you use a separate one):
 
 - `Keychain.swift`
@@ -177,6 +266,8 @@ you use a separate one):
 - `GetClientCountIntent.swift` — also holds `MyPtStudioShortcuts`, which
   registers the spoken phrases for **both** intents
 - `FindClientIntent.swift` *(Phase 2)*
+- `GetClientDetailIntent.swift` *(Phase 3)* — also holds `ClientEntity` and
+  `ClientEntityQuery`, which are what make Siri ask *which* Rahul
 
 ### 2. Info.plist keys
 
@@ -230,57 +321,106 @@ Build to a device (Siri does not work in the Simulator), sign in once, then:
 
 > "Hey Siri, how many clients do I have in MY PT STUDIO?"
 > "Hey Siri, find Rahul in MY PT STUDIO."
+> "Hey Siri, show me Rahul's details in MY PT STUDIO."
 
-Both phrases are registered by `MyPtStudioShortcuts`, so no Shortcut has to be
-created first. Alternative phrasings are also registered — "client count in
-MY PT STUDIO", "search for Rahul in MY PT STUDIO", "show Rahul PT details in
+All three phrases are registered by `MyPtStudioShortcuts`, so no Shortcut has
+to be created first. Alternative phrasings are also registered — "client count
+in MY PT STUDIO", "search for Rahul in MY PT STUDIO", "how is Rahul doing in
 MY PT STUDIO".
 
 `FindClientIntent` takes the name as a spoken parameter. A phrase with no name
 ("find someone in MY PT STUDIO") prompts for one rather than failing.
 
-## Security notes
+### Several people called Rahul
 
-- **No hardcoded secrets.** No API key, client secret or base URL literal in
-  any Swift file. The base URL is build configuration; the token is the user's
-  own session, written by their own sign-in.
+`GetClientDetailIntent` takes a **`ClientEntity`**, not a string. Siri resolves
+the spoken name through `ClientEntityQuery.entities(matching:)`, which calls
+the Phase 2 search endpoint:
+
+| Matches | What happens |
+| --- | --- |
+| 0 | Siri re-prompts for a name |
+| 1 | resolved silently, detail fetched |
+| 2+ | **Siri asks which one**, showing name + package, then fetches |
+
+The choice happens **before** any detail is requested, so no one's expiry date
+is read out on the assumption that they were the Rahul meant. Each candidate is
+shown as a name and a package type and nothing else — enough to tell two people
+apart, and not worth reading over someone's shoulder.
+
+`suggestedEntities()` returns `[]` on purpose. Filling it would push the
+studio's roster into the Shortcuts UI — names on screen, cached by the system,
+visible to whoever is holding the phone — to save a search nobody asked to
+skip.
+
+`entities(for:)` re-fetches each id through the API rather than trusting a
+value cached on the device, so a saved Shortcut pointing at a client who has
+since been deleted, transferred, or who was never this account's to read
+resolves to nothing. **A saved Shortcut is not a standing grant.**
+
+## Security notes — what holds across all three phases
+
+- **Siri never touches SQL.** It cannot express a query. It calls one of three
+  named endpoints whose SQL is fixed in this repository; the only caller-supplied
+  values are a search term and a client id, both bound as parameters and both
+  length- and shape-checked first.
 - **No cross-organization access.** The org id is resolved from the session by
-  `tenantScope`. A tenant user sending `x-org-id` is ignored — asserted by
-  `voice.authz.test.js`.
+  `tenantScope`. A tenant user sending `x-org-id` is ignored. Phase 3 adds an
+  ownership check on the id itself, and answers 404 — not 403 — so the API does
+  not confirm that a foreign id exists.
 - **Fail closed.** A tenant user with no organization filters on `NULL`, which
-  matches no rows. The dangerous failure would be dropping the filter.
-- **Read-only.** Everything under `/api/voice` is a GET returning one scalar. A
-  voice surface that can write is one that can be made to write by anyone
-  within earshot.
-- **No roster detail.** The response is a count and a sentence — no names, no
-  ids, no list. A spoken answer cannot be scrolled past or redacted, and a
-  bystander hears whatever comes back.
-- **Siri never touches SQL.** It cannot express a query; it can only call a
-  named endpoint whose SQL is fixed in this repository.
+  matches nothing. A trainer account with no trainer record returns nothing
+  rather than falling through to the whole studio. Both are asserted by tests,
+  and both were verified by mutation: removing either guard fails the suite.
+- **No secrets on the device.** No API key, client secret or base URL literal
+  in any Swift file. The base URL is build configuration; the token is the
+  user's own session, written by their own sign-in, stored
+  `AfterFirstUnlockThisDeviceOnly` so it is excluded from iCloud Keychain and
+  encrypted backups.
+- **Nothing private is spoken.** No mobile, email, address or amount is
+  selected by any of the three endpoints, so there is nothing to leak by
+  accident. Internal ids are never spoken — the one id in a response exists for
+  the intent to pass back, not for Siri to read out.
+- **Unknown is never spoken as zero.** A missing balance is left out of the
+  sentence rather than announced as "0 sessions left"; an unreadable workout log
+  is spoken as unchecked rather than as "nothing logged".
+- **Audit.** Every call writes an `activity_log` row — `voice.dashboard.client_count`,
+  `voice.clients.search`, `voice.clients.detail`. A voice request leaves no UI
+  trace, so the audit row is the only record it happened.
 
-## Phase 3 — exact next step
 
-Phases 1–2 are both **read-only** and both answer with a sentence. Phase 3 is
-where that stops being enough, so the next step is deliberately still read-only
-— one more retrieval, with a richer result — before anything writes:
+## Phase 4 — exact next step
 
-1. `GET /api/voice/clients/:id/summary` in `src/routes/voice.js`, taking the
-   `id` Phase 2 already returns. Same `orgWhere` filter, same trainer
-   narrowing, and an ownership check on the id itself: a client id from
-   another studio must 404, never 403, so the API does not confirm that the id
-   exists somewhere.
-2. Return the next session, sessions remaining and the balance — the three
-   things a trainer asks after finding someone. Still no contact details.
-3. Extend the Swift client with `clientSummary(id:)` — one more method on
-   `VoiceAPIClient`, not a second client.
-4. Add `GetClientSummaryIntent` that accepts the `VoiceClient` from
-   `FindClientIntent` as its parameter, so "find Rahul" → "how many sessions
-   does he have left" chains without a second search.
-5. Extend `voice.clientSearch.authz.test.js`'s pattern into a new
-   `voice.clientSummary.authz.test.js`, with the cross-organization test
-   asserting the 404-not-403 behaviour.
+Phases 1–3 are all **read-only**. Phase 4 is where that has to stop being the
+rule, because the thing a trainer actually wants to say next is "mark Rahul's
+session done" — and a write reachable from a locked phone is a different
+security problem from a read, not a bigger one.
 
-Deliberately **not** in Phase 3: anything that writes (booking, cancelling,
-marking attendance), and anything returning contact details. A write reachable
-from a locked phone needs a separate decision about confirmation and replay,
-and it should not ride in on a retrieval phase.
+The recommendation is therefore **one narrow write, with confirmation**, rather
+than a set of them:
+
+1. `POST /api/voice/clients/:clientId/sessions/today/complete` in
+   `src/routes/voice.js` — the single state change Phase 3 already reports and
+   the only one whose effect is fully described by a sentence Siri can say
+   back. Same `clientInOrg()` ownership check, same org filter, same trainer
+   narrowing, same 404-not-403.
+2. **Idempotent by date, not by request.** Completing an already-completed
+   session returns `200` with "that was already marked done" rather than
+   writing twice. Siri repeats itself when it mishears a confirmation, and a
+   voice write that double-applies is a voice write that cannot be trusted.
+3. **A separate rate limit**, much tighter than `userApiLimiter`'s 200/min. A
+   read that runs away wastes a query; a write that runs away rewrites a day.
+4. `requestConfirmation(result:)` in the intent, so Siri states what it is
+   about to do and waits. Set `authenticationPolicy` to
+   `.requiresAuthentication` — this one should **not** run from the lock
+   screen. A read spoken to a locked phone leaks; a write accepts an
+   instruction from anyone within earshot, and Face ID is the difference.
+5. `voice.clientComplete.authz.test.js`, extending the Phase 3 pattern, plus
+   two tests that do not exist yet on this surface because nothing has written
+   before: **the double-apply case**, and **an unauthorized caller must not
+   change state** — asserting the pool never saw an `UPDATE`, not merely that
+   the response was 403.
+
+Deliberately **not** in Phase 4: booking, cancelling, payments, or anything
+returning contact details. Each needs its own decision about confirmation and
+replay, and none should ride in on the first write.

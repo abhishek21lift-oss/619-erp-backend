@@ -30,6 +30,7 @@ const { auth } = require('../middleware/auth');
 const { requireStaff } = require('../middleware/rbac');
 const { validate } = require('../middleware/validate');
 const { orgWhere } = require('../lib/tenant-db');
+const { clientInOrg } = require('../lib/orgGuard');
 const { logActivity } = require('../lib/activityLog');
 const { z } = require('../lib/validation');
 const logger = require('../lib/logger');
@@ -214,6 +215,235 @@ router.get('/clients/search', validate(searchSchema), async (req, res, next) => 
     next(err);
   }
 });
+
+const detailSchema = {
+  params: z.object({
+    // Bounded and character-classed. These ids are uuid-or-text primary keys,
+    // so this is not a uuid() check — but it does stop a path segment that is
+    // obviously not an id from reaching a query at all.
+    clientId: z.string()
+      .min(1)
+      .max(64)
+      .regex(/^[A-Za-z0-9_-]+$/, 'Invalid client id'),
+  }),
+};
+
+/**
+ * GET /api/voice/clients/:clientId
+ *
+ * → { id, name, status, active, package_type, expires_on, expired,
+ *     sessions_remaining, today, spoken }
+ *
+ * ── Ownership is checked before anything is read ──────────────────────────
+ *
+ * The id comes from the caller. `clientInOrg` is the shared guard that exists
+ * because this module's neighbour once shipped the opposite: handlers that
+ * took a client_id from the request and read rows for it without asking whose
+ * client it was (see modules/automation/automation.routes.js's header).
+ *
+ * A client in another studio answers **404, not 403** — deliberately the same
+ * answer as an id that does not exist. A 403 would confirm the id is real
+ * somewhere, which is an enumeration oracle for a surface whose ids are handed
+ * out by the search endpoint.
+ *
+ * ── Two joins, both scoped through the verified client ─────────────────────
+ *
+ * `session_balance` and `workout_sessions` are keyed on pt_clients.id. Rather
+ * than re-deriving the tenant on each, both are constrained to the client this
+ * request has already proven the caller owns — one place to get isolation
+ * right instead of three.
+ */
+router.get('/clients/:clientId', validate(detailSchema), async (req, res, next) => {
+  try {
+    const { clientId } = req.params;
+
+    // Ownership first, before any client data is read.
+    if (!await clientInOrg(req, clientId)) return notFoundClient(res);
+
+    const params = [clientId];
+    const orgClause = orgWhere(req, params, 'organization_id');
+
+    // A trainer sees only their own roster — the same narrowing Phase 2
+    // applies, so a trainer cannot read a colleague's client by pasting an id
+    // the search endpoint gave somebody else.
+    let trainerClause = '';
+    if (req.user.role === 'trainer') {
+      if (!req.user.trainer_id) return notFoundClient(res);
+      params.push(req.user.trainer_id);
+      trainerClause = ` AND trainer_id = $${params.length}`;
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id, name, status, package_type, pt_end_date
+         FROM pt_clients
+        WHERE id = $1
+          AND deleted_at IS NULL
+          ${orgClause}
+          ${trainerClause}`,
+      params
+    );
+
+    const client = rows[0];
+    if (!client) return notFoundClient(res);
+
+    // Both reads are best-effort. A missing session balance or an unreadable
+    // workout log must not fail the whole answer — the package facts are the
+    // core of it, and the two extras are reported as unknown rather than as
+    // zero. `null` here means "not on file", which the sentence below says
+    // differently from "none left".
+    const [balance, today] = await Promise.all([
+      sessionsRemainingFor(clientId).catch(() => null),
+      todaysSessionFor(clientId).catch(() => null),
+    ]);
+
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const expired = client.pt_end_date ? client.pt_end_date < todayIso : null;
+
+    const detail = {
+      // The pt_clients id — the same opaque handle Phase 2 already returns and
+      // the App Intent already holds. No internal row ids from the joined
+      // tables are exposed, and nothing here is ever spoken aloud.
+      id: client.id,
+      name: client.name,
+      status: client.status,
+      active: client.status === 'active',
+      package_type: client.package_type,
+      expires_on: client.pt_end_date,
+      expired,
+      sessions_remaining: balance,
+      today,
+    };
+
+    logActivity(req, 'voice.clients.detail', 'pt_client', clientId,
+      { channel: 'voice' });
+
+    res.json({ ...detail, spoken: spokenForDetail(detail) });
+  } catch (err) {
+    logger.error({ err: err.message }, 'voice client detail failed');
+    next(err);
+  }
+});
+
+/** 404 for both "not yours" and "not there" — see the handler's note. */
+function notFoundClient(res) {
+  return res.status(404).json({
+    error: { code: 'NOT_FOUND', message: 'Client not found' },
+    spoken: 'I could not find that client.',
+  });
+}
+
+/**
+ * Sessions left on the active package, or null when none is on file.
+ *
+ * Null and 0 are different answers and are spoken differently: one is "no
+ * package recorded", the other is "they have run out".
+ */
+async function sessionsRemainingFor(clientId) {
+  const { rows } = await pool.query(
+    `SELECT remaining_sessions
+       FROM session_balance
+      WHERE client_id = $1
+        AND status = 'active'
+      ORDER BY start_date DESC
+      LIMIT 1`,
+    [clientId]
+  );
+  const v = rows[0]?.remaining_sessions;
+  return typeof v === 'number' ? v : null;
+}
+
+/**
+ * Today's workout, as one of three states.
+ *
+ * `null` means no session row exists for today — which for a trainer asking
+ * "is Rahul done" reads as "not started", but is reported as its own state so
+ * the sentence can say "nothing scheduled" rather than inventing a plan that
+ * was never assigned.
+ */
+async function todaysSessionFor(clientId) {
+  const { rows } = await pool.query(
+    `SELECT status, program_name
+       FROM workout_sessions
+      WHERE client_id = $1
+        AND session_date = CURRENT_DATE
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [clientId]
+  );
+  if (!rows[0]) return { status: 'none', program_name: null };
+  return { status: rows[0].status, program_name: rows[0].program_name || null };
+}
+
+/**
+ * "Rahul Sharma is on PT Gold. His package expires on 14 September, and
+ * today's workout is pending."
+ *
+ * Assembled server-side like every other sentence on this surface. Names no
+ * ids, no amounts and no contact details — the response carries the id for the
+ * intent to reuse, and the sentence never says it.
+ *
+ * Gender-neutral throughout: the record has a `gender` column but inferring a
+ * pronoun from it would be wrong for some clients and is not worth being wrong
+ * about out loud. "Their package" reads naturally and is always correct.
+ */
+function spokenForDetail(d) {
+  const sentences = [];
+
+  sentences.push(d.package_type
+    ? `${d.name} is on ${d.package_type}.`
+    : `${d.name} has no package on file.`);
+
+  const clauses = [];
+
+  if (d.status && d.status !== 'active') {
+    clauses.push(`their account is ${d.status}`);
+  } else if (d.expired === true) {
+    clauses.push(`their package expired${d.expires_on ? ` on ${speakDate(d.expires_on)}` : ''}`);
+  } else if (d.expires_on) {
+    clauses.push(`their package expires on ${speakDate(d.expires_on)}`);
+  }
+
+  // Only when there is a real number. "0 sessions left" is worth saying;
+  // "no balance on file" is not the same fact and is left unsaid rather than
+  // spoken as zero.
+  if (typeof d.sessions_remaining === 'number') {
+    clauses.push(d.sessions_remaining === 1
+      ? 'they have 1 session left'
+      : `they have ${d.sessions_remaining} sessions left`);
+  }
+
+  clauses.push(todayClause(d.today));
+
+  sentences.push(`${capitalize(clauses.join(', and '))}.`);
+  return sentences.join(' ');
+}
+
+function todayClause(today) {
+  switch (today?.status) {
+    case 'completed':   return "today's workout is done";
+    case 'in_progress': return "today's workout is pending";
+    case 'none':        return 'nothing is logged for today';
+    // The read failed. Say so rather than reporting a state we did not see.
+    default:            return "today's workout could not be checked";
+  }
+}
+
+/** "2026-09-14" → "14 September". Spoken dates drop the year when it is the
+ *  current one, because a trainer asking today does not need it. */
+function speakDate(iso) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return iso;
+  const month = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+    'August', 'September', 'October', 'November', 'December'][d.getUTCMonth()];
+  const sameYear = d.getUTCFullYear() === new Date().getUTCFullYear();
+  return sameYear
+    ? `${d.getUTCDate()} ${month}`
+    : `${d.getUTCDate()} ${month} ${d.getUTCFullYear()}`;
+}
+
+function capitalize(s) {
+  return s.length ? s[0].toUpperCase() + s.slice(1) : s;
+}
 
 /**
  * The sentence Siri reads.

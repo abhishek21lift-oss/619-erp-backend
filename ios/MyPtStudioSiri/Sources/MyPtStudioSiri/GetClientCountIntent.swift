@@ -99,5 +99,26 @@ struct MyPtStudioShortcuts: AppShortcutsProvider {
             shortTitle: "Find Client",
             systemImageName: "magnifyingglass"
         )
+
+        // Phase 3. `\(\.$client)` is an ENTITY parameter, not a string, so
+        // Siri resolves the spoken name through ClientEntityQuery and asks
+        // which person is meant when more than one matches — before any
+        // detail is fetched.
+        //
+        // "Show Rahul PT details" is registered above on FindClientIntent as
+        // well, and the two are kept distinct on purpose: that phrase answers
+        // with package status alone, while these retrieve one person's
+        // sessions and today's workout.
+        AppShortcut(
+            intent: GetClientDetailIntent(),
+            phrases: [
+                "Show me \(\.$client) details in \(.applicationName)",
+                "Get \(\.$client) details in \(.applicationName)",
+                "How is \(\.$client) doing in \(.applicationName)",
+                "\(.applicationName) details for \(\.$client)",
+            ],
+            shortTitle: "Client Details",
+            systemImageName: "person.text.rectangle"
+        )
     }
 }

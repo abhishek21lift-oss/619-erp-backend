@@ -43,6 +43,57 @@ struct ClientSearchResponse: Decodable {
     let spoken: String
 }
 
+/// Today's workout, as one of four states.
+///
+/// `none` and `unknown` are different answers and must stay different: one
+/// says nothing was scheduled, the other says the log could not be read. A
+/// voice surface that reports an unread log as "nothing scheduled" tells a
+/// trainer their client has no session when they may well have one.
+struct TodaySession: Decodable {
+    let status: String
+    let programName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case programName = "program_name"
+    }
+}
+
+/// One client in the detail a trainer actually asks for.
+///
+/// Still no contact details: the server does not select mobile, email or
+/// address for this endpoint either. `sessionsRemaining` is optional because
+/// "no balance on file" and "0 left" are different facts — collapsing the
+/// first into the second would have Siri announce that a client has run out
+/// when nothing was ever recorded.
+struct ClientDetailResponse: Decodable {
+    let id: String
+    let name: String
+    let status: String?
+    let active: Bool
+    let packageType: String?
+    let expiresOn: String?
+    /// `nil` when no end date is on file: unknown, not lapsed.
+    let expired: Bool?
+    /// `nil` when no balance is on file: unknown, not zero.
+    let sessionsRemaining: Int?
+    let today: TodaySession?
+    let spoken: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case status
+        case active
+        case packageType = "package_type"
+        case expiresOn = "expires_on"
+        case expired
+        case sessionsRemaining = "sessions_remaining"
+        case today
+        case spoken
+    }
+}
+
 /// Every way this can fail, phrased as something Siri can say.
 ///
 /// The distinction that matters is `unauthorized` vs `network`: one is fixed
@@ -54,6 +105,7 @@ enum VoiceAPIError: LocalizedError {
     case notSignedIn
     case unauthorized
     case invalidQuery
+    case notFound
     case rateLimited
     case server(status: Int)
     case network(underlying: Error)
@@ -69,6 +121,13 @@ enum VoiceAPIError: LocalizedError {
             // The server bounds `q` at 2–60 characters. Say what to do about
             // it rather than reporting a validation failure.
             return "Please say at least two letters of the name."
+        case .notFound:
+            // Also what the server returns for a client belonging to ANOTHER
+            // studio, deliberately — so this sentence must not distinguish
+            // "gone" from "not yours". Saying "you do not have access to that
+            // client" would confirm the id exists somewhere, which is the
+            // thing the 404 is there to avoid.
+            return "I could not find that client."
         case .rateLimited:
             return "Too many requests just now. Please try again in a moment."
         case .server:
@@ -156,6 +215,28 @@ struct VoiceAPIClient {
         return try await get(url)
     }
 
+    /// GET /api/voice/clients/:clientId
+    ///
+    /// Takes the opaque id Phase 2's search already returned — the intent
+    /// never constructs one, and the server checks that the id belongs to the
+    /// caller's organization before it reads anything. An id from another
+    /// studio comes back 404, not 403, so a caller cannot use this endpoint to
+    /// learn which ids exist.
+    func clientDetail(id: String) async throws -> ClientDetailResponse {
+        // Matched to the server's own bound on the path parameter. Checked
+        // here so a malformed id fails locally instead of being encoded into
+        // a path and sent — there is no id worth a round trip that this
+        // rejects.
+        let allowed = CharacterSet(charactersIn:
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+        guard
+            !id.isEmpty, id.count <= 64,
+            id.unicodeScalars.allSatisfy({ allowed.contains($0) })
+        else { throw VoiceAPIError.notFound }
+
+        return try await get("api/voice/clients/\(id)")
+    }
+
     // MARK: - Transport
 
     /// One request path for every voice endpoint.
@@ -208,6 +289,11 @@ struct VoiceAPIClient {
             // A staff-only surface reached by a client account. Same remedy as
             // signing in, from the user's point of view.
             throw VoiceAPIError.unauthorized
+        case 404:
+            // Either the client is gone or it was never this studio's. The
+            // server returns the same status for both on purpose and so does
+            // this — see `.notFound`.
+            throw VoiceAPIError.notFound
         case 429:
             throw VoiceAPIError.rateLimited
         default:
