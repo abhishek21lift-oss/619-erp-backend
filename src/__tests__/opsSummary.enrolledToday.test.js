@@ -176,3 +176,60 @@ describe('the per-trainer totals query', () => {
     expect(src).toContain('`, bareParams);');
   });
 });
+
+// ── Session Activity's three numbers ───────────────────────────────────────
+//
+// The dashboard's Session Activity card reads Total / Done / Last month off
+// session_stats. Those counted pt_sessions, which is the DIARY: booking a slot
+// writes a row with status 'scheduled', and nothing in the product ever moves
+// it on. Finishing a workout PATCHes workout_sessions.status on the workout
+// log — a different table the booking never hears about.
+//
+// So Done and Last month were counting a status no code path writes. The card
+// showed a real Total beside two zeros, and nothing about that looks broken:
+// a studio that had not finished a workout all month would render identically.
+//
+// The table is the whole bug, so the table is what this asserts.
+
+const statsQuery = () => queryWith('this_month_completed', 'last_month_completed');
+
+describe('the session-stats query', () => {
+  it('counts the workout log, not the booking diary', () => {
+    const q = statsQuery();
+    expect(q).toMatch(/FROM\s+workout_sessions/);
+    expect(q).not.toMatch(/FROM\s+pt_sessions/);
+  });
+
+  it('takes Done from the status the workout log actually writes', () => {
+    // workout_sessions.status is exactly 'in_progress' or 'completed'.
+    expect(statsQuery()).toMatch(/status\s*=\s*'completed'/);
+  });
+
+  it('counts Total without filtering on status', () => {
+    // Total is every session STARTED this month, in progress or finished.
+    // A status filter on that count would make Total equal Done and the card
+    // would read 100% completion forever.
+    const total = statsQuery().match(/COUNT\(\*\) FILTER \(([\s\S]*?)\)::INT AS this_month_total/);
+    expect(total).not.toBeNull();
+    expect(total[1]).not.toMatch(/status/);
+  });
+
+  it('reaches back exactly one month for Last month', () => {
+    const q = statsQuery();
+    expect(q).toMatch(/DATE_TRUNC\('month', CURRENT_DATE\) - INTERVAL '1 month'/);
+  });
+
+  it('is scoped to the studio', () => {
+    // Through the shared `orgBare1` fragment, which is
+    // ' AND organization_id = $1' when a filter applies and '' when it does
+    // not — the same way every bare-table query in this function scopes. A
+    // count is exactly where another studio's rows would go unnoticed.
+    expect(statsQuery()).toContain('${orgBare1}');
+  });
+
+  it('does not filter on a deleted_at the table does not have', () => {
+    // workout_sessions hard-deletes; there is no deleted_at column. Carrying
+    // the old clause across would have thrown on every dashboard load.
+    expect(statsQuery()).not.toMatch(/deleted_at/);
+  });
+});
