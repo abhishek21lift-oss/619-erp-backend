@@ -36,6 +36,13 @@ on:
         required: true
         type: string
 
+# Shares deploy.yml's concurrency group: a rollback and a deploy both SSH into
+# the same box and move the same checkout, so they must never overlap. See the
+# note in deploy.yml for why an in-progress run is queued rather than cancelled.
+concurrency:
+  group: deploy-vps-backend
+  cancel-in-progress: false
+
 jobs:
   rollback:
     runs-on: ubuntu-latest

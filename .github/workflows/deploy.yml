@@ -26,6 +26,29 @@ on:
 # The script lives here so the three attempts below cannot drift apart. It is
 # idempotent — pull, build, migrate, up -d — so running it twice is the same as
 # running it once.
+# One deploy at a time, per box.
+#
+# Both jobs here and rollback.yml SSH into the same VPS and run the same
+# idempotent script — fetch, checkout, build, migrate, `docker compose up -d`.
+# Idempotent means running it twice in SEQUENCE is the same as once; it says
+# nothing about running it twice at the SAME time, which is what happens when
+# two commits land close together, or when an operator presses "Run workflow"
+# while a push-triggered deploy is still going. Two runs then interleave a
+# checkout, a build and a container swap on one working tree, and the box ends
+# up on a mixture of two commits with no error anywhere to say so.
+#
+# `cancel-in-progress: false` on purpose. The default cancels the older run,
+# and the older run here is the one that may be halfway through `docker
+# compose up` or a migration — killing it is how you get a half-migrated
+# database or a stopped container. Queue instead: the second deploy waits, then
+# runs against the newer commit, which is the state you wanted anyway.
+#
+# rollback.yml shares this group, because a rollback racing a deploy is the
+# same collision with worse consequences.
+concurrency:
+  group: deploy-vps-backend
+  cancel-in-progress: false
+
 env:
   DEPLOY_SCRIPT: |
     set -e
