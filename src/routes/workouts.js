@@ -240,6 +240,37 @@ router.get('/plans', auth, async (req, res, next) => {
     const tenant = planReadFilter(req, p);
     if (tenant.sql) { conds.push(tenant.sql); params.push(...tenant.params); p += tenant.params.length; }
 
+    // ── Who is actually running each programme ──
+    //
+    // The list returned a plan's shape and nothing about its use: no assigned
+    // client, and `progress` was the literal 0 whenever the caller did not
+    // name a client. Every card on the studio-wide Workout Plans screen
+    // therefore read "0% complete" — not because nobody had trained, but
+    // because the query never asked.
+    //
+    // Two restrictions, both load-bearing:
+    //
+    //   · organization. workout_assignments is tenant data (086). Without
+    //     this, one studio's plan card would name another studio's clients.
+    //   · trainer. GET /api/pt/clients already narrows to req.user.trainer_id
+    //     for a trainer, so a trainer sees only their own clients everywhere
+    //     else on this page. Returning every client on the plan here would
+    //     hand them names the rest of the app deliberately withholds.
+    //
+    // Shared platform templates (organization_id IS NULL) stay readable by
+    // everyone, but their assignments are still filtered to the caller's own
+    // studio — the template is shared, the roster on it is not.
+    const scope = tenantScope(req);
+    const assignConds = ["wa.status = 'active'", 'pc.deleted_at IS NULL'];
+    if (scope.applyFilter) {
+      assignConds.push(`wa.organization_id = $${p++}`);
+      params.push(scope.orgId);
+    }
+    if (req.user?.role === 'trainer') {
+      assignConds.push(`pc.trainer_id = $${p++}`);
+      params.push(req.user.trainer_id || '');
+    }
+
     const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     params.push(limit, offset);
@@ -257,7 +288,17 @@ router.get('/plans', auth, async (req, res, next) => {
         ) ORDER BY we.day_of_week, we.sort_order)
         FROM workout_exercises we
         LEFT JOIN exercises e ON e.id = we.exercise_id
-        WHERE we.workout_plan_id = wp.id), '[]'::json) AS exercises
+        WHERE we.workout_plan_id = wp.id), '[]'::json) AS exercises,
+        COALESCE((SELECT json_agg(json_build_object(
+          'client_id',    pc.id,
+          'client_name',  pc.name,
+          'progress_pct', COALESCE(wa_r.progress_pct, 0),
+          'start_date',   wa_r.start_date
+        ) ORDER BY pc.name)
+        FROM workout_assignments wa_r
+        JOIN pt_clients pc ON pc.id = wa_r.client_id
+        WHERE wa_r.workout_plan_id = wp.id
+          AND ${assignConds.join(' AND ').replace(/\bwa\./g, 'wa_r.')}), '[]'::json) AS assignments
       FROM workout_plans wp
       ${joinClause}
       WHERE ${conds.join(' AND ')}
@@ -265,7 +306,22 @@ router.get('/plans', auth, async (req, res, next) => {
       LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params
     );
-    res.json(rows);
+    // `progress` keeps meaning "how far along is this plan". Named a client,
+    // that is their own figure, as before. Studio-wide it is the mean across
+    // the clients actually running it — which is a number, where the old
+    // hardcoded 0 was a placeholder wearing a percentage sign. A plan nobody
+    // is running is still 0, and now that is true rather than incidental.
+    res.json(rows.map((row) => ({
+      ...row,
+      progress: client_id
+        ? row.progress
+        : (row.assignments.length
+          ? Math.round(
+            row.assignments.reduce((sum, a) => sum + (Number(a.progress_pct) || 0), 0)
+              / row.assignments.length,
+          )
+          : 0),
+    })));
   } catch (err) {
     if (err.message?.includes('does not exist')) return res.json([]);
     next(err);

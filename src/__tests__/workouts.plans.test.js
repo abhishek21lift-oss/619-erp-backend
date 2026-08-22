@@ -339,3 +339,121 @@ describe('granular endpoints — what makes autosave safe', () => {
     }
   });
 });
+
+// ── Who is running the plan ────────────────────────────────────────────────
+//
+// The list used to describe a plan's shape and nothing about its use. There
+// was no assigned client in the payload, and `progress` was the literal 0
+// whenever the caller did not name one — so every card on the studio-wide
+// Workout Plans screen read "0% complete" no matter how much training had
+// happened. The number was a placeholder that looked like a measurement.
+//
+// Adding the roster to the response opens a second hole at the same time: a
+// trainer is shown only their own clients everywhere else in this module
+// (GET /api/pt/clients narrows to req.user.trainer_id), so a plan card that
+// listed every client on the programme would hand them names the rest of the
+// app withholds. Both restrictions are asserted here because losing either
+// one is silent — the screen looks correct with the wrong names on it.
+describe('plan rosters — real progress, and only the clients you may see', () => {
+  /** The assignments sub-select, whitespace-collapsed. */
+  const rosterSql = () =>
+    sqls().find((s) => /FROM workout_assignments wa_r/.test(s));
+
+  it('scopes the roster to the caller\'s studio', async () => {
+    mockUser = ADMIN_A;
+    await request(app).get('/api/workouts/plans');
+    expect(rosterSql()).toMatch(/wa_r\.organization_id = \$\d/);
+  });
+
+  it('shows a trainer only the clients they train', async () => {
+    // The leak this prevents: two trainers in one studio, both able to read
+    // the same plan, each seeing the other's clients named on its card.
+    mockUser = TRAINER_A;
+    await request(app).get('/api/workouts/plans');
+    const sql = rosterSql();
+    expect(sql).toMatch(/pc\.trainer_id = \$\d/);
+
+    const call = pool.query.mock.calls.find(([s]) => /FROM workout_assignments wa_r/.test(String(s).replace(/\s+/g, ' ')));
+    expect(call[1]).toContain(TRAINER_A.trainer_id);
+  });
+
+  it('does not narrow an admin to one trainer\'s clients', async () => {
+    mockUser = ADMIN_A;
+    await request(app).get('/api/workouts/plans');
+    expect(rosterSql()).not.toMatch(/pc\.trainer_id/);
+  });
+
+  it('leaves out clients whose record was deleted', async () => {
+    mockUser = ADMIN_A;
+    await request(app).get('/api/workouts/plans');
+    expect(rosterSql()).toMatch(/pc\.deleted_at IS NULL/);
+  });
+
+  it('counts only assignments that are still running', async () => {
+    mockUser = ADMIN_A;
+    await request(app).get('/api/workouts/plans');
+    expect(rosterSql()).toMatch(/wa_r\.status = 'active'/);
+  });
+
+  it('reports progress as the mean across the clients running the plan', async () => {
+    // The defect in one assertion: this used to be 0 regardless.
+    mockUser = ADMIN_A;
+    pool.query.mockResolvedValueOnce({
+      rows: [{
+        id: PLAN, organization_id: ORG_A, progress: 0,
+        assignments: [
+          { client_id: 'c1', client_name: 'Rahul Sharma', progress_pct: 60, start_date: '2026-08-01' },
+          { client_id: 'c2', client_name: 'Anita Desai', progress_pct: 40, start_date: '2026-08-08' },
+        ],
+      }],
+    });
+    const res = await request(app).get('/api/workouts/plans');
+    expect(res.status).toBe(200);
+    expect(res.body[0].progress).toBe(50);
+    expect(res.body[0].assignments).toHaveLength(2);
+  });
+
+  it('rounds rather than emitting a fraction of a percent', async () => {
+    mockUser = ADMIN_A;
+    pool.query.mockResolvedValueOnce({
+      rows: [{
+        id: PLAN, progress: 0,
+        assignments: [
+          { client_id: 'c1', progress_pct: 50 },
+          { client_id: 'c2', progress_pct: 51 },
+        ],
+      }],
+    });
+    const res = await request(app).get('/api/workouts/plans');
+    expect(res.body[0].progress).toBe(51);
+  });
+
+  it('reports 0 for a plan nobody is running, and says the roster is empty', async () => {
+    // Still 0 — but now because there is nothing to average, which is a fact
+    // about the plan rather than about the query.
+    mockUser = ADMIN_A;
+    pool.query.mockResolvedValueOnce({
+      rows: [{ id: PLAN, progress: 0, assignments: [] }],
+    });
+    const res = await request(app).get('/api/workouts/plans');
+    expect(res.body[0].progress).toBe(0);
+    expect(res.body[0].assignments).toEqual([]);
+  });
+
+  it('keeps one client\'s own figure when the list is scoped to them', async () => {
+    // Asking for a single client's plans must not average them with anybody
+    // else's — that view is about that person.
+    mockUser = ADMIN_A;
+    pool.query.mockResolvedValueOnce({
+      rows: [{
+        id: PLAN, progress: 73,
+        assignments: [
+          { client_id: 'c1', progress_pct: 73 },
+          { client_id: 'c2', progress_pct: 5 },
+        ],
+      }],
+    });
+    const res = await request(app).get('/api/workouts/plans?client_id=c1');
+    expect(res.body[0].progress).toBe(73);
+  });
+});
