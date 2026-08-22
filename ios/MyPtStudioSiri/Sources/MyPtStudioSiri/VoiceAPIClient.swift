@@ -94,6 +94,67 @@ struct ClientDetailResponse: Decodable {
     }
 }
 
+/// One entry on today's list.
+///
+/// `startTime` is `nil` whenever the studio never committed to a time —
+/// a programme day, or a client whose preferred slot could not be parsed.
+/// `timeSource` says where a present time came from, so a PREFERENCE is never
+/// presented as an appointment.
+struct TodayWorkout: Decodable, Identifiable {
+    let id: String
+    let clientName: String
+    let programName: String?
+    /// 'HH:MM', studio-local, or nil when there is no committed time.
+    let startTime: String?
+    /// "booked" | "preference" | nil
+    let timeSource: String?
+    let status: String
+    let trainerName: String?
+    /// "booked" | "programme" | "enrolment"
+    let source: String
+
+    enum CodingKeys: String, CodingKey {
+        case id = "client_id"
+        case clientName = "client_name"
+        case programName = "program_name"
+        case startTime = "start_time"
+        case timeSource = "time_source"
+        case status
+        case trainerName = "trainer_name"
+        case source
+    }
+}
+
+/// Today's roster.
+///
+/// `date` and `timezone` are the STUDIO's, resolved server-side. The phone's
+/// own zone is deliberately not consulted: a trainer checking the roster from
+/// another country must see the day the studio is operating on, not the day
+/// where they happen to be standing.
+struct TodayWorkoutsResponse: Decodable {
+    let date: String
+    let timezone: String
+    let count: Int
+    let bookedCount: Int
+    let sessions: [TodayWorkout]
+    let truncated: Bool
+    /// `false` when the signed-in account is not attached to a trainer profile
+    /// — a real state with its own sentence, not an error and not an empty day.
+    let trainerLinked: Bool
+    let spoken: String
+
+    enum CodingKeys: String, CodingKey {
+        case date
+        case timezone
+        case count
+        case bookedCount = "booked_count"
+        case sessions
+        case truncated
+        case trainerLinked = "trainer_linked"
+        case spoken
+    }
+}
+
 /// Every way this can fail, phrased as something Siri can say.
 ///
 /// The distinction that matters is `unauthorized` vs `network`: one is fixed
@@ -235,6 +296,16 @@ struct VoiceAPIClient {
         else { throw VoiceAPIError.notFound }
 
         return try await get("api/voice/clients/\(id)")
+    }
+
+    /// GET /api/voice/workouts/today
+    ///
+    /// Sends nothing but the path and the token — no date, no timezone, no
+    /// filter. "Today" is resolved on the server in the studio's own zone, so
+    /// a phone with a wrong clock, a traveller's device, or a handset still on
+    /// yesterday's date cannot shift which day is reported.
+    func todaysWorkouts() async throws -> TodayWorkoutsResponse {
+        try await get("api/voice/workouts/today")
     }
 
     // MARK: - Transport

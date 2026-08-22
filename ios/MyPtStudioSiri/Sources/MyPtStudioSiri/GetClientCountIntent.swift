@@ -120,5 +120,22 @@ struct MyPtStudioShortcuts: AppShortcutsProvider {
             shortTitle: "Client Details",
             systemImageName: "person.text.rectangle"
         )
+
+        // Phase 4. No parameter at all — the subject is always the caller's
+        // own studio, today. Apple requires the app name in every phrase,
+        // which is also what keeps "show today's workouts" from colliding with
+        // Fitness and Calendar.
+        AppShortcut(
+            intent: GetTodaysWorkoutsIntent(),
+            phrases: [
+                "Show today's workouts in \(.applicationName)",
+                "What workouts do I have today in \(.applicationName)",
+                "Who has a workout today in \(.applicationName)",
+                "Show my PT sessions today in \(.applicationName)",
+                "\(.applicationName) today's schedule",
+            ],
+            shortTitle: "Today's Workouts",
+            systemImageName: "calendar.day.timeline.left"
+        )
     }
 }

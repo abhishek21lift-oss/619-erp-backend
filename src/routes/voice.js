@@ -10,11 +10,17 @@
 //
 //   · Everything is READ-ONLY. A voice surface that can write is a voice
 //     surface that can be made to write by anyone within earshot.
-//   · Everything returns ONE scalar plus the sentence to say. No lists, no
-//     names, no ids — a spoken response cannot be scrolled past or redacted,
-//     and a bystander hears whatever comes back.
-//   · Nothing takes a caller-supplied identifier. The subject is always
-//     "the authenticated user's own organization", derived server-side.
+//   · Everything returns the sentence to say alongside the data. A spoken
+//     response cannot be scrolled past or redacted, and a bystander hears
+//     whatever comes back — so no endpoint here selects a mobile number, an
+//     email, an address or an amount, and no identifier is ever spoken.
+//   · Any caller-supplied identifier is checked for ownership BEFORE it is
+//     used to read anything, and a foreign one answers 404 rather than 403.
+//     The subject is otherwise always "the authenticated user's own
+//     organization", derived server-side from the session.
+//   · "Today" is the STUDIO's today (src/lib/appTime.js), never the phone's
+//     and never UTC. A trainer asking at 6am must get the day the studio is
+//     actually operating on.
 //
 // ── The intent layer never touches SQL ─────────────────────────────────────
 //
@@ -33,6 +39,8 @@ const { orgWhere } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
 const { logActivity } = require('../lib/activityLog');
 const { z } = require('../lib/validation');
+const { today: studioToday, todayShortDay: studioShortDay, appTimeZone } = require('../lib/appTime');
+const { resolveMyTrainerIds } = require('../lib/trainerIdentity');
 const logger = require('../lib/logger');
 
 // Staff only, on the whole router.
@@ -296,7 +304,10 @@ router.get('/clients/:clientId', validate(detailSchema), async (req, res, next) 
       todaysSessionFor(clientId).catch(() => null),
     ]);
 
-    const todayIso = new Date().toISOString().slice(0, 10);
+    // The STUDIO's today, not UTC's. `toISOString()` here would call a
+    // package that lapsed yesterday "still valid" between midnight and
+    // 05:30 IST — the exact bug src/lib/appTime.js was written to end.
+    const todayIso = studioToday();
     const expired = client.pt_end_date ? client.pt_end_date < todayIso : null;
 
     const detail = {
@@ -435,7 +446,7 @@ function speakDate(iso) {
   if (Number.isNaN(d.getTime())) return iso;
   const month = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
     'August', 'September', 'October', 'November', 'December'][d.getUTCMonth()];
-  const sameYear = d.getUTCFullYear() === new Date().getUTCFullYear();
+  const sameYear = String(d.getUTCFullYear()) === studioToday().slice(0, 4);
   return sameYear
     ? `${d.getUTCDate()} ${month}`
     : `${d.getUTCDate()} ${month} ${d.getUTCFullYear()}`;
@@ -483,6 +494,409 @@ function spokenFor(query, results) {
     ? names.join(', ')
     : `${names.slice(0, 3).join(', ')} and others`;
   return `I found ${results.length} people matching ${query}: ${list}.`;
+}
+
+
+/* ========================================================================== *
+ * Phase 4 — "Hey Siri, show me today's workouts in MY PT STUDIO."
+ * ========================================================================== */
+
+/**
+ * The endpoint takes no input.
+ *
+ * `.strict()` is the point: a query string is the one thing a caller controls
+ * here, and rejecting unknown keys means a request like `?organization_id=…`
+ * or `?trainer_id=…` fails loudly instead of being silently ignored. Silently
+ * ignoring it is what makes a future reader assume it was honoured.
+ */
+const todaySchema = { query: z.object({}).strict() };
+
+/** Enough for a studio's day; the response says when it clipped. */
+const TODAY_LIMIT = 25;
+
+/**
+ * GET /api/voice/workouts/today
+ *
+ * → { date, timezone, count, booked_count, sessions[], truncated, spoken }
+ *
+ * ── Why this reads THREE sources and not just the appointment book ─────────
+ *
+ * The obvious implementation is `pt_sessions WHERE session_date = today`. It
+ * is also the implementation that ships a dead feature: pt-os.service.js
+ * records that pt_sessions "holds no rows at all while five assignments are
+ * active", because these studios run off programmes rather than a diary. A
+ * voice command that answers "no sessions today" every single day is worse
+ * than no command, and the dashboard panel next door was rebuilt twice for
+ * exactly this reason.
+ *
+ * So the same three tiers that panel settled on, in the same priority order,
+ * each one more specific than the next:
+ *
+ *   booked     — a real slot in pt_sessions. Has a real start_time.
+ *   programme  — an active plan whose exercises name today's weekday.
+ *   enrolment  — the client's own preferred_training_days says today.
+ *
+ * A client appears once, under the most specific tier that matches — the
+ * NOT EXISTS clauses below are what stop the same person being announced
+ * three times.
+ *
+ * ── The time is never invented ────────────────────────────────────────────
+ *
+ * Only `booked` rows carry a scheduled time the studio actually committed to.
+ * A programme row has none, and the enrolment tier has only a free-text
+ * preference. Both are reported with `start_time: null` and `time_source`
+ * naming where the time came from, and the spoken sentence names a clock time
+ * ONLY for rows that have one. Announcing a preference as an appointment
+ * would have a trainer turn up for a slot nobody agreed to.
+ *
+ * ── Today ─────────────────────────────────────────────────────────────────
+ *
+ * The studio's calendar day (Asia/Kolkata by default), from appTime.js — not
+ * the phone's zone and not UTC. Siri is most used first thing in the morning,
+ * which in IST is precisely the window where a UTC "today" is still yesterday.
+ */
+router.get('/workouts/today', validate(todaySchema), async (req, res, next) => {
+  try {
+    const date = studioToday();
+    const shortDay = studioShortDay();
+
+    // A trainer sees only their own diary. Every profile that IS this caller,
+    // because `pt_sessions.trainer_id` may hold an id from either trainer
+    // table — see lib/trainerIdentity.js.
+    //
+    // Fail closed: a trainer we cannot resolve to any profile gets an empty
+    // list, never the whole studio's. `trainer_linked: false` says why, so the
+    // sentence can explain rather than implying an empty day.
+    let trainerIds = null;
+    if (req.user.role === 'trainer') {
+      trainerIds = await resolveMyTrainerIds(req);
+      if (!trainerIds.length) {
+        return res.json({
+          date,
+          timezone: appTimeZone(),
+          count: 0,
+          booked_count: 0,
+          sessions: [],
+          truncated: false,
+          trainer_linked: false,
+          spoken: 'Your account is not linked to a trainer profile yet, so I '
+                + 'cannot show your schedule.',
+        });
+      }
+    }
+
+    const [booked, programme, enrolment] = await Promise.all([
+      bookedToday(req, date, trainerIds),
+      // The two derived tiers are best-effort. They are a convenience over the
+      // appointment book, and a failure in either must not turn a day with
+      // real booked slots into an error.
+      programmeToday(req, date, trainerIds).catch((err) => {
+        logger.warn({ err: err.message }, 'voice today: programme tier failed');
+        return [];
+      }),
+      enrolmentToday(req, date, shortDay, trainerIds).catch((err) => {
+        logger.warn({ err: err.message }, 'voice today: enrolment tier failed');
+        return [];
+      }),
+    ]);
+
+    const all = [...booked, ...programme, ...enrolment];
+    const sessions = all.slice(0, TODAY_LIMIT);
+
+    logActivity(req, 'voice.workouts.today', 'pt_session', null,
+      { channel: 'voice', date, count: sessions.length });
+
+    res.json({
+      date,
+      timezone: appTimeZone(),
+      count: sessions.length,
+      booked_count: booked.length,
+      sessions,
+      truncated: all.length > sessions.length,
+      trainer_linked: true,
+      spoken: spokenForToday(sessions, all.length),
+    });
+  } catch (err) {
+    logger.error({ err: err.message }, 'voice today workouts failed');
+    next(err);
+  }
+});
+
+
+/**
+ * Tier 1 — slots the studio actually booked.
+ *
+ * `plan_name` comes from the client's ACTIVE assignment via a LATERAL with
+ * LIMIT 1, not a plain join: a client with two assignments would otherwise fan
+ * into two rows of the same appointment, which is a defect the dashboard hit
+ * against live data.
+ *
+ * Cancelled slots are excluded. "You have 6 sessions today" must not count a
+ * session the studio cancelled — the number is the whole answer on a surface
+ * with no screen to check.
+ */
+async function bookedToday(req, date, trainerIds) {
+  const params = [date];
+  const orgClause = orgWhere(req, params, 's.organization_id');
+
+  let trainerClause = '';
+  if (trainerIds) {
+    params.push(trainerIds);
+    trainerClause = ` AND s.trainer_id = ANY($${params.length})`;
+  }
+
+  const { rows } = await pool.query(
+    `SELECT s.id, s.client_id, s.start_time::TEXT AS start_time, s.status,
+            c.name AS client_name, t.name AS trainer_name, wa.plan_name
+       FROM pt_sessions s
+       LEFT JOIN pt_clients  c ON c.id = s.client_id
+       LEFT JOIN pt_trainers t ON t.id = s.trainer_id
+       LEFT JOIN LATERAL (
+         SELECT wp.name AS plan_name
+           FROM workout_assignments a
+           JOIN workout_plans wp ON wp.id = a.workout_plan_id
+          WHERE a.client_id = s.client_id AND a.status = 'active'
+          ORDER BY a.start_date DESC
+          LIMIT 1
+       ) wa ON TRUE
+      WHERE s.session_date = $1
+        AND s.deleted_at IS NULL
+        AND s.status <> 'cancelled'
+        ${orgClause}
+        ${trainerClause}
+      ORDER BY COALESCE(s.start_time, '00:00'::TIME)
+      LIMIT ${TODAY_LIMIT}`,
+    params
+  );
+
+  return rows.map((r) => ({
+    client_id: r.client_id,
+    client_name: r.client_name,
+    program_name: r.plan_name || null,
+    start_time: normaliseTime(r.start_time),
+    time_source: r.start_time ? 'booked' : null,
+    status: r.status,
+    trainer_name: r.trainer_name || null,
+    source: 'booked',
+  }));
+}
+
+/**
+ * Tier 2 — an active programme whose exercises name today's weekday.
+ *
+ * day_of_week is ISO (1 = Monday) to match workout_exercises, and the date is
+ * cast rather than compared as text. No booked slot, or tier 1 already has it.
+ */
+async function programmeToday(req, date, trainerIds) {
+  const params = [date];
+  const orgClause = orgWhere(req, params, 'c.organization_id');
+
+  let trainerClause = '';
+  if (trainerIds) {
+    params.push(trainerIds);
+    trainerClause = ` AND c.trainer_id = ANY($${params.length})`;
+  }
+
+  const { rows } = await pool.query(
+    `SELECT c.id AS client_id, c.name AS client_name,
+            c.trainer_name, wp.name AS plan_name
+       FROM workout_assignments a
+       JOIN workout_plans wp ON wp.id = a.workout_plan_id
+       JOIN pt_clients    c  ON c.id = a.client_id
+      WHERE a.status = 'active'
+        AND c.deleted_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM workout_exercises we
+           WHERE we.workout_plan_id = wp.id
+             AND we.day_of_week = EXTRACT(ISODOW FROM $1::date)::int
+             AND we.week_number = 1
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM pt_sessions s
+           WHERE s.client_id = c.id AND s.session_date = $1
+             AND s.deleted_at IS NULL
+        )
+        ${orgClause}
+        ${trainerClause}
+      ORDER BY c.name
+      LIMIT ${TODAY_LIMIT}`,
+    params
+  );
+
+  return rows.map((r) => ({
+    client_id: r.client_id,
+    client_name: r.client_name,
+    program_name: r.plan_name || null,
+    // A programme names a DAY, never a time.
+    start_time: null,
+    time_source: null,
+    status: 'expected',
+    trainer_name: r.trainer_name || null,
+    source: 'programme',
+  }));
+}
+
+/**
+ * Tier 3 — the client's own enrolment says they train today.
+ *
+ * `preferred_training_days` is the literal string the enrolment form wrote —
+ * "Mon, Wed, Fri" — so matching means producing the same three letters, in the
+ * studio's zone, and stripping spaces before splitting so "Mon,Wed" behaves
+ * the same. See appTime.todayShortDay, which exists for this comparison.
+ *
+ * `preferred_workout_time` is a PREFERENCE, not an appointment, and is
+ * reported as such: `time_source: 'preference'` so nothing downstream can
+ * mistake it for a slot the studio agreed to.
+ */
+async function enrolmentToday(req, date, shortDay, trainerIds) {
+  const params = [date, shortDay];
+  const orgClause = orgWhere(req, params, 'c.organization_id');
+
+  let trainerClause = '';
+  if (trainerIds) {
+    params.push(trainerIds);
+    trainerClause = ` AND c.trainer_id = ANY($${params.length})`;
+  }
+
+  const { rows } = await pool.query(
+    `SELECT c.id AS client_id, c.name AS client_name,
+            c.trainer_name, c.preferred_workout_time
+       FROM pt_clients c
+      WHERE c.deleted_at IS NULL
+        AND c.status = 'active'
+        AND c.preferred_training_days IS NOT NULL
+        AND $2 = ANY(string_to_array(replace(c.preferred_training_days, ' ', ''), ','))
+        AND NOT EXISTS (
+          SELECT 1 FROM pt_sessions s
+           WHERE s.client_id = c.id AND s.session_date = $1
+             AND s.deleted_at IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1
+            FROM workout_assignments a
+            JOIN workout_plans wp ON wp.id = a.workout_plan_id
+           WHERE a.client_id = c.id AND a.status = 'active'
+             AND EXISTS (
+               SELECT 1 FROM workout_exercises we
+                WHERE we.workout_plan_id = wp.id
+                  AND we.day_of_week = EXTRACT(ISODOW FROM $1::date)::int
+                  AND we.week_number = 1
+             )
+        )
+        ${orgClause}
+        ${trainerClause}
+      ORDER BY c.name
+      LIMIT ${TODAY_LIMIT}`,
+    params
+  );
+
+  return rows.map((r) => ({
+    client_id: r.client_id,
+    client_name: r.client_name,
+    program_name: null,
+    start_time: normaliseTime(r.preferred_workout_time),
+    time_source: normaliseTime(r.preferred_workout_time) ? 'preference' : null,
+    status: 'expected',
+    trainer_name: r.trainer_name || null,
+    source: 'enrolment',
+  }));
+}
+
+/**
+ * Any of the shapes these columns hold → 'HH:MM', or null.
+ *
+ * `pt_sessions.start_time` is a real TIME and arrives as 'HH:MM:SS'.
+ * `pt_clients.preferred_workout_time` is free text holding two formats: the
+ * enrolment dropdown writes '6:00 AM' and its custom field, an
+ * `<input type="time">`, writes '06:00'. Anything matching neither shape
+ * returns null — an unparseable string must not be spoken as a time.
+ */
+function normaliseTime(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+
+  let m = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(s);
+  if (m) {
+    const h = Number(m[1]);
+    return h <= 23 ? `${String(h).padStart(2, '0')}:${m[2]}` : null;
+  }
+
+  m = /^(\d{1,2}):(\d{2})\s*([AaPp])[Mm]$/.exec(s);
+  if (m) {
+    let h = Number(m[1]);
+    if (h < 1 || h > 12) return null;
+    const pm = m[3].toLowerCase() === 'p';
+    if (h === 12) h = 0;
+    if (pm) h += 12;
+    return `${String(h).padStart(2, '0')}:${m[2]}`;
+  }
+
+  return null;
+}
+
+/** '09:00' → '9 AM'; '11:30' → '11:30 AM'. The o'clock case drops ':00'. */
+function speakTime(hhmm) {
+  const m = /^(\d{2}):(\d{2})$/.exec(hhmm || '');
+  if (!m) return null;
+  const h24 = Number(m[1]);
+  const mins = m[2];
+  const suffix = h24 < 12 ? 'AM' : 'PM';
+  const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+  return mins === '00' ? `${h12} ${suffix}` : `${h12}:${mins} ${suffix}`;
+}
+
+/**
+ * "You have 6 PT sessions today. Rahul at 9 AM, Amit at 11 AM, and four more."
+ *
+ * ── Why only the first name ───────────────────────────────────────────────
+ *
+ * This is spoken in a room. Naming three people is what makes the answer
+ * useful; naming them in full is what makes it worth overhearing. The first
+ * name is enough for the trainer who already knows their own roster, and is
+ * the same thing the brief's own example says.
+ *
+ * ── Why only three ───────────────────────────────────────────────────────
+ *
+ * A spoken list cannot be skimmed. Six names read aloud is not six facts
+ * received; it is one long noise ending in a number the listener has already
+ * lost track of. Three plus a count is the most that survives being heard.
+ *
+ * A name is spoken with a time only when the row HAS one — a programme day is
+ * announced by name alone rather than given an hour nobody agreed to.
+ */
+function spokenForToday(sessions, total) {
+  if (!sessions.length) return 'You have no workouts scheduled today.';
+
+  const noun = total === 1 ? 'session' : 'sessions';
+  const head = `You have ${total} PT ${noun} today.`;
+
+  const named = sessions.slice(0, 3).map((s) => {
+    const first = String(s.client_name || '').trim().split(/\s+/)[0] || 'someone';
+    const at = speakTime(s.start_time);
+    // Only a booked slot is stated as a clock time. A preference is spoken as
+    // one — "around 6 AM" — because that is what it is.
+    if (!at) return first;
+    return s.time_source === 'preference'
+      ? `${first} around ${at}`
+      : `${first} at ${at}`;
+  });
+
+  const remaining = total - named.length;
+  if (remaining > 0) named.push(`${spellCount(remaining)} more`);
+
+  return `${head} ${joinList(named)}.`;
+}
+
+/** Small counts read better as words than as digits. */
+function spellCount(n) {
+  const words = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven',
+    'eight', 'nine', 'ten'];
+  return n <= 10 ? words[n] : String(n);
+}
+
+function joinList(items) {
+  if (items.length === 1) return items[0];
+  return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
 }
 
 module.exports = router;
