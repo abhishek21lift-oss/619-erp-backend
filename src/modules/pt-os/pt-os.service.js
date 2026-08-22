@@ -549,6 +549,20 @@ async function getOpsSummary(scope = {}) {
     LIMIT 5
   `, bareParams);
 
+  // Sessions TRAINED, not sessions BOOKED.
+  //
+  // This counted pt_sessions, which is the diary: a trainer books a slot and a
+  // row appears with status 'scheduled'. Nothing in the product ever moves
+  // that row to 'completed' — finishing a workout PATCHes
+  // workout_sessions.status on the workout log, a different table the booking
+  // never learns about. So "Done" and "Last month" were counting a status no
+  // code path writes, and the card read 0 / 0 next to a real Total no matter
+  // how many workouts the studio actually ran.
+  //
+  // workout_sessions is where the work lands, so that is what is counted. It
+  // has no deleted_at — a log is hard-deleted or it exists — and its status is
+  // exactly 'in_progress' or 'completed', so Total is genuinely "started this
+  // month" and Done is the subset that was finished.
   const { rows: [session_stats] } = await pool.query(`
     SELECT
       COUNT(*) FILTER (
@@ -565,8 +579,8 @@ async function getOpsSummary(scope = {}) {
           AND session_date <  DATE_TRUNC('month', CURRENT_DATE)
           AND status = 'completed'
       )::INT AS last_month_completed
-    FROM pt_sessions
-    WHERE deleted_at IS NULL${orgBare1}
+    FROM workout_sessions
+    WHERE TRUE${orgBare1}
   `, bareParams);
 
   // Per-trainer totals for the month — scoped, unlike every other query here.
