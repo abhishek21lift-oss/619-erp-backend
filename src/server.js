@@ -680,6 +680,17 @@ app.use('/api/subscription',      require('./routes/subscription'));
 // through that branch with NO narrowing and searched the whole studio.
 app.use('/api/search',            auth, requireStaff, require('./routes/search'));
 
+// Voice surface (Siri / App Intents). Read-only scalar aggregates only — see
+// routes/voice.js for why this is a separate router rather than the dashboard
+// endpoints called by another client.
+//
+// userApiLimiter, keyed on the user rather than the IP: a phone on cellular
+// shares an egress IP with a whole carrier, so an IP-keyed limit would let one
+// noisy device throttle unrelated studios. The router applies auth +
+// requireStaff itself; both are named here too so the mount states its own
+// posture rather than requiring a reader to open the file to learn it.
+app.use('/api/voice',             userApiLimiter, auth, requireStaff, require('./routes/voice'));
+
 // ONE router, deliberately. This mount used to carry a second file,
 // routes/client-actions.js, whose thirteen endpoints read and wrote the legacy
 // `clients` table — a table with no organization_id column, so nothing mounted
