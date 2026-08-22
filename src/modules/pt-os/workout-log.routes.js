@@ -720,8 +720,13 @@ router.get('/workout-log/today', auth, wrap(async (req, res) => {
             wa.progress_pct,
             ws.id                AS session_id,
             ws.status            AS session_status,
+            -- week 1 only, like every other count of a plan's exercises.
+            -- Weeks a trainer has edited have rows of their own, so without
+            -- the filter a plan whose week 6 was edited reports Monday twice
+            -- over: "8 exercises planned" for a four-exercise day.
             COALESCE((SELECT COUNT(*) FROM workout_exercises we
-                       WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2), 0) AS planned_exercises
+                       WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
+                         AND we.week_number = 1), 0) AS planned_exercises
        FROM roster r
        JOIN pt_clients c ON c.id = r.client_id AND c.deleted_at IS NULL
        -- LEFT, not INNER: a client can be on today's roster with no programme
