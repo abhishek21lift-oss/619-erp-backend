@@ -834,6 +834,12 @@ app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), 
 // because the studio is over its token allowance for the month.
 app.use('/api/ai',               userApiLimiter, ...gate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
 app.use('/api/ai',               ...gate('ai_suite'), requireAiQuota(), require('./routes/ai'));
+// Phase 2D: Memory management routes (trainer-facing confirmation)
+app.use('/api/ai/memory',         ...gate('ai_suite'), require('./routes/aiMemory'));
+// Phase 2E: Programmer Agent routes
+app.use('/api/ai/programmer',     ...gate('ai_suite'), requireAiQuota(), require('./routes/aiProgrammer'));
+// Phase 2F: Trainer Intelligence + Approval Center
+app.use('/api/ai/trainer',        ...gate('ai_suite'), require('./routes/aiTrainer'));
 
 // ────────────────────────
 // MEMBER PORTAL ROUTES

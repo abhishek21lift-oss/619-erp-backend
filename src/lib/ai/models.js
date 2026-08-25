@@ -14,9 +14,9 @@
 const settings = require('./settings');
 
 const DEFAULTS = {
-  primary:   'openai/gpt-oss-120b:free',
-  secondary: 'poolside/laguna-m.1:free',
-  fallback:  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  primary:   'nvidia/nemotron-3-super-120b-a12b:free',
+  secondary: 'openai/gpt-oss-120b',
+  fallback:  'nvidia/nemotron-3-nano-30b-a3b:free',
 };
 
 const models = {
@@ -27,7 +27,7 @@ const models = {
 
 // Intent → tier routing table
 const INTENT_ROUTES = {
-  // Fitness — primary model (gpt-oss-120b)
+  // Fitness — primary model (nemotron-3-super-120b)
   chat:         'primary',
   workout:      'primary',
   diet:         'primary',
@@ -41,7 +41,7 @@ const INTENT_ROUTES = {
   goal:         'primary',
   recovery:     'primary',
 
-  // Development — secondary model (poolside/laguna-m1)
+  // Development — secondary model (gpt-oss-120b)
   code:         'secondary',
   debug:        'secondary',
   sql:          'secondary',
@@ -51,7 +51,7 @@ const INTENT_ROUTES = {
   refactor:     'secondary',
   database:     'secondary',
 
-  // Business reporting — fallback model (nvidia/nemotron-3-ultra)
+  // Business reporting — fallback model (nemotron-3-nano-30b)
   business:     'fallback',
   insights:     'fallback',
   report:       'fallback',

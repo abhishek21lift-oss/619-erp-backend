@@ -3,7 +3,7 @@
 // function calling.
 //
 // Why not native OpenAI-style function calling: this app's chat models are
-// free-tier OpenRouter models (openai/gpt-oss-120b:free etc, chosen and
+// free-tier OpenRouter models (nvidia/nemotron-3-super-120b-a12b:free etc, chosen and
 // swappable via env vars — see lib/ai/models.js), and function-calling
 // support across free/open models is inconsistent at best. Betting a core
 // feature on the model reliably emitting well-formed tool_calls would be

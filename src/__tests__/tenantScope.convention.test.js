@@ -114,6 +114,12 @@ const REVIEWED_EXCEPTIONS = {
     'Command Center SMTP health collector — reads admin_invitations delivery ' +
     'errors platform-wide, which is the operator console\'s purpose. Mounted ' +
     'under /api/super-admin behind requireSuperAdmin + requireSuperAdminMfa.',
+  'modules/command-center/collectors/ai.collector.js':
+    'Command Center AI health collector — reads ai_usage_log platform-wide for ' +
+    'aggregate AI metrics (model usage, fallback rate, request latency). The ' +
+    'table now has organization_id (migration 180) but the collector needs ' +
+    'cross-tenant aggregates for the operator console. Mounted under ' +
+    '/api/super-admin behind requireSuperAdmin + requireSuperAdminMfa.',
   'modules/platform/super-admin/shared.js':
     'audit() logs super-admin actions (organisation suspend/activate, plan ' +
     'changes, impersonation, invitations) that operate ON a tenant from ' +

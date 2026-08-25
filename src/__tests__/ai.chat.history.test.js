@@ -271,10 +271,12 @@ describe('POST /api/ai/chat — bounded conversation history (F-5)', () => {
       .post('/api/ai/chat')
       .send({ message: 'hi', conversation_id: 'conv-1', client_id: 'cli-1' });
 
-    const clientGate = pool.query.mock.calls.find(([sql]) => sql.includes('pt_clients WHERE'));
+    // Phase 2C: buildClientState uses multiline SQL — check for pt_clients + WHERE separately
+    const clientGate = pool.query.mock.calls.find(([sql]) => sql.includes('pt_clients') && sql.includes('WHERE id') && sql.includes('deleted_at IS NULL'));
     expect(clientGate).toBeTruthy();
-    expect(clientGate[0]).toContain('organization_id=$2');
-    expect(clientGate[1]).toEqual(['cli-1', 'org-1']);
+    expect(clientGate[0]).toContain('organization_id');
+    expect(clientGate[1]).toContain('cli-1');
+    expect(clientGate[1]).toContain('org-1');
     expect(historyMessages().map(m => m.content)).toEqual(['msg-1', 'msg-2', 'msg-3', 'Q4']);
   });
 

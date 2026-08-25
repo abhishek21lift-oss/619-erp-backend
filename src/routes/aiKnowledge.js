@@ -21,6 +21,7 @@ const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { saveFile } = require('../lib/fileStorage');
 const { SUPPORTED_MIME_TYPES } = require('../lib/ai/textExtract');
 const { ingestDocument, deleteDocument } = require('../lib/ai/knowledgeBase');
+const { aiIntentLimit } = require('../lib/ai/rateLimit');
 const logger = require('../lib/logger');
 
 const router = express.Router();
@@ -43,7 +44,7 @@ const EXT_BY_MIME = { 'application/pdf': 'pdf', 'text/plain': 'txt' };
 /* ═══════════════════════════════════════════════════════════════════════════
    POST /api/ai/knowledge  — upload + queue a document for indexing
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/', auth, requireRole('admin', 'manager'), (req, res, next) => {
+router.post('/', auth, requireRole('admin', 'manager'), aiIntentLimit('knowledge_ingest'), (req, res, next) => {
   upload.single('file')(req, res, (err) => {
     if (err) return res.status(400).json({ error: { code: 'UPLOAD_ERROR', message: err.message } });
     next();
@@ -136,7 +137,7 @@ router.delete('/:id', auth, requireRole('admin', 'manager'), async (req, res) =>
 /* ═══════════════════════════════════════════════════════════════════════════
    POST /api/ai/knowledge/:id/reindex — re-run extraction+chunking+embedding
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/:id/reindex', auth, requireRole('admin', 'manager'), async (req, res) => {
+router.post('/:id/reindex', auth, requireRole('admin', 'manager'), aiIntentLimit('knowledge_ingest'), async (req, res) => {
   const scope = tenantScope(req);
   const params = [req.params.id];
   let orgClause = '';
