@@ -12,6 +12,7 @@
 
 const express = require('express');
 const { auth } = require('../middleware/auth');
+const { requireRole } = require('../middleware/rbac');
 const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 const {
@@ -51,7 +52,7 @@ async function verifyClient(clientId, organizationId) {
 // GET /api/ai/trainer/pending
 // Unified pending work queue
 // ═══════════════════════════════════════════════════════════════════════════
-router.get('/pending', auth, async (req, res) => {
+router.get('/pending', auth, requireRole('trainer'), async (req, res) => {
   const { client_id, limit } = req.query;
   const scope = tenantScope(req);
   const org = scope.applyFilter ? scope.orgId : null;
@@ -75,7 +76,7 @@ router.get('/pending', auth, async (req, res) => {
 // GET /api/ai/trainer/intelligence/:client_id
 // Client intelligence summary
 // ═══════════════════════════════════════════════════════════════════════════
-router.get('/intelligence/:client_id', auth, async (req, res) => {
+router.get('/intelligence/:client_id', auth, requireRole('trainer'), async (req, res) => {
   const { client_id } = req.params;
   const scope = tenantScope(req);
   const org = scope.applyFilter ? scope.orgId : null;
@@ -100,7 +101,7 @@ router.get('/intelligence/:client_id', auth, async (req, res) => {
 // POST /api/ai/trainer/memory/:id/confirm
 // Confirm a memory candidate → active
 // ═══════════════════════════════════════════════════════════════════════════
-router.post('/memory/:id/confirm', auth, async (req, res) => {
+router.post('/memory/:id/confirm', auth, requireRole('trainer'), async (req, res) => {
   const { id } = req.params;
   const scope = tenantScope(req);
   const org = scope.applyFilter ? scope.orgId : null;
@@ -134,7 +135,7 @@ router.post('/memory/:id/confirm', auth, async (req, res) => {
 // POST /api/ai/trainer/memory/:id/reject
 // Reject a memory candidate
 // ═══════════════════════════════════════════════════════════════════════════
-router.post('/memory/:id/reject', auth, async (req, res) => {
+router.post('/memory/:id/reject', auth, requireRole('trainer'), async (req, res) => {
   const { id } = req.params;
   const { reason } = req.body || {};
   const scope = tenantScope(req);
@@ -169,7 +170,7 @@ router.post('/memory/:id/reject', auth, async (req, res) => {
 // POST /api/ai/trainer/proposal/:id/approve
 // Approve a programmer proposal (with stale revalidation)
 // ═══════════════════════════════════════════════════════════════════════════
-router.post('/proposal/:id/approve', auth, async (req, res) => {
+router.post('/proposal/:id/approve', auth, requireRole('trainer'), async (req, res) => {
   const { id } = req.params;
   const { execute } = req.body || {};  // optional: { execute: true } to run immediately
   const scope = tenantScope(req);
@@ -236,7 +237,7 @@ router.post('/proposal/:id/approve', auth, async (req, res) => {
 // POST /api/ai/trainer/proposal/:id/reject
 // Reject a programmer proposal
 // ═══════════════════════════════════════════════════════════════════════════
-router.post('/proposal/:id/reject', auth, async (req, res) => {
+router.post('/proposal/:id/reject', auth, requireRole('trainer'), async (req, res) => {
   const { id } = req.params;
   const { reason } = req.body || {};
   const scope = tenantScope(req);
@@ -271,7 +272,7 @@ router.post('/proposal/:id/reject', auth, async (req, res) => {
 // POST /api/ai/trainer/proposal/:id/execute
 // Execute an already-approved proposal
 // ═══════════════════════════════════════════════════════════════════════════
-router.post('/proposal/:id/execute', auth, async (req, res) => {
+router.post('/proposal/:id/execute', auth, requireRole('trainer'), async (req, res) => {
   const { id } = req.params;
   const scope = tenantScope(req);
   const org = scope.applyFilter ? scope.orgId : null;
@@ -301,7 +302,7 @@ router.post('/proposal/:id/execute', auth, async (req, res) => {
 // POST /api/ai/trainer/proposal/:id/reverse
 // Reverse an executed proposal — restore exact previous state
 // ═══════════════════════════════════════════════════════════════════════════
-router.post('/proposal/:id/reverse', auth, async (req, res) => {
+router.post('/proposal/:id/reverse', auth, requireRole('trainer'), async (req, res) => {
   const { id } = req.params;
   const { reason } = req.body || {};
   const scope = tenantScope(req);
@@ -338,7 +339,7 @@ router.post('/proposal/:id/reverse', auth, async (req, res) => {
 // GET /api/ai/trainer/audit
 // Audit trail for intelligence actions
 // ═══════════════════════════════════════════════════════════════════════════
-router.get('/audit', auth, async (req, res) => {
+router.get('/audit', auth, requireRole('trainer'), async (req, res) => {
   const { client_id, target_type, limit: limitStr } = req.query;
   const scope = tenantScope(req);
   const org = scope.applyFilter ? scope.orgId : null;
