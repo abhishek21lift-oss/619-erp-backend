@@ -2,21 +2,14 @@
 // Super Admin platform API (multi-tenant SaaS).
 //
 // The hidden admin portal that only platform operators (role='super_admin')
-// can reach. Mounted in server.js with `auth` + `requireSuperAdmin` +
-// `requireSuperAdminMfa` applied at the mount point, so every handler in every
-// router below runs as an authenticated super admin.
+// can reach. Mounted in server.js with auth + requireSuperAdmin +
+// requireSuperAdminMfa applied at the mount point.
 //
-// SECURITY: platform-level only. Tenant admins (role='admin') never reach here.
-// Every mutation is written to activity_log for audit.
-//
-// This file is intentionally a mount list. Domain behavior belongs in the
-// smaller routers under ./super-admin and the Command Center module.
+// SECURITY: platform-level only. Tenant admins never reach this router.
+// Keep this file as a mount list; domain behavior belongs in its submodules.
 
 const router = require('express').Router();
 
-// Mounted before organizations, which owns PATCH/DELETE /users/:id.
-// GET /users/summary is a literal segment and must remain ahead of any future
-// GET /users/:id route. The route split test pins this invariant.
 router.use(require('./super-admin/users'));
 router.use(require('./super-admin/organizations'));
 router.use(require('./super-admin/operations'));
@@ -34,9 +27,11 @@ router.use(require('./super-admin/storage'));
 router.use(require('./super-admin/registrations'));
 router.use(require('./super-admin/mail'));
 
-// Command Center inherits this mount's authentication + super-admin + MFA
-// chain. It is deliberately not mounted behind a second, weaker door.
+// Command Center inherits the same authenticated platform boundary. These
+// routers are intentionally separate so operational features can evolve
+// without turning the platform mount back into a monolith.
 router.use(require('../command-center/command-center.routes'));
 router.use(require('../command-center/risk.routes'));
+router.use(require('../command-center/action-center.routes'));
 
 module.exports = router;
