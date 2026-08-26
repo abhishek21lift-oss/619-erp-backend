@@ -2,12 +2,16 @@
 // TRAINER_LIMIT and OWNER_EXISTS — the API half of one studio, one owner, one
 // trainer.
 //
-// Migration 184 enforces the trainer rule in the database, but only where it
-// could build its index: on any studio that already had two active trainers it
-// warns and skips, deliberately, so that a deploy is never taken down by a row
-// the migration did not create. These guards are what holds the rule there, and
-// they are also what turns a unique violation into a message a studio owner can
-// act on rather than a 500 naming a constraint.
+// Migration 184 enforces the trainer rule in the database and refuses to be
+// skipped — if trainers_one_active_per_org cannot be built, the migration
+// aborts the deploy. So these guards are not what enforces the rule, and the
+// gap between their check and their insert does not matter: losing that race
+// means the index rejects the second write.
+//
+// What they do is turn the refusal into something actionable. Without them a
+// second trainer is a 500 naming a constraint; with them it is a 409 naming
+// the trainer who already holds the slot, which is what the Add Coach screen
+// renders.
 //
 // There is no database constraint for the owner rule at all — a partial unique
 // index on admins would fail to build wherever two already exist, and demoting

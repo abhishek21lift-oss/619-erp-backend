@@ -12,11 +12,17 @@
 //
 // migrate.js:122-131 gives each migration its own transaction and rethrows on
 // failure, and server.js runs migrations before serving traffic — so a
-// migration that throws stops the deploy. 184 runs at deploy time, by which
-// point a studio may have gained a second active trainer that would make its
-// index unbuildable. The test that earns its place here is the one asserting
-// that this produces a WARNING and a missing index rather than an exception:
-// that is the difference between a constraint that has to wait and an outage.
+// migration that throws stops the deploy. 184 throws anyway when it cannot
+// build trainers_one_active_per_org, because a silently absent constraint is
+// worse than a stopped deploy: nothing downstream can tell "enforced" from
+// "skipped", and the API guard cannot close the race between two concurrent
+// creates or cover writes that never reach those routes.
+//
+// So the tests that earn their place are the ones asserting the migration
+// FAILS on a two-trainer studio, that nothing it did survives the rollback,
+// and — easy to undo by accident and invisible when broken — that the
+// per-studio diagnostic is emitted BEFORE the abort, so an operator is left
+// with a list rather than only an error.
 //
 // ── Nothing is left behind ─────────────────────────────────────────────────
 //
@@ -128,6 +134,25 @@ describeIf('184_one_trainer_per_studio.sql', () => {
 
   const run = () => db.query(MIGRATION_SQL);
 
+  /**
+   * Run the migration expecting it to raise, and return the error.
+   *
+   * Inside a SAVEPOINT because the suite wraps each case in a transaction it
+   * rolls back: without one, the deliberate failure aborts that transaction
+   * and every assertion afterwards dies with "current transaction is aborted"
+   * instead of reporting what it found.
+   */
+  async function runExpectingFailure() {
+    await db.query('SAVEPOINT before_migration');
+    try {
+      await db.query(MIGRATION_SQL);
+    } catch (err) {
+      await db.query('ROLLBACK TO SAVEPOINT before_migration');
+      return err;
+    }
+    throw new Error('the migration was expected to fail, and did not');
+  }
+
   describe('linking an owner to their studio trainer', () => {
     it('links an owner whose trainer_id is NULL to the sole active trainer', async () => {
       // The production case: Abhishek PT Studio, whose admin was seeded rather
@@ -153,25 +178,30 @@ describeIf('184_one_trainer_per_studio.sql', () => {
       expect(await adminLink('linked')).toBe('mig184-tr-old');
     });
 
-    it('refuses to link when the studio has two active trainers', async () => {
-      // Ambiguous: picking one would silently decide who the owner is.
+    it('does not commit a link when the studio has two active trainers', async () => {
+      // Ambiguous, and now fatal: the whole migration rolls back, so the link
+      // cannot have been committed whatever section 1 decided in passing.
       await seedStudio('two', {
         trainers: [{ id: 'mig184-tr-two-a' }, { id: 'mig184-tr-two-b' }],
       });
 
-      await run();
+      await runExpectingFailure();
 
       expect(await adminLink('two')).toBeNull();
-      expect(warnings.join('\n')).toMatch(/Studio two has 2 active trainers/);
     });
 
-    it('leaves a studio with no active trainer alone, without erroring', async () => {
+    it('leaves a studio with no active trainer alone, without failing the deploy', async () => {
+      // Zero trainers cannot make the index unbuildable, so it is reported and
+      // survived. Only MORE than one is fatal — a deploy must not stop for a
+      // studio that merely has nobody to train in it.
       await seedStudio('none', { trainers: [{ id: 'mig184-tr-gone', status: 'inactive' }] });
+      await makeEveryOtherStudioClean();
 
       await expect(run()).resolves.toBeDefined();
 
       expect(await adminLink('none')).toBeNull();
       expect(warnings.join('\n')).toMatch(/Studio none has NO active trainer/);
+      expect(await indexExists()).toBe(true);
     });
 
     it('ignores soft-deleted trainers when deciding the studio has exactly one', async () => {
@@ -219,22 +249,58 @@ describeIf('184_one_trainer_per_studio.sql', () => {
       )).resolves.toBeDefined();
     });
 
-    it('WARNS and skips rather than throwing when a studio has two active trainers', async () => {
-      // The whole reason this migration does not RAISE EXCEPTION. A throw here
-      // would roll back the transaction migrate.js opened and stop the deploy,
-      // over a row 184 did not create.
+    it('FAILS rather than proceeding without the constraint', async () => {
+      // The central decision. Skipping the index would leave the one-trainer
+      // rule unenforced while everything downstream — the code, these tests,
+      // the next engineer reading the migration — assumes it is there. The API
+      // 409 is not a substitute: it cannot close the race between two creates
+      // that both read zero active trainers before either inserts.
       await seedStudio('block', {
         trainers: [{ id: 'mig184-tr-b1' }, { id: 'mig184-tr-b2' }],
       });
 
-      await expect(run()).resolves.toBeDefined();
+      const err = await runExpectingFailure();
 
+      expect(err.message).toMatch(/cannot create trainers_one_active_per_org/);
+      expect(err.message).toMatch(/Studio block \(2\)/);
       expect(await indexExists()).toBe(false);
-      expect(warnings.join('\n')).toMatch(/NOT creating trainers_one_active_per_org/);
-      expect(warnings.join('\n')).toMatch(/Studio block \(2\)/);
+    });
+
+    it('names the offending studio BEFORE it aborts, not after', async () => {
+      // Section 2 runs ahead of section 3 for this reason alone. Notices are
+      // not transactional, so they survive the rollback and reach the deploy
+      // log via migrate.js's listener — but only if they were raised first.
+      // Reordered back, an operator gets a failure and no list, and nothing
+      // else in this suite would notice.
+      await seedStudio('early', {
+        trainers: [{ id: 'mig184-tr-e1' }, { id: 'mig184-tr-e2' }],
+      });
+
+      await runExpectingFailure();
+
+      expect(warnings.join('\n')).toMatch(/Studio early has 2 active trainers/);
+      expect(warnings.join('\n')).toMatch(/WILL abort the migration/);
+    });
+
+    it('tells the operator how to fix it, and warns against DELETE', async () => {
+      // The hint is the difference between a stopped deploy someone can clear
+      // in a minute and one they escalate. DELETE is called out because it
+      // cascades pt_commissions, pt_payouts and leave_requests — the failure
+      // mode this whole change was designed around.
+      await seedStudio('hint', {
+        trainers: [{ id: 'mig184-tr-h1' }, { id: 'mig184-tr-h2' }],
+      });
+
+      const err = await runExpectingFailure();
+
+      expect(err.hint).toMatch(/status = 'inactive'/);
+      expect(err.hint).toMatch(/Never DELETE/);
+      expect(err.hint).toMatch(/cascade/);
     });
 
     it('does not fail when the index already exists', async () => {
+      // Re-running a migration is normal; the index existing is the state the
+      // first run leaves. This must stay a NOTICE-and-return, not an abort.
       await seedStudio('again', { trainers: [{ id: 'mig184-tr-again' }] });
       await makeEveryOtherStudioClean();
       await run();

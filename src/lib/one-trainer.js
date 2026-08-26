@@ -3,11 +3,16 @@
  * One active trainer per studio, and one owner.
  *
  * The database enforces the trainer half through the partial unique index
- * `trainers_one_active_per_org` (migration 184). These helpers exist because a
- * unique violation reaching the client is a 500 with a constraint name in it,
- * which tells a studio owner nothing about what they did or what to do next.
- * They also cover the window before that index exists: 184 skips it, loudly, on
- * any database that already had a second active trainer.
+ * `trainers_one_active_per_org` (migration 184), which refuses to be skipped —
+ * if it cannot be built the migration aborts the deploy. So the constraint is
+ * always there, and these helpers are not what enforces the rule.
+ *
+ * What they do is turn the refusal into something a studio owner can act on. A
+ * unique violation reaching the client is a 500 naming a constraint, which says
+ * nothing about what they did or what to do next; a 409 naming the trainer who
+ * already holds the slot says both. They are the courtesy, not the guarantee —
+ * which is why they check-then-insert without a transaction and that is fine:
+ * losing the race means the index rejects the second write anyway.
  *
  * The owner half has no database constraint on purpose. A partial unique index
  * on admins would fail to build wherever two already exist, and demoting one
