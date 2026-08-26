@@ -75,7 +75,42 @@ describe('DELETE /settings/branches/:id', () => {
     expect(res.status).toBe(200);
     // The client types this as { message: string } and shows it on success.
     expect(res.body).toEqual({ message: 'Branch deleted' });
-    expect(deleteQuery().params).toEqual([BRANCH_KEY]);
+    // Both the key AND the caller's organisation. system_settings carries a
+    // tenant column since migration 180; before it, this DELETE addressed the
+    // key alone and one studio's owner could remove another studio's branch.
+    expect(deleteQuery().params).toEqual([BRANCH_KEY, 'org-1']);
+  });
+
+  test('scopes every statement to the caller\'s organisation', async () => {
+    // The guard against the whole class of bug, not just the DELETE: the
+    // existence check, the member count and the delete must all be bounded, or
+    // the route reports on one studio's data while acting on another's.
+    await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
+
+    const touching = mockQueries.filter((q) =>
+      /system_settings|pt_clients/i.test(q.sql));
+    expect(touching.length).toBeGreaterThanOrEqual(3);
+    for (const q of touching) {
+      expect(q.sql).toMatch(/organization_id\s*=\s*\$\d/i);
+      expect(q.params).toContain('org-1');
+    }
+  });
+
+  test('refuses to delete when no organisation resolved', async () => {
+    // An admin account carrying no organisation — a legacy or half-provisioned
+    // row, which middleware/auth.js loads through a LEFT JOIN and will happily
+    // hand over. orgIdOf() returns null for it, and an unbounded DELETE would
+    // remove the branch from whichever studio owned it. So the write refuses.
+    //
+    // Deliberately an `admin`, not a `super_admin`: adminOnly gates these
+    // routes on role === 'admin' exactly, so an operator never reaches the
+    // handler at all and this backstop only ever fires for the case above.
+    mockUser = { id: 'admin-2', role: 'admin', organization_id: null };
+    const res = await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('NO_TARGET_ORG');
+    expect(deleteQuery()).toBeUndefined();
   });
 
   test('addresses the row by its prefixed settings key, not the bare id', async () => {
