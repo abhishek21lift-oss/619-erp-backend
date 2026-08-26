@@ -6,6 +6,7 @@ const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { trainerSchemas } = require('../lib/validation');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const { activeTrainerOf, trainerLimitFlat } = require('../lib/one-trainer');
 
 // Fields a non-admin (trainer) is allowed to see about other trainers.
 // Salary, incentive_rate, address, dob, certifications etc. are scrubbed.
@@ -144,6 +145,14 @@ router.post('/', auth, adminOnly, validate(trainerSchemas.create), async (req, r
   try {
     const d = req.body;
     if (!d.name?.trim()) return res.status(400).json({ error: 'Name required' });
+
+    // One active trainer per studio. Checked here as well as by the database's
+    // trainers_one_active_per_org index (184), because a unique violation
+    // surfaces as a 500 naming a constraint, and because 184 skips the index on
+    // any database that already had a second active trainer.
+    const existingTrainer = await activeTrainerOf(pool, req);
+    if (existingTrainer) return res.status(409).json(trainerLimitFlat(existingTrainer));
+
     const id = randomUUID();
     const rate = (parseFloat(d.incentive_rate) || 50) / 100; // convert % to decimal
     const metadata = (d.metadata && typeof d.metadata === 'object') ? d.metadata : {};

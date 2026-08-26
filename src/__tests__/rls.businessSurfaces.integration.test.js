@@ -90,7 +90,15 @@ const SURFACES = [
     what: 'a trainer, and with them their commission rate',
     pk: 'id',
     mutable: 'name',
-    row: (org, s) => ({ id: `tr-probe-${s}`, name: `Trainer ${s}`, organization_id: org }),
+    // status='inactive' for the same class of reason attendance_logs needs
+    // `vary`: a constraint that has nothing to do with isolation would
+    // otherwise stop the probe inserting at all. Migration 184 added
+    // trainers_one_active_per_org — UNIQUE (organization_id) WHERE
+    // status='active' — and the fixture above already put an active trainer in
+    // each org, so an active probe row is refused before RLS is ever consulted.
+    // The policy filters on organization_id and never reads status, so an
+    // archived trainer proves exactly the same property.
+    row: (org, s) => ({ id: `tr-probe-${s}`, name: `Trainer ${s}`, status: 'inactive', organization_id: org }),
   },
   {
     table: 'pt_sessions',

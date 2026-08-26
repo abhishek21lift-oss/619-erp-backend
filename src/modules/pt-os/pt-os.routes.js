@@ -9,6 +9,7 @@ const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
+const { activeTrainerOf, trainerLimitNested } = require('../../lib/one-trainer');
 const { today: studioToday } = require('../../lib/appTime');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
@@ -161,6 +162,13 @@ router.post('/trainers', auth, adminOnly, wrap(async (req, res) => {
   // org-less trainer is invisible to the very studio that just created them —
   // the create would appear to silently do nothing.
   const scope = tenantScope(req);
+
+  // One active trainer per studio — same rule and same reasoning as
+  // POST /api/trainers. Both paths insert into `trainers`, so guarding only one
+  // of them would leave the other as a way around it.
+  const existingTrainer = await activeTrainerOf(pool, req);
+  if (existingTrainer) return res.status(409).json(trainerLimitNested(existingTrainer));
+
   const { rows } = await pool.query(
     `INSERT INTO trainers (name, email, mobile, specialization, incentive_rate, status, organization_id)
      VALUES ($1,$2,$3,$4,$5,'active',$6) RETURNING *`,
