@@ -42,39 +42,15 @@ if (missingRecommended.length) {
 }
 
 // ── RLS cutover validation ───────────────────────────────────────────────────
-// When TENANT_RLS_ENFORCE is on (default in production), the app_tenant role
-// must be used for tenant requests, and a separate owner connection (ADMIN_DATABASE_URL)
-// must exist for platform-wide operations. If both URLs are the same, the app
-// connects as the table owner (postgres) which has BYPASSRLS, making all RLS
-// policies ineffective. This check catches the misconfiguration at boot.
+// The check that used to live here compared DATABASE_URL against
+// ADMIN_DATABASE_URL as strings and refused to boot when they matched. Two
+// different strings can authenticate as the same role, so it passed in exactly
+// the state it existed to catch — verified against the live database on
+// 26 Aug 2026, where both connections resolved to `postgres` (rolbypassrls =
+// true) and all ninety tenant_isolation policies were inert.
 //
-// The condition below must be the SAME predicate db/pool.js and
-// middleware/auth.js use to decide whether enforcement is on, and it was not:
-// this line tested the variable for truthiness while they test it against the
-// string 'off'. The two disagreed in both directions, and both directions were
-// wrong:
-//
-//   TENANT_RLS_ENFORCE | old guard fired? | enforcement actually on?
-//   <unset>            | no               | YES  ← shipped the misconfiguration
-//   'off'              | YES              | no   ← refused to boot when disabled
-//
-// Unset is the production default, so the check meant to catch "enforcement on
-// with a single owner connection" was silent in precisely the configuration it
-// existed to catch. The predicate now lives in lib/tenantRlsFlag.js and is
-// imported by all three call sites, so they cannot drift apart again.
-if (isProd && rlsEnforcementEnabled()) {
-  const adminUrl = process.env.ADMIN_DATABASE_URL || process.env.DATABASE_URL;
-  if (adminUrl === process.env.DATABASE_URL) {
-    logger.fatal(
-      'Refusing to start: TENANT_RLS_ENFORCE is enabled but ADMIN_DATABASE_URL is not set to a different connection string. '
-      + 'The app_tenant role (migration 157) must be used for tenant traffic via DATABASE_URL, '
-      + 'and the privileged owner role must be configured separately via ADMIN_DATABASE_URL '
-      + 'for platform-wide operations (migrations, workers, super-admin console). '
-      + 'See db/migrations/TENANT-RLS-PLAN.md for the rollout procedure.'
-    );
-    process.exit(1);
-  }
-}
+// It has been replaced by an assertion made of the database itself, run at the
+// head of the boot chain at the bottom of this file. See lib/tenantRoleAssertion.js.
 
 // ── TRUST_PROXY validation ───────────────────────────────────────────────────
 // The correct value depends on the deployment topology. The current production
@@ -1013,9 +989,73 @@ app.use(errorHandler);
 // START — run migrations first, then listen
 // ────────────────────────
 const { runMigrationsWithRetry } = require('./db/migrate');
+const { evaluateTenantRole } = require('./lib/tenantRoleAssertion');
 
-logger.info('Running database migrations…');
-runMigrationsWithRetry()
+/**
+ * Ask the database who it authenticated us as, and refuse to serve traffic if
+ * the answer means RLS is not enforcing.
+ *
+ * Runs at the head of the boot chain, before migrations and long before
+ * listen(), so a misconfigured deploy never takes a request.
+ *
+ * A thrown verification is treated as a failed verification when enforcement
+ * is on in production: an authorisation property that cannot be checked is not
+ * a property that may be assumed. Everywhere else it is a warning, because a
+ * dev machine with no database should still boot far enough to say so.
+ */
+async function assertTenantRole() {
+  const enforcing = rlsEnforcementEnabled();
+  // Required here rather than at module scope: db/pool opens connections on
+  // require, and this file is also loaded by tests that never boot.
+  const pool = require('./db/pool');
+  let roles;
+  try {
+    roles = await pool.inspectRoles();
+  } catch (err) {
+    const msg = 'Could not verify the database role of the tenant connection: ' + err.message;
+    if (isProd && enforcing) { logger.fatal(msg + ' Refusing to start.'); process.exit(1); }
+    logger.warn(msg);
+    return;
+  }
+
+  const result = evaluateTenantRole(roles);
+
+  // Logged on every boot, pass or fail. The state that produced the August
+  // incident was invisible precisely because nothing ever printed which role
+  // the pool had authenticated as.
+  logger.info({ ...result.detail, tenantRlsEnforce: enforcing }, 'Database role check');
+
+  if (result.ok) return;
+
+  if (!enforcing) {
+    // TENANT_RLS_ENFORCE=off means the operator has deliberately turned the
+    // wrapper off; isolation then rests on application SQL alone, which is a
+    // choice, not a misconfiguration. Say so and continue.
+    logger.warn({ code: result.code, ...result.detail },
+      'TENANT_RLS_ENFORCE is off — ' + result.message);
+    return;
+  }
+
+  if (isProd) {
+    logger.fatal({ code: result.code, ...result.detail }, 'Refusing to start: ' + result.message);
+    process.exit(1);
+  }
+  logger.warn({ code: result.code, ...result.detail }, result.message);
+}
+
+// Before the migrations, not after. The check reads pg_roles for whichever
+// role the connection authenticated as, which no migration influences — and
+// the misconfiguration it exists to catch takes migrations down with it. Point
+// DATABASE_URL at app_tenant without an ADMIN_DATABASE_URL and the migration
+// runner, having no owner connection to fall back to, tries to run DDL as an
+// unprivileged role and buries the actual cause under a wall of permission
+// errors. One line naming the problem is worth more than that.
+logger.info('Verifying the database role of the tenant connection…');
+assertTenantRole()
+  .then(function() {
+    logger.info('Running database migrations…');
+    return runMigrationsWithRetry();
+  })
   .then(function() {
     // Start polling the operator's AI model overrides. After migrations, so
     // the table is guaranteed to exist; before listen, so the first request
@@ -1278,7 +1318,10 @@ runMigrationsWithRetry()
     process.on('SIGINT',  shutdown('SIGINT'));
   })
   .catch(function(err) {
-    logger.fatal({ err: err.message }, 'Startup migration failed');
+    // Covers the whole chain, not only the migrations: the role check ahead of
+    // them reports its own failures and exits, so anything arriving here is
+    // either a migration error or the pool failing to load at all.
+    logger.fatal({ err: err.message }, 'Startup failed before the server could listen');
     process.exit(1);
   });
 
