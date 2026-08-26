@@ -69,24 +69,33 @@ describe('an unknown key or role is denied, never waved through', () => {
   });
 });
 
-// The frontend lives in a sibling checkout. Skipped rather than failed when it
-// is absent, so the backend suite still runs on its own — but it runs in CI,
-// where both are present, which is where a drift would actually land.
+// The frontend lives in a sibling checkout, and CI checks out only this repo.
+//
+// ── Why the reads are inside each test and not up here ──────────────────────
+//
+// They were in the describe callback body, guarded by `describe.skip`. That
+// does not work: skip suppresses the TESTS, not the callback, which Jest still
+// executes while collecting the file. So on CI — backend-only — readFileSync
+// threw during collection and the whole suite failed to run, with 2658 other
+// tests passing around it.
+//
+// Reading lazily inside each `it` means the guard actually guards. The earlier
+// version of this comment also claimed CI has both checkouts, which is what led
+// me to write it that way; it does not.
+const readFrontend = (...p) => fs.readFileSync(path.join(FRONTEND, ...p), 'utf8');
 const describeCrossRepo = frontendAvailable ? describe : describe.skip;
 
 describeCrossRepo('backend and frontend agree', () => {
-  const ctx = fs.readFileSync(path.join(FRONTEND, 'lib', 'permissions-context.tsx'), 'utf8');
-  const sidebar = fs.readFileSync(path.join(FRONTEND, 'components', 'sidebar', 'Sidebar.tsx'), 'utf8');
-
   it('the shipped defaults are identical', () => {
+    const ctx = readFrontend('lib', 'permissions-context.tsx');
     const block = ctx.slice(ctx.indexOf('const DEFAULTS'), ctx.indexOf('};', ctx.indexOf('const DEFAULTS')));
     const frontDefaults = {};
     for (const [, k, v] of block.matchAll(/(perm_[a-z_]+):\s*(true|false)/g)) {
       frontDefaults[k] = v === 'true';
     }
     // Only compare keys the frontend actually ships — it omits two the backend
-    // round-trips (staff_view for reception is present, all_pt_clients is not),
-    // and a missing key there is a separate question from a differing value.
+    // round-trips, and a missing key there is a separate question from a
+    // differing value.
     for (const [k, v] of Object.entries(frontDefaults)) {
       expect({ [k]: PERM_DEFAULTS[k] }).toEqual({ [k]: v });
     }
@@ -97,6 +106,7 @@ describeCrossRepo('backend and frontend agree', () => {
     // The direction that matters. A link hidden by a rule the server does not
     // apply is the original bug; the reverse (server stricter than the menu) is
     // merely confusing.
+    const sidebar = readFrontend('components', 'sidebar', 'Sidebar.tsx');
     const used = [...sidebar.matchAll(/can\('([a-z_]+)'\)/g)].map((m) => m[1]);
     expect(used.length).toBeGreaterThan(0);
     for (const feature of new Set(used)) {
