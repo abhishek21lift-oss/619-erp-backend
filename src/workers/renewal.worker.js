@@ -26,6 +26,24 @@ const razorpay = require('../lib/razorpay');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 
+// ── Two of the three sweeps below are still dead ────────────────────────────
+//
+// runClassReminders() was fixed with the booking module (migration 182) and now
+// reads the live tables.
+//
+// runReminders() and runAutoRenew() have NOT been. Both operate entirely on
+// `members`, `member_memberships` and the legacy `payments` table — the
+// abandoned v3 model. Nothing writes those tables (the only INSERT INTO
+// member_memberships is inside runAutoRenew itself, reached from a SELECT over
+// the same empty table), so both select zero rows and report success on every
+// daily tick. There is therefore no membership expiry reminder and no
+// auto-renew for any real client.
+//
+// That is a rewrite against pt_clients + pt_client_subscriptions + pt_payments,
+// and it is deliberately not bundled here: runAutoRenew CHARGES CARDS through
+// Razorpay, and a sweep that moves money needs its own change, its own dry-run
+// against a full cycle, and a decision about whether studios auto-charge at all.
+// See BIZ-03 in the architecture audit.
 const REMINDER_DAYS = [7, 3, 1];   // send reminder when this many days remain
 
 async function runReminders() {
@@ -123,17 +141,33 @@ async function runAutoRenew() {
 }
 
 async function runClassReminders() {
-  // 30 minutes before each class, ping confirmed members
+  // 30 minutes before each class, ping the clients booked into it.
+  //
+  // Rewritten alongside the booking module (migration 182). Every join here was
+  // against something that does not exist: `cs.starts_at` is not a column —
+  // class_sessions stores `date` and `start_time` — and `members` is the
+  // abandoned v3 table, joined on `bookings.member_id`, which bookings no
+  // longer use. So this swept zero rows and reported success, on every tick,
+  // every thirty minutes.
+  //
+  // class_templates is LEFT JOINed and users is LEFT JOINed on purpose: an
+  // ad-hoc session without a template, or a client without a login, should
+  // still get whatever channel it CAN be reached on rather than dropping out of
+  // the sweep entirely. An inner join here is a silently missed reminder.
   const { rows } = await pool.query(`
-    SELECT b.id AS booking_id, m.user_id, m.name, m.phone, m.email,
-           ct.name AS class_name, TO_CHAR(cs.starts_at, 'HH24:MI') AS time,
+    SELECT b.id AS booking_id, u.id AS user_id,
+           c.name, c.mobile AS phone, c.email,
+           COALESCE(ct.name, cs.title) AS class_name,
+           TO_CHAR(cs.date + cs.start_time, 'HH24:MI') AS time,
            cs.id AS session_id
     FROM bookings b
     JOIN class_sessions cs ON cs.id = b.session_id
-    JOIN class_templates ct ON ct.id = cs.template_id
-    JOIN members m ON m.id = b.member_id
+    LEFT JOIN class_templates ct ON ct.id = cs.template_id
+    JOIN pt_clients c ON c.id = b.client_id AND c.deleted_at IS NULL
+    LEFT JOIN users u ON u.pt_client_id = c.id AND u.deleted_at IS NULL
     WHERE b.status = 'confirmed'
-      AND cs.starts_at BETWEEN NOW() + INTERVAL '25 minutes' AND NOW() + INTERVAL '35 minutes'
+      AND (cs.date + cs.start_time) AT TIME ZONE current_setting('TimeZone')
+          BETWEEN NOW() + INTERVAL '25 minutes' AND NOW() + INTERVAL '35 minutes'
   `);
   for (const r of rows) {
     await notifier.send('class_reminder', r,

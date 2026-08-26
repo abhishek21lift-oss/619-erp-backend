@@ -17,12 +17,12 @@
 //                                    — a role, never an owner. Any admin or
 //                                    trainer of ANY studio could mark ANY
 //                                    booking attended, and the mirrored
-//                                    attendance row landed in the booking's
+//                                    attendance_logs row landed in the booking's
 //                                    studio, not the caller's.
 //   DELETE /api/bookings/:id         the role check only constrained `member`,
 //                                    so staff of any studio could cancel any
 //                                    booking on the platform.
-//   GET  /api/bookings?member_id=X   member_id straight off the query string
+//   GET  /api/bookings?client_id=X   client_id straight off the query string
 //                                    for any non-member caller.
 //   POST /api/bookings               session_id was never checked against the
 //                                    caller's studio, so a member could book a
@@ -94,17 +94,20 @@ describe('bookings service is bounded by the caller\'s studio', () => {
     it('never reaches the attendance mirror when the booking is not the caller\'s', async () => {
       await expect(svc.checkIn('booking-owned-by-A', {}, ctxB)).rejects.toThrow();
       // A row written here would have landed in studio A on studio B's say-so.
-      expect(touching('attendance')).toHaveLength(0);
+      expect(touching('attendance_logs')).toHaveLength(0);
     });
 
     it('stamps the attendance mirror from the booking, not from the caller', async () => {
       // The booking's own org wins, so the mirror cannot land in a different
       // studio from the booking it mirrors even if the two disagree.
-      mockRows = [{ id: 'bk-1', member_id: 'm-1', organization_id: ORG_B }];
+      mockRows = [{ id: 'bk-1', client_id: 'pc-1', client_name: 'Asha', organization_id: ORG_B }];
       await svc.checkIn('bk-1', { method: 'manual' }, ctxB);
 
-      const insert = touching('attendance')[0];
-      expect(insert.sql).toMatch(/INSERT INTO attendance/i);
+      // attendance_logs, not `attendance`. The latter had exactly one writer —
+      // this line — and no readers anywhere, so a class check-in was recorded
+      // where no screen, report or export would ever find it.
+      const insert = touching('attendance_logs')[0];
+      expect(insert.sql).toMatch(/INSERT INTO attendance_logs/i);
       expect(insert.sql).toMatch(/organization_id/);
       expect(insert.params).toContain(ORG_B);
     });
@@ -123,7 +126,7 @@ describe('bookings service is bounded by the caller\'s studio', () => {
 
   describe('book', () => {
     it('scopes the session lock by organization', async () => {
-      await expect(svc.book({ session_id: 'session-in-A', member_id: 'm-1' }, ctxB))
+      await expect(svc.book({ session_id: 'session-in-A', client_id: 'pc-1' }, ctxB))
         .rejects.toMatchObject({ status: 404 });
 
       const lock = mockQueries.find((q) => /FROM class_sessions/i.test(q.sql));
@@ -137,7 +140,7 @@ describe('bookings service is bounded by the caller\'s studio', () => {
       // implicitly; inserting NULL would hit migration 176's NOT NULL as an
       // opaque 500 instead.
       const platformCtx = { ...ctxB, organization_id: null, role: 'super_admin' };
-      await expect(svc.book({ session_id: 's-1', member_id: 'm-1' }, platformCtx))
+      await expect(svc.book({ session_id: 's-1', client_id: 'pc-1' }, platformCtx))
         .rejects.toMatchObject({ status: 400 });
       expect(mockQueries).toHaveLength(0);
     });
@@ -150,9 +153,9 @@ describe('bookings service is bounded by the caller\'s studio', () => {
     });
   });
 
-  describe('listForMember — member_id comes straight off the query string', () => {
+  describe('listForClient — client_id comes straight off the query string', () => {
     it('adds the organization predicate when the caller is a tenant user', async () => {
-      await svc.listForMember('member-of-A', {}, { applyFilter: true, orgId: ORG_B });
+      await svc.listForClient('client-of-A', {}, { applyFilter: true, orgId: ORG_B });
 
       const [q] = mockQueries;
       expect(q.sql).toMatch(/b\.organization_id = \$\d/);
@@ -160,7 +163,7 @@ describe('bookings service is bounded by the caller\'s studio', () => {
     });
 
     it('omits it for a platform super admin operating platform-wide', async () => {
-      await svc.listForMember('member-of-A', {}, { applyFilter: false, orgId: null });
+      await svc.listForClient('client-of-A', {}, { applyFilter: false, orgId: null });
 
       const [q] = mockQueries;
       expect(q.sql).not.toMatch(/b\.organization_id/);

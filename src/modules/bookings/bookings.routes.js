@@ -7,26 +7,35 @@ const svc = require('./bookings.service');
 const cal = require('../../lib/google-calendar');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+// `client_id`, from pt_client_id — NOT member_id.
+//
+// Every member-facing path here read `req.user.member_id`, which
+// middleware/rbac.js documents as always NULL for a real client account since
+// migration 154. So a client listing their bookings got an empty array, and a
+// client trying to book got 400 "member_id required" — before any of the schema
+// problems below were even reached.
 const ctx = (req) => ({
   user_id: req.user.id, user_name: req.user.name, organization_id: req.user.organization_id,
-  role: req.user.role, trainer_id: req.user.trainer_id, member_id: req.user.member_id,
+  role: req.user.role, trainer_id: req.user.trainer_id, client_id: req.user.pt_client_id,
 });
 
 // GET /api/v1/bookings  — current user's bookings
 router.get('/', auth, wrap(async (req, res) => {
-  let memberId = req.query.member_id;
-  if (req.user.role === 'member') memberId = req.user.member_id;
-  if (!memberId) return res.json({ data: [] });
-  const data = await svc.listForMember(memberId, req.query, tenantScope(req));
+  // A member may only ever ask about themselves; the id is taken from the
+  // session and any client_id in the query is ignored for them.
+  let clientId = req.query.client_id || req.query.member_id;
+  if (req.user.role === 'member') clientId = req.user.pt_client_id;
+  if (!clientId) return res.json({ data: [] });
+  const data = await svc.listForClient(clientId, req.query, tenantScope(req));
   res.json({ data });
 }));
 
 // POST /api/v1/bookings  — book a class
 router.post('/', auth, wrap(async (req, res) => {
-  let memberId = req.body.member_id;
-  if (req.user.role === 'member') memberId = req.user.member_id;
-  if (!memberId) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'member_id required' } });
-  const booking = await svc.book({ session_id: req.body.session_id, member_id: memberId }, ctx(req));
+  let clientId = req.body.client_id || req.body.member_id;
+  if (req.user.role === 'member') clientId = req.user.pt_client_id;
+  if (!clientId) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'client_id required' } });
+  const booking = await svc.book({ session_id: req.body.session_id, client_id: clientId }, ctx(req));
   res.status(201).json({ data: booking });
   // Fire-and-forget: sync confirmed bookings to the user's Google Calendar.
   // A calendar failure must never fail the booking itself.
