@@ -268,6 +268,34 @@ if (isProd) {
   }
 }
 
+// ── The role-permission matrix ──────────────────────────────────────────────
+//
+// Announced at boot because this control CHANGES BEHAVIOUR on the deploy that
+// carries it, and the change is invisible from every other angle: a trainer who
+// could open Finance yesterday gets a 403 today, and the only thing that
+// changed is that a toggle the studio set long ago started being honoured.
+//
+// Deliberately not in SECURITY_FLAGS above — that block validates strictly
+// on/off, and this one has a third state ('report') whose whole purpose is to
+// let an operator see who WOULD lose access before anybody does.
+const { permissionMode, permissionModeIsValid } = require('./lib/permissionFlag');
+if (!permissionModeIsValid()) {
+  logger.warn(
+    { value: process.env.PERMISSION_ENFORCE, using: 'on' },
+    'PERMISSION_ENFORCE is not one of on/off/report — defaulting to "on". '
+    + 'A typo must not silently disable an authorisation gate.'
+  );
+}
+{
+  const mode = permissionMode();
+  const describe = {
+    on:     'role permissions are ENFORCED — staff will be refused features their role has switched off',
+    report: 'role permissions are OBSERVED ONLY — refusals are logged as permission_would_deny, nothing is blocked',
+    off:    'role permissions are NOT enforced — the Settings matrix is decorative, as it was before this control existed',
+  }[mode];
+  (mode === 'off' ? logger.warn : logger.info).call(logger, { mode }, `PERMISSION_ENFORCE=${mode}: ${describe}`);
+}
+
 const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
@@ -293,6 +321,7 @@ const { requirePlatformOwner } = require('./middleware/platformAuth');
 const PLATFORM_GUARD = [auth, requireSuperAdmin, requireSuperAdminMfa, requirePlatformOwner];
 const { branchScope }            = require('./middleware/branch-scope');
 const { requireFeature }         = require('./lib/features');
+const { requirePermission }      = require('./middleware/permissions');
 const { requireAiQuota }         = require('./lib/aiQuota');
 
 // Feature gating for tenant-facing routers.
@@ -314,24 +343,43 @@ const { requireAiQuota }         = require('./lib/aiQuota');
 // the Control Centre — which is the point of the toggle existing.
 const gate = (key) => [auth, requireFeature(key)];
 
-// The same feature gate, plus a role gate.
+// The feature gate, plus a role gate, plus the studio's own permission matrix.
 //
-// gate() checks that the STUDIO has a feature switched on. It does not check
-// who is asking, and a feature flag is not an authorisation decision. Handlers
-// behind gate() then scope by organization_id, which bounds the studio and
-// says nothing about the role — so a `member` (the account client activation
-// creates for a gym client) satisfied every check and read staff data.
+// Three different questions, and conflating any two of them has already cost
+// this codebase a bug:
 //
-// Found by memberEscalation.authz.test.js, which drives a real member session
-// at every mount. GET /api/invoices returned every invoice in the studio —
-// other clients' names, invoice numbers and amounts — and GET
-// /api/reports/monthly returned the studio's revenue: it self-scopes for a
-// trainer via `role === 'trainer'`, so a member fell through the branch with
-// no filter at all.
+//   requireFeature   has the STUDIO bought this capability?
+//   requireStaff     is this person back-office staff at all?
+//   requirePermission may THIS ROLE use it, per the studio's Settings?
 //
-// Use this for any mount whose data belongs to the studio rather than to the
-// person asking.
-const staffGate = (key) => [auth, requireStaff, requireFeature(key)];
+// gate() checks only the first. It does not check who is asking, and a feature
+// flag is not an authorisation decision — handlers behind gate() then scope by
+// organization_id, which bounds the studio and says nothing about the role, so
+// a `member` (the account client activation creates) satisfied every check and
+// read staff data. Found by memberEscalation.authz.test.js, which drives a real
+// member session at every mount: GET /api/invoices returned every invoice in
+// the studio, and GET /api/reports/monthly returned its revenue.
+//
+// requirePermission is the third question, and until middleware/permissions.js
+// nothing on the server ever asked it. The sixteen perm_* toggles in Settings
+// were read by exactly one thing — the frontend sidebar, deciding whether to
+// render a link — so a trainer with perm_trainer_finance switched off saw no
+// Finance menu item and could still call GET /api/expenses directly.
+//
+// `permission` is the matrix's vocabulary, not the feature registry's: they are
+// different systems that happen to share the word "feature". The mapping comes
+// from Sidebar.tsx's canSeeByPermission(), so a link that disappears and a
+// request that is refused agree about why.
+//
+// Ordering matters: a studio without the module at all should hear that, rather
+// than being told it is a permissions problem.
+//
+// This replaces staffGate(), which every caller has become — the two differed
+// only in the third question, and a helper that answers two of three is the one
+// somebody reaches for by accident.
+const permGate = (featureKey, permission) => [
+  auth, requireStaff, requireFeature(featureKey), requirePermission(permission),
+];
 
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -721,18 +769,18 @@ app.use('/api/attendance',        ...gate('attendance'), require('./routes/atten
 // So "legacy" had it backwards: /api/reports is the tenant-safe, live
 // implementation, and the migration target was the unsafe one. Do not
 // reintroduce a v1 reports router without organization_id on its tables.
-app.use('/api/reports',           userApiLimiter, ...staffGate('insights'), require('./routes/reports'));
+app.use('/api/reports',           userApiLimiter, ...permGate('insights', 'reports'), require('./routes/reports'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
 // requireStaff: staff leave requests — who is off, when, and why. HR data
 // about employees, org-scoped but not role-scoped.
 app.use('/api/leave',             auth, requireStaff, require('./routes/leave'));
-// staffGate, not gate: routes/expenses.js narrows with `if (req.user.role ===
+// permGate, not gate: routes/expenses.js narrows with `if (req.user.role ===
 // 'trainer')` and then applies the org filter — so a member fell through the
 // trainer branch and got the studio's whole expense stats. Third instance of
 // that fall-through after reports/monthly and search; a feature flag is not an
 // authorisation decision.
-app.use('/api/expenses',          ...staffGate('finance'), require('./routes/expenses'));
+app.use('/api/expenses',          ...permGate('finance', 'finance'), require('./routes/expenses'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.
@@ -792,8 +840,31 @@ app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-che
 // keys from non-admins, but system_settings carries NO organization_id at all
 // (it is on tenantColumns' KNOWN_GAPS as per-studio keys inside a shared
 // table), so the query is unfiltered by studio as well as by role.
-app.use('/api/settings',          auth, requireStaff, require('./routes/settings'));
-app.use('/api/invoices',          ...staffGate('finance'), require('./routes/invoices'));
+// requirePermission('settings') gates the STUDIO SETTINGS screens on the
+// matrix, at the mount rather than per route — every route in this router is
+// settings, and the write routes keep their own adminOnly on top.
+//
+// GET /permissions is the one exception, and it has to be: it is the endpoint
+// by which a client learns its OWN permissions. The frontend's
+// PermissionsProvider calls it for every logged-in user, and the default
+// perm_trainer_settings / perm_reception_settings are both false — so gating it
+// would 403 the very call that tells a trainer what they may do. Its provider
+// would fall back to the shipped defaults, and a studio that granted
+// perm_trainer_finance would have its trainers see no Finance link while the
+// server happily served them. The menu and the API would disagree, which is the
+// exact failure this whole change exists to end, reintroduced from the other
+// side.
+//
+// Safe to exempt: the handler returns only the caller's own studio's matrix and
+// their role, which is information they are entitled to and can already infer
+// from which screens work.
+const settingsGate = requirePermission('settings');
+app.use('/api/settings', auth, requireStaff, (req, res, next) => (
+  req.method === 'GET' && req.path === '/permissions'
+    ? next()
+    : settingsGate(req, res, next)
+), require('./routes/settings'));
+app.use('/api/invoices',          ...permGate('finance', 'finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
 // The Exercise Library. Sits behind the same 'programs' feature as the Workout
 // Builder it feeds — a studio with programmes always has the library, and one
@@ -854,10 +925,15 @@ app.use('/api/classes',           require('./routes/classes'));
 //
 // auth() running twice is cheap: the second call is a user-cache hit.
 // A client's own data is served by /api/me, which scopes to the caller.
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/pt-os.routes'));
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/parq.routes'));
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/informed-consent.routes'));
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/workout-log.routes'));
+//
+// requirePermission('pt_module') is the matrix's say on top of the role gate.
+// Note what this changes on the deploy that carries it: perm_reception_pt_module
+// ships FALSE, so a receptionist loses /api/pt-os — which is exactly what that
+// toggle has claimed since it was added, and never did.
+app.use('/api/pt-os',            auth, requireStaff, requirePermission('pt_module'), require('./modules/pt-os/pt-os.routes'));
+app.use('/api/pt-os',            auth, requireStaff, requirePermission('pt_module'), require('./modules/pt-os/parq.routes'));
+app.use('/api/pt-os',            auth, requireStaff, requirePermission('pt_module'), require('./modules/pt-os/informed-consent.routes'));
+app.use('/api/pt-os',            auth, requireStaff, requirePermission('pt_module'), require('./modules/pt-os/workout-log.routes'));
 
 // The client's own surfaces. Mirror image of the block above: requireClient
 // refuses anyone who is not a `member` linked to a client record, and every
@@ -885,8 +961,8 @@ app.use('/api/client-login',     auth, requireStaff, require('./routes/client-lo
 // userApiLimiter as well: these two mounts had only the 2000-per-15-minutes
 // global bucket, which is a generous ceiling for an endpoint that returns
 // health records a page at a time.
-app.use('/api/progress',   userApiLimiter, auth, requireStaff, require('./modules/progress/progress.routes'));
-app.use('/api/automation', userApiLimiter, auth, requireStaff, require('./modules/automation/automation.routes'));
+app.use('/api/progress',   userApiLimiter, auth, requireStaff, requirePermission('pt_module'), require('./modules/progress/progress.routes'));
+app.use('/api/automation', userApiLimiter, auth, requireStaff, requirePermission('pt_module'), require('./modules/automation/automation.routes'));
 
 // ────────────────────────
 // v3 MODULE ROUTES

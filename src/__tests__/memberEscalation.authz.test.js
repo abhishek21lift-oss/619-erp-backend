@@ -146,7 +146,11 @@ function mountsFromServer() {
       // staffGate() is the [auth, requireStaff, requireFeature] helper; it must
       // be named here explicitly, since it does not contain the substring
       // "requireStaff" and this check would otherwise miss every mount using it.
-      gated: /requireStaff|staffGate|requireRole|requireSuperAdmin|adminOnly|platformAuth|requireClient/.test(chain),
+      // permGate() is the [auth, requireStaff, requireFeature, requirePermission]
+      // helper and replaced staffGate(); like it, the name does not contain the
+      // substring "requireStaff", so it has to be listed explicitly or every
+      // mount using it reads as ungated here.
+      gated: /requireStaff|permGate|requireRole|requireSuperAdmin|adminOnly|platformAuth|requireClient/.test(chain),
     });
   }
   return out;

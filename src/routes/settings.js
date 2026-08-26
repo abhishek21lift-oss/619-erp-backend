@@ -31,6 +31,11 @@ const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
 const { orgWhere, orgIdOf } = require('../lib/tenant-db');
+// PERM_KEYS / PERM_DEFAULTS live in lib/permissions.js, not here, because
+// middleware/permissions.js now enforces the same matrix and two copies of a
+// default is two answers to "may this trainer open Finance".
+const { PERM_KEYS, PERM_DEFAULTS } = require('../lib/permissions');
+const { invalidatePermissions } = require('../middleware/permissions');
 const logger = require('../lib/logger');
 
 /**
@@ -379,34 +384,6 @@ router.put('/gym', auth, adminOnly, async (req, res, next) => {
 
 // ── ROLE PERMISSIONS ─────────────────────────────────────────────────────────
 
-const PERM_KEYS = [
-  'perm_trainer_pt_module', 'perm_trainer_finance', 'perm_trainer_reports',
-  'perm_trainer_insights', 'perm_trainer_staff_view', 'perm_trainer_settings',
-  'perm_trainer_all_pt_clients', 'perm_trainer_commissions', 'perm_trainer_record_payment',
-  'perm_reception_pt_module', 'perm_reception_finance', 'perm_reception_reports',
-  'perm_reception_insights', 'perm_reception_settings', 'perm_reception_staff_view',
-  'perm_reception_record_payment',
-];
-
-const PERM_DEFAULTS = {
-  perm_trainer_pt_module: true,
-  perm_trainer_finance: false,
-  perm_trainer_reports: false,
-  perm_trainer_insights: false,
-  perm_trainer_staff_view: true,
-  perm_trainer_settings: false,
-  perm_trainer_all_pt_clients: false,
-  perm_trainer_commissions: true,
-  perm_trainer_record_payment: false,
-  perm_reception_pt_module: false,
-  perm_reception_finance: false,
-  perm_reception_reports: false,
-  perm_reception_insights: false,
-  perm_reception_settings: false,
-  perm_reception_staff_view: true,
-  perm_reception_record_payment: true,
-};
-
 // GET /api/settings/permissions
 router.get('/permissions', auth, async (req, res, next) => {
   try {
@@ -446,6 +423,9 @@ router.put('/permissions', auth, adminOnly, async (req, res, next) => {
          DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
         [keys, strVals, orgId]
       );
+      // The gate caches the matrix for 30s per studio. Without this an owner
+      // switches a toggle, watches nothing happen, and switches it again.
+      invalidatePermissions(orgId);
     }
     res.json({ message: 'Permissions updated' });
   } catch (err) {

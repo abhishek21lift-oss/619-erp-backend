@@ -49,7 +49,20 @@ const mockTxClient = {
 
 jest.mock('../db/pool', () => ({
   connect: jest.fn(async () => mockTxClient),
-  query: jest.fn(async () => ({ rows: [{ id: 'pay-new', amount: 5000 }], rowCount: 1 })),
+  query: jest.fn(async (sql) => {
+    // The route now carries requirePermission('record_payment'), which reads
+    // the studio's matrix off system_settings. These tests are about the
+    // transaction structure and the trainer-ownership check, so the studio is
+    // given the toggle switched ON and the gate becomes a non-factor — rather
+    // than swapping the fixture to an admin, which would stop exercising the
+    // ownership branch that is the point of the file.
+    //
+    // permissions.enforcement.test.js is where the gate itself is tested.
+    if (/perm/i.test(String(sql))) {
+      return { rows: [{ key: 'perm_trainer_record_payment', value: 'true' }], rowCount: 1 };
+    }
+    return { rows: [{ id: 'pay-new', amount: 5000 }], rowCount: 1 };
+  }),
 }));
 
 jest.mock('../db/receipts', () => ({ genReceiptNo: jest.fn(async () => 'RCPT-0001') }));
@@ -83,6 +96,9 @@ const verbs = () => mockTxLog.filter((q) => /^BEGIN$|^COMMIT$|^ROLLBACK$/i.test(
 const validBody = (over = {}) => ({ client_id: CLIENT_A, amount: 5000, date: '2026-08-06', method: 'UPI', ...over });
 
 beforeEach(() => {
+  // The gate caches per studio for 30s; without this the first test's matrix
+  // would be served to all the others.
+  require('../middleware/permissions').invalidatePermissions();
   mockTxLog.length = 0;
   mockTxClient.query.mockClear();
   mockTxClient.release.mockClear();

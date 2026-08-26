@@ -3,6 +3,7 @@ const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
 const { auth, adminOnly, adminOrManager } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
+const { requirePermission } = require('../../middleware/permissions');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
@@ -1010,7 +1011,11 @@ router.get('/balance-sheet', auth, wrap(async (req, res) => {
 }));
 
 // ─── Commissions ────────────────────────────────────────────
-router.get('/commissions', auth, wrap(async (req, res) => {
+// requirePermission('commissions'): perm_trainer_commissions is the toggle the
+// Settings screen offers, and it gates READING the commission roll-up — the
+// write routes below are adminOnly, and an admin is not constrained by the
+// matrix, so a gate there would be inert.
+router.get('/commissions', auth, requirePermission('commissions'), wrap(async (req, res) => {
   const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : req.query.trainer_id;
   const rows = await svc.getCommissionHistory(trainerId, tenantScope(req));
   res.json({ data: rows });
@@ -1056,7 +1061,7 @@ router.put('/commissions/:trainerId', auth, adminOnly, wrap(async (req, res) => 
 }));
 
 // ─── Payouts ────────────────────────────────────────────────
-router.get('/payouts', auth, wrap(async (req, res) => {
+router.get('/payouts', auth, requirePermission('commissions'), wrap(async (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
   const rows = await svc.getTrainerPayouts(month, tenantScope(req));
   res.json({ data: rows, month });
@@ -1439,7 +1444,9 @@ router.get('/payments', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/payments', auth, wrap(async (req, res) => {
+// perm_*_record_payment. Reception ships TRUE for this and trainer FALSE —
+// taking money at the desk is a front-desk job.
+router.post('/payments', auth, requirePermission('record_payment'), wrap(async (req, res) => {
   const { client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes } = req.body;
   const numAmount = Number(amount) || 0;
 

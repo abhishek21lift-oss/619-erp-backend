@@ -144,9 +144,9 @@ describe('the routes that carried this pattern are gated', () => {
   // specific mounts stay gated, so a future edit that drops one is caught by
   // name rather than by a count changing somewhere.
   it.each([
-    ['/api/expenses', 'staffGate'],
+    ['/api/expenses', 'permGate'],
     ['/api/search', 'requireStaff'],
-    ['/api/reports', 'staffGate'],
+    ['/api/reports', 'permGate'],
   ])('%s is mounted behind %s', (mount, guard) => {
     const line = server.split('\n').find((l) => l.includes(`app.use('${mount}'`));
     expect(line).toBeDefined();

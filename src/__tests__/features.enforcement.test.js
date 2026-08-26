@@ -88,15 +88,20 @@ describe('server.js wiring', () => {
     expect(order).toBe('auth,requireFeature(key)');
   });
 
-  it('puts auth and requireStaff BEFORE requireFeature in staffGate', () => {
+  it('puts auth and requireStaff BEFORE requireFeature in permGate', () => {
     // Same reasoning as the gate() ordering test above, and one more: a
     // feature flag is not an authorisation decision, so requireStaff has to
     // run for the mounts whose data belongs to the studio rather than to the
     // caller. If requireFeature moved first, turning a feature ON would be
     // enough to expose it to a member.
-    const helper = server.match(/const staffGate = \(key\) => \[([^\]]+)\]/);
+    //
+    // permGate replaced staffGate and appends the fourth check. requirePermission
+    // must come LAST: a studio that has not bought the module at all should be
+    // told that, not told it is a permissions problem.
+    const helper = server.match(/const permGate = \(featureKey, permission\) => \[([^\]]+)\]/);
     expect(helper).not.toBeNull();
-    expect(helper[1].replace(/\s/g, '')).toBe('auth,requireStaff,requireFeature(key)');
+    expect(helper[1].replace(/\s/g, ''))
+      .toBe('auth,requireStaff,requireFeature(featureKey),requirePermission(permission),');
   });
 
   it('gates the capabilities the Control Centre advertises', () => {
@@ -104,9 +109,10 @@ describe('server.js wiring', () => {
       'ai_suite', 'ai_knowledge_base', 'attendance', 'programs',
       'insights', 'communication', 'integrations', 'packages', 'finance',
     ]) {
-      // Either helper counts: staffGate() is gate() plus requireStaff, so a
-      // capability behind it is still feature-gated.
-      expect(server).toMatch(new RegExp(`(?:staffG|g)ate\\('${key}'\\)`));
+      // Either helper counts: permGate() is gate() plus requireStaff and the
+      // permission matrix, so a capability behind it is still feature-gated.
+      // permGate takes the feature key first, hence the optional second arg.
+      expect(server).toMatch(new RegExp(`(?:permG|g)ate\\('${key}'`));
     }
   });
 
@@ -114,7 +120,7 @@ describe('server.js wiring', () => {
     // A studio must always be able to sign in and pay us, whatever else an
     // operator has switched off. Gating these could lock a studio out of
     // fixing its own billing — the one thing that must never happen.
-    const gatedMounts = [...server.matchAll(/app\.use\('([^']+)'[^\n]*(?:staffG|g)ate\(/g)].map((m) => m[1]);
+    const gatedMounts = [...server.matchAll(/app\.use\('([^']+)'[^\n]*(?:permG|g)ate\(/g)].map((m) => m[1]);
     for (const mount of gatedMounts) {
       expect(mount).not.toMatch(/^\/api\/(auth|subscription|payments)/);
     }
