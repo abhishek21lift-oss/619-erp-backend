@@ -49,6 +49,20 @@ async function calculateMonthlyCommissions(month, scope = {}) {
   // COALESCE on trainer_commission preserves the loop's behaviour exactly —
   // it read the value through Number(), and Number(null) is 0, where passing
   // a SQL NULL into a NOT NULL column would now fail instead.
+  //
+  // ── The trainer table this joins ─────────────────────────────────────────
+  //
+  // The JOIN is against `trainers`, and that is the whole of BIZ-01.
+  //
+  // It used to read `pt_trainers` — the fork that migration 018 created and
+  // that nothing has written to since (there is no INSERT INTO pt_trainers
+  // anywhere in the repository; 145 found it empty in production). Because this
+  // is an INNER JOIN, every candidate client was filtered out before the
+  // INSERT: not a zero-value commission, no commission row at all. Silent, on
+  // every run, for every trainer.
+  //
+  // See migration 181, which makes `trainers` a superset first so that this
+  // switch cannot lose anybody.
   const { rows: written } = await pool.query(`
     INSERT INTO pt_commissions
       (trainer_id, trainer_name, client_id, client_name,
@@ -56,7 +70,7 @@ async function calculateMonthlyCommissions(month, scope = {}) {
     SELECT c.trainer_id, c.trainer_name, c.id, c.name,
            $1::DATE, COALESCE(c.trainer_commission, 0), t.incentive_rate, 'pending'
     FROM pt_clients c
-    JOIN pt_trainers t ON t.id = c.trainer_id
+    JOIN trainers t ON t.id = c.trainer_id
     WHERE c.deleted_at IS NULL
       AND c.status IN ('active','frozen')
       AND c.trainer_id IS NOT NULL
@@ -100,7 +114,7 @@ async function getTrainerPayouts(month, scope = {}) {
       COALESCE(pp.net_amount, 0) AS paid_amount,
       COALESCE(pp.status, 'pending') AS payout_status,
       pp.id AS payout_id
-    FROM pt_trainers t
+    FROM trainers t
     LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
     LEFT JOIN pt_payouts pp ON pp.trainer_id = t.id AND pp.month = $1
     WHERE t.deleted_at IS NULL AND t.status = 'active'${orgClause}
@@ -245,7 +259,7 @@ async function getDashboardStats(scope = {}) {
       COUNT(c.id) FILTER (WHERE c.status = 'active')::INT AS active_clients,
       COALESCE(SUM(c.monthly_pt_amount) FILTER (WHERE c.status = 'active'), 0) AS monthly_revenue,
       COALESCE(SUM(c.trainer_commission) FILTER (WHERE c.status = 'active'), 0) AS monthly_commission
-    FROM pt_trainers t
+    FROM trainers t
     LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL${orgC}
     WHERE t.deleted_at IS NULL AND t.status = 'active'
     GROUP BY t.id, t.name
@@ -302,7 +316,7 @@ async function createPayout(trainerId, month, deductions, processedBy, scope = {
     SELECT
       t.name AS trainer_name,
       COALESCE(SUM(pc.commission_amt), 0) AS total_commission
-    FROM pt_trainers t
+    FROM trainers t
     LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
     WHERE t.id = $2 AND t.deleted_at IS NULL${orgClause}
     GROUP BY t.name
@@ -334,7 +348,7 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy, 
   let orgClause = '';
   if (scope.applyFilter) {
     params.push(scope.orgId);
-    orgClause = ` AND trainer_id IN (SELECT id FROM pt_trainers WHERE organization_id = $${params.length})`;
+    orgClause = ` AND trainer_id IN (SELECT id FROM trainers WHERE organization_id = $${params.length})`;
   }
   const { rows } = await pool.query(`
     UPDATE pt_payouts
@@ -402,7 +416,7 @@ async function getOpsSummary(scope = {}) {
       wa.plan_name, wa.plan_id
     FROM pt_sessions s
     LEFT JOIN pt_clients c  ON c.id = s.client_id
-    LEFT JOIN pt_trainers t ON t.id = s.trainer_id
+    LEFT JOIN trainers t ON t.id = s.trainer_id
     LEFT JOIN LATERAL (
       SELECT wp.name AS plan_name, wp.id AS plan_id
         FROM workout_assignments a
@@ -608,7 +622,7 @@ async function getOpsSummary(scope = {}) {
       COUNT(s.id) FILTER (WHERE s.status = 'completed')::INT AS completed,
       COUNT(s.id) FILTER (WHERE s.status = 'scheduled')::INT AS scheduled,
       COUNT(s.id) FILTER (WHERE s.status IN ('cancelled','no_show'))::INT AS missed
-    FROM pt_trainers t
+    FROM trainers t
     LEFT JOIN pt_sessions s
       ON s.trainer_id = t.id
       AND s.session_date >= DATE_TRUNC('month', CURRENT_DATE)

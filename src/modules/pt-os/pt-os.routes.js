@@ -116,8 +116,12 @@ async function clientInOrg(req, clientId) {
 
 // ─── Trainers ───────────────────────────────────────────────
 router.get('/trainers', auth, wrap(async (req, res) => {
-  // Include trainers from both the main trainers table and the PT-OS-specific
-  // pt_trainers table so adding a trainer in either place makes them available here.
+  // One table. `trainers` is where every insert site in the product writes,
+  // and migration 181 copied across anything that existed only in the fork, so
+  // the UNION with pt_trainers that used to be here can no longer contribute a
+  // row. Removing it also restores `photo_url`: the union arm selected
+  // `NULL::text AS photo_url` for the `trainers` side — the column exists on
+  // that table and always has — so PT OS has never shown a trainer's photo.
   //
   // Scoped by organization. This route had no tenant filter at all, so every
   // studio saw every trainer on the platform — the Book PT Session dialog
@@ -138,12 +142,8 @@ router.get('/trainers', auth, wrap(async (req, res) => {
   }
 
   const { rows } = await pool.query(`
-    SELECT id, name, email, mobile, specialization, incentive_rate, status, NULL::text AS photo_url
-    FROM trainers
-    WHERE deleted_at IS NULL AND status = 'active' ${orgFilter}
-    UNION
     SELECT id, name, email, mobile, specialization, incentive_rate, status, photo_url
-    FROM pt_trainers
+    FROM trainers
     WHERE deleted_at IS NULL AND status = 'active' ${orgFilter}
     ORDER BY name
   `, params);
@@ -392,10 +392,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
     let resolvedTrainerName = reqTrainerName || null;
     if (!resolvedTrainerName && trainer_id) {
       const { rows: tRows } = await pool.query(
-        `SELECT name FROM trainers WHERE id = $1
-         UNION
-         SELECT name FROM pt_trainers WHERE id = $1
-         LIMIT 1`, [trainer_id]
+        'SELECT name FROM trainers WHERE id = $1 LIMIT 1', [trainer_id]
       );
       resolvedTrainerName = tRows[0]?.name || null;
     }
@@ -1040,14 +1037,14 @@ router.put('/commissions/:trainerId', auth, adminOnly, wrap(async (req, res) => 
   const beforeParams = [req.params.trainerId];
   const beforeOrg = orgWhere(req, beforeParams);
   const { rows: before } = await pool.query(
-    `SELECT id, name, incentive_rate FROM pt_trainers WHERE id = $1${beforeOrg}`, beforeParams
+    `SELECT id, name, incentive_rate FROM trainers WHERE id = $1${beforeOrg}`, beforeParams
   );
   if (before.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Trainer not found' } });
 
   const updParams = [rate, req.params.trainerId];
   const updOrg = orgWhere(req, updParams);
   await pool.query(
-    `UPDATE pt_trainers SET incentive_rate = $1, updated_at = NOW() WHERE id = $2${updOrg}`,
+    `UPDATE trainers SET incentive_rate = $1, updated_at = NOW() WHERE id = $2${updOrg}`,
     updParams
   );
 
@@ -1077,7 +1074,7 @@ router.post('/payouts', auth, adminOnly, wrap(async (req, res) => {
 // organization filter at all. An admin in any studio calling this marked
 // every other studio's pending payouts paid too. trainer_id is the only tie
 // back to a tenant (pt_payouts itself carries no organization_id), so the
-// filter is a subquery against pt_trainers, same pattern as markPayoutPaid.
+// filter is a subquery against trainers, same pattern as markPayoutPaid.
 router.post('/payouts/mark-all-paid', auth, adminOnly, wrap(async (req, res) => {
   const month = req.body.month || new Date().toISOString().slice(0, 7);
   const monthStart = `${month}-01`;
@@ -1086,7 +1083,7 @@ router.post('/payouts/mark-all-paid', auth, adminOnly, wrap(async (req, res) => 
   let orgClause = '';
   if (scope.applyFilter) {
     params.push(scope.orgId);
-    orgClause = ` AND trainer_id IN (SELECT id FROM pt_trainers WHERE organization_id = $${params.length})`;
+    orgClause = ` AND trainer_id IN (SELECT id FROM trainers WHERE organization_id = $${params.length})`;
   }
   const { rowCount } = await pool.query(
     `UPDATE pt_payouts SET status = 'paid', paid_at = NOW(), updated_at = NOW()
@@ -1110,7 +1107,7 @@ router.put('/payouts/:trainerId', auth, adminOnly, wrap(async (req, res) => {
   const scope = tenantScope(req);
   if (scope.applyFilter) {
     const { rowCount } = await pool.query(
-      `SELECT 1 FROM pt_trainers WHERE id = $1 AND organization_id = $2`,
+      `SELECT 1 FROM trainers WHERE id = $1 AND organization_id = $2`,
       [req.params.trainerId, scope.orgId]
     );
     if (rowCount === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Trainer not found' } });
@@ -1187,8 +1184,8 @@ router.get('/revenue', auth, wrap(async (req, res) => {
 // opens this screen — would drop out of the report entirely.
 //
 // Rows with a NULL organization_id stay hidden rather than shown to everyone.
-// That is migration 143's decision for exactly these tables, and pt_trainers
-// is not in 155's NOT NULL list, so unattributable rows can still exist.
+// That is migration 143's decision for exactly these tables, and `trainers` is
+// not in 155's NOT NULL list, so unattributable rows can still exist.
 router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) => {
   const params = [];
   const tOrg = orgWhere(req, params, 't.organization_id');
@@ -1202,7 +1199,7 @@ router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) =
       COALESCE(SUM(c.trainer_commission) FILTER (WHERE c.status = 'active'), 0) AS monthly_commission,
       COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_payment_revenue,
       COALESCE(SUM(p.incentive_amt) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_incentives
-    FROM pt_trainers t
+    FROM trainers t
     LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL${cOrg}
     LEFT JOIN pt_payments p ON p.trainer_id = t.id AND p.deleted_at IS NULL${pOrg}
     WHERE t.deleted_at IS NULL AND t.status = 'active'${tOrg}
@@ -1259,15 +1256,15 @@ router.get('/sessions', auth, wrap(async (req, res) => {
 // Keying solely off the column reported "not linked" to the studio owner and
 // told them to ask an admin — which they are.
 //
-// Second, `pt_sessions.trainer_id` has had NO foreign key since migration
-// 018 dropped pt_sessions_trainer_id_fkey, and the Book Session picker is fed
-// by GET /trainers, a UNION of `trainers` and `pt_trainers`. So a booked
-// session's trainer_id can be an id from EITHER table, and the same human
-// routinely exists in both. Matching one id misses the other's sessions.
+// Second, a booked session's trainer_id is not necessarily the id on the
+// caller's user row. `pt_sessions.trainer_id` references `trainers` (migration
+// 145 repointed it there from the empty pt_trainers fork), while
+// `users.trainer_id` may be unset for a studio owner who also trains.
 //
-// Hence: the explicit link, plus an email match in both tables, all within the
-// caller's own organisation. Email is the join the two trainer tables already
-// share — 018 seeded pt_trainers FROM trainers carrying it across.
+// Hence: the explicit link, plus an email match, within the caller's own
+// organisation. This used to match against both trainer tables because the
+// Book Session picker UNIONed them and an id could come from either; migration
+// 181 consolidated on `trainers`, so one lookup now covers every session.
 //
 // The org filter mirrors GET /trainers exactly, including excluding NULL
 // organization_id rather than treating it as shared: an unattributable trainer
@@ -1289,9 +1286,6 @@ async function resolveMyTrainerIds(req) {
     }
     const { rows } = await pool.query(`
       SELECT id FROM trainers
-       WHERE deleted_at IS NULL AND LOWER(email) = $1 ${orgFilter}
-      UNION
-      SELECT id FROM pt_trainers
        WHERE deleted_at IS NULL AND LOWER(email) = $1 ${orgFilter}
     `, params);
     for (const r of rows) ids.add(r.id);
@@ -1435,11 +1429,10 @@ router.get('/payments', auth, wrap(async (req, res) => {
   const pOrg = orgWhere(req, params, 'p.organization_id');
   if (pOrg) where.push(pOrg.replace(/^ AND /, ''));
   const { rows } = await pool.query(`
-    SELECT p.*, c.name AS client_name, COALESCE(t.name, ptt.name) AS trainer_name
+    SELECT p.*, c.name AS client_name, t.name AS trainer_name
     FROM pt_payments p
     LEFT JOIN pt_clients c ON c.id = p.client_id
     LEFT JOIN trainers t ON t.id = p.trainer_id
-    LEFT JOIN pt_trainers ptt ON ptt.id = p.trainer_id
     WHERE ${where.join(' AND ')}
     ORDER BY p.date DESC
   `, params);

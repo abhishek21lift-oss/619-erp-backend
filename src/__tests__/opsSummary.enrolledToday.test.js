@@ -141,7 +141,7 @@ describe('getOpsSummary contract', () => {
 // already scoped, which is exactly how it survived — nothing about the code
 // around it looked wrong.
 describe('the per-trainer totals query', () => {
-  const trainerSessionsQuery = () => queryWith('FROM pt_trainers t', 'LEFT JOIN pt_sessions s');
+  const trainerSessionsQuery = () => queryWith('FROM trainers t', 'LEFT JOIN pt_sessions s');
 
   it('lists only this organization\'s trainers', () => {
     expect(trainerSessionsQuery()).toContain('t.organization_id = $1');
@@ -172,7 +172,7 @@ describe('the per-trainer totals query', () => {
     // pool.query(`…`) with no second argument is what the leak looked like.
     // The template is interpolated with $1, so a missing bindings array would
     // now throw rather than quietly return the platform.
-    const src = SRC.slice(SRC.indexOf('FROM pt_trainers t') - 900);
+    const src = SRC.slice(SRC.indexOf('FROM trainers t') - 900);
     expect(src).toContain('`, bareParams);');
   });
 });

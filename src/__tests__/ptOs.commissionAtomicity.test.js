@@ -55,7 +55,7 @@ describe('calculateMonthlyCommissions writes in a single statement', () => {
     const { sql } = calls[0];
     expect(sql).toMatch(/^INSERT INTO pt_commissions/i);
     expect(sql).toMatch(/SELECT c\.trainer_id/i);
-    expect(sql).toMatch(/FROM pt_clients c JOIN pt_trainers t/i);
+    expect(sql).toMatch(/FROM pt_clients c JOIN trainers t/i);
     // The upsert is what makes a re-run idempotent rather than duplicating.
     expect(sql).toMatch(/ON CONFLICT \(trainer_id, client_id, month\) DO UPDATE/i);
     expect(sql).toMatch(/RETURNING \*/i);
