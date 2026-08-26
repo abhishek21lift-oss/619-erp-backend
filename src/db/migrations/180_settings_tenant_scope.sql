@@ -85,9 +85,27 @@ ALTER TABLE IF EXISTS feature_flags   ADD COLUMN IF NOT EXISTS organization_id U
 --
 -- A branch lives as a single `branch_<uuid>` row whose value is a JSON blob.
 -- Its only link to a studio is that `pt_clients.branch_id` holds the full
--- system_settings key (see the member_count subquery in routes/settings.js).
--- pt_clients.organization_id has been NOT NULL since migration 155, so every
--- branch a client actually uses is attributable.
+-- system_settings key — which is what the member_count subquery in
+-- routes/settings.js assumes.
+--
+-- ── That column may not exist ───────────────────────────────────────────────
+--
+-- No migration ever adds `branch_id` to pt_clients. routes/clients.js says so
+-- outright and works around it:
+--
+--     FROM (SELECT pc.*, NULL::text AS branch_id FROM pt_clients pc) c
+--     -- "branch_id is shimmed as NULL because pt_clients is single-branch"
+--
+-- So on a database built from these migrations the column is absent, and an
+-- unguarded reference to it does not return zero rows — it aborts the whole
+-- migration with `column c.branch_id does not exist`, which is exactly what it
+-- did on the first CI run of this file. Production may still have it (see
+-- 177_tables_that_existed_only_in_production.sql for the precedent), so this
+-- has to work either way rather than pick one.
+--
+-- Dynamic SQL is used only INSIDE this guard. The literal-statement rule that
+-- 174 documents applies to the ADD COLUMN statements in step 1, which every
+-- tenant guard in this repo discovers by regex — those stay literal above.
 --
 -- Only rows resolving to exactly ONE organisation are attributed. A branch key
 -- referenced by clients in two studios is pre-existing corruption, and guessing
@@ -103,25 +121,39 @@ BEGIN
     RETURN;
   END IF;
 
-  UPDATE system_settings s
-     SET organization_id = a.org_id
-    FROM (
-      -- (array_agg(DISTINCT …))[1] rather than min(), because Postgres has no
-      -- min(uuid) aggregate — `function min(uuid) does not exist` aborts the
-      -- migration. The HAVING below already guarantees exactly one distinct
-      -- value, so taking the first element is not a choice between candidates.
-      SELECT c.branch_id AS branch_key,
-             (array_agg(DISTINCT c.organization_id))[1] AS org_id
-        FROM pt_clients c
-       WHERE c.branch_id IS NOT NULL
-         AND c.organization_id IS NOT NULL
-         AND c.deleted_at IS NULL
-       GROUP BY c.branch_id
-      HAVING count(DISTINCT c.organization_id) = 1
-    ) a
-   WHERE s.key = a.branch_key
-     AND s.key LIKE 'branch\_%'
-     AND s.organization_id IS NULL;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'pt_clients'
+       AND column_name = 'branch_id'
+  ) THEN
+    RAISE NOTICE
+      '180: pt_clients has no branch_id column, so branch rows cannot be '
+      'attributed from client assignments. Any branch_%% row stays unattributed '
+      'and invisible — see the warning in step 6.';
+    RETURN;
+  END IF;
+
+  EXECUTE $q$
+    UPDATE system_settings s
+       SET organization_id = a.org_id
+      FROM (
+        -- (array_agg(DISTINCT …))[1] rather than min(), because Postgres has no
+        -- min(uuid) aggregate — `function min(uuid) does not exist` aborts the
+        -- migration. The HAVING below already guarantees exactly one distinct
+        -- value, so taking the first element is not a choice between candidates.
+        SELECT c.branch_id AS branch_key,
+               (array_agg(DISTINCT c.organization_id))[1] AS org_id
+          FROM pt_clients c
+         WHERE c.branch_id IS NOT NULL
+           AND c.organization_id IS NOT NULL
+           AND c.deleted_at IS NULL
+         GROUP BY c.branch_id
+        HAVING count(DISTINCT c.organization_id) = 1
+      ) a
+     WHERE s.key = a.branch_key
+       AND s.key LIKE 'branch\_%'
+       AND s.organization_id IS NULL
+  $q$;
 
   GET DIAGNOSTICS attributed = ROW_COUNT;
   RAISE NOTICE '180: attributed % branch row(s) from pt_clients', attributed;
@@ -316,16 +348,22 @@ BEGIN
     FROM system_settings
    WHERE key LIKE 'branch\_%' AND organization_id IS NULL;
 
-  IF to_regclass('public.pt_clients') IS NOT NULL THEN
-    SELECT count(*) INTO split_branches
-      FROM (
+  -- Same column guard as step 2: without branch_id there is nothing to split.
+  IF to_regclass('public.pt_clients') IS NOT NULL AND EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'pt_clients'
+       AND column_name = 'branch_id'
+  ) THEN
+    EXECUTE $q$
+      SELECT count(*) FROM (
         SELECT c.branch_id
           FROM pt_clients c
          WHERE c.branch_id IS NOT NULL AND c.organization_id IS NOT NULL
            AND c.deleted_at IS NULL
          GROUP BY c.branch_id
         HAVING count(DISTINCT c.organization_id) > 1
-      ) x;
+      ) x
+    $q$ INTO split_branches;
   END IF;
 
   IF orphan_branches > 0 THEN
