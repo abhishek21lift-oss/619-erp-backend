@@ -5,7 +5,6 @@
 'use strict';
 
 const ORG_A = '11111111-1111-1111-1111-111111111111';
-const ORG_B = '22222222-2222-2222-2222-222222222222';
 
 const queries = [];
 let mockClientRow = null;
