@@ -69,7 +69,17 @@ describe('calculateMonthlyCommissions writes in a single statement', () => {
 
   it('omits the org filter for a platform-wide operator, and only then', async () => {
     await svc.calculateMonthlyCommissions('2026-08', { applyFilter: false });
-    expect(calls[0].sql).not.toMatch(/organization_id/);
+    // The exact negation of the assertion above, and deliberately not the
+    // broader `not.toMatch(/organization_id/)` it used to be. That version
+    // conflated two different things: the org PREDICATE, which a platform
+    // operator must not get, and the org COLUMN, which every row must now
+    // carry because migration 186 makes pt_commissions.organization_id NOT
+    // NULL. Writing the column is required in both scopes; filtering by it is
+    // required in only one.
+    expect(calls[0].sql).not.toMatch(/c\.organization_id = \$\d/);
+    // Still written, still sourced from the client — in every scope.
+    expect(calls[0].sql).toMatch(/INSERT INTO pt_commissions[\s\S]*organization_id/i);
+    expect(calls[0].sql).toMatch(/'pending',\s*c\.organization_id/);
     expect(calls[0].params).toEqual(['2026-08-01', '2026-09-01']);
   });
 

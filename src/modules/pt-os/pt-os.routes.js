@@ -540,26 +540,31 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
       d.pt_start_date, ptEndDate, d.duration_months, paidNow]);
 
   // Log to renewal history
+  // organization_id is required from migration 186 on — NOT NULL plus an AND'd
+  // parent-walk policy, so a renewal without it is refused outright.
   await pool.query(`
     INSERT INTO pt_client_renewals
       (client_id, client_name, trainer_name, old_package, new_package,
        old_end_date, new_start_date, new_end_date, duration_months,
-       base_amount, discount, final_amount, paid_amount, balance_amount, notes)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       base_amount, discount, final_amount, paid_amount, balance_amount, notes,
+       organization_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
   `, [
     req.params.id, c.name, c.trainer_name,
     c.package_type, packageType || c.package_type,
     c.pt_end_date, d.pt_start_date, ptEndDate, d.duration_months,
     baseAmt, disc, finalAmt, paidNow, Math.max(finalAmt - paidNow, 0),
     d.notes || null,
+    orgIdOf(req),
   ]);
 
   // Also write to pt_client_subscriptions (canonical term history used by the profile page)
   await pool.query(`
     INSERT INTO pt_client_subscriptions
       (client_id, plan_name, start_date, end_date, duration_months,
-       selling_price, amount_paid, balance_amount, trainer_name, status, source)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','renewal')
+       selling_price, amount_paid, balance_amount, trainer_name, status, source,
+       organization_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','renewal',$10)
     ON CONFLICT DO NOTHING
   `, [
     req.params.id,
@@ -567,6 +572,7 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
     d.pt_start_date, ptEndDate, d.duration_months,
     finalAmt, paidNow, Math.max(finalAmt - paidNow, 0),
     c.trainer_name,
+    orgIdOf(req),
   ]);
 
   // Ledger: money collected at renewal must land in pt_payments — the revenue
@@ -765,14 +771,16 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
       await pool.query(`
         INSERT INTO pt_client_subscriptions
           (client_id, plan_name, start_date, end_date, duration_months,
-           selling_price, amount_paid, balance_amount, trainer_name, status, source)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','enrollment')
+           selling_price, amount_paid, balance_amount, trainer_name, status, source,
+           organization_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','enrollment',$10)
         ON CONFLICT DO NOTHING
       `, [
         req.params.id, rows[0].package_type,
         rows[0].pt_start_date, rows[0].pt_end_date, rows[0].duration_months,
         rows[0].final_amount, rows[0].paid_amount, rows[0].balance_amount,
         rows[0].trainer_name,
+        orgIdOf(req),
       ]);
     }
   }

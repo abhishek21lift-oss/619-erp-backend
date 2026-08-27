@@ -63,12 +63,26 @@ async function calculateMonthlyCommissions(month, scope = {}) {
   //
   // See migration 181, which makes `trainers` a superset first so that this
   // switch cannot lose anybody.
+  // ── organization_id, in every scope ──────────────────────────────────────
+  //
+  // Taken off pt_clients in this same SELECT, which is its only honest source:
+  // a commission belongs to whichever studio the CLIENT belongs to, and
+  // reading it from anywhere else would let the two disagree. Migration 186
+  // makes the column NOT NULL and gives pt_commissions an AND'd parent-walk
+  // policy, so a row written without it is refused outright.
+  //
+  // Note this is NOT the orgClause above. The clause FILTERS which clients a
+  // caller may bill; this COLUMN records which studio each resulting row is
+  // for. A platform-wide operator skips the filter and still writes the
+  // column — every row needs an owner, including the ones it wrote for
+  // somebody else.
   const { rows: written } = await pool.query(`
     INSERT INTO pt_commissions
       (trainer_id, trainer_name, client_id, client_name,
-       month, commission_amt, incentive_rate, status)
+       month, commission_amt, incentive_rate, status, organization_id)
     SELECT c.trainer_id, c.trainer_name, c.id, c.name,
-           $1::DATE, COALESCE(c.trainer_commission, 0), t.incentive_rate, 'pending'
+           $1::DATE, COALESCE(c.trainer_commission, 0), t.incentive_rate, 'pending',
+           c.organization_id
     FROM pt_clients c
     JOIN trainers t ON t.id = c.trainer_id
     WHERE c.deleted_at IS NULL
@@ -327,10 +341,17 @@ async function createPayout(trainerId, month, deductions, processedBy, scope = {
   const totalCommission = Number(commData.total_commission);
   const netAmount = Math.max(0, totalCommission - (deductions || 0));
 
+  // organization_id is read from the TRAINER rather than passed in. This is a
+  // service function with no req to take an org from, and the trainer is the
+  // payout's only tenancy signal — a payout is one trainer, one month, with no
+  // client dimension at all. It is the same path migration 186's backfill
+  // uses, so a row written here and a row backfilled there cannot disagree.
   const { rows } = await pool.query(`
     INSERT INTO pt_payouts
-      (trainer_id, trainer_name, month, total_commission, deductions, net_amount, status, processed_by)
-    VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)
+      (trainer_id, trainer_name, month, total_commission, deductions, net_amount, status, processed_by,
+       organization_id)
+    VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,
+       (SELECT organization_id FROM trainers WHERE id = $1))
     ON CONFLICT (trainer_id, month)
     DO UPDATE SET total_commission = EXCLUDED.total_commission,
                   deductions = EXCLUDED.deductions,

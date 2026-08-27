@@ -113,6 +113,19 @@ async function runAutoRenew() {
       await client.query(`UPDATE member_memberships SET status='expired' WHERE id = $1`, [m.id]);
 
       // 4. Record payment
+      //
+      // STILL BROKEN, and deliberately not fixed here: `payments` has no
+      // member_id column, so this raises before it writes anything — the
+      // BIZ-03 half this file's header already flags. It is left alone
+      // because repairing it means deciding how a gym membership (members,
+      // member_memberships, branch_id — a pre-multi-tenancy subsystem with no
+      // organization_id anywhere) maps onto the PT client model, which is a
+      // product decision and not a tenancy fix.
+      //
+      // Whoever does fix it: migration 186 makes payments.organization_id NOT
+      // NULL and gives the table an AND'd parent-walk policy against
+      // pt_clients, so this INSERT will need both a real client_id and the
+      // org that client belongs to.
       await client.query(
         `INSERT INTO payments (member_id, amount, method, date, gateway, gateway_txn_id, gateway_status, branch_id)
          VALUES ($1,$2,'RAZORPAY', CURRENT_DATE, 'razorpay', $3, $4, COALESCE($5, 'br-main'))`,
