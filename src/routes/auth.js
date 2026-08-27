@@ -14,6 +14,7 @@ const pool   = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const { activeOwnerOf, ownerExistsFlat } = require('../lib/one-trainer');
 const { requireSuperAdmin } = require('../middleware/tenant');
 const platformAuth = require('../middleware/platformAuth');
 const { validate } = require('../middleware/validate');
@@ -682,6 +683,15 @@ async function createUserHandler(req, res) {
       'SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [email.trim()]
     );
     if (exists.length) return res.status(409).json({ error: 'Email already registered' });
+
+    // One owner per studio. Only the admin branch is guarded — manager,
+    // reception, trainer and member logins stay unlimited, because the
+    // one-owner-one-trainer rule is about those two slots and not about how
+    // many people a studio may give a login to.
+    if (role === 'admin') {
+      const owner = await activeOwnerOf(pool, req);
+      if (owner) return res.status(409).json(ownerExistsFlat(owner));
+    }
 
     const hashed = await bcrypt.hash(password, 12);
     const id = crypto.randomUUID();

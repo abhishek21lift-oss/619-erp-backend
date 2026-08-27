@@ -42,39 +42,15 @@ if (missingRecommended.length) {
 }
 
 // ── RLS cutover validation ───────────────────────────────────────────────────
-// When TENANT_RLS_ENFORCE is on (default in production), the app_tenant role
-// must be used for tenant requests, and a separate owner connection (ADMIN_DATABASE_URL)
-// must exist for platform-wide operations. If both URLs are the same, the app
-// connects as the table owner (postgres) which has BYPASSRLS, making all RLS
-// policies ineffective. This check catches the misconfiguration at boot.
+// The check that used to live here compared DATABASE_URL against
+// ADMIN_DATABASE_URL as strings and refused to boot when they matched. Two
+// different strings can authenticate as the same role, so it passed in exactly
+// the state it existed to catch — verified against the live database on
+// 26 Aug 2026, where both connections resolved to `postgres` (rolbypassrls =
+// true) and all ninety tenant_isolation policies were inert.
 //
-// The condition below must be the SAME predicate db/pool.js and
-// middleware/auth.js use to decide whether enforcement is on, and it was not:
-// this line tested the variable for truthiness while they test it against the
-// string 'off'. The two disagreed in both directions, and both directions were
-// wrong:
-//
-//   TENANT_RLS_ENFORCE | old guard fired? | enforcement actually on?
-//   <unset>            | no               | YES  ← shipped the misconfiguration
-//   'off'              | YES              | no   ← refused to boot when disabled
-//
-// Unset is the production default, so the check meant to catch "enforcement on
-// with a single owner connection" was silent in precisely the configuration it
-// existed to catch. The predicate now lives in lib/tenantRlsFlag.js and is
-// imported by all three call sites, so they cannot drift apart again.
-if (isProd && rlsEnforcementEnabled()) {
-  const adminUrl = process.env.ADMIN_DATABASE_URL || process.env.DATABASE_URL;
-  if (adminUrl === process.env.DATABASE_URL) {
-    logger.fatal(
-      'Refusing to start: TENANT_RLS_ENFORCE is enabled but ADMIN_DATABASE_URL is not set to a different connection string. '
-      + 'The app_tenant role (migration 157) must be used for tenant traffic via DATABASE_URL, '
-      + 'and the privileged owner role must be configured separately via ADMIN_DATABASE_URL '
-      + 'for platform-wide operations (migrations, workers, super-admin console). '
-      + 'See db/migrations/TENANT-RLS-PLAN.md for the rollout procedure.'
-    );
-    process.exit(1);
-  }
-}
+// It has been replaced by an assertion made of the database itself, run at the
+// head of the boot chain at the bottom of this file. See lib/tenantRoleAssertion.js.
 
 // ── TRUST_PROXY validation ───────────────────────────────────────────────────
 // The correct value depends on the deployment topology. The current production
@@ -268,6 +244,34 @@ if (isProd) {
   }
 }
 
+// ── The role-permission matrix ──────────────────────────────────────────────
+//
+// Announced at boot because this control CHANGES BEHAVIOUR on the deploy that
+// carries it, and the change is invisible from every other angle: a trainer who
+// could open Finance yesterday gets a 403 today, and the only thing that
+// changed is that a toggle the studio set long ago started being honoured.
+//
+// Deliberately not in SECURITY_FLAGS above — that block validates strictly
+// on/off, and this one has a third state ('report') whose whole purpose is to
+// let an operator see who WOULD lose access before anybody does.
+const { permissionMode, permissionModeIsValid } = require('./lib/permissionFlag');
+if (!permissionModeIsValid()) {
+  logger.warn(
+    { value: process.env.PERMISSION_ENFORCE, using: 'on' },
+    'PERMISSION_ENFORCE is not one of on/off/report — defaulting to "on". '
+    + 'A typo must not silently disable an authorisation gate.'
+  );
+}
+{
+  const mode = permissionMode();
+  const describe = {
+    on:     'role permissions are ENFORCED — staff will be refused features their role has switched off',
+    report: 'role permissions are OBSERVED ONLY — refusals are logged as permission_would_deny, nothing is blocked',
+    off:    'role permissions are NOT enforced — the Settings matrix is decorative, as it was before this control existed',
+  }[mode];
+  (mode === 'off' ? logger.warn : logger.info).call(logger, { mode }, `PERMISSION_ENFORCE=${mode}: ${describe}`);
+}
+
 const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
@@ -293,6 +297,7 @@ const { requirePlatformOwner } = require('./middleware/platformAuth');
 const PLATFORM_GUARD = [auth, requireSuperAdmin, requireSuperAdminMfa, requirePlatformOwner];
 const { branchScope }            = require('./middleware/branch-scope');
 const { requireFeature }         = require('./lib/features');
+const { requirePermission }      = require('./middleware/permissions');
 const { requireAiQuota }         = require('./lib/aiQuota');
 
 // Feature gating for tenant-facing routers.
@@ -314,24 +319,43 @@ const { requireAiQuota }         = require('./lib/aiQuota');
 // the Control Centre — which is the point of the toggle existing.
 const gate = (key) => [auth, requireFeature(key)];
 
-// The same feature gate, plus a role gate.
+// The feature gate, plus a role gate, plus the studio's own permission matrix.
 //
-// gate() checks that the STUDIO has a feature switched on. It does not check
-// who is asking, and a feature flag is not an authorisation decision. Handlers
-// behind gate() then scope by organization_id, which bounds the studio and
-// says nothing about the role — so a `member` (the account client activation
-// creates for a gym client) satisfied every check and read staff data.
+// Three different questions, and conflating any two of them has already cost
+// this codebase a bug:
 //
-// Found by memberEscalation.authz.test.js, which drives a real member session
-// at every mount. GET /api/invoices returned every invoice in the studio —
-// other clients' names, invoice numbers and amounts — and GET
-// /api/reports/monthly returned the studio's revenue: it self-scopes for a
-// trainer via `role === 'trainer'`, so a member fell through the branch with
-// no filter at all.
+//   requireFeature   has the STUDIO bought this capability?
+//   requireStaff     is this person back-office staff at all?
+//   requirePermission may THIS ROLE use it, per the studio's Settings?
 //
-// Use this for any mount whose data belongs to the studio rather than to the
-// person asking.
-const staffGate = (key) => [auth, requireStaff, requireFeature(key)];
+// gate() checks only the first. It does not check who is asking, and a feature
+// flag is not an authorisation decision — handlers behind gate() then scope by
+// organization_id, which bounds the studio and says nothing about the role, so
+// a `member` (the account client activation creates) satisfied every check and
+// read staff data. Found by memberEscalation.authz.test.js, which drives a real
+// member session at every mount: GET /api/invoices returned every invoice in
+// the studio, and GET /api/reports/monthly returned its revenue.
+//
+// requirePermission is the third question, and until middleware/permissions.js
+// nothing on the server ever asked it. The sixteen perm_* toggles in Settings
+// were read by exactly one thing — the frontend sidebar, deciding whether to
+// render a link — so a trainer with perm_trainer_finance switched off saw no
+// Finance menu item and could still call GET /api/expenses directly.
+//
+// `permission` is the matrix's vocabulary, not the feature registry's: they are
+// different systems that happen to share the word "feature". The mapping comes
+// from Sidebar.tsx's canSeeByPermission(), so a link that disappears and a
+// request that is refused agree about why.
+//
+// Ordering matters: a studio without the module at all should hear that, rather
+// than being told it is a permissions problem.
+//
+// This replaces staffGate(), which every caller has become — the two differed
+// only in the third question, and a helper that answers two of three is the one
+// somebody reaches for by accident.
+const permGate = (featureKey, permission) => [
+  auth, requireStaff, requireFeature(featureKey), requirePermission(permission),
+];
 
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -721,18 +745,18 @@ app.use('/api/attendance',        ...gate('attendance'), require('./routes/atten
 // So "legacy" had it backwards: /api/reports is the tenant-safe, live
 // implementation, and the migration target was the unsafe one. Do not
 // reintroduce a v1 reports router without organization_id on its tables.
-app.use('/api/reports',           userApiLimiter, ...staffGate('insights'), require('./routes/reports'));
+app.use('/api/reports',           userApiLimiter, ...permGate('insights', 'reports'), require('./routes/reports'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
 // requireStaff: staff leave requests — who is off, when, and why. HR data
 // about employees, org-scoped but not role-scoped.
 app.use('/api/leave',             auth, requireStaff, require('./routes/leave'));
-// staffGate, not gate: routes/expenses.js narrows with `if (req.user.role ===
+// permGate, not gate: routes/expenses.js narrows with `if (req.user.role ===
 // 'trainer')` and then applies the org filter — so a member fell through the
 // trainer branch and got the studio's whole expense stats. Third instance of
 // that fall-through after reports/monthly and search; a feature flag is not an
 // authorisation decision.
-app.use('/api/expenses',          ...staffGate('finance'), require('./routes/expenses'));
+app.use('/api/expenses',          ...permGate('finance', 'finance'), require('./routes/expenses'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.
@@ -792,8 +816,31 @@ app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-che
 // keys from non-admins, but system_settings carries NO organization_id at all
 // (it is on tenantColumns' KNOWN_GAPS as per-studio keys inside a shared
 // table), so the query is unfiltered by studio as well as by role.
-app.use('/api/settings',          auth, requireStaff, require('./routes/settings'));
-app.use('/api/invoices',          ...staffGate('finance'), require('./routes/invoices'));
+// requirePermission('settings') gates the STUDIO SETTINGS screens on the
+// matrix, at the mount rather than per route — every route in this router is
+// settings, and the write routes keep their own adminOnly on top.
+//
+// GET /permissions is the one exception, and it has to be: it is the endpoint
+// by which a client learns its OWN permissions. The frontend's
+// PermissionsProvider calls it for every logged-in user, and the default
+// perm_trainer_settings / perm_reception_settings are both false — so gating it
+// would 403 the very call that tells a trainer what they may do. Its provider
+// would fall back to the shipped defaults, and a studio that granted
+// perm_trainer_finance would have its trainers see no Finance link while the
+// server happily served them. The menu and the API would disagree, which is the
+// exact failure this whole change exists to end, reintroduced from the other
+// side.
+//
+// Safe to exempt: the handler returns only the caller's own studio's matrix and
+// their role, which is information they are entitled to and can already infer
+// from which screens work.
+const settingsGate = requirePermission('settings');
+app.use('/api/settings', auth, requireStaff, (req, res, next) => (
+  req.method === 'GET' && req.path === '/permissions'
+    ? next()
+    : settingsGate(req, res, next)
+), require('./routes/settings'));
+app.use('/api/invoices',          ...permGate('finance', 'finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
 // The Exercise Library. Sits behind the same 'programs' feature as the Workout
 // Builder it feeds — a studio with programmes always has the library, and one
@@ -854,10 +901,15 @@ app.use('/api/classes',           require('./routes/classes'));
 //
 // auth() running twice is cheap: the second call is a user-cache hit.
 // A client's own data is served by /api/me, which scopes to the caller.
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/pt-os.routes'));
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/parq.routes'));
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/informed-consent.routes'));
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/workout-log.routes'));
+//
+// requirePermission('pt_module') is the matrix's say on top of the role gate.
+// Note what this changes on the deploy that carries it: perm_reception_pt_module
+// ships FALSE, so a receptionist loses /api/pt-os — which is exactly what that
+// toggle has claimed since it was added, and never did.
+app.use('/api/pt-os',            auth, requireStaff, requirePermission('pt_module'), require('./modules/pt-os/pt-os.routes'));
+app.use('/api/pt-os',            auth, requireStaff, requirePermission('pt_module'), require('./modules/pt-os/parq.routes'));
+app.use('/api/pt-os',            auth, requireStaff, requirePermission('pt_module'), require('./modules/pt-os/informed-consent.routes'));
+app.use('/api/pt-os',            auth, requireStaff, requirePermission('pt_module'), require('./modules/pt-os/workout-log.routes'));
 
 // The client's own surfaces. Mirror image of the block above: requireClient
 // refuses anyone who is not a `member` linked to a client record, and every
@@ -885,8 +937,8 @@ app.use('/api/client-login',     auth, requireStaff, require('./routes/client-lo
 // userApiLimiter as well: these two mounts had only the 2000-per-15-minutes
 // global bucket, which is a generous ceiling for an endpoint that returns
 // health records a page at a time.
-app.use('/api/progress',   userApiLimiter, auth, requireStaff, require('./modules/progress/progress.routes'));
-app.use('/api/automation', userApiLimiter, auth, requireStaff, require('./modules/automation/automation.routes'));
+app.use('/api/progress',   userApiLimiter, auth, requireStaff, requirePermission('pt_module'), require('./modules/progress/progress.routes'));
+app.use('/api/automation', userApiLimiter, auth, requireStaff, requirePermission('pt_module'), require('./modules/automation/automation.routes'));
 
 // ────────────────────────
 // v3 MODULE ROUTES
@@ -937,9 +989,73 @@ app.use(errorHandler);
 // START — run migrations first, then listen
 // ────────────────────────
 const { runMigrationsWithRetry } = require('./db/migrate');
+const { evaluateTenantRole } = require('./lib/tenantRoleAssertion');
 
-logger.info('Running database migrations…');
-runMigrationsWithRetry()
+/**
+ * Ask the database who it authenticated us as, and refuse to serve traffic if
+ * the answer means RLS is not enforcing.
+ *
+ * Runs at the head of the boot chain, before migrations and long before
+ * listen(), so a misconfigured deploy never takes a request.
+ *
+ * A thrown verification is treated as a failed verification when enforcement
+ * is on in production: an authorisation property that cannot be checked is not
+ * a property that may be assumed. Everywhere else it is a warning, because a
+ * dev machine with no database should still boot far enough to say so.
+ */
+async function assertTenantRole() {
+  const enforcing = rlsEnforcementEnabled();
+  // Required here rather than at module scope: db/pool opens connections on
+  // require, and this file is also loaded by tests that never boot.
+  const pool = require('./db/pool');
+  let roles;
+  try {
+    roles = await pool.inspectRoles();
+  } catch (err) {
+    const msg = 'Could not verify the database role of the tenant connection: ' + err.message;
+    if (isProd && enforcing) { logger.fatal(msg + ' Refusing to start.'); process.exit(1); }
+    logger.warn(msg);
+    return;
+  }
+
+  const result = evaluateTenantRole(roles);
+
+  // Logged on every boot, pass or fail. The state that produced the August
+  // incident was invisible precisely because nothing ever printed which role
+  // the pool had authenticated as.
+  logger.info({ ...result.detail, tenantRlsEnforce: enforcing }, 'Database role check');
+
+  if (result.ok) return;
+
+  if (!enforcing) {
+    // TENANT_RLS_ENFORCE=off means the operator has deliberately turned the
+    // wrapper off; isolation then rests on application SQL alone, which is a
+    // choice, not a misconfiguration. Say so and continue.
+    logger.warn({ code: result.code, ...result.detail },
+      'TENANT_RLS_ENFORCE is off — ' + result.message);
+    return;
+  }
+
+  if (isProd) {
+    logger.fatal({ code: result.code, ...result.detail }, 'Refusing to start: ' + result.message);
+    process.exit(1);
+  }
+  logger.warn({ code: result.code, ...result.detail }, result.message);
+}
+
+// Before the migrations, not after. The check reads pg_roles for whichever
+// role the connection authenticated as, which no migration influences — and
+// the misconfiguration it exists to catch takes migrations down with it. Point
+// DATABASE_URL at app_tenant without an ADMIN_DATABASE_URL and the migration
+// runner, having no owner connection to fall back to, tries to run DDL as an
+// unprivileged role and buries the actual cause under a wall of permission
+// errors. One line naming the problem is worth more than that.
+logger.info('Verifying the database role of the tenant connection…');
+assertTenantRole()
+  .then(function() {
+    logger.info('Running database migrations…');
+    return runMigrationsWithRetry();
+  })
   .then(function() {
     // Start polling the operator's AI model overrides. After migrations, so
     // the table is guaranteed to exist; before listen, so the first request
@@ -1202,7 +1318,10 @@ runMigrationsWithRetry()
     process.on('SIGINT',  shutdown('SIGINT'));
   })
   .catch(function(err) {
-    logger.fatal({ err: err.message }, 'Startup migration failed');
+    // Covers the whole chain, not only the migrations: the role check ahead of
+    // them reports its own failures and exits, so anything arriving here is
+    // either a migration error or the pool failing to load at all.
+    logger.fatal({ err: err.message }, 'Startup failed before the server could listen');
     process.exit(1);
   });
 

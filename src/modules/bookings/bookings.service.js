@@ -1,6 +1,35 @@
 // src/modules/bookings/bookings.service.js
 // Class booking with capacity enforcement, waitlist, and cancellation policy.
 // Uses transactions + row locking to prevent overbooking under concurrent load.
+//
+// ── This module was written against a schema that was never migrated ────────
+//
+// Every statement here referenced something that does not exist: class_sessions
+// columns `starts_at` / `ends_at` / `trainer_id` (the real ones are `date`,
+// `start_time`, `end_time`, `instructor_id`), bookings columns `membership_id`
+// and `position`, and the statuses `waitlist` and `attended`. Migration 182
+// adds the four columns that were genuinely missing and widens the status
+// CHECK; everything else is fixed here, by naming the columns the schema has.
+//
+// SESSION_START / SESSION_END below are that fix in one place. `date` is a DATE
+// and `start_time` a TIME, so the sum is a timestamp WITHOUT a zone; it is
+// resolved against the connection's TimeZone — which db/pool.js sets to the
+// studio's on every connect — so a 09:00 class is 09:00 where the studio is,
+// not 09:00 UTC. Aliased back to starts_at/ends_at because that is the shape
+// the member Classes screen reads.
+//
+// ── Entitlement ─────────────────────────────────────────────────────────────
+//
+// The membership gate is an ACTIVE-CLIENT check, not a credit ledger. The old
+// one read `member_memberships` joined to `plans.included_classes` — the
+// abandoned v3 model, which no code path writes and which holds no rows. There
+// is no class-credit model in the live schema to replace it with:
+// pt_client_subscriptions carries money and dates, not class counts.
+//
+// Inventing one would be inventing a pricing product. So the rule is the
+// narrowest defensible one — a studio's own active client may book its classes
+// — and selling class packs with a credit balance remains an open product
+// decision rather than something guessed at here.
 
 const pool = require('../../db/pool');
 const { HttpError } = require('../../middleware/errorHandler');
@@ -8,6 +37,18 @@ const cal = require('../../lib/google-calendar');
 const logger = require('../../lib/logger');
 
 const CANCEL_GRACE_HOURS = 2;     // free cancel if > 2h before start
+
+// A class session's start and end, from the columns the table actually has.
+const SESSION_START = "(cs.date + cs.start_time) AT TIME ZONE current_setting('TimeZone')";
+const SESSION_END   = "(cs.date + cs.end_time)   AT TIME ZONE current_setting('TimeZone')";
+
+// attendance_logs.method is CHECK-constrained, and the route takes its value
+// straight from the request body — so an unrecognised string would abort the
+// mirror write with a constraint violation AFTER the booking was already marked
+// checked in, leaving the two records disagreeing. Anything unknown records as
+// 'manual', which is what a person clicking the button in the studio is.
+const ATTENDANCE_METHODS = ['face', 'manual', 'qr', 'biometric'];
+const attendanceMethod = (m) => (ATTENDANCE_METHODS.includes(m) ? m : 'manual');
 
 /**
  * Push a booking to (or remove it from) the member's own Google Calendar.
@@ -26,21 +67,24 @@ const CANCEL_GRACE_HOURS = 2;     // free cancel if > 2h before start
  *    .catch() so a rejection can never surface as an unhandled promise and
  *    take the process down.
  *
- * The event goes to the MEMBER's calendar, not the acting user's — an admin
+ * The event goes to the CLIENT's calendar, not the acting user's — an admin
  * booking a class on someone's behalf should not have it appear in their own
  * diary. Members without a login simply have nothing to sync to.
  */
-function syncBookingToCalendar(action, memberId, bookingId) {
-  if (!memberId || !bookingId || !cal.isConfigured()) return;
+function syncBookingToCalendar(action, clientId, bookingId) {
+  if (!clientId || !bookingId || !cal.isConfigured()) return;
 
   (async () => {
     const { rows } = await pool.query(
+      // pt_client_id, not member_id: the latter is always NULL for a real
+      // client account (see middleware/rbac.js and migration 154), so this
+      // lookup could never have found anybody to sync a calendar for.
       `SELECT u.id, o.name AS organization_name
        FROM users u
        LEFT JOIN organizations o ON o.id = u.organization_id
-       WHERE u.member_id = $1 AND u.deleted_at IS NULL
+       WHERE u.pt_client_id = $1 AND u.deleted_at IS NULL
        LIMIT 1`,
-      [memberId]
+      [clientId]
     );
     const userId = rows[0]?.id;
     if (!userId) return;
@@ -56,7 +100,7 @@ function syncBookingToCalendar(action, memberId, bookingId) {
  * Book a class session for a member.
  * Atomic: locks the session row, counts confirmed bookings, decides confirmed vs waitlist.
  */
-async function book({ session_id, member_id }, ctx) {
+async function book({ session_id, client_id }, ctx) {
   // A booking is a studio-owned record, so it must have a studio. A platform
   // super admin operating platform-wide has no organization_id and cannot pick
   // one implicitly — refusing here is clearer than inserting NULL and hitting
@@ -76,8 +120,10 @@ async function book({ session_id, member_id }, ctx) {
     // consuming a credit against the wrong studio's capacity. 404 rather than
     // 403 so the response does not confirm the session exists elsewhere.
     const sessionRes = await client.query(
-      `SELECT id, capacity, starts_at, status, template_id
-       FROM class_sessions WHERE id = $1 AND organization_id = $2 FOR UPDATE`,
+      `SELECT cs.id, cs.capacity, cs.status, cs.template_id,
+              ${SESSION_START} AS starts_at
+       FROM class_sessions cs
+       WHERE cs.id = $1 AND cs.organization_id = $2 FOR UPDATE`,
       [session_id, ctx.organization_id]
     );
     if (sessionRes.rows.length === 0) throw new HttpError(404, 'NOT_FOUND', 'Class session not found');
@@ -87,33 +133,33 @@ async function book({ session_id, member_id }, ctx) {
 
     // 2. Verify no existing booking
     const existing = await client.query(
-      `SELECT id, status FROM bookings WHERE session_id = $1 AND member_id = $2`,
-      [session_id, member_id]
+      `SELECT id, status FROM bookings WHERE session_id = $1 AND client_id = $2`,
+      [session_id, client_id]
     );
     if (existing.rows.length > 0 && ['confirmed','waitlist'].includes(existing.rows[0].status)) {
       throw new HttpError(409, 'ALREADY_BOOKED', 'You already have a booking for this session');
     }
 
-    // 3. Check active membership.
-    // Qualify every column with mm./p. — `id`, `classes_used`, `plan_id` exist
-    // on both tables and Postgres throws "column reference is ambiguous" if
-    // they're left unqualified.
-    const mm = await client.query(
-      `SELECT mm.id, mm.classes_used, mm.plan_id, p.included_classes
-       FROM member_memberships mm
-       JOIN plans p ON p.id = mm.plan_id
-       WHERE mm.member_id = $1 AND mm.status = 'active'
-         AND mm.organization_id = $2
-         AND mm.start_date <= CURRENT_DATE AND mm.end_date >= CURRENT_DATE
-       ORDER BY mm.end_date DESC LIMIT 1`,
-      [member_id, ctx.organization_id]
+    // 3. Entitlement: an ACTIVE client of THIS studio.
+    //
+    // This replaces a credit check against member_memberships + plans, which is
+    // the abandoned v3 model — no code path writes it and it holds no rows, so
+    // the check refused everybody. See the note at the top of this file for why
+    // a credit ledger is not reinvented here.
+    //
+    // The organization predicate is doing real work, not just repeating step 1:
+    // it is what stops a client of studio A booking into studio B by presenting
+    // their own id against a session id they guessed.
+    const cli = await client.query(
+      `SELECT id, name, status FROM pt_clients
+        WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+      [client_id, ctx.organization_id]
     );
-    if (mm.rows.length === 0) throw new HttpError(402, 'NO_MEMBERSHIP', 'Active membership required');
-    const membership = mm.rows[0];
-
-    if (membership.included_classes !== null && membership.classes_used >= membership.included_classes) {
-      throw new HttpError(402, 'CLASSES_EXHAUSTED', 'No class credits left on your plan');
+    if (cli.rows.length === 0) throw new HttpError(404, 'NOT_FOUND', 'Client not found');
+    if (cli.rows[0].status !== 'active') {
+      throw new HttpError(402, 'CLIENT_INACTIVE', 'This membership is not active');
     }
+    const bookingClient = cli.rows[0];
 
     // 4. Count confirmed bookings (with the lock from step 1, this is safe)
     const countRes = await client.query(
@@ -136,20 +182,12 @@ async function book({ session_id, member_id }, ctx) {
 
     // 5. Insert booking
     const bookingRes = await client.query(
-      `INSERT INTO bookings (session_id, member_id, membership_id, status, position, organization_id)
+      `INSERT INTO bookings (session_id, client_id, client_name, status, position, organization_id)
        VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING *`,
-      [session_id, member_id, membership.id, status, position, ctx.organization_id]
+      [session_id, client_id, bookingClient.name, status, position, ctx.organization_id]
     );
     const booking = bookingRes.rows[0];
-
-    // 6. If confirmed and plan has limited classes, increment usage
-    if (status === 'confirmed' && membership.included_classes !== null) {
-      await client.query(
-        `UPDATE member_memberships SET classes_used = classes_used + 1 WHERE id = $1`,
-        [membership.id]
-      );
-    }
 
     // 7. Audit + notification (queued; not awaited here in real impl).
     // Previously targeted a differently-shaped legacy table and threw on
@@ -169,7 +207,7 @@ async function book({ session_id, member_id }, ctx) {
     // an appointment, and putting one in someone's diary would be a lie. It
     // gets its event later, if and when the waitlist promotes it in cancel().
     if (booking.status === 'confirmed') {
-      syncBookingToCalendar('create', member_id, booking.id);
+      syncBookingToCalendar('create', client_id, booking.id);
     }
     return booking;
   } catch (err) {
@@ -200,11 +238,9 @@ async function cancel(bookingId, { reason } = {}, ctx) {
       orgClause = ` AND b.organization_id = $${params.length}`;
     }
     const r = await client.query(
-      `SELECT b.*, cs.starts_at, cs.capacity, mm.plan_id, p.included_classes
+      `SELECT b.*, cs.capacity, ${SESSION_START} AS starts_at
        FROM bookings b
        JOIN class_sessions cs ON cs.id = b.session_id
-       LEFT JOIN member_memberships mm ON mm.id = b.membership_id
-       LEFT JOIN plans p ON p.id = mm.plan_id
        WHERE b.id = $1${orgClause} FOR UPDATE OF b`,
       params
     );
@@ -212,7 +248,7 @@ async function cancel(bookingId, { reason } = {}, ctx) {
     const b = r.rows[0];
 
     // Authorization
-    if (ctx.role === 'member' && b.member_id !== ctx.member_id) {
+    if (ctx.role === 'member' && b.client_id !== ctx.client_id) {
       throw new HttpError(403, 'FORBIDDEN', 'Not your booking');
     }
     if (b.status === 'cancelled') throw new HttpError(400, 'ALREADY_CANCELLED', 'Already cancelled');
@@ -225,19 +261,17 @@ async function cancel(bookingId, { reason } = {}, ctx) {
       [bookingId, reason || null]
     );
 
-    // Refund credit if cancelled in grace period and was confirmed and uses credits
-    if (b.status === 'confirmed' && inGrace && b.included_classes !== null) {
-      await client.query(
-        `UPDATE member_memberships SET classes_used = GREATEST(classes_used - 1, 0) WHERE id = $1`,
-        [b.membership_id]
-      );
-    }
+    // No credit to refund: there is no credit ledger (see the note at the top).
+    // `inGrace` is still computed and still returned, because the grace period
+    // is what a studio's cancellation policy is written against — it is now
+    // reported rather than acted on, and is the hook a future credit model
+    // would attach to.
 
     // Promote first waitlist booking if a confirmed slot freed up
     let promoted = null;
     if (b.status === 'confirmed') {
       const promote = await client.query(
-        `SELECT id, member_id, membership_id, position FROM bookings
+        `SELECT id, client_id, position FROM bookings
          WHERE session_id = $1 AND status='waitlist'
          ORDER BY position ASC LIMIT 1 FOR UPDATE`,
         [b.session_id]
@@ -268,13 +302,13 @@ async function cancel(bookingId, { reason } = {}, ctx) {
     // Remove the cancelled member's event. Safe even if there was never one
     // (waitlist bookings never got one) — deleteBookingEvent no-ops when it
     // finds no stored google_event_id.
-    syncBookingToCalendar('delete', b.member_id, bookingId);
+    syncBookingToCalendar('delete', b.client_id, bookingId);
 
     // Someone promoted off the waitlist now genuinely has a class to attend,
     // so they get the event the cancelled member just lost. Without this, a
     // promotion is invisible in their calendar and they miss the session.
     if (promoted) {
-      syncBookingToCalendar('create', promoted.member_id, promoted.id);
+      syncBookingToCalendar('create', promoted.client_id, promoted.id);
     }
 
     return { id: bookingId, status: 'cancelled', refunded: inGrace };
@@ -301,55 +335,78 @@ async function checkIn(bookingId, { method = 'manual' }, ctx = {}) {
     params.push(ctx.organization_id);
     orgClause = ` AND organization_id = $${params.length}`;
   }
+  // 'checked_in', not 'attended'. The status CHECK has always had `checked_in`
+  // and never had `attended`, so this UPDATE violated the constraint on every
+  // call. Two spellings of one state is how a status column stops being
+  // trustworthy, so the existing one wins.
   const r = await pool.query(
-    `UPDATE bookings SET status='attended', checked_in_at = NOW(), check_in_method = $2
+    `UPDATE bookings SET status='checked_in', checked_in_at = NOW(), check_in_method = $2
      WHERE id = $1 AND status = 'confirmed'${orgClause}
      RETURNING *`,
     params
   );
-  if (r.rows.length === 0) throw new HttpError(400, 'BAD_STATE', 'Booking not confirmed or already attended');
+  if (r.rows.length === 0) throw new HttpError(400, 'BAD_STATE', 'Booking not confirmed or already checked in');
 
-  // Mirror to attendance table. organization_id comes from the booking row
-  // that was just verified, not from ctx — so the mirror cannot land in a
-  // different studio from the booking it mirrors even if the two disagree.
+  // Mirror into attendance_logs — the table the studio's attendance screens,
+  // client reports, AI tools and platform analytics all read.
+  //
+  // This used to write `attendance`, which has exactly one writer (this line)
+  // and no readers anywhere in the codebase, so a class check-in was recorded
+  // where nobody would ever see it. Same shape as routes/qr-checkin.js, so a
+  // class arrival and a QR arrival are one row per client per day rather than
+  // two competing records.
+  //
+  // organization_id comes from the booking row that was just verified, not from
+  // ctx — so the mirror cannot land in a different studio from the booking it
+  // mirrors even if the two disagree.
   const b = r.rows[0];
   await pool.query(
-    `INSERT INTO attendance (type, ref_id, member_id, booking_id, branch_id, date, check_in, status, check_in_method, organization_id)
-     VALUES ('client', $1, $1, $2, COALESCE($4, 'br-main'), CURRENT_DATE, NOW()::time, 'present', $3, $5)
-     ON CONFLICT (type, ref_id, date) DO UPDATE SET check_in = EXCLUDED.check_in, status = 'present'`,
-    [b.member_id, b.id, method, process.env.BRANCH_ID || null, b.organization_id]
+    `INSERT INTO attendance_logs
+       (ref_id, ref_type, ref_name, date, check_in_time, method, status, notes, organization_id)
+     VALUES ($1, 'client', $2, CURRENT_DATE, NOW(), $3, 'present', $4, $5)
+     ON CONFLICT (ref_id, ref_type, date) DO UPDATE
+       SET check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
+           status        = 'present'`,
+    [b.client_id, b.client_name || null, attendanceMethod(method), `Class booking ${b.id}`, b.organization_id]
   );
   return b;
 }
 
-// `memberId` reaches this from ?member_id= for any non-member caller, so the
+// `clientId` reaches this from ?client_id= for any non-member caller, so the
 // organization filter is the only thing standing between a studio A admin and
-// studio B's members' class history. Passing an unknown member id now returns
-// an empty list rather than another studio's bookings.
-async function listForMember(memberId, { from, to, status } = {}, scope = {}) {
-  const params = [memberId];
-  const where = [`b.member_id = $1`];
+// studio B's clients' class history. Passing an unknown client id returns an
+// empty list rather than another studio's bookings.
+async function listForClient(clientId, { from, to, status } = {}, scope = {}) {
+  const params = [clientId];
+  const where = [`b.client_id = $1`];
   if (scope.applyFilter) {
     params.push(scope.orgId);
     where.push(`b.organization_id = $${params.length}`);
   }
-  if (from)   { params.push(from);   where.push(`cs.starts_at >= $${params.length}`); }
-  if (to)     { params.push(to);     where.push(`cs.starts_at <= $${params.length}`); }
+  if (from)   { params.push(from);   where.push(`${SESSION_START} >= $${params.length}`); }
+  if (to)     { params.push(to);     where.push(`${SESSION_START} <= $${params.length}`); }
   if (status) { params.push(status); where.push(`b.status = $${params.length}`); }
 
+  // class_templates is LEFT JOINed, not INNER. cs.template_id is nullable, and
+  // an inner join silently drops every ad-hoc session that was not built from a
+  // template — which would read as "you have no bookings" rather than as a
+  // missing class name.
   const { rows } = await pool.query(
     `SELECT b.id, b.status, b.position, b.booked_at, b.checked_in_at,
-            cs.id AS session_id, cs.starts_at, cs.ends_at,
-            ct.name AS class_name, ct.color, t.name AS trainer_name
+            cs.id AS session_id,
+            ${SESSION_START} AS starts_at,
+            ${SESSION_END}   AS ends_at,
+            COALESCE(ct.name, cs.title) AS class_name, ct.color,
+            COALESCE(t.name, cs.instructor_name) AS trainer_name
      FROM bookings b
      JOIN class_sessions cs ON cs.id = b.session_id
-     JOIN class_templates ct ON ct.id = cs.template_id
-     LEFT JOIN trainers t ON t.id = cs.trainer_id
+     LEFT JOIN class_templates ct ON ct.id = cs.template_id
+     LEFT JOIN trainers t ON t.id = cs.instructor_id
      WHERE ${where.join(' AND ')}
-     ORDER BY cs.starts_at DESC LIMIT 200`,
+     ORDER BY ${SESSION_START} DESC LIMIT 200`,
     params
   );
   return rows;
 }
 
-module.exports = { book, cancel, checkIn, listForMember };
+module.exports = { book, cancel, checkIn, listForClient };

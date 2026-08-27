@@ -145,7 +145,7 @@ describe('GET /api/pt-os/trainer-performance — tenant isolation', () => {
   });
 
   it('qualifies every org column, so the JOIN cannot throw "ambiguous"', async () => {
-    // pt_trainers, pt_clients and pt_payments all carry organization_id, so an
+    // trainers, pt_clients and pt_payments all carry organization_id, so an
     // unqualified predicate here is a guaranteed 500 on every call. See
     // ptOs.orgWhereQualified.test.js for the outage that rule came from.
     await request(app).get('/api/pt-os/trainer-performance').expect(200);

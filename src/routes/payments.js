@@ -20,6 +20,7 @@ const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { genReceiptNo } = require('../db/receipts');
 const { auth, adminOnly } = require('../middleware/auth');
+const { requirePermission } = require('../middleware/permissions');
 const { validate } = require('../middleware/validate');
 const { paymentSchemas } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
@@ -108,7 +109,9 @@ router.get('/', auth, async (req, res, next) => {
 });
 
 // POST /api/payments
-router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) => {
+// perm_*_record_payment — the Settings toggle that has always claimed to
+// control who may take money. Reception ships TRUE, trainer FALSE.
+router.post('/', auth, requirePermission('record_payment'), validate(paymentSchemas.create), async (req, res, next) => {
   const tx = await pool.connect();
   try {
     const d = req.body;

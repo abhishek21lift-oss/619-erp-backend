@@ -272,6 +272,60 @@ function buildBusinessSystemPrompt() {
   ].join('\n');
 }
 
+/* ─── Renewal Reminder Drafting ─────────────────────────────────────────── */
+
+// One call drafts every recipient in a plan at once (see
+// modules/ai-actions/registry.js) — never one call per client — so this asks
+// for a JSON array keyed by client id rather than a single message.
+function buildRenewalReminderPrompt() {
+  return [
+    'You are drafting short WhatsApp renewal-reminder messages for a personal training',
+    'studio. You will be given a list of clients, each with a name and how many days are',
+    'left on their package (or its end date).',
+    '',
+    'For EACH client, write ONE short WhatsApp message (1-2 sentences, under 320',
+    'characters) that:',
+    '• Uses their first name.',
+    '• References only the days-left/end-date facts given — never invent a discount,',
+    '  price, offer, or anything else not supplied.',
+    '• Is warm and direct, not salesy. No emoji unless it reads naturally. No markdown.',
+    '',
+    'CRITICAL: Respond ONLY with a valid JSON object, one entry per client id given, in',
+    'any order. No markdown, no prose, no code fences.',
+    'JSON schema:',
+    JSON.stringify({ drafts: [{ id: 'string — the client id exactly as given', body: 'string' }] }, null, 2),
+  ].join('\n');
+}
+
+/* ─── Lead Follow-up Drafting ────────────────────────────────────────────── */
+
+// Same one-call-per-batch shape as buildRenewalReminderPrompt, and the same
+// reason: a lead list can be dozens of rows, and this must never become one
+// model call per lead.
+function buildLeadFollowupPrompt() {
+  return [
+    'You are drafting short WhatsApp follow-up messages for a personal training studio\'s',
+    'sales pipeline. You will be given a list of leads — people who showed interest but',
+    'have not yet joined — each with a name, how they found the studio, what package (if',
+    'any) they were interested in, and their current pipeline status.',
+    '',
+    'For EACH lead, write ONE short WhatsApp message (1-2 sentences, under 320 characters)',
+    'that:',
+    '• Uses their first name.',
+    '• References only the facts given — never invent a discount, price, offer, class',
+    '  time, or anything else not supplied.',
+    '• If a package they were interested in is given, you may mention it by name.',
+    '• Invites them to continue the conversation (a call, a visit, a trial) — it is a',
+    '  follow-up, not a hard sell. Warm and direct. No emoji unless it reads naturally.',
+    '  No markdown.',
+    '',
+    'CRITICAL: Respond ONLY with a valid JSON object, one entry per lead id given, in any',
+    'order. No markdown, no prose, no code fences.',
+    'JSON schema:',
+    JSON.stringify({ drafts: [{ id: 'string — the lead id exactly as given', body: 'string' }] }, null, 2),
+  ].join('\n');
+}
+
 module.exports = {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -279,4 +333,6 @@ module.exports = {
   buildProgressSystemPrompt,
   buildFitnessTestingSystemPrompt,
   buildBusinessSystemPrompt,
+  buildRenewalReminderPrompt,
+  buildLeadFollowupPrompt,
 };

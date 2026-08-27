@@ -9,6 +9,7 @@ const router = require('express').Router();
 const {
   EMAIL_RE, TENANT_ROLES, TRIAL_DAYS, audit, bcrypt, crypto, deliverInvitation, detectLogoType, invalidateUserCache, invitations, logger, logoUpload, pool, saveFile, sendPasswordReset, slugify, smtpConfigured, uniqueSlug,
 } = require('./shared');
+const { activeOwnerOf, ownerExistsNested } = require('../../../lib/one-trainer');
 // ── GET /organizations ───────────────────────────────────────────────────────
 router.get('/organizations', async (req, res, next) => {
   try {
@@ -293,6 +294,15 @@ router.post('/organizations/:id/users', async (req, res, next) => {
 
     const { rows: dupe } = await pool.query('SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
     if (dupe.length) return res.status(409).json({ error: { code: 'CONFLICT', message: 'That email is already in use' } });
+
+    // One owner per studio. The mirror of the LAST_ADMIN guard below: that one
+    // stops a studio dropping to zero admins, this one stops it climbing to
+    // two. Note the org comes from the URL, not the caller — the platform
+    // console creates users into a studio it does not itself belong to.
+    if (role === 'admin') {
+      const owner = await activeOwnerOf(pool, null, req.params.id);
+      if (owner) return res.status(409).json(ownerExistsNested(owner));
+    }
 
     const hashed = await bcrypt.hash(password, 12);
     const userId = crypto.randomUUID();

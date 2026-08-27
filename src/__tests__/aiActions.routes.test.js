@@ -233,3 +233,264 @@ describe('executing', () => {
     expect(res.body.data.tally.not_configured).toBe(2);
   });
 });
+
+// renewal_reminders is model-backed (usesModel: true): its plan/execute path
+// freezes AI-drafted text at plan time rather than re-deriving it at execute
+// (see registry.js's draft() and this route's own comments for why — model
+// output is not deterministic, so re-drafting at execute would fail the
+// fingerprint check on a perfectly good plan almost every time). These tests
+// exercise that freeze directly rather than through the real model.
+describe('a model-backed action freezes its drafted text', () => {
+  const mockRoutedChat = jest.fn();
+  jest.doMock('../lib/ai/router', () => ({ routedChat: (...a) => mockRoutedChat(...a) }));
+
+  function freshApp() {
+    jest.resetModules();
+    jest.doMock('../db/pool', () => ({ query: (...a) => pool.query(...a) }));
+    jest.doMock('../middleware/auth', () => ({
+      auth: (req, _res, next) => { req.user = mockUser; next(); },
+      adminOnly: (_req, _res, next) => next(),
+      adminOrManager: (_req, _res, next) => next(),
+    }));
+    jest.doMock('../services/whatsappDelivery', () => ({
+      sendText: (...a) => mockSendText(...a), sendTemplate: jest.fn(), twilioWhatsappConfigured: () => true,
+    }));
+    jest.doMock('../lib/ai/router', () => ({ routedChat: (...a) => mockRoutedChat(...a) }));
+    // Quota enforcement itself (parallel-query resolution, over/under-limit
+    // math) is aiQuota.test.js's job — mocked to a pass-through here so
+    // these tests exercise the freeze/staleness logic in isolation. The
+    // separate "never gated" test below swaps this for a spy instead.
+    jest.doMock('../lib/aiQuota', () => ({ requireAiQuota: () => (_req, _res, next) => next() }));
+    const a = express();
+    a.use(express.json());
+    a.use('/api/ai', require('../modules/ai-actions/ai-actions.routes'));
+    a.use((err, _req, res, _next) => res.status(500).json({ error: err.message }));
+    return a;
+  }
+
+  const RENEWAL = (i, days) => ({
+    id: `c${i}`, name: `Client ${i}`, mobile: `99900000${i}`,
+    pt_end_date: '2026-09-01', days_left: days,
+  });
+
+  beforeEach(() => {
+    mockRoutedChat.mockReset();
+    pool.query.mockReset();
+  });
+
+  test('the text sent is exactly the text drafted at plan time, not re-drafted at execute', async () => {
+    const a = freshApp();
+    mockRoutedChat.mockResolvedValue({
+      content: JSON.stringify({ drafts: [{ id: 'c1', body: 'DRAFTED: hi Client 1, 3 days left!' }] }),
+      model: 'test-model', usage: {}, latency_ms: 5, used_fallback: false,
+    });
+
+    pool.query
+      .mockResolvedValueOnce({ rows: [RENEWAL(1, 3)] })                  // resolve (plan)
+      .mockResolvedValueOnce({ rows: [] })                               // draft()'s logUsage insert
+      .mockResolvedValueOnce({ rows: [{ id: 'plan-1', expires_at: future() }] }); // insert plan
+
+    const planned = await request(a).post('/api/ai/actions/renewal_reminders/plan').send({ days: 7 });
+    expect(planned.status).toBe(200);
+    expect(planned.body.data.sample_message).toBe('DRAFTED: hi Client 1, 3 days left!');
+    expect(mockRoutedChat).toHaveBeenCalledTimes(1); // one call for the whole batch
+
+    const insertCall = pool.query.mock.calls.find(([sql]) => /INSERT INTO ai_action_plans/.test(sql));
+    const [storedFingerprint, , , storedResolved] = insertCall[1].slice(3);
+    const resolvedRecipients = JSON.parse(storedResolved);
+    expect(resolvedRecipients).toEqual([{ id: 'c1', body: 'DRAFTED: hi Client 1, 3 days left!' }]);
+
+    pool.query.mockReset();
+    pool.query
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'plan-1', action_id: 'renewal_reminders', fingerprint: storedFingerprint,
+          params: { days: 7 }, resolved_recipients: resolvedRecipients,
+          consumed_at: null, expires_at: future(),
+        }],
+      })
+      .mockResolvedValueOnce({ rows: [RENEWAL(1, 3)] }) // resolve (execute) — eligibility unchanged
+      .mockResolvedValueOnce({ rowCount: 1 })            // claim
+      .mockResolvedValueOnce({ rows: [] });              // store result
+
+    const executed = await request(a)
+      .post('/api/ai/actions/renewal_reminders/execute')
+      .send({ plan_id: planned.body.data.plan_id });
+
+    expect(executed.status).toBe(200);
+    expect(executed.body.data.sent).toBe(1);
+    // routedChat was NOT called again — execute never re-drafts.
+    expect(mockRoutedChat).toHaveBeenCalledTimes(1);
+    expect(mockSendText).toHaveBeenCalledWith({ to: '999000001', body: 'DRAFTED: hi Client 1, 3 days left!' });
+  });
+
+  test('refuses as stale when eligibility changed, without ever re-drafting', async () => {
+    const a = freshApp();
+    mockRoutedChat.mockResolvedValue({
+      content: JSON.stringify({ drafts: [{ id: 'c1', body: 'DRAFTED for c1' }] }),
+      model: 'test-model', usage: {}, latency_ms: 5, used_fallback: false,
+    });
+
+    pool.query
+      .mockResolvedValueOnce({ rows: [RENEWAL(1, 3)] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ id: 'plan-1', expires_at: future() }] });
+
+    const planned = await request(a).post('/api/ai/actions/renewal_reminders/plan').send({ days: 7 });
+    const insertCall = pool.query.mock.calls.find(([sql]) => /INSERT INTO ai_action_plans/.test(sql));
+    const [storedFingerprint, , , storedResolved] = insertCall[1].slice(3);
+
+    pool.query.mockReset();
+    pool.query
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'plan-1', action_id: 'renewal_reminders', fingerprint: storedFingerprint,
+          params: { days: 7 }, resolved_recipients: JSON.parse(storedResolved),
+          consumed_at: null, expires_at: future(),
+        }],
+      })
+      // c1 renewed already (dropped) and c2 is now newly eligible instead.
+      .mockResolvedValueOnce({ rows: [RENEWAL(2, 5)] });
+
+    const executed = await request(a)
+      .post('/api/ai/actions/renewal_reminders/execute')
+      .send({ plan_id: planned.body.data.plan_id });
+
+    expect(executed.status).toBe(409);
+    expect(executed.body.code).toBe('plan_stale');
+    expect(mockSendText).not.toHaveBeenCalled();
+    // Refused on the id-set check alone — never asked the model to re-draft.
+    expect(mockRoutedChat).toHaveBeenCalledTimes(1);
+  });
+
+  test('refuses if the stored drafted text was tampered with after planning', async () => {
+    const a = freshApp();
+    mockRoutedChat.mockResolvedValue({
+      content: JSON.stringify({ drafts: [{ id: 'c1', body: 'DRAFTED for c1' }] }),
+      model: 'test-model', usage: {}, latency_ms: 5, used_fallback: false,
+    });
+
+    pool.query
+      .mockResolvedValueOnce({ rows: [RENEWAL(1, 3)] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ id: 'plan-1', expires_at: future() }] });
+
+    const planned = await request(a).post('/api/ai/actions/renewal_reminders/plan').send({ days: 7 });
+    const insertCall = pool.query.mock.calls.find(([sql]) => /INSERT INTO ai_action_plans/.test(sql));
+    const [storedFingerprint] = insertCall[1].slice(3);
+
+    // Same recipient, same id set — but the stored body was altered after
+    // the operator approved it (simulating row corruption/tampering).
+    const tampered = [{ id: 'c1', body: 'TAMPERED — not what was reviewed' }];
+
+    pool.query.mockReset();
+    pool.query
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'plan-1', action_id: 'renewal_reminders', fingerprint: storedFingerprint,
+          params: { days: 7 }, resolved_recipients: tampered,
+          consumed_at: null, expires_at: future(),
+        }],
+      })
+      .mockResolvedValueOnce({ rows: [RENEWAL(1, 3)] }); // same eligibility as plan time
+
+    const executed = await request(a)
+      .post('/api/ai/actions/renewal_reminders/execute')
+      .send({ plan_id: planned.body.data.plan_id });
+
+    expect(executed.status).toBe(409);
+    expect(executed.body.code).toBe('plan_stale');
+    expect(mockSendText).not.toHaveBeenCalled();
+  });
+
+  // Not a repeat of the renewal_reminders proof above for its own sake — this
+  // is what proves the freeze/quota mechanism is a general property of
+  // `usesModel` actions, not something special-cased for one of them.
+  test('a second model-backed action (lead_followup) gets the same freeze-and-send treatment', async () => {
+    const a = freshApp();
+    mockRoutedChat.mockResolvedValue({
+      content: JSON.stringify({ drafts: [{ id: 'l1', body: 'DRAFTED: hi Priya, still interested?' }] }),
+      model: 'test-model', usage: {}, latency_ms: 5, used_fallback: false,
+    });
+
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ id: 'l1', name: 'Priya', mobile: '9990000001', source: 'walk_in', status: 'new', interested_package: null, follow_up_date: '2026-09-01' }] })
+      .mockResolvedValueOnce({ rows: [] }) // draft()'s logUsage insert
+      .mockResolvedValueOnce({ rows: [{ id: 'plan-1', expires_at: future() }] });
+
+    const planned = await request(a).post('/api/ai/actions/lead_followup/plan').send({ days: 7 });
+    expect(planned.status).toBe(200);
+    expect(planned.body.data.sample_message).toBe('DRAFTED: hi Priya, still interested?');
+
+    const insertCall = pool.query.mock.calls.find(([sql]) => /INSERT INTO ai_action_plans/.test(sql));
+    const [storedFingerprint, , , storedResolved] = insertCall[1].slice(3);
+
+    pool.query.mockReset();
+    pool.query
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'plan-1', action_id: 'lead_followup', fingerprint: storedFingerprint,
+          params: { days: 7 }, resolved_recipients: JSON.parse(storedResolved),
+          consumed_at: null, expires_at: future(),
+        }],
+      })
+      .mockResolvedValueOnce({ rows: [{ id: 'l1', name: 'Priya', mobile: '9990000001', source: 'walk_in', status: 'new', interested_package: null, follow_up_date: '2026-09-01' }] })
+      .mockResolvedValueOnce({ rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const executed = await request(a)
+      .post('/api/ai/actions/lead_followup/execute')
+      .send({ plan_id: planned.body.data.plan_id });
+
+    expect(executed.status).toBe(200);
+    expect(executed.body.data.sent).toBe(1);
+    expect(mockRoutedChat).toHaveBeenCalledTimes(1); // never re-drafted at execute
+    expect(mockSendText).toHaveBeenCalledWith({ to: '9990000001', body: 'DRAFTED: hi Priya, still interested?' });
+  });
+});
+
+// Separate describe: needs to observe the quota guard being called or not,
+// so it uses a spy instead of the blanket pass-through above.
+describe('the quota gate applies only to model-backed actions', () => {
+  test('dues_reminders (usesModel: false) never invokes the quota guard; renewal_reminders (usesModel: true) does', async () => {
+    jest.resetModules();
+    const quotaGuardSpy = jest.fn((_req, _res, next) => next());
+    jest.doMock('../db/pool', () => ({ query: (...a) => pool.query(...a) }));
+    jest.doMock('../middleware/auth', () => ({
+      auth: (req, _res, next) => { req.user = mockUser; next(); },
+      adminOnly: (_req, _res, next) => next(),
+      adminOrManager: (_req, _res, next) => next(),
+    }));
+    jest.doMock('../services/whatsappDelivery', () => ({
+      sendText: (...a) => mockSendText(...a), sendTemplate: jest.fn(), twilioWhatsappConfigured: () => true,
+    }));
+    jest.doMock('../lib/ai/router', () => ({
+      routedChat: jest.fn().mockResolvedValue({
+        content: JSON.stringify({ drafts: [{ id: 'c1', body: 'drafted' }] }),
+        model: 'm', usage: {}, latency_ms: 1, used_fallback: false,
+      }),
+    }));
+    jest.doMock('../lib/aiQuota', () => ({ requireAiQuota: () => quotaGuardSpy }));
+    const a = express();
+    a.use(express.json());
+    a.use('/api/ai', require('../modules/ai-actions/ai-actions.routes'));
+    a.use((err, _req, res, _next) => res.status(500).json({ error: err.message }));
+
+    pool.query.mockReset();
+    pool.query
+      .mockResolvedValueOnce({ rows: [CLIENT(1)] })
+      .mockResolvedValueOnce({ rows: [{ id: 'plan-1', expires_at: future() }] });
+    const duesRes = await request(a).post('/api/ai/actions/dues_reminders/plan').send({});
+    expect(duesRes.status).toBe(200);
+    expect(quotaGuardSpy).not.toHaveBeenCalled();
+
+    pool.query.mockReset();
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ id: 'c1', name: 'A', mobile: '999', pt_end_date: '2026-09-01', days_left: 3 }] })
+      .mockResolvedValueOnce({ rows: [] }) // draft()'s logUsage insert
+      .mockResolvedValueOnce({ rows: [{ id: 'plan-2', expires_at: future() }] });
+    const renewalRes = await request(a).post('/api/ai/actions/renewal_reminders/plan').send({ days: 7 });
+    expect(renewalRes.status).toBe(200);
+    expect(quotaGuardSpy).toHaveBeenCalledTimes(1);
+  });
+});

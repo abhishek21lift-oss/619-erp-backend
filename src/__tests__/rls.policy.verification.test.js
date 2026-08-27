@@ -210,13 +210,51 @@ describe('RLS Cutover Validation', () => {
     serverJs = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
   });
 
-  it('server.js validates ADMIN_DATABASE_URL differs from DATABASE_URL when RLS enforced', () => {
-    expect(serverJs).toMatch(/const adminUrl = process\.env\.ADMIN_DATABASE_URL \|\| process\.env\.DATABASE_URL;/);
-    expect(serverJs).toMatch(/adminUrl === process\.env\.DATABASE_URL/);
-    // The guard must be gated on the SHARED predicate, not on the raw env
-    // var. Gated on the raw var it was silent when the var was unset — the
+  it('the boot guard asks the database which role it authenticated as', () => {
+    expect(serverJs).toContain("require('./lib/tenantRoleAssertion')");
+    expect(serverJs).toContain('pool.inspectRoles()');
+    expect(serverJs).toContain('evaluateTenantRole(roles)');
+  });
+
+  it('the guard runs before the migrations, which it would otherwise bury', () => {
+    // Order matters for the diagnosis, not for correctness: the check reads
+    // pg_roles for the role the connection authenticated as, which no
+    // migration influences. But DATABASE_URL pointing at app_tenant with no
+    // ADMIN_DATABASE_URL takes the migration runner down first — DDL as an
+    // unprivileged role — and buries the cause under permission errors.
+    const guard = serverJs.indexOf('assertTenantRole()\n');
+    const chain = serverJs.indexOf('return runMigrationsWithRetry();');
+    const listen = serverJs.indexOf('app.listen(PORT');
+    expect(guard).toBeGreaterThan(-1);
+    expect(chain).toBeGreaterThan(guard);
+    expect(listen).toBeGreaterThan(chain);
+  });
+
+  it('no longer decides tenant isolation by comparing two connection strings', () => {
+    // Two different strings can authenticate as the same role. The live
+    // database on 26 Aug 2026 had both resolving to `postgres`
+    // (rolbypassrls = true) with all ninety policies inert, and this check
+    // passed. Comparing the URLs cannot answer the question, so it is gone.
+    expect(serverJs).not.toMatch(/const adminUrl = process\.env\.ADMIN_DATABASE_URL/);
+    expect(serverJs).not.toMatch(/adminUrl === process\.env\.DATABASE_URL/);
+  });
+
+  it('the guard is gated on the shared enforcement predicate, not the raw env var', () => {
+    // Gated on the raw var it was silent when the var was unset — the
     // production default, and exactly the case it exists to catch.
-    expect(serverJs).toMatch(/if \(isProd && rlsEnforcementEnabled\(\)\)/);
+    expect(serverJs).toContain('rlsEnforcementEnabled()');
     expect(serverJs).not.toMatch(/if \(isProd && process\.env\.TENANT_RLS_ENFORCE\)/);
+  });
+
+  it('a failed check is fatal in production, not a warning', () => {
+    const fn = serverJs.slice(
+      serverJs.indexOf('async function assertTenantRole('),
+      serverJs.indexOf('logger.info(\'Verifying the database role')
+    );
+    expect(fn).toContain('process.exit(1)');
+    // Verification that throws is a failed verification, not a passed one:
+    // an authorisation property that cannot be checked may not be assumed.
+    const katch = fn.slice(fn.indexOf('} catch (err) {'), fn.indexOf('const result ='));
+    expect(katch).toContain('process.exit(1)');
   });
 });

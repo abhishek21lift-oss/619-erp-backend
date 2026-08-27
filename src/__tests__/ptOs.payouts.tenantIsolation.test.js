@@ -9,7 +9,7 @@
 // commission/payout surface in this file shared the same gap.
 //
 // pt_payouts and pt_commissions carry no organization_id of their own — the
-// tenant boundary runs through pt_trainers.organization_id via trainer_id —
+// tenant boundary runs through trainers.organization_id via trainer_id —
 // so the fix is a subquery filter, not a plain WHERE column, and these tests
 // assert on the SQL actually sent rather than only on the HTTP response: a
 // mock can be made to return the right rows by accident, but it cannot fake
@@ -66,7 +66,7 @@ describe('POST /pt-os/payouts/mark-all-paid tenant isolation', () => {
     const q = queries.find((x) => /UPDATE pt_payouts/i.test(x.sql) && /status != 'paid'/i.test(x.sql));
 
     expect(q).toBeTruthy();
-    expect(q.sql).toMatch(/trainer_id IN \(SELECT id FROM pt_trainers WHERE organization_id = \$2\)/i);
+    expect(q.sql).toMatch(/trainer_id IN \(SELECT id FROM trainers WHERE organization_id = \$2\)/i);
     expect(q.params).toEqual(['2026-08-01', ORG_A]);
   });
 
@@ -111,7 +111,7 @@ describe('PUT /pt-os/payouts/:trainerId tenant isolation', () => {
 
     expect(res.status).toBe(404);
     expect(queries.find((x) => /UPDATE pt_payouts/i.test(x.sql))).toBeUndefined();
-    const check = queries.find((x) => /SELECT 1 FROM pt_trainers/i.test(x.sql));
+    const check = queries.find((x) => /SELECT 1 FROM trainers/i.test(x.sql));
     expect(check.params).toEqual(['org-b-trainer', ORG_A]);
   });
 
@@ -119,7 +119,7 @@ describe('PUT /pt-os/payouts/:trainerId tenant isolation', () => {
     mockQueryImpl = async (sql, params) => {
       const clean = String(sql).replace(/\s+/g, ' ').trim();
       queries.push({ sql: clean, params });
-      if (/SELECT 1 FROM pt_trainers/i.test(clean)) return { rows: [{ exists: 1 }], rowCount: 1 };
+      if (/SELECT 1 FROM trainers/i.test(clean)) return { rows: [{ exists: 1 }], rowCount: 1 };
       return { rows: [], rowCount: 0 };
     };
 
@@ -142,7 +142,7 @@ describe('POST /pt-os/payouts/:id/approve tenant isolation', () => {
     expect(res.status).toBe(404);
     const update = queries.find((x) => /UPDATE pt_payouts/i.test(x.sql) && /RETURNING/i.test(x.sql));
     expect(update).toBeTruthy();
-    expect(update.sql).toMatch(/trainer_id IN \(SELECT id FROM pt_trainers WHERE organization_id = \$5\)/i);
+    expect(update.sql).toMatch(/trainer_id IN \(SELECT id FROM trainers WHERE organization_id = \$5\)/i);
     expect(update.params[0]).toBe('org-b-payout');
     expect(update.params[4]).toBe(ORG_A);
   });
@@ -151,14 +151,14 @@ describe('POST /pt-os/payouts/:id/approve tenant isolation', () => {
 describe('GET /pt-os/payouts and POST /pt-os/commissions/calculate tenant isolation', () => {
   test('GET /payouts scopes the trainer roll-up by organization', async () => {
     await request(app()).get('/api/pt-os/payouts?month=2026-08');
-    const q = queries.find((x) => /FROM pt_trainers t/i.test(x.sql) && /LEFT JOIN pt_payouts/i.test(x.sql));
+    const q = queries.find((x) => /FROM trainers t/i.test(x.sql) && /LEFT JOIN pt_payouts/i.test(x.sql));
     expect(q.sql).toMatch(/t\.organization_id = \$2/);
     expect(q.params).toEqual(['2026-08-01', ORG_A]);
   });
 
   test('POST /commissions/calculate only recalculates the caller organization\'s clients', async () => {
     await request(app()).post('/api/pt-os/commissions/calculate').send({ month: '2026-08' });
-    const q = queries.find((x) => /FROM pt_clients c/i.test(x.sql) && /JOIN pt_trainers t/i.test(x.sql));
+    const q = queries.find((x) => /FROM pt_clients c/i.test(x.sql) && /JOIN trainers t/i.test(x.sql));
     expect(q.sql).toMatch(/c\.organization_id = \$3/);
     expect(q.params).toEqual(['2026-08-01', '2026-09-01', ORG_A]);
   });

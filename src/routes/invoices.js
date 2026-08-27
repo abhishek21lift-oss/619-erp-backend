@@ -268,12 +268,17 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
 
     // Also record as a payment if not already recorded
     const receiptNo = 'INV-' + inv[0].invoice_no;
+    // organization_id is required from migration 186 on: payments carries the
+    // column NOT NULL and an AND'd parent-walk policy, so a row without it is
+    // refused. orgIdOf(req) is the same value the invoice above was scoped by.
     await tx.query(`
-      INSERT INTO payments (id, client_id, client_name, trainer_id, amount, method, date, receipt_no, notes, created_at)
-      VALUES ($1, $2, $3, NULL, $4, $5, CURRENT_DATE, $6, $7, NOW())
+      INSERT INTO payments (id, client_id, client_name, trainer_id, amount, method, date, receipt_no, notes, created_at,
+        organization_id)
+      VALUES ($1, $2, $3, NULL, $4, $5, CURRENT_DATE, $6, $7, NOW(), $8)
       ON CONFLICT DO NOTHING`,
       [randomUUID(), inv[0].client_id, inv[0].client_name, inv[0].total_amount,
-       req.body.payment_method || 'CASH', receiptNo, 'Payment for invoice ' + inv[0].invoice_no]
+       req.body.payment_method || 'CASH', receiptNo, 'Payment for invoice ' + inv[0].invoice_no,
+       orgIdOf(req)]
     );
 
     // Update the linked client's paid/balance fields so their financial record

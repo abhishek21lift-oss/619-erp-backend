@@ -411,6 +411,52 @@ pool.connect = function tenantScopedConnect(...args) {
 pool.withOrgScope = withOrgScope;
 pool.scopeClient = scopeClient;
 
+/**
+ * Who does each pool ACTUALLY authenticate as, and does that role bypass RLS?
+ *
+ * ── Why this borrows a client instead of calling query ──────────────────────
+ *
+ * It runs at boot, where there is no AsyncLocalStorage store, so
+ * isPlatformWide() is true and BOTH wrappers above route to the OWNER pool. An
+ * assertion written the obvious way inspects the privileged connection, finds
+ * it privileged, and reports exactly the state it exists to detect.
+ *
+ * _origQuery is not far enough back to escape that, and the first version of
+ * this function got it wrong by assuming it was. pg's Pool.prototype.query
+ * calls `this.connect()` internally, and _origQuery is bound to `pool`, whose
+ * connect HAS been replaced — so a query issued through it still arrives on
+ * the owner pool. Verified by running it against a local database with
+ * DATABASE_URL pointing at app_tenant: it reported `postgres`.
+ *
+ * _origConnect is the real pg pool method, captured before the patch and
+ * consulting nothing that was patched afterwards. Borrowing through it is the
+ * only way to reach the tenant pool from here.
+ *
+ * `current_user` rather than the connection string: a URL says what was
+ * typed, not who the server authenticated. Two different strings can resolve
+ * to the same role — which is precisely how the previous boot guard, a string
+ * comparison of DATABASE_URL against ADMIN_DATABASE_URL, could pass while both
+ * connected as the table-owning `postgres`.
+ */
+async function inspectRoles() {
+  const SQL = `SELECT current_user AS role,
+                      COALESCE((SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user), false) AS bypassrls,
+                      COALESCE((SELECT rolsuper     FROM pg_roles WHERE rolname = current_user), false) AS superuser`;
+  const client = await _origConnect();
+  let tenant;
+  try {
+    tenant = (await client.query(SQL)).rows[0];
+  } finally {
+    client.release();
+  }
+  // Only ask the owner pool when there IS one; otherwise constructing it would
+  // open a second pool purely to answer a question about the first.
+  const owner = SEPARATE_ADMIN_CONNECTION ? (await ownerPool().query(SQL)).rows[0] : null;
+  return { tenant, owner, separateAdminConnection: SEPARATE_ADMIN_CONNECTION };
+}
+
+pool.inspectRoles = inspectRoles;
+
 // Test connection on startup. Don't crash here — Render's healthcheck will
 // surface a 5xx and you can read the log. Crashing prevents redeploys from
 // recovering when Supabase has a brief connectivity blip.

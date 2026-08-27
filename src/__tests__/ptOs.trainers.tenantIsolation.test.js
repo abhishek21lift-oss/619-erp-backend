@@ -47,7 +47,7 @@ function app() {
 
 /** The trainer-list query, whichever of the recorded statements it is. */
 function trainerQuery() {
-  return queries.find((q) => /FROM trainers/i.test(q.sql) && /UNION/i.test(q.sql));
+  return queries.find((q) => /SELECT id, name, email/i.test(q.sql) && /FROM trainers/i.test(q.sql));
 }
 
 beforeEach(() => {
@@ -56,15 +56,36 @@ beforeEach(() => {
 });
 
 describe('GET /pt-os/trainers tenant isolation', () => {
-  test('filters BOTH tables by the caller organization', async () => {
+  test('filters by the caller organization', async () => {
     await request(app()).get('/api/pt-os/trainers');
     const q = trainerQuery();
 
     expect(q).toBeTruthy();
-    // Once for `trainers`, once for `pt_trainers` — a filter on only one half
-    // of the UNION still leaks the other half.
-    expect(q.sql.match(/organization_id = \$1/g)).toHaveLength(2);
+    // Once, because there is one table. This asserted TWO filters when the
+    // query was a UNION over `trainers` and `pt_trainers` — a filter on only
+    // one half still leaked the other. Migration 181 consolidated on
+    // `trainers`, so the second half no longer exists to leak.
+    expect(q.sql.match(/organization_id = \$1/g)).toHaveLength(1);
     expect(q.params).toEqual([ORG_A]);
+  });
+
+  test('reads one table — the fork nothing writes to is gone from this query', async () => {
+    // The bug this replaced the UNION for: `pt_trainers` is never written, so
+    // every read that used it as its only source returned nothing. Here it was
+    // merely redundant, but leaving it would keep the two-table shape alive in
+    // the one query people copy from.
+    await request(app()).get('/api/pt-os/trainers');
+    const q = trainerQuery();
+    expect(q.sql).not.toMatch(/pt_trainers/i);
+    expect(q.sql).not.toMatch(/UNION/i);
+  });
+
+  test('returns the photo the trainers table actually stores', async () => {
+    // The UNION selected `NULL::text AS photo_url` on the `trainers` side even
+    // though the column exists there, so PT OS never showed a trainer's photo.
+    await request(app()).get('/api/pt-os/trainers');
+    expect(trainerQuery().sql).not.toMatch(/NULL::text AS photo_url/i);
+    expect(trainerQuery().sql).toMatch(/photo_url/);
   });
 
   test('a trainer from another studio cannot be reached by asking', async () => {

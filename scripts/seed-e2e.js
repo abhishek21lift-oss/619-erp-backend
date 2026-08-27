@@ -123,18 +123,18 @@ async function seedStudio(s, hash) {
   // cannot happen, by reading B's status back after A has called it.
   await pool.query(
     `INSERT INTO pt_payouts (id, trainer_id, trainer_name, month, total_commission,
-                             deductions, net_amount, status, created_at, updated_at)
-     VALUES ($1, $2, $3, date_trunc('month', CURRENT_DATE)::DATE, $4, 0, $4, 'pending', NOW(), NOW())
+                             deductions, net_amount, status, organization_id, created_at, updated_at)
+     VALUES ($1, $2, $3, date_trunc('month', CURRENT_DATE)::DATE, $4, 0, $4, 'pending', $5, NOW(), NOW())
      ON CONFLICT (id) DO UPDATE SET status = 'pending', paid_at = NULL`,
-    [s.payoutId, s.trainerId, s.trainerName, s.amount]
+    [s.payoutId, s.trainerId, s.trainerName, s.amount, s.orgId]
   );
 
   await pool.query(
     `INSERT INTO pt_commissions (id, trainer_id, trainer_name, client_id, client_name,
-                                 month, commission_amt, incentive_rate, status, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, date_trunc('month', CURRENT_DATE)::DATE, $6, 0.10, 'pending', NOW(), NOW())
+                                 month, commission_amt, incentive_rate, status, organization_id, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, date_trunc('month', CURRENT_DATE)::DATE, $6, 0.10, 'pending', $7, NOW(), NOW())
      ON CONFLICT (id) DO NOTHING`,
-    [s.commissionId, s.trainerId, s.trainerName, s.clientId, s.clientName, s.amount]
+    [s.commissionId, s.trainerId, s.trainerName, s.clientId, s.clientName, s.amount, s.orgId]
   );
 
   // A PENDING leave request. leave_requests gained organization_id in

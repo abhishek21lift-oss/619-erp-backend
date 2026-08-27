@@ -3,11 +3,13 @@ const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
 const { auth, adminOnly, adminOrManager } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
+const { requirePermission } = require('../../middleware/permissions');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
 const svc = require('./pt-os.service');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
+const { activeTrainerOf, trainerLimitNested } = require('../../lib/one-trainer');
 const { today: studioToday } = require('../../lib/appTime');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
@@ -17,6 +19,9 @@ const { generateCoach } = require('./coach-ai');
 const { buildRecovery } = require('./recovery');
 const { routedChat } = require('../../lib/ai/router');
 const { logActivity } = require('../../lib/activityLog');
+const { logUsage } = require('../../lib/ai/usage');
+const { generateCheckinInsight } = require('./checkin-insight');
+const { requireAiQuota } = require('../../lib/aiQuota');
 
 /**
  * Where a client found the studio.
@@ -116,8 +121,12 @@ async function clientInOrg(req, clientId) {
 
 // ─── Trainers ───────────────────────────────────────────────
 router.get('/trainers', auth, wrap(async (req, res) => {
-  // Include trainers from both the main trainers table and the PT-OS-specific
-  // pt_trainers table so adding a trainer in either place makes them available here.
+  // One table. `trainers` is where every insert site in the product writes,
+  // and migration 181 copied across anything that existed only in the fork, so
+  // the UNION with pt_trainers that used to be here can no longer contribute a
+  // row. Removing it also restores `photo_url`: the union arm selected
+  // `NULL::text AS photo_url` for the `trainers` side — the column exists on
+  // that table and always has — so PT OS has never shown a trainer's photo.
   //
   // Scoped by organization. This route had no tenant filter at all, so every
   // studio saw every trainer on the platform — the Book PT Session dialog
@@ -138,12 +147,8 @@ router.get('/trainers', auth, wrap(async (req, res) => {
   }
 
   const { rows } = await pool.query(`
-    SELECT id, name, email, mobile, specialization, incentive_rate, status, NULL::text AS photo_url
-    FROM trainers
-    WHERE deleted_at IS NULL AND status = 'active' ${orgFilter}
-    UNION
     SELECT id, name, email, mobile, specialization, incentive_rate, status, photo_url
-    FROM pt_trainers
+    FROM trainers
     WHERE deleted_at IS NULL AND status = 'active' ${orgFilter}
     ORDER BY name
   `, params);
@@ -160,6 +165,13 @@ router.post('/trainers', auth, adminOnly, wrap(async (req, res) => {
   // org-less trainer is invisible to the very studio that just created them —
   // the create would appear to silently do nothing.
   const scope = tenantScope(req);
+
+  // One active trainer per studio — same rule and same reasoning as
+  // POST /api/trainers. Both paths insert into `trainers`, so guarding only one
+  // of them would leave the other as a way around it.
+  const existingTrainer = await activeTrainerOf(pool, req);
+  if (existingTrainer) return res.status(409).json(trainerLimitNested(existingTrainer));
+
   const { rows } = await pool.query(
     `INSERT INTO trainers (name, email, mobile, specialization, incentive_rate, status, organization_id)
      VALUES ($1,$2,$3,$4,$5,'active',$6) RETURNING *`,
@@ -392,10 +404,7 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
     let resolvedTrainerName = reqTrainerName || null;
     if (!resolvedTrainerName && trainer_id) {
       const { rows: tRows } = await pool.query(
-        `SELECT name FROM trainers WHERE id = $1
-         UNION
-         SELECT name FROM pt_trainers WHERE id = $1
-         LIMIT 1`, [trainer_id]
+        'SELECT name FROM trainers WHERE id = $1 LIMIT 1', [trainer_id]
       );
       resolvedTrainerName = tRows[0]?.name || null;
     }
@@ -534,26 +543,31 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
       d.pt_start_date, ptEndDate, d.duration_months, paidNow]);
 
   // Log to renewal history
+  // organization_id is required from migration 186 on — NOT NULL plus an AND'd
+  // parent-walk policy, so a renewal without it is refused outright.
   await pool.query(`
     INSERT INTO pt_client_renewals
       (client_id, client_name, trainer_name, old_package, new_package,
        old_end_date, new_start_date, new_end_date, duration_months,
-       base_amount, discount, final_amount, paid_amount, balance_amount, notes)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       base_amount, discount, final_amount, paid_amount, balance_amount, notes,
+       organization_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
   `, [
     req.params.id, c.name, c.trainer_name,
     c.package_type, packageType || c.package_type,
     c.pt_end_date, d.pt_start_date, ptEndDate, d.duration_months,
     baseAmt, disc, finalAmt, paidNow, Math.max(finalAmt - paidNow, 0),
     d.notes || null,
+    orgIdOf(req),
   ]);
 
   // Also write to pt_client_subscriptions (canonical term history used by the profile page)
   await pool.query(`
     INSERT INTO pt_client_subscriptions
       (client_id, plan_name, start_date, end_date, duration_months,
-       selling_price, amount_paid, balance_amount, trainer_name, status, source)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','renewal')
+       selling_price, amount_paid, balance_amount, trainer_name, status, source,
+       organization_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','renewal',$10)
     ON CONFLICT DO NOTHING
   `, [
     req.params.id,
@@ -561,6 +575,7 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
     d.pt_start_date, ptEndDate, d.duration_months,
     finalAmt, paidNow, Math.max(finalAmt - paidNow, 0),
     c.trainer_name,
+    orgIdOf(req),
   ]);
 
   // Ledger: money collected at renewal must land in pt_payments — the revenue
@@ -759,14 +774,16 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
       await pool.query(`
         INSERT INTO pt_client_subscriptions
           (client_id, plan_name, start_date, end_date, duration_months,
-           selling_price, amount_paid, balance_amount, trainer_name, status, source)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','enrollment')
+           selling_price, amount_paid, balance_amount, trainer_name, status, source,
+           organization_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','enrollment',$10)
         ON CONFLICT DO NOTHING
       `, [
         req.params.id, rows[0].package_type,
         rows[0].pt_start_date, rows[0].pt_end_date, rows[0].duration_months,
         rows[0].final_amount, rows[0].paid_amount, rows[0].balance_amount,
         rows[0].trainer_name,
+        orgIdOf(req),
       ]);
     }
   }
@@ -1013,7 +1030,11 @@ router.get('/balance-sheet', auth, wrap(async (req, res) => {
 }));
 
 // ─── Commissions ────────────────────────────────────────────
-router.get('/commissions', auth, wrap(async (req, res) => {
+// requirePermission('commissions'): perm_trainer_commissions is the toggle the
+// Settings screen offers, and it gates READING the commission roll-up — the
+// write routes below are adminOnly, and an admin is not constrained by the
+// matrix, so a gate there would be inert.
+router.get('/commissions', auth, requirePermission('commissions'), wrap(async (req, res) => {
   const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : req.query.trainer_id;
   const rows = await svc.getCommissionHistory(trainerId, tenantScope(req));
   res.json({ data: rows });
@@ -1040,14 +1061,14 @@ router.put('/commissions/:trainerId', auth, adminOnly, wrap(async (req, res) => 
   const beforeParams = [req.params.trainerId];
   const beforeOrg = orgWhere(req, beforeParams);
   const { rows: before } = await pool.query(
-    `SELECT id, name, incentive_rate FROM pt_trainers WHERE id = $1${beforeOrg}`, beforeParams
+    `SELECT id, name, incentive_rate FROM trainers WHERE id = $1${beforeOrg}`, beforeParams
   );
   if (before.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Trainer not found' } });
 
   const updParams = [rate, req.params.trainerId];
   const updOrg = orgWhere(req, updParams);
   await pool.query(
-    `UPDATE pt_trainers SET incentive_rate = $1, updated_at = NOW() WHERE id = $2${updOrg}`,
+    `UPDATE trainers SET incentive_rate = $1, updated_at = NOW() WHERE id = $2${updOrg}`,
     updParams
   );
 
@@ -1059,7 +1080,7 @@ router.put('/commissions/:trainerId', auth, adminOnly, wrap(async (req, res) => 
 }));
 
 // ─── Payouts ────────────────────────────────────────────────
-router.get('/payouts', auth, wrap(async (req, res) => {
+router.get('/payouts', auth, requirePermission('commissions'), wrap(async (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
   const rows = await svc.getTrainerPayouts(month, tenantScope(req));
   res.json({ data: rows, month });
@@ -1077,7 +1098,7 @@ router.post('/payouts', auth, adminOnly, wrap(async (req, res) => {
 // organization filter at all. An admin in any studio calling this marked
 // every other studio's pending payouts paid too. trainer_id is the only tie
 // back to a tenant (pt_payouts itself carries no organization_id), so the
-// filter is a subquery against pt_trainers, same pattern as markPayoutPaid.
+// filter is a subquery against trainers, same pattern as markPayoutPaid.
 router.post('/payouts/mark-all-paid', auth, adminOnly, wrap(async (req, res) => {
   const month = req.body.month || new Date().toISOString().slice(0, 7);
   const monthStart = `${month}-01`;
@@ -1086,7 +1107,7 @@ router.post('/payouts/mark-all-paid', auth, adminOnly, wrap(async (req, res) => 
   let orgClause = '';
   if (scope.applyFilter) {
     params.push(scope.orgId);
-    orgClause = ` AND trainer_id IN (SELECT id FROM pt_trainers WHERE organization_id = $${params.length})`;
+    orgClause = ` AND trainer_id IN (SELECT id FROM trainers WHERE organization_id = $${params.length})`;
   }
   const { rowCount } = await pool.query(
     `UPDATE pt_payouts SET status = 'paid', paid_at = NOW(), updated_at = NOW()
@@ -1110,7 +1131,7 @@ router.put('/payouts/:trainerId', auth, adminOnly, wrap(async (req, res) => {
   const scope = tenantScope(req);
   if (scope.applyFilter) {
     const { rowCount } = await pool.query(
-      `SELECT 1 FROM pt_trainers WHERE id = $1 AND organization_id = $2`,
+      `SELECT 1 FROM trainers WHERE id = $1 AND organization_id = $2`,
       [req.params.trainerId, scope.orgId]
     );
     if (rowCount === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Trainer not found' } });
@@ -1187,8 +1208,8 @@ router.get('/revenue', auth, wrap(async (req, res) => {
 // opens this screen — would drop out of the report entirely.
 //
 // Rows with a NULL organization_id stay hidden rather than shown to everyone.
-// That is migration 143's decision for exactly these tables, and pt_trainers
-// is not in 155's NOT NULL list, so unattributable rows can still exist.
+// That is migration 143's decision for exactly these tables, and `trainers` is
+// not in 155's NOT NULL list, so unattributable rows can still exist.
 router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) => {
   const params = [];
   const tOrg = orgWhere(req, params, 't.organization_id');
@@ -1202,7 +1223,7 @@ router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) =
       COALESCE(SUM(c.trainer_commission) FILTER (WHERE c.status = 'active'), 0) AS monthly_commission,
       COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_payment_revenue,
       COALESCE(SUM(p.incentive_amt) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_incentives
-    FROM pt_trainers t
+    FROM trainers t
     LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL${cOrg}
     LEFT JOIN pt_payments p ON p.trainer_id = t.id AND p.deleted_at IS NULL${pOrg}
     WHERE t.deleted_at IS NULL AND t.status = 'active'${tOrg}
@@ -1259,15 +1280,15 @@ router.get('/sessions', auth, wrap(async (req, res) => {
 // Keying solely off the column reported "not linked" to the studio owner and
 // told them to ask an admin — which they are.
 //
-// Second, `pt_sessions.trainer_id` has had NO foreign key since migration
-// 018 dropped pt_sessions_trainer_id_fkey, and the Book Session picker is fed
-// by GET /trainers, a UNION of `trainers` and `pt_trainers`. So a booked
-// session's trainer_id can be an id from EITHER table, and the same human
-// routinely exists in both. Matching one id misses the other's sessions.
+// Second, a booked session's trainer_id is not necessarily the id on the
+// caller's user row. `pt_sessions.trainer_id` references `trainers` (migration
+// 145 repointed it there from the empty pt_trainers fork), while
+// `users.trainer_id` may be unset for a studio owner who also trains.
 //
-// Hence: the explicit link, plus an email match in both tables, all within the
-// caller's own organisation. Email is the join the two trainer tables already
-// share — 018 seeded pt_trainers FROM trainers carrying it across.
+// Hence: the explicit link, plus an email match, within the caller's own
+// organisation. This used to match against both trainer tables because the
+// Book Session picker UNIONed them and an id could come from either; migration
+// 181 consolidated on `trainers`, so one lookup now covers every session.
 //
 // The org filter mirrors GET /trainers exactly, including excluding NULL
 // organization_id rather than treating it as shared: an unattributable trainer
@@ -1289,9 +1310,6 @@ async function resolveMyTrainerIds(req) {
     }
     const { rows } = await pool.query(`
       SELECT id FROM trainers
-       WHERE deleted_at IS NULL AND LOWER(email) = $1 ${orgFilter}
-      UNION
-      SELECT id FROM pt_trainers
        WHERE deleted_at IS NULL AND LOWER(email) = $1 ${orgFilter}
     `, params);
     for (const r of rows) ids.add(r.id);
@@ -1435,18 +1453,19 @@ router.get('/payments', auth, wrap(async (req, res) => {
   const pOrg = orgWhere(req, params, 'p.organization_id');
   if (pOrg) where.push(pOrg.replace(/^ AND /, ''));
   const { rows } = await pool.query(`
-    SELECT p.*, c.name AS client_name, COALESCE(t.name, ptt.name) AS trainer_name
+    SELECT p.*, c.name AS client_name, t.name AS trainer_name
     FROM pt_payments p
     LEFT JOIN pt_clients c ON c.id = p.client_id
     LEFT JOIN trainers t ON t.id = p.trainer_id
-    LEFT JOIN pt_trainers ptt ON ptt.id = p.trainer_id
     WHERE ${where.join(' AND ')}
     ORDER BY p.date DESC
   `, params);
   res.json({ data: rows });
 }));
 
-router.post('/payments', auth, wrap(async (req, res) => {
+// perm_*_record_payment. Reception ships TRUE for this and trainer FALSE —
+// taking money at the desk is a front-desk job.
+router.post('/payments', auth, requirePermission('record_payment'), wrap(async (req, res) => {
   const { client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes } = req.body;
   const numAmount = Number(amount) || 0;
 
@@ -1918,6 +1937,65 @@ router.post('/clients/:id/coach', auth, wrap(async (req, res) => {
     // The rule-based prompts are true whatever the model does, so they are
     // what the card falls back to rather than an empty state.
     fallback: snapshot.coach,
+  });
+
+  res.json({ data: out });
+}));
+
+// POST /clients/:id/checkin-insight
+//
+// A short, advisory read of a client's recent weekly check-ins — nothing
+// this writes anywhere. On demand only, same reasoning as /coach above: a
+// client's check-in history doesn't change between two page opens an hour
+// apart, so there is no reason to spend a model call on every visit.
+//
+// Explicitly quota-gated, unlike /coach above (a pre-existing gap in this
+// file, not introduced here and not this route's to fix) — this is a new
+// LLM-calling endpoint and there's no reason to special-case it out of the
+// same budget every other AI Suite call respects.
+router.post('/clients/:id/checkin-insight', auth, requireAiQuota(), wrap(async (req, res) => {
+  const clientId = req.params.id;
+  const params = [clientId];
+  const orgClause = orgWhere(req, params, 'c.organization_id');
+
+  const { rows: clientRows } = await pool.query(
+    `SELECT c.id, c.name FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
+    params,
+  );
+  const client = clientRows[0];
+  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+
+  const { rows: checkins } = await pool.query(
+    `SELECT weight, mood, sleep_hours, water_glasses, client_notes, created_at
+       FROM weekly_checkins WHERE client_id = $1
+      ORDER BY created_at DESC LIMIT 6`,
+    [clientId],
+  );
+
+  // Nothing to say about one data point, and nothing worth a model call for
+  // it — nudge the trainer at the source instead of drafting a hollow card.
+  if (checkins.length < 2) {
+    return res.json({ data: { available: false, reason: 'not_enough_checkins', checkins_count: checkins.length } });
+  }
+
+  // Oldest → newest, matching the shape every other generator in this file
+  // feeds the model (see /progress/analyze's own reversal).
+  const out = await generateCheckinInsight({
+    client,
+    checkins: checkins.slice().reverse(),
+    chat: async (args) => {
+      const result = await routedChat(args);
+      logUsage({
+        user_id: req.user.id,
+        model: result.model,
+        intent_type: 'checkin',
+        tokens_prompt: result.usage?.prompt_tokens || 0,
+        tokens_completion: result.usage?.completion_tokens || 0,
+        latency_ms: result.latency_ms,
+        used_fallback: result.used_fallback,
+      }).catch(() => {});
+      return result;
+    },
   });
 
   res.json({ data: out });

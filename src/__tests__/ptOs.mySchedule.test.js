@@ -11,10 +11,14 @@
 //      other account — including every studio predating that flow — has it
 //      null, so the route short-circuited before looking at anything else.
 //
-//   2. `pt_sessions.trainer_id` has had no foreign key since migration 018
-//      dropped pt_sessions_trainer_id_fkey, and the Book Session picker is a
-//      UNION of `trainers` and `pt_trainers`. One human is routinely a row in
-//      both, so their sessions carry two different trainer_ids.
+//   2. a session's trainer_id need not equal the id on the caller's user row,
+//      so the email lookup has to run as well as the explicit link, and the
+//      two id sets have to be merged rather than one chosen.
+//
+//      This used to be a UNION across `trainers` and `pt_trainers`, because
+//      the Book Session picker offered ids from either table. Migration 181
+//      consolidated on `trainers`; the merge below still matters, the second
+//      table no longer does.
 //
 // Asserted on the emitted SQL and its bound parameters, not only on returned
 // rows: a mock can be coaxed into returning the right thing by accident, but
@@ -63,7 +67,7 @@ function app() {
 
 /** The identity lookup over the two trainer tables. */
 const identityQuery = () =>
-  queries.find((q) => /LOWER\(email\)/i.test(q.sql) && /UNION/i.test(q.sql));
+  queries.find((q) => /LOWER\(email\)/i.test(q.sql) && /FROM trainers/i.test(q.sql));
 
 /** The schedule query itself. */
 const scheduleQuery = () =>
@@ -89,15 +93,15 @@ describe('resolving the caller trainer profile', () => {
     expect(res.body.trainer_linked).toBe(true);
     const q = identityQuery();
     expect(q).toBeTruthy();
-    // Both halves of the UNION, or the pt_trainers sessions stay invisible.
+    // One table, and specifically not the fork nothing writes to.
     expect(q.sql).toMatch(/FROM trainers/i);
-    expect(q.sql).toMatch(/FROM pt_trainers/i);
+    expect(q.sql).not.toMatch(/pt_trainers/i);
     expect(q.params[0]).toBe('owner@studio.com');
   });
 
-  test('matches on both id spaces at once, not just the linked one', async () => {
-    // The same person as a `trainers` row AND a `pt_trainers` row. Sessions
-    // booked before and after 018 carry different ids for one human.
+  test('merges the linked id with whatever the email lookup finds', async () => {
+    // The explicit users.trainer_id link and the email match can resolve to
+    // different ids for one human. Taking either alone loses sessions.
     mockUser.trainer_id = 'tr-linked';
     mockTrainerRows = [{ id: 'tr-linked' }, { id: 'ptr-2' }];
 
@@ -151,9 +155,11 @@ describe('tenant isolation of the identity lookup', () => {
     await request(app()).get('/api/pt-os/sessions/my');
 
     const q = identityQuery();
-    // Once per half of the UNION. Filtering one half still lets a same-email
-    // trainer at another studio resolve as "me".
-    expect(q.sql.match(/organization_id = \$2/g)).toHaveLength(2);
+    // Once, for the one table. This asserted twice when the lookup was a UNION,
+    // because filtering only one half still let a same-email trainer at another
+    // studio resolve as "me". The half that could leak is gone; the filter that
+    // stops it is still required.
+    expect(q.sql.match(/organization_id = \$2/g)).toHaveLength(1);
     expect(q.params).toEqual(['owner@studio.com', ORG_A]);
   });
 

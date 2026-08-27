@@ -63,6 +63,7 @@ const INTENT_ROUTES = {
   checkin:      'secondary',
   absent:       'secondary',
   client:       'secondary',
+  lead:         'secondary',
   member:       'secondary',
   trainer:      'secondary',
   session:      'secondary',
