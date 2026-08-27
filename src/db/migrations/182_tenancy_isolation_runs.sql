@@ -18,9 +18,12 @@
 -- partition, because the write rate is one click per five
 -- minutes per platform admin and the rows are not large.
 --
--- No RLS on this table. It is platform-only; the
--- app_tenant role has no reason to know how often isolation
--- tests run.
+-- Platform-only, behind requirePlatformOwner. Deny-all RLS below,
+-- not the absence of RLS — the app_tenant role has no reason to
+-- know how often isolation tests run, and a deny-all policy still
+-- holds that even if a future grant is added by accident. The
+-- platform route reads this via the owner connection, which
+-- bypasses RLS.
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS public.tenancy_isolation_runs (
@@ -39,4 +42,28 @@ CREATE INDEX IF NOT EXISTS idx_tenancy_isolation_runs_ran_at
   ON public.tenancy_isolation_runs (ran_at DESC);
 
 COMMENT ON TABLE public.tenancy_isolation_runs IS
-  'One row per platform-triggered e2e tenant isolation test run. result is a JSONB snapshot of per-tenant outcomes. Platform-only; no RLS.';
+  'One row per platform-triggered e2e tenant isolation test run. result is a JSONB snapshot of per-tenant outcomes. Platform-only; deny-all RLS, read via the owner connection.';
+
+ALTER TABLE public.tenancy_isolation_runs ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'tenancy_isolation_runs'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON public.tenancy_isolation_runs
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+
+  -- Guarded: anon/authenticated are Supabase roles and do not exist on a plain
+  -- Postgres. Migrations run automatically at boot, so an unguarded REVOKE
+  -- would abort the boot of any deployment that is not Supabase.
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    REVOKE ALL ON public.tenancy_isolation_runs FROM anon;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    REVOKE ALL ON public.tenancy_isolation_runs FROM authenticated;
+  END IF;
+END $$;

@@ -163,7 +163,13 @@ function referencedTables() {
             // `INSERT INTO activity_log (user_id, …)` by one character —
             // the regex backtracked to satisfy it. Functions are excluded by
             // stripping EXTRACT/SUBSTRING above and by NOT_A_TABLE instead.
-            /\b(?:FROM|JOIN|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:ONLY\s+)?["']?([a-z][a-z0-9_]*)\b/gi
+            //
+            // The schema-qualifier group mirrors schemaRelations()'s own
+            // `(?:public\.)?` on CREATE TABLE: `FROM public.foo` must resolve
+            // to "foo", the same table the migration scan sees, not to
+            // "public" — which is a schema name, not a table, and would
+            // always read as an orphan since nothing ever creates it.
+            /\b(?:FROM|JOIN|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:ONLY\s+)?["']?(?:public\.)?([a-z][a-z0-9_]*)\b/gi
           )) {
             const t = m[1].toLowerCase();
             if (fileCtes.has(t) || NOT_A_TABLE.has(t)) continue;

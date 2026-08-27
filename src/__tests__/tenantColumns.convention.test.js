@@ -98,6 +98,8 @@ const NO_TENANT_COLUMN_BY_DESIGN = {
   system_logs: 'Command Centre log capture. Operator surface, mounted behind requireSuperAdmin + MFA.',
   trials: 'Platform-level trial tracking for the SaaS subscription funnel.',
   admin_reset_intents: 'Break-glass reset intents, reachable only behind the platform guard.',
+  tenancy_known_gaps: 'Command Centre Tenancy Health card — mirrors this very list. Deny-all RLS, read via the owner connection, mounted behind requirePlatformOwner.',
+  tenancy_isolation_runs: 'Command Centre "Run isolation tests" log — who clicked, when, per-tenant results. Deny-all RLS, read via the owner connection, mounted behind requirePlatformOwner.',
 
   // ── 3. Reference libraries — platform-global content every studio draws on ─
   muscles: 'Anatomical reference data shared by every studio\'s exercise library.',
@@ -167,6 +169,7 @@ const KNOWN_GAPS = {
   feature_flags: 'Studio feature toggles, admin-only, read through settings routes.',
   payments: 'Legacy payment rows. The live path is pt_payments (which carries the column) and payment_orders; this table is read by invoices.js and the Razorpay webhook.',
   clients: 'The legacy table migration 170 drops. Still referenced by admin-reset and clients.js.',
+  subscriptions: 'Legacy subscription rows, keyed by client_id against the `clients` table migration 170 drops. The live path is pt_client_subscriptions (which resolves org through its client). Newly read by the Command Centre\'s platform KPIs, search and studio detail — aggregated across every studio by a platform operator, so a missing column here does not cross a tenant boundary; it is still debt because the day this table is read from a tenant-scoped route it needs the column first.',
   notification_log: 'Delivery log, WRITE-ONLY — nothing in the codebase SELECTs from it, so there is no read path to cross studios. It should carry the column (a delivery audit trail that cannot name the studio is a poor one), but adding it means changing the INSERT and deciding what an org-less system notification records.',
 };
 
@@ -302,7 +305,13 @@ describe('every table the API reads can name its owning studio', () => {
     // Pinned at the count established when this test was written. Fixing a gap
     // means deleting its entry AND lowering this number; nothing else should
     // move it. An addition fails here rather than passing quietly.
-    expect(Object.keys(KNOWN_GAPS)).toHaveLength(5);
+    //
+    // Deliberately raised to 6: `subscriptions` is not new debt this PR
+    // introduces — the table has lacked organization_id since it was
+    // created — but the Command Centre's platform KPIs/search/studio detail
+    // are its first READ anywhere in the repo, which is what put it in this
+    // test's sights for the first time. See its entry above.
+    expect(Object.keys(KNOWN_GAPS)).toHaveLength(6);
   });
 
   it('no table is in both lists, which would make the reason meaningless', () => {

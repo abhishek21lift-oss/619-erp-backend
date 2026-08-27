@@ -22,9 +22,12 @@
 -- with a comment. The card groups by severity, not by
 -- table count, so severity is the thing that matters.
 --
--- No RLS on this table. It is platform-only, behind
--- requirePlatformOwner; the app_tenant role has no business
--- reading the list of things that are unprotected.
+-- Platform-only, behind requirePlatformOwner. Deny-all RLS below,
+-- not the absence of RLS — the app_tenant role has no business
+-- reading the list of things that are unprotected, and a deny-all
+-- policy still holds that even if a future grant is added by
+-- accident. The platform route reads this via the owner
+-- connection, which bypasses RLS.
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS public.tenancy_known_gaps (
@@ -38,7 +41,7 @@ CREATE TABLE IF NOT EXISTS public.tenancy_known_gaps (
 );
 
 COMMENT ON TABLE public.tenancy_known_gaps IS
-  'Tenant business tables that should carry organization_id and do not. Mirrors KNOWN_GAPS in src/__tests__/tenantColumns.convention.test.js. Platform-only; no RLS.';
+  'Tenant business tables that should carry organization_id and do not. Mirrors KNOWN_GAPS in src/__tests__/tenantColumns.convention.test.js. Platform-only; deny-all RLS, read via the owner connection.';
 
 -- Seed from the current KNOWN_GAPS list. ON CONFLICT DO NOTHING
 -- so a re-run after a hand edit is safe. The "reason" column
@@ -60,3 +63,34 @@ INSERT INTO public.tenancy_known_gaps (table_name, reason, severity) VALUES
    'Delivery log, WRITE-ONLY — nothing in the codebase SELECTs from it, so there is no read path to cross studios. It should carry the column (a delivery audit trail that cannot name the studio is a poor one), but adding it means changing the INSERT and deciding what an org-less system notification records.',
    'low')
 ON CONFLICT (table_name) DO NOTHING;
+
+-- "No RLS" above described intent, not the safe way to get there. Platform-
+-- only does not mean unprotected: the app_tenant role has no business reading
+-- this table, but the way to guarantee that is deny-all RLS plus a revoke, not
+-- the absence of RLS — an absent policy relies on nobody ever granting SELECT
+-- to a broader role by accident, where a deny-all policy holds even then. The
+-- platform route reads this through the owner connection, which bypasses RLS,
+-- so nothing here changes what requirePlatformOwner already serves.
+ALTER TABLE public.tenancy_known_gaps ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'tenancy_known_gaps'
+       AND policyname = 'deny_all_direct_access'
+  ) THEN
+    CREATE POLICY deny_all_direct_access ON public.tenancy_known_gaps
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+
+  -- Guarded: anon/authenticated are Supabase roles and do not exist on a plain
+  -- Postgres. Migrations run automatically at boot, so an unguarded REVOKE
+  -- would abort the boot of any deployment that is not Supabase.
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    REVOKE ALL ON public.tenancy_known_gaps FROM anon;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    REVOKE ALL ON public.tenancy_known_gaps FROM authenticated;
+  END IF;
+END $$;
