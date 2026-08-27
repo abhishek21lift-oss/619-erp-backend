@@ -690,7 +690,7 @@ app.use('/api/search',            auth, requireStaff, require('./routes/search')
 // org-scoped equivalents live under /api/pt-os/clients.
 // See src/__tests__/clients.legacy-table.test.js, which fails if anything
 // mounted here starts reading that table again.
-app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
+app.use('/api/clients',           userApiLimiter, auth, requireStaff, require('./routes/clients'));
 
 // requireStaff: returns t.* per trainer PLUS month_revenue and
 // all_time_revenue. Staff earnings are not client-facing data.
@@ -699,8 +699,8 @@ app.use('/api/trainers',          auth, requireStaff, require('./routes/trainers
 // router below: that one owns DELETE /:id and a bare /:id would otherwise
 // swallow /api/payments/upi/... before this router ever sees it.
 app.use('/api/payments/upi',      userApiLimiter, require('./routes/upi-payments'));
-app.use('/api/payments',          userApiLimiter, require('./routes/payments'));
-app.use('/api/attendance',        ...gate('attendance'), require('./routes/attendance'));
+app.use('/api/payments',          userApiLimiter, auth, requireStaff, require('./routes/payments'));
+app.use('/api/attendance',        auth, requireStaff, ...gate('attendance'), require('./routes/attendance'));
 
 // ROUTE INTEGRITY NOTE (R-03) — SUPERSEDED, and deliberately reversed.
 //
@@ -818,7 +818,7 @@ app.use('/api/integrations',      ...gate('integrations'), require('./routes/int
 app.use('/api/campaigns',         ...gate('communication'), require('./routes/campaigns'));
 app.use('/api/offers',            require('./routes/offers'));
 app.use('/api/feedback',          require('./routes/feedback'));
-app.use('/api/communication',     ...gate('communication'), require('./routes/communication'));
+app.use('/api/communication',     auth, requireStaff, ...gate('communication'), require('./routes/communication'));
 // Mounted before /api/ai so /api/ai/knowledge/* is matched here first,
 // regardless of what routes/ai.js's own router does internally.
 // The AI mounts additionally carry a token-quota guard. It runs AFTER the
