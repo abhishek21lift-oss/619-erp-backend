@@ -2,16 +2,28 @@ const express = require('express');
 const router  = express.Router();
 const crypto  = require('crypto');
 const pool    = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
 const logger  = require('../lib/logger');
 const { escapeIdentifier } = require('pg');
 const { sendAdminResetOtp } = require('../lib/email');
+
+// SECURITY (audit finding C-1): this router performs platform-wide, unscoped
+// destructive operations (DELETE/DROP with no organization_id filter, across
+// every tenant). It must only ever be reachable by the platform super admin.
+// That is enforced at the mount point in server.js: `auth, requireSuperAdmin,
+// requireSuperAdminMfa`. Do NOT re-add a per-route `adminOnly` check here —
+// `adminOnly` matches role==='admin', the ordinary tenant Studio Owner role,
+// which is exactly the access this file must never grant.
 
 const ALLOWED_TABLES = new Set([
   'attendance_logs', 'payments', 'subscriptions', 'invoices', 'outstanding_dues',
   'client_goals', 'transformations', 'face_embeddings', 'notifications', 'message_logs',
   'clients', 'clients_id_seq', 'payments_id_seq', 'attendance_logs_id_seq',
   'subscriptions_id_seq', 'invoices_id_seq',
+  // PT-OS tables
+  'pt_clients', 'pt_payments', 'pt_sessions', 'pt_assessments', 'pt_goals',
+  'pt_leads', 'pt_informed_consents', 'pt_parq_forms', 'pt_parq_documents',
+  'pt_medical_clearances', 'pt_consent_records', 'pt_client_renewals',
+  'pt_client_subscriptions', 'pt_payments', 'pt_sessions',
 ]);
 
 function validateTableName(tableName) {
@@ -43,7 +55,7 @@ async function dropIfExists(client, tableName) {
    Step 1 — POST /admin/initiate-reset  → emails a 6-digit OTP
    Step 2 — POST /admin/reset-all-data  → Body: { otp: "123456" }
 ══════════════════════════════════════════════════════════════════════ */
-router.post('/initiate-reset', auth, adminOnly, async (req, res) => {
+router.post('/initiate-reset', async (req, res) => {
   try {
     const action = String(req.body?.action || 'reset-all');
     const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit
@@ -79,7 +91,7 @@ router.post('/initiate-reset', auth, adminOnly, async (req, res) => {
    POST /admin/reset-all-data
    Body: { otp: "123456" }
 ══════════════════════════════════════════════════════════════════════ */
-router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
+router.post('/reset-all-data', async (req, res) => {
   const otp = String(req.body?.otp || '');
   if (!otp) {
     return res.status(400).json({ error: 'OTP required. Call /admin/initiate-reset first to receive a code.' });
@@ -110,6 +122,21 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
     await deleteIfExists(client, 'face_embeddings');
     await deleteIfExists(client, 'notifications');
     await deleteIfExists(client, 'message_logs');
+    // PT-OS tables
+    await deleteIfExists(client, 'pt_clients');
+    await deleteIfExists(client, 'pt_payments');
+    await deleteIfExists(client, 'pt_sessions');
+    await deleteIfExists(client, 'pt_assessments');
+    await deleteIfExists(client, 'pt_goals');
+    await deleteIfExists(client, 'pt_leads');
+    await deleteIfExists(client, 'pt_informed_consents');
+    await deleteIfExists(client, 'pt_parq_forms');
+    await deleteIfExists(client, 'pt_parq_documents');
+    await deleteIfExists(client, 'pt_medical_clearances');
+    await deleteIfExists(client, 'pt_consent_records');
+    await deleteIfExists(client, 'pt_client_renewals');
+    await deleteIfExists(client, 'pt_client_subscriptions');
+    // Legacy tables (kept for backward compatibility; empty in production)
     if ((await client.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists) {
       await client.query(`UPDATE clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`);
       await client.query(`DELETE FROM clients`);
@@ -143,7 +170,7 @@ router.post('/reset-all-data', auth, adminOnly, async (req, res) => {
    POST /admin/reset-outstanding-dues
    Body: { otp: "123456" }  (OTP from /initiate-reset?action=reset-dues)
 ══════════════════════════════════════════════════════════════════════ */
-router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
+router.post('/reset-outstanding-dues', async (req, res) => {
   const otp = String(req.body?.otp || '');
   if (!otp) {
     return res.status(400).json({ error: 'OTP required. Call /admin/initiate-reset with action=reset-dues first.' });
@@ -162,10 +189,14 @@ router.post('/reset-outstanding-dues', auth, adminOnly, async (req, res) => {
   try {
     await dropIfExists(pool, 'outstanding_dues');
     await deleteIfExists(pool, 'payments');
-    const hasClients = (await pool.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists;
-    if (hasClients) {
+    await deleteIfExists(pool, 'pt_payments');
+    await deleteIfExists(pool, 'pt_client_renewals');
+    const hasLegacyClients = (await pool.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists;
+    if (hasLegacyClients) {
       await pool.query(`UPDATE clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`).catch(() => {});
     }
+    // Also reset PT client balances
+    await pool.query(`UPDATE pt_clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`).catch(() => {});
     res.json({ success: true, message: 'Payments and dues-related data cleared safely, and client balances were reset to zero.' });
   } catch (err) {
     logger.error({ err: err.message }, 'Reset dues error');

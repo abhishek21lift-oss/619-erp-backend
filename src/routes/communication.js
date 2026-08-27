@@ -69,50 +69,34 @@ router.post('/send', async (req, res, next) => {
     // pt_end_date and balance_amount are the real columns.
     // Tenant isolation: recipient targeting must never reach another tenant's
     // clients. pt_clients is filtered to the caller's org ($1, null-safe for
-    // super admins). The legacy `clients` union is empty in this deployment.
+    // super admins). The legacy `clients` table is empty.
     const org = orgParam(req);
     let recipientCount = recipients;
     if (!recipientCount) {
       if (audience === 'expiring') {
-        const r = await pool.query(`
-          SELECT COUNT(*) FROM (
-            SELECT id FROM clients WHERE status = 'active' AND pt_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
-            UNION ALL
-            SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND pt_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
-              AND ($1::uuid IS NULL OR organization_id = $1)
-          ) x`, [org]);
+        const r = await pool.query(
+          `SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND pt_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+            AND ($1::uuid IS NULL OR organization_id = $1)`, [org]);
         recipientCount = Number(r.rows[0].count);
       } else if (audience === 'dues') {
-        const r = await pool.query(`
-          SELECT COUNT(*) FROM (
-            SELECT id FROM clients WHERE status = 'active' AND balance_amount > 0
-            UNION ALL
-            SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND balance_amount > 0
-              AND ($1::uuid IS NULL OR organization_id = $1)
-          ) x`, [org]);
+        const r = await pool.query(
+          `SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND balance_amount > 0
+            AND ($1::uuid IS NULL OR organization_id = $1)`, [org]);
         recipientCount = Number(r.rows[0].count);
       } else if (audience === 'pt') {
         const r = await pool.query(
           "SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND ($1::uuid IS NULL OR organization_id = $1)", [org]);
         recipientCount = Number(r.rows[0].count);
       } else if (audience === 'expired') {
-        const r = await pool.query(`
-          SELECT COUNT(*) FROM (
-            SELECT id FROM clients WHERE status = 'expired'
-            UNION ALL
-            SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'expired'
-              AND ($1::uuid IS NULL OR organization_id = $1)
-          ) x`, [org]);
+        const r = await pool.query(
+          `SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'expired'
+            AND ($1::uuid IS NULL OR organization_id = $1)`, [org]);
         recipientCount = Number(r.rows[0].count);
       } else {
         // 'all' or unspecified
-        const r = await pool.query(`
-          SELECT COUNT(*) FROM (
-            SELECT id FROM clients WHERE status = 'active'
-            UNION ALL
-            SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'active'
-              AND ($1::uuid IS NULL OR organization_id = $1)
-          ) x`, [org]);
+        const r = await pool.query(
+          `SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active'
+            AND ($1::uuid IS NULL OR organization_id = $1)`, [org]);
         recipientCount = Number(r.rows[0].count);
       }
     }
@@ -124,22 +108,20 @@ router.post('/send', async (req, res, next) => {
       [title, body, type || 'announcement', audience || 'all', recipientCount, req.user?.id, org]
     );
 
-    // Broadcast in-app notification to all active members with a login
-    // (fire-and-forget). `clients`/`pt_clients` have no user_id column —
-    // the link is users.member_id, same as the webauthn/passkey flows.
+// Broadcast in-app notification to all active members with a login
+    // (fire-and-forget). The link between users and clients is
+    // users.pt_client_id → pt_clients.id.
     pool.query(
       `INSERT INTO notifications (user_id, type, title, body)
        SELECT u.id, 'announcement', $1, $2
          FROM users u
         WHERE u.is_active = true
           AND ($3::uuid IS NULL OR u.organization_id = $3)
-          AND u.member_id IN (
-            SELECT id FROM clients WHERE status = 'active'
-            UNION
+          AND u.pt_client_id IN (
             SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'active'
               AND ($3::uuid IS NULL OR organization_id = $3)
           )
-        LIMIT 500`,
+       LIMIT 500`,
       [title, body, org]
     ).catch(() => {});
 

@@ -142,7 +142,10 @@ describe('fileStorage integration', () => {
   // saveFile must not await the ledger. If it did, a slow metrics table would
   // add its latency to every upload, and a locked one would hang it.
   const fs = require('fs');
-  const source = fs.readFileSync(require.resolve('../lib/fileStorage.js'), 'utf8');
+  // Normalise CRLF: a Windows checkout (git autocrlf) makes the working copy
+  // CRLF, which breaks the '\n}\n' slice sentinel below on this platform.
+  const source = fs.readFileSync(require.resolve('../lib/fileStorage.js'), 'utf8')
+    .replace(/\r\n/g, '\n');
 
   it('never awaits a ledger call', () => {
     expect(source).not.toMatch(/await\s+storageLedger\./);

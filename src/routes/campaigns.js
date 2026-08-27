@@ -1,7 +1,16 @@
 'use strict';
+// Marketing campaigns.
+//
+// Every statement here is scoped to the caller's studio. Before migration 174
+// the campaigns table had no organization_id at all, so `SELECT … FROM
+// campaigns` returned every studio's campaigns to any admin on the platform,
+// and `DELETE … WHERE id = $1` deleted any of them. The `WHERE 1=1${org}`
+// shape below is the codebase's existing idiom for a filter that must always
+// be present and may be followed by optional ones.
 const express = require('express');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { orgWhere, orgIdOf } = require('../lib/tenant-db');
 
 const router = express.Router();
 router.use(auth, adminOnly);
@@ -10,11 +19,12 @@ router.use(auth, adminOnly);
 router.get('/', async (req, res, next) => {
   try {
     const { status, type } = req.query;
-    const conditions = [];
     const values = [];
-    if (status) { conditions.push(`status = $${values.length + 1}`); values.push(status); }
-    if (type)   { conditions.push(`type = $${values.length + 1}`);   values.push(type); }
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const org = orgWhere(req, values);
+    const conditions = [];
+    if (status) { values.push(status); conditions.push(`status = $${values.length}`); }
+    if (type)   { values.push(type);   conditions.push(`type = $${values.length}`); }
+    const extra = conditions.length ? ` AND ${conditions.join(' AND ')}` : '';
     const result = await pool.query(
       `SELECT id, name, status, audience,
               type            AS channel,
@@ -25,7 +35,7 @@ router.get('/', async (req, res, next) => {
               open_count      AS opened,
               conversions     AS converted,
               created_at, updated_at
-       FROM campaigns ${where} ORDER BY created_at DESC`,
+       FROM campaigns WHERE 1=1${org}${extra} ORDER BY created_at DESC`,
       values
     );
     res.json(result.rows);
@@ -35,6 +45,8 @@ router.get('/', async (req, res, next) => {
 // GET /api/campaigns/stats
 router.get('/stats', async (req, res, next) => {
   try {
+    const values = [];
+    const org = orgWhere(req, values);
     const result = await pool.query(`
       SELECT
         COUNT(*) FILTER (WHERE status = 'active')        AS active,
@@ -43,8 +55,8 @@ router.get('/stats', async (req, res, next) => {
         CASE WHEN COALESCE(SUM(sent_count), 0) = 0 THEN 0
           ELSE ROUND(SUM(conversions)::NUMERIC / SUM(sent_count) * 100, 1)
         END                                               AS conv_rate
-      FROM campaigns
-    `);
+      FROM campaigns WHERE 1=1${org}
+    `, values);
     res.json(result.rows[0]);
   } catch (err) { next(err); }
 });
@@ -52,7 +64,11 @@ router.get('/stats', async (req, res, next) => {
 // GET /api/campaigns/:id
 router.get('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
+    const values = [req.params.id];
+    const org = orgWhere(req, values);
+    const result = await pool.query(`SELECT * FROM campaigns WHERE id = $1${org}`, values);
+    // 404 rather than 403 on a row that belongs to another studio: the
+    // response must not confirm that the id exists somewhere else.
     if (!result.rows.length) return res.status(404).json({ error: 'Campaign not found' });
     res.json(result.rows[0]);
   } catch (err) { next(err); }
@@ -64,13 +80,13 @@ router.post('/', async (req, res, next) => {
     const { name, type, channel, audience, subject, goal, body, scheduled_at, start, end, sent_at, status } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
     const result = await pool.query(
-      `INSERT INTO campaigns (name, type, audience, subject, body, scheduled_at, sent_at, status, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO campaigns (name, type, audience, subject, body, scheduled_at, sent_at, status, created_by, organization_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id, name, status, audience,
                  type AS channel, subject AS goal, scheduled_at AS start,
                  sent_at AS end, sent_count AS sent, open_count AS opened,
                  conversions AS converted, created_at`,
-      [name, type || channel || 'email', audience || 'all', subject || goal || null, body || null, scheduled_at || start || null, sent_at || end || null, status || 'draft', req.user?.id]
+      [name, type || channel || 'email', audience || 'all', subject || goal || null, body || null, scheduled_at || start || null, sent_at || end || null, status || 'draft', req.user?.id, orgIdOf(req)]
     );
     res.status(201).json({ campaign: result.rows[0] });
   } catch (err) { next(err); }
@@ -80,6 +96,8 @@ router.post('/', async (req, res, next) => {
 router.put('/:id', async (req, res, next) => {
   try {
     const { name, type, audience, subject, body, scheduled_at, status } = req.body;
+    const values = [name, type, audience, subject, body, scheduled_at || null, status, req.params.id];
+    const org = orgWhere(req, values);
     const result = await pool.query(
       `UPDATE campaigns
        SET name = COALESCE($1, name),
@@ -90,9 +108,9 @@ router.put('/:id', async (req, res, next) => {
            scheduled_at = $6,
            status = COALESCE($7, status),
            updated_at = NOW()
-       WHERE id = $8
+       WHERE id = $8${org}
        RETURNING *`,
-      [name, type, audience, subject, body, scheduled_at || null, status, req.params.id]
+      values
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Campaign not found' });
     res.json({ campaign: result.rows[0] });
@@ -102,7 +120,9 @@ router.put('/:id', async (req, res, next) => {
 // DELETE /api/campaigns/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('DELETE FROM campaigns WHERE id = $1 RETURNING id', [req.params.id]);
+    const values = [req.params.id];
+    const org = orgWhere(req, values);
+    const result = await pool.query(`DELETE FROM campaigns WHERE id = $1${org} RETURNING id`, values);
     if (!result.rows.length) return res.status(404).json({ error: 'Campaign not found' });
     res.json({ message: 'Campaign deleted' });
   } catch (err) { next(err); }

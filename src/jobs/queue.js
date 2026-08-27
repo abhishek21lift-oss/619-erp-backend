@@ -54,6 +54,28 @@ function getQueue(name) {
 }
 
 /**
+ * A named queue that materializes only when first used.
+ *
+ * Constructing a BullMQ Queue opens a Redis connection immediately, so the
+ * eager exports below would dial REDIS_HOST (default `redis`) on every boot —
+ * even where Redis is not configured and every producer has already degraded
+ * to its inline path. Redis is optional in this stack by design (lib/redis.js),
+ * so the named exports stay lazy: property access — always after an
+ * `ensureReady()` guard at the call site — is what creates the queue.
+ */
+function lazyQueue(name) {
+  let queue;
+  return new Proxy({}, {
+    get(_target, prop) {
+      if (prop === 'then') return undefined; // never look like a thenable
+      if (!queue) queue = getQueue(name);
+      const value = queue[prop];
+      return typeof value === 'function' ? value.bind(queue) : value;
+    },
+  });
+}
+
+/**
  * Close every producer queue. Safe to call on shutdown: queues never close
  * the shared connection they were handed (BullMQ only closes connections it
  * created itself), so the caller closes lib/redis.js separately.
@@ -70,9 +92,9 @@ module.exports = {
   closeAll,
   QUEUE_NAMES,
   DEFAULT_JOB_OPTIONS,
-  emailQueue: getQueue('email'),
-  whatsappQueue: getQueue('whatsapp'),
-  aiQueue: getQueue('ai'),
-  notificationsQueue: getQueue('notifications'),
-  membershipRenewalsQueue: getQueue('membership-renewals'),
+  emailQueue: lazyQueue('email'),
+  whatsappQueue: lazyQueue('whatsapp'),
+  aiQueue: lazyQueue('ai'),
+  notificationsQueue: lazyQueue('notifications'),
+  membershipRenewalsQueue: lazyQueue('membership-renewals'),
 };

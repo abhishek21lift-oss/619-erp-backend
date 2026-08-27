@@ -1,0 +1,421 @@
+'use strict';
+// Does the database actually stop one studio reading another's rows?
+//
+// Every other test in this repo about tenancy is a convention test: it reads
+// source and checks a filter is present. That is a ratchet against new
+// mistakes, and it proves nothing about the database. This one connects as
+// the real `app_tenant` role — NOBYPASSRLS, not the table owner — against a
+// real PostgreSQL with the real 158 migrations applied, and tries to commit
+// the four crimes:
+//
+//   SELECT  another studio's row
+//   INSERT  a row belonging to another studio
+//   UPDATE  another studio's row
+//   DELETE  another studio's row
+//
+// It is the first test here that CAN fail for the reason isolation actually
+// breaks, because nothing is mocked: no fake pool, no stubbed client, a real
+// connection whose current_user is app_tenant.
+//
+// Skipped unless RLS_TEST_DATABASE_URL points at a throwaway database, so it
+// never runs in an environment that has anything to lose. Stand one up with:
+//
+//   scripts/rls-proof-setup.sh
+//
+// which creates the roles, applies src/db/schema.sql, runs the migrations, and
+// prints the URL to export.
+
+const { Pool } = require('pg');
+
+// Not named URL: that shadows the global URL class this file also needs.
+const DB_URL = process.env.RLS_TEST_DATABASE_URL;
+const describeIf = DB_URL ? describe : describe.skip;
+
+// Skipping is right on a laptop and wrong in CI.
+//
+// This suite gates itself on RLS_TEST_DATABASE_URL so it never runs against
+// anything that has something to lose. CI never set that variable, so the
+// only test that proves one studio cannot read another's rows AT THE DATABASE
+// reported itself as 17 quiet skips at the bottom of a green run — from the
+// day it was written until the workflow was fixed. Nothing failed. Nothing
+// warned. The suite simply never executed.
+//
+// So in CI a missing URL is not a developer running the suite without a
+// database, it is the wiring having broken. Fail, loudly, naming the file
+// that has to be repaired.
+if (process.env.CI && !DB_URL) {
+  describe('cross-tenant isolation, against a real database', () => {
+    it('has a database to run against', () => {
+      throw new Error(
+        'RLS_TEST_DATABASE_URL is not set in CI, so the tenant-isolation proof '
+        + 'would silently skip. Restore the "Stand up the RLS isolation database" '
+        + 'step and the env var in .github/workflows/ci.yml.'
+      );
+    });
+  });
+}
+
+const ORG_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const ORG_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+describeIf('cross-tenant isolation, against a real database', () => {
+  /** Owner connection. Bypasses RLS — used only to set the world up and to check it after. */
+  let owner;
+  /** The role the app will eventually connect as. */
+  let tenant;
+
+  beforeAll(async () => {
+    owner = new Pool({ connectionString: DB_URL, max: 2 });
+    const tenantUrl = new URL(DB_URL);
+    tenantUrl.username = 'app_tenant';
+    tenantUrl.password = process.env.RLS_TEST_TENANT_PASSWORD || 'localproof';
+    tenant = new Pool({ connectionString: tenantUrl.toString(), max: 2 });
+
+    await owner.query(
+      `INSERT INTO organizations (id, name, slug) VALUES ($1,'Studio A','studio-a'), ($2,'Studio B','studio-b')
+       ON CONFLICT (id) DO NOTHING`, [ORG_A, ORG_B]);
+  });
+
+  afterAll(async () => {
+    await owner.query(`DELETE FROM pt_clients WHERE organization_id IN ($1,$2)`, [ORG_A, ORG_B]);
+    await owner.query(`DELETE FROM organizations WHERE id IN ($1,$2)`, [ORG_A, ORG_B]);
+    await owner?.end();
+    await tenant?.end();
+  });
+
+  beforeEach(async () => {
+    await owner.query(`DELETE FROM pt_clients WHERE id IN ('client-a','client-b')`);
+    await owner.query(
+      `INSERT INTO pt_clients (id, name, organization_id)
+       VALUES ('client-a','A Member',$1), ('client-b','B Member',$2)`, [ORG_A, ORG_B]);
+  });
+
+  /** Run `fn` on a connection scoped to `orgId`, exactly as db/pool.js does. */
+  async function asOrg(orgId, fn) {
+    const client = await tenant.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT set_config($1,$2,true)', ['app.org_id', orgId]);
+      const out = await fn(client);
+      await client.query('COMMIT');
+      return out;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  it('connects as a role that cannot bypass RLS', async () => {
+    // If this drifts, every assertion below passes for the wrong reason.
+    const { rows } = await tenant.query(
+      `SELECT current_user AS who, rolbypassrls, rolsuper
+         FROM pg_roles WHERE rolname = current_user`);
+    expect(rows[0].who).toBe('app_tenant');
+    expect(rows[0].rolbypassrls).toBe(false);
+    expect(rows[0].rolsuper).toBe(false);
+  });
+
+  it('the owner really can see both rows, so the fixture is real', async () => {
+    const { rows } = await owner.query(
+      `SELECT id FROM pt_clients WHERE id IN ('client-a','client-b') ORDER BY id`);
+    expect(rows.map((r) => r.id)).toEqual(['client-a', 'client-b']);
+  });
+
+  // ── SELECT ────────────────────────────────────────────────────────────
+  it('SELECT returns only the scoped studio\'s rows', async () => {
+    const a = await asOrg(ORG_A, (c) =>
+      c.query(`SELECT id FROM pt_clients WHERE id IN ('client-a','client-b') ORDER BY id`));
+    expect(a.rows.map((r) => r.id)).toEqual(['client-a']);
+
+    const b = await asOrg(ORG_B, (c) =>
+      c.query(`SELECT id FROM pt_clients WHERE id IN ('client-a','client-b') ORDER BY id`));
+    expect(b.rows.map((r) => r.id)).toEqual(['client-b']);
+  });
+
+  it('SELECT cannot reach the other studio even when asked for it by primary key', async () => {
+    const { rows } = await asOrg(ORG_A, (c) =>
+      c.query(`SELECT id, name FROM pt_clients WHERE id = 'client-b'`));
+    expect(rows).toEqual([]);
+  });
+
+  it('aggregate queries cannot count what they cannot see', async () => {
+    // The shape that leaks without anyone noticing: no row is returned, but a
+    // total tells you how many exist.
+    const { rows } = await asOrg(ORG_A, (c) =>
+      c.query(`SELECT count(*)::int AS n FROM pt_clients`));
+    const { rows: all } = await owner.query(`SELECT count(*)::int AS n FROM pt_clients`);
+    expect(rows[0].n).toBe(1);
+    expect(all[0].n).toBe(2);
+  });
+
+  // ── INSERT ────────────────────────────────────────────────────────────
+  it('INSERT of a row belonging to another studio is refused', async () => {
+    // WITH CHECK, not USING. Without it a tenant could write rows into another
+    // studio and simply not be able to read them back.
+    await expect(asOrg(ORG_A, (c) =>
+      c.query(`INSERT INTO pt_clients (id, name, organization_id) VALUES ('smuggled','X',$1)`, [ORG_B])),
+    ).rejects.toThrow(/row-level security/i);
+
+    const { rows } = await owner.query(`SELECT id FROM pt_clients WHERE id = 'smuggled'`);
+    expect(rows).toEqual([]);
+  });
+
+  it('INSERT into the scoped studio still works', async () => {
+    // The failure mode on the other side: a policy that denies everything
+    // passes an isolation test and breaks the product.
+    await asOrg(ORG_A, (c) =>
+      c.query(`INSERT INTO pt_clients (id, name, organization_id) VALUES ('client-a2','A Second',$1)`, [ORG_A]));
+    const { rows } = await owner.query(`SELECT organization_id FROM pt_clients WHERE id = 'client-a2'`);
+    expect(rows[0].organization_id).toBe(ORG_A);
+    await owner.query(`DELETE FROM pt_clients WHERE id = 'client-a2'`);
+  });
+
+  // ── UPDATE ────────────────────────────────────────────────────────────
+  it('UPDATE of another studio\'s row changes nothing', async () => {
+    const res = await asOrg(ORG_A, (c) =>
+      c.query(`UPDATE pt_clients SET name = 'HACKED' WHERE id = 'client-b'`));
+    expect(res.rowCount).toBe(0);
+
+    const { rows } = await owner.query(`SELECT name FROM pt_clients WHERE id = 'client-b'`);
+    expect(rows[0].name).toBe('B Member');
+  });
+
+  it('UPDATE cannot move a row into another studio', async () => {
+    // Reparenting — taking a row you own and stamping someone else's org on
+    // it. Blocked twice over, which is worth knowing because it is not
+    // obvious: WITH CHECK rejects the new row, AND a FOR ALL policy's USING
+    // expression is itself applied to the NEW row on UPDATE, not only the
+    // existing one. Verified by mutation: USING(true)+CHECK(true) lets the
+    // reparent through, and restoring either half alone blocks it again.
+    await expect(asOrg(ORG_A, (c) =>
+      c.query(`UPDATE pt_clients SET organization_id = $1 WHERE id = 'client-a'`, [ORG_B])),
+    ).rejects.toThrow(/row-level security/i);
+
+    const { rows } = await owner.query(`SELECT organization_id FROM pt_clients WHERE id = 'client-a'`);
+    expect(rows[0].organization_id).toBe(ORG_A);
+  });
+
+  it('is blocked by each half of the policy independently', async () => {
+    // Guards the belt-and-braces claim above. If someone later "simplifies"
+    // the policy to USING-only or WITH CHECK-only, reparenting is still
+    // refused — but the redundancy is gone, and this test is where that gets
+    // noticed rather than in an incident.
+    const policy = await owner.query(
+      `SELECT qual, with_check FROM pg_policies
+        WHERE tablename = 'pt_clients' AND policyname = 'tenant_isolation'`);
+    expect(policy.rows[0].qual).toMatch(/app\.org_id/);
+    expect(policy.rows[0].with_check).toMatch(/app\.org_id/);
+  });
+
+  it('UPDATE of the scoped studio\'s own row still works', async () => {
+    const res = await asOrg(ORG_A, (c) =>
+      c.query(`UPDATE pt_clients SET name = 'A Renamed' WHERE id = 'client-a'`));
+    expect(res.rowCount).toBe(1);
+  });
+
+  // ── DELETE ────────────────────────────────────────────────────────────
+  it('DELETE of another studio\'s row removes nothing', async () => {
+    const res = await asOrg(ORG_A, (c) =>
+      c.query(`DELETE FROM pt_clients WHERE id = 'client-b'`));
+    expect(res.rowCount).toBe(0);
+
+    const { rows } = await owner.query(`SELECT id FROM pt_clients WHERE id = 'client-b'`);
+    expect(rows.map((r) => r.id)).toEqual(['client-b']);
+  });
+
+  it('an unqualified DELETE removes only the scoped studio\'s rows', async () => {
+    // The worst plausible accident — a missing WHERE — and the backstop that
+    // makes it survivable.
+    await asOrg(ORG_A, (c) => c.query(`DELETE FROM pt_clients`));
+    const { rows } = await owner.query(
+      `SELECT id FROM pt_clients WHERE id IN ('client-a','client-b') ORDER BY id`);
+    expect(rows.map((r) => r.id)).toEqual(['client-b']);
+  });
+
+  it('DELETE of the scoped studio\'s own row still works', async () => {
+    const res = await asOrg(ORG_A, (c) =>
+      c.query(`DELETE FROM pt_clients WHERE id = 'client-a'`));
+    expect(res.rowCount).toBe(1);
+  });
+
+  // ── The GUC itself ────────────────────────────────────────────────────
+  it('sees nothing at all when app.org_id is not set', async () => {
+    // Fail-closed. A connection that forgets the GUC must return zero rows,
+    // not every row — this is the property that makes the whole design safe
+    // to roll out before every call site is audited.
+    const client = await tenant.connect();
+    try {
+      const { rows } = await client.query(`SELECT id FROM pt_clients`);
+      expect(rows).toEqual([]);
+    } finally {
+      client.release();
+    }
+  });
+
+  it('forgets the scope at COMMIT, so the next borrower starts clean', async () => {
+    // set_config(..., true) is transaction-local. If it leaked, a pooled
+    // connection would carry one studio's scope into the next request.
+    await asOrg(ORG_A, (c) => c.query(`SELECT 1`));
+    const client = await tenant.connect();
+    try {
+      const { rows } = await client.query(`SELECT current_setting('app.org_id', true) AS v`);
+      expect(rows[0].v === null || rows[0].v === '').toBe(true);
+    } finally {
+      client.release();
+    }
+  });
+
+  it('a forged org id matches nothing rather than everything', async () => {
+    const { rows } = await asOrg('99999999-9999-4999-8999-999999999999', (c) =>
+      c.query(`SELECT id FROM pt_clients`));
+    expect(rows).toEqual([]);
+  });
+
+  // ── Migration 159: the tables 157's schema scan could not see ──────────
+  //
+  // 157 builds its policy list from tables carrying organization_id, so
+  // eleven tables that reach the tenant boundary some other way had RLS
+  // enabled and no policy naming app_tenant — which does not raise, it
+  // returns zero rows. Verified before the fix: `organizations` and
+  // `subscription_plans` were readable as postgres and empty as app_tenant.
+  //
+  // Each shape 159 introduces is exercised here, because "the count is right"
+  // is the assertion that catches a policy which is accidentally `USING
+  // (true)` as well as one that is accidentally denying everything.
+  describe('gap tables (migration 159)', () => {
+    beforeEach(async () => {
+      // Child rows hanging off the two studios' existing fixture clients.
+      //
+      // organization_id is supplied because migration 174 gave this table the
+      // column and made it NOT NULL. It was a "gap table" when 159 was written
+      // — tenancy reachable only by walking client_id up to pt_clients — and
+      // it is now BOTH: it carries the column and keeps the parent walk, ANDed
+      // together in one policy. The insert therefore has to name an org, and
+      // has to name the one that owns the client.
+      await owner.query(`DELETE FROM pt_lifestyle_assessments WHERE id IN ('la-a','la-b')`);
+      await owner.query(
+        `INSERT INTO pt_lifestyle_assessments (id, client_id, organization_id)
+         VALUES ('la-a','client-a',$1), ('la-b','client-b',$2)`,
+        [ORG_A, ORG_B]);
+    });
+
+    afterEach(async () => {
+      await owner.query(`DELETE FROM pt_lifestyle_assessments WHERE id IN ('la-a','la-b')`);
+    });
+
+    it('organizations is scoped by its own id, not by organization_id', async () => {
+      // The boundary table itself. auth.js joins it on every authenticated
+      // request, so a policy that denied here would blank the studio name and
+      // logo everywhere at once.
+      const a = await asOrg(ORG_A, (c) => c.query(`SELECT id FROM organizations ORDER BY id`));
+      expect(a.rows.map((r) => r.id)).toEqual([ORG_A]);
+
+      const b = await asOrg(ORG_B, (c) => c.query(`SELECT id FROM organizations ORDER BY id`));
+      expect(b.rows.map((r) => r.id)).toEqual([ORG_B]);
+    });
+
+    it('a child row is reachable only through its own studio\'s parent', async () => {
+      const a = await asOrg(ORG_A, (c) =>
+        c.query(`SELECT id FROM pt_lifestyle_assessments WHERE id IN ('la-a','la-b') ORDER BY id`));
+      expect(a.rows.map((r) => r.id)).toEqual(['la-a']);
+
+      const b = await asOrg(ORG_B, (c) =>
+        c.query(`SELECT id FROM pt_lifestyle_assessments WHERE id IN ('la-a','la-b') ORDER BY id`));
+      expect(b.rows.map((r) => r.id)).toEqual(['la-b']);
+    });
+
+    it('a child row cannot be written against the other studio\'s parent', async () => {
+      // WITH CHECK, not USING: the insert names a client this studio cannot
+      // see, and the write must be refused rather than land unowned.
+      //
+      // The row stamps studio A's OWN org id, so the column half of the policy
+      // is satisfied and only the parent walk can refuse this. That is the
+      // point: after migration 174 gave this table an organization_id, a bare
+      // column check would have accepted this write and quietly created a row
+      // owned by studio A that points at studio B's client. The two halves are
+      // ANDed precisely so this stays refused.
+      await expect(
+        asOrg(ORG_A, (c) =>
+          c.query(
+            `INSERT INTO pt_lifestyle_assessments (id, client_id, organization_id)
+             VALUES ('smuggled','client-b',$1)`, [ORG_A]))
+      ).rejects.toThrow(/row-level security/i);
+
+      const { rows } = await owner.query(`SELECT id FROM pt_lifestyle_assessments WHERE id = 'smuggled'`);
+      expect(rows).toEqual([]);
+
+      // And the mirror: naming the other studio's org is refused by the column
+      // half, even though the client and the org agree with each other.
+      await expect(
+        asOrg(ORG_A, (c) =>
+          c.query(
+            `INSERT INTO pt_lifestyle_assessments (id, client_id, organization_id)
+             VALUES ('smuggled-2','client-b',$1)`, [ORG_B]))
+      ).rejects.toThrow(/row-level security/i);
+
+      const { rows: r2 } = await owner.query(`SELECT id FROM pt_lifestyle_assessments WHERE id = 'smuggled-2'`);
+      expect(r2).toEqual([]);
+    });
+
+    it('the platform catalogue stays readable by every studio', async () => {
+      // The trap TENANT-RLS-PLAN.md flagged with the 890-row exercise
+      // library: scoping shared platform content empties it for everyone.
+      const { rows: all } = await owner.query(`SELECT count(*)::int AS n FROM subscription_plans`);
+      for (const org of [ORG_A, ORG_B]) {
+        const { rows } = await asOrg(org, (c) =>
+          c.query(`SELECT count(*)::int AS n FROM subscription_plans`));
+        expect(rows[0].n).toBe(all[0].n);
+      }
+    });
+
+    it('leaves no table with RLS on and no policy, except the three that mean it', async () => {
+      // The check that found this in the first place. A new table that lands
+      // with the deny-all convention but no app_tenant policy goes quiet the
+      // day DATABASE_URL points at app_tenant, and nothing else would say so.
+      //
+      // The exceptions are listed with their reasons because the two kinds are
+      // not the same, and an unexplained allow-list is how the next one gets
+      // waved through:
+      //
+      //   agent_audit_log, agent_tasks — unused. They carry organization_id
+      //     and WILL need a tenant policy the day something writes them. They
+      //     are here because they are empty, not because they are correct.
+      //
+      //   platform_owners (migration 161) — deliberate, and permanent. It is
+      //     the platform-authorization grant: it has no organization_id and
+      //     never will, because a platform owner belongs to no studio. There
+      //     is no tenant-scoping policy to write, and app_tenant reading zero
+      //     rows IS the intended behaviour rather than a table gone quiet.
+      //     Every legitimate read of it goes over the owner connection —
+      //     middleware/platformAuth.js wraps the lookup in runAsPlatform
+      //     precisely so that stays true even when the operator has an org
+      //     pinned.
+      const EXPECTED_NO_POLICY = ['agent_audit_log', 'agent_tasks', 'platform_owners'];
+
+      const { rows } = await owner.query(
+        `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity
+            AND NOT EXISTS (
+              SELECT 1 FROM pg_policies p
+               WHERE p.schemaname = 'public' AND p.tablename = c.relname
+                 AND ('app_tenant' = ANY(p.roles) OR 'public' = ANY(p.roles)))
+          ORDER BY 1`);
+      expect(rows.map((r) => r.relname)).toEqual(EXPECTED_NO_POLICY);
+    });
+
+    it('keeps app_tenant out of platform_owners entirely', async () => {
+      // The other half of the exception above. "No policy" is only safe if the
+      // tenant role also holds no table privilege — a GRANT plus a future
+      // permissive policy would open it, and this is the platform's own
+      // authorization table.
+      const { rows } = await owner.query(
+        `SELECT count(*)::int AS n
+           FROM information_schema.role_table_grants
+          WHERE table_schema = 'public' AND table_name = 'platform_owners'
+            AND grantee = 'app_tenant'`);
+      expect(rows[0].n).toBe(0);
+    });
+  });
+});

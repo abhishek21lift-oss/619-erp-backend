@@ -17,8 +17,10 @@ const ACK_LABELS = {
  * uploads/informed-consent/pdf/<id>.pdf. Returns the served URL.
  *
  * @param {object} record - a pt_informed_consents row.
+ * @param {string} [studioName='MY PT STUDIO'] - the tenant's display name;
+ *   falls back to the platform brand when no tenant context exists.
  */
-async function generateInformedConsentPdf(record) {
+async function generateInformedConsentPdf(record, studioName = 'MY PT STUDIO') {
   const doc = new PDFDocument({ size: 'A4', margin: 50 });
   const chunks = [];
   doc.on('data', (chunk) => chunks.push(chunk));
@@ -27,7 +29,7 @@ async function generateInformedConsentPdf(record) {
     .text('Personal Training Informed Consent', { align: 'center' });
   doc.moveDown(0.3);
   doc.fontSize(10).font('Helvetica').fillColor('#6B7280')
-    .text('MY PT STUDIO', { align: 'center' });
+    .text(studioName, { align: 'center' });
   doc.moveDown();
 
   drawSectionHeading(doc, 'Client Details');

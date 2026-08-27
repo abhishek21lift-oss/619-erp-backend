@@ -20,13 +20,16 @@ function makeBranchScope(isAdmin, branchId) {
   function appendTo(existingParams) {
     if (!branchId) {
       // Single-branch / admin / legacy install — no filter needed.
+      // Admins see all branches (including legacy NULL branch_id rows).
       return { sql: 'TRUE', params: existingParams || [] };
     }
     const offset = (existingParams || []).length;
     return {
-      // The `OR branch_id IS NULL` keeps legacy rows (no branch_id set) visible
-      // during the multi-branch rollout. Once every row has a branch_id, drop the OR.
-      sql:    `(branch_id = $${offset + 1} OR branch_id IS NULL)`,
+      // Non-admin users only see their own branch.
+      // Legacy rows with NULL branch_id are NOT visible to them —
+      // they must be backfilled to a branch or will be invisible.
+      // See migration 168 for branch_id backfill.
+      sql:    `branch_id = $${offset + 1}`,
       params: [...(existingParams || []), branchId],
     };
   }

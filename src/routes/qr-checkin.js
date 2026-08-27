@@ -16,10 +16,46 @@ const QRCode   = require('qrcode');
 const pool     = require('../db/pool');
 const logger   = require('../lib/logger');
 const { auth } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
-const rateLimit = require('express-rate-limit');
 
-const qrLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+// ── AUD-004 (P1): this router is a MIXED surface ────────────────────────────
+//
+// Deliberately NOT gated at the mount, and that is the whole finding. Three
+// routes here derive their subject from req.user and are self-scoped by
+// construction — a client legitimately calls all three:
+//
+//   GET  /generate      the caller's OWN check-in QR
+//   POST /checkout      closes the caller's OWN open attendance row
+//   GET  /my-history    the caller's OWN attendance history
+//
+// Putting requireStaff on the mount (which is what the first pass at this
+// finding proposed) would 403 a member trying to display their own check-in
+// code — a client-facing outage introduced by a security fix.
+//
+// Two routes are studio-wide and get `requireStaff` individually, marked below:
+//   POST /scan          marks ANYONE present from a signed payload
+//   GET  /dashboard     live studio-wide attendance aggregates
+//
+// Two already carry their own RBAC and are left exactly as they are:
+//   GET /generate/:type/:id   admin/manager/owner, or trainer for own client
+//   GET /staff-report         inline admin check
+//
+// __tests__/security/qr.authz.test.js pins BOTH directions: the two staff
+// routes refuse a client, and the three client routes keep working and stay
+// self-scoped. The second half is what stops a future "just add requireStaff to
+// the mount" from shipping.
+const rateLimit = require('express-rate-limit');
+const { makeStore } = require('../lib/rateLimitStore');
+
+const qrLimiter = rateLimit({
+  store: makeStore('qr'),
+  passOnStoreError: true,
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -179,7 +215,9 @@ router.get('/generate', auth, qrLimiter, async (req, res) => {
     let userType = 'user';
 
     // Map auth role to QR user type
-    if (u.member_id) { userId = u.member_id; userType = 'client'; }
+    // PT clients use pt_client_id; gym members use member_id
+    if (u.pt_client_id) { userId = u.pt_client_id; userType = 'client'; }
+    else if (u.member_id) { userId = u.member_id; userType = 'client'; }
     else if (u.trainer_id) { userId = u.trainer_id; userType = 'trainer'; }
     else if (['admin', 'manager', 'staff', 'reception', 'receptionist'].includes(u.role)) {
       userType = 'staff';
@@ -209,13 +247,10 @@ router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
     const isTrainer = req.user.role === 'trainer';
     if (!isAdmin && !isTrainer) return res.status(403).json({ error: 'Not authorized' });
 
-    // Trainers can only generate for their own clients (gym and PT)
+    // Trainers can only generate for their own PT clients (legacy `clients` table is empty)
     if (isTrainer && type === 'client') {
       const { rows } = await pool.query(
-        `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
-         UNION
-         SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
-         LIMIT 1`,
+        `SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2 LIMIT 1`,
         [id, req.user.trainer_id]
       );
       if (!rows[0]) return res.status(403).json({ error: 'Client not assigned to you' });
@@ -237,9 +272,19 @@ router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
 // ── POST /api/qr/scan ─────────────────────────────────────────────────────────
 // Validate signed QR payload and mark attendance. Called by scanner.
 // Auth required (reception, kiosk, trainer, admin) OR kiosk token.
-const scanLimiter = rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false });
+const scanLimiter = rateLimit({
+  store: makeStore('qrscan'),
+  passOnStoreError: true,
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
-router.post('/scan', auth, scanLimiter, async (req, res) => {
+// AUD-004: staff only. A signed QR marks whoever it names present, so this is
+// the scanner's endpoint — reception, a kiosk, a trainer or an admin — never
+// the person being scanned.
+router.post('/scan', auth, requireStaff, scanLimiter, async (req, res) => {
   try {
     const { payload, device_info, location } = req.body;
     if (!payload) return res.status(400).json({ error: 'QR payload required' });
@@ -271,13 +316,31 @@ router.post('/scan', auth, scanLimiter, async (req, res) => {
        LIMIT 1`,
       [userId, refType, orgId]
     );
+    // The same shape on every outcome. The scanner draws the person's face on
+    // the result card, and the branch that most needs a face is a rejection —
+    // "membership expired" is a conversation the desk has to have with a
+    // specific human standing in front of them, not with a name on a screen.
+    // Nothing here is more sensitive than what the success branch already
+    // returns, and `user` is only reached after resolveUser() has confirmed
+    // the person belongs to the caller's org.
+    const publicUser = (status) => ({
+      id: userId,
+      name: user.name,
+      status,
+      photo_url: user.photo_url || null,
+      member_code: user.member_code || user.client_id || null,
+      package_type: user.package_type || null,
+      role: user.role || userType,
+    });
+
     if (recent[0]) {
       return res.json({
         success: true,
         duplicate: true,
         message: `Already checked in (${new Date(recent[0].check_in_time).toLocaleTimeString()})`,
-        user: { id: userId, name: user.name, status: 'active' },
+        user: publicUser('active'),
         attendance_id: recent[0].id,
+        check_in_time: recent[0].check_in_time,
       });
     }
 
@@ -286,7 +349,7 @@ router.post('/scan', auth, scanLimiter, async (req, res) => {
       return res.json({
         success: false,
         message: `Membership ${status}`,
-        user: { id: userId, name: user.name, status },
+        user: publicUser(status),
       });
     }
 
@@ -295,15 +358,7 @@ router.post('/scan', auth, scanLimiter, async (req, res) => {
     return res.json({
       success: true,
       message: `Welcome, ${user.name}!`,
-      user: {
-        id: userId,
-        name: user.name,
-        status: status,
-        photo_url: user.photo_url || null,
-        member_code: user.member_code || user.client_id || null,
-        package_type: user.package_type || null,
-        role: user.role || userType,
-      },
+      user: publicUser(status),
       attendance_id: att?.id,
       check_in_time: att?.check_in_time,
     });
@@ -321,7 +376,8 @@ router.post('/checkout', auth, async (req, res) => {
     let userId = u.id;
     let refType = 'staff';
 
-    if (u.member_id) { userId = u.member_id; refType = 'client'; }
+    if (u.pt_client_id) { userId = u.pt_client_id; refType = 'client'; }
+    else if (u.member_id) { userId = u.member_id; refType = 'client'; }
     else if (u.trainer_id) { userId = u.trainer_id; refType = 'trainer'; }
 
     const { rows } = await pool.query(
@@ -354,7 +410,9 @@ router.post('/checkout', auth, async (req, res) => {
 
 // ── GET /api/qr/dashboard ─────────────────────────────────────────────────────
 // Live attendance dashboard: currently inside, today's count, peak hours, breakdown.
-router.get('/dashboard', auth, async (req, res) => {
+// AUD-004: staff only. Studio-wide aggregates — who is inside right now,
+// today's totals, peak hours — across every client the studio has.
+router.get('/dashboard', auth, requireStaff, async (req, res) => {
   try {
     // Tenant scope: every aggregate below is limited to the caller's org.
     const scope = tenantScope(req);
@@ -417,11 +475,10 @@ router.get('/dashboard', auth, async (req, res) => {
     const { rows: recent } = await pool.query(
       `SELECT a.id, a.ref_id, a.ref_type, a.ref_name, a.check_in_time, a.check_out_time,
               a.method, a.status,
-              COALESCE(c.photo_url, pc.photo_url) AS photo_url,
-              COALESCE(c.member_code, pc.client_id) AS member_code,
-              COALESCE(c.status, pc.status) AS membership_status
+              pc.photo_url AS photo_url,
+              pc.client_id AS member_code,
+              pc.status AS membership_status
          FROM attendance_logs a
-         LEFT JOIN clients c ON c.id = a.ref_id AND a.ref_type = 'client'
          LEFT JOIN pt_clients pc ON pc.id = a.ref_id AND a.ref_type = 'client' AND pc.deleted_at IS NULL
         WHERE a.date = CURRENT_DATE AND a.status = 'present'${ocA}
         ORDER BY a.check_in_time DESC NULLS LAST
@@ -467,10 +524,11 @@ router.get('/my-history', auth, async (req, res) => {
     let refId = u.id;
     let refType = 'staff';
 
-    if (u.member_id) { refId = u.member_id; refType = 'client'; }
+    if (u.pt_client_id) { refId = u.pt_client_id; refType = 'client'; }
+    else if (u.member_id) { refId = u.member_id; refType = 'client'; }
     else if (u.trainer_id) { refId = u.trainer_id; refType = 'trainer'; }
 
-    const limit = Math.min(parseInt(req.query.limit || '90'), 365);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '90', 10) || 90, 1), 365);
     const { rows } = await pool.query(
       `SELECT date, status, check_in_time, check_out_time, method, duration_minutes
          FROM attendance_logs

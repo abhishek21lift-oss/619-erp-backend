@@ -2,9 +2,26 @@
 const logger = require('../logger');
 
 const BASE_URL     = 'https://openrouter.ai/api/v1';
-const TIMEOUT_MS   = 90_000;
 const SITE_URL     = process.env.FRONTEND_URL || 'https://619fitness.app';
 const SITE_NAME    = 'MY PT STUDIO';
+
+// Request timeout for OpenRouter calls, including response-body streaming.
+// Configurable via AI_OPENROUTER_TIMEOUT_MS; bounds keep a typo from either
+// killing fast requests (anything under 1s) or pinning the process to a
+// hung upstream forever (anything over 5 minutes). The 90s default is
+// unchanged from the historical hard-coded value.
+const DEFAULT_TIMEOUT_MS = 90_000;
+const MIN_TIMEOUT_MS     = 1_000;
+const MAX_TIMEOUT_MS     = 300_000;
+
+function defaultTimeoutMs() {
+  const raw = Number(process.env.AI_OPENROUTER_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw >= MIN_TIMEOUT_MS && raw <= MAX_TIMEOUT_MS) return raw;
+  if (process.env.AI_OPENROUTER_TIMEOUT_MS) {
+    logger.warn({ value: process.env.AI_OPENROUTER_TIMEOUT_MS }, 'ai_openrouter_timeout_invalid');
+  }
+  return DEFAULT_TIMEOUT_MS;
+}
 
 function getApiKey() {
   const key = process.env.OPENROUTER_API_KEY;
@@ -29,7 +46,7 @@ function buildHeaders() {
  * Non-streaming chat completion.
  * Returns { content, usage, model, latency_ms }
  */
-async function chatCompletion({ model, messages, temperature = 0.7, max_tokens = 2048, timeout = TIMEOUT_MS }) {
+async function chatCompletion({ model, messages, temperature = 0.7, max_tokens = 2048, timeout = defaultTimeoutMs() }) {
   const start      = Date.now();
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), timeout);
@@ -66,6 +83,7 @@ async function chatCompletion({ model, messages, temperature = 0.7, max_tokens =
     if (err.name === 'AbortError' || err.message === 'This operation was aborted.' ||
         err.message === 'Load failed') {
       const elapsed = Date.now() - start;
+      logger.warn({ model, timeout_ms: timeout, latency_ms: elapsed }, 'ai_completion_timeout');
       const t = new Error(`OpenRouter request timed out after ${elapsed}ms`);
       t.code = 'TIMEOUT';
       throw t;
@@ -78,7 +96,7 @@ async function chatCompletion({ model, messages, temperature = 0.7, max_tokens =
  * Streaming chat completion — yields text delta strings.
  * Returns { usage } after the stream is exhausted.
  */
-async function* streamCompletion({ model, messages, temperature = 0.7, max_tokens = 2048, timeout = TIMEOUT_MS }) {
+async function* streamCompletion({ model, messages, temperature = 0.7, max_tokens = 2048, timeout = defaultTimeoutMs() }) {
   const start      = Date.now();
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), timeout);
@@ -94,6 +112,7 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
   } catch (err) {
     clearTimeout(timer);
     if (err.name === 'AbortError') {
+      logger.warn({ model, timeout_ms: timeout, latency_ms: Date.now() - start }, 'ai_stream_timeout');
       const t = new Error(`Stream timed out after ${timeout}ms`);
       t.code = 'TIMEOUT';
       throw t;
@@ -136,6 +155,15 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
         } catch { /* skip malformed chunk */ }
       }
     }
+  } catch (err) {
+    if (err.name === 'AbortError' || err.message === 'This operation was aborted.' ||
+        err.message === 'Load failed') {
+      logger.warn({ model, timeout_ms: timeout, latency_ms: Date.now() - start }, 'ai_stream_timeout');
+      const t = new Error(`OpenRouter stream timed out after ${timeout}ms`);
+      t.code = 'TIMEOUT';
+      throw t;
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
     reader.releaseLock();

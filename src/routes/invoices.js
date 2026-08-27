@@ -34,6 +34,7 @@ router.get('/', auth, async (req, res, next) => {
 
     const { rows } = await pool.query(`
       SELECT i.*,
+        pc.photo_url AS client_photo,
         COALESCE((SELECT json_agg(json_build_object(
           'id', ii.id,
           'description', ii.description,
@@ -43,6 +44,15 @@ router.get('/', auth, async (req, res, next) => {
           'type', ii.type
         )) FROM invoice_items ii WHERE ii.invoice_id = i.id), '[]'::json) AS items
       FROM invoices i
+      -- Only for the client's face on the list. The org equality is part of
+      -- the join rather than assumed from i.client_id: an invoice carries a
+      -- denormalised client_name and a nullable client_id, and this must not
+      -- become a way to read a row from another tenant. Legacy rows with a
+      -- NULL organization_id match nothing and fall back to initials.
+      LEFT JOIN pt_clients pc
+        ON pc.id = i.client_id
+       AND pc.organization_id = i.organization_id
+       AND pc.deleted_at IS NULL
       ${where}
       ORDER BY i.issue_date DESC, i.created_at DESC
       LIMIT $${p++} OFFSET $${p++}`,
@@ -113,8 +123,22 @@ router.post('/', auth, async (req, res, next) => {
     // Structured form: look up the client (pt_clients is the live client
     // table — the legacy `clients` table has been empty since PT-OS shipped)
     if (!isSimplified) {
+      // Multi-tenant isolation: the client must belong to the caller's
+      // organization. Without the org predicate this lookup accepted ANY
+      // client id, so a caller could invoice against another studio's client
+      // and read that client's name back in the 201 response — a cross-tenant
+      // disclosure on a route that otherwise stamps the invoice with the
+      // caller's own org. 404 rather than 403, matching payments.js and
+      // mark-paid below, so a miss never confirms the id exists elsewhere.
+      const cScope = tenantScope(req);
+      const cParams = [d.client_id];
+      let cGuard = '';
+      if (cScope.applyFilter) {
+        cParams.push(cScope.orgId);
+        cGuard = ` AND organization_id = $${cParams.length}`;
+      }
       const { rows: cl } = await tx.query(
-        'SELECT id, name FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [d.client_id]
+        `SELECT id, name FROM pt_clients WHERE id=$1 AND deleted_at IS NULL${cGuard}`, cParams
       );
       if (!cl[0]) { await tx.query('ROLLBACK'); return res.status(404).json({ error: 'Client not found' }); }
       clientName = cl[0].name;

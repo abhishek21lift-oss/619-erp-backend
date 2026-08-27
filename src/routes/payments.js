@@ -24,6 +24,7 @@ const { validate } = require('../middleware/validate');
 const { paymentSchemas } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
+const { logActivity } = require('../lib/activityLog');
 
 // Both ledgers, aliased to one shape. pt_payments has no branch_id — shimmed
 // NULL so the branch-scope clause (branch_id = $n OR branch_id IS NULL) keeps
@@ -60,9 +61,13 @@ router.get('/', auth, async (req, res, next) => {
       conditions.push(`p.trainer_id = $${p++}`); params.push(trainer_id);
     }
     // Members can only ever see their own payments — ignore any client_id
-    // they pass and force it to their own member_id.
+    // they pass and force it to their own client record.
+    //
+    // pt_payments.client_id references pt_clients (users.pt_client_id).
+    // The legacy payments table is empty, so no need to union.
     if (req.user.role === 'member') {
-      conditions.push(`p.client_id = $${p++}`); params.push(req.user.member_id);
+      conditions.push(`p.client_id = ANY($${p++})`);
+      params.push([req.user.pt_client_id].filter(Boolean));
     } else if (client_id) {
       conditions.push(`p.client_id = $${p++}`); params.push(client_id);
     }
@@ -184,6 +189,10 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
              c.name AS client_name
       FROM pt_payments p LEFT JOIN pt_clients c ON c.id = p.client_id
       WHERE p.id=$1`, [id]);
+    // After COMMIT, on pool.query rather than tx — logActivity opens its own
+    // connection, and a row logged before the transaction actually lands
+    // would describe a payment that, on rollback, never happened.
+    await logActivity(req, 'payment.create', 'pt_payment', id, rows[0]);
     res.status(201).json({ message: 'Payment recorded', payment: rows[0] });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
@@ -198,7 +207,7 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
 // Avoids the 200-row paginated list being used for totals.
 router.get('/stats', auth, async (req, res, next) => {
   try {
-    const { from, to, trainer_id } = req.query;
+    const { from, to, trainer_id, client_id } = req.query;
     const conditions = ['p.deleted_at IS NULL'];
     const params = [];
     let p = 1;
@@ -207,6 +216,20 @@ router.get('/stats', auth, async (req, res, next) => {
       conditions.push(`p.trainer_id = $${p++}`); params.push(req.user.trainer_id);
     } else if (trainer_id) {
       conditions.push(`p.trainer_id = $${p++}`); params.push(trainer_id);
+    }
+    // Members see only their own payments — the same clamp GET / applies.
+    //
+    // This was missing here while the list endpoint had it, so a member
+    // calling /stats received org-wide totals: every rupee the studio had
+    // taken, from an endpoint any member session can reach. No screen asks
+    // for it, which is precisely why it went unnoticed. Closed here because
+    // this endpoint is now the authoritative source behind the money KPIs.
+    // PT client only, legacy table is empty.
+    if (req.user.role === 'member') {
+      conditions.push(`p.client_id = ANY($${p++})`);
+      params.push([req.user.pt_client_id].filter(Boolean));
+    } else if (client_id) {
+      conditions.push(`p.client_id = $${p++}`); params.push(client_id);
     }
     if (from) { conditions.push(`p.date >= $${p++}`); params.push(from); }
     if (to)   { conditions.push(`p.date <= $${p++}`); params.push(to); }
@@ -277,6 +300,7 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
         WHERE id = $2`, [ptRows[0].amount, ptRows[0].client_id]
       );
       await tx.query('COMMIT');
+      await logActivity(req, 'payment.delete', 'pt_payment', ptRows[0].id, null, ptRows[0]);
       return res.json({ message: 'Payment deleted' });
     }
 
@@ -306,7 +330,7 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
 
     if (!alreadyReversed) {
       await tx.query(`
-        UPDATE clients
+        UPDATE pt_clients
         SET paid_amount = GREATEST(0, paid_amount - $1),
             balance_amount = balance_amount + $1,
             updated_at = NOW()
@@ -314,6 +338,7 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
       );
     }
     await tx.query('COMMIT');
+    await logActivity(req, 'payment.delete', 'payment', payment.id, null, payment);
     res.json({ message: 'Payment deleted' });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});

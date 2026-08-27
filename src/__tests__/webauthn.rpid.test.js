@@ -144,10 +144,13 @@ describe('getExpectedOrigin', () => {
   beforeEach(() => { process.env.FRONTEND_URL = 'https://app.example.com'; });
 
   it('returns the configured origin when it is the one being used', () => {
+    // Plus its www-toggled sibling: withWwwSibling runs over the accepted
+    // list unconditionally, closing the same apex/www gap regardless of
+    // whether the origin came from WEBAUTHN_ORIGIN or the request.
     process.env.RP_ID = 'example.com';
     process.env.WEBAUTHN_ORIGIN = 'https://app.example.com';
     expect(getExpectedOrigin(req({ origin: 'https://app.example.com' })))
-      .toBe('https://app.example.com');
+      .toEqual(['https://app.example.com', 'https://www.app.example.com']);
   });
 
   it('accepts a second domain on the same rpId that WEBAUTHN_ORIGIN forgot', () => {
@@ -159,7 +162,10 @@ describe('getExpectedOrigin', () => {
     process.env.RP_ID = 'example.com';
     process.env.WEBAUTHN_ORIGIN = 'https://app.example.com';
     const out = getExpectedOrigin(req({ origin: 'https://studio.example.com' }));
-    expect(out).toEqual(['https://app.example.com', 'https://studio.example.com']);
+    expect(out).toEqual([
+      'https://app.example.com', 'https://www.app.example.com',
+      'https://studio.example.com', 'https://www.studio.example.com',
+    ]);
   });
 
   it('does not accept an origin that fails the rpId test', () => {
@@ -169,22 +175,24 @@ describe('getExpectedOrigin', () => {
     process.env.RP_ID = 'example.com';
     process.env.WEBAUTHN_ORIGIN = 'https://app.example.com';
     expect(getExpectedOrigin(req({ origin: 'https://evil.test' })))
-      .toBe('https://app.example.com');
+      .toEqual(['https://app.example.com', 'https://www.app.example.com']);
   });
 
   it('reconstructs the origin from forwarded headers when Origin is absent', () => {
     expect(getExpectedOrigin(req({
       'x-forwarded-host': 'app.example.com', 'x-forwarded-proto': 'https',
-    }))).toBe('https://app.example.com');
+    }))).toEqual(['https://app.example.com', 'https://www.app.example.com']);
   });
 
   it('falls back to the rpId when there is nothing to go on', () => {
     process.env.RP_ID = 'example.com';
     process.env.FRONTEND_URL = 'https://example.com';
-    expect(getExpectedOrigin(req({}))).toBe('https://example.com');
+    expect(getExpectedOrigin(req({})))
+      .toEqual(['https://example.com', 'https://www.example.com']);
     delete process.env.RP_ID;
     delete process.env.FRONTEND_URL;
-    expect(getExpectedOrigin(req({}))).toBe('http://localhost:3000');
+    expect(getExpectedOrigin(req({})))
+      .toEqual(['http://localhost:3000', 'http://www.localhost:3000']);
   });
 });
 

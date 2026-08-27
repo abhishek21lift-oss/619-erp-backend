@@ -1,14 +1,26 @@
 // src/routes/clients.js
 const router = require('express').Router();
-const { randomUUID } = require('crypto');
 const pool   = require('../db/pool');
-const { genReceiptNo } = require('../db/receipts');
 const { auth, adminOnly } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { validate } = require('../middleware/validate');
 const { clientSchemas } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
-const { generateClientId, generateMemberCode } = require('../db/id-gen');
+
+// Apply requireStaff to all routes in this router.
+// GET /:id has its own member access check (lines 240-241), so we apply
+// requireStaff to all routes first, then re-allow member access for GET /:id
+// by checking the role before requireStaff runs.
+router.use(auth, (req, res, next) => {
+  // Allow member access to GET /:id (their own record) - this route has
+  // its own member check at lines 240-241.
+  if (req.method === 'GET' && req.path.match(/^\/[a-f0-9-]{36}$/)) {
+    return next();
+  }
+  // All other routes require staff role.
+  return requireStaff(req, res, next);
+});
 
 // Helper: parse a value as a finite number, or return fallback.
 // parseFloat('') is NaN — `??` does NOT catch that. Use this guard instead.
@@ -18,22 +30,46 @@ function num(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/**
+ * Resolve :id to a client the CALLER is allowed to touch, or null.
+ *
+ * Every by-id handler in this router needs the same two things — read
+ * pt_clients (not the empty legacy `clients` table) and constrain to the
+ * caller's organization — and getting either wrong is how a studio ends up
+ * reading, editing or deleting another studio's client by guessing an id.
+ * Returning null for "not yours" as well as "not there" is deliberate: the
+ * caller answers 404 either way, so the API never confirms that an id exists
+ * in some other studio.
+ */
+async function findClientForRequest(req) {
+  const scope = tenantScope(req);
+  const params = [req.params.id];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND organization_id = $${params.length}`;
+  }
+  const { rows } = await pool.query(
+    `SELECT * FROM pt_clients WHERE id=$1${orgClause}`, params
+  );
+  return rows[0] || null;
+}
+
 // Track last auto-expire run so we don't fire the UPDATE on every list call.
 let lastExpireRun = 0;
 async function maybeAutoExpire() {
   const now = Date.now();
   // Run at most once per hour
   if (now - lastExpireRun < 60 * 60 * 1000) return;
-  lastExpireRun = now;
   try {
-    await pool.query(
-      `UPDATE clients SET status='expired', updated_at=NOW()
-       WHERE status='active' AND pt_end_date < CURRENT_DATE`
-    );
+    // pt_clients only. The twin UPDATE against `clients` that used to sit here
+    // matched 0 rows on every run — that table has been empty since the PT-OS
+    // enrolment flow shipped.
     await pool.query(
       `UPDATE pt_clients SET status='expired', updated_at=NOW()
        WHERE status='active' AND pt_end_date < CURRENT_DATE AND deleted_at IS NULL`
     );
+    lastExpireRun = now;
   } catch (err) {
     logger.warn({ err: err.message }, 'Auto-expire error');
   }
@@ -209,7 +245,14 @@ router.get('/:id', auth, async (req, res, next) => {
     }
 
     // Member role can only see their own record.
-    if (req.user.role === 'member' && rows[0].id !== req.user.member_id) {
+    //
+    // Compared against pt_client_id: the row above is selected FROM pt_clients,
+    // and users.pt_client_id is the column that references that table.
+    // member_id points at the legacy `clients` table and is NULL on every real
+    // client account, so this compared a pt_clients id against NULL and 404'd
+    // a client asking for their own record. It fails closed, so it locked
+    // people out rather than letting anyone in — but it did lock them out.
+    if (req.user.role === 'member' && rows[0].id !== req.user.pt_client_id) {
       return res.status(404).json({ error: 'Client not found' });
     }
 
@@ -230,7 +273,7 @@ router.get('/:id', auth, async (req, res, next) => {
         [req.params.id]
       ),
       pool.query(
-        'SELECT * FROM pt_client_renewals WHERE client_id=$1 ORDER BY created_at DESC LIMIT 20',
+        'SELECT * FROM pt_client_renewals WHERE client_id=$1 ORDER BY renewed_at DESC LIMIT 20',
         [req.params.id]
       ),
     ]);
@@ -251,268 +294,86 @@ router.get('/:id', auth, async (req, res, next) => {
   }
 });
 
-// POST /api/clients/:id/renew  — renew an existing client's membership.
-// Wrapped in a transaction so the client row, the renewal row, and (optionally)
-// the payment row all succeed together — or none of them do.
-router.post('/:id/renew', auth, async (req, res, next) => {
-  const tx = await pool.connect();
-  try {
-    const d = req.body || {};
-    const id = req.params.id;
-
-    if (!d.package_type) return res.status(400).json({ error: 'Package type is required' });
-    if (!d.pt_start_date || !d.pt_end_date) return res.status(400).json({ error: 'Start and end dates are required' });
-
-    await tx.query('BEGIN');
-
-    const { rows: existing } = await tx.query(
-      'SELECT * FROM clients WHERE id=$1 FOR UPDATE', [id]
-    );
-    if (!existing[0]) {
-      await tx.query('ROLLBACK');
-      return res.status(404).json({ error: 'Client not found' });
-    }
-    const c = existing[0];
-
-    // Trainers can only renew their own clients
-    if (req.user.role === 'trainer' &&
-        (!req.user.trainer_id || c.trainer_id !== req.user.trainer_id)) {
-      await tx.query('ROLLBACK');
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    const base    = num(d.base_amount,  0);
-    const disc    = num(d.discount,     0);
-    const final   = num(d.final_amount, base - disc);
-    const paid    = num(d.paid_amount,  0);
-    const balance = Math.max(0, final - paid);
-
-    if (final <= 0) {
-      await tx.query('ROLLBACK');
-      return res.status(400).json({ error: 'Final amount must be greater than zero' });
-    }
-
-    // 1. Insert renewal record (history)
-    await tx.query(`
-      INSERT INTO renewals (id, client_id, client_name, trainer_id, trainer_name,
-        old_package, new_package, old_end_date, new_end_date,
-        amount, paid_amount, payment_method, renewed_on, notes)
-      VALUES (gen_random_uuid()::TEXT, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-      [id, c.name, c.trainer_id, c.trainer_name,
-       c.package_type, d.package_type,
-       c.pt_end_date, d.pt_end_date,
-       final, paid, d.payment_method || 'CASH',
-       d.renewed_on || new Date().toISOString().split('T')[0],
-       d.notes || null]
-    );
-
-    // 2. Update the client to reflect the new membership
-    await tx.query(`
-      UPDATE clients SET
-        package_type   = $1,
-        pt_start_date  = $2,
-        pt_end_date    = $3,
-        base_amount    = $4,
-        discount       = $5,
-        final_amount   = $6,
-        paid_amount    = $7,
-        balance_amount = $8,
-        payment_method = $9,
-        payment_date   = $10,
-        status         = 'active',
-        updated_at     = NOW()
-      WHERE id = $11`,
-      [d.package_type, d.pt_start_date, d.pt_end_date,
-       base, disc, final, paid, balance,
-       d.payment_method || 'CASH',
-       d.renewed_on || new Date().toISOString().split('T')[0],
-       id]
-    );
-
-    // 3. If they paid anything today, create a payment record + incentive
-    if (paid > 0) {
-      let incentiveRate = 0.5;
-      if (c.trainer_id) {
-        const { rows: tr } = await tx.query(
-          'SELECT incentive_rate FROM trainers WHERE id=$1', [c.trainer_id]
-        );
-        incentiveRate = tr[0]?.incentive_rate ?? 0.5;
-      }
-      const receiptNo = await genReceiptNo(tx);
-      await tx.query(`
-        INSERT INTO payments (id, client_id, client_name, trainer_id, trainer_name,
-          amount, method, date, receipt_no, package_type, incentive_amt, notes)
-        VALUES (gen_random_uuid()::TEXT, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [id, c.name, c.trainer_id, c.trainer_name, paid,
-         d.payment_method || 'CASH',
-         d.renewed_on || new Date().toISOString().split('T')[0],
-         receiptNo, d.package_type,
-         Math.round(paid * incentiveRate),
-         (d.notes ? `Renewal: ${d.notes}` : `Renewal — ${d.package_type}`)]
-      );
-    }
-
-    await tx.query('COMMIT');
-
-    // Re-fetch the updated client + history to send back
-    const { rows: fresh } = await pool.query('SELECT * FROM clients WHERE id=$1', [id]);
-    const { rows: payments } = await pool.query(
-      'SELECT * FROM payments WHERE client_id=$1 ORDER BY date DESC LIMIT 50', [id]
-    );
-    const { rows: renewals } = await pool.query(
-      'SELECT * FROM renewals WHERE client_id=$1 ORDER BY renewed_on DESC LIMIT 20', [id]
-    );
-
-    res.json({ message: 'Membership renewed', client: { ...fresh[0], payments, renewals } });
-  } catch (err) {
-    await tx.query('ROLLBACK').catch(() => {});
-    next(err);
-  } finally {
-    tx.release();
-  }
-});
-
-// POST /api/clients/:id/pt-renew - renew personal training dates/amount.
-router.post('/:id/pt-renew', auth, async (req, res, next) => {
-  const tx = await pool.connect();
-  try {
-    const d = req.body || {};
-    if (!d.pt_start_date || !d.pt_end_date) {
-      return res.status(400).json({ error: 'PT start and end dates are required' });
-    }
-
-    await tx.query('BEGIN');
-    const { rows: existing } = await tx.query('SELECT * FROM clients WHERE id=$1 FOR UPDATE', [req.params.id]);
-    const c = existing[0];
-    if (!c) {
-      await tx.query('ROLLBACK');
-      return res.status(404).json({ error: 'Client not found' });
-    }
-    if (req.user.role === 'trainer' && (!req.user.trainer_id || c.trainer_id !== req.user.trainer_id)) {
-      await tx.query('ROLLBACK');
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    const amount = num(d.amount, 0);
-    await tx.query(`
-      UPDATE clients SET
-        package_type = COALESCE($1, package_type),
-        pt_start_date=$2,
-        pt_end_date=$3,
-        final_amount = CASE WHEN $4 > 0 THEN $4 ELSE final_amount END,
-        balance_amount = CASE WHEN $4 > 0 THEN GREATEST(0, $4 - COALESCE(paid_amount,0)) ELSE balance_amount END,
-        status='active',
-        updated_at=NOW()
-      WHERE id=$5`,
-      [d.package_type || 'PT', d.pt_start_date, d.pt_end_date, amount, req.params.id]
-    );
-
-    await tx.query(`
-      INSERT INTO renewals (id, client_id, client_name, trainer_id, trainer_name,
-        old_package, new_package, old_end_date, new_end_date, amount, paid_amount,
-        payment_method, renewed_on, notes)
-      VALUES (gen_random_uuid()::TEXT,$1,$2,$3,$4,$5,$6,$7,$8,$9,0,'PT_RENEWAL',CURRENT_DATE,$10)`,
-      [req.params.id, c.name, c.trainer_id, c.trainer_name, c.package_type,
-       d.package_type || 'PT', c.pt_end_date, d.pt_end_date, amount, d.reason || d.notes || null]
-    );
-
-    await tx.query('COMMIT');
-    const { rows } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
-    res.json({ message: 'Personal training renewed', client: rows[0] });
-  } catch (err) {
-    await tx.query('ROLLBACK').catch(() => {});
-    next(err);
-  } finally {
-    tx.release();
-  }
-});
+// POST /api/clients/:id/renew  — REMOVED.
+// POST /api/clients/:id/pt-renew — REMOVED.
+//
+// The same story as POST /api/clients below, and removed for the same reason.
+// Both read `SELECT * FROM clients WHERE id=$1` and wrote back to that table.
+// `clients` has held 0 rows since the PT-OS enrolment flow shipped, so both
+// handlers 404'd on every call — and neither was reachable from the client
+// anyway.
+//
+// Repointing them at pt_clients was not an option worth taking:
+//
+//   * `clients` has NO organization_id column, so neither handler could be
+//     tenant-scoped. They sat behind plain `auth`, which means any logged-in
+//     user of any studio could have renewed any row in that table. That was
+//     harmless only because the table is empty — an accident, not a design.
+//   * Both INSERT INTO `renewals`, a table that does not exist in this
+//     database. Had the 404 not stopped them first, they would have 500'd.
+//   * The org-scoped equivalent already exists and is what the app calls:
+//     POST /api/pt-os/clients/:id/renew.
 
 // POST /api/clients
-router.post('/', auth, validate(clientSchemas.create), async (req, res, next) => {
-  const client = await pool.connect();
-  try {
-    const d = req.body;
-    if (!d.name?.trim()) return res.status(400).json({ error: 'Client name is required' });
-
-    await client.query('BEGIN');
-
-    // Serialise concurrent client creates so two requests never produce the same code.
-    await client.query("SELECT pg_advisory_xact_lock(hashtext('clients_seq'))");
-
-    const clientId = await generateClientId(client);
-    const memberCode = await generateMemberCode(client);
-
-    const id = randomUUID();
-    const base    = num(d.base_amount,  0);
-    const disc    = num(d.discount,     0);
-    const final   = num(d.final_amount, base - disc);
-    const paid    = num(d.paid_amount,  0);
-    // Clamp to zero — overpayment shouldn't show as a negative balance.
-    const balance = Math.max(0, final - paid);
-
-    // If trainer is adding, force their trainer_id
-    const trainer_id = req.user.role === 'trainer' ? req.user.trainer_id : (d.trainer_id || null);
-
-    // Get trainer name + incentive_rate in a single query
-    let trainer_name = d.trainer_name || null;
-    let incentiveRate = 0.5;
-    if (trainer_id) {
-      const { rows: tr } = await client.query(
-        'SELECT name, incentive_rate FROM trainers WHERE id=$1', [trainer_id]
-      );
-      if (tr[0]) {
-        if (!trainer_name) trainer_name = tr[0].name || null;
-        incentiveRate = tr[0].incentive_rate ?? 0.5;
-      }
-    }
-
-    await client.query(`
-      INSERT INTO clients (
-        id, client_id, member_code, name, mobile, email, gender, dob, address,
-        trainer_id, trainer_name, joining_date, pt_start_date, pt_end_date,
-        package_type, base_amount, discount, final_amount, paid_amount, balance_amount,
-        payment_method, payment_date, weight, notes, status, photo_url, biometric_code, biometric_added
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
-      [id, clientId, memberCode, d.name.trim(), d.mobile||null, d.email?.toLowerCase()||null,
-       d.gender||null, d.dob||null, d.address||null,
-       trainer_id, trainer_name,
-       d.joining_date||null, d.pt_start_date||null, d.pt_end_date||null,
-       d.package_type||null, base, disc, final, paid, balance,
-       d.payment_method||'CASH', d.payment_date||null,
-       num(d.weight, null), d.notes||null, d.status||'active', d.photo_url||null,
-       d.biometric_code || clientId, true]
-    );
-
-    // If paid > 0, auto-create a payment record (in same transaction)
-    if (paid > 0) {
-      const receiptNo = await genReceiptNo(client);
-      await client.query(`
-        INSERT INTO payments (id, client_id, client_name, trainer_id, trainer_name,
-          amount, method, date, receipt_no, package_type, incentive_amt)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-        [randomUUID(), id, d.name.trim(), trainer_id, trainer_name, paid,
-         d.payment_method||'CASH', d.payment_date||new Date().toISOString().split('T')[0],
-         receiptNo, d.package_type||null, Math.round(paid * incentiveRate)]
-      );
-    }
-
-    await client.query('COMMIT');
-
-    const { rows } = await pool.query('SELECT * FROM clients WHERE id=$1', [id]);
-    res.status(201).json({ message: 'Client created', client: rows[0] });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    next(err);
-  } finally {
-    client.release();
-  }
-});
+// POST /api/clients — REMOVED. Create clients via POST /api/pt-os/clients.
+//
+// This handler inserted into `clients` and `payments`, the gym-membership pair
+// that has held 0 rows since the PT-OS enrolment flow shipped. Nothing on the
+// client called it, which is the only reason it never did damage: it did not
+// fail, it succeeded, and every row it wrote was invisible to GET /api/clients
+// (which reads pt_clients) and to every other screen in the product.
+//
+// It was also unsafe in two ways that a repoint could not inherit:
+//
+//   * No organization_id. The `clients` table has no such column, so a row
+//     created here belonged to no studio at all.
+//   * No plan seat check. /api/pt-os/clients calls clientLimitStatus() and
+//     refuses at the plan's client limit; this path billed nobody and
+//     enforced nothing.
+//
+// Repointing it at pt_clients would have meant duplicating the org stamping
+// and the seat check, leaving two create paths for one entity — which is the
+// confusion this whole cleanup exists to remove. One entity, one way in.
 
 // PUT /api/clients/:id
+// PUT /api/clients/:id
+//
+// Reads and writes pt_clients, like the rest of this router.
+//
+// This handler used to touch the legacy `clients` table while GET / and
+// GET /:id had already been moved to pt_clients. `clients` has been empty
+// since the PT-OS enrolment flow shipped, so the first statement here found
+// nothing and the handler answered 404 "Client not found" for EVERY client —
+// including the one the page had just rendered from pt_clients a moment
+// earlier. Visible symptom: the client profile's Save Notes button failing
+// permanently with "Failed to save notes"
+// (app/pt-os/clients/[id]/page.tsx).
+//
+// The tenant scope below is new and is not optional. The old query was
+// `WHERE id=$1` with no organization filter — harmless only because the table
+// was empty. Pointing that same query at pt_clients, which holds every
+// studio's clients, would have let any studio edit any other studio's client
+// by id. This mirrors GET /:id above.
+//
+// payment_method, payment_date, biometric_added and member_code are dropped
+// rather than carried across: they are gym-membership columns that pt_clients
+// does not have, and this product is personal training. A payment method
+// belongs on the payment (pt_payments), not on the client row. None of the
+// four is accepted by clientSchemas.update anyway, so zod was already
+// stripping them and they only ever wrote their defaults.
 router.put('/:id', auth, validate(clientSchemas.update), async (req, res, next) => {
   try {
     const d = req.body;
-    const { rows: existing } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
+    const scope = tenantScope(req);
+    const findParams = [req.params.id];
+    let orgClause = '';
+    if (scope.applyFilter) {
+      findParams.push(scope.orgId);
+      orgClause = ` AND organization_id = $${findParams.length}`;
+    }
+    const { rows: existing } = await pool.query(
+      `SELECT * FROM pt_clients WHERE id=$1${orgClause}`, findParams
+    );
     if (!existing[0]) return res.status(404).json({ error: 'Client not found' });
     if (req.user.role === 'trainer' &&
         (!req.user.trainer_id || existing[0].trainer_id !== req.user.trainer_id))
@@ -535,30 +396,50 @@ router.put('/:id', auth, validate(clientSchemas.update), async (req, res, next) 
       trainer_name = tr[0]?.name || null;
     }
 
+    // Every field falls back to its CURRENT value, never to null.
+    //
+    // This is a full-row UPDATE driven by a partial body, and the previous
+    // version wrote `d.mobile||null`, `d.address||null`, `d.pt_start_date||null`
+    // and so on. The client profile calls this with a single key —
+    // api.clients.update(id, { notes }) — so saving a note would have blanked
+    // that client's mobile, email, gender, dob, address, PT dates, weight and
+    // photo in one statement. It never fired only because the handler was
+    // reading the empty `clients` table and 404ing first; repointing it at
+    // pt_clients without this change would have turned a dead endpoint into a
+    // data-loss one.
+    //
+    // `??` rather than `||` so a deliberate empty string still clears a field
+    // (notes, address) and 0 stays 0 — with `||` both would silently revert.
+    // pt_start_date, pt_end_date, weight and photo_url are not part of
+    // clientSchemas.update at all, so zod strips them and they can only ever
+    // be preserved here.
     await pool.query(`
-      UPDATE clients SET
+      UPDATE pt_clients SET
         name=$1, mobile=$2, email=$3, gender=$4, dob=$5, address=$6,
         trainer_id=$7, trainer_name=$8, pt_start_date=$9, pt_end_date=$10,
         package_type=$11, base_amount=$12, discount=$13, final_amount=$14,
-        paid_amount=$15, balance_amount=$16, payment_method=$17, payment_date=$18,
-        weight=$19, notes=$20, status=$21, photo_url=$22, biometric_code=$23,
-        biometric_added=$24, updated_at=NOW()
-      WHERE id=$25`,
-      [d.name?.trim()||existing[0].name,
-       d.mobile||null, d.email?.toLowerCase()||null,
-       d.gender||null, d.dob||null, d.address||null,
+        paid_amount=$15, balance_amount=$16,
+        weight=$17, notes=$18, status=$19, photo_url=$20, biometric_code=$21,
+        updated_at=NOW()
+      WHERE id=$22`,
+      [d.name?.trim() ?? existing[0].name,
+       d.mobile ?? existing[0].mobile,
+       d.email?.toLowerCase() ?? existing[0].email,
+       d.gender ?? existing[0].gender,
+       d.dob ?? existing[0].dob,
+       d.address ?? existing[0].address,
        trainer_id, trainer_name,
-       d.pt_start_date||null, d.pt_end_date||null,
-       d.package_type||null, base, disc, final, paid, Math.max(0, final-paid),
-       d.payment_method||'CASH', d.payment_date||null,
-       num(d.weight, null), d.notes||null,
-       d.status||existing[0].status,
-       d.photo_url || null,
-       d.biometric_code || existing[0].biometric_code || existing[0].client_id,
-       Boolean(d.biometric_code || existing[0].biometric_code || existing[0].client_id),
+       existing[0].pt_start_date, existing[0].pt_end_date,
+       d.package_type ?? existing[0].package_type,
+       base, disc, final, paid, Math.max(0, final - paid),
+       existing[0].weight,
+       d.notes ?? existing[0].notes,
+       d.status ?? existing[0].status,
+       existing[0].photo_url,
+       existing[0].biometric_code ?? existing[0].client_id,
        req.params.id]
     );
-    const { rows } = await pool.query('SELECT * FROM clients WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT * FROM pt_clients WHERE id=$1', [req.params.id]);
     res.json({ message: 'Updated', client: rows[0] });
   } catch (err) {
     next(err);
@@ -569,13 +450,13 @@ router.put('/:id', auth, validate(clientSchemas.update), async (req, res, next) 
 // Returns attendance logs for a single client (used by profile page tab).
 router.get('/:id/attendance', auth, async (req, res, next) => {
   try {
-    const { rows: client } = await pool.query('SELECT trainer_id FROM clients WHERE id=$1', [req.params.id]);
-    if (!client[0]) return res.status(404).json({ error: 'Client not found' });
+    const client = await findClientForRequest(req);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
     if (req.user.role === 'trainer' &&
-        (!req.user.trainer_id || client[0].trainer_id !== req.user.trainer_id)) {
+        (!req.user.trainer_id || client.trainer_id !== req.user.trainer_id)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     const { rows } = await pool.query(
       `SELECT id, date, check_in_time, check_out_time, method, notes
@@ -595,18 +476,23 @@ router.get('/:id/attendance', auth, async (req, res, next) => {
 // Returns payment history for a single client (used by profile page tab).
 router.get('/:id/payments', auth, async (req, res, next) => {
   try {
-    const { rows: client } = await pool.query('SELECT trainer_id FROM clients WHERE id=$1', [req.params.id]);
-    if (!client[0]) return res.status(404).json({ error: 'Client not found' });
+    const client = await findClientForRequest(req);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
     if (req.user.role === 'trainer' &&
-        (!req.user.trainer_id || client[0].trainer_id !== req.user.trainer_id)) {
+        (!req.user.trainer_id || client.trainer_id !== req.user.trainer_id)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    // pt_payments, not `payments` — the latter is the gym-era ledger and is
+    // empty. Column names differ, so the old aliases are preserved for the
+    // client: method <- payment_method, receipt_no <- payment_ref. There is no
+    // package_type on pt_payments, so `plan` is dropped rather than faked.
     const { rows } = await pool.query(
-      `SELECT id, amount, method, date, receipt_no, package_type AS plan, notes
-         FROM payments
-        WHERE client_id = $1
+      `SELECT id, amount, payment_method AS method, date,
+              payment_ref AS receipt_no, notes
+         FROM pt_payments
+        WHERE client_id = $1 AND deleted_at IS NULL
         ORDER BY date DESC, created_at DESC
         LIMIT $2 OFFSET $3`,
       [req.params.id, limit, offset]
@@ -628,16 +514,23 @@ router.get('/:id/payments', auth, async (req, res, next) => {
 // test rows but never the right call in production.
 router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   try {
+    // Resolve within the caller's organization first, so a client belonging to
+    // another studio 404s exactly like a non-existent id. Without this the
+    // delete below would have matched on id alone — tolerable while `clients`
+    // was empty, a cross-tenant delete against pt_clients.
+    const client = await findClientForRequest(req);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+
     if (req.query.hard === '1') {
       const { rows } = await pool.query(
-        'DELETE FROM clients WHERE id=$1 RETURNING id',
+        'DELETE FROM pt_clients WHERE id=$1 RETURNING id',
         [req.params.id]
       );
       if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
       return res.json({ message: 'Client hard-deleted' });
     }
     const { rows } = await pool.query(
-      `UPDATE clients
+      `UPDATE pt_clients
           SET deleted_at = NOW(),
               updated_at = NOW(),
               status     = 'inactive'

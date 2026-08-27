@@ -5,22 +5,26 @@ const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { planSchemas } = require('../lib/validation');
+const { orgWhere, orgIdOf } = require('../lib/tenant-db');
 
 // GET /api/plans
 router.get('/', auth, async (req, res, next) => {
   try {
     const { kind, active } = req.query;
-    const conds = ['deleted_at IS NULL'];
     const params = [];
-    let p = 1;
-    if (kind)              { conds.push(`kind = $${p++}`);       params.push(kind); }
-    if (active !== undefined) { conds.push(`is_active = $${p++}`); params.push(active !== 'false'); }
+    // Org clause first, so it is present on every read whatever else is asked
+    // for. Before migration 174 this endpoint returned every studio's pricing
+    // to any authenticated account, of any role.
+    const org = orgWhere(req, params);
+    const conds = ['deleted_at IS NULL'];
+    if (kind)              { params.push(kind); conds.push(`kind = $${params.length}`); }
+    if (active !== undefined) { params.push(active !== 'false'); conds.push(`is_active = $${params.length}`); }
 
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     params.push(limit, offset);
     const { rows } = await pool.query(
-      `SELECT * FROM plans WHERE ${conds.join(' AND ')} ORDER BY kind, duration, final_amount LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      `SELECT * FROM plans WHERE ${conds.join(' AND ')}${org} ORDER BY kind, duration, final_amount LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params
     );
     res.json(rows);
@@ -63,9 +67,9 @@ router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res,
       `INSERT INTO plans
          (id, kind, name, description, duration,
           base_amount, discount, final_amount, joining_fee, tax_pct,
-          sessions_per_week, features, popular, color, is_active)
+          sessions_per_week, features, popular, color, is_active, organization_id)
        VALUES
-         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        RETURNING *`,
       [
         id,
@@ -79,6 +83,7 @@ router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res,
         Boolean(d.popular),
         d.color || 'violet',
         isActive,
+        orgIdOf(req),
       ]
     );
     res.status(201).json({ message: 'Plan created', plan: rows[0] });
@@ -91,7 +96,11 @@ router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res,
 router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, res, next) => {
   try {
     const d = req.body;
-    const { rows: ex } = await pool.query('SELECT * FROM plans WHERE id=$1', [req.params.id]);
+    const exParams = [req.params.id];
+    const exOrg = orgWhere(req, exParams);
+    const { rows: ex } = await pool.query(`SELECT * FROM plans WHERE id=$1${exOrg}`, exParams);
+    // 404 rather than 403 for another studio's plan: the response must not
+    // confirm the id exists elsewhere on the platform.
     if (!ex[0]) return res.status(404).json({ error: 'Plan not found' });
 
     // Safe numeric coerce: only override if the field is actually present
@@ -115,6 +124,26 @@ router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, re
     if (d.is_active !== undefined)   isActive = Boolean(d.is_active);
     else if (d.status !== undefined) isActive = d.status !== 'draft';
 
+    // The org clause is applied here as well as on the SELECT above, rather
+    // than trusting that check to have covered it. The two statements are
+    // separate round trips, so an unscoped UPDATE would still be reachable if
+    // the row changed hands in between — and more practically, a reader of
+    // this query should be able to see that it is scoped without having to
+    // scroll up and verify that something else was.
+    const upParams = [
+      d.kind        || ex[0].kind,
+      (d.name       || ex[0].name).trim(),
+      d.description !== undefined ? d.description : ex[0].description,
+      d.duration    || ex[0].duration,
+      base, disc, final, joining, taxPct,
+      d.sessions_per_week ? parseInt(d.sessions_per_week) : ex[0].sessions_per_week,
+      features,
+      Boolean(d.popular ?? ex[0].popular),
+      d.color || ex[0].color || 'violet',
+      isActive,
+      req.params.id,
+    ];
+    const upOrg = orgWhere(req, upParams);
     const { rows } = await pool.query(
       `UPDATE plans SET
          kind=$1, name=$2, description=$3, duration=$4,
@@ -123,21 +152,10 @@ router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, re
          sessions_per_week=$10, features=$11,
          popular=$12, color=$13, is_active=$14,
          updated_at=NOW()
-       WHERE id=$15 RETURNING *`,
-      [
-        d.kind        || ex[0].kind,
-        (d.name       || ex[0].name).trim(),
-        d.description !== undefined ? d.description : ex[0].description,
-        d.duration    || ex[0].duration,
-        base, disc, final, joining, taxPct,
-        d.sessions_per_week ? parseInt(d.sessions_per_week) : ex[0].sessions_per_week,
-        features,
-        Boolean(d.popular ?? ex[0].popular),
-        d.color || ex[0].color || 'violet',
-        isActive,
-        req.params.id,
-      ]
+       WHERE id=$15${upOrg} RETURNING *`,
+      upParams
     );
+    if (!rows[0]) return res.status(404).json({ error: 'Plan not found' });
     res.json({ message: 'Plan updated', plan: rows[0] });
   } catch (err) {
     next(err);
@@ -147,9 +165,11 @@ router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, re
 // DELETE /api/plans/:id  (admin only) — soft delete
 router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   try {
+    const params = [req.params.id];
+    const org = orgWhere(req, params);
     const { rows } = await pool.query(
-      'UPDATE plans SET deleted_at=NOW() WHERE id=$1 AND deleted_at IS NULL RETURNING id',
-      [req.params.id]
+      `UPDATE plans SET deleted_at=NOW() WHERE id=$1 AND deleted_at IS NULL${org} RETURNING id`,
+      params
     );
     if (!rows[0]) return res.status(404).json({ error: 'Plan not found' });
     res.json({ message: 'Plan deleted' });

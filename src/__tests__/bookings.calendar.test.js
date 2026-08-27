@@ -58,19 +58,23 @@ function bookQueue({ confirmedCount = 0 } = {}) {
   mockClient.query.mockResolvedValue({ rows: [] });
 }
 
+// Migration 176 made bookings.organization_id NOT NULL; book() now refuses a
+// ctx with no studio rather than inserting NULL. Every ctx below carries one.
+const ORG = '11111111-1111-4111-8111-111111111111';
+
 describe('booking → Google Calendar sync', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    pool.query.mockResolvedValue({ rows: [{ id: 'usr-1' }] });
+    pool.query.mockResolvedValue({ rows: [{ id: 'usr-1', organization_name: 'Acme Fitness' }] });
     cal.isConfigured.mockReturnValue(true);
   });
 
   it('creates the event only after COMMIT', async () => {
     bookQueue();
-    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9' });
+    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9', organization_id: ORG });
     await flush();
 
-    expect(cal.createBookingEvent).toHaveBeenCalledWith('usr-1', 'bk-1');
+    expect(cal.createBookingEvent).toHaveBeenCalledWith('usr-1', 'bk-1', 'Acme Fitness');
 
     // The session row is locked FOR UPDATE for the whole transaction. Calling
     // Google before COMMIT would hold that lock across a network round-trip
@@ -82,19 +86,20 @@ describe('booking → Google Calendar sync', () => {
 
   it('syncs to the MEMBER, not the admin who made the booking', async () => {
     bookQueue();
-    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'admin-7' });
+    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'admin-7', organization_id: ORG });
     await flush();
 
     // The user lookup must be by member_id — an admin booking on someone's
     // behalf must not get the class in their own diary.
     const [sql, params] = pool.query.mock.calls[0];
-    expect(sql).toMatch(/WHERE member_id = \$1/);
+    expect(sql).toMatch(/WHERE u\.member_id = \$1/);
     expect(params).toEqual(['mem-1']);
+    expect(sql).toMatch(/organizations/);
   });
 
   it('does not put a waitlist place in anyone diary', async () => {
     bookQueue({ confirmedCount: SESSION.capacity });
-    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9' });
+    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9', organization_id: ORG });
     await flush();
     expect(cal.createBookingEvent).not.toHaveBeenCalled();
   });
@@ -102,7 +107,7 @@ describe('booking → Google Calendar sync', () => {
   it('skips entirely when Google Calendar is not configured', async () => {
     cal.isConfigured.mockReturnValue(false);
     bookQueue();
-    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9' });
+    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9', organization_id: ORG });
     await flush();
     expect(pool.query).not.toHaveBeenCalled();
     expect(cal.createBookingEvent).not.toHaveBeenCalled();
@@ -111,7 +116,7 @@ describe('booking → Google Calendar sync', () => {
   it('skips a member who has no login', async () => {
     pool.query.mockResolvedValue({ rows: [] });
     bookQueue();
-    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9' });
+    await bookings.book({ session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9', organization_id: ORG });
     await flush();
     expect(cal.createBookingEvent).not.toHaveBeenCalled();
   });
@@ -122,7 +127,7 @@ describe('booking → Google Calendar sync', () => {
     cal.createBookingEvent.mockRejectedValueOnce(new Error('google is down'));
     bookQueue();
     const booking = await bookings.book(
-      { session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9' }
+      { session_id: 'sess-1', member_id: 'mem-1' }, { user_id: 'usr-9', organization_id: ORG }
     );
     await flush();
     expect(booking.id).toBe('bk-1');

@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
+const { makeStore } = require('../lib/rateLimitStore');
 // otplib v13 removed the `authenticator` singleton that v12 exported and
 // replaced it with these functions. Verification now returns a RESULT OBJECT
 // ({ valid, delta, ... }), not a boolean — reading it as a boolean would make
@@ -13,6 +14,7 @@ const { generateSecret, verifySync } = require('otplib');
 const pool = require('../db/pool');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const { logActivity } = require('../lib/activityLog');
+const recovery = require('../lib/mfaRecoveryCodes');
 const logger = require('../lib/logger');
 const { saveFile, deleteFile } = require('../lib/fileStorage');
 const credentials = require('../lib/credentials');
@@ -689,8 +691,26 @@ router.put('/password', async (req, res, next) => {
     if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
 
     const hashed = await bcrypt.hash(newPassword, 12);
+    // AUD-005. This is a SECOND password-change path, parallel to
+    // /api/auth/change-password, and it had no refresh-token revocation at all —
+    // so changing your password here left every refresh token alive for the rest
+    // of its 7-day window, including a stolen one. Bumping token_version only
+    // kills the 15-minute access tokens; /api/auth/refresh never reads it.
+    //
+    // Unlike the auth.js handler this route issues no replacement session, so
+    // every token goes, the caller's included — which matches what this route
+    // already did to the access token.
     await pool.query(
-      'UPDATE users SET password = $1, token_version = token_version + 1, updated_at = NOW() WHERE id = $2',
+      `WITH pw AS (
+         UPDATE users
+            SET password = $1, token_version = token_version + 1, updated_at = NOW()
+          WHERE id = $2
+         RETURNING id
+       )
+       UPDATE refresh_tokens
+          SET revoked_at = NOW()
+        WHERE user_id = (SELECT id FROM pw)
+          AND revoked_at IS NULL`,
       [hashed, req.user.id]
     );
     invalidateUserCache(req.user.id);
@@ -714,7 +734,7 @@ router.post('/mfa/setup', async (req, res, next) => {
     );
     res.json({
       secret,
-      qrUrl: `otpauth://totp/619-ERP:${encodeURIComponent(req.user.email)}?secret=${secret}&issuer=619-ERP`,
+      qrUrl: `otpauth://totp/${encodeURIComponent('MY PT STUDIO')}:${encodeURIComponent(req.user.email)}?secret=${secret}&issuer=${encodeURIComponent('MY PT STUDIO')}`,
     });
   } catch (err) {
     next(err);
@@ -724,6 +744,8 @@ router.post('/mfa/setup', async (req, res, next) => {
 // A 6-digit TOTP code is a 1M-value space; throttle harder than the general
 // per-user API limit so it can't be brute-forced from a single account.
 const mfaVerifyLimiter = rateLimit({
+  store: makeStore('mfa'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: 15,
   standardHeaders: true,
@@ -749,7 +771,19 @@ router.post('/mfa/verify', mfaVerifyLimiter, async (req, res, next) => {
         WHERE user_id = $1`,
       [req.user.id]
     );
-    const recoveryCodes = Array.from({ length: 8 }, () => crypto.randomBytes(4).toString('hex').toUpperCase());
+    // Recovery codes are now STORED (hashed) and redeemable at login.
+    //
+    // They used to be eight random hex strings generated here, returned, and
+    // never written anywhere — while the dialog that shows them promises
+    // "each code can be used once to get back into your account". Nothing
+    // could check one, and login's validator rejected the format outright,
+    // so the promise was false twice over. For the platform super admin,
+    // whose second factor SUPER_ADMIN_REQUIRE_MFA makes mandatory, that was
+    // the difference between a lost phone and a lost platform.
+    //
+    // issueForUser replaces any previous set: re-enrolling is exactly when
+    // the old codes stop being trustworthy. See lib/mfaRecoveryCodes.js.
+    const recoveryCodes = await recovery.issueForUser(pool, req.user.id);
     await logActivity(req, 'profile.mfa.enable', 'user', req.user.id);
     res.json({ recoveryCodes });
   } catch (err) {
@@ -761,6 +795,10 @@ router.delete('/mfa', async (req, res, next) => {
   try {
     await ensureSchema();
     await pool.query('UPDATE user_profiles SET mfa_enabled = FALSE, mfa_secret = NULL, updated_at = NOW() WHERE user_id = $1', [req.user.id]);
+    // Codes outlive nothing. Leaving them behind would mean a re-enrolment
+    // later silently inherits credentials issued against a secret that no
+    // longer exists, and anyone holding an old printout keeps a way in.
+    await pool.query('DELETE FROM mfa_recovery_codes WHERE user_id = $1', [req.user.id]);
     await logActivity(req, 'profile.mfa.disable', 'user', req.user.id);
     res.json({ message: 'MFA disabled' });
   } catch (err) {

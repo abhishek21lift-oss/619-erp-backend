@@ -36,7 +36,7 @@ const mockLog = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jes
 jest.mock('../lib/logger', () => mockLog);
 
 // otplib pulls in @scure/base, which ships ESM that Jest will not parse — the
-// same incompatibility render.yaml pins NODE_VERSION for. Mocked so requiring
+// same incompatibility the Dockerfile pins a Node version for. Mocked so requiring
 // the auth router does not drag it in; MFA is not what this file tests.
 jest.mock('otplib', () => ({
   generateSecret: jest.fn(() => 'JBSWY3DPEHPK3PXP'),

@@ -219,10 +219,20 @@ router.get('/parq/forms', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-// GET /parq/forms/:id — form + family history + clearances + consent records + documents.
+// GET /parq/forms/:id — form + family history + clearance + consent + documents.
 // Parallel queries rather than one giant JOIN (child collections have very
 // different cardinalities/shapes, so a JOIN would just require de-duplicating
 // the parent row in application code anyway).
+//
+// Clearance and consent are returned SINGULAR — `medical_clearance` and
+// `consent`, not the underlying row arrays. That is the shape the client's
+// ParqFormDetail contract declares, and the edit screen reads
+// `row.medical_clearance?.id` to decide update-vs-create. Emitting the arrays
+// here (as this route used to) left both fields undefined on the client: the
+// clearance and consent sections silently rendered blank for forms that had
+// them, and every re-save took the create path and wrote a duplicate
+// pt_medical_clearances row. Both queries order by created_at DESC, so row 0
+// is the current record; a form only ever has one live clearance/consent.
 router.get('/parq/forms/:id', auth, wrap(async (req, res) => {
   const { id } = req.params;
   const scope = tenantScope(req);
@@ -242,8 +252,8 @@ router.get('/parq/forms/:id', auth, wrap(async (req, res) => {
     data: {
       ...form,
       family_history: familyRes.rows,
-      medical_clearances: clearanceRes.rows,
-      consent_records: consentRes.rows,
+      medical_clearance: clearanceRes.rows[0] ?? null,
+      consent: consentRes.rows[0] ?? null,
       documents: docsRes.rows,
     },
   });

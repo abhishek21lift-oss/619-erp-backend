@@ -2,13 +2,27 @@
 const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
 const { computeAccess } = require('../lib/subscription');
+const { resolveOrgId } = require('./tenant');
+const { runWithTenantContext } = require('../lib/tenant-context');
+const { platformSessionBlocked, TENANT_SESSION_REQUIRED } = require('./platformAuth');
+
+// Defaults to ON in production for security. Explicitly set to 'off' to disable
+// (staged rollout only). See TENANT-RLS-PLAN.md and server.js startup validation.
+// Shared predicate — see lib/tenantRlsFlag.js for why it is not inlined here.
+const { rlsEnforcementEnabled } = require('../lib/tenantRlsFlag');
+const TENANT_RLS_ENFORCE = rlsEnforcementEnabled();
 
 // Path prefixes that stay reachable even when a studio's subscription has lapsed,
 // so the studio can still authenticate, view its billing/frozen screen, manage
 // its own profile, and the platform operator can always get in.
 const SUBSCRIPTION_ALLOWLIST = [
   '/api/auth', '/api/v1/auth', '/api/profile',
-  '/api/subscription', '/api/super-admin', '/api/health',
+  '/api/subscription', '/api/health',
+  // Both names for the control plane. A lapsed subscription is a TENANT
+  // state; the platform operator has no subscription and must never be
+  // billing-gated out of the console — least of all when the reason they are
+  // opening it is that somebody's billing is broken.
+  '/api/platform', '/api/super-admin',
 ];
 
 // Returns the blocking access decision when a tenant user's studio may not use
@@ -89,7 +103,14 @@ async function auth(req, res, next) {
           // organization_id carries the tenant boundary onto req.user for the
           // multi-tenant isolation layer (migration 078).
           // SECURITY: filter out soft-deleted users (deleted_at IS NOT NULL).
-          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
+          // pt_client_id is the client-account link, and it is a DIFFERENT
+          // column from member_id — member_id carries a foreign key to the
+          // legacy, empty `clients` table (migration 154 explains why).
+          // requireClient and every /api/me query read it off req.user, so it
+          // has to load here with role and organization_id: taking a client id
+          // from the request instead is the exact mistake the isolation layer
+          // exists to prevent.
+          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.pt_client_id, u.branch_id,
                   u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
                   o.is_founder, o.founder_number,
                   o.status AS organization_status, o.subscription_status,
@@ -103,9 +124,14 @@ async function auth(req, res, next) {
         );
         rows = result.rows;
       } catch {
-        // Fallback if deleted_at column doesn't exist (pre-migration)
+        // Fallback if deleted_at column doesn't exist (pre-migration).
+        // pt_client_id is selected here too: this branch runs on a database
+        // behind on migrations, and a client whose account silently loads
+        // without its link would be refused by requireClient with no clue why.
+        // If 154 has not run either, this query fails and the caller gets a
+        // clean 401 rather than a session missing its tenant identity.
         const result = await pool.query(
-          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.branch_id,
+          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.pt_client_id, u.branch_id,
                   u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
                   o.is_founder, o.founder_number,
                   u.is_active, u.token_version
@@ -130,6 +156,32 @@ async function auth(req, res, next) {
     }
 
     req.user = user;
+
+    // Which plane this session was opened for — see middleware/platformAuth.js.
+    //
+    // Read off the token rather than derived from req.user.role, and that is
+    // the entire point: the role says what this account IS, the audience says
+    // which door it came through. Deriving one from the other would collapse
+    // them back into the single check the platform boundary exists to replace.
+    //
+    // `aud` is absent on every token minted before audiences existed, and null
+    // is carried through as null rather than defaulted, so platformAuth.js can
+    // tell "legacy session" from "tenant session" and treat them differently
+    // during rollout.
+    req.session = { aud: decoded.aud ?? null };
+
+    // A Command Center session may not act inside a studio.
+    //
+    // Enforced here, once, rather than mounted onto the ~45 tenant route
+    // mounts in server.js — a boundary that has to be remembered forty-five
+    // times is a boundary with a hole in it. denyPlatformSession classifies by
+    // path and treats anything it does not recognise as tenant surface, so a
+    // route added later is covered without being added to a list.
+    //
+    // Dormant until PLATFORM_SESSION_ENFORCE is on; see platformAuth.js.
+    if (platformSessionBlocked(req)) {
+      return res.status(403).json(TENANT_SESSION_REQUIRED);
+    }
 
     // Super-admin impersonation: the token carries an `imp` claim minted by the
     // platform portal. req.user is already the impersonated admin (loaded above),
@@ -164,6 +216,28 @@ async function auth(req, res, next) {
           });
         }
       }
+    }
+
+    // Tenant context for db/pool.js's RLS query wrapper. Resolution failure
+    // must never block the request — this flag is for testing whether the
+    // wrapper works, not a new authorization gate, and NO_TENANT is already
+    // handled properly by requireRole/requireClient/etc. further down the
+    // chain for routes that actually need it.
+    if (TENANT_RLS_ENFORCE) {
+      let orgId = null;
+      try { orgId = resolveOrgId(req); } catch { /* see comment above */ }
+      // The ONLY place platform-wide status is granted, and the only reason
+      // it is safe: it requires the role loaded from the database on this
+      // request — never a header, a body field or anything the caller sent —
+      // AND that no target org was resolved. A super admin who named a studio
+      // via x-org-id is scoped to it like anybody else.
+      //
+      // Everything downstream (db/pool.js) treats this as "use the owner
+      // connection, which bypasses RLS", so a bug that set it for a tenant
+      // user would hand them the whole platform. That is why it is computed
+      // here, from req.user.role, and nowhere else.
+      const platformWide = req.user.role === 'super_admin' && orgId == null;
+      return runWithTenantContext(orgId, next, { platformWide });
     }
 
     next();

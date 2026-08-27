@@ -1,51 +1,96 @@
 const pool = require('../../db/pool');
+const { today: studioToday, todayShortDay: studioShortDay } = require('../../lib/appTime');
 
-async function calculateMonthlyCommissions(month) {
+async function calculateMonthlyCommissions(month, scope = {}) {
   const monthStart = `${month}-01`;
+  // UTC arithmetic only. The previous form built the next month from the
+  // LOCAL getFullYear()/getMonth() of a UTC-parsed date, so west of UTC the
+  // month-end collapsed onto the month start (e.g. [2026-08-01, 2026-08-01]
+  // on America/Los_Angeles), narrowing the window to a single day and
+  // under-counting commissions.
   const mStart = new Date(monthStart + 'T00:00:00Z');
-  const mEnd = new Date(mStart.getFullYear(), mStart.getMonth() + 1, 1);
+  const mEnd = new Date(Date.UTC(mStart.getUTCFullYear(), mStart.getUTCMonth() + 1, 1));
   const mEndStr = mEnd.toISOString().slice(0, 10);
 
-  const { rows: clients } = await pool.query(`
-    SELECT c.id, c.name, c.trainer_id, c.trainer_name,
-           c.monthly_pt_amount, c.trainer_commission,
-           t.incentive_rate
+  const params = [mStart.toISOString().slice(0, 10), mEndStr];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND c.organization_id = $${params.length}`;
+  }
+  // ── One statement, not one per client ────────────────────────────────────
+  //
+  // This used to SELECT the eligible clients and then loop, issuing an
+  // INSERT … ON CONFLICT per client. Two problems, both of which get worse
+  // exactly where this function matters most — a studio with a lot of PT
+  // clients at month end:
+  //
+  //   · No transaction wrapped the loop. A failure partway through — a
+  //     timeout, a dropped connection, one bad row — left some commissions
+  //     written and the rest not, with no signal beyond the error. Re-running
+  //     recovers because the upsert is idempotent, but nothing said it needed
+  //     re-running.
+  //   · N+1 round trips. With TENANT_RLS_ENFORCE on, db/pool.js wraps every
+  //     query in BEGIN → set_config → … → COMMIT on a dedicated pooled client,
+  //     so each iteration costs four round trips and holds one of twenty
+  //     connections. A thousand PT clients is four thousand round trips, which
+  //     passes the 15s query_timeout somewhere in the hundreds.
+  //
+  // Folding the read into the write fixes both at once. A single statement is
+  // atomic in Postgres, so this needs no explicit BEGIN/COMMIT — adding one
+  // would suggest the atomicity came from the transaction rather than from
+  // there being one statement.
+  //
+  // The ON CONFLICT arbiter is (trainer_id, client_id, month). A multi-row
+  // upsert raises if the same arbiter appears twice in one statement, which
+  // cannot happen here: the source is one row per pt_clients.id and client_id
+  // is part of the key.
+  //
+  // COALESCE on trainer_commission preserves the loop's behaviour exactly —
+  // it read the value through Number(), and Number(null) is 0, where passing
+  // a SQL NULL into a NOT NULL column would now fail instead.
+  const { rows: written } = await pool.query(`
+    INSERT INTO pt_commissions
+      (trainer_id, trainer_name, client_id, client_name,
+       month, commission_amt, incentive_rate, status)
+    SELECT c.trainer_id, c.trainer_name, c.id, c.name,
+           $1::DATE, COALESCE(c.trainer_commission, 0), t.incentive_rate, 'pending'
     FROM pt_clients c
     JOIN pt_trainers t ON t.id = c.trainer_id
     WHERE c.deleted_at IS NULL
       AND c.status IN ('active','frozen')
       AND c.trainer_id IS NOT NULL
       AND c.pt_start_date IS NOT NULL
-      AND (c.pt_end_date IS NULL OR NULLIF(c.pt_end_date, '')::DATE >= $1::DATE)
-      AND c.pt_start_date <= $2
-      AND c.monthly_pt_amount > 0
-  `, [mStart.toISOString().slice(0, 10), mEndStr]);
+      -- NULLIF(c.pt_end_date, '') here made this endpoint 500 unconditionally.
+      -- pt_end_date is a DATE column, so Postgres has to coerce the '' literal
+      -- to date to type the NULLIF, and that fails at plan time — before any
+      -- row is examined, so it errored even with nothing to calculate:
+      --   invalid input syntax for type date: ""
+      -- The idiom belongs to a TEXT column (getActiveClients still reads
+      -- pt_end_date::TEXT != '' because it handles both shapes); this one was
+      -- left behind when the column became a date, and a NULL end date is
+      -- already covered by the IS NULL arm. Found by the E2E isolation suite.
+      AND (c.pt_end_date IS NULL OR c.pt_end_date >= $1::DATE)
+      AND c.pt_start_date <= $2::DATE
+      AND c.monthly_pt_amount > 0${orgClause}
+    ON CONFLICT (trainer_id, client_id, month)
+    DO UPDATE SET commission_amt = EXCLUDED.commission_amt,
+                  incentive_rate = EXCLUDED.incentive_rate,
+                  updated_at = NOW()
+    RETURNING *
+  `, params);
 
-  const results = [];
-  for (const cl of clients) {
-    const commission = Number(cl.trainer_commission);
-    const { rows } = await pool.query(`
-      INSERT INTO pt_commissions
-        (trainer_id, trainer_name, client_id, client_name,
-         month, commission_amt, incentive_rate, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
-      ON CONFLICT (trainer_id, client_id, month)
-      DO UPDATE SET commission_amt = EXCLUDED.commission_amt,
-                    incentive_rate = EXCLUDED.incentive_rate,
-                    updated_at = NOW()
-      RETURNING *
-    `, [
-      cl.trainer_id, cl.trainer_name,
-      cl.id, cl.name,
-      monthStart, commission, cl.incentive_rate,
-    ]);
-    results.push(rows[0]);
-  }
-  return { count: results.length, total: results.reduce((s, r) => s + Number(r.commission_amt), 0) };
+  return { count: written.length, total: written.reduce((s, r) => s + Number(r.commission_amt), 0) };
 }
 
-async function getTrainerPayouts(month) {
+async function getTrainerPayouts(month, scope = {}) {
   const monthStart = `${month}-01`;
+  const params = [monthStart];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND t.organization_id = $${params.length}`;
+  }
   const { rows } = await pool.query(`
     SELECT
       t.id AS trainer_id,
@@ -58,10 +103,10 @@ async function getTrainerPayouts(month) {
     FROM pt_trainers t
     LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
     LEFT JOIN pt_payouts pp ON pp.trainer_id = t.id AND pp.month = $1
-    WHERE t.deleted_at IS NULL AND t.status = 'active'
+    WHERE t.deleted_at IS NULL AND t.status = 'active'${orgClause}
     GROUP BY t.id, t.name, pp.net_amount, pp.status, pp.id
     ORDER BY total_commission DESC
-  `, [monthStart]);
+  `, params);
   return rows;
 }
 
@@ -159,6 +204,13 @@ async function getDashboardStats(scope = {}) {
       COUNT(*) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL)::INT AS active_pt_clients,
       COUNT(*) FILTER (WHERE status = 'expired')::INT AS expired_clients,
       COUNT(*) FILTER (WHERE balance_amount > 0)::INT AS clients_with_balance,
+      -- Owed AND past the end of the package they owe it for. "Pending" and
+      -- "overdue" are different sentences to say to somebody on the phone.
+      COUNT(*) FILTER (
+        WHERE balance_amount > 0
+          AND pt_end_date IS NOT NULL
+          AND pt_end_date::DATE < CURRENT_DATE
+      )::INT AS overdue_clients,
       COALESCE(SUM(trainer_commission) FILTER (WHERE status = 'active' AND pt_start_date IS NOT NULL), 0) AS total_monthly_commission,
       COALESCE(SUM(balance_amount), 0) AS total_outstanding
     FROM pt_clients
@@ -175,6 +227,17 @@ async function getDashboardStats(scope = {}) {
       AND deleted_at IS NULL${orgBare}
   `, orgParams);
   totals.total_monthly_pt_revenue = revenueRow.total_monthly_pt_revenue;
+
+  // What actually came in today. Same source as the monthly figure above —
+  // pt_payments, the money that was collected — rather than the contracted
+  // amounts on pt_clients, which are what was promised.
+  const { rows: [todayRow] } = await pool.query(`
+    SELECT COALESCE(SUM(amount), 0) AS collected, COUNT(*)::INT AS payments
+    FROM pt_payments
+    WHERE date = CURRENT_DATE AND deleted_at IS NULL${orgBare}
+  `, orgParams);
+  totals.today_collected = todayRow.collected;
+  totals.today_payments = todayRow.payments;
 
   const { rows: trainerStats } = await pool.query(`
     SELECT
@@ -205,12 +268,16 @@ async function getDashboardStats(scope = {}) {
   return { ...totals, trainers: trainerStats, revenueTrend };
 }
 
-async function getCommissionHistory(trainerId) {
+async function getCommissionHistory(trainerId, scope = {}) {
   const where = ['c.deleted_at IS NULL'];
   const params = [];
   if (trainerId) {
     params.push(trainerId);
     where.push(`pc.trainer_id = $${params.length}`);
+  }
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    where.push(`c.organization_id = $${params.length}`);
   }
   const { rows } = await pool.query(`
     SELECT pc.*, c.name AS client_name
@@ -223,17 +290,23 @@ async function getCommissionHistory(trainerId) {
   return rows;
 }
 
-async function createPayout(trainerId, month, deductions, processedBy) {
+async function createPayout(trainerId, month, deductions, processedBy, scope = {}) {
   const monthStart = `${month}-01`;
+  const params = [monthStart, trainerId];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND t.organization_id = $${params.length}`;
+  }
   const { rows: [commData] } = await pool.query(`
     SELECT
       t.name AS trainer_name,
       COALESCE(SUM(pc.commission_amt), 0) AS total_commission
     FROM pt_trainers t
     LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
-    WHERE t.id = $2 AND t.deleted_at IS NULL
+    WHERE t.id = $2 AND t.deleted_at IS NULL${orgClause}
     GROUP BY t.name
-  `, [monthStart, trainerId]);
+  `, params);
 
   if (!commData) throw new Error('Trainer not found');
 
@@ -256,7 +329,13 @@ async function createPayout(trainerId, month, deductions, processedBy) {
   return rows[0];
 }
 
-async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) {
+async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy, scope = {}) {
+  const params = [payoutId, paymentMethod, paymentRef, processedBy];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND trainer_id IN (SELECT id FROM pt_trainers WHERE organization_id = $${params.length})`;
+  }
   const { rows } = await pool.query(`
     UPDATE pt_payouts
     SET status = 'paid',
@@ -265,9 +344,9 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) 
         paid_at = NOW(),
         processed_by = COALESCE($4, processed_by),
         updated_at = NOW()
-    WHERE id = $1
+    WHERE id = $1${orgClause}
     RETURNING *
-  `, [payoutId, paymentMethod, paymentRef, processedBy]);
+  `, params);
 
   if (rows.length > 0) {
     const payout = rows[0];
@@ -284,13 +363,18 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy) 
  * getOpsSummary — powers the "Today's Operations" and "Session Activity"
  * dashboard sections.  Returns:
  *   today_sessions   — all pt_sessions scheduled/completed today
+ *   today_unscheduled— clients whose PROGRAMME prescribes today's weekday
+ *   today_enrolled   — clients whose ENROLMENT says they train today
  *   renewals_due     — active clients whose pt_end_date is within 7 days
  *   top_dues         — up to 5 clients with the highest outstanding balance
  *   session_stats    — this-month vs last-month completed session counts
  *   trainer_sessions — per-trainer session totals this month
  */
 async function getOpsSummary(scope = {}) {
-  const today = new Date().toISOString().slice(0, 10);
+  // Studio-local, not UTC. `toISOString()` here meant the panel showed
+  // yesterday's sessions between midnight and 05:30 IST — see src/lib/appTime.js.
+  const today = studioToday();
+  const todayDay = studioShortDay();   // 'Mon' … 'Sun', matching the enrolment format
   // Tenant scope: $1 is always `today`; when filtering, $2 is the org id.
   const apply = Boolean(scope.applyFilter);
   const orgS = apply ? ' AND s.organization_id = $2' : '';   // aliased pt_sessions
@@ -369,9 +453,78 @@ async function getOpsSummary(scope = {}) {
    LIMIT 25
   `, sessParams);
 
+  // Clients whose ENROLMENT says they train today.
+  //
+  // The two lists above both assume the studio records its work somewhere the
+  // dashboard already looks: an appointment booked into pt_sessions, or a
+  // workout plan whose exercises name a weekday. A studio that does neither
+  // got "Nothing on today — no booked slots, and no client's programme falls
+  // on today" every single day, under a heading naming a day its clients were
+  // in fact training on. The panel was not wrong about its own two sources; it
+  // was blind to where the answer actually lived.
+  //
+  // It lives on the client. pt_clients.preferred_training_days is filled at
+  // enrolment, where the day picker is a REQUIRED, validated field — so every
+  // enrolled client has it — and it is written as the literal string
+  // "Mon, Wed, Fri" (the form's `trainingDays.join(', ')`). Until now nothing
+  // read it back except the enrolment PDF: the studio was asked which days its
+  // client trains, answered, and was then told nobody trains today.
+  //
+  // Matching strips spaces before splitting so "Mon,Wed" and "Mon, Wed" behave
+  // the same, and compares against a three-letter day produced in the studio's
+  // own zone (appTime.todayShortDay) rather than the database's locale.
+  //
+  // The two NOT EXISTS clauses keep a client from appearing twice. A booked
+  // slot is more specific than "they usually train Thursdays", and a programme
+  // day is more specific than an enrolment preference, so whichever of those
+  // exists wins and this list stays the fallback it is meant to be.
+  const { rows: today_enrolled } = await pool.query(`
+    SELECT
+      c.id AS client_id, c.name AS client_name, c.photo_url AS client_photo,
+      c.preferred_workout_time, c.preferred_training_days, c.trainer_name
+    FROM pt_clients c
+   WHERE c.deleted_at IS NULL
+     AND c.status = 'active'
+     AND c.preferred_training_days IS NOT NULL
+     AND $2 = ANY(string_to_array(replace(c.preferred_training_days, ' ', ''), ','))
+     AND NOT EXISTS (
+       SELECT 1 FROM pt_sessions s
+        WHERE s.client_id = c.id AND s.session_date = $1 AND s.deleted_at IS NULL
+     )
+     AND NOT EXISTS (
+       SELECT 1
+         FROM workout_assignments a
+         JOIN workout_plans wp ON wp.id = a.workout_plan_id
+        WHERE a.client_id = c.id AND a.status = 'active'
+          AND EXISTS (
+            SELECT 1 FROM workout_exercises we
+             WHERE we.workout_plan_id = wp.id
+               AND we.day_of_week = EXTRACT(ISODOW FROM $1::date)::int
+               AND we.week_number = 1
+          )
+     )
+     ${apply ? 'AND c.organization_id = $3' : ''}
+   -- Parsed to a real TIME, not sorted as text. The column is free text
+   -- holding two formats: the enrolment dropdown writes '6:00 AM' and its
+   -- custom field, an <input type="time">, writes '06:00'. As strings
+   -- '1:00 PM' < '5:00 AM', so the afternoon slot sorted before the dawn one.
+   -- Anything matching neither shape sorts last rather than corrupting the
+   -- order of the rows around it.
+   ORDER BY
+     CASE
+       WHEN c.preferred_workout_time ~* '^[0-9]{1,2}:[0-9]{2}\\s*(AM|PM)$'
+         THEN to_timestamp(trim(c.preferred_workout_time), 'HH12:MI AM')::time
+       WHEN c.preferred_workout_time ~ '^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$'
+         THEN c.preferred_workout_time::time
+       ELSE NULL
+     END NULLS LAST,
+     c.name
+   LIMIT 25
+  `, apply ? [today, todayDay, scope.orgId] : [today, todayDay]);
+
   const { rows: renewals_due } = await pool.query(`
     SELECT
-      id, name, mobile, trainer_name, package_type,
+      id, name, mobile, trainer_name, package_type, photo_url,
       pt_end_date::TEXT,
       (pt_end_date::DATE - CURRENT_DATE)::INT AS days_left,
       balance_amount,
@@ -387,7 +540,7 @@ async function getOpsSummary(scope = {}) {
 
   const { rows: top_dues } = await pool.query(`
     SELECT
-      id, name, mobile, trainer_name, balance_amount,
+      id, name, mobile, trainer_name, balance_amount, photo_url,
       pt_end_date::TEXT,
       CASE WHEN pt_end_date IS NOT NULL AND pt_end_date::DATE < CURRENT_DATE THEN 'overdue' ELSE 'due' END AS due_status
     FROM pt_clients
@@ -396,6 +549,20 @@ async function getOpsSummary(scope = {}) {
     LIMIT 5
   `, bareParams);
 
+  // Sessions TRAINED, not sessions BOOKED.
+  //
+  // This counted pt_sessions, which is the diary: a trainer books a slot and a
+  // row appears with status 'scheduled'. Nothing in the product ever moves
+  // that row to 'completed' — finishing a workout PATCHes
+  // workout_sessions.status on the workout log, a different table the booking
+  // never learns about. So "Done" and "Last month" were counting a status no
+  // code path writes, and the card read 0 / 0 next to a real Total no matter
+  // how many workouts the studio actually ran.
+  //
+  // workout_sessions is where the work lands, so that is what is counted. It
+  // has no deleted_at — a log is hard-deleted or it exists — and its status is
+  // exactly 'in_progress' or 'completed', so Total is genuinely "started this
+  // month" and Done is the subset that was finished.
   const { rows: [session_stats] } = await pool.query(`
     SELECT
       COUNT(*) FILTER (
@@ -412,10 +579,29 @@ async function getOpsSummary(scope = {}) {
           AND session_date <  DATE_TRUNC('month', CURRENT_DATE)
           AND status = 'completed'
       )::INT AS last_month_completed
-    FROM pt_sessions
-    WHERE deleted_at IS NULL${orgBare1}
+    FROM workout_sessions
+    WHERE TRUE${orgBare1}
   `, bareParams);
 
+  // Per-trainer totals for the month — scoped, unlike every other query here.
+  //
+  // This one took no parameters at all: it listed every active trainer on the
+  // PLATFORM and their session counts, to every studio that loaded a
+  // dashboard. Names of other studios' staff, and how busy they are, is
+  // competitive information; it is also the exact class of bug the tenant
+  // filter exists to prevent, sitting in the middle of a function where every
+  // sibling query was already scoped.
+  //
+  // Both sides need the filter, for different reasons. On `t` it decides which
+  // trainers are listed at all. On `s` it stops a foreign session being
+  // COUNTED against a local trainer — the ids are per-table, so a collision is
+  // unlikely rather than impossible, and a count is exactly where a stray row
+  // would go unnoticed.
+  //
+  // The `s` filter belongs in the JOIN condition, not the WHERE clause. In the
+  // WHERE it would discard the NULL-extended rows a LEFT JOIN produces and
+  // silently turn this into an INNER JOIN, dropping every trainer who has no
+  // sessions this month — who are precisely the ones a manager is looking for.
   const { rows: trainer_sessions } = await pool.query(`
     SELECT
       t.name AS trainer_name,
@@ -428,13 +614,16 @@ async function getOpsSummary(scope = {}) {
       AND s.session_date >= DATE_TRUNC('month', CURRENT_DATE)
       AND s.session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
       AND s.deleted_at IS NULL
+      ${apply ? 'AND s.organization_id = $1' : ''}
     WHERE t.deleted_at IS NULL AND t.status = 'active'
+      ${apply ? 'AND t.organization_id = $1' : ''}
     GROUP BY t.id, t.name
     ORDER BY completed DESC
-  `);
+  `, bareParams);
 
   return {
-    today_sessions, today_unscheduled, renewals_due, top_dues, session_stats, trainer_sessions,
+    today_sessions, today_unscheduled, today_enrolled,
+    renewals_due, top_dues, session_stats, trainer_sessions,
   };
 }
 

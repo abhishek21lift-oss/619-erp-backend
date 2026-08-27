@@ -28,6 +28,7 @@ const multer = require('multer');
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { validate } = require('../middleware/validate');
 const { z } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
@@ -222,18 +223,33 @@ function sendPaymentError(res, err) {
 /**
  * Load an order the caller is entitled to see.
  *
- * Members are restricted to their own member_id. A member asking for someone
- * else's order gets 404, not 403 — 403 would confirm the order exists.
+ * Members are restricted to their own client record. A member asking for
+ * someone else's order gets 404, not 403 — 403 would confirm the order exists.
+ *
+ * ── Scoped by pt_client_id, not member_id ──────────────────────────────
+ *
+ * These are two different id spaces and this table is in the second one:
+ *
+ *   payment_orders.client_id  → pt_clients   (migration 112)
+ *   users.pt_client_id        → pt_clients   (migration 154)
+ *   users.member_id           → clients      (legacy v3, 0 rows)
+ *
+ * So filtering a pt_clients column by a clients-space id could only ever
+ * match nothing — and because member_id is NULL on every real client account
+ * (verified against production: the one live client account has pt_client_id
+ * set and member_id NULL), the guard below threw 404 for every client opening
+ * their own payment. Fails closed, so it was never a leak; it just meant the
+ * feature did not work for the people it is for.
  */
 async function loadOrderForCaller(req, orderId) {
   const orgId = requireOrg(req);
   const params = [orderId, orgId];
   let clause = '';
   if (req.user.role === 'member') {
-    if (!req.user.member_id) {
+    if (!req.user.pt_client_id) {
       throw new upi.PaymentError('NOT_FOUND', 'Payment not found', 404);
     }
-    params.push(req.user.member_id);
+    params.push(req.user.pt_client_id);
     clause = ` AND o.client_id = $${params.length}`;
   }
   const { rows } = await pool.query(
@@ -255,7 +271,9 @@ async function loadOrderForCaller(req, orderId) {
  * behalf (walk-in at the desk), which is why client_id is accepted at all.
  */
 async function resolveTargetClient(req, requestedClientId, orgId) {
-  const clientId = req.user.role === 'member' ? req.user.member_id : requestedClientId;
+  // pt_client_id, not member_id: the lookup below is against pt_clients, and
+  // member_id belongs to the legacy `clients` table. See loadOrderForCaller.
+  const clientId = req.user.role === 'member' ? req.user.pt_client_id : requestedClientId;
   if (!clientId) {
     throw new upi.PaymentError('NO_MEMBER', 'No member is linked to this account', 403);
   }
@@ -286,10 +304,20 @@ async function notify(userId, type, title, body, link) {
   }
 }
 
-/** The login attached to a member record, if there is one. */
+/**
+ * The login attached to a client record, if there is one.
+ *
+ * Matched on pt_client_id. Every caller passes a pt_clients id
+ * (order.client_id, result.member.id, rows[].client_id), and users.member_id
+ * references the legacy `clients` table — so this looked the id up in the
+ * wrong space and returned null every time. The result was not an error
+ * anywhere: notify() takes `if (!userId) return`, so every payment
+ * notification to a client was silently dropped, including the ones raised by
+ * admin-side verification.
+ */
 async function userIdForClient(clientId) {
   const { rows } = await pool.query(
-    `SELECT id FROM users WHERE member_id = $1 AND is_active = TRUE LIMIT 1`, [clientId]
+    `SELECT id FROM users WHERE pt_client_id = $1 AND is_active = TRUE LIMIT 1`, [clientId]
   );
   return rows[0]?.id || null;
 }
@@ -311,7 +339,12 @@ async function adminUserIds(orgId) {
 // GET /api/payments/upi/settings — what the payment page and the settings
 // screen both read. Safe for any authenticated user in the studio: it exposes
 // the studio's own public payee details and nothing else.
-router.get('/settings', auth, wrap(async (req, res) => {
+// requireStaff on this route only. The rest of this mount is the member-facing
+// payment flow (create, upload proof, submit UTR), which must stay open — but
+// this returns the studio's UPI configuration object, and the sibling endpoint
+// /api/subscription/checkout/settings deliberately withholds its VPA from its
+// own response for exactly that reason. Gating the mount would break paying.
+router.get('/settings', auth, requireStaff, wrap(async (req, res) => {
   const orgId = requireOrg(req);
   const settings = await upi.getSettings(orgId);
   res.json({ data: settings, configured: Boolean(settings), enabled: Boolean(settings?.is_enabled) });
@@ -319,8 +352,8 @@ router.get('/settings', auth, wrap(async (req, res) => {
 
 // PUT /api/payments/upi/settings — admin only.
 router.put('/settings', auth, adminOnly, validate(schemas.settings), wrap(async (req, res) => {
-  const orgId = requireOrg(req);
   try {
+    const orgId = requireOrg(req);
     const saved = await upi.upsertSettings(orgId, req.body);
     await logActivity(req, 'payment_settings.update', 'payment_settings', saved.id, {
       upi_id: saved.upi_id, is_enabled: saved.is_enabled, gst_percent: saved.gst_percent,
@@ -337,8 +370,8 @@ router.put('/settings', auth, adminOnly, validate(schemas.settings), wrap(async 
 
 // POST /api/payments/upi/create
 router.post('/create', auth, validate(schemas.createOrder), wrap(async (req, res) => {
-  const orgId = requireOrg(req);
   try {
+    const orgId = requireOrg(req);
     const member = await resolveTargetClient(req, req.body.client_id, orgId);
 
     // Price resolution. When the order names a real plan, the STORED price is
@@ -604,10 +637,11 @@ router.get('/history', auth, validate(schemas.history), wrap(async (req, res) =>
   const conditions = ['o.organization_id = $1'];
   const params = [orgId];
 
-  // A member sees only their own, whatever they ask for.
+  // A member sees only their own, whatever they ask for. pt_client_id, not
+  // member_id — o.client_id is a pt_clients id. See loadOrderForCaller.
   if (req.user.role === 'member') {
-    if (!req.user.member_id) return res.json({ data: [], total: 0 });
-    params.push(req.user.member_id);
+    if (!req.user.pt_client_id) return res.json({ data: [], total: 0 });
+    params.push(req.user.pt_client_id);
     conditions.push(`o.client_id = $${params.length}`);
   } else if (req.query.client_id) {
     params.push(req.query.client_id);
@@ -760,8 +794,8 @@ router.get('/:id/audit', auth, adminOnly, validate(schemas.idParam), wrap(async 
 
 // POST /api/payments/upi/:id/approve — admin only.
 router.post('/:id/approve', auth, adminOnly, validate(schemas.idParam), wrap(async (req, res) => {
-  const orgId = requireOrg(req);
   try {
+    const orgId = requireOrg(req);
     const result = await upi.approve({ orderId: req.params.id, orgId, actor: actorOf(req) });
 
     const memberUserId = await userIdForClient(result.member.id);
@@ -787,8 +821,8 @@ router.post('/:id/approve', auth, adminOnly, validate(schemas.idParam), wrap(asy
 
 // POST /api/payments/upi/:id/reject — admin only.
 router.post('/:id/reject', auth, adminOnly, validate(schemas.reject), wrap(async (req, res) => {
-  const orgId = requireOrg(req);
   try {
+    const orgId = requireOrg(req);
     const result = await upi.reject({
       orderId: req.params.id, orgId,
       reason: req.body.reason, note: req.body.note, actor: actorOf(req),
@@ -819,8 +853,8 @@ router.post('/:id/reject', auth, adminOnly, validate(schemas.reject), wrap(async
 // action differs so the trail records what the admin actually meant.
 router.post('/:id/request-correction', auth, adminOnly, validate(schemas.reject),
   wrap(async (req, res) => {
-    const orgId = requireOrg(req);
     try {
+      const orgId = requireOrg(req);
       const result = await upi.reject({
         orderId: req.params.id, orgId, reason: req.body.reason, note: req.body.note,
         actor: actorOf(req), correction: true,

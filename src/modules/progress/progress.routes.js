@@ -4,7 +4,7 @@ const { auth } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
-const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+const { tenantScope, orgIdOf, orgWhere } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
 const scoring = require('./fitness-scoring');
 const goalScoring = require('./goal-scoring');
@@ -661,15 +661,29 @@ function computeLifestyleAnalysis(b) {
   };
 }
 
+// GET /lifestyle-assessments
+//
+// client_id is REQUIRED, which it was not before. Called bare, this endpoint
+// used to return every lifestyle assessment on the platform — sleep, stress,
+// smoking status, alcohol intake, coach notes — for every studio, to any
+// authenticated account. A list endpoint over health records has no honest
+// use for "all of them", so the parameter is mandatory and the org filter is
+// applied whether or not it is supplied.
 router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
-  const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  if (!client_id) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'client_id is required' } });
+  }
+  if (!await clientInOrg(req, client_id)) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
+  const params = [client_id];
+  const org = orgWhere(req, params);
   const { rows } = await pool.query(
-    `SELECT * FROM pt_lifestyle_assessments ${whereSql} ORDER BY assessment_date DESC`, params
+    `SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC`,
+    params
   );
-  res.json({ data: rows });
+  return res.json({ data: rows });
 }));
 
 router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(lifestyleAssessmentCreateSchema), wrap(async (req, res) => {
@@ -690,7 +704,7 @@ router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'tra
        smoking_status, cigarettes_per_day, years_smoking, alcohol_status, drinks_per_week,
        screen_time_bracket, travel_frequency, energy_level, motivation_to_exercise, recovery_quality, recovery_score,
        sedentary_risk, recovery_risk, habit_risk_score, risk_factors, lifestyle_score, lifestyle_readiness,
-       coach_notes, created_by
+       coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_lifestyle_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,$7,$8,
@@ -703,7 +717,7 @@ router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'tra
        $25,$26,$27,$28,$29,
        $30,$31,$32,$33,$34,$35,
        $36,$37,$38,$39,$40,$41,
-       $42::jsonb,$43
+       $42::jsonb,$43,$44
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
@@ -717,7 +731,7 @@ router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'tra
       b.smoking_status || null, b.cigarettes_per_day ?? null, b.years_smoking ?? null, b.alcohol_status || null, b.drinks_per_week ?? null,
       b.screen_time_bracket || null, b.travel_frequency || null, b.energy_level ?? null, b.motivation_to_exercise ?? null, b.recovery_quality || null, analysis.recoveryScore,
       analysis.sedentaryRisk, analysis.recoveryRisk, analysis.habitRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.lifestyleScore, analysis.lifestyleReadiness,
-      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -732,7 +746,13 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
     'screen_time_bracket', 'travel_frequency', 'energy_level', 'motivation_to_exercise', 'recovery_quality', 'coach_notes',
   ];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_lifestyle_assessments WHERE id = $1', [req.params.id]);
+  // Scoped read before the write. Unscoped, this loaded — and the UPDATE below
+  // then rewrote — any studio's health record by id.
+  const exParams = [req.params.id];
+  const exOrg = orgWhere(req, exParams);
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_lifestyle_assessments WHERE id = $1${exOrg}`, exParams
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -777,7 +797,11 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
   }
 
   sets.push('updated_at = NOW()');
-  const { rows } = await pool.query(`UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  const upOrg = orgWhere(req, params);
+  const { rows } = await pool.query(
+    `UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1${upOrg} RETURNING *`, params
+  );
+  if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ data: rows[0] });
 }));
 
@@ -885,15 +909,26 @@ async function computeNutritionAnalysis(clientId, b) {
   };
 }
 
+// GET /nutrition-assessments
+//
+// Same shape, and the same reasoning, as /lifestyle-assessments above — this
+// table additionally holds food_allergies, medical_conditions and
+// medical_notes, so the bare call was the widest medical-data read in the API.
 router.get('/nutrition-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
-  const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  if (!client_id) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'client_id is required' } });
+  }
+  if (!await clientInOrg(req, client_id)) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
+  const params = [client_id];
+  const org = orgWhere(req, params);
   const { rows } = await pool.query(
-    `SELECT * FROM pt_nutrition_assessments ${whereSql} ORDER BY assessment_date DESC`, params
+    `SELECT * FROM pt_nutrition_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC`,
+    params
   );
-  res.json({ data: rows });
+  return res.json({ data: rows });
 }));
 
 router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(nutritionAssessmentCreateSchema), wrap(async (req, res) => {
@@ -916,7 +951,7 @@ router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'tra
        meal_preparer, nutrition_budget, medical_conditions, medical_notes,
        diet_quality_score, protein_score, protein_assessment, hydration_score, digestive_health_score,
        supplement_score, nutrition_risk_score, risk_factors, nutrition_score, nutrition_readiness,
-       coach_notes, created_by
+       coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_nutrition_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,
@@ -931,7 +966,7 @@ router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'tra
        $30,$31,$32,$33,
        $34,$35,$36,$37,$38,
        $39,$40,$41,$42,$43,
-       $44::jsonb,$45
+       $44::jsonb,$45,$46
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
@@ -950,7 +985,7 @@ router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'tra
       b.meal_preparer || null, b.nutrition_budget || null, b.medical_conditions && b.medical_conditions.length ? b.medical_conditions : null, b.medical_notes || null,
       analysis.dietQualityScore, analysis.proteinScore, analysis.proteinAssessment, analysis.hydrationScore, analysis.digestiveHealthScore,
       analysis.supplementScore, analysis.nutritionRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.nutritionScore, analysis.nutritionReadiness,
-      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -971,7 +1006,12 @@ router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
     'meal_preparer', 'nutrition_budget', 'medical_conditions', 'medical_notes', 'coach_notes',
   ];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_nutrition_assessments WHERE id = $1', [req.params.id]);
+  // Scoped read before the write, as on the lifestyle PATCH above.
+  const exParams = [req.params.id];
+  const exOrg = orgWhere(req, exParams);
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_nutrition_assessments WHERE id = $1${exOrg}`, exParams
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -1016,7 +1056,11 @@ router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
   }
 
   sets.push('updated_at = NOW()');
-  const { rows } = await pool.query(`UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  const upOrg = orgWhere(req, params);
+  const { rows } = await pool.query(
+    `UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1${upOrg} RETURNING *`, params
+  );
+  if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ data: rows[0] });
 }));
 
@@ -1051,7 +1095,12 @@ function computeMobilityAnalysis(b) {
 router.get('/mobility-performance-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
+  // Multi-tenant isolation: this table missed the 084 sweep (weekly_checkins/
+  // strength_logs/progress_photos) — client_id alone let a caller who knows or
+  // guesses another org's client_id list that org's mobility records.
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT * FROM pt_mobility_performance_assessments ${whereSql} ORDER BY assessment_date DESC`, params
@@ -1069,18 +1118,18 @@ router.post('/mobility-performance-assessments', auth, requireRole('admin', 'man
        client_id, assessment_number, assessment_date,
        body_regions, mobility_tests,
        grip_strength_kg, vertical_jump_cm, sit_reach_cm, balance_test_seconds, reaction_time_ms, performance_notes,
-       mobility_score, mobility_category, created_by
+       mobility_score, mobility_category, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_mobility_performance_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3::jsonb,$4::jsonb,
        $5,$6,$7,$8,$9,$10,
-       $11,$12,$13
+       $11,$12,$13,$14
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
       b.body_regions ? JSON.stringify(b.body_regions) : null, b.mobility_tests ? JSON.stringify(b.mobility_tests) : null,
       b.grip_strength_kg ?? null, b.vertical_jump_cm ?? null, b.sit_reach_cm ?? null, b.balance_test_seconds ?? null, b.reaction_time_ms ?? null, b.performance_notes || null,
-      analysis.mobilityScore, analysis.mobilityCategory, req.user.id,
+      analysis.mobilityScore, analysis.mobilityCategory, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -1092,7 +1141,12 @@ router.patch('/mobility-performance-assessments/:id', auth, wrap(async (req, res
     'grip_strength_kg', 'vertical_jump_cm', 'sit_reach_cm', 'balance_test_seconds', 'reaction_time_ms', 'performance_notes',
   ];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_mobility_performance_assessments WHERE id = $1', [req.params.id]);
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_mobility_performance_assessments WHERE id = $1${guard}`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -1140,7 +1194,11 @@ function computePostureAnalysis(b) {
 router.get('/posture-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
+  // Multi-tenant isolation: this table missed the 084 sweep the same way
+  // mobility-performance-assessments did — see that route for the finding.
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT * FROM pt_posture_assessments ${whereSql} ORDER BY assessment_date DESC`, params
@@ -1158,12 +1216,12 @@ router.post('/posture-assessments', auth, requireRole('admin', 'manager', 'train
        client_id, assessment_number, assessment_date,
        front_issues, side_issues, back_issues, other_issue_notes,
        posture_risk_score, posture_risk_level,
-       coach_notes, created_by
+       coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_posture_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,
        $7,$8,
-       $9::jsonb,$10
+       $9::jsonb,$10,$11
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
@@ -1172,7 +1230,7 @@ router.post('/posture-assessments', auth, requireRole('admin', 'manager', 'train
       b.back_issues && b.back_issues.length ? b.back_issues : null,
       b.other_issue_notes || null,
       analysis.postureRiskScore, analysis.postureRiskLevel,
-      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -1181,7 +1239,12 @@ router.post('/posture-assessments', auth, requireRole('admin', 'manager', 'train
 router.patch('/posture-assessments/:id', auth, wrap(async (req, res) => {
   const allowed = ['assessment_date', 'front_issues', 'side_issues', 'back_issues', 'other_issue_notes', 'coach_notes'];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_posture_assessments WHERE id = $1', [req.params.id]);
+  const scope = tenantScope(req);
+  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_posture_assessments WHERE id = $1${guard}`,
+    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 

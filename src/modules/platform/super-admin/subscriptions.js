@@ -200,7 +200,7 @@ router.delete('/coupons/:id', async (req, res, next) => {
 // nothing, which is correct — they pay nothing.
 router.get('/subscription-metrics', async (req, res, next) => {
   try {
-    const [mrrRow, planMix, states, conversion, founders, revenueTrend, growth] = await Promise.all([
+    const [mrrRow, planMix, states, conversion, founders, revenueTrend, growth, churn] = await Promise.all([
       // Run-rate across everything currently entitled to service.
       pool.query(`
         SELECT
@@ -298,9 +298,36 @@ router.get('/subscription-metrics', async (req, res, next) => {
           FROM first_activation
          WHERE activated_at >= date_trunc('month', now()) - interval '11 months'
          GROUP BY 1, 2 ORDER BY 2`),
+
+      // ── Churn ────────────────────────────────────────────────────────────
+      //
+      // Counted from activity_log, because that is where cancellations are
+      // actually written — the cancel handler calls audit(), not the
+      // subscription_events logger the two queries above read. Deriving churn
+      // from states.cancelled instead would give a CUMULATIVE total that only
+      // ever rises and is not a rate at all.
+      //
+      // The 30-day rate's denominator is (studios paying now + studios that
+      // cancelled in the window), which is an approximation of "paying at the
+      // start of the window": the true denominator needs a paying-studio count
+      // as of a past date, and nothing stores one. It is close for small
+      // windows and it is stated rather than implied — see the null below.
+      //
+      // rate_30d_pct is null, never 0, when the denominator is empty. A
+      // platform with no paying studios has no churn RATE; printing 0% would
+      // read as "nobody is leaving" when the truth is "there is nobody to
+      // leave", and those are opposite signals to an operator.
+      pool.query(`
+        SELECT
+          count(*) FILTER (WHERE created_at >= now() - interval '30 days')::int AS cancelled_30d,
+          count(*) FILTER (WHERE created_at >= now() - interval '90 days')::int AS cancelled_90d
+          FROM activity_log
+         WHERE action = 'subscription_cancelled'`),
     ]);
 
     const mrr = mrrRow.rows[0] || { mrr_inr: 0, paying_studios: 0, arpu_inr: 0 };
+    const ch = churn.rows[0] || { cancelled_30d: 0, cancelled_90d: 0 };
+    const churnBase = (mrr.paying_studios || 0) + (ch.cancelled_30d || 0);
     const conv = conversion.rows[0] || { trials_started: 0, trials_converted: 0 };
     const f = founders.rows[0] || { granted: 0, locked_value_inr: 0, highest_number: null };
     const slotsRemaining = await subscription.founderSlotsRemaining();
@@ -313,6 +340,16 @@ router.get('/subscription-metrics', async (req, res, next) => {
         paying_studios: mrr.paying_studios,
         states: states.rows[0],
         plan_distribution: planMix.rows,
+        churn: {
+          cancelled_30d: ch.cancelled_30d,
+          cancelled_90d: ch.cancelled_90d,
+          // Currently in the cancelled state — a stock, not a flow, and named
+          // so it cannot be mistaken for the 30-day figures above.
+          currently_cancelled: states.rows[0]?.cancelled ?? 0,
+          rate_30d_pct: churnBase > 0
+            ? Math.round((ch.cancelled_30d / churnBase) * 1000) / 10
+            : null,
+        },
         trial_conversion: {
           started: conv.trials_started,
           converted: conv.trials_converted,
@@ -581,7 +618,7 @@ router.get('/subscription-requests', async (req, res, next) => {
   try {
     const status = ['AWAITING_VERIFICATION', 'AWAITING_PAYMENT', 'APPROVED', 'ALL']
       .includes(req.query.status) ? req.query.status : 'AWAITING_VERIFICATION';
-    const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
     const conds = [];

@@ -108,6 +108,19 @@ describe('super-admin API — the H-03 split', () => {
     'GET /billing/invoices/:id/pdf',
     'GET /billing/invoices/export',
     'GET /billing/settings',
+    // Command Center (Phases 1 and 5). Deliberate additions, not refactor
+    // drift — mounted under super-admin so the console inherits this mount's
+    // auth -> requireSuperAdmin -> requireSuperAdminMfa chain rather than
+    // standing up a second door to guard. That inheritance is the whole reason
+    // the POST is allowed to exist: it pauses queues and deletes failed jobs,
+    // so it must sit behind the strictest chain in the app.
+    'GET /command-center/alerts',
+    'GET /command-center/cards',
+    'GET /command-center/commands',
+    'GET /command-center/guardian',
+    'GET /command-center/logs',
+    'GET /command-center/logs/history',
+    'GET /command-center/snapshot',
     'GET /coupons',
     'GET /coupons/:id/redemptions',
     'GET /features',
@@ -140,6 +153,11 @@ describe('super-admin API — the H-03 split', () => {
     'GET /support/tickets',
     'GET /support/tickets/:id',
     'GET /system-health',
+    // Added deliberately — the platform user directory (super-admin/users.js).
+    // Not part of the H-03 split; the console had no cross-tenant view of
+    // accounts at all, only per-studio ones reached through an organization.
+    'GET /users',
+    'GET /users/summary',
     'PATCH /announcements/:id',
     'PATCH /coupons/:id',
     'PATCH /features/:key',
@@ -152,6 +170,11 @@ describe('super-admin API — the H-03 split', () => {
     'POST /announcements/:id/preview',
     'POST /announcements/:id/schedule',
     'POST /announcements/:id/send',
+    'POST /command-center/alerts/:id/ack',
+    'POST /command-center/alerts/:id/resolve',
+    'POST /command-center/commands/:name',
+    'POST /command-center/guardian/:id/explain',
+    'POST /command-center/stream-ticket',
     'POST /coupons',
     'POST /invitations/:id/cancel',
     'POST /invitations/:id/link',

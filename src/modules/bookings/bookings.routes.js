@@ -2,13 +2,14 @@
 const router = require('express').Router();
 const { auth } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
+const { tenantScope } = require('../../lib/tenant-db');
 const svc = require('./bookings.service');
 const cal = require('../../lib/google-calendar');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const ctx = (req) => ({
-  user_id: req.user.id, role: req.user.role,
-  trainer_id: req.user.trainer_id, member_id: req.user.member_id,
+  user_id: req.user.id, user_name: req.user.name, organization_id: req.user.organization_id,
+  role: req.user.role, trainer_id: req.user.trainer_id, member_id: req.user.member_id,
 });
 
 // GET /api/v1/bookings  — current user's bookings
@@ -16,7 +17,7 @@ router.get('/', auth, wrap(async (req, res) => {
   let memberId = req.query.member_id;
   if (req.user.role === 'member') memberId = req.user.member_id;
   if (!memberId) return res.json({ data: [] });
-  const data = await svc.listForMember(memberId, req.query);
+  const data = await svc.listForMember(memberId, req.query, tenantScope(req));
   res.json({ data });
 }));
 

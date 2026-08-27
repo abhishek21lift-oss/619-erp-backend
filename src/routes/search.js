@@ -18,6 +18,7 @@
 
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
+const { makeStore } = require('../lib/rateLimitStore');
 const { auth } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
 const searchService = require('../modules/search/search.service');
@@ -28,6 +29,8 @@ const searchService = require('../modules/search/search.service');
 // what debounced typing generates and low enough that the box cannot be used to
 // enumerate a database.
 const searchLimiter = rateLimit({
+  store: makeStore('search'),
+  passOnStoreError: true,
   windowMs: 60 * 1000,
   max: 240,
   standardHeaders: true,

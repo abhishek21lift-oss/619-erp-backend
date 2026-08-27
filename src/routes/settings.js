@@ -78,7 +78,7 @@ router.get('/studio', auth, async (req, res, next) => {
     // Get branches
     const { rows: branches } = await pool.query(
       `SELECT s.key AS branch_id, s.value AS name,
-              COALESCE((SELECT COUNT(*) FROM clients WHERE branch_id = s.key AND deleted_at IS NULL), 0) AS member_count
+              COALESCE((SELECT COUNT(*) FROM pt_clients WHERE branch_id = s.key AND deleted_at IS NULL), 0) AS member_count
        FROM system_settings s
        WHERE s.key LIKE 'branch_%' AND s.type = 'json'
        ORDER BY s.key`
@@ -98,7 +98,7 @@ router.get('/branches', auth, async (req, res, next) => {
               (value::jsonb)->>'name' AS name,
               (value::jsonb)->>'location' AS location,
               (value::jsonb)->>'status' AS status,
-              COALESCE((SELECT COUNT(*) FROM clients WHERE branch_id = s.key AND deleted_at IS NULL), 0)::int AS member_count
+              COALESCE((SELECT COUNT(*) FROM pt_clients WHERE branch_id = s.key AND deleted_at IS NULL), 0)::int AS member_count
        FROM system_settings s
        WHERE s.key LIKE 'branch_%' AND s.type = 'json'
        ORDER BY s.key`
@@ -158,6 +158,45 @@ router.put('/branches/:id', auth, adminOnly, async (req, res, next) => {
     );
 
     res.json({ id: req.params.id, ...updated });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/settings/branches/:id
+//
+// The client has always had a Delete Branch button; there was no route behind
+// it, so it 404'd and the row stayed on screen.
+//
+// Refuses rather than orphans. `clients.branch_id` holds the full
+// system_settings key (see the member_count subquery on GET /branches), and
+// there is no FK to cascade or null it out — deleting a branch with members
+// would leave those rows pointing at a key that no longer resolves, and they
+// would silently vanish from every per-branch view. A studio that wants the
+// branch out of the way without moving its members can PUT status:'inactive'.
+router.delete('/branches/:id', auth, adminOnly, async (req, res, next) => {
+  try {
+    const branchKey = 'branch_' + req.params.id;
+
+    const { rows: ex } = await pool.query(
+      'SELECT key FROM system_settings WHERE key=$1', [branchKey]
+    );
+    if (!ex[0]) return res.status(404).json({ error: 'Branch not found' });
+
+    const { rows: [{ member_count }] } = await pool.query(
+      `SELECT COUNT(*)::int AS member_count
+         FROM pt_clients WHERE branch_id=$1 AND deleted_at IS NULL`,
+      [branchKey]
+    );
+    if (member_count > 0) {
+      return res.status(409).json({
+        error: `Cannot delete a branch with ${member_count} member${member_count === 1 ? '' : 's'}. `
+             + 'Move them to another branch first, or set this one to inactive.',
+      });
+    }
+
+    await pool.query('DELETE FROM system_settings WHERE key=$1', [branchKey]);
+    res.json({ message: 'Branch deleted' });
   } catch (err) {
     next(err);
   }
@@ -318,13 +357,32 @@ router.put('/feature-flags', auth, adminOnly, async (req, res, next) => {
     if (!updates || typeof updates !== 'object')
       return res.status(400).json({ error: 'Body must be a key-value object' });
 
-    for (const [key, val] of Object.entries(updates)) {
-      await pool.query(
-        `UPDATE feature_flags SET value=$1, updated_at=NOW() WHERE key=$2`,
-        [Boolean(val), key]
-      );
-    }
-    res.json({ message: 'Feature flags updated' });
+    const keys = Object.keys(updates);
+    if (!keys.length) return res.json({ message: 'Feature flags updated', updated: 0, requested: 0 });
+
+    // One statement, atomic by construction — the same shape PUT /permissions
+    // above uses for the same class of bulk key/value write.
+    //
+    // This was a `for` loop issuing one UPDATE per key with no transaction
+    // around it. A failure partway through (dropped connection, constraint
+    // error on flag 3 of 5) left flags 1-2 committed, 4-5 never attempted, and
+    // returned a single 500 that read as "nothing happened" — so the operator's
+    // next move was to retry a write that had already half-applied. Feature
+    // flags gate real functionality, so a half-applied set is a half-configured
+    // product, not a cosmetic problem.
+    const vals = keys.map((k) => Boolean(updates[k]));
+    const { rowCount } = await pool.query(
+      `UPDATE feature_flags AS f
+          SET value = v.value, updated_at = NOW()
+         FROM unnest($1::text[], $2::boolean[]) AS v(key, value)
+        WHERE f.key = v.key`,
+      [keys, vals]
+    );
+
+    // Report what actually changed. Unknown keys match no row and are skipped
+    // silently — true of the loop too — so returning the count lets a caller
+    // notice a typo instead of reading "updated" and believing it.
+    res.json({ message: 'Feature flags updated', updated: rowCount, requested: keys.length });
   } catch (err) {
     next(err);
   }

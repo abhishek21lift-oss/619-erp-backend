@@ -9,6 +9,7 @@ const Sentry = require('./instrument');
 require('dotenv').config();
 
 const logger = require('./lib/logger');
+const { rlsEnforcementEnabled } = require('./lib/tenantRlsFlag');
 
 // Define isProd early — used in env checks below and throughout the file
 const isProd = (process.env.NODE_ENV || 'development') === 'production';
@@ -38,6 +39,58 @@ const RECOMMENDED_ENV = [
 const missingRecommended = RECOMMENDED_ENV.filter(function(k) { return !process.env[k]; });
 if (missingRecommended.length) {
   logger.warn({ missing: missingRecommended }, 'Recommended env vars not set — some features may be degraded');
+}
+
+// ── RLS cutover validation ───────────────────────────────────────────────────
+// When TENANT_RLS_ENFORCE is on (default in production), the app_tenant role
+// must be used for tenant requests, and a separate owner connection (ADMIN_DATABASE_URL)
+// must exist for platform-wide operations. If both URLs are the same, the app
+// connects as the table owner (postgres) which has BYPASSRLS, making all RLS
+// policies ineffective. This check catches the misconfiguration at boot.
+//
+// The condition below must be the SAME predicate db/pool.js and
+// middleware/auth.js use to decide whether enforcement is on, and it was not:
+// this line tested the variable for truthiness while they test it against the
+// string 'off'. The two disagreed in both directions, and both directions were
+// wrong:
+//
+//   TENANT_RLS_ENFORCE | old guard fired? | enforcement actually on?
+//   <unset>            | no               | YES  ← shipped the misconfiguration
+//   'off'              | YES              | no   ← refused to boot when disabled
+//
+// Unset is the production default, so the check meant to catch "enforcement on
+// with a single owner connection" was silent in precisely the configuration it
+// existed to catch. The predicate now lives in lib/tenantRlsFlag.js and is
+// imported by all three call sites, so they cannot drift apart again.
+if (isProd && rlsEnforcementEnabled()) {
+  const adminUrl = process.env.ADMIN_DATABASE_URL || process.env.DATABASE_URL;
+  if (adminUrl === process.env.DATABASE_URL) {
+    logger.fatal(
+      'Refusing to start: TENANT_RLS_ENFORCE is enabled but ADMIN_DATABASE_URL is not set to a different connection string. '
+      + 'The app_tenant role (migration 157) must be used for tenant traffic via DATABASE_URL, '
+      + 'and the privileged owner role must be configured separately via ADMIN_DATABASE_URL '
+      + 'for platform-wide operations (migrations, workers, super-admin console). '
+      + 'See db/migrations/TENANT-RLS-PLAN.md for the rollout procedure.'
+    );
+    process.exit(1);
+  }
+}
+
+// ── TRUST_PROXY validation ───────────────────────────────────────────────────
+// The correct value depends on the deployment topology. The current production
+// topology is: browser → nginx → frontend (Next.js rewrite) → backend = 2 hops.
+// If TRUST_PROXY is not set (defaults to 1) in production with this topology,
+// all req.ip will be the frontend container IP, collapsing rate-limit buckets.
+if (isProd) {
+  const trustProxy = (process.env.TRUST_PROXY || '').trim();
+  if (!trustProxy || trustProxy === '1') {
+    logger.warn(
+      'TRUST_PROXY is not set or set to 1 in production. '
+      + 'If the deployment topology includes nginx + Next.js rewrite (2 proxy hops), '
+      + 'set TRUST_PROXY=2 so req.ip resolves to the real client IP. '
+      + 'Incorrect value collapses all callers into one rate-limit bucket and neuters brute-force protection.'
+    );
+  }
 }
 
 // ── Email (SMTP) ────────────────────────────────────────────────────────────
@@ -141,15 +194,103 @@ if (isProd && r2Set.length === 0) {
   process.exit(1);
 }
 
+// ── Security controls must be ON in production ──────────────────────────────
+//
+// Three controls ship behind an env flag so they can be rolled out
+// deliberately (see db/migrations/TENANT-RLS-PLAN.md). Each is read as an
+// exact `=== 'on'` comparison at the point of use — deliberately strict, so
+// that a typo, an empty string, "true", "1" or "ON" all read as OFF rather
+// than being coerced into ON by a truthiness check. That strictness is the
+// right call and is preserved verbatim here.
+//
+// For NEW production deployments, these default to ON for security.
+// Existing deployments going through staged rollout can explicitly set
+// them to 'off' to disable. The value MUST be either 'on' or 'off' in production.
+//
+// ── Before deploying with these set ─────────────────────────────────────────
+//
+// Each flag has a prerequisite, and turning one on without it is the outage
+// this check is meant to prevent — so they are stated here rather than in a
+// runbook nobody opens at 2am:
+//
+//   TENANT_RLS_ENFORCE      Safe to turn on as-is. Until DATABASE_URL points
+//                           at the app_tenant role (migration 157), this only
+//                           wraps queries in a set_config transaction; the
+//                           connecting role still owns the tables and bypasses
+//                           RLS, so nothing changes but latency. That is
+//                           exactly what measuring it in staging is for.
+//
+//   PLATFORM_SESSION_ENFORCE  Refuses platform tokens that carry no `aud`
+//                           claim. Operators holding a session issued before
+//                           migration 162 are signed out and must log in
+//                           again — recoverable, but do it knowingly.
+//
+//   SUPER_ADMIN_REQUIRE_MFA The operator must have MFA enabled FIRST
+//                           (user_profiles.mfa_enabled), or the platform
+//                           console answers MFA_SETUP_REQUIRED to the only
+//                           account that can reach it. The enrolment routes
+//                           under /api/profile/mfa are never gated, so this
+//                           is a lockout to recover from, not a deadlock —
+//                           but it is still a lockout. Verify before enabling.
+const SECURITY_FLAGS = [
+  ['TENANT_RLS_ENFORCE', 'per-request tenant scoping of the data plane (app.org_id)'],
+  ['PLATFORM_SESSION_ENFORCE', 'platform session audience checks on operator tokens'],
+  ['SUPER_ADMIN_REQUIRE_MFA', 'two-factor requirement on the platform admin console'],
+];
+
+if (isProd) {
+  const invalid = SECURITY_FLAGS
+    .filter(function(f) {
+      const val = process.env[f[0]];
+      return val !== undefined && val !== 'on' && val !== 'off';
+    })
+    .map(function(f) { return { flag: f[0], value: process.env[f[0]] }; });
+
+  if (invalid.length) {
+    logger.fatal(
+      { invalid },
+      'Refusing to start: security control has invalid value. '
+      + 'Each flag must be either "on" or "off" (or unset to default to "on").'
+    );
+    process.exit(1);
+  }
+
+  const disabled = SECURITY_FLAGS
+    .filter(function(f) { return process.env[f[0]] === 'off'; })
+    .map(function(f) { return { flag: f[0], protects: f[1] }; });
+
+  if (disabled.length) {
+    logger.warn(
+      { disabled },
+      'Security controls explicitly disabled via env. This is intended only for staged rollout. '
+      + 'New production deployments should not disable these.'
+    );
+  }
+}
+
 const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
 const rateLimit     = require('express-rate-limit');
+const { makeStore } = require('./lib/rateLimitStore');
 const cookieParser  = require('cookie-parser');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { auth, adminOnly }        = require('./middleware/auth');
+const { requireStaff, requireClient } = require('./middleware/rbac');
 const { requireSuperAdmin, requireSuperAdminMfa } = require('./middleware/tenant');
+const { requirePlatformOwner } = require('./middleware/platformAuth');
+
+// The control plane's guard chain, named once.
+//
+// requireSuperAdmin is the ROLE check and stays where it was; requirePlatformOwner
+// is the BOUNDARY — explicit grant (platform_owners, migration 161), platform
+// session audience, and no impersonation. Both, in that order, so the cheap
+// synchronous check refuses the common case before the grant lookup runs.
+//
+// Written as one array rather than repeated at each mount so the platform
+// surface cannot end up with two different definitions of who may reach it.
+const PLATFORM_GUARD = [auth, requireSuperAdmin, requireSuperAdminMfa, requirePlatformOwner];
 const { branchScope }            = require('./middleware/branch-scope');
 const { requireFeature }         = require('./lib/features');
 const { requireAiQuota }         = require('./lib/aiQuota');
@@ -172,6 +313,25 @@ const { requireAiQuota }         = require('./lib/aiQuota');
 // so this changes nothing for anyone until an operator turns something off in
 // the Control Centre — which is the point of the toggle existing.
 const gate = (key) => [auth, requireFeature(key)];
+
+// The same feature gate, plus a role gate.
+//
+// gate() checks that the STUDIO has a feature switched on. It does not check
+// who is asking, and a feature flag is not an authorisation decision. Handlers
+// behind gate() then scope by organization_id, which bounds the studio and
+// says nothing about the role — so a `member` (the account client activation
+// creates for a gym client) satisfied every check and read staff data.
+//
+// Found by memberEscalation.authz.test.js, which drives a real member session
+// at every mount. GET /api/invoices returned every invoice in the studio —
+// other clients' names, invoice numbers and amounts — and GET
+// /api/reports/monthly returned the studio's revenue: it self-scopes for a
+// trainer via `role === 'trainer'`, so a member fell through the branch with
+// no filter at all.
+//
+// Use this for any mount whose data belongs to the studio rather than to the
+// person asking.
+const staffGate = (key) => [auth, requireStaff, requireFeature(key)];
 
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -265,7 +425,41 @@ app.use('/api/webhooks/razorpay', require('./routes/razorpay-webhook'));
 // ────────────────────────
 // BODY PARSING
 // ────────────────────────
-// L-06: 100kb default
+// ── The three endpoints that carry an image inside JSON ─────────────────────
+//
+// 100kb is the right default and stays the default. But three endpoints take a
+// base64 data URL in the body, and base64 inflates bytes by a third:
+//
+//   POST /api/pt-os/clients/:id/photo        the client's profile photo
+//   POST /api/progress/progress-photos       progress photos
+//   POST /api/pt-os/informed-consent/:id/sign  the signature image
+//
+// The client photo is cropped and re-encoded browser-side to 800px JPEG at
+// q0.8 before it is sent, which sounds small and is not. Measured in Chromium
+// on an 800x800 canvas, as the JSON body actually posted:
+//
+//   smooth gradient   14 KB     (best case for JPEG)
+//   detailed / noisy  529 KB    (worst case)
+//
+// A photograph of a person — hair, skin texture, a background — sits near the
+// noisy end. So this limit rejected the request with 413 before the route ran,
+// and it had done so since the feature shipped: the new-client flow posts to
+// the same endpoint, which is why no client in the database has a photo.
+//
+// Raised only for these paths, matched exactly. Everything else keeps 100kb.
+const imageJson = express.json({ limit: '4mb' });
+const IMAGE_JSON_PATHS = [
+  /^\/api\/pt-os\/clients\/[^/]+\/photo$/,
+  /^\/api\/progress\/progress-photos$/,
+  /^\/api\/pt-os\/informed-consent\/[^/]+\/sign$/,
+];
+app.use((req, res, next) => (
+  req.method === 'POST' && IMAGE_JSON_PATHS.some((re) => re.test(req.path))
+    ? imageJson(req, res, next)
+    : next()
+));
+
+// L-06: 100kb default for everything else
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use(cookieParser());
@@ -276,6 +470,19 @@ app.use('/uploads', require('./routes/uploads'));
 // ────────────────────────
 const { originCheck } = require('./middleware/originCheck');
 app.use('/api/', originCheck);
+
+// ────────────────────────
+// FIRST-PARTY SERVICE ATTESTATION
+// ────────────────────────
+// The AI service (repo: mps-ai) relays the end user's own token and adds
+// X-Service-Auth to attest that the relay was it. Mounted here — after
+// originCheck, before auth — so a forged attestation is refused before any
+// user lookup or database work happens.
+//
+// It grants NOTHING: `auth` still resolves the user and tenantScope still
+// filters. Requests without the header — every browser — pass straight through.
+const { serviceAuth } = require('./middleware/serviceAuth');
+app.use('/api/', serviceAuth);
 
 // ────────────────────────
 // INPUT SANITIZATION
@@ -293,11 +500,29 @@ app.use(requestId);
 // ────────────────────────
 // STRUCTURED REQUEST LOGGER
 // ────────────────────────
+const httpMetrics = require('./modules/command-center/httpMetrics');
+
 app.use(function(req, res, next) {
   const start = Date.now();
   res.on('finish', function() {
     const ms = Date.now() - start;
     if (req.path.startsWith('/api/')) {
+      // Feed the Command Center's latency ring from the timing that already
+      // happens here rather than adding a second middleware doing the same
+      // work — two timers would double the cost and could disagree with these
+      // logs the moment someone edits one of them.
+      //
+      // req.route?.path is the MATCHED route ('/:id'), so the key is
+      // '/api/clients/:id' and not a distinct endpoint per client id. Falls
+      // back to the raw path for 404s, which have no matched route. Never
+      // allowed to break the response.
+      try {
+        const matched = req.route?.path
+          ? `${req.baseUrl || ''}${req.route.path}`
+          : req.path;
+        httpMetrics.record(req.method, matched, res.statusCode, ms);
+      } catch { /* metrics must never affect a response */ }
+
       logger.info({
         method: req.method,
         url: req.originalUrl,
@@ -330,6 +555,8 @@ app.get('/api/health', async function(req, res) {
 // ────────────────────────
 // Global IP-based limiter (catches unauthenticated traffic)
 const apiLimiter = rateLimit({
+  store: makeStore('api'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: isProd ? 2000 : 5000,
   standardHeaders: true,
@@ -338,6 +565,8 @@ const apiLimiter = rateLimit({
 
 // M-05: per-user limiter applied after auth so shared IPs don't block each other
 const userApiLimiter = rateLimit({
+  store: makeStore('user'),
+  passOnStoreError: true,
   windowMs: 60 * 1000,
   max: 200,
   standardHeaders: true,
@@ -348,6 +577,8 @@ const userApiLimiter = rateLimit({
 });
 
 const loginLimiter = rateLimit({
+  store: makeStore('login'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: 30,
   standardHeaders: true,
@@ -356,6 +587,8 @@ const loginLimiter = rateLimit({
 });
 
 const registerLimiter = rateLimit({
+  store: makeStore('register'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000,
   max: 10,
   standardHeaders: true,
@@ -403,6 +636,10 @@ app.use('/api/public',            require('./routes/public'));
 // require one. The single-use hashed token IS the credential — see
 // routes/invitations.js for why every rejection returns the same shape.
 app.use('/api/invitations',       require('./routes/invitations'));
+// Public for the same reason: a client activating their login has no password
+// yet. The single-use hashed token IS the credential — see
+// routes/client-activation.js, which holds every rejection to one shape.
+app.use('/api/client-activation', require('./routes/client-activation'));
 // Self-serve trial signup. Deliberately unauthenticated: the whole point is
 // that the applicant does not have an account yet.
 app.use('/api/registrations',     require('./routes/registrations'));
@@ -420,38 +657,82 @@ app.use('/api/features',          require('./routes/features'));
 // no request-controlled org parameter; internal operator notes are excluded by
 // lib/support.TENANT_MESSAGE_SQL. Deliberately NOT feature-gated — a studio
 // must always be able to reach us, whatever else is switched off.
-app.use('/api/support',           require('./routes/support'));
+// requireStaff, not bare auth. routes/support.js mounts `router.use(auth)` and
+// then scopes every handler by organization_id — which bounds the STUDIO but
+// says nothing about the ROLE. A `member` (the account client activation
+// creates for a gym client) passed that filter and could list every support
+// ticket the studio had raised — subject, category, priority, status and
+// created_by_name — and open new ones in the studio's name. These are the
+// studio's private correspondence with the platform: billing disputes,
+// operational complaints, and whatever a frustrated owner typed at midnight.
+//
+// Found by memberEscalation.authz.test.js, which drives a real member session
+// at every mount; the audit asked for that test by name (Section 11).
+// src/app/(chrome)/support/page.tsx is the only caller and lives in the staff
+// shell, so no client-facing screen loses anything.
+app.use('/api/support',           auth, requireStaff, require('./routes/support'));
 app.use('/api/subscription',      require('./routes/subscription'));
 // Global top-nav search. Carries its own rate limiter (see routes/search.js),
 // so it is deliberately NOT wrapped in userApiLimiter — debounced typing would
 // otherwise consume the shared per-user budget that real API calls need.
-app.use('/api/search',            require('./routes/search'));
+// requireStaff: search fans out across the studio's clients, and its own
+// narrowing is `role === 'trainer' ? trainer_id : null` — so a member fell
+// through that branch with NO narrowing and searched the whole studio.
+app.use('/api/search',            auth, requireStaff, require('./routes/search'));
 
-// ROUTE INTEGRITY NOTE (R-02):
-// /api/clients mounts two separate routers. Express resolves in registration
-// order — if both files define the same METHOD+PATH, client-actions.js will
-// be shadowed. Audit both files for overlapping routes before adding new ones.
-app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
-app.use('/api/clients',           userApiLimiter, require('./routes/client-actions'));
+// ONE router, deliberately. This mount used to carry a second file,
+// routes/client-actions.js, whose thirteen endpoints read and wrote the legacy
+// `clients` table — a table with no organization_id column, so nothing mounted
+// on it could be tenant-scoped at all. It was unreachable in practice (the
+// table is empty, so every handler 404'd, and two of the tables it wrote to no
+// longer exist) and nothing called it, but "unreachable" was an accident of
+// there being no rows rather than a property of the code. Deleted; the
+// org-scoped equivalents live under /api/pt-os/clients.
+// See src/__tests__/clients.legacy-table.test.js, which fails if anything
+// mounted here starts reading that table again.
+app.use('/api/clients',           userApiLimiter, auth, requireStaff, require('./routes/clients'));
 
-app.use('/api/trainers',          require('./routes/trainers'));
+// requireStaff: returns t.* per trainer PLUS month_revenue and
+// all_time_revenue. Staff earnings are not client-facing data.
+app.use('/api/trainers',          auth, requireStaff, require('./routes/trainers'));
 // Manual UTR verification payments. MUST be mounted before the finance ledger
 // router below: that one owns DELETE /:id and a bare /:id would otherwise
 // swallow /api/payments/upi/... before this router ever sees it.
 app.use('/api/payments/upi',      userApiLimiter, require('./routes/upi-payments'));
-app.use('/api/payments',          userApiLimiter, require('./routes/payments'));
-app.use('/api/attendance',        ...gate('attendance'), require('./routes/attendance'));
+app.use('/api/payments',          userApiLimiter, auth, requireStaff, require('./routes/payments'));
+app.use('/api/attendance',        auth, requireStaff, ...gate('attendance'), require('./routes/attendance'));
 
-// ROUTE INTEGRITY NOTE (R-03):
-// Legacy /api/reports (routes/reports.js) and v3 /api/v1/reports
-// (modules/reports) coexist. Frontend pages must call the correct version.
-// New pages should use /api/v1/reports. Do not add endpoints to the legacy
-// router — it will be removed once all consumers are migrated.
-app.use('/api/reports',           userApiLimiter, ...gate('insights'), require('./routes/reports'));
+// ROUTE INTEGRITY NOTE (R-03) — SUPERSEDED, and deliberately reversed.
+//
+// This note used to read: "New pages should use /api/v1/reports. Do not add
+// endpoints to the legacy router — it will be removed once all consumers are
+// migrated." That direction is no longer correct and following it would be a
+// tenant-isolation regression, so /api/v1/reports has been deleted and THIS
+// router is the one to build on.
+//
+// What changed is that the v3 model underneath /api/v1/reports was abandoned.
+// It read members, payments and member_memberships; all three are empty, none
+// has an organization_id column, and modules/reports carried no tenant filter
+// of any kind — `GET /api/v1/reports/revenue` was `FROM payments p WHERE
+// p.deleted_at IS NULL` behind auth + admin/manager, i.e. every studio's
+// revenue to any studio's admin. This router scopes every query (see orgParam)
+// and reads the clients / pt_* tables the product actually writes to.
+//
+// So "legacy" had it backwards: /api/reports is the tenant-safe, live
+// implementation, and the migration target was the unsafe one. Do not
+// reintroduce a v1 reports router without organization_id on its tables.
+app.use('/api/reports',           userApiLimiter, ...staffGate('insights'), require('./routes/reports'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
-app.use('/api/leave',             require('./routes/leave'));
-app.use('/api/expenses',          ...gate('finance'), require('./routes/expenses'));
+// requireStaff: staff leave requests — who is off, when, and why. HR data
+// about employees, org-scoped but not role-scoped.
+app.use('/api/leave',             auth, requireStaff, require('./routes/leave'));
+// staffGate, not gate: routes/expenses.js narrows with `if (req.user.role ===
+// 'trainer')` and then applies the org filter — so a member fell through the
+// trainer branch and got the studio's whole expense stats. Third instance of
+// that fall-through after reports/monthly and search; a feature flag is not an
+// authorisation decision.
+app.use('/api/expenses',          ...staffGate('finance'), require('./routes/expenses'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.
@@ -459,33 +740,74 @@ app.use('/api/expenses',          ...gate('finance'), require('./routes/expenses
 app.use('/api/v1/bookings',       require('./modules/bookings/bookings.routes'));
 app.use('/api/bookings',          require('./modules/bookings/bookings.routes'));
 
-// FIX (Route Integrity R-10):
+// FIX (Route Integrity R-10, tightened by audit finding C-1):
 // /api/admin previously relied solely on individual route handlers to apply
 // auth + adminOnly middleware. This left the mount unguarded — any handler
 // that forgot to include the middleware chain would be publicly accessible.
-// We now enforce auth + adminOnly at the mount level as defense-in-depth.
-// Individual handlers may still include the middleware; it is a no-op.
-app.use('/api/admin',             auth, adminOnly, require('./routes/admin-reset'));
+// We enforce auth at the mount level as defense-in-depth. Individual handlers
+// may still include their own middleware; it is a no-op.
+//
+// C-1: admin-reset.js performs platform-wide, unscoped destructive operations
+// (DELETE/DROP across every tenant's data, no organization_id filter — these
+// are irreversible bulk-wipe tools, not ordinary tenant-admin actions). Gating
+// them behind `adminOnly` (role==='admin', the ordinary Studio Owner role
+// auto-granted to every self-serve trial signup) let any trial signup wipe
+// every tenant on the platform. This must be `requireSuperAdmin` +
+// `requireSuperAdminMfa`, matching every other platform-destructive route.
+app.use('/api/admin',             ...PLATFORM_GUARD, require('./routes/admin-reset'));
 app.use('/api/debug',             auth, adminOnly, require('./routes/debug'));
 
-// Platform Super Admin portal (multi-tenant SaaS). Guarded at the mount with
-// auth + requireSuperAdmin — inaccessible to tenant admins and everyone else.
-app.use('/api/super-admin',       auth, requireSuperAdmin, requireSuperAdminMfa, require('./modules/platform/super-admin.routes'));
+// ── The Command Center API — the platform control plane ─────────────────────
+//
+// One router, mounted at two paths, guarded identically.
+//
+// `/api/platform` is the name the boundary actually has. `/api/super-admin`
+// names a ROLE, and naming a security boundary after one of the facts that
+// happens to satisfy it is how the two planes got conflated in the first
+// place: every reader who saw the path concluded the rule was "is this user a
+// super admin", which is precisely the single-string check migration 161 and
+// middleware/platformAuth.js exist to stop being the whole story.
+//
+// The old path stays mounted, and stays mounted indefinitely rather than
+// behind a deprecation window, because it is not only this repo's frontend
+// that calls it — the mobile client ships compiled URLs, and an operator's
+// bookmark is not something this repo can migrate. Both go through
+// PLATFORM_GUARD, so there is one boundary with two names, not two doors.
+const platformRoutes = require('./modules/platform/super-admin.routes');
+app.use('/api/platform',          ...PLATFORM_GUARD, platformRoutes);
+app.use('/api/super-admin',       ...PLATFORM_GUARD, platformRoutes);
 
-app.use('/api/modules',           require('./modules/operations/operations.routes'));
+// requireStaff: the operations workspace behind eight (chrome) tabs —
+// attendance, finance, settings, reports. Migration 174 gave module_records a
+// tenant column and Phase 1 added orgWhere(), which bounds the studio; this
+// bounds the role.
+app.use('/api/modules',           auth, requireStaff, require('./modules/operations/operations.routes'));
 
 // ────────────────────────
 // PREMIUM FEATURE ROUTES (v4)
 // ────────────────────────
 app.use('/api/calendar',          require('./routes/calendar'));
 app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-checkin'));
-app.use('/api/settings',          require('./routes/settings'));
-app.use('/api/invoices',          ...gate('finance'), require('./routes/invoices'));
+// requireStaff: the handler already hides internal_/geo_/biometric_/feature_
+// keys from non-admins, but system_settings carries NO organization_id at all
+// (it is on tenantColumns' KNOWN_GAPS as per-studio keys inside a shared
+// table), so the query is unfiltered by studio as well as by role.
+app.use('/api/settings',          auth, requireStaff, require('./routes/settings'));
+app.use('/api/invoices',          ...staffGate('finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
 // The Exercise Library. Sits behind the same 'programs' feature as the Workout
 // Builder it feeds — a studio with programmes always has the library, and one
 // without it has no use for either.
 app.use('/api/exercises',         ...gate('programs'), require('./routes/exercises'));
+
+// The new training domain (migrations 164-166). Mounted BESIDE /api/workouts
+// rather than over it: the old routes still serve production, and this slice
+// is additive so the two can run together while the UI is rebuilt. Slice G
+// repoints /api/workouts once nothing reads it.
+//
+// Same feature gate as the old one — a studio without 'programs' does not get
+// a degraded builder, it does not get the route.
+app.use('/api/training',          ...gate('programs'), require('./modules/training/training.routes'));
 app.use('/api/diet',              require('./routes/diet'));
 // '/api/biometric-attend' and '/api/webauthn' were mounted here: a second
 // check-in path (fingerprint / GPS) writing the same attendance_logs rows as
@@ -496,7 +818,7 @@ app.use('/api/integrations',      ...gate('integrations'), require('./routes/int
 app.use('/api/campaigns',         ...gate('communication'), require('./routes/campaigns'));
 app.use('/api/offers',            require('./routes/offers'));
 app.use('/api/feedback',          require('./routes/feedback'));
-app.use('/api/communication',     ...gate('communication'), require('./routes/communication'));
+app.use('/api/communication',     auth, requireStaff, ...gate('communication'), require('./routes/communication'));
 // Mounted before /api/ai so /api/ai/knowledge/* is matched here first,
 // regardless of what routes/ai.js's own router does internally.
 // The AI mounts additionally carry a token-quota guard. It runs AFTER the
@@ -506,6 +828,11 @@ app.use('/api/communication',     ...gate('communication'), require('./routes/co
 // guard fails open if the check itself errors — a cost control must not be
 // able to take the AI Suite down. See lib/aiQuota.js.
 app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), requireAiQuota(), require('./routes/aiKnowledge'));
+// Executable actions. Mounted BEFORE routes/ai so /api/ai/actions/* is not
+// swallowed by anything there, and deliberately outside requireAiQuota():
+// these endpoints run no model. Confirming a WhatsApp send must not fail
+// because the studio is over its token allowance for the month.
+app.use('/api/ai',               userApiLimiter, ...gate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
 app.use('/api/ai',               ...gate('ai_suite'), requireAiQuota(), require('./routes/ai'));
 
 // ────────────────────────
@@ -516,24 +843,86 @@ app.use('/api/classes',           require('./routes/classes'));
 // ────────────────────────
 // PT OS — Personal Training Operating System
 // ────────────────────────
-app.use('/api/pt-os',            require('./modules/pt-os/pt-os.routes'));
-app.use('/api/pt-os',            require('./modules/pt-os/parq.routes'));
-app.use('/api/pt-os',            require('./modules/pt-os/informed-consent.routes'));
-app.use('/api/pt-os',            require('./modules/pt-os/workout-log.routes'));
+// The back office, and gated as such at the MOUNT rather than per route.
+//
+// Every handler inside already calls auth(); the pair here runs first so the
+// role check cannot be forgotten on a route added later — which is exactly how
+// the gap this closes came about. Read routes here were `auth`-only, harmless
+// only for as long as no account held the `member` role. Client logins end
+// that, and an ungated GET /api/pt-os/clients hands a client the studio's
+// whole client list. See requireStaff in middleware/rbac.js.
+//
+// auth() running twice is cheap: the second call is a user-cache hit.
+// A client's own data is served by /api/me, which scopes to the caller.
+app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/pt-os.routes'));
+app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/parq.routes'));
+app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/informed-consent.routes'));
+app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/workout-log.routes'));
+
+// The client's own surfaces. Mirror image of the block above: requireClient
+// refuses anyone who is not a `member` linked to a client record, and every
+// query inside is scoped to req.user.pt_client_id — never to an id from the
+// request.
+app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-portal.routes'));
+
+// Trainer-side control of client logins. Staff only, org-scoped.
+app.use('/api/client-login',     auth, requireStaff, require('./routes/client-login'));
 
 // ────────────────────────
 // BUSINESS FLOW ROUTES (v4 — Progress, Automation)
 // ────────────────────────
-app.use('/api/progress',         require('./modules/progress/progress.routes'));
-app.use('/api/automation',       require('./modules/automation/automation.routes'));
+//
+// requireStaff, for the same reason /api/pt-os carries it: both modules serve
+// the studio's back office, and both were mounted on `auth` alone — which was
+// survivable only while no account held the `member` role. Client activation
+// creates those accounts by the hundred, and until this line existed a client
+// with a valid token could call GET /api/progress/lifestyle-assessments and
+// GET /api/automation/session-balance, which between them return health
+// records and other clients' names and phone numbers.
+//
+// A client's own data is served by /api/me, which scopes to the caller.
+//
+// userApiLimiter as well: these two mounts had only the 2000-per-15-minutes
+// global bucket, which is a generous ceiling for an endpoint that returns
+// health records a page at a time.
+app.use('/api/progress',   userApiLimiter, auth, requireStaff, require('./modules/progress/progress.routes'));
+app.use('/api/automation', userApiLimiter, auth, requireStaff, require('./modules/automation/automation.routes'));
 
 // ────────────────────────
 // v3 MODULE ROUTES
 // ────────────────────────
-app.use('/api/v1/members',        require('./modules/members/members.routes'));
-app.use('/api/v1/pt-sessions',    require('./modules/sessions/sessions.routes'));
+//
+// /api/v1/pt-sessions and /api/v1/reports were removed along with
+// modules/sessions and modules/reports. Both were unreachable from the client
+// and duplicated live implementations (/api/pt-os/sessions and /api/reports),
+// but the reason they had to go rather than be left alone is tenant isolation:
+// neither carried any. `GET /api/v1/reports/revenue` was auth + admin/manager
+// with `FROM payments p WHERE p.deleted_at IS NULL` and no organization filter,
+// so any studio's admin could read every studio's revenue. routes/reports.js,
+// which the client actually calls, scopes every query.
+//
+// They were harmless in practice only because they read the abandoned v3
+// tables — members, payments and member_memberships are all empty, and none of
+// the three even has an organization_id column to filter on. That is precisely
+// what made them dangerous to keep: the day anyone populated those tables, five
+// endpoints would have started serving cross-tenant data with no code change
+// and nothing to notice it. They cannot be fixed in place without a schema
+// change to tables holding no data, so deleting them is the honest option.
+//
+// /api/v1/members has now gone the same way, for the same reason and after the
+// same check. It was kept because the client appeared to call two of its
+// routes; both were dead — defined in the frontend's api barrel and invoked
+// from nowhere. A read-only count against production returned 0 rows, 0
+// organisations represented, 0 attributable rows, 0 duplicate member codes.
+// See src/db/migrations/MEMBERS-TENANT-GAP.md for the audit and the decision.
+//
+// The members TABLE is deliberately untouched: workers/renewal.worker.js still
+// joins it, member_memberships still has a foreign key to it, and dropping a
+// table was never part of this.
+//
+// /api/v1/notifications stays — it backs the notification bell and has a live
+// caller.
 app.use('/api/v1/notifications',  require('./modules/notifications/notifications.routes'));
-app.use('/api/v1/reports',        require('./modules/reports/reports.routes'));
 
 // ────────────────────────
 // 404 + GLOBAL ERROR HANDLER
@@ -583,18 +972,47 @@ runMigrationsWithRetry()
       }, 'MY PT STUDIO API listening on port %d (%s)', PORT, NODE_ENV);
     });
 
-    // Render free tier sleeps after 15 min without inbound traffic — ping every
-    // 14 min, during studio hours only. See lib/keepalive.js for why the ping
-    // has to go to the public URL rather than localhost, and why it stops
-    // overnight instead of running around the clock.
+    // ── Command Center realtime stream (Phase 3) ──────────────────────────
+    //
+    // Attached to the http.Server, not to Express: an Upgrade is an event on
+    // the server and never enters the middleware stack, so `auth` cannot see
+    // it. The socket is authenticated by a single-use ticket minted over the
+    // already-authenticated HTTPS channel instead — the browser addresses
+    // api.myptstudio.com directly here (the frontend's Next.js rewrite cannot
+    // carry an Upgrade) and the session cookie belongs to myptstudio.com.
+    // See modules/command-center/tickets.js for the alternatives and why.
+    //
+    // Nothing degrades when this is off: the console falls back to polling the
+    // same snapshot endpoint, which is what it did before Phase 3.
+    // Disable with COMMAND_CENTER_STREAM=off.
+    let commandCenterStream = null;
+    if (process.env.COMMAND_CENTER_STREAM !== 'off') {
+      commandCenterStream = require('./modules/command-center/stream');
+      commandCenterStream.attach(server, { allowedOrigins });
+    }
+
+    // Keepalive — a leftover from a sleep-on-idle host, INERT on this VPS.
+    //
+    // The containers run under `restart: unless-stopped` and nothing spins them
+    // down, so there is nothing to keep awake. It stays because a future
+    // deployment might sleep again and because ripping out a working feature is
+    // not a cleanup; it is disabled simply by leaving KEEPALIVE_URL unset,
+    // which is the state on this box.
+    //
+    // The message below used to say the service "will sleep after 15 minutes
+    // idle" whenever the variable was absent. On a VPS that is false, and it is
+    // exactly the kind of line that sends someone chasing a problem that does
+    // not exist — so it now states what is true and leaves the judgement open.
     if (isProd) {
       const { resolveKeepalive, isWithinActiveHours } = require('./lib/keepalive');
       const PING_INTERVAL_MS = 14 * 60 * 1000;
       const ka = resolveKeepalive(process.env);
 
       if (!ka.url) {
-        logger.warn(
-          'Keepalive disabled — no RENDER_EXTERNAL_URL or KEEPALIVE_URL. The service will sleep after 15 minutes idle and the next visitor pays a cold start.'
+        logger.info(
+          'Keepalive not configured (no KEEPALIVE_URL). Expected on a VPS, where the '
+          + 'containers do not sleep; only set this if the app is ever moved to a host '
+          + 'that spins down when idle.'
         );
       } else {
         setInterval(() => {
@@ -670,10 +1088,98 @@ runMigrationsWithRetry()
       logger.info({ interval: '15min' }, 'UPI expiry sweeps scheduled');
     }
 
+    // Command Center log persistence (D4). The ring buffer needs no scheduling
+    // — it is filled synchronously by the logger — but the critical lines it
+    // queues are written in batches, and the table needs a retention sweep or
+    // it grows forever.
+    //
+    // Deliberately NOT wrapped in a logger call on failure: logCapture writes
+    // its own errors straight to stderr, because logging a failure to persist
+    // logs is how that feature turns into an infinite loop.
+    // Disable with LOG_CAPTURE=off (which also disables the capture itself).
+    if (process.env.LOG_CAPTURE !== 'off') {
+      const logCapture = require('./modules/command-center/logCapture');
+      // 5s: long enough to batch a burst into one statement, short enough that
+      // a crash loses only a few seconds of error lines — and they are still on
+      // stdout regardless, which Docker has already collected.
+      setInterval(() => { logCapture.flush(); }, 5 * 1000).unref();
+      // Retention. Hourly rather than daily so the delete is always small.
+      setInterval(() => { logCapture.prune(); }, 60 * 60 * 1000).unref();
+      logger.info(
+        { flush: '5s', retention_days: Number(process.env.LOG_RETENTION_DAYS) || 30 },
+        'Command Center log capture active',
+      );
+    }
+
+    // Refresh token retention.
+    //
+    // Deliberately OUTSIDE the LOG_CAPTURE guard above: this has nothing to do
+    // with the Command Centre, and turning off log capture must not silently
+    // stop pruning the auth table. Hourly for the same reason — the first
+    // sweep on a database that has never been pruned drains a backlog in
+    // bounded batches rather than one large statement.
+    {
+      const refreshTokens = require('./lib/refreshTokenRetention');
+      const sweep = () => { refreshTokens.prune(); };
+      setInterval(sweep, 60 * 60 * 1000).unref();
+      // Once at boot too: a container that restarts more often than hourly
+      // would otherwise never reach the first interval tick.
+      sweep();
+      logger.info(
+        { retention_days: Number(process.env.REFRESH_TOKEN_RETENTION_DAYS)
+            || refreshTokens.DEFAULT_RETENTION_DAYS },
+        'Refresh token retention active',
+      );
+    }
+
+    // Command Center alerting. Without this the Alert Center only notices a
+    // problem while somebody has the console open, which is the opposite of
+    // what alerting is for — the point is being told when you are NOT looking.
+    //
+    // Runs in the API process rather than the worker on purpose: the runtime
+    // and http collectors measure THIS process (event-loop lag, heap, the
+    // request-timing ring), and the worker can see none of it.
+    //
+    // A plain interval is safe for the same reason it is safe for the
+    // announcement dispatcher above: the writes are idempotent. Overlapping
+    // ticks cannot double-open an alert, because migration 150 puts a partial
+    // unique index on (fingerprint) WHERE status <> 'resolved'.
+    // Disable with ALERT_EVALUATION=off.
+    if (process.env.ALERT_EVALUATION !== 'off') {
+      const alerts = require('./modules/command-center/alerts.service');
+      const alertTick = () => alerts.evaluate()
+        .then((r) => {
+          if (r.opened.length || r.escalated.length || r.resolved.length) {
+            logger.info({
+              opened: r.opened.map((a) => a.source),
+              escalated: r.escalated.map((a) => a.source),
+              resolved: r.resolved.map((a) => a.source),
+            }, 'Alert evaluation changed state');
+          }
+        })
+        // evaluate() already swallows per-card failures; this is the belt for
+        // anything outside them, so a bad tick never becomes an unhandled
+        // rejection once a minute for the life of the process.
+        .catch((err) => logger.warn({ err: err.message }, 'Alert evaluation failed'));
+      // First pass only once boot has settled. Evaluating while the pool is
+      // still warming would open a database alert about our own cold start.
+      setTimeout(alertTick, 120 * 1000).unref();
+      setInterval(alertTick, 60 * 1000).unref();
+      logger.info({ interval: '60s' }, 'Command Center alert evaluation scheduled');
+    }
+
     const pool = require('./db/pool');
     function shutdown(sig) {
       return function() {
         logger.info({ signal: sig }, 'Received signal — shutting down');
+
+        // Before server.close(), not inside its callback. `close()` stops
+        // accepting new connections and then waits for the open ones to end —
+        // and a WebSocket never ends on its own. Left running, every deploy
+        // would sit out the full 10s force-exit below for as long as one
+        // operator had the console open.
+        if (commandCenterStream) commandCenterStream.close(server);
+
         server.close(async function() {
           try {
             if (workers.length) {

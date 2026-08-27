@@ -35,13 +35,17 @@ function syncBookingToCalendar(action, memberId, bookingId) {
 
   (async () => {
     const { rows } = await pool.query(
-      'SELECT id FROM users WHERE member_id = $1 AND deleted_at IS NULL LIMIT 1',
+      `SELECT u.id, o.name AS organization_name
+       FROM users u
+       LEFT JOIN organizations o ON o.id = u.organization_id
+       WHERE u.member_id = $1 AND u.deleted_at IS NULL
+       LIMIT 1`,
       [memberId]
     );
     const userId = rows[0]?.id;
     if (!userId) return;
 
-    if (action === 'create') await cal.createBookingEvent(userId, bookingId);
+    if (action === 'create') await cal.createBookingEvent(userId, bookingId, rows[0].organization_name);
     else await cal.deleteBookingEvent(userId, bookingId);
   })().catch((err) => {
     logger.warn({ err: err.message, action, bookingId }, 'calendar sync failed (non-critical)');
@@ -53,15 +57,28 @@ function syncBookingToCalendar(action, memberId, bookingId) {
  * Atomic: locks the session row, counts confirmed bookings, decides confirmed vs waitlist.
  */
 async function book({ session_id, member_id }, ctx) {
+  // A booking is a studio-owned record, so it must have a studio. A platform
+  // super admin operating platform-wide has no organization_id and cannot pick
+  // one implicitly — refusing here is clearer than inserting NULL and hitting
+  // the NOT NULL constraint from migration 176 as an opaque 500.
+  if (!ctx.organization_id) {
+    throw new HttpError(400, 'NO_ORGANIZATION', 'Booking requires a studio context');
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1. Lock the session row to serialize concurrent bookers
+    // 1. Lock the session row to serialize concurrent bookers.
+    //
+    // Scoped by organization: without it a member of studio A could book a
+    // seat in studio B's class simply by knowing (or guessing) a session id,
+    // consuming a credit against the wrong studio's capacity. 404 rather than
+    // 403 so the response does not confirm the session exists elsewhere.
     const sessionRes = await client.query(
       `SELECT id, capacity, starts_at, status, template_id
-       FROM class_sessions WHERE id = $1 FOR UPDATE`,
-      [session_id]
+       FROM class_sessions WHERE id = $1 AND organization_id = $2 FOR UPDATE`,
+      [session_id, ctx.organization_id]
     );
     if (sessionRes.rows.length === 0) throw new HttpError(404, 'NOT_FOUND', 'Class session not found');
     const session = sessionRes.rows[0];
@@ -86,9 +103,10 @@ async function book({ session_id, member_id }, ctx) {
        FROM member_memberships mm
        JOIN plans p ON p.id = mm.plan_id
        WHERE mm.member_id = $1 AND mm.status = 'active'
+         AND mm.organization_id = $2
          AND mm.start_date <= CURRENT_DATE AND mm.end_date >= CURRENT_DATE
        ORDER BY mm.end_date DESC LIMIT 1`,
-      [member_id]
+      [member_id, ctx.organization_id]
     );
     if (mm.rows.length === 0) throw new HttpError(402, 'NO_MEMBERSHIP', 'Active membership required');
     const membership = mm.rows[0];
@@ -118,10 +136,10 @@ async function book({ session_id, member_id }, ctx) {
 
     // 5. Insert booking
     const bookingRes = await client.query(
-      `INSERT INTO bookings (session_id, member_id, membership_id, status, position)
-       VALUES ($1,$2,$3,$4,$5)
+      `INSERT INTO bookings (session_id, member_id, membership_id, status, position, organization_id)
+       VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING *`,
-      [session_id, member_id, membership.id, status, position]
+      [session_id, member_id, membership.id, status, position, ctx.organization_id]
     );
     const booking = bookingRes.rows[0];
 
@@ -133,10 +151,16 @@ async function book({ session_id, member_id }, ctx) {
       );
     }
 
-    // 7. Audit + notification (queued; not awaited here in real impl)
+    // 7. Audit + notification (queued; not awaited here in real impl).
+    // Previously targeted a differently-shaped legacy table and threw on
+    // every call (unreached in practice — this module has no frontend
+    // caller). Fixed to the table every other audited write in the app
+    // uses, on the same client/transaction so a rollback also rolls this
+    // back.
     await client.query(
-      `INSERT INTO audit_log (user_id, action, entity, entity_id, after) VALUES ($1,'booking.create','booking',$2,$3)`,
-      [ctx.user_id, booking.id, booking]
+      `INSERT INTO activity_log (user_id, user_name, action, entity_type, entity_id, new_data, organization_id)
+       VALUES ($1,$2,'booking.create','booking',$3,$4,$5)`,
+      [ctx.user_id, ctx.user_name || null, booking.id, JSON.stringify(booking), ctx.organization_id || null]
     );
 
     await client.query('COMMIT');
@@ -164,14 +188,25 @@ async function cancel(bookingId, { reason } = {}, ctx) {
   try {
     await client.query('BEGIN');
 
+    // Scoped by organization. The role check below only ever constrained
+    // `member`, so before this an admin, manager or trainer of ANY studio
+    // could cancel ANY booking on the platform by id — the booking's own
+    // studio was never consulted. 404 rather than 403: a caller outside the
+    // studio must not be able to tell the booking exists.
+    const params = [bookingId];
+    let orgClause = '';
+    if (ctx.organization_id) {
+      params.push(ctx.organization_id);
+      orgClause = ` AND b.organization_id = $${params.length}`;
+    }
     const r = await client.query(
       `SELECT b.*, cs.starts_at, cs.capacity, mm.plan_id, p.included_classes
        FROM bookings b
        JOIN class_sessions cs ON cs.id = b.session_id
        LEFT JOIN member_memberships mm ON mm.id = b.membership_id
        LEFT JOIN plans p ON p.id = mm.plan_id
-       WHERE b.id = $1 FOR UPDATE OF b`,
-      [bookingId]
+       WHERE b.id = $1${orgClause} FOR UPDATE OF b`,
+      params
     );
     if (r.rows.length === 0) throw new HttpError(404, 'NOT_FOUND', 'Booking not found');
     const b = r.rows[0];
@@ -224,8 +259,9 @@ async function cancel(bookingId, { reason } = {}, ctx) {
     }
 
     await client.query(
-      `INSERT INTO audit_log (user_id, action, entity, entity_id) VALUES ($1,'booking.cancel','booking',$2)`,
-      [ctx.user_id, bookingId]
+      `INSERT INTO activity_log (user_id, user_name, action, entity_type, entity_id, organization_id)
+       VALUES ($1,$2,'booking.cancel','booking',$3,$4)`,
+      [ctx.user_id, ctx.user_name || null, bookingId, ctx.organization_id || null]
     );
     await client.query('COMMIT');
 
@@ -253,29 +289,50 @@ async function cancel(bookingId, { reason } = {}, ctx) {
 /**
  * Check in (member arrives at the gym).
  */
-async function checkIn(bookingId, { method = 'manual' }, _ctx) {
+async function checkIn(bookingId, { method = 'manual' }, ctx = {}) {
+  // The route gates this on requireRole('admin','manager','trainer') — but a
+  // role is not an ownership check. Any admin or trainer of any studio could
+  // mark any booking on the platform as attended, and the mirrored attendance
+  // row landed in whatever studio the row belonged to. The organization filter
+  // is what makes the role check mean "of THIS studio".
+  const params = [bookingId, method];
+  let orgClause = '';
+  if (ctx.organization_id) {
+    params.push(ctx.organization_id);
+    orgClause = ` AND organization_id = $${params.length}`;
+  }
   const r = await pool.query(
     `UPDATE bookings SET status='attended', checked_in_at = NOW(), check_in_method = $2
-     WHERE id = $1 AND status = 'confirmed'
+     WHERE id = $1 AND status = 'confirmed'${orgClause}
      RETURNING *`,
-    [bookingId, method]
+    params
   );
   if (r.rows.length === 0) throw new HttpError(400, 'BAD_STATE', 'Booking not confirmed or already attended');
 
-  // Mirror to attendance table
+  // Mirror to attendance table. organization_id comes from the booking row
+  // that was just verified, not from ctx — so the mirror cannot land in a
+  // different studio from the booking it mirrors even if the two disagree.
   const b = r.rows[0];
   await pool.query(
-    `INSERT INTO attendance (type, ref_id, member_id, booking_id, branch_id, date, check_in, status, check_in_method)
-     VALUES ('client', $1, $1, $2, COALESCE($4, 'br-main'), CURRENT_DATE, NOW()::time, 'present', $3)
+    `INSERT INTO attendance (type, ref_id, member_id, booking_id, branch_id, date, check_in, status, check_in_method, organization_id)
+     VALUES ('client', $1, $1, $2, COALESCE($4, 'br-main'), CURRENT_DATE, NOW()::time, 'present', $3, $5)
      ON CONFLICT (type, ref_id, date) DO UPDATE SET check_in = EXCLUDED.check_in, status = 'present'`,
-    [b.member_id, b.id, method, process.env.BRANCH_ID || null]
+    [b.member_id, b.id, method, process.env.BRANCH_ID || null, b.organization_id]
   );
   return b;
 }
 
-async function listForMember(memberId, { from, to, status } = {}) {
+// `memberId` reaches this from ?member_id= for any non-member caller, so the
+// organization filter is the only thing standing between a studio A admin and
+// studio B's members' class history. Passing an unknown member id now returns
+// an empty list rather than another studio's bookings.
+async function listForMember(memberId, { from, to, status } = {}, scope = {}) {
   const params = [memberId];
   const where = [`b.member_id = $1`];
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    where.push(`b.organization_id = $${params.length}`);
+  }
   if (from)   { params.push(from);   where.push(`cs.starts_at >= $${params.length}`); }
   if (to)     { params.push(to);     where.push(`cs.starts_at <= $${params.length}`); }
   if (status) { params.push(status); where.push(`b.status = $${params.length}`); }

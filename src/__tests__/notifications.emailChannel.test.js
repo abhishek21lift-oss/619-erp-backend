@@ -4,7 +4,7 @@
 // from that duplication:
 //
 //   1. Its "secure" flag came from SMTP_SECURE, a variable nothing in
-//      .env.example or render.yaml ever told anyone to set. lib/email.js has
+//      .env.example ever told anyone to set. lib/email.js has
 //      always derived it correctly from the port (secure = port === 465).
 //      On Hostinger port 465, that mismatch means this channel never worked.
 //   2. When NEITHER Resend nor SMTP was configured, it returned

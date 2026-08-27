@@ -44,15 +44,22 @@ async function dispatchAiJob(type, payload, fallback) {
 }
 
 /**
- * Worker processor. ingestDocument already records failures on the document
- * row (status='failed'), so throwing from here is reserved for actual bugs.
+ * Worker processor. BullMQ's `Queue.add(name, data)` (see enqueueAiJob)
+ * carries the job type in `job.name`; `job.data` holds only the payload
+ * ({ documentId }). This matches every other worker in the repo
+ * (e.g. renewal.worker.js dispatches on job.name).
+ *
+ * ingestDocument already records failures on the document row
+ * (status='failed'), so throwing from here is reserved for actual bugs —
+ * including unknown job names, which must fail loudly rather than silently
+ * no-op.
  */
 async function processAiJob(job) {
-  const { type } = job.data || {};
+  const type = job.name;
   const { ingestDocument } = require('../lib/ai/knowledgeBase');
 
   if (type === 'ingest_document' || type === 'reindex_document') {
-    return ingestDocument(job.data.documentId);
+    return ingestDocument(job.data?.documentId);
   }
   throw new Error(`Unknown ai job type: ${type}`);
 }

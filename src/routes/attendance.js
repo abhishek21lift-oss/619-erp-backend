@@ -13,7 +13,35 @@ const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+
+// ── AUD-004 (P1): this is the studio's back office ──────────────────────────
+//
+// Every route below was gated on `auth` alone. The mount in server.js adds
+// `gate('attendance')`, which is [auth, requireFeature('attendance')] — a
+// feature flag, not a role check. And the ownership check inside PUT and
+// DELETE is written `if (req.user.role === 'trainer')`, so an account with role
+// `member` falls straight through it.
+//
+// The result, with an ordinary session and no exploit: an activated client
+// could read the studio's entire attendance register — every other client's
+// name, dates and times — and create, edit or delete rows in it. Reproduced in
+// __tests__/security/attendance.authz.test.js, where a `member` got 201 from
+// POST /bulk and 200 from /stats, /gaps and /today-summary against the code
+// this comment replaces.
+//
+// Declared HERE rather than at the mount, matching offers.js / campaigns.js /
+// feedback.js / integrations.js: the guard travels with the router, so it
+// cannot be lost if the mount is edited or the router is mounted a second time.
+// `auth` runs twice as a result (once from the mount's gate, once here) and
+// that is deliberate and cheap — the second call is a user-cache hit, and the
+// same doubling already happens on every /api/pt-os mount.
+//
+// A client's own attendance is served by GET /api/me/attendance
+// (modules/client-portal/client-portal.routes.js), which scopes to
+// req.user.pt_client_id — so nothing member-facing is lost here.
+router.use(auth, requireStaff);
 
 // GET /api/attendance?date=YYYY-MM-DD&type=client&page=1&limit=100
 router.get('/', auth, async (req, res, next) => {
@@ -26,7 +54,7 @@ router.get('/', auth, async (req, res, next) => {
     if (req.user.role === 'trainer' && req.user.trainer_id) {
       conditions.push(`a.ref_type = 'client'`);
       params.push(req.user.trainer_id);
-      conditions.push(`a.ref_id IN (SELECT id FROM clients WHERE trainer_id = $${p} UNION SELECT id FROM pt_clients WHERE trainer_id = $${p})`);
+      conditions.push(`a.ref_id IN (SELECT id FROM pt_clients WHERE trainer_id = $${p})`);
       p++;
     }
     if (date)   { conditions.push(`a.date = $${p++}`);     params.push(date); }
@@ -47,7 +75,7 @@ router.get('/', auth, async (req, res, next) => {
     // Pagination: if page is provided use paginated response, otherwise fall back to legacy limit
     if (req.query.page !== undefined) {
       const page = parseInt(req.query.page) || 1;
-      const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
       const offset = (page - 1) * limit;
 
       const { rows: countRows } = await pool.query(
@@ -97,14 +125,11 @@ router.post('/', auth, async (req, res, next) => {
 
     const type = d.type || 'client';
 
-    // RBAC: trainers can only mark attendance for their own clients (gym and PT)
+    // RBAC: trainers can only mark attendance for their own clients (PT)
     if (req.user.role === 'trainer') {
       if (type === 'client') {
         const { rows: own } = await pool.query(
-          `SELECT trainer_id FROM clients WHERE id = $1 AND deleted_at IS NULL
-           UNION
-           SELECT trainer_id FROM pt_clients WHERE id = $1 AND deleted_at IS NULL
-           LIMIT 1`,
+          `SELECT trainer_id FROM pt_clients WHERE id = $1 AND deleted_at IS NULL LIMIT 1`,
           [d.ref_id]
         );
         if (!own[0]) return res.status(404).json({ error: 'Client not found' });
@@ -150,7 +175,7 @@ router.get('/today-summary', auth, async (req, res, next) => {
     let trainerFilter = '';
     if (req.user.role === 'trainer' && req.user.trainer_id) {
       params.push(req.user.trainer_id);
-      trainerFilter = 'AND a.ref_id IN (SELECT id FROM clients WHERE trainer_id = $' + params.length + ' UNION SELECT id FROM pt_clients WHERE trainer_id = $' + params.length + ') ';
+      trainerFilter = 'AND a.ref_id IN (SELECT id FROM pt_clients WHERE trainer_id = $' + params.length + ') ';
     }
     const scope = tenantScope(req);
     let orgFilter = '';
@@ -186,10 +211,7 @@ router.put('/:id', auth, async function(req, res, next) {
     // RBAC: trainers can only edit records belonging to their own clients
     if (req.user.role === 'trainer') {
       const { rows: own } = await pool.query(
-        `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
-         UNION
-         SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
-         LIMIT 1`,
+        `SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2 LIMIT 1`,
         [existing[0].ref_id, req.user.trainer_id]
       );
       if (!own[0]) return res.status(403).json({ error: 'Access denied' });
@@ -231,10 +253,7 @@ router.delete('/:id', auth, async function(req, res, next) {
     // RBAC: trainers can only delete records belonging to their own clients
     if (req.user.role === 'trainer') {
       const { rows: own } = await pool.query(
-        `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
-         UNION
-         SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
-         LIMIT 1`,
+        `SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2 LIMIT 1`,
         [existing[0].ref_id, req.user.trainer_id]
       );
       if (!own[0]) return res.status(403).json({ error: 'Access denied' });
@@ -274,13 +293,10 @@ router.post('/bulk', auth, async function(req, res, next) {
         const type = d.type || 'client';
         const id = randomUUID();
 
-        // RBAC: trainers scoped to own clients (gym and PT)
+        // RBAC: trainers scoped to own clients (PT)
         if (req.user.role === 'trainer') {
           const { rows: own } = await pool.query(
-            `SELECT 1 FROM clients WHERE id = $1 AND trainer_id = $2
-             UNION
-             SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2
-             LIMIT 1`,
+            `SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2 LIMIT 1`,
             [d.ref_id, req.user.trainer_id]
           );
           if (!own[0]) {
@@ -336,7 +352,7 @@ router.get('/stats', auth, async function(req, res, next) {
     let trainerFilter = '';
     if (req.user.role === 'trainer' && req.user.trainer_id) {
       params.push(req.user.trainer_id);
-      trainerFilter = 'AND a.ref_id IN (SELECT id FROM clients WHERE trainer_id = $' + params.length + ' UNION SELECT id FROM pt_clients WHERE trainer_id = $' + params.length + ') ';
+      trainerFilter = 'AND a.ref_id IN (SELECT id FROM pt_clients WHERE trainer_id = $' + params.length + ') ';
     }
     const scope = tenantScope(req);
     let orgFilter = '';
@@ -382,21 +398,20 @@ router.get('/gaps', auth, async function(req, res, next) {
       params.push(req.user.trainer_id);
       trainerFilter = 'AND c.trainer_id = $' + params.length + ' ';
     }
-    // Tenant scope: the client identity list must be limited to this org. The
-    // legacy `clients` table has no organization_id (it is empty in this
-    // deployment), so we scope the pt_clients branch plus the attendance
-    // references (a / a2). $orgIdx is reused in three places.
+    // Tenant scope: the client identity list must be limited to this org.
     const scope = tenantScope(req);
     let ptOrg = '', aOrg = '', a2Org = '';
     if (scope.applyFilter) {
       params.push(scope.orgId);
       const orgIdx = params.length;
-      ptOrg = ' AND organization_id = $' + orgIdx;
+      // Qualified as c.organization_id: both pt_clients and attendance_logs
+      // carry the column, so an unqualified reference is ambiguous.
+      ptOrg = ' AND c.organization_id = $' + orgIdx;
       aOrg = ' AND a.organization_id = $' + orgIdx;
       a2Org = ' AND a2.organization_id = $' + orgIdx;
     }
 
-    // Find members (gym + PT) with absent streak >= minStreak
+    // Find members (PT) with absent streak >= minStreak
     const { rows } = await pool.query(
       'SELECT c.id, c.name, c.mobile, c.trainer_id, ' +
       'COALESCE(t.name, \'—\') AS trainer_name, ' +
@@ -405,14 +420,11 @@ router.get('/gaps', auth, async function(req, res, next) {
       '(SELECT COUNT(*) FROM attendance_logs a2 ' +
       '  WHERE a2.ref_id = c.id AND a2.ref_type = \'client\' ' +
       '  AND a2.date >= $1::DATE AND a2.date <= $2::DATE' + a2Org + ') AS total_entries ' +
-      'FROM (' +
-      '  SELECT id, name, mobile, trainer_id FROM clients WHERE deleted_at IS NULL AND status = \'active\' ' +
-      '  UNION ALL ' +
-      '  SELECT id, name, mobile, trainer_id FROM pt_clients WHERE deleted_at IS NULL AND status = \'active\'' + ptOrg +
-      ') c ' +
+      'FROM pt_clients c ' +
       'LEFT JOIN attendance_logs a ON a.ref_id = c.id AND a.ref_type = \'client\' AND a.status = \'absent\'' + aOrg + ' ' +
       'LEFT JOIN trainers t ON t.id = c.trainer_id ' +
-      'WHERE 1=1 ' + trainerFilter +
+      'WHERE c.deleted_at IS NULL AND c.status = \'active\'' + ptOrg + ' ' +
+      trainerFilter +
       'GROUP BY c.id, c.name, c.mobile, c.trainer_id, t.name ' +
       'HAVING COUNT(a.id) >= $3 ' +
       'ORDER BY absent_days DESC',

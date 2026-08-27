@@ -194,5 +194,7 @@ describe('generateQrDataUrl', () => {
     const dataUrl = await upi.generateQrDataUrl(intent);
     expect(dataUrl.startsWith('data:image/png;base64,')).toBe(true);
     expect(dataUrl.length).toBeGreaterThan(500);
-  });
+    // The qrcode PNG encoder runs ~50x slower inside Jest's VM than in plain
+    // node (~6.3s vs 116ms measured), so the default 5s timeout is not enough.
+  }, 20000);
 });

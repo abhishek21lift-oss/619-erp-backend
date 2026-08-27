@@ -14,8 +14,7 @@ function orgParam(req) {
 }
 
 // GET /api/reports/monthly
-// ISSUE-029: UNIONs gym payments with PT payments so the monthly
-// revenue figures include both revenue streams.
+// Monthly revenue from PT payments only (legacy `payments` table is empty).
 router.get('/monthly', auth, async (req, res, next) => {
   try {
     const { year = new Date().getFullYear() } = req.query;
@@ -24,7 +23,7 @@ router.get('/monthly', auth, async (req, res, next) => {
     const params = tid ? [parseInt(year), tid] : [parseInt(year)];
     const trainerWhere = tid ? 'AND p.trainer_id=$2' : '';
     // Tenant isolation: scope PT revenue to the caller's org (null-safe for
-    // platform super admins). The legacy `payments` union is empty here.
+    // platform super admins).
     params.push(orgParam(req));
     const ptOrgWhere = `AND ($${params.length}::uuid IS NULL OR p.organization_id = $${params.length})`;
 
@@ -36,16 +35,6 @@ router.get('/monthly', auth, async (req, res, next) => {
         COALESCE(SUM(revenue), 0) AS revenue,
         COALESCE(SUM(incentives), 0) AS incentives
       FROM (
-        SELECT
-          EXTRACT(MONTH FROM p.date::date) AS month_num,
-          TO_CHAR(DATE_TRUNC('month', p.date::date), 'Month') AS month_name,
-          p.amount AS revenue,
-          p.incentive_amt AS incentives
-        FROM payments p
-        WHERE EXTRACT(YEAR FROM p.date::date) = $1
-          AND p.deleted_at IS NULL
-          ${trainerWhere}
-        UNION ALL
         SELECT
           EXTRACT(MONTH FROM p.date::date) AS month_num,
           TO_CHAR(DATE_TRUNC('month', p.date::date), 'Month') AS month_name,
@@ -67,9 +56,7 @@ router.get('/monthly', auth, async (req, res, next) => {
 });
 
 // GET /api/reports/trainer-summary (admin only)
-// ISSUE-021: after migration 017/018, PT clients live in pt_clients and PT
-// payments live in pt_payments. Both tables are joined so the summary
-// includes gym clients + PT clients and gym payments + PT payments.
+// Trainer summary from PT clients and PT payments only (legacy tables are empty).
 router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
   try {
     // Tenant isolation: scope to the caller's org via the driving `trainers`
@@ -77,18 +64,12 @@ router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
     // hang off trainer_id, so scoping trainers scopes the whole summary.
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
-        COUNT(DISTINCT c.id)   FILTER (WHERE c.status='active'   AND c.deleted_at IS NULL)   +
-        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
-        COUNT(DISTINCT c.id)   FILTER (WHERE c.deleted_at IS NULL)   +
-        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
-        COALESCE(SUM(p.amount)   FILTER (WHERE p.date   >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),   0) +
+        COUNT(ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
+        COUNT(ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
         COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.date >= DATE_TRUNC('month',NOW()) AND ptp.deleted_at IS NULL), 0) AS month_revenue,
-        COALESCE(SUM(p.amount)   FILTER (WHERE p.deleted_at IS NULL),   0) +
         COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.deleted_at IS NULL), 0) AS total_revenue
       FROM trainers t
-      LEFT JOIN clients     c   ON c.trainer_id   = t.id
       LEFT JOIN pt_clients  ptc ON ptc.trainer_id = t.id
-      LEFT JOIN payments    p   ON p.trainer_id   = t.id
       LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
       WHERE t.status = 'active'
         AND ($1::uuid IS NULL OR t.organization_id = $1)
@@ -103,25 +84,19 @@ router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
 });
 
 // GET /api/reports/trainers — alias for /trainer-summary (used by frontend Reports page)
-// ISSUE-021: mirrors the fix above — includes pt_clients + pt_payments.
+// Trainer summary from PT clients and PT payments only (legacy tables are empty).
 router.get('/trainers', auth, adminOnly, async (req, res, next) => {
   try {
     // Tenant isolation: scope to the caller's org via the driving `trainers`
     // table (null-safe for platform super admins).
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
-        COUNT(DISTINCT c.id)   FILTER (WHERE c.status='active'   AND c.deleted_at IS NULL)   +
-        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
-        COUNT(DISTINCT c.id)   FILTER (WHERE c.deleted_at IS NULL)   +
-        COUNT(DISTINCT ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
-        COALESCE(SUM(p.amount)   FILTER (WHERE p.date   >= DATE_TRUNC('month',NOW()) AND p.deleted_at IS NULL),   0) +
+        COUNT(ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
+        COUNT(ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
         COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.date >= DATE_TRUNC('month',NOW()) AND ptp.deleted_at IS NULL), 0) AS month_revenue,
-        COALESCE(SUM(p.amount)   FILTER (WHERE p.deleted_at IS NULL),   0) +
         COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.deleted_at IS NULL), 0) AS total_revenue
       FROM trainers t
-      LEFT JOIN clients     c   ON c.trainer_id   = t.id
       LEFT JOIN pt_clients  ptc ON ptc.trainer_id = t.id
-      LEFT JOIN payments    p   ON p.trainer_id   = t.id
       LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
       WHERE t.status = 'active'
         AND ($1::uuid IS NULL OR t.organization_id = $1)
@@ -136,7 +111,7 @@ router.get('/trainers', auth, adminOnly, async (req, res, next) => {
 });
 
 // GET /api/reports/revenue — total collected revenue for a date range
-// Unions gym payments + PT payments so the figure includes both streams.
+// From PT payments only (legacy `payments` table is empty).
 // Called by api.reports.revenue() in the frontend.
 router.get('/revenue', auth, async (req, res, next) => {
   try {
@@ -154,9 +129,7 @@ router.get('/revenue', auth, async (req, res, next) => {
 
     const where = 'WHERE ' + conditions.join(' AND ');
 
-    // Tenant isolation: scope PT revenue to the caller's org inside the
-    // pt_payments arm of the union (null-safe for platform super admins). The
-    // legacy `payments` arm is empty in this deployment.
+    // Tenant isolation: scope PT revenue to the caller's org.
     params.push(orgParam(req));
     const orgIdx = params.length;
 
@@ -165,13 +138,9 @@ router.get('/revenue', auth, async (req, res, next) => {
         COUNT(*)::int                AS count,
         COALESCE(SUM(p.amount), 0)   AS total,
         COALESCE(SUM(p.incentive_amt), 0) AS total_incentives
-      FROM (
-        SELECT amount, incentive_amt, date, deleted_at FROM payments
-        UNION ALL
-        SELECT amount, incentive_amt, date, deleted_at FROM pt_payments
-        WHERE ($${orgIdx}::uuid IS NULL OR organization_id = $${orgIdx})
-      ) p
+      FROM pt_payments p
       ${where}
+        AND ($${orgIdx}::uuid IS NULL OR organization_id = $${orgIdx})
     `, params);
     res.json(rows[0]);
   } catch (err) {
@@ -179,7 +148,79 @@ router.get('/revenue', auth, async (req, res, next) => {
   }
 });
 
+// GET /api/reports/dues/summary
+//
+// The authoritative outstanding figures, aggregated in the database.
+//
+// GET /dues below returns the top 100 debtors by balance — the right thing for
+// a table and the wrong thing for a total. The Outstanding Dues page was
+// summing those rows in the browser, so once a studio passed 100 debtors its
+// headline "Outstanding" silently became "outstanding among the hundred who
+// owe the most" while still being presented as the whole number. The risk-band
+// counts beside it had the same fault.
+//
+// This runs the IDENTICAL population as /dues — same union, same
+// balance_amount > 0, same soft-delete filter, same trainer scope, same org
+// scope — differing only in having no LIMIT and returning aggregates instead
+// of rows. It is a separate route rather than a change to /dues so the array
+// response stays untouched: three pages consume that (finance/dues, reports,
+// insights/revenue) and none of them have to change.
+//
+// The risk thresholds arrive as query params rather than being hard-coded
+// here. They are already defined in the page (riskLevel() in finance/dues),
+// and a second copy on the server is how the two drift apart later.
+router.get('/dues/summary', auth, async (req, res, next) => {
+  try {
+    const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
+    const params = [];
+    let trainerFilter = '';
+    if (tid) {
+      params.push(tid);
+      trainerFilter = ` AND trainer_id = $${params.length}`;
+    }
+
+    params.push(orgParam(req));
+    const orgIdx = params.length;
+
+    // Defaults match the page's current bands; a caller may override them.
+    const high = Number.isFinite(Number(req.query.high)) ? Number(req.query.high) : 10000;
+    const medium = Number.isFinite(Number(req.query.medium)) ? Number(req.query.medium) : 3000;
+    params.push(high);
+    const highIdx = params.length;
+    params.push(medium);
+    const medIdx = params.length;
+
+    const { rows } = await pool.query(`
+      SELECT
+        COALESCE(SUM(balance_amount), 0)                           AS total_outstanding,
+        COUNT(*)::int                                              AS debtor_count,
+        COUNT(*) FILTER (WHERE balance_amount >= $${highIdx})::int      AS high_risk_count,
+        COUNT(*) FILTER (WHERE balance_amount >= $${medIdx}
+                           AND balance_amount <  $${highIdx})::int      AS medium_risk_count
+      FROM pt_clients
+      WHERE balance_amount > 0 AND deleted_at IS NULL
+        AND ($${orgIdx}::uuid IS NULL OR organization_id = $${orgIdx})
+      ${trainerFilter}`,
+      params
+    );
+
+    const r = rows[0] || {};
+    res.json({
+      total_outstanding: Number(r.total_outstanding || 0),
+      debtor_count: Number(r.debtor_count || 0),
+      high_risk_count: Number(r.high_risk_count || 0),
+      medium_risk_count: Number(r.medium_risk_count || 0),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/reports/dues
+//
+// Capped at 100 rows (see the LIMIT below). Anything needing a TOTAL rather
+// than a page of rows must use /dues/summary above — summing what this returns
+// gives the top hundred debtors, not the studio.
 router.get('/dues', auth, async (req, res, next) => {
   try {
     const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
@@ -189,27 +230,16 @@ router.get('/dues', auth, async (req, res, next) => {
       params.push(tid);
       trainerFilter = ` AND trainer_id = $${params.length}`;
     }
-    // Tenant isolation: scope PT dues to the caller's org inside the pt_clients
-    // arm of the union (null-safe for platform super admins). The legacy
-    // `clients` arm is empty in this deployment.
+    // Tenant isolation: scope PT dues to the caller's org.
     params.push(orgParam(req));
     const orgIdx = params.length;
     const { rows } = await pool.query(`
-      SELECT id, client_id, name, mobile, trainer_name,
+      SELECT id, client_id, name, mobile, trainer_name, photo_url,
              balance_amount, pt_end_date, status
-      FROM (
-        SELECT c.id, c.client_id, c.name, c.mobile, c.trainer_name,
-               c.balance_amount, c.pt_end_date, c.status, c.trainer_id
-        FROM clients c
-        WHERE c.balance_amount > 0 AND c.deleted_at IS NULL
-        UNION ALL
-        SELECT ptc.id, NULL AS client_id, ptc.name, ptc.mobile, ptc.trainer_name,
-               ptc.balance_amount, ptc.pt_end_date, ptc.status, ptc.trainer_id
-        FROM pt_clients ptc
-        WHERE ptc.balance_amount > 0 AND ptc.deleted_at IS NULL
-          AND ($${orgIdx}::uuid IS NULL OR ptc.organization_id = $${orgIdx})
-      ) combined
-      WHERE 1=1${trainerFilter}
+      FROM pt_clients
+      WHERE balance_amount > 0 AND deleted_at IS NULL
+        AND ($${orgIdx}::uuid IS NULL OR organization_id = $${orgIdx})
+        ${trainerFilter}
       ORDER BY balance_amount DESC LIMIT 100`,
       params
     );
@@ -226,28 +256,20 @@ router.get('/dues', auth, async (req, res, next) => {
 // constraint and by the deliberate absence of any update route, NOT by
 // disabling an input on the client.
 //
-// `achieved` reuses the EXACT union that GET /monthly aggregates (payments +
-// pt_payments, same date column, same soft-delete filter, same org scope). If
-// the two ever diverged, the hero card and the chart directly below it would
-// show different numbers for the same month, which destroys trust in both.
+// `achieved` reuses the EXACT query that GET /monthly aggregates (pt_payments,
+// same date column, same soft-delete filter, same org scope). If the two ever
+// diverged, the hero card and the chart directly below it would show different
+// numbers for the same month, which destroys trust in both.
 
 /** Sum of this month's revenue for the caller's scope. */
 async function currentMonthRevenue(req) {
   const params = [orgParam(req)];
   const { rows } = await pool.query(`
-    SELECT COALESCE(SUM(revenue), 0) AS achieved
-    FROM (
-      SELECT p.amount AS revenue
-        FROM payments p
-       WHERE p.deleted_at IS NULL
-         AND date_trunc('month', p.date::date) = date_trunc('month', CURRENT_DATE)
-      UNION ALL
-      SELECT p.amount AS revenue
-        FROM pt_payments p
-       WHERE p.deleted_at IS NULL
-         AND date_trunc('month', p.date::date) = date_trunc('month', CURRENT_DATE)
-         AND ($1::uuid IS NULL OR p.organization_id = $1)
-    ) combined`, params);
+    SELECT COALESCE(SUM(p.amount), 0) AS achieved
+    FROM pt_payments p
+   WHERE p.deleted_at IS NULL
+     AND date_trunc('month', p.date::date) = date_trunc('month', CURRENT_DATE)
+     AND ($1::uuid IS NULL OR p.organization_id = $1)`, params);
   return Number(rows[0]?.achieved ?? 0);
 }
 

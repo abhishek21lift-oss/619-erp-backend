@@ -2,9 +2,12 @@
 // AI knowledge-base service: document ingestion (extract → chunk → embed →
 // store) and retrieval (embed query → pgvector similarity search).
 //
-// Tenant isolation: every read and write here is scoped by organization_id.
-// Retrieval never crosses that boundary — a studio's AI Coach can only ever
-// be grounded in that same studio's own documents.
+// Tenant isolation: every read and write here is scoped by organization_id —
+// except for documents explicitly marked is_global, which are the platform's
+// own knowledge base documents and are available to every organization.
+// Retrieval filters at the DOCUMENT level (see retrieveContext), so a chunk is
+// only ever reachable through a parent document whose tenancy the caller is
+// authorized for.
 
 const pool = require('../../db/pool');
 const logger = require('../logger');
@@ -100,10 +103,23 @@ async function deleteDocument(documentId) {
 }
 
 /**
- * Embeds `query` and returns the top-K most similar chunks for this org,
- * above the similarity threshold — empty array if nothing qualifies (the
- * caller must then tell the model honestly that no matching documentation
- * was found, not let it guess).
+ * Embeds `query` and returns the top-K most similar chunks the caller is
+ * authorized to see, above the similarity threshold — empty array if nothing
+ * qualifies (the caller must then tell the model honestly that no matching
+ * documentation was found, not let it guess).
+ *
+ * Tenant filter (enforced here, at the retrieval layer, and document-level):
+ *   (d.is_global = TRUE OR d.organization_id = $2)
+ * A chunk is reachable only through its parent document (JOIN on
+ * document_id), and the document's own tenancy is the single source of
+ * truth — the denormalized organization_id on the chunk row is never used as
+ * an authorization check. `is_global` documents are only ever produced by
+ * super-admin uploads (routes/aiKnowledge.js), never by inference.
+ *
+ * Fail-closed: a missing organizationId (e.g. a platform super admin with no
+ * tenant context) returns [] immediately — global knowledge is NOT served as
+ * a workaround, and an embed failure also returns [] after logging, mirroring
+ * the AI Coach chat path where retrieval failure must never fail generation.
  *
  * pgvector's `<=>` operator is cosine DISTANCE (0 = identical, 2 = opposite);
  * similarity = 1 - distance.
@@ -124,7 +140,8 @@ async function retrieveContext({ organizationId, query, topK = DEFAULT_TOP_K, si
             1 - (c.embedding <=> $1::vector) AS similarity
      FROM ai_document_chunks c
      JOIN ai_documents d ON d.id = c.document_id
-     WHERE c.organization_id = $2 AND d.status = 'ready'
+     WHERE d.status = 'ready'
+       AND (d.is_global = TRUE OR d.organization_id = $2)
      ORDER BY c.embedding <=> $1::vector ASC
      LIMIT $3`,
     [toVectorLiteral(queryVector), organizationId, topK]

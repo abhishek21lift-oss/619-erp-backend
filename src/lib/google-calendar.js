@@ -162,8 +162,14 @@ async function disconnect(userId) {
 /**
  * Create a Google Calendar event for a confirmed booking.
  * Fire-and-forget safe: catches all errors internally.
+ *
+ * @param {string} userId - the member's user id (owner of the calendar).
+ * @param {string} bookingId - the booking row id.
+ * @param {string} [organizationName] - the tenant's display name, resolved
+ *   from the member's user's organization; falls back to the platform brand
+ *   when the user has no org (legacy members) or no name is available.
  */
-async function createBookingEvent(userId, bookingId) {
+async function createBookingEvent(userId, bookingId, organizationName) {
   try {
     const authorized = await getAuthorizedClient(userId);
     if (!authorized) return;
@@ -188,18 +194,19 @@ async function createBookingEvent(userId, bookingId) {
 
     const calId = authorized.row.calendar_id || 'primary';
     const calendar = google.calendar({ version: 'v3', auth: authorized.client });
+    const studio = organizationName || 'MY PT STUDIO';
 
     const event = await calendar.events.insert({
       calendarId: calId,
       requestBody: {
-        summary:     `${bk.class_name} — MY PT STUDIO`,
+        summary:     `${bk.class_name} — ${studio}`,
         description: [
           `Class: ${bk.class_name}`,
           bk.trainer_name ? `Trainer: ${bk.trainer_name}` : null,
           `Status: Confirmed`,
           `Booking ID: ${bk.id}`,
         ].filter(Boolean).join('\n'),
-        location:  bk.branch_name ? `MY PT STUDIO — ${bk.branch_name}` : 'MY PT STUDIO',
+        location:  bk.branch_name ? `${studio} — ${bk.branch_name}` : studio,
         start:     { dateTime: bk.starts_at },
         end:       { dateTime: bk.ends_at   },
         colorId:   '11',  // Tomato — gym-brand red-ish

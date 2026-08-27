@@ -2,7 +2,8 @@
 //
 // Concurrency-safe receipt-number generator.
 //
-// WHY: code paths in payments.js, clients.js and client-actions.js all built
+// WHY: code paths in payments.js and clients.js (and the since-deleted
+// client-actions.js) all built
 // receipt numbers with `Date.now()` and `Math.random()`. Under concurrency
 // the millisecond timestamp + 4-digit random tail can collide and Postgres
 // rejects the insert because `payments.receipt_no` is UNIQUE — surfacing

@@ -119,11 +119,13 @@ const EXERCISE_COLUMNS = `
   e.movement_pattern, e.plane_of_motion,
   e.instructions, e.coaching_cues, e.common_mistakes, e.safety_tips,
   e.contraindications, e.breathing_tips, e.tempo_recommendation,
+  e.progression_notes,
   e.recommended_reps, e.recommended_sets,
   e.beginner_notes, e.advanced_notes, e.trainer_notes,
   e.sets_default, e.reps_default, e.rest_seconds,
   e.tags, e.search_keywords, e.visibility, e.is_custom,
   e.archived_at, e.deleted_at, e.version,
+  e.prescription_mode_primary, e.prescription_mode_allowed,
   e.primary_muscle_id, e.equipment_id, e.category_id, e.organization_id,
   e.created_by, e.updated_by, e.created_at, e.updated_at,
   m.name AS primary_muscle, m.slug AS primary_muscle_slug, m.body_region,
@@ -221,7 +223,7 @@ router.get('/', auth, async (req, res, next) => {
       ? `${relevance}, e.name ASC`
       : (SORTS[req.query.sort] || 'e.name ASC');
 
-    const limit  = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
     // Count and page in one round trip. The window function counts the full
@@ -347,7 +349,7 @@ router.get('/favorites', auth, async (req, res, next) => {
 
 router.get('/recent', auth, async (req, res, next) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
     const { rows } = await pool.query(
       `SELECT ${EXERCISE_COLUMNS}, r.use_count, r.used_at,
               EXISTS (SELECT 1 FROM exercise_favorites f
@@ -553,7 +555,20 @@ router.post('/', auth, async (req, res, next) => {
 router.put('/:id', auth, async (req, res, next) => {
   const client = await pool.connect();
   try {
-    const { rows: existing } = await client.query(
+    // pool.query, not client.query: this read happens BEFORE the BEGIN below,
+    // and db/pool.js only sets app.org_id on a borrowed client when it sees
+    // that BEGIN. Left on the borrowed client, this lookup would carry no org
+    // once DATABASE_URL points at app_tenant — and because `exercises` is a
+    // SHARED table (its policy also admits organization_id IS NULL), it would
+    // still return the built-in library while silently hiding the studio's own
+    // custom exercises. Editing a built-in would work and editing your own
+    // would 404, which reads as data loss rather than a scoping bug.
+    //
+    // pool.query wraps its own scoping transaction, so this is scoped
+    // correctly. It stays outside the write transaction deliberately — that is
+    // where it already was, and moving BEGIN above it would leave an open
+    // transaction on every early return below.
+    const { rows: existing } = await pool.query(
       'SELECT id, created_by, is_custom, organization_id FROM exercises WHERE id = $1 AND deleted_at IS NULL',
       [req.params.id]
     );
@@ -652,7 +667,11 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
 
   const client = await pool.connect();
   try {
-    const { rows: src } = await client.query(
+    // pool.query for the same reason as PUT /:id above — this read precedes
+    // the BEGIN, so on a borrowed client it would carry no app.org_id and
+    // duplicating your own custom exercise would 404 while duplicating a
+    // built-in still worked.
+    const { rows: src } = await pool.query(
       'SELECT * FROM exercises WHERE id = $1 AND deleted_at IS NULL', [req.params.id]
     );
     if (!src[0]) return res.status(404).json({ error: 'Exercise not found' });

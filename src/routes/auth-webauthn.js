@@ -14,11 +14,15 @@ const { auth } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
 const logger   = require('../lib/logger');
 const loginEvents = require('../lib/loginEvents');
+const { AUD_TENANT } = require('../middleware/platformAuth');
 const rateLimit = require('express-rate-limit');
+const { makeStore } = require('../lib/rateLimitStore');
 
 const router = express.Router();
 
 const authnLimiter = rateLimit({
+  store: makeStore('webauthn'),
+  passOnStoreError: true,
   windowMs: 15 * 60 * 1000, max: 20,
   standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many authentication attempts. Please wait 15 minutes.' },
@@ -40,6 +44,57 @@ const isProd  = process.env.NODE_ENV === 'production';
 // used to return process.env.RP_ID unconditionally, so a value left pointing at
 // a previous domain (a rebrand, a second client, a moved deployment) broke
 // every enrolment with no error anywhere on this side.
+
+/**
+ * Raised when neither the env vars nor the request headers can tell us which
+ * domain this instance serves, so no honest WebAuthn ceremony is possible.
+ * Carries its own HTTP shape because the generic error handler would render it
+ * as an opaque 500 — and an opaque 500 is exactly the failure mode this is
+ * here to eliminate.
+ */
+class WebAuthnConfigError extends Error {
+  constructor(what) {
+    super(
+      `WebAuthn is not configured on this deployment: cannot determine the ${what}. ` +
+      'Set RP_ID to the bare domain the frontend is served from (no scheme, no port) ' +
+      'and WEBAUTHN_ORIGIN to its full origin, then redeploy. ' +
+      'Both are per-deployment values and are intentionally not in the repo.'
+    );
+    this.name = 'WebAuthnConfigError';
+    this.status = 503;
+    this.code = 'WEBAUTHN_NOT_CONFIGURED';
+  }
+}
+
+/**
+ * Wraps a route so a WebAuthnConfigError becomes its own 503 with an
+ * actionable message instead of falling through to the generic handler.
+ *
+ * Intercepts BOTH exits, because every route in this file already wraps its
+ * body in `try { … } catch (err) { next(err) }`. That inner catch swallows the
+ * throw before it can reach this function, so catching alone never fires — the
+ * error reaches the app's generic handler and renders as an opaque 500, which
+ * is precisely the failure mode this exists to replace. Hence the wrapped
+ * `next`: it is the path that actually runs, and the try/catch is the backstop
+ * for any future route that lets an error escape instead.
+ */
+function withConfigCheck(handler) {
+  return async function configChecked(req, res, next) {
+    const render = (err) => {
+      logger.error({ code: err.code }, err.message);
+      return res.status(err.status).json({ error: err.message, code: err.code });
+    };
+    const guardedNext = (err) =>
+      (err instanceof WebAuthnConfigError ? render(err) : next(err));
+
+    try {
+      return await handler(req, res, guardedNext);
+    } catch (err) {
+      if (err instanceof WebAuthnConfigError) return render(err);
+      return next(err);
+    }
+  };
+}
 
 /**
  * WebAuthn's registrable-suffix test.
@@ -64,16 +119,44 @@ function isRegistrableSuffix(rpId, hostname) {
  * Vercel's rewrite and nginx both set it to the client-facing host. Host last.
  */
 function requestHostname(req) {
+  const trusted = trustedHostname(req);
+  if (trusted) return trusted;
+  const candidate = req.headers.host;
+  if (candidate) {
+    const host = String(candidate).split(',')[0].trim().replace(/:\d+$/, '');
+    if (host) return host;
+  }
+  return null;
+}
+
+/**
+ * The same, from a source we can trust to reflect the browser's own page
+ * rather than a hop in between — Origin, or x-forwarded-host for a proxy
+ * that dropped it.
+ *
+ * Deliberately excludes the bare Host header that requestHostname() falls
+ * back to. Host is not the browser's account of anything — it is whatever
+ * the connecting socket or an intermediate hop happened to send, which on
+ * many topologies is an internal address or a load balancer's own name.
+ * getEffectiveRpId() uses this, not requestHostname(), to decide whether a
+ * CONFIGURED RP_ID should be rejected: rejecting a correctly configured
+ * value because it does not match Host would refuse legitimate traffic on
+ * any topology where Host is not the public-facing domain — exactly the
+ * failure mode a direct-to-backend health check or this file's own
+ * integration tests hit, and a real regression the first version of this
+ * change shipped with.
+ */
+function trustedHostname(req) {
   const origin = req.headers.origin;
   if (origin) {
     try {
       const { hostname } = new URL(origin);
       if (hostname) return hostname;
-    } catch { /* malformed Origin — fall through to the forwarded headers */ }
+    } catch { /* malformed Origin — fall through to the forwarded header */ }
   }
-  const candidate = req.headers['x-forwarded-host'] || req.headers.host;
-  if (candidate) {
-    const host = String(candidate).split(',')[0].trim().replace(/:\d+$/, '');
+  const fwdHost = req.headers['x-forwarded-host'];
+  if (fwdHost) {
+    const host = String(fwdHost).split(',')[0].trim().replace(/:\d+$/, '');
     if (host) return host;
   }
   return null;
@@ -110,7 +193,7 @@ function frontendHostname() {
 }
 
 function getEffectiveRpId(req) {
-  const hostname = requestHostname(req);
+  const hostname = trustedHostname(req);
   const configured = process.env.RP_ID;
 
   // Honoured whenever the browser could actually accept it.
@@ -135,13 +218,67 @@ function getEffectiveRpId(req) {
 
   // No FRONTEND_URL (impossible in production; server.js exits at boot without
   // it). Only now is the request worth reading, and only to keep local
-  // development working.
-  if (hostname && hostname !== 'localhost' && !hostname.startsWith('127.')) {
-    logger.warn({ hostname }, 'WebAuthn rpId derived from the request — set RP_ID and FRONTEND_URL');
-    return hostname;
+  // development working — requestHostname() here (not trustedHostname()),
+  // since nothing is being rejected at this point and the bare Host header
+  // is better than nothing for a local dev server with no proxy in front.
+  const derived = requestHostname(req);
+  if (derived && derived !== 'localhost' && !derived.startsWith('127.')) {
+    logger.warn({ hostname: derived }, 'WebAuthn rpId derived from the request — set RP_ID and FRONTEND_URL');
+    return derived;
   }
 
+  // Reached only when RP_ID is unset or rejected AND FRONTEND_URL is
+  // unusable AND the request carries no usable host — the pathological case,
+  // since server.js already refuses to boot in production without
+  // FRONTEND_URL set. Failing loudly here is still cheaper than a silent 200:
+  // rpId='localhost' served to a browser on a real domain makes
+  // navigator.credentials.create() throw SecurityError client-side, with
+  // nothing logged server-side and no row written anywhere. The ceremony dies
+  // between /options and /verify, leaving only an orphaned challenge,
+  // indistinguishable from a user who changed their mind.
+  if (isProd) throw new WebAuthnConfigError('rpId');
+
+  logger.warn('No usable RP_ID, FRONTEND_URL or request host — falling back to localhost');
   return 'localhost';
+}
+
+/**
+ * Every origin we will accept, given one we already trust — the origin itself
+ * plus its `www`-toggled sibling.
+ *
+ * This exists because of a real failure. WEBAUTHN_ORIGIN was set to the apex,
+ * `https://myptstudio.com`, while the browser was served from
+ * `https://www.myptstudio.com`. The ceremony then failed at the last possible
+ * moment, in /register/verify:
+ *
+ *   Unexpected registration response origin "https://www.myptstudio.com",
+ *   expected "https://myptstudio.com"
+ *
+ * Note this got as far as step 3, so nothing was wrong with rpId: the browser
+ * had already accepted `myptstudio.com` because an RP ID only has to be a
+ * registrable suffix of the page's domain, and the apex is a suffix of `www.`.
+ * Only the origin comparison, which is exact, rejected it. So the two checks
+ * disagreed about the same deployment — the RP ID spanned www and apex while
+ * the origin did not.
+ *
+ * Toggling exactly one `www` label is the narrowest way to close that gap. It
+ * cannot widen trust beyond what rpId already permits, and it deliberately
+ * does NOT accept arbitrary subdomains — `evil.myptstudio.com` stays rejected.
+ */
+function withWwwSibling(origins) {
+  const out = [];
+  for (const o of origins) {
+    if (!out.includes(o)) out.push(o);
+    let u;
+    try { u = new URL(o); } catch { continue; }
+    u.hostname = u.hostname.startsWith('www.')
+      ? u.hostname.slice(4)
+      : `www.${u.hostname}`;
+    // href on a bare origin gains a trailing slash; WebAuthn origins have none.
+    const sibling = u.origin;
+    if (!out.includes(sibling)) out.push(sibling);
+  }
+  return out;
 }
 
 function getExpectedOrigin(req) {
@@ -173,9 +310,14 @@ function getExpectedOrigin(req) {
     }
   }
 
-  if (list.length === 1) return list[0];
-  if (list.length) return list;
-  return rpId === 'localhost' ? 'http://localhost:3000' : `https://${rpId}`;
+  // Each accepted origin also admits its www-toggled sibling. WEBAUTHN_ORIGIN
+  // set to the apex while the browser is served from `www.` (or the reverse)
+  // otherwise fails at the last step, in /register/verify, even though rpId
+  // already accepted the host as a registrable suffix — see withWwwSibling.
+  const withSiblings = withWwwSibling(
+    list.length ? list : [rpId === 'localhost' ? 'http://localhost:3000' : `https://${rpId}`]
+  );
+  return withSiblings.length === 1 ? withSiblings[0] : withSiblings;
 }
 
 /**
@@ -303,7 +445,7 @@ async function logEvent(req, action, detail) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /register/options
-router.post('/register/options', auth, async (req, res, next) => {
+router.post('/register/options', auth, withConfigCheck(async (req, res, next) => {
   try {
     const user = req.user;
     const rpId = getEffectiveRpId(req);
@@ -347,10 +489,10 @@ router.post('/register/options', auth, async (req, res, next) => {
     logger.error({ err: err.message }, 'register/options unexpected error');
     next(err);
   }
-});
+}));
 
 // POST /register/verify
-router.post('/register/verify', auth, async (req, res, next) => {
+router.post('/register/verify', auth, withConfigCheck(async (req, res, next) => {
   try {
     const user = req.user;
     const { registration, deviceName, deviceType: clientDeviceType } = req.body;
@@ -425,14 +567,14 @@ router.post('/register/verify', auth, async (req, res, next) => {
 
     res.json({ success: true, credential: { id: rows[0].id } });
   } catch (err) { next(err); }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AUTHENTICATION — login with passkey (no session required)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /login/options
-router.post('/login/options', authnLimiter, async (req, res, next) => {
+router.post('/login/options', authnLimiter, withConfigCheck(async (req, res, next) => {
   try {
     const email = String(req.body?.email || '').trim().toLowerCase();
     let userId = null;
@@ -467,10 +609,10 @@ router.post('/login/options', authnLimiter, async (req, res, next) => {
     await saveChallenge(options.challenge, userId, 'authentication');
     res.json(options);
   } catch (err) { next(err); }
-});
+}));
 
 // POST /login/verify
-router.post('/login/verify', authnLimiter, async (req, res, next) => {
+router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next) => {
   try {
     const { authentication } = req.body;
     if (!authentication) return res.status(400).json({ error: 'authentication payload is required' });
@@ -544,8 +686,10 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
     }
     const user = users[0];
 
+    // Tenant audience — the passkey door is the studio door. See the same
+    // note in routes/auth-google.js and middleware/platformAuth.js.
     const token = jwt.sign(
-      { id: user.id, token_version: user.token_version ?? 0 },
+      { id: user.id, token_version: user.token_version ?? 0, aud: AUD_TENANT },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
@@ -565,11 +709,11 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
       success: true,
       user: {
         id: user.id, name: user.name, email: user.email,
-        role: user.role, trainer_id: user.trainer_id, member_id: user.member_id,
+        role: user.role, trainer_id: user.trainer_id, pt_client_id: user.pt_client_id,
       },
     });
   } catch (err) { next(err); }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ACTION VERIFICATION — logged-in user re-verifying for a sensitive action
@@ -577,7 +721,7 @@ router.post('/login/verify', authnLimiter, async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /action/options
-router.post('/action/options', auth, async (req, res, next) => {
+router.post('/action/options', auth, withConfigCheck(async (req, res, next) => {
   try {
     const user = req.user;
     const { rows: creds } = await pool.query(
@@ -602,10 +746,10 @@ router.post('/action/options', auth, async (req, res, next) => {
     await saveChallenge(options.challenge, user.id, 'action');
     res.json(options);
   } catch (err) { next(err); }
-});
+}));
 
 // POST /action/verify
-router.post('/action/verify', auth, async (req, res, next) => {
+router.post('/action/verify', auth, withConfigCheck(async (req, res, next) => {
   try {
     const user = req.user;
     const { authentication } = req.body;
@@ -665,7 +809,7 @@ router.post('/action/verify', auth, async (req, res, next) => {
 
     res.json({ actionToken });
   } catch (err) { next(err); }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CREDENTIAL MANAGEMENT — user's own passkeys
@@ -812,7 +956,7 @@ router.get('/admin/stats', auth, requireAdminOrManager, async (req, res, next) =
 // GET /admin/credentials — tenant-scoped list.
 router.get('/admin/credentials', auth, requireAdminOrManager, async (req, res, next) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit,  10) || 100, 500);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit,  10) || 100, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0,   0);
     const { orgId, applyFilter } = tenantScope(req);
 
@@ -870,7 +1014,7 @@ router.delete('/admin/credentials/:id', auth, async (req, res, next) => {
 // authenticated actor). Platform super_admin sees everything.
 router.get('/admin/audit-logs', auth, requireAdminOrManager, async (req, res, next) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
     const { orgId, applyFilter } = tenantScope(req);
 
     const params = [];

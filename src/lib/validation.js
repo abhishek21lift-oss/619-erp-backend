@@ -9,9 +9,44 @@ const authSchemas = {
     body: z.object({
       email: emailSchema,
       password: z.string().min(1, 'Password is required'),
-      // Optional TOTP code — required at login for platform super admins who
-      // have 2FA enabled (enforced in the login handler, not here).
-      mfa_code: z.string().trim().regex(/^\d{6}$/, 'MFA code must be 6 digits').optional(),
+      // Optional second factor — required at login for platform super admins
+      // who have 2FA enabled (enforced in the login handler, not here).
+      //
+      // Either a 6-digit TOTP, or a one-time recovery code. This used to
+      // accept /^\d{6}$/ only, which meant a recovery code was rejected here
+      // as malformed before the handler could ever redeem it — the codes were
+      // unusable by construction, however they were stored. Recovery codes
+      // are ten Crockford-base32 characters and are conventionally displayed
+      // with a hyphen (H4K2M-9PQR7); spaces and case are tolerated because
+      // this is typed off paper by someone who has just lost their phone.
+      // The handler normalises before comparing — see lib/mfaRecoveryCodes.js.
+      mfa_code: z.string().trim()
+        .regex(
+          /^(\d{6}|[0-9A-Za-z\s-]{10,14})$/,
+          'Enter the 6-digit code from your authenticator, or a recovery code'
+        )
+        .optional(),
+      // Which door the person came through: the staff sign-in, the member one,
+      // or the Command Center. Enforced in the login handler, AFTER the
+      // password check — see routes/auth.js for why the order matters.
+      //
+      // Optional and defaulting to 'staff' so existing callers (the mobile
+      // app on /api/v1/auth/login, any saved bookmark) keep working exactly
+      // as before. A member has never been able to sign in through those, so
+      // defaulting this way changes nothing for anyone who works today.
+      //
+      // 'platform' was missing here when the Command Center's door shipped.
+      // The handler understood it, the frontend sent it, the TypeScript type
+      // allowed it — and this schema rejected the request with a bare
+      // "Invalid request" before any of that ran, so the new sign-in page was
+      // unusable from the moment it deployed. Every test that covered the
+      // platform door asserted on the handler's SOURCE rather than posting a
+      // request through this middleware, so all of them passed.
+      //
+      // Anything added to this enum must be handled in routes/auth.js, and
+      // anything handled there must appear here. auth.portal.test.js now posts
+      // a real login for each value to keep the two in step.
+      portal: z.enum(['staff', 'member', 'platform']).optional(),
     }),
   },
   changePassword: {
