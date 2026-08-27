@@ -9,6 +9,7 @@ const Sentry = require('./instrument');
 require('dotenv').config();
 
 const logger = require('./lib/logger');
+const { rlsEnforcementEnabled } = require('./lib/tenantRlsFlag');
 
 // Define isProd early — used in env checks below and throughout the file
 const isProd = (process.env.NODE_ENV || 'development') === 'production';
@@ -38,6 +39,58 @@ const RECOMMENDED_ENV = [
 const missingRecommended = RECOMMENDED_ENV.filter(function(k) { return !process.env[k]; });
 if (missingRecommended.length) {
   logger.warn({ missing: missingRecommended }, 'Recommended env vars not set — some features may be degraded');
+}
+
+// ── RLS cutover validation ───────────────────────────────────────────────────
+// When TENANT_RLS_ENFORCE is on (default in production), the app_tenant role
+// must be used for tenant requests, and a separate owner connection (ADMIN_DATABASE_URL)
+// must exist for platform-wide operations. If both URLs are the same, the app
+// connects as the table owner (postgres) which has BYPASSRLS, making all RLS
+// policies ineffective. This check catches the misconfiguration at boot.
+//
+// The condition below must be the SAME predicate db/pool.js and
+// middleware/auth.js use to decide whether enforcement is on, and it was not:
+// this line tested the variable for truthiness while they test it against the
+// string 'off'. The two disagreed in both directions, and both directions were
+// wrong:
+//
+//   TENANT_RLS_ENFORCE | old guard fired? | enforcement actually on?
+//   <unset>            | no               | YES  ← shipped the misconfiguration
+//   'off'              | YES              | no   ← refused to boot when disabled
+//
+// Unset is the production default, so the check meant to catch "enforcement on
+// with a single owner connection" was silent in precisely the configuration it
+// existed to catch. The predicate now lives in lib/tenantRlsFlag.js and is
+// imported by all three call sites, so they cannot drift apart again.
+if (isProd && rlsEnforcementEnabled()) {
+  const adminUrl = process.env.ADMIN_DATABASE_URL || process.env.DATABASE_URL;
+  if (adminUrl === process.env.DATABASE_URL) {
+    logger.fatal(
+      'Refusing to start: TENANT_RLS_ENFORCE is enabled but ADMIN_DATABASE_URL is not set to a different connection string. '
+      + 'The app_tenant role (migration 157) must be used for tenant traffic via DATABASE_URL, '
+      + 'and the privileged owner role must be configured separately via ADMIN_DATABASE_URL '
+      + 'for platform-wide operations (migrations, workers, super-admin console). '
+      + 'See db/migrations/TENANT-RLS-PLAN.md for the rollout procedure.'
+    );
+    process.exit(1);
+  }
+}
+
+// ── TRUST_PROXY validation ───────────────────────────────────────────────────
+// The correct value depends on the deployment topology. The current production
+// topology is: browser → nginx → frontend (Next.js rewrite) → backend = 2 hops.
+// If TRUST_PROXY is not set (defaults to 1) in production with this topology,
+// all req.ip will be the frontend container IP, collapsing rate-limit buckets.
+if (isProd) {
+  const trustProxy = (process.env.TRUST_PROXY || '').trim();
+  if (!trustProxy || trustProxy === '1') {
+    logger.warn(
+      'TRUST_PROXY is not set or set to 1 in production. '
+      + 'If the deployment topology includes nginx + Next.js rewrite (2 proxy hops), '
+      + 'set TRUST_PROXY=2 so req.ip resolves to the real client IP. '
+      + 'Incorrect value collapses all callers into one rate-limit bucket and neuters brute-force protection.'
+    );
+  }
 }
 
 // ── Email (SMTP) ────────────────────────────────────────────────────────────
@@ -141,6 +194,80 @@ if (isProd && r2Set.length === 0) {
   process.exit(1);
 }
 
+// ── Security controls must be ON in production ──────────────────────────────
+//
+// Three controls ship behind an env flag so they can be rolled out
+// deliberately (see db/migrations/TENANT-RLS-PLAN.md). Each is read as an
+// exact `=== 'on'` comparison at the point of use — deliberately strict, so
+// that a typo, an empty string, "true", "1" or "ON" all read as OFF rather
+// than being coerced into ON by a truthiness check. That strictness is the
+// right call and is preserved verbatim here.
+//
+// For NEW production deployments, these default to ON for security.
+// Existing deployments going through staged rollout can explicitly set
+// them to 'off' to disable. The value MUST be either 'on' or 'off' in production.
+//
+// ── Before deploying with these set ─────────────────────────────────────────
+//
+// Each flag has a prerequisite, and turning one on without it is the outage
+// this check is meant to prevent — so they are stated here rather than in a
+// runbook nobody opens at 2am:
+//
+//   TENANT_RLS_ENFORCE      Safe to turn on as-is. Until DATABASE_URL points
+//                           at the app_tenant role (migration 157), this only
+//                           wraps queries in a set_config transaction; the
+//                           connecting role still owns the tables and bypasses
+//                           RLS, so nothing changes but latency. That is
+//                           exactly what measuring it in staging is for.
+//
+//   PLATFORM_SESSION_ENFORCE  Refuses platform tokens that carry no `aud`
+//                           claim. Operators holding a session issued before
+//                           migration 162 are signed out and must log in
+//                           again — recoverable, but do it knowingly.
+//
+//   SUPER_ADMIN_REQUIRE_MFA The operator must have MFA enabled FIRST
+//                           (user_profiles.mfa_enabled), or the platform
+//                           console answers MFA_SETUP_REQUIRED to the only
+//                           account that can reach it. The enrolment routes
+//                           under /api/profile/mfa are never gated, so this
+//                           is a lockout to recover from, not a deadlock —
+//                           but it is still a lockout. Verify before enabling.
+const SECURITY_FLAGS = [
+  ['TENANT_RLS_ENFORCE', 'per-request tenant scoping of the data plane (app.org_id)'],
+  ['PLATFORM_SESSION_ENFORCE', 'platform session audience checks on operator tokens'],
+  ['SUPER_ADMIN_REQUIRE_MFA', 'two-factor requirement on the platform admin console'],
+];
+
+if (isProd) {
+  const invalid = SECURITY_FLAGS
+    .filter(function(f) {
+      const val = process.env[f[0]];
+      return val !== undefined && val !== 'on' && val !== 'off';
+    })
+    .map(function(f) { return { flag: f[0], value: process.env[f[0]] }; });
+
+  if (invalid.length) {
+    logger.fatal(
+      { invalid },
+      'Refusing to start: security control has invalid value. '
+      + 'Each flag must be either "on" or "off" (or unset to default to "on").'
+    );
+    process.exit(1);
+  }
+
+  const disabled = SECURITY_FLAGS
+    .filter(function(f) { return process.env[f[0]] === 'off'; })
+    .map(function(f) { return { flag: f[0], protects: f[1] }; });
+
+  if (disabled.length) {
+    logger.warn(
+      { disabled },
+      'Security controls explicitly disabled via env. This is intended only for staged rollout. '
+      + 'New production deployments should not disable these.'
+    );
+  }
+}
+
 const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
@@ -152,6 +279,18 @@ const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { auth, adminOnly }        = require('./middleware/auth');
 const { requireStaff, requireClient } = require('./middleware/rbac');
 const { requireSuperAdmin, requireSuperAdminMfa } = require('./middleware/tenant');
+const { requirePlatformOwner } = require('./middleware/platformAuth');
+
+// The control plane's guard chain, named once.
+//
+// requireSuperAdmin is the ROLE check and stays where it was; requirePlatformOwner
+// is the BOUNDARY — explicit grant (platform_owners, migration 161), platform
+// session audience, and no impersonation. Both, in that order, so the cheap
+// synchronous check refuses the common case before the grant lookup runs.
+//
+// Written as one array rather than repeated at each mount so the platform
+// surface cannot end up with two different definitions of who may reach it.
+const PLATFORM_GUARD = [auth, requireSuperAdmin, requireSuperAdminMfa, requirePlatformOwner];
 const { branchScope }            = require('./middleware/branch-scope');
 const { requireFeature }         = require('./lib/features');
 const { requireAiQuota }         = require('./lib/aiQuota');
@@ -174,6 +313,25 @@ const { requireAiQuota }         = require('./lib/aiQuota');
 // so this changes nothing for anyone until an operator turns something off in
 // the Control Centre — which is the point of the toggle existing.
 const gate = (key) => [auth, requireFeature(key)];
+
+// The same feature gate, plus a role gate.
+//
+// gate() checks that the STUDIO has a feature switched on. It does not check
+// who is asking, and a feature flag is not an authorisation decision. Handlers
+// behind gate() then scope by organization_id, which bounds the studio and
+// says nothing about the role — so a `member` (the account client activation
+// creates for a gym client) satisfied every check and read staff data.
+//
+// Found by memberEscalation.authz.test.js, which drives a real member session
+// at every mount. GET /api/invoices returned every invoice in the studio —
+// other clients' names, invoice numbers and amounts — and GET
+// /api/reports/monthly returned the studio's revenue: it self-scopes for a
+// trainer via `role === 'trainer'`, so a member fell through the branch with
+// no filter at all.
+//
+// Use this for any mount whose data belongs to the studio rather than to the
+// person asking.
+const staffGate = (key) => [auth, requireStaff, requireFeature(key)];
 
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -499,34 +657,27 @@ app.use('/api/features',          require('./routes/features'));
 // no request-controlled org parameter; internal operator notes are excluded by
 // lib/support.TENANT_MESSAGE_SQL. Deliberately NOT feature-gated — a studio
 // must always be able to reach us, whatever else is switched off.
-app.use('/api/support',           require('./routes/support'));
+// requireStaff, not bare auth. routes/support.js mounts `router.use(auth)` and
+// then scopes every handler by organization_id — which bounds the STUDIO but
+// says nothing about the ROLE. A `member` (the account client activation
+// creates for a gym client) passed that filter and could list every support
+// ticket the studio had raised — subject, category, priority, status and
+// created_by_name — and open new ones in the studio's name. These are the
+// studio's private correspondence with the platform: billing disputes,
+// operational complaints, and whatever a frustrated owner typed at midnight.
+//
+// Found by memberEscalation.authz.test.js, which drives a real member session
+// at every mount; the audit asked for that test by name (Section 11).
+// src/app/(chrome)/support/page.tsx is the only caller and lives in the staff
+// shell, so no client-facing screen loses anything.
+app.use('/api/support',           auth, requireStaff, require('./routes/support'));
 app.use('/api/subscription',      require('./routes/subscription'));
 // Global top-nav search. Carries its own rate limiter (see routes/search.js),
 // so it is deliberately NOT wrapped in userApiLimiter — debounced typing would
 // otherwise consume the shared per-user budget that real API calls need.
-// ── Staff-only routers ──────────────────────────────────────────────────────
-//
-// requireStaff went in for /api/pt-os and stopped there. Its own comment in
-// middleware/rbac.js states the reason it exists: read routes were gated on
-// `auth` alone, "survivable only because no account had ever held the `member`
-// role... client logins create those accounts by the hundred."
-//
-// Those accounts carry their studio's organization_id, so tenantScope() lets
-// them through — the boundary that matters for tenancy is intact, and nothing
-// here is a cross-tenant leak. What it means is that a logged-in CLIENT could
-// read their own gym's staff data: GET /api/clients returns `c.*` for up to a
-// thousand rows (names, mobiles, emails, balances, notes), /api/reports/revenue
-// and /dues return the studio's finances, and the nine GETs on /api/progress
-// take an optional client_id that, omitted, returns the whole organisation.
-//
-// Verified before gating: the client portal calls exactly ONE endpoint,
-// /api/me. No screen under app/(bare)/member, /client or /member-login touches
-// any router below.
-//
-// auth() runs twice on the ...gate() lines and that is fine — the second call
-// is a user-cache hit, as the /api/pt-os mounts below already note. requireStaff
-// deliberately precedes the feature gate so a client cannot learn which
-// features a studio has by the shape of the refusal.
+// requireStaff: search fans out across the studio's clients, and its own
+// narrowing is `role === 'trainer' ? trainer_id : null` — so a member fell
+// through that branch with NO narrowing and searched the whole studio.
 app.use('/api/search',            auth, requireStaff, require('./routes/search'));
 
 // ONE router, deliberately. This mount used to carry a second file,
@@ -541,6 +692,8 @@ app.use('/api/search',            auth, requireStaff, require('./routes/search')
 // mounted here starts reading that table again.
 app.use('/api/clients',           userApiLimiter, auth, requireStaff, require('./routes/clients'));
 
+// requireStaff: returns t.* per trainer PLUS month_revenue and
+// all_time_revenue. Staff earnings are not client-facing data.
 app.use('/api/trainers',          auth, requireStaff, require('./routes/trainers'));
 // Manual UTR verification payments. MUST be mounted before the finance ledger
 // router below: that one owns DELETE /:id and a bare /:id would otherwise
@@ -568,11 +721,18 @@ app.use('/api/attendance',        auth, requireStaff, ...gate('attendance'), req
 // So "legacy" had it backwards: /api/reports is the tenant-safe, live
 // implementation, and the migration target was the unsafe one. Do not
 // reintroduce a v1 reports router without organization_id on its tables.
-app.use('/api/reports',           userApiLimiter, auth, requireStaff, ...gate('insights'), require('./routes/reports'));
+app.use('/api/reports',           userApiLimiter, ...staffGate('insights'), require('./routes/reports'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
-app.use('/api/leave',             require('./routes/leave'));
-app.use('/api/expenses',          auth, requireStaff, ...gate('finance'), require('./routes/expenses'));
+// requireStaff: staff leave requests — who is off, when, and why. HR data
+// about employees, org-scoped but not role-scoped.
+app.use('/api/leave',             auth, requireStaff, require('./routes/leave'));
+// staffGate, not gate: routes/expenses.js narrows with `if (req.user.role ===
+// 'trainer')` and then applies the org filter — so a member fell through the
+// trainer branch and got the studio's whole expense stats. Third instance of
+// that fall-through after reports/monthly and search; a feature flag is not an
+// authorisation decision.
+app.use('/api/expenses',          ...staffGate('finance'), require('./routes/expenses'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.
@@ -594,27 +754,60 @@ app.use('/api/bookings',          require('./modules/bookings/bookings.routes'))
 // auto-granted to every self-serve trial signup) let any trial signup wipe
 // every tenant on the platform. This must be `requireSuperAdmin` +
 // `requireSuperAdminMfa`, matching every other platform-destructive route.
-app.use('/api/admin',             auth, requireSuperAdmin, requireSuperAdminMfa, require('./routes/admin-reset'));
+app.use('/api/admin',             ...PLATFORM_GUARD, require('./routes/admin-reset'));
 app.use('/api/debug',             auth, adminOnly, require('./routes/debug'));
 
-// Platform Super Admin portal (multi-tenant SaaS). Guarded at the mount with
-// auth + requireSuperAdmin — inaccessible to tenant admins and everyone else.
-app.use('/api/super-admin',       auth, requireSuperAdmin, requireSuperAdminMfa, require('./modules/platform/super-admin.routes'));
+// ── The Command Center API — the platform control plane ─────────────────────
+//
+// One router, mounted at two paths, guarded identically.
+//
+// `/api/platform` is the name the boundary actually has. `/api/super-admin`
+// names a ROLE, and naming a security boundary after one of the facts that
+// happens to satisfy it is how the two planes got conflated in the first
+// place: every reader who saw the path concluded the rule was "is this user a
+// super admin", which is precisely the single-string check migration 161 and
+// middleware/platformAuth.js exist to stop being the whole story.
+//
+// The old path stays mounted, and stays mounted indefinitely rather than
+// behind a deprecation window, because it is not only this repo's frontend
+// that calls it — the mobile client ships compiled URLs, and an operator's
+// bookmark is not something this repo can migrate. Both go through
+// PLATFORM_GUARD, so there is one boundary with two names, not two doors.
+const platformRoutes = require('./modules/platform/super-admin.routes');
+app.use('/api/platform',          ...PLATFORM_GUARD, platformRoutes);
+app.use('/api/super-admin',       ...PLATFORM_GUARD, platformRoutes);
 
-app.use('/api/modules',           require('./modules/operations/operations.routes'));
+// requireStaff: the operations workspace behind eight (chrome) tabs —
+// attendance, finance, settings, reports. Migration 174 gave module_records a
+// tenant column and Phase 1 added orgWhere(), which bounds the studio; this
+// bounds the role.
+app.use('/api/modules',           auth, requireStaff, require('./modules/operations/operations.routes'));
 
 // ────────────────────────
 // PREMIUM FEATURE ROUTES (v4)
 // ────────────────────────
 app.use('/api/calendar',          require('./routes/calendar'));
 app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-checkin'));
-app.use('/api/settings',          require('./routes/settings'));
-app.use('/api/invoices',          auth, requireStaff, ...gate('finance'), require('./routes/invoices'));
+// requireStaff: the handler already hides internal_/geo_/biometric_/feature_
+// keys from non-admins, but system_settings carries NO organization_id at all
+// (it is on tenantColumns' KNOWN_GAPS as per-studio keys inside a shared
+// table), so the query is unfiltered by studio as well as by role.
+app.use('/api/settings',          auth, requireStaff, require('./routes/settings'));
+app.use('/api/invoices',          ...staffGate('finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
 // The Exercise Library. Sits behind the same 'programs' feature as the Workout
 // Builder it feeds — a studio with programmes always has the library, and one
 // without it has no use for either.
 app.use('/api/exercises',         ...gate('programs'), require('./routes/exercises'));
+
+// The new training domain (migrations 164-166). Mounted BESIDE /api/workouts
+// rather than over it: the old routes still serve production, and this slice
+// is additive so the two can run together while the UI is rebuilt. Slice G
+// repoints /api/workouts once nothing reads it.
+//
+// Same feature gate as the old one — a studio without 'programs' does not get
+// a degraded builder, it does not get the route.
+app.use('/api/training',          ...gate('programs'), require('./modules/training/training.routes'));
 app.use('/api/diet',              require('./routes/diet'));
 // '/api/biometric-attend' and '/api/webauthn' were mounted here: a second
 // check-in path (fingerprint / GPS) writing the same attendance_logs rows as
@@ -678,8 +871,22 @@ app.use('/api/client-login',     auth, requireStaff, require('./routes/client-lo
 // ────────────────────────
 // BUSINESS FLOW ROUTES (v4 — Progress, Automation)
 // ────────────────────────
-app.use('/api/progress',         auth, requireStaff, require('./modules/progress/progress.routes'));
-app.use('/api/automation',       require('./modules/automation/automation.routes'));
+//
+// requireStaff, for the same reason /api/pt-os carries it: both modules serve
+// the studio's back office, and both were mounted on `auth` alone — which was
+// survivable only while no account held the `member` role. Client activation
+// creates those accounts by the hundred, and until this line existed a client
+// with a valid token could call GET /api/progress/lifestyle-assessments and
+// GET /api/automation/session-balance, which between them return health
+// records and other clients' names and phone numbers.
+//
+// A client's own data is served by /api/me, which scopes to the caller.
+//
+// userApiLimiter as well: these two mounts had only the 2000-per-15-minutes
+// global bucket, which is a generous ceiling for an endpoint that returns
+// health records a page at a time.
+app.use('/api/progress',   userApiLimiter, auth, requireStaff, require('./modules/progress/progress.routes'));
+app.use('/api/automation', userApiLimiter, auth, requireStaff, require('./modules/automation/automation.routes'));
 
 // ────────────────────────
 // v3 MODULE ROUTES
@@ -901,6 +1108,27 @@ runMigrationsWithRetry()
       logger.info(
         { flush: '5s', retention_days: Number(process.env.LOG_RETENTION_DAYS) || 30 },
         'Command Center log capture active',
+      );
+    }
+
+    // Refresh token retention.
+    //
+    // Deliberately OUTSIDE the LOG_CAPTURE guard above: this has nothing to do
+    // with the Command Centre, and turning off log capture must not silently
+    // stop pruning the auth table. Hourly for the same reason — the first
+    // sweep on a database that has never been pruned drains a backlog in
+    // bounded batches rather than one large statement.
+    {
+      const refreshTokens = require('./lib/refreshTokenRetention');
+      const sweep = () => { refreshTokens.prune(); };
+      setInterval(sweep, 60 * 60 * 1000).unref();
+      // Once at boot too: a container that restarts more often than hourly
+      // would otherwise never reach the first interval tick.
+      sweep();
+      logger.info(
+        { retention_days: Number(process.env.REFRESH_TOKEN_RETENTION_DAYS)
+            || refreshTokens.DEFAULT_RETENTION_DAYS },
+        'Refresh token retention active',
       );
     }
 

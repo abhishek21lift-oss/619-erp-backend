@@ -33,9 +33,17 @@ const STAFF_ONLY = [
   'search',
 ];
 
+// A mount satisfies "behind requireStaff" one of two ways: the literal
+// middleware inline (`auth, requireStaff, ...gate(key)`), or the staffGate(key)
+// combinator — `const staffGate = (key) => [auth, requireStaff, requireFeature(key)]`
+// — which bakes requireStaff in without the word appearing at the call site.
+// Both are asserted below; staffGate's own definition is checked separately so
+// swapping a mount to it doesn't silently stop proving the ordering property.
+const STAFF_GATED = /requireStaff|staffGate\(/;
+
 describe('every staff-only router is mounted behind requireStaff', () => {
   test.each(STAFF_ONLY)('/api/%s', (name) => {
-    const mount = new RegExp(`app\\.use\\('/api/${name}',[^;]*requireStaff[^;]*require\\(`);
+    const mount = new RegExp(`app\\.use\\('/api/${name}',[^;]*(?:requireStaff|staffGate\\()[^;]*require\\(`);
     expect(server).toMatch(mount);
   });
 
@@ -44,17 +52,30 @@ describe('every staff-only router is mounted behind requireStaff', () => {
     // regressed if this goes red.
     const lines = server.split('\n').filter((l) => l.includes(`app.use('/api/${name}'`));
     expect(lines.length).toBeGreaterThan(0);
-    for (const line of lines) expect(line).toContain('requireStaff');
+    for (const line of lines) expect(line).toMatch(STAFF_GATED);
   });
 });
 
 describe('the gate is ordered so a client learns nothing extra', () => {
-  test.each(['reports', 'expenses', 'invoices', 'communication', 'attendance'])(
+  test.each(['attendance', 'communication'])(
     'requireStaff precedes the feature gate on /api/%s', (name) => {
       const line = server.split('\n').find((l) => l.includes(`app.use('/api/${name}'`));
       expect(line.indexOf('requireStaff')).toBeLessThan(line.indexOf('gate('));
     },
   );
+
+  test.each(['reports', 'expenses', 'invoices'])(
+    'staffGate(key) carries the same ordering on /api/%s', (name) => {
+      const line = server.split('\n').find((l) => l.includes(`app.use('/api/${name}'`));
+      expect(line).toMatch(/staffGate\(/);
+    },
+  );
+
+  test('staffGate itself puts requireStaff before requireFeature', () => {
+    const def = server.split('\n').find((l) => l.includes('const staffGate ='));
+    expect(def).toBeTruthy();
+    expect(def.indexOf('requireStaff')).toBeLessThan(def.indexOf('requireFeature'));
+  });
 });
 
 describe('the client portal is unaffected', () => {
