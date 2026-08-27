@@ -468,21 +468,15 @@ describeIf('cross-tenant isolation across business surfaces', () => {
     'google_calendar_events',
     'google_calendar_tokens',
     'holds_freezes',
-    'invoice_items',
     'members',
     'membership_actions',
     'muscles',
     'notifications',
-    'payments',
     'plan_features',
     'platform_ai_settings',
     'platform_announcements',
     'platform_billing_settings',
     'platform_features',
-    'pt_client_renewals',
-    'pt_client_subscriptions',
-    'pt_commissions',
-    'pt_payouts',
     'pt_plans',
     'qr_tokens',
     'receipt_counter',
@@ -494,7 +488,6 @@ describeIf('cross-tenant isolation across business surfaces', () => {
     'system_logs',
     'training_program_phases',
     'training_program_weeks',
-    'trial_sessions',
     'trials',
     'user_profiles',
     'webauthn_challenges',
@@ -536,30 +529,63 @@ describeIf('cross-tenant isolation across business surfaces', () => {
       }
     });
 
-    it("a payment belonging to the caller's OWN studio is invisible to app_tenant", async () => {
-      // The concrete demonstration, because a list of 64 table names does not
-      // convey what it costs. This is not a cross-tenant test: the payment is
-      // the caller's own, taken by the caller's own studio, and the caller
-      // cannot see it. No error is raised. The row simply is not there.
+    // ── The two below used to assert the DEFECT ────────────────────────────
+    //
+    // They read "a payment belonging to the caller's OWN studio is invisible
+    // to app_tenant" and "and a payment cannot be recorded either" — the
+    // concrete demonstration of what the blind spot cost, because a list of
+    // table names does not convey it.
+    //
+    // Migration 186 fixed `payments`, so they now assert the opposite. Kept
+    // and inverted rather than deleted: the behaviour they describe is the
+    // whole point of that migration, and a fix with no test is a fix waiting
+    // to be reverted by someone who never knew it was a fix.
+
+    it("a payment belonging to the caller's OWN studio is VISIBLE to app_tenant", async () => {
       await owner.query(
-        `INSERT INTO payments (id, client_id, amount) VALUES ('blind-pay','client-a',1000)
-         ON CONFLICT (id) DO NOTHING`);
+        `INSERT INTO payments (id, client_id, amount, organization_id)
+         VALUES ('own-pay','client-a',1000,$1) ON CONFLICT (id) DO NOTHING`, [ORG_A]);
       try {
-        const asOwner = await owner.query(`SELECT count(*)::int AS n FROM payments WHERE id = 'blind-pay'`);
+        const asOwner = await owner.query(`SELECT count(*)::int AS n FROM payments WHERE id = 'own-pay'`);
         expect(asOwner.rows[0].n).toBe(1);
 
+        // The studio that took the money can see the money.
         const asTenant = await asOrg(ORG_A, (c) =>
-          c.query(`SELECT count(*)::int AS n FROM payments WHERE id = 'blind-pay'`));
-        expect(asTenant.rows[0].n).toBe(0);
+          c.query(`SELECT count(*)::int AS n FROM payments WHERE id = 'own-pay'`));
+        expect(asTenant.rows[0].n).toBe(1);
+
+        // And the studio next door still cannot.
+        const asOther = await asOrg(ORG_B, (c) =>
+          c.query(`SELECT count(*)::int AS n FROM payments WHERE id = 'own-pay'`));
+        expect(asOther.rows[0].n).toBe(0);
       } finally {
-        await owner.query(`DELETE FROM payments WHERE id = 'blind-pay'`);
+        await owner.query(`DELETE FROM payments WHERE id = 'own-pay'`);
       }
     });
 
-    it('and a payment cannot be recorded either', async () => {
-      // The write half. Taking money is the studio's core transaction.
-      await expect(asOrg(ORG_A, (c) =>
-        c.query(`INSERT INTO payments (id, client_id, amount) VALUES ('blind-pay-2','client-a',1000)`)))
+    it('and a payment can be recorded again', async () => {
+      // The write half. Taking money is the studio's core transaction, and it
+      // was refused outright while payments had no permissive policy.
+      try {
+        await asOrg(ORG_A, (c) => c.query(
+          `INSERT INTO payments (id, client_id, amount, organization_id)
+           VALUES ('own-pay-2','client-a',1000,$1)`, [ORG_A]));
+        const { rows } = await owner.query(
+          `SELECT count(*)::int AS n FROM payments WHERE id = 'own-pay-2'`);
+        expect(rows[0].n).toBe(1);
+      } finally {
+        await owner.query(`DELETE FROM payments WHERE id = 'own-pay-2'`);
+      }
+    });
+
+    it('but a payment cannot be recorded against another studio\'s client', async () => {
+      // 186 gives the client-bearing financial tables the AND'd parent walk
+      // 174 established, so stamping your own org onto a row that points at
+      // someone else's client is refused. A foreign key alone would have
+      // accepted this: it proves the client EXISTS, not that it is yours.
+      await expect(asOrg(ORG_A, (c) => c.query(
+        `INSERT INTO payments (id, client_id, amount, organization_id)
+         VALUES ('forged-pay','client-b',1000,$1)`, [ORG_A])))
         .rejects.toThrow(/row-level security/i);
     });
   });
