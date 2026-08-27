@@ -34,7 +34,7 @@ const { sendText, twilioWhatsappConfigured } = require('../../services/whatsappD
 const { routedChat } = require('../../lib/ai/router');
 const { logUsage } = require('../../lib/ai/usage');
 const { extractJson } = require('../../lib/ai/jsonExtract');
-const { buildRenewalReminderPrompt } = require('../../lib/ai/prompts/system');
+const { buildRenewalReminderPrompt, buildLeadFollowupPrompt } = require('../../lib/ai/prompts/system');
 
 /** Clamp an incoming number into a range, falling back for junk input. */
 function clampInt(value, { min, max, fallback }) {
@@ -62,6 +62,61 @@ function toRecipients(rows) {
     (r.mobile ? reachable : unreachable).push(r);
   }
   return { reachable, unreachable };
+}
+
+/**
+ * Drafts a personalized body for every recipient in ONE model call, not one
+ * call per recipient — a 200-row plan would otherwise mean up to 200
+ * sequential LLM round trips inside a single synchronous HTTP request.
+ *
+ * Shared by every model-backed action's `draft()`. Only ever called at PLAN
+ * time (see ai-actions.routes.js) — execute freezes whatever this returned
+ * rather than calling it again, because model output is not deterministic:
+ * re-drafting at execute would almost always produce different text than
+ * what the operator approved, which would make the plan/execute fingerprint
+ * check refuse a good plan every time, or force a fuzzy compare that stops
+ * meaning anything.
+ *
+ * Anything the model doesn't return a usable draft for keeps its
+ * `templateBody` — a bad/failed model call must never mean a recipient gets
+ * no message at all.
+ */
+async function draftInOneCall({ recipients, req, intent, systemPrompt, describeBatch, logFailure }) {
+  if (!recipients.length) return recipients;
+  try {
+    const facts = recipients.map((r) => ({ id: r.id, ...r._draftFacts }));
+    const result = await routedChat({
+      intent,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `${describeBatch}\n\n${JSON.stringify(facts, null, 2)}` },
+      ],
+      temperature: 0.5,
+      max_tokens: Math.min(300 * recipients.length, 8000),
+    });
+
+    logUsage({
+      user_id: req.user.id,
+      model: result.model,
+      intent_type: intent,
+      tokens_prompt: result.usage?.prompt_tokens || 0,
+      tokens_completion: result.usage?.completion_tokens || 0,
+      latency_ms: result.latency_ms,
+      used_fallback: result.used_fallback,
+    }).catch(() => {});
+
+    const parsed = extractJson(result.content);
+    const byId = new Map((parsed?.drafts || []).map((d) => [String(d.id), d.body]));
+
+    return recipients.map((r) => {
+      const drafted = byId.get(String(r.id));
+      const usable = typeof drafted === 'string' && drafted.trim().length > 0 && drafted.length <= 500;
+      return { ...r, body: usable ? drafted.trim() : r.templateBody, ai_drafted: usable };
+    });
+  } catch (err) {
+    logger.warn({ err: err.message }, logFailure);
+    return recipients.map((r) => ({ ...r, body: r.templateBody, ai_drafted: false }));
+  }
 }
 
 const ACTIONS = [
@@ -126,57 +181,78 @@ const ACTIONS = [
       };
     },
 
-    /**
-     * Drafts a personalized body for every recipient in ONE model call, not
-     * one call per recipient — a 200-row plan would otherwise mean up to 200
-     * sequential LLM round trips inside a single synchronous HTTP request.
-     *
-     * Only ever called at PLAN time (see ai-actions.routes.js) — execute
-     * freezes whatever this returned rather than calling it again, because
-     * model output is not deterministic: re-drafting at execute would almost
-     * always produce different text than what the operator approved, which
-     * would make the plan/execute fingerprint check refuse a good plan every
-     * time, or force a fuzzy compare that stops meaning anything.
-     */
-    async draft(recipients, req) {
-      if (!recipients.length) return recipients;
-      try {
-        const facts = recipients.map((r) => ({ id: r.id, ...r._draftFacts }));
-        const result = await routedChat({
-          intent: 'renew',
-          messages: [
-            { role: 'system', content: buildRenewalReminderPrompt() },
-            { role: 'user', content: `Draft a reminder for each of these clients:\n\n${JSON.stringify(facts, null, 2)}` },
-          ],
-          temperature: 0.5,
-          max_tokens: Math.min(300 * recipients.length, 8000),
-        });
+    draft: (recipients, req) => draftInOneCall({
+      recipients, req,
+      intent: 'renew',
+      systemPrompt: buildRenewalReminderPrompt(),
+      describeBatch: 'Draft a reminder for each of these clients:',
+      logFailure: 'renewal_reminder_draft_failed_falling_back',
+    }),
+  },
 
-        logUsage({
-          user_id: req.user.id,
-          model: result.model,
-          intent_type: 'renew',
-          tokens_prompt: result.usage?.prompt_tokens || 0,
-          tokens_completion: result.usage?.completion_tokens || 0,
-          latency_ms: result.latency_ms,
-          used_fallback: result.used_fallback,
-        }).catch(() => {});
+  {
+    id: 'lead_followup',
+    title: 'Send lead follow-ups',
+    outward: true,
+    usesModel: true,
+    roles: ['admin', 'manager', 'super_admin'],
+    describe: (p) => `WhatsApp every open lead whose follow-up is due within ${p.days} days`,
+    normalize: (body = {}) => ({ days: clampInt(body.days, { min: 1, max: 90, fallback: 7 }) }),
 
-        const parsed = extractJson(result.content);
-        const byId = new Map((parsed?.drafts || []).map((d) => [String(d.id), d.body]));
-
-        // Anything the model didn't return a usable draft for keeps its
-        // templateBody — never left without any message.
-        return recipients.map((r) => {
-          const drafted = byId.get(String(r.id));
-          const usable = typeof drafted === 'string' && drafted.trim().length > 0 && drafted.length <= 500;
-          return { ...r, body: usable ? drafted.trim() : r.templateBody, ai_drafted: usable };
-        });
-      } catch (err) {
-        logger.warn({ err: err.message }, 'renewal_reminder_draft_failed_falling_back');
-        return recipients.map((r) => ({ ...r, body: r.templateBody, ai_drafted: false }));
+    async resolve(req, params) {
+      const scope = tenantScope(req);
+      const values = [params.days];
+      // 'converted' and 'lost' are terminal — nothing left to follow up on.
+      // follow_up_date <= today+N catches anything already overdue as well
+      // as what's coming due, same as renewal_reminders' own window.
+      let where = `status IN ('new', 'contacted', 'trial_scheduled')
+                   AND follow_up_date IS NOT NULL
+                   AND follow_up_date <= CURRENT_DATE + ($1 || ' days')::INTERVAL`;
+      if (scope.applyFilter) {
+        values.push(scope.orgId);
+        where += ` AND organization_id = $${values.length}`;
       }
+      const { rows } = await pool.query(
+        `SELECT id, name, mobile, source, status, interested_package, follow_up_date::TEXT
+           FROM pt_leads
+          WHERE ${where}
+          ORDER BY follow_up_date ASC, id ASC
+          LIMIT ${MAX_RECIPIENTS}`,
+        values,
+      );
+
+      const { reachable, unreachable } = toRecipients(rows);
+      const warnings = [];
+      if (!twilioWhatsappConfigured()) {
+        warnings.push('WhatsApp is not configured on this server — nothing will be delivered.');
+      }
+      if (unreachable.length) {
+        warnings.push(`${unreachable.length} matching lead${unreachable.length === 1 ? ' has' : 's have'} no mobile number and will be skipped.`);
+      }
+
+      return {
+        recipients: reachable.map((r) => ({
+          id: r.id,
+          name: r.name,
+          mobile: r.mobile,
+          detail: r.interested_package || r.status,
+          templateBody: `Hi ${r.name}, following up on your interest in personal training${r.interested_package ? ` (${r.interested_package})` : ''}. Would you like to schedule a time to chat?`,
+          _draftFacts: {
+            name: r.name, source: r.source, status: r.status,
+            interested_package: r.interested_package, follow_up_date: r.follow_up_date,
+          },
+        })),
+        warnings,
+      };
     },
+
+    draft: (recipients, req) => draftInOneCall({
+      recipients, req,
+      intent: 'lead',
+      systemPrompt: buildLeadFollowupPrompt(),
+      describeBatch: 'Draft a follow-up for each of these leads:',
+      logFailure: 'lead_followup_draft_failed_falling_back',
+    }),
   },
 
   {

@@ -40,7 +40,7 @@ describe('who may run an action', () => {
 
   test('an admin is', () => {
     expect(listFor(admin).map((a) => a.id).sort())
-      .toEqual(['dues_reminders', 'renewal_reminders']);
+      .toEqual(['dues_reminders', 'lead_followup', 'renewal_reminders']);
     expect(canRun(findAction('renewal_reminders'), admin)).toBe(true);
   });
 
@@ -103,6 +103,74 @@ describe('recipients come from the server, scoped to the org', () => {
     mockQuery.mockResolvedValue({ rows: [] });
     await findAction('renewal_reminders').resolve(reqAs(admin), { days: 7 });
     expect(mockQuery.mock.calls[0][0]).toMatch(new RegExp(`LIMIT ${MAX_RECIPIENTS}\\b`));
+  });
+});
+
+describe('lead_followup resolves only open leads with a due follow-up', () => {
+  test('queries pt_leads, excludes terminal statuses, scoped to the caller\'s org', async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+    await findAction('lead_followup').resolve(reqAs(admin), { days: 7 });
+
+    const [sql, values] = mockQuery.mock.calls[0];
+    expect(sql).toMatch(/FROM pt_leads/);
+    expect(sql).toMatch(/status IN \('new', 'contacted', 'trial_scheduled'\)/);
+    expect(sql).not.toMatch(/'converted'|'lost'/);
+    expect(sql).toMatch(/organization_id = \$2/);
+    expect(values).toEqual([7, 'org-1']);
+  });
+
+  test('a lead with no mobile number is excluded and counted, same as the client actions', async () => {
+    mockQuery.mockResolvedValue({
+      rows: [
+        { id: 'l1', name: 'Has Phone', mobile: '9990000001', source: 'walk_in', status: 'new', interested_package: null, follow_up_date: '2026-09-01' },
+        { id: 'l2', name: 'No Phone', mobile: null, source: 'referral', status: 'contacted', interested_package: null, follow_up_date: '2026-09-01' },
+      ],
+    });
+    const { recipients, warnings } = await findAction('lead_followup').resolve(reqAs(admin), { days: 7 });
+    expect(recipients.map((r) => r.id)).toEqual(['l1']);
+    expect(warnings.join(' ')).toMatch(/1 matching lead has no mobile number/);
+  });
+
+  test('resolve() alone never computes a final body — it is model-backed', async () => {
+    mockQuery.mockResolvedValue({
+      rows: [{ id: 'l1', name: 'Ajeet', mobile: '9990000001', source: 'instagram', status: 'new', interested_package: 'Gold', follow_up_date: '2026-09-01' }],
+    });
+    const { recipients } = await findAction('lead_followup').resolve(reqAs(admin), { days: 7 });
+    expect(findAction('lead_followup').usesModel).toBe(true);
+    expect(recipients[0].body).toBeUndefined();
+    expect(recipients[0].templateBody).toContain('Ajeet');
+    expect(recipients[0].templateBody).toContain('Gold');
+  });
+});
+
+describe('lead_followup drafting reuses the same one-call batching as renewal_reminders', () => {
+  test('drafts under the lead intent, falls back to templateBody per-recipient on a partial reply', async () => {
+    jest.resetModules();
+    const mockRoutedChat = jest.fn().mockResolvedValue({
+      content: JSON.stringify({ drafts: [{ id: 'l1', body: 'Hey Ajeet, still thinking about Gold membership?' }] }),
+      model: 'test-model', usage: {}, latency_ms: 10, used_fallback: false,
+    });
+    jest.doMock('../lib/ai/router', () => ({ routedChat: mockRoutedChat }));
+    jest.doMock('../db/pool', () => ({ query: (...a) => mockQuery(...a) }));
+    jest.doMock('../services/whatsappDelivery', () => ({
+      sendText: (...a) => mockSendText(...a), sendTemplate: jest.fn(), twilioWhatsappConfigured: () => mockConfigured(),
+    }));
+    const registry = require('../modules/ai-actions/registry');
+
+    const recipients = [
+      { id: 'l1', name: 'Ajeet', templateBody: 'TEMPLATE for Ajeet', _draftFacts: { name: 'Ajeet', source: 'instagram', status: 'new', interested_package: 'Gold', follow_up_date: '2026-09-01' } },
+      { id: 'l2', name: 'Priya', templateBody: 'TEMPLATE for Priya', _draftFacts: { name: 'Priya', source: 'referral', status: 'contacted', interested_package: null, follow_up_date: '2026-09-02' } },
+    ];
+    const out = await registry.finalize(registry.findAction('lead_followup'), reqAs(admin), recipients);
+
+    expect(mockRoutedChat).toHaveBeenCalledTimes(1);
+    expect(mockRoutedChat.mock.calls[0][0].intent).toBe('lead');
+    expect(out.find((r) => r.id === 'l1').body).toBe('Hey Ajeet, still thinking about Gold membership?');
+    expect(out.find((r) => r.id === 'l2').body).toBe('TEMPLATE for Priya');
+    expect(out.find((r) => r.id === 'l2').ai_drafted).toBe(false);
+    jest.dontMock('../lib/ai/router');
+    jest.dontMock('../db/pool');
+    jest.dontMock('../services/whatsappDelivery');
   });
 });
 

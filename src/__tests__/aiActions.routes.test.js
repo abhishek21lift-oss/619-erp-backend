@@ -403,6 +403,50 @@ describe('a model-backed action freezes its drafted text', () => {
     expect(mockSendText).not.toHaveBeenCalled();
   });
 
+  // Not a repeat of the renewal_reminders proof above for its own sake — this
+  // is what proves the freeze/quota mechanism is a general property of
+  // `usesModel` actions, not something special-cased for one of them.
+  test('a second model-backed action (lead_followup) gets the same freeze-and-send treatment', async () => {
+    const a = freshApp();
+    mockRoutedChat.mockResolvedValue({
+      content: JSON.stringify({ drafts: [{ id: 'l1', body: 'DRAFTED: hi Priya, still interested?' }] }),
+      model: 'test-model', usage: {}, latency_ms: 5, used_fallback: false,
+    });
+
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ id: 'l1', name: 'Priya', mobile: '9990000001', source: 'walk_in', status: 'new', interested_package: null, follow_up_date: '2026-09-01' }] })
+      .mockResolvedValueOnce({ rows: [] }) // draft()'s logUsage insert
+      .mockResolvedValueOnce({ rows: [{ id: 'plan-1', expires_at: future() }] });
+
+    const planned = await request(a).post('/api/ai/actions/lead_followup/plan').send({ days: 7 });
+    expect(planned.status).toBe(200);
+    expect(planned.body.data.sample_message).toBe('DRAFTED: hi Priya, still interested?');
+
+    const insertCall = pool.query.mock.calls.find(([sql]) => /INSERT INTO ai_action_plans/.test(sql));
+    const [storedFingerprint, , , storedResolved] = insertCall[1].slice(3);
+
+    pool.query.mockReset();
+    pool.query
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'plan-1', action_id: 'lead_followup', fingerprint: storedFingerprint,
+          params: { days: 7 }, resolved_recipients: JSON.parse(storedResolved),
+          consumed_at: null, expires_at: future(),
+        }],
+      })
+      .mockResolvedValueOnce({ rows: [{ id: 'l1', name: 'Priya', mobile: '9990000001', source: 'walk_in', status: 'new', interested_package: null, follow_up_date: '2026-09-01' }] })
+      .mockResolvedValueOnce({ rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const executed = await request(a)
+      .post('/api/ai/actions/lead_followup/execute')
+      .send({ plan_id: planned.body.data.plan_id });
+
+    expect(executed.status).toBe(200);
+    expect(executed.body.data.sent).toBe(1);
+    expect(mockRoutedChat).toHaveBeenCalledTimes(1); // never re-drafted at execute
+    expect(mockSendText).toHaveBeenCalledWith({ to: '9990000001', body: 'DRAFTED: hi Priya, still interested?' });
+  });
 });
 
 // Separate describe: needs to observe the quota guard being called or not,
