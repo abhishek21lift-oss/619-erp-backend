@@ -136,8 +136,15 @@ describe('super-admin API — the H-03 split', () => {
     'GET /organizations/:id/subscription',
     'GET /organizations/:id/subscription/change-quote',
     'GET /overview',
+    // Phase 5 — kpis() is the brief's "ONE payload" for the home, replaced
+    // the old /overview's many bespoke queries with one snapshot endpoint.
+    'GET /overview/kpis',
     'GET /platform-payment-settings',
     'GET /registrations',
+    // Phase 5 — CommandBar search (super-admin/search.js). Kinds are
+    // studio/owner/trainer/client; org_id is on every result row by
+    // design so the platform admin never sees an ambiguous tenant.
+    'GET /search',
     'GET /security/login-events',
     'GET /security/overview',
     'GET /security/sessions',
@@ -146,6 +153,12 @@ describe('super-admin API — the H-03 split', () => {
     'GET /storage/largest',
     'GET /storage/overview',
     'GET /storage/trend',
+    // Phase 5 — Studio 360 (super-admin/studios.js). Three views per studio,
+    // all read-only, all under PLATFORM_GUARD. :id is a UUID, not a slug —
+    // the URL is the authorization, so a typo is rejected before any query.
+    'GET /studios/:id/health',
+    'GET /studios/:id/memberships',
+    'GET /studios/:id/pt-revenue',
     'GET /subscription-metrics',
     'GET /subscription-requests',
     'GET /subscriptions',
@@ -153,6 +166,14 @@ describe('super-admin API — the H-03 split', () => {
     'GET /support/tickets',
     'GET /support/tickets/:id',
     'GET /system-health',
+    // Phase 5 — Tenancy health (super-admin/tenancy.js). The honest-state
+    // card: 5 sections, each with its own status. The /tenancy-health rollup
+    // is the home's primary signal; the four drilldowns back the card's
+    // "view" buttons.
+    'GET /tenancy-health',
+    'GET /tenancy/cross-tenant-attempts',
+    'GET /tenancy/known-gaps',
+    'GET /tenancy/orphans',
     // Added deliberately — the platform user directory (super-admin/users.js).
     // Not part of the H-03 split; the console had no cross-tenant view of
     // accounts at all, only per-studio ones reached through an organization.
@@ -201,6 +222,8 @@ describe('super-admin API — the H-03 split', () => {
     'POST /subscription-requests/:id/approve',
     'POST /subscription-requests/:id/reject',
     'POST /support/tickets/:id/messages',
+    // Phase 5 — the only mutation in tenancy.js. 5-min per-user cooldown.
+    'POST /tenancy/run-isolation-tests',
     'POST /users/:id/force-logout',
     'POST /users/:id/reset-mfa',
     'POST /users/:id/reset-password',

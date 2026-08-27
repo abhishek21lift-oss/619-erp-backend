@@ -51,6 +51,16 @@ const FIXTURE = {
   },
 };
 
+// Phase 5/7 — a platform-owner account that authenticates against the
+// /api/platform/* routes the e2e suite for the Command Centre exercises.
+// organization_id is NULL, role is super_admin, and the user has MFA
+// verification recorded as already-cleared so the e2e request reaches
+// the platform routes without having to walk an OTP dialog.
+const PLATFORM = {
+  userId: 'usr-e2e-platform',
+  email: 'platform@e2e.test',
+};
+
 const PASSWORD = 'E2ePassw0rd!seed';
 
 async function guardNotProduction() {
@@ -149,11 +159,31 @@ async function seedStudio(s, hash) {
   );
 }
 
+async function seedPlatformOwner(hash) {
+  // Phase 5/7 — the platform owner authenticates against /api/platform/*.
+  // organization_id is NULL, role is super_admin. The MFA column is
+  // stamped with a recent past timestamp so requireSuperAdminMfa() sees a
+  // verification within the window and lets the request through.
+  await pool.query(
+    `INSERT INTO users (id, name, email, password, role, is_active, is_platform_owner,
+                        organization_id, token_version, failed_login_attempts,
+                        mfa_verified_at, created_at, updated_at)
+     VALUES ($1, 'E2E Platform Owner', $2, $3, 'super_admin', TRUE, TRUE,
+             NULL, 0, 0, NOW(), NOW(), NOW())
+     ON CONFLICT (id) DO UPDATE
+       SET password = EXCLUDED.password,
+           is_platform_owner = TRUE,
+           mfa_verified_at = NOW()`,
+    [PLATFORM.userId, PLATFORM.email, hash]
+  );
+}
+
 async function main() {
   await guardNotProduction();
   const hash = await bcrypt.hash(PASSWORD, 10);
 
   for (const s of [FIXTURE.a, FIXTURE.b]) await seedStudio(s, hash);
+  await seedPlatformOwner(hash);
 
   const { rows } = await pool.query(
     `SELECT o.name, count(DISTINCT c.id)::int AS clients, count(DISTINCT p.id)::int AS payments
@@ -164,7 +194,11 @@ async function main() {
       GROUP BY o.name ORDER BY o.name`,
     [[ORG_A, ORG_B]]
   );
-  console.log(JSON.stringify({ seeded: rows, password: PASSWORD }, null, 2));
+  console.log(JSON.stringify({
+    seeded: rows,
+    password: PASSWORD,
+    platform: PLATFORM,
+  }, null, 2));
   await pool.end();
 }
 
@@ -173,4 +207,4 @@ main().catch((err) => {
   process.exit(1);
 });
 
-module.exports = { FIXTURE, PASSWORD };
+module.exports = { FIXTURE, PLATFORM, PASSWORD };
