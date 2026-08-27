@@ -28,11 +28,22 @@ const pool = require('../../db/pool');
 const { auth } = require('../../middleware/auth');
 const logger = require('../../lib/logger');
 const { tenantScope } = require('../../lib/tenant-db');
-const { findAction, canRun, listFor, deliver, MAX_RECIPIENTS } = require('./registry');
+const { requireAiQuota } = require('../../lib/aiQuota');
+const { findAction, canRun, listFor, deliver, finalize, MAX_RECIPIENTS } = require('./registry');
 
 /** Long enough to read a list of twelve names and think about it; short
  *  enough that the world has probably not moved underneath it. */
 const PLAN_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * This router is mounted WITHOUT requireAiQuota() (server.js) because most
+ * actions here send a fixed template and never touch a model. Now that an
+ * action can be model-backed (`usesModel`, see registry.js), the gate is
+ * applied here instead, per-request, only when the specific action being
+ * planned actually calls a model — so dues_reminders staying template-only
+ * is never blocked by an org's unrelated AI quota being exhausted.
+ */
+const quotaGuard = requireAiQuota();
 
 /**
  * What the operator is agreeing to, reduced to one string.
@@ -64,8 +75,19 @@ router.post('/actions/:id/plan', auth, wrap(async (req, res) => {
     return res.status(403).json({ error: 'You do not have permission to run this action' });
   }
 
+  if (action.usesModel) {
+    let allowed = false;
+    await quotaGuard(req, res, () => { allowed = true; });
+    // quotaGuard either sent a 429 itself (blocked) or called our callback
+    // (allowed — enforcement off, under limit, or its own internal error,
+    // which it deliberately fails open on).
+    if (!allowed) return;
+  }
+
   const params = action.normalize(req.body);
-  const { recipients, warnings } = await action.resolve(req, params);
+  const resolved = await action.resolve(req, params);
+  const recipients = await finalize(action, req, resolved.recipients);
+  const warnings = resolved.warnings;
 
   const summary = {
     action_id: action.id,
@@ -77,6 +99,7 @@ router.post('/actions/:id/plan', auth, wrap(async (req, res) => {
     // not an export. The count above is the number that will be messaged.
     preview: recipients.slice(0, 8).map((r) => ({ name: r.name, detail: r.detail })),
     sample_message: recipients[0]?.body ?? null,
+    ai_drafted: action.usesModel ? recipients.some((r) => r.ai_drafted) : false,
     warnings,
     truncated: recipients.length >= MAX_RECIPIENTS,
   };
@@ -84,11 +107,16 @@ router.post('/actions/:id/plan', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
   const { rows } = await pool.query(
     `INSERT INTO ai_action_plans
-       (organization_id, user_id, action_id, fingerprint, params, summary, expires_at)
-     VALUES ($1,$2,$3,$4,$5,$6, now() + ($7 || ' milliseconds')::INTERVAL)
+       (organization_id, user_id, action_id, fingerprint, params, summary, resolved_recipients, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7, now() + ($8 || ' milliseconds')::INTERVAL)
      RETURNING id, expires_at`,
     [scope.orgId, req.user.id, action.id, fingerprint(recipients),
-      JSON.stringify(params), JSON.stringify(summary), PLAN_TTL_MS],
+      JSON.stringify(params), JSON.stringify(summary),
+      // Only stored for model-backed actions — what execute freezes instead
+      // of re-drafting. NULL for a template-only action: resolve() alone
+      // reproduces the same body forever, nothing new to remember.
+      action.usesModel ? JSON.stringify(recipients.map((r) => ({ id: r.id, body: r.body }))) : null,
+      PLAN_TTL_MS],
   );
 
   res.json({ data: { plan_id: rows[0].id, expires_at: rows[0].expires_at, ...summary } });
@@ -107,7 +135,7 @@ router.post('/actions/:id/execute', auth, wrap(async (req, res) => {
   // Scoped to the confirming user, not just to the org: a plan is one
   // person's approval and is not transferable to a colleague's session.
   const { rows: found } = await pool.query(
-    `SELECT id, action_id, fingerprint, params, consumed_at, expires_at
+    `SELECT id, action_id, fingerprint, params, resolved_recipients, consumed_at, expires_at
        FROM ai_action_plans
       WHERE id = $1 AND user_id = $2`,
     [planId, req.user.id],
@@ -124,8 +152,41 @@ router.post('/actions/:id/execute', auth, wrap(async (req, res) => {
     return res.status(409).json({ error: 'That plan has expired — please review it again', code: 'expired' });
   }
 
-  // Re-derive. Nothing from the request body reaches this.
-  const { recipients, warnings } = await action.resolve(req, plan.params);
+  // Re-derive eligibility. Nothing from the request body reaches this.
+  const resolved = await action.resolve(req, plan.params);
+  const warnings = resolved.warnings;
+
+  let recipients;
+  if (action.usesModel) {
+    // Never re-draft here — see draft()'s own comment in registry.js for
+    // why. Freeze the exact text the operator approved at plan time, and
+    // only re-check WHO still qualifies: if eligibility moved (someone
+    // renewed, someone's package now excludes them) since the plan was
+    // read, that's the same "stale plan" refusal as the template-only path
+    // below, just checked as a set of ids first because there's no fresh
+    // body to fingerprint-compare directly against.
+    const frozen = new Map((plan.resolved_recipients || []).map((r) => [String(r.id), r.body]));
+    const freshIds = new Set(resolved.recipients.map((r) => String(r.id)));
+    const sameSet = freshIds.size === frozen.size && [...freshIds].every((id) => frozen.has(id));
+    if (!sameSet) {
+      return res.status(409).json({
+        error: 'The list changed since you reviewed it — please check it again',
+        code: 'plan_stale',
+        count: resolved.recipients.length,
+      });
+    }
+    // Fresh contact details (a phone number may have been corrected since
+    // planning) paired with the frozen, human-approved text.
+    recipients = resolved.recipients.map((r) => ({ ...r, body: frozen.get(String(r.id)) }));
+  } else {
+    recipients = resolved.recipients.map((r) => ({ ...r, body: r.templateBody }));
+  }
+
+  // Tamper/corruption check against the stored plan row. For a model-backed
+  // action this should always pass by construction — the ids+bodies above
+  // are exactly what resolved_recipients was fingerprinted from at plan
+  // time — so a mismatch here means the plan row itself was altered, not
+  // that the world moved (that was already caught above).
   if (fingerprint(recipients) !== plan.fingerprint) {
     return res.status(409).json({
       error: 'The list changed since you reviewed it — please check it again',

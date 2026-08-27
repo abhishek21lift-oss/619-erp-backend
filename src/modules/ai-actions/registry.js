@@ -28,8 +28,13 @@
  */
 
 const pool = require('../../db/pool');
+const logger = require('../../lib/logger');
 const { tenantScope } = require('../../lib/tenant-db');
 const { sendText, twilioWhatsappConfigured } = require('../../services/whatsappDelivery');
+const { routedChat } = require('../../lib/ai/router');
+const { logUsage } = require('../../lib/ai/usage');
+const { extractJson } = require('../../lib/ai/jsonExtract');
+const { buildRenewalReminderPrompt } = require('../../lib/ai/prompts/system');
 
 /** Clamp an incoming number into a range, falling back for junk input. */
 function clampInt(value, { min, max, fallback }) {
@@ -65,6 +70,11 @@ const ACTIONS = [
     title: 'Send renewal reminders',
     /** Leaves the building. The confirmation step is not decoration. */
     outward: true,
+    // Drives the conditional requireAiQuota() gate on /plan (see
+    // ai-actions.routes.js) and tells the route it must freeze — never
+    // re-derive — the drafted text at execute time. dues_reminders has no
+    // draft() and stays outside both.
+    usesModel: true,
     roles: ['admin', 'manager', 'super_admin'],
     describe: (p) => `WhatsApp every active client whose package ends within ${p.days} days`,
     normalize: (body = {}) => ({ days: clampInt(body.days, { min: 1, max: 90, fallback: 7 }) }),
@@ -100,15 +110,72 @@ const ACTIONS = [
       }
 
       return {
+        // `templateBody` is the deterministic fallback every recipient
+        // always carries — draft() below tries to replace it with a
+        // personalized message, but a bad/failed model call must never mean
+        // a client gets no reminder at all.
         recipients: reachable.map((r) => ({
           id: r.id,
           name: r.name,
           mobile: r.mobile,
           detail: r.days_left === 0 ? 'ends today' : `${r.days_left}d left`,
-          body: `Hi ${r.name}, your personal training package ends on ${r.pt_end_date}. Reply here to renew and keep your slot.`,
+          templateBody: `Hi ${r.name}, your personal training package ends on ${r.pt_end_date}. Reply here to renew and keep your slot.`,
+          _draftFacts: { name: r.name, days_left: r.days_left, end_date: r.pt_end_date },
         })),
         warnings,
       };
+    },
+
+    /**
+     * Drafts a personalized body for every recipient in ONE model call, not
+     * one call per recipient — a 200-row plan would otherwise mean up to 200
+     * sequential LLM round trips inside a single synchronous HTTP request.
+     *
+     * Only ever called at PLAN time (see ai-actions.routes.js) — execute
+     * freezes whatever this returned rather than calling it again, because
+     * model output is not deterministic: re-drafting at execute would almost
+     * always produce different text than what the operator approved, which
+     * would make the plan/execute fingerprint check refuse a good plan every
+     * time, or force a fuzzy compare that stops meaning anything.
+     */
+    async draft(recipients, req) {
+      if (!recipients.length) return recipients;
+      try {
+        const facts = recipients.map((r) => ({ id: r.id, ...r._draftFacts }));
+        const result = await routedChat({
+          intent: 'renew',
+          messages: [
+            { role: 'system', content: buildRenewalReminderPrompt() },
+            { role: 'user', content: `Draft a reminder for each of these clients:\n\n${JSON.stringify(facts, null, 2)}` },
+          ],
+          temperature: 0.5,
+          max_tokens: Math.min(300 * recipients.length, 8000),
+        });
+
+        logUsage({
+          user_id: req.user.id,
+          model: result.model,
+          intent_type: 'renew',
+          tokens_prompt: result.usage?.prompt_tokens || 0,
+          tokens_completion: result.usage?.completion_tokens || 0,
+          latency_ms: result.latency_ms,
+          used_fallback: result.used_fallback,
+        }).catch(() => {});
+
+        const parsed = extractJson(result.content);
+        const byId = new Map((parsed?.drafts || []).map((d) => [String(d.id), d.body]));
+
+        // Anything the model didn't return a usable draft for keeps its
+        // templateBody — never left without any message.
+        return recipients.map((r) => {
+          const drafted = byId.get(String(r.id));
+          const usable = typeof drafted === 'string' && drafted.trim().length > 0 && drafted.length <= 500;
+          return { ...r, body: usable ? drafted.trim() : r.templateBody, ai_drafted: usable };
+        });
+      } catch (err) {
+        logger.warn({ err: err.message }, 'renewal_reminder_draft_failed_falling_back');
+        return recipients.map((r) => ({ ...r, body: r.templateBody, ai_drafted: false }));
+      }
     },
   },
 
@@ -116,6 +183,7 @@ const ACTIONS = [
     id: 'dues_reminders',
     title: 'Send payment reminders',
     outward: true,
+    usesModel: false,
     roles: ['admin', 'manager', 'super_admin'],
     describe: (p) => `WhatsApp every client with a balance over ${moneyINR(p.min_balance)}`,
     normalize: (body = {}) => ({
@@ -154,13 +222,26 @@ const ACTIONS = [
           name: r.name,
           mobile: r.mobile,
           detail: moneyINR(r.balance_amount),
-          body: `Hi ${r.name}, a balance of ${moneyINR(r.balance_amount)} is pending on your training account. Reply here if you'd like a payment link.`,
+          templateBody: `Hi ${r.name}, a balance of ${moneyINR(r.balance_amount)} is pending on your training account. Reply here if you'd like a payment link.`,
         })),
         warnings,
       };
     },
   },
 ];
+
+/**
+ * Turns `resolve()`'s recipients (each carrying a `templateBody` fallback)
+ * into recipients carrying the final `body` that will actually be sent.
+ * Model-backed actions get one shot at drafting, at plan time only — see
+ * `draft()`'s own comment for why execute never calls this again.
+ */
+async function finalize(action, req, recipients) {
+  if (action.usesModel && typeof action.draft === 'function') {
+    return action.draft(recipients, req);
+  }
+  return recipients.map((r) => ({ ...r, body: r.templateBody, ai_drafted: false }));
+}
 
 /**
  * Deliver one plan. Returns a per-recipient result and never throws for a
@@ -197,4 +278,4 @@ function listFor(user) {
   }));
 }
 
-module.exports = { ACTIONS, MAX_RECIPIENTS, findAction, canRun, listFor, deliver, clampInt };
+module.exports = { ACTIONS, MAX_RECIPIENTS, findAction, canRun, listFor, deliver, finalize, clampInt };

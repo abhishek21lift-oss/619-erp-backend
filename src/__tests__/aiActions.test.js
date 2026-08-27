@@ -133,9 +133,109 @@ describe('the plan tells the truth before anybody confirms', () => {
     mockQuery.mockResolvedValue({
       rows: [{ id: 'c1', name: 'Ajeet', mobile: '9990000001', balance_amount: 2500 }],
     });
+    // dues_reminders has no draft() (usesModel: false), so finalize() copies
+    // templateBody straight to body — this IS the message that gets sent.
     const { recipients } = await findAction('dues_reminders').resolve(reqAs(admin), { min_balance: 1 });
-    expect(recipients[0].body).toContain('Ajeet');
-    expect(recipients[0].body).toContain('₹2,500');
+    expect(recipients[0].templateBody).toContain('Ajeet');
+    expect(recipients[0].templateBody).toContain('₹2,500');
+  });
+});
+
+describe('the model can draft the words, never who gets messaged or when', () => {
+  test('renewal_reminders is model-backed; dues_reminders is not', () => {
+    expect(findAction('renewal_reminders').usesModel).toBe(true);
+    expect(findAction('dues_reminders').usesModel).toBe(false);
+  });
+
+  test('resolve() alone never computes a final body for a model-backed action', async () => {
+    mockQuery.mockResolvedValue({
+      rows: [{ id: 'c1', name: 'Ajeet', mobile: '9990000001', pt_end_date: '2026-09-01', days_left: 3 }],
+    });
+    const { recipients } = await findAction('renewal_reminders').resolve(reqAs(admin), { days: 7 });
+    expect(recipients[0].body).toBeUndefined();
+    expect(recipients[0].templateBody).toContain('Ajeet');
+  });
+
+  test('finalize() drafts one recipient in one model call, not one call per recipient', async () => {
+    jest.resetModules();
+    const mockRoutedChat = jest.fn().mockResolvedValue({
+      content: JSON.stringify({ drafts: [{ id: 'c1', body: 'Hey Ajeet — 3 days left on your package, want to renew?' }] }),
+      model: 'test-model', usage: { prompt_tokens: 10, completion_tokens: 10 }, latency_ms: 50, used_fallback: false,
+    });
+    jest.doMock('../lib/ai/router', () => ({ routedChat: mockRoutedChat }));
+    jest.doMock('../db/pool', () => ({ query: (...a) => mockQuery(...a) }));
+    jest.doMock('../services/whatsappDelivery', () => ({
+      sendText: (...a) => mockSendText(...a), sendTemplate: jest.fn(), twilioWhatsappConfigured: () => mockConfigured(),
+    }));
+    const registry = require('../modules/ai-actions/registry');
+
+    const recipients = [{
+      id: 'c1', name: 'Ajeet', mobile: '9990000001', detail: '3d left',
+      templateBody: 'Hi Ajeet, your personal training package ends on 2026-09-01. Reply here to renew and keep your slot.',
+      _draftFacts: { name: 'Ajeet', days_left: 3, end_date: '2026-09-01' },
+    }];
+    const out = await registry.finalize(
+      registry.findAction('renewal_reminders'), reqAs(admin), recipients,
+    );
+
+    expect(mockRoutedChat).toHaveBeenCalledTimes(1);
+    expect(out[0].body).toBe('Hey Ajeet — 3 days left on your package, want to renew?');
+    expect(out[0].ai_drafted).toBe(true);
+    jest.dontMock('../lib/ai/router');
+    jest.dontMock('../db/pool');
+    jest.dontMock('../services/whatsappDelivery');
+  });
+
+  test('a recipient the model skipped still gets the deterministic fallback, never nothing', async () => {
+    jest.resetModules();
+    const mockRoutedChat = jest.fn().mockResolvedValue({
+      // Only c1 drafted — c2 is missing from the response entirely.
+      content: JSON.stringify({ drafts: [{ id: 'c1', body: 'Hi Ajeet, 3 days left!' }] }),
+      model: 'test-model', usage: {}, latency_ms: 10, used_fallback: false,
+    });
+    jest.doMock('../lib/ai/router', () => ({ routedChat: mockRoutedChat }));
+    jest.doMock('../db/pool', () => ({ query: (...a) => mockQuery(...a) }));
+    jest.doMock('../services/whatsappDelivery', () => ({
+      sendText: (...a) => mockSendText(...a), sendTemplate: jest.fn(), twilioWhatsappConfigured: () => mockConfigured(),
+    }));
+    const registry = require('../modules/ai-actions/registry');
+
+    const recipients = [
+      { id: 'c1', name: 'Ajeet', templateBody: 'TEMPLATE for Ajeet', _draftFacts: { name: 'Ajeet', days_left: 3, end_date: '2026-09-01' } },
+      { id: 'c2', name: 'Priya', templateBody: 'TEMPLATE for Priya', _draftFacts: { name: 'Priya', days_left: 5, end_date: '2026-09-03' } },
+    ];
+    const out = await registry.finalize(
+      registry.findAction('renewal_reminders'), reqAs(admin), recipients,
+    );
+
+    expect(out.find((r) => r.id === 'c1').ai_drafted).toBe(true);
+    expect(out.find((r) => r.id === 'c2').ai_drafted).toBe(false);
+    expect(out.find((r) => r.id === 'c2').body).toBe('TEMPLATE for Priya');
+    jest.dontMock('../lib/ai/router');
+    jest.dontMock('../db/pool');
+    jest.dontMock('../services/whatsappDelivery');
+  });
+
+  test('a model failure falls back to the template for everyone, never throws', async () => {
+    jest.resetModules();
+    const mockRoutedChat = jest.fn().mockRejectedValue(new Error('AI service temporarily unavailable'));
+    jest.doMock('../lib/ai/router', () => ({ routedChat: mockRoutedChat }));
+    jest.doMock('../db/pool', () => ({ query: (...a) => mockQuery(...a) }));
+    jest.doMock('../services/whatsappDelivery', () => ({
+      sendText: (...a) => mockSendText(...a), sendTemplate: jest.fn(), twilioWhatsappConfigured: () => mockConfigured(),
+    }));
+    const registry = require('../modules/ai-actions/registry');
+
+    const recipients = [{ id: 'c1', name: 'Ajeet', templateBody: 'TEMPLATE for Ajeet', _draftFacts: { name: 'Ajeet', days_left: 3, end_date: '2026-09-01' } }];
+    const out = await registry.finalize(
+      registry.findAction('renewal_reminders'), reqAs(admin), recipients,
+    );
+
+    expect(out[0].body).toBe('TEMPLATE for Ajeet');
+    expect(out[0].ai_drafted).toBe(false);
+    jest.dontMock('../lib/ai/router');
+    jest.dontMock('../db/pool');
+    jest.dontMock('../services/whatsappDelivery');
   });
 });
 

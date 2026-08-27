@@ -19,6 +19,9 @@ const { generateCoach } = require('./coach-ai');
 const { buildRecovery } = require('./recovery');
 const { routedChat } = require('../../lib/ai/router');
 const { logActivity } = require('../../lib/activityLog');
+const { logUsage } = require('../../lib/ai/usage');
+const { generateCheckinInsight } = require('./checkin-insight');
+const { requireAiQuota } = require('../../lib/aiQuota');
 
 /**
  * Where a client found the studio.
@@ -1934,6 +1937,65 @@ router.post('/clients/:id/coach', auth, wrap(async (req, res) => {
     // The rule-based prompts are true whatever the model does, so they are
     // what the card falls back to rather than an empty state.
     fallback: snapshot.coach,
+  });
+
+  res.json({ data: out });
+}));
+
+// POST /clients/:id/checkin-insight
+//
+// A short, advisory read of a client's recent weekly check-ins — nothing
+// this writes anywhere. On demand only, same reasoning as /coach above: a
+// client's check-in history doesn't change between two page opens an hour
+// apart, so there is no reason to spend a model call on every visit.
+//
+// Explicitly quota-gated, unlike /coach above (a pre-existing gap in this
+// file, not introduced here and not this route's to fix) — this is a new
+// LLM-calling endpoint and there's no reason to special-case it out of the
+// same budget every other AI Suite call respects.
+router.post('/clients/:id/checkin-insight', auth, requireAiQuota(), wrap(async (req, res) => {
+  const clientId = req.params.id;
+  const params = [clientId];
+  const orgClause = orgWhere(req, params, 'c.organization_id');
+
+  const { rows: clientRows } = await pool.query(
+    `SELECT c.id, c.name FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
+    params,
+  );
+  const client = clientRows[0];
+  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+
+  const { rows: checkins } = await pool.query(
+    `SELECT weight, mood, sleep_hours, water_glasses, client_notes, created_at
+       FROM weekly_checkins WHERE client_id = $1
+      ORDER BY created_at DESC LIMIT 6`,
+    [clientId],
+  );
+
+  // Nothing to say about one data point, and nothing worth a model call for
+  // it — nudge the trainer at the source instead of drafting a hollow card.
+  if (checkins.length < 2) {
+    return res.json({ data: { available: false, reason: 'not_enough_checkins', checkins_count: checkins.length } });
+  }
+
+  // Oldest → newest, matching the shape every other generator in this file
+  // feeds the model (see /progress/analyze's own reversal).
+  const out = await generateCheckinInsight({
+    client,
+    checkins: checkins.slice().reverse(),
+    chat: async (args) => {
+      const result = await routedChat(args);
+      logUsage({
+        user_id: req.user.id,
+        model: result.model,
+        intent_type: 'checkin',
+        tokens_prompt: result.usage?.prompt_tokens || 0,
+        tokens_completion: result.usage?.completion_tokens || 0,
+        latency_ms: result.latency_ms,
+        used_fallback: result.used_fallback,
+      }).catch(() => {});
+      return result;
+    },
   });
 
   res.json({ data: out });
