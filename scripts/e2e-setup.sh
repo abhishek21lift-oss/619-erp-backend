@@ -25,7 +25,15 @@ set -euo pipefail
 : "${JWT_SECRET:=e2e-test-secret-at-least-32-characters-long!!}"
 : "${FRONTEND_URL:=http://127.0.0.1:3100}"
 : "${PORT:=5100}"
-export JWT_SECRET FRONTEND_URL PORT
+# The seeded E2E platform owner (scripts/seed-e2e.js) is not TOTP-enrolled —
+# there is no deterministic way to produce a valid 6-digit code from a
+# fixture. requireSuperAdminMfa (middleware/tenant.js) defaults to ON, which
+# would 403 every platform-route request from that account with
+# MFA_SETUP_REQUIRED. This is exactly the staged-rollout case the flag exists
+# for: "turning it on before sessions have churned would lock the operator
+# out" — here that operator is the E2E suite itself.
+: "${SUPER_ADMIN_REQUIRE_MFA:=off}"
+export JWT_SECRET FRONTEND_URL PORT SUPER_ADMIN_REQUIRE_MFA
 export NODE_ENV="${NODE_ENV:-development}"
 export RUN_WORKERS=0
 
