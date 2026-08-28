@@ -53,9 +53,9 @@ const FIXTURE = {
 
 // Phase 5/7 — a platform-owner account that authenticates against the
 // /api/platform/* routes the e2e suite for the Command Centre exercises.
-// organization_id is NULL, role is super_admin, and the user has MFA
-// verification recorded as already-cleared so the e2e request reaches
-// the platform routes without having to walk an OTP dialog.
+// organization_id is NULL, role is super_admin. See seedPlatformOwner() for
+// how it clears requirePlatformOwner and requireSuperAdminMfa without a real
+// OTP device.
 const PLATFORM = {
   userId: 'usr-e2e-platform',
   email: 'platform@e2e.test',
@@ -161,21 +161,39 @@ async function seedStudio(s, hash) {
 
 async function seedPlatformOwner(hash) {
   // Phase 5/7 — the platform owner authenticates against /api/platform/*.
-  // organization_id is NULL, role is super_admin. The MFA column is
-  // stamped with a recent past timestamp so requireSuperAdminMfa() sees a
-  // verification within the window and lets the request through.
+  // organization_id is NULL, role is super_admin.
+  //
+  // role='super_admin' alone is not enough — requirePlatformOwner
+  // (middleware/platformAuth.js) also requires a live platform_owners grant,
+  // and this row is created AFTER migration 161's own one-time seed already
+  // ran (it grants every super_admin that existed at migration time), so the
+  // grant below has to be written explicitly rather than inherited.
   await pool.query(
-    `INSERT INTO users (id, name, email, password, role, is_active, is_platform_owner,
+    `INSERT INTO users (id, name, email, password, role, is_active,
                         organization_id, token_version, failed_login_attempts,
-                        mfa_verified_at, created_at, updated_at)
-     VALUES ($1, 'E2E Platform Owner', $2, $3, 'super_admin', TRUE, TRUE,
-             NULL, 0, 0, NOW(), NOW(), NOW())
+                        created_at, updated_at)
+     VALUES ($1, 'E2E Platform Owner', $2, $3, 'super_admin', TRUE,
+             NULL, 0, 0, NOW(), NOW())
      ON CONFLICT (id) DO UPDATE
-       SET password = EXCLUDED.password,
-           is_platform_owner = TRUE,
-           mfa_verified_at = NOW()`,
+       SET password = EXCLUDED.password`,
     [PLATFORM.userId, PLATFORM.email, hash]
   );
+
+  await pool.query(
+    `INSERT INTO platform_owners (user_id, granted_by, note)
+     VALUES ($1, NULL, 'Seeded by scripts/seed-e2e.js for E2E fixtures')
+     ON CONFLICT (user_id) DO UPDATE SET revoked_at = NULL`,
+    [PLATFORM.userId]
+  );
+
+  // Deliberately NOT TOTP-enrolled: routes/auth.js requires a valid 6-digit
+  // code at login whenever user_profiles.mfa_enabled is true, and there is no
+  // deterministic way for a fixture to produce one. Leaving this account
+  // unenrolled instead lets login succeed outright (flagged
+  // mfaSetupRequired, which nothing here needs). requireSuperAdminMfa would
+  // still 403 every platform-route request behind that — see
+  // SUPER_ADMIN_REQUIRE_MFA=off in scripts/e2e-setup.sh, the other half of
+  // this.
 }
 
 async function main() {
