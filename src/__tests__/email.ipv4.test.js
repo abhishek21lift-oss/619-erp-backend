@@ -185,6 +185,38 @@ describe('a DNS failure degrades instead of taking mail down', () => {
   });
 });
 
+describe('verification never sends mail', () => {
+  test('verifyConnection() calls verify() and nothing else on the transport', async () => {
+    // The whole point of verifyConnection() existing separately from a real
+    // send: an operator (or the boot check) can prove the credentials work
+    // without a message landing in anyone's inbox. If a future change made
+    // verification fall through to sendMail, this is what would catch it.
+    const { email, nm } = load({ SMTP_PORT: '587' });
+    const sendMail = jest.fn(async () => ({ messageId: 'should-not-happen' }));
+    nm.createTransport.mockReturnValue({ verify: jest.fn(async () => true), sendMail });
+
+    await email.verifyConnection();
+
+    expect(sendMail).not.toHaveBeenCalled();
+  });
+
+  test('still true when verification fails', async () => {
+    // A failed verify() must not fall back to attempting a real send to
+    // double-check — the failure is reported as data, nothing is sent.
+    const { email, nm } = load({ SMTP_PORT: '587' });
+    const sendMail = jest.fn(async () => ({ messageId: 'should-not-happen' }));
+    nm.createTransport.mockReturnValue({
+      verify: jest.fn(async () => { throw Object.assign(new Error('Invalid login'), { code: 'EAUTH' }); }),
+      sendMail,
+    });
+
+    const r = await email.verifyConnection();
+
+    expect(r.ok).toBe(false);
+    expect(sendMail).not.toHaveBeenCalled();
+  });
+});
+
 describe('the TLS pairing is unchanged by the fix', () => {
   test('587 stays STARTTLS and 465 stays implicit TLS', async () => {
     // Guards against "fixing" this by forcing secure alongside the host swap.
