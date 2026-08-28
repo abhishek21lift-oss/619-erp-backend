@@ -63,4 +63,16 @@ router.use(require('./super-admin/mail'));
 // second door to guard.
 router.use(require('../command-center/command-center.routes'));
 
+// Command Centre Phase 6 — Tenancy Health, platform KPIs, Studio 360 deep
+// view, and global search. Each module is read-only except
+// `tenancy.run-isolation-tests`, which is rate-limited per user and audited
+// the same way every other platform mutation is. The mounts here are
+// deliberately AFTER every other domain so the platform-owners / overview /
+// users / audit routes still take precedence on any literal-segment conflict
+// (none today, but the order is the cheap insurance).
+router.use(require('./super-admin/tenancy'));
+router.use(require('./super-admin/kpis'));
+router.use(require('./super-admin/studios'));
+router.use(require('./super-admin/search'));
+
 module.exports = router;
