@@ -28,6 +28,7 @@ jest.mock('../db/pool', () => {
           'client-no-trainer': ORG_A,
           'client-other-org': ORG_B,
         };
+        // console.log(`clientInOrgMatch: clientId=${clientId}, orgId=${orgId}, expectedOrg=${CLIENT_MAP[clientId]}`);
         if (CLIENT_MAP[clientId] === orgId) {
           return { rows: [{ one: 1 }], rowCount: 1 };
         }

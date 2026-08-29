@@ -95,6 +95,7 @@ router.get('/overview/kpis', async (_req, res, next) => {
               COUNT(*) FILTER (WHERE severity = 'high'     AND status = 'open')::int AS high_alerts,
               COUNT(*) FILTER (WHERE severity = 'medium'   AND status = 'open')::int AS medium_alerts
               FROM system_alerts
+             WHERE deleted_at IS NULL
           )
         SELECT
           ok.*, own.*, tk.*, ck.*, sk.*, pk.*, ak.*
