@@ -235,13 +235,35 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   }
 });
 
-// POST /api/trainers/sessions — create a PT session
+// POST /api/trainers/sessions — create a PT session with tenant and trainer ownership checks
 router.post('/sessions', auth, async (req, res, next) => {
   try {
     const { trainer_id, client_id, date, time, duration, type, notes } = req.body;
     if (!trainer_id || !client_id || !date) {
       return res.status(400).json({ error: 'trainer_id, client_id, and date are required' });
     }
+
+    // Verify client belongs to the caller's organization and is not soft‑deleted
+    const { clientInOrg } = require('../lib/orgGuard');
+    const belongs = await clientInOrg(req, client_id);
+    if (!belongs) {
+      // 404 prevents probing other studios' client IDs
+      return res.status(404).json({ error: 'Client not found' });
+    }
+
+    // If the caller is a trainer, ensure the client is assigned to that trainer
+    if (req.user.role === 'trainer') {
+      const { rows: clientRows } = await pool.query(
+        'SELECT trainer_id FROM pt_clients WHERE id = $1 AND deleted_at IS NULL',
+        [client_id]
+      );
+      const client = clientRows[0];
+      if (!client || client.trainer_id !== trainer_id) {
+        // 403 indicates the trainer is not authorised for this client
+        return res.status(403).json({ error: 'Trainer not authorized for this client' });
+      }
+    }
+
     const startTime = time || null;
     const endTime = (time && duration)
       ? (() => {
