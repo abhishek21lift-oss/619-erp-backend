@@ -5,5 +5,5 @@ ALTER TABLE system_alerts
   ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 -- Create index for soft-delete filtering.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS system_alerts_deleted_at_idx
+CREATE INDEX IF NOT EXISTS system_alerts_deleted_at_idx
   ON system_alerts (deleted_at);
