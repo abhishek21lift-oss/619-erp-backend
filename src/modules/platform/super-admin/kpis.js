@@ -47,6 +47,7 @@ router.get('/overview/kpis', async (_req, res, next) => {
             SELECT
               COUNT(*)::int AS total_studios,
               COUNT(*) FILTER (WHERE status = 'active')::int AS active_studios,
+              COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_studios,
               COUNT(*) FILTER (WHERE subscription_status = 'trial'
                                 AND (trial_ends_at IS NULL OR trial_ends_at > NOW()))::int AS trial_studios,
               COUNT(*) FILTER (WHERE status = 'suspended')::int AS suspended_studios
@@ -121,6 +122,7 @@ router.get('/overview/kpis', async (_req, res, next) => {
         SELECT
           ok.total_studios,
           ok.active_studios,
+          ok.pending_studios,
           ok.trial_studios,
           ok.suspended_studios,
           own.total_owners,
@@ -151,7 +153,7 @@ router.get('/overview/kpis', async (_req, res, next) => {
         business: {
           total_studios: r.total_studios ?? 0,
           active_studios: r.active_studios ?? 0,
-          pending_studios: 0,
+          pending_studios: r.pending_studios ?? 0,
           suspended_studios: r.suspended_studios ?? 0,
           trial_studios: r.trial_studios ?? 0,
           total_owners: r.total_owners ?? 0,
