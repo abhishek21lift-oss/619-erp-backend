@@ -70,7 +70,7 @@ function rowFixture() {
     total_owners: 14, total_trainers: 38,
     total_clients: 247, active_clients: 198, new_clients_30d: 22,
     active_subscriptions: 10, trial_subscriptions: 2, expiring_in_7d: 1,
-    mrr_inr: '123456.78',
+    collected_30d_inr: '123456.78',
     failed_payments_30d: 3,
     critical_alerts: 1, high_alerts: 4, medium_alerts: 7,
   };
@@ -121,7 +121,7 @@ describe('GET /api/platform/overview/kpis — response shape', () => {
       total_owners: 0, total_trainers: 0,
       total_clients: 0, active_clients: 0, new_clients_30d: 0,
       active_subscriptions: 0, trial_subscriptions: 0, expiring_in_7d: 0,
-      mrr_inr: '0', failed_payments_30d: 0,
+      collected_30d_inr: '0', failed_payments_30d: 0,
       critical_alerts: 0, high_alerts: 0, medium_alerts: 0,
     };
     pool.query.mockResolvedValueOnce({ rows: [empty] });
