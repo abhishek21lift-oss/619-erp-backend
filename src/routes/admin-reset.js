@@ -14,6 +14,12 @@ const { sendAdminResetOtp } = require('../lib/email');
 // `adminOnly` matches role==='admin', the ordinary tenant Studio Owner role,
 // which is exactly the access this file must never grant.
 
+// SECURITY (audit finding P1-5): OTP brute-force protection.
+// After MAX_OTP_ATTEMPTS failed attempts, lock the intent for OTP_LOCK_MS.
+// The intent must be re-issued via /initiate-reset to unlock.
+const MAX_OTP_ATTEMPTS = 5;
+const OTP_LOCK_MS      = 15 * 60 * 1000; // 15 minutes
+
 const ALLOWED_TABLES = new Set([
   'attendance_logs', 'payments', 'subscriptions', 'invoices', 'outstanding_dues',
   'client_goals', 'transformations', 'face_embeddings', 'notifications', 'message_logs',
@@ -97,6 +103,20 @@ router.post('/reset-all-data', async (req, res) => {
     return res.status(400).json({ error: 'OTP required. Call /admin/initiate-reset first to receive a code.' });
   }
   const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+
+  // ── Rate-limit check: reject if the intent is locked ──────────────────
+  const { rows: lockCheck } = await pool.query(
+    `SELECT id, attempt_count, locked_until FROM admin_reset_intents
+      WHERE admin_id = $1 AND action = 'reset-all'`,
+    [req.user.id],
+  );
+  if (lockCheck.length && lockCheck[0].locked_until > new Date()) {
+    return res.status(429).json({
+      error: 'Too many OTP attempts. Call /admin/initiate-reset to request a new code.',
+    });
+  }
+
+  // ── Verify OTP and consume intent atomically ──────────────────────────
   const { rows: intent } = await pool.query(
     `DELETE FROM admin_reset_intents
       WHERE admin_id = $1 AND action = 'reset-all'
@@ -105,6 +125,20 @@ router.post('/reset-all-data', async (req, res) => {
     [req.user.id, otpHash],
   );
   if (!intent.length) {
+    // Failed attempt — increment counter, lock if threshold reached.
+    if (lockCheck.length) {
+      const attemptCount = lockCheck[0].attempt_count + 1;
+      const lockedUntil = attemptCount >= MAX_OTP_ATTEMPTS
+        ? new Date(Date.now() + OTP_LOCK_MS)
+        : null;
+      await pool.query(
+        `UPDATE admin_reset_intents
+          SET attempt_count = $1, last_attempt_at = NOW(),
+              locked_until = $2
+          WHERE admin_id = $3 AND action = 'reset-all'`,
+        [attemptCount, lockedUntil, req.user.id],
+      );
+    }
     return res.status(400).json({ error: 'Invalid or expired OTP.' });
   }
 
@@ -176,6 +210,20 @@ router.post('/reset-outstanding-dues', async (req, res) => {
     return res.status(400).json({ error: 'OTP required. Call /admin/initiate-reset with action=reset-dues first.' });
   }
   const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+
+  // ── Rate-limit check: reject if the intent is locked ──────────────────
+  const { rows: lockCheck } = await pool.query(
+    `SELECT id, attempt_count, locked_until FROM admin_reset_intents
+      WHERE admin_id = $1 AND action = 'reset-dues'`,
+    [req.user.id],
+  );
+  if (lockCheck.length && lockCheck[0].locked_until > new Date()) {
+    return res.status(429).json({
+      error: 'Too many OTP attempts. Call /admin/initiate-reset to request a new code.',
+    });
+  }
+
+  // ── Verify OTP and consume intent atomically ──────────────────────────
   const { rows: intent } = await pool.query(
     `DELETE FROM admin_reset_intents
       WHERE admin_id = $1 AND action = 'reset-dues'
@@ -184,6 +232,20 @@ router.post('/reset-outstanding-dues', async (req, res) => {
     [req.user.id, otpHash],
   );
   if (!intent.length) {
+    // Failed attempt — increment counter, lock if threshold reached.
+    if (lockCheck.length) {
+      const attemptCount = lockCheck[0].attempt_count + 1;
+      const lockedUntil = attemptCount >= MAX_OTP_ATTEMPTS
+        ? new Date(Date.now() + OTP_LOCK_MS)
+        : null;
+      await pool.query(
+        `UPDATE admin_reset_intents
+          SET attempt_count = $1, last_attempt_at = NOW(),
+              locked_until = $2
+          WHERE admin_id = $3 AND action = 'reset-dues'`,
+        [attemptCount, lockedUntil, req.user.id],
+      );
+    }
     return res.status(400).json({ error: 'Invalid or expired OTP.' });
   }
   try {

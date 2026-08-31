@@ -79,13 +79,13 @@ if (isProd && rlsEnforcementEnabled()) {
 // ── TRUST_PROXY validation ───────────────────────────────────────────────────
 // The correct value depends on the deployment topology. The current production
 // topology is: browser → nginx → frontend (Next.js rewrite) → backend = 2 hops.
-// If TRUST_PROXY is not set (defaults to 1) in production with this topology,
+// If TRUST_PROXY is not set to 2 in production with this topology,
 // all req.ip will be the frontend container IP, collapsing rate-limit buckets.
 if (isProd) {
   const trustProxy = (process.env.TRUST_PROXY || '').trim();
-  if (!trustProxy || trustProxy === '1') {
+  if (trustProxy !== '2') {
     logger.warn(
-      'TRUST_PROXY is not set or set to 1 in production. '
+      'TRUST_PROXY is not set to 2 in production. '
       + 'If the deployment topology includes nginx + Next.js rewrite (2 proxy hops), '
       + 'set TRUST_PROXY=2 so req.ip resolves to the real client IP. '
       + 'Incorrect value collapses all callers into one rate-limit bucket and neuters brute-force protection.'
@@ -268,9 +268,43 @@ if (isProd) {
   }
 }
 
+// ── Redis must be configured in production for rate limiting ────────────────
+//
+// The default in-process store multiplies limits by replica count, making
+// brute-force protection ineffective. Redis is already a hard dependency for
+// BullMQ workers, so this adds no new infrastructure.
+//
+// If Redis is unavailable, the app will log a warning but continue with
+// per-process limits. For production, we require Redis to be configured.
+//
+// If Redis is configured but unreachable mid-request, rate limiting will
+// temporarily fall back to in-process storage (via passOnStoreError: true)
+// rather than failing requests.
+if (isProd && !require('./lib/redis').isConfigured()) {
+  logger.fatal(
+    'Redis must be configured in production for rate limiting. '
+    + 'Set REDIS_URL or REDIS_HOST/REDIS_PORT/etc. environment variables.'
+  );
+  process.exit(1);
+}
+
+// ── Platform session audience must be enforced in production ────────────────
+//
+// PLATFORM_SESSION_ENFORCE must be unset or explicitly 'on' in production.
+// If set to 'off', platform and tenant sessions become indistinguishable.
+// This would allow a tenant session (cookie) to drive the control plane.
+if (isProd && process.env.PLATFORM_SESSION_ENFORCE === 'off') {
+  logger.fatal(
+    'PLATFORM_SESSION_ENFORCE must not be set to "off" in production. '
+    + 'Unset it to allow the default (ON) behavior, or explicitly set to "on".'
+  );
+  process.exit(1);
+}
+
 const express   = require('express');
 const cors      = require('cors');
 const helmet    = require('helmet');
+const compression = require('compression');
 const rateLimit     = require('express-rate-limit');
 const { makeStore } = require('./lib/rateLimitStore');
 const cookieParser  = require('cookie-parser');
@@ -463,6 +497,7 @@ app.use((req, res, next) => (
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use(cookieParser());
+app.use(compression());
 app.use('/uploads', require('./routes/uploads'));
 
 // ────────────────────────
@@ -1029,17 +1064,18 @@ runMigrationsWithRetry()
     // AI knowledge-base embedding warmup: the local embedding model
     // (@xenova/transformers) downloads its weights from Hugging Face on
     // first use, which is slow and — in network-restricted environments —
-    // can fail outright. Doing that on server boot rather than on the first
-    // real document upload surfaces a broken/blocked download in the logs
-    // immediately instead of as a confusing "upload succeeded, indexing
-    // failed" for whichever user happens to try it first. Non-fatal either
+    // can fail outright. Doing that after server listen rather than during
+    // boot avoids blocking startup on a slow/model download. Non-fatal either
     // way: a failure here just means documents will show status='failed'
-    // until it's fixed, not that the server won't start.
+    // until it's fixed.
     if (process.env.AI_EMBEDDING_WARMUP !== 'off') {
-      require('./lib/ai/embeddings').embedText('warmup').then(
-        () => logger.info('AI embedding model ready'),
-        (err) => logger.warn({ err: err.message }, 'AI embedding model warmup failed — document indexing will error until this is resolved')
-      );
+      // Defer warmup until after server starts listening to avoid boot delay
+      setImmediate(() => {
+        require('./lib/ai/embeddings').embedText('warmup').then(
+          () => logger.info('AI embedding model ready'),
+          (err) => logger.warn({ err: err.message }, 'AI embedding model warmup failed — document indexing will error until this is resolved')
+        );
+      });
     }
 
     // Subscription sweep: freeze lapsed trials/subscriptions + send 7/3/1/expiry

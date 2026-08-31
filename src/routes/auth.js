@@ -24,7 +24,7 @@ const loginEvents = require('../lib/loginEvents');
 const recovery = require('../lib/mfaRecoveryCodes');
 const { sendPasswordReset } = require('../lib/email');
 
-const isProd = process.env.NODE_ENV === 'production';
+const isSecure = process.env.NODE_ENV !== 'development';
 
 const ACCESS_TOKEN_TTL_MS  = 15 * 60 * 1000;          // 15 minutes
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -32,7 +32,7 @@ const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 function setTokenCookie(res, token) {
   res.cookie('token', token, {
     httpOnly: true,
-    secure: isProd,
+    secure: isSecure,
     sameSite: 'strict',
     maxAge: ACCESS_TOKEN_TTL_MS,
     path: '/',
@@ -42,7 +42,7 @@ function setTokenCookie(res, token) {
 function setRefreshCookie(res, rawToken) {
   res.cookie('refresh_token', rawToken, {
     httpOnly: true,
-    secure: isProd,
+    secure: isSecure,
     sameSite: 'strict',
     maxAge: REFRESH_TOKEN_TTL_MS,
     path: '/api/auth',
@@ -389,8 +389,8 @@ router.post('/logout', async function(req, res) {
   // Mobile clients have no refresh_token cookie to read — accept it from
   // the body as a fallback so they can revoke their session too.
   await revokeRefreshToken(req.cookies?.refresh_token || req.body?.refresh_token);
-  res.clearCookie('token', { httpOnly: true, secure: isProd, sameSite: 'strict', path: '/' });
-  res.clearCookie('refresh_token', { httpOnly: true, secure: isProd, sameSite: 'strict', path: '/api/auth' });
+  res.clearCookie('token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/' });
+  res.clearCookie('refresh_token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/api/auth' });
   res.json({ message: 'Logged out' });
 });
 
@@ -417,7 +417,8 @@ router.post('/refresh', async (req, res) => {
            JOIN users u ON u.id = rt.user_id
           WHERE rt.token_hash = $1
             AND rt.expires_at > NOW()
-            AND rt.revoked_at IS NULL`,
+            AND rt.revoked_at IS NULL
+          FOR UPDATE`,
         [tokenHash]
       ));
     } catch (err) {
@@ -428,7 +429,8 @@ router.post('/refresh', async (req, res) => {
              JOIN users u ON u.id = rt.user_id
             WHERE rt.token_hash = $1
               AND rt.expires_at > NOW()
-              AND rt.revoked_at IS NULL`,
+              AND rt.revoked_at IS NULL
+            FOR UPDATE`,
           [tokenHash]
         ));
       } else {
@@ -437,7 +439,7 @@ router.post('/refresh', async (req, res) => {
     }
 
     if (!rows[0] || !rows[0].is_active || rows[0].deleted_at) {
-      res.clearCookie('refresh_token', { httpOnly: true, secure: isProd, sameSite: 'strict', path: '/api/auth' });
+      res.clearCookie('refresh_token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/api/auth' });
       return res.status(401).json({ error: 'Invalid or expired refresh token' });
     }
 
