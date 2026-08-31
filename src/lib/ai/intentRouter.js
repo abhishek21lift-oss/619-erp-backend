@@ -4,27 +4,27 @@
 const TOOLS = [
   {
     name: 'attendance_summary',
-    patterns: [/\b(attendance|check-?in|checked in|present|absent|came to|who came)\b/i],
+    patterns: [/\b(attendance|check-?in|checked in|present|absent|came)\b/i],
   },
   {
     name: 'revenue_summary',
-    patterns: [/\b(revenue|earnings|income|collections?|money|collect|collected)\b/i],
+    patterns: [/\b(revenue|earnings|income|collection|collect|collected|money)\b/i],
   },
   {
     name: 'dues_summary',
-    patterns: [/\b(outstanding|pending)\s+dues?\b|\bwho owes\b|\b(unpaid|still has not paid|paid)\b|\bbalance\s+(due|owed)\b/i],
+    patterns: [/\b(outstanding|pending|dues?|who.*owes|unpaid|paid|balance.*due)\b/i],
   },
   {
     name: 'trainer_roster',
-    patterns: [/\b(list|how many|who are the|show me all)\b.*\btrainers?\b/i],
+    patterns: [/\b(trainer|trainers)\b.*\b(list|how many|who are|show)\b|\b(show|list|how many|who are)\b.*\b(trainer|trainers)\b/i],
   },
   {
     name: 'client_stats',
-    patterns: [/\b(how many|count of|number of)\b.*\b(client|clients|member|members|active)\b/i],
+    patterns: [/\b(how many|count of|number of)\b.*\b(client|clients|member|members|active|active members)\b/i],
   },
   {
     name: 'search_exercises',
-    patterns: [/\bexercises?\b.*\b(for|targeting|that work|to (train|hit))\b|\bworkout\s+(move|exercise)s?\b/i],
+    patterns: [/\b(exercise|workout)\b.*\b(for|targeting|hypertrophy|that work|train|hit)\b|\b(workout|exercise)s?\s+(move|exercise)\b/i],
   },
 ];
 
