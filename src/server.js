@@ -278,8 +278,7 @@ if (isProd) {
 // per-process limits. For production, we require Redis to be configured.
 //
 // If Redis is configured but unreachable mid-request, rate limiting will
-// temporarily fall back to in-process storage (via passOnStoreError: true)
-// rather than failing requests.
+// temporarily fall back to in-process storage rather than failing requests.
 if (isProd && !require('./lib/redis').isConfigured()) {
   logger.fatal(
     'Redis must be configured in production for rate limiting. '
