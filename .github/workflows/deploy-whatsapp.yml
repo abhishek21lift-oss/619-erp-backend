@@ -1,0 +1,587 @@
+name: WhatsApp Gateway — VPS
+
+# Installs and wires up the self-hosted WhatsApp gateway (repo:
+# 619-erp-whatsapp) on the VPS, in stages, by hand.
+#
+# ── Why this is separate from deploy.yml ────────────────────────────────────
+#
+# deploy.yml is automatic: CI passes on main, the backend ships. That is right
+# for the backend and wrong for this. The gateway holds Baileys credentials —
+# full WhatsApp account access for every linked studio — and has never
+# completed a real pairing (619-erp-whatsapp/docs/TESTING.md §1). Installing it
+# is a decision somebody makes, watches, and can stop halfway through. So:
+#
+#   • `workflow_dispatch` only. Nothing here fires from a push, ever.
+#   • One `stage` input, defaulting to the read-only one, so a mis-click
+#     inspects the box rather than changing it.
+#   • Every stage that writes takes a timestamped backup of the compose file
+#     FIRST and restores it if validation fails.
+#
+# ── Why there is no retry ladder ────────────────────────────────────────────
+#
+# deploy.yml retries SSH four times because it fires unattended from a push:
+# nobody is watching, so a dropped connection has to heal itself. Every run
+# here is dispatched by a person watching the log, and every stage is
+# idempotent, so a network blip is answered by pressing the button again. That
+# keeps this file small enough to actually read before running it.
+#
+# ── Secrets ─────────────────────────────────────────────────────────────────
+#
+# HOST / USERNAME / SSH_KEY are the same repository secrets deploy.yml and
+# rollback.yml already use. WA_GATEWAY_KEY and WA_WEBHOOK_SECRET are NOT
+# GitHub secrets and must never become them: the `install` stage generates them
+# ON THE BOX with `openssl rand -hex 32` and appends them to
+# /opt/myptstudio/.env. They are never printed, never leave the VPS, and are
+# not known to GitHub or to whoever dispatched the run.
+#
+# Nothing below echoes a secret value. The `inspect` stage prints variable
+# NAMES from .env and never values — that is deliberate, do not "improve" it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Which stage to run (start at inspect)'
+        required: true
+        default: inspect
+        type: choice
+        options:
+          - inspect          # read-only
+          - build            # clone + docker build + probes; nothing serving is touched
+          - install          # add the gateway container
+          - wire-backend     # point the ERP at it (restarts the API)
+          - verify           # re-check everything, read-only
+          - uninstall        # remove the container, KEEP the session volume
+      gateway_ref:
+        description: 'Branch/tag/SHA of 619-erp-whatsapp to deploy'
+        required: true
+        default: feature/whatsapp-gateway-mvp
+        type: string
+      backend_service:
+        description: 'Name of the backend service in /opt/myptstudio/docker-compose.yml'
+        required: true
+        default: backend
+        type: string
+
+# Shares deploy.yml's concurrency group.
+#
+# The install and wire-backend stages edit /opt/myptstudio/docker-compose.yml
+# and run `docker compose up -d`, which is exactly what deploy.yml and
+# rollback.yml do. Two of those interleaving on one working tree is how a box
+# ends up on a mixture of two states with no error anywhere to say so.
+# `cancel-in-progress: false` for the same reason deploy.yml gives: the older
+# run is the one that may be mid-`compose up`, and killing it is the harm.
+concurrency:
+  group: deploy-vps-backend
+  cancel-in-progress: false
+
+env:
+  GATEWAY_REPO: abhishek21lift-oss/619-erp-whatsapp
+  ROOT: /opt/myptstudio
+
+jobs:
+  run-stage:
+    name: ${{ inputs.stage }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: What this run will do
+        run: |
+          echo "Stage:           ${{ inputs.stage }}"
+          echo "Gateway ref:     ${{ inputs.gateway_ref }}"
+          echo "Backend service: ${{ inputs.backend_service }}"
+          case "${{ inputs.stage }}" in
+            inspect|verify)  echo "READ-ONLY. Nothing on the box changes." ;;
+            build)           echo "Clones and builds an image. Nothing serving is touched." ;;
+            install)         echo "CHANGES THE BOX: adds a container and edits docker-compose.yml." ;;
+            wire-backend)    echo "CHANGES THE BOX: edits docker-compose.yml, migrates, RESTARTS THE API." ;;
+            uninstall)       echo "CHANGES THE BOX: removes the container. The session volume is KEPT." ;;
+          esac
+
+      # ── inspect ────────────────────────────────────────────────────────────
+      #
+      # Everything 619-erp-whatsapp/docs/DEPLOYMENT.md §2.2 says to "check on
+      # the box" before pasting anything, plus the two facts that decide
+      # whether the rest is possible at all: can the box clone the gateway
+      # repo, and can it reach WhatsApp.
+      - name: Inspect the box
+        if: inputs.stage == 'inspect'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 10m
+          script_stop: true
+          script: |
+            set -e
+            cd "${{ env.ROOT }}"
+
+            echo "══ compose file ═════════════════════════════════════════════"
+            ls -l docker-compose.yml
+
+            echo; echo "══ services ═════════════════════════════════════════════════"
+            docker compose config --services
+
+            echo; echo "══ volumes declared ═════════════════════════════════════════"
+            docker compose config --volumes
+
+            echo; echo "══ top-level networks ═══════════════════════════════════════"
+            # If this prints a NAMED network, the fragment's `networks: default:`
+            # must be changed to match it or the gateway lands somewhere it
+            # cannot reach redis or the backend.
+            docker compose config | sed -n '/^networks:/,$p' | head -20
+
+            echo; echo "══ is the gateway already installed? ════════════════════════"
+            if docker compose config --services | grep -qx whatsapp; then
+              echo "YES — a 'whatsapp' service already exists. install would be a no-op."
+            else
+              echo "no"
+            fi
+
+            echo; echo "══ running containers ═══════════════════════════════════════"
+            docker compose ps
+            echo
+            docker ps --format 'table {{.Names}}\t{{.Status}}'
+
+            echo; echo "══ redis service ════════════════════════════════════════════"
+            # The fragment's `depends_on: redis: condition: service_healthy`
+            # needs redis to declare a healthcheck. Without one, compose errors.
+            docker compose config | sed -n '/^  redis:/,/^  [a-z]/p' | head -30
+
+            echo; echo "══ .env — VARIABLE NAMES ONLY, never values ═════════════════"
+            if [ -f .env ]; then
+              sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' .env | sort
+              echo
+              echo "-- WA_* already present? --"
+              sed -n 's/^\(WA_[A-Za-z0-9_]*\)=.*/\1/p' .env | sort || true
+              echo "-- .env permissions (want 600) --"
+              stat -c '%a %U:%G %n' .env
+            else
+              echo "NO .env AT ${{ env.ROOT }}/.env — install cannot write secrets there."
+            fi
+
+            echo; echo "══ gateway repo on the box ══════════════════════════════════"
+            if [ -d 619-erp-whatsapp/.git ]; then
+              git -C 619-erp-whatsapp log --oneline -1
+              git -C 619-erp-whatsapp branch --show-current || echo "(detached)"
+            else
+              echo "not cloned"
+            fi
+
+            echo; echo "══ can the box FETCH the gateway repo? ══════════════════════"
+            # The likely blocker. The box authenticates to 619-erp-backend
+            # somehow; if that is a per-repo deploy key it will NOT cover this
+            # second repo, and a deploy key has to be added before `build` runs.
+            if GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code \
+                 "https://github.com/${{ env.GATEWAY_REPO }}.git" HEAD >/dev/null 2>&1; then
+              echo "HTTPS: reachable"
+            else
+              echo "HTTPS: NOT reachable (expected for a private repo without a token)"
+            fi
+            if GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
+                 git ls-remote --exit-code \
+                 "git@github.com:${{ env.GATEWAY_REPO }}.git" HEAD >/dev/null 2>&1; then
+              echo "SSH:   reachable  <- build can clone"
+            else
+              echo "SSH:   NOT reachable  <- add a deploy key for ${{ env.GATEWAY_REPO }} before running build"
+            fi
+
+            echo; echo "══ resources ════════════════════════════════════════════════"
+            df -h / /var/lib/docker 2>/dev/null || df -h
+            echo
+            free -h
+            echo
+            docker --version
+            docker compose version
+
+            echo; echo "══ CAN THIS BOX REACH WHATSAPP? ════════════════════════════"
+            # The single fact that decides whether pairing is possible at all.
+            # The build environment this was written in gets a 403 here, which
+            # is why no QR has ever been produced (docs/TESTING.md §1).
+            curl -sS -o /dev/null -w 'web.whatsapp.com -> HTTP %{http_code}\n' \
+                 --max-time 15 https://web.whatsapp.com/ \
+              || echo "web.whatsapp.com -> UNREACHABLE. Pairing cannot work from this box."
+
+      # ── build ──────────────────────────────────────────────────────────────
+      #
+      # docs/DEPLOYMENT.md §1. The image has never been built anywhere, so this
+      # is the first time this Dockerfile is exercised. Nothing that is serving
+      # traffic is touched.
+      - name: Clone and build the gateway image
+        if: inputs.stage == 'build'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 30m
+          script_stop: true
+          script: |
+            set -e
+            cd "${{ env.ROOT }}"
+
+            echo "══ clone or update ══════════════════════════════════════════"
+            if [ ! -d 619-erp-whatsapp/.git ]; then
+              GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
+                git clone "git@github.com:${{ env.GATEWAY_REPO }}.git" 619-erp-whatsapp \
+              || GIT_TERMINAL_PROMPT=0 \
+                git clone "https://github.com/${{ env.GATEWAY_REPO }}.git" 619-erp-whatsapp
+            fi
+            cd 619-erp-whatsapp
+            GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
+              git fetch --all --tags --prune
+            git checkout --detach "origin/${{ inputs.gateway_ref }}" 2>/dev/null \
+              || git checkout --detach "${{ inputs.gateway_ref }}"
+            git log --oneline -1
+
+            echo; echo "══ docker build ═════════════════════════════════════════════"
+            docker build -t wa-gateway-test .
+
+            echo; echo "══ probe 1: it must REFUSE to start without secrets ═════════"
+            # Failing here is the expected result. A container that starts
+            # happily with no secrets would be an unauthenticated WhatsApp
+            # gateway, which is the failure src/config.ts exists to prevent.
+            if docker run --rm wa-gateway-test 2>&1 | tee /tmp/wa-probe1.log; then
+              echo "FAIL: started with no secrets. Do not deploy this."
+              exit 1
+            fi
+            for v in WA_GATEWAY_KEY WA_WEBHOOK_SECRET WA_BACKEND_URL; do
+              grep -q "$v" /tmp/wa-probe1.log \
+                || { echo "FAIL: refusal did not name $v"; exit 1; }
+            done
+            echo "OK — refused, naming all three missing values at once."
+
+            echo; echo "══ probe 2: healthcheck + non-root ══════════════════════════"
+            docker rm -f wa-probe >/dev/null 2>&1 || true
+            # WA_CONNECTOR=null: the whole service runs with pairing inert, so
+            # this probe cannot touch WhatsApp. Secrets are generated inline and
+            # discarded with the container.
+            docker run -d --name wa-probe \
+              -e WA_GATEWAY_KEY="$(openssl rand -hex 32)" \
+              -e WA_WEBHOOK_SECRET="$(openssl rand -hex 32)" \
+              -e WA_BACKEND_URL=http://127.0.0.1:1 \
+              -e WA_CONNECTOR=null \
+              wa-gateway-test >/dev/null
+            echo "waiting out the 20s start-period..."
+            sleep 30
+            HEALTH="$(docker inspect --format '{{.State.Health.Status}}' wa-probe)"
+            WHO="$(docker exec wa-probe id -u)"
+            echo "health: $HEALTH"
+            echo "uid:    $WHO"
+            docker logs --tail 20 wa-probe || true
+            docker rm -f wa-probe >/dev/null
+            [ "$HEALTH" = "healthy" ] || { echo "FAIL: HEALTHCHECK did not go healthy"; exit 1; }
+            [ "$WHO" = "1001" ]      || { echo "FAIL: not running as uid 1001"; exit 1; }
+            echo "OK — healthy, non-root."
+
+      # ── install ────────────────────────────────────────────────────────────
+      - name: Install the gateway service
+        if: inputs.stage == 'install'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 30m
+          script_stop: true
+          script: |
+            set -e
+            cd "${{ env.ROOT }}"
+
+            FRAGMENT=619-erp-whatsapp/deploy/compose.whatsapp.yml
+            [ -f "$FRAGMENT" ] || { echo "No $FRAGMENT — run the build stage first."; exit 1; }
+
+            if docker compose config --services | grep -qx whatsapp; then
+              echo "A 'whatsapp' service already exists. Nothing to insert."
+              docker compose up -d whatsapp
+              exit 0
+            fi
+
+            echo "══ generate the two shared secrets, ON THE BOX ══════════════"
+            # Never printed, never sent to GitHub. If they already exist they
+            # are left alone — regenerating would break the backend's copy.
+            touch .env && chmod 600 .env
+            grep -q '^WA_GATEWAY_KEY='    .env || echo "WA_GATEWAY_KEY=$(openssl rand -hex 32)"    >> .env
+            grep -q '^WA_WEBHOOK_SECRET=' .env || echo "WA_WEBHOOK_SECRET=$(openssl rand -hex 32)" >> .env
+            echo "present now:"
+            sed -n 's/^\(WA_[A-Za-z0-9_]*\)=.*/  \1/p' .env
+
+            echo; echo "══ back up the compose file ═════════════════════════════════"
+            BAK="docker-compose.yml.bak.$(date +%Y%m%d-%H%M%S)"
+            cp docker-compose.yml "$BAK"
+            echo "$BAK"
+
+            echo; echo "══ insert the service ═══════════════════════════════════════"
+            # Taken verbatim from the fragment: everything from `  whatsapp:`
+            # up to its top-level `volumes:` key. Inserted immediately after the
+            # existing `services:` line — first position in the mapping is
+            # always valid YAML and needs no search for the block's end.
+            awk '/^  whatsapp:/{f=1} /^volumes:/{f=0} f' "$FRAGMENT" > /tmp/wa-service.yml
+            [ -s /tmp/wa-service.yml ] || { echo "could not extract the service block"; exit 1; }
+
+            awk -v file=/tmp/wa-service.yml '
+              { print }
+              /^services:$/ && !done {
+                while ((getline line < file) > 0) print line
+                done = 1
+              }
+            ' docker-compose.yml > /tmp/wa-compose.yml
+
+            if grep -q '^volumes:' /tmp/wa-compose.yml; then
+              awk '{ print } /^volumes:$/ && !d { print "  whatsapp-sessions:"; d=1 }' \
+                /tmp/wa-compose.yml > /tmp/wa-compose2.yml
+              mv /tmp/wa-compose2.yml /tmp/wa-compose.yml
+            else
+              printf '\nvolumes:\n  whatsapp-sessions:\n' >> /tmp/wa-compose.yml
+            fi
+            cp /tmp/wa-compose.yml docker-compose.yml
+
+            echo; echo "══ validate — and restore the backup if it fails ════════════"
+            if ! docker compose config >/dev/null; then
+              cp "$BAK" docker-compose.yml
+              echo "VALIDATION FAILED. docker-compose.yml restored from $BAK. Nothing was started."
+              exit 1
+            fi
+            echo "valid."
+
+            echo; echo "══ confirm no host port is published ════════════════════════"
+            # The primary security control. A published port would put full
+            # WhatsApp account access behind one shared header value.
+            if docker compose config | awk '/^  whatsapp:/{f=1;next} /^  [a-z]/{f=0} f' | grep -q 'published'; then
+              cp "$BAK" docker-compose.yml
+              echo "REFUSING: the whatsapp service publishes a host port. Restored $BAK."
+              exit 1
+            fi
+            echo "no published ports."
+
+            echo; echo "══ start it ═════════════════════════════════════════════════"
+            docker compose up -d whatsapp
+            sleep 25
+            docker compose ps whatsapp
+            docker compose logs --tail 40 whatsapp
+
+            echo; echo "══ readiness ════════════════════════════════════════════════"
+            docker compose exec -T whatsapp node -e \
+              "fetch('http://127.0.0.1:8080/readyz').then(r=>r.json()).then(o=>console.log(JSON.stringify(o)))"
+
+      # ── wire-backend ───────────────────────────────────────────────────────
+      #
+      # The only stage that can take the ERP down, so it is the only one with
+      # an automatic health rollback.
+      - name: Point the ERP at the gateway
+        if: inputs.stage == 'wire-backend'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 30m
+          script_stop: true
+          script: |
+            set -e
+            cd "${{ env.ROOT }}"
+            SVC='${{ inputs.backend_service }}'
+
+            docker compose config --services | grep -qx whatsapp \
+              || { echo "No 'whatsapp' service. Run install first."; exit 1; }
+            docker compose config --services | grep -qx "$SVC" \
+              || { echo "No '$SVC' service. Check backend_service."; exit 1; }
+
+            echo "══ .env ═════════════════════════════════════════════════════"
+            grep -q '^WA_GATEWAY_URL='       .env || echo 'WA_GATEWAY_URL=http://myptstudio-whatsapp:8080' >> .env
+            grep -q '^WA_GATEWAY_TIMEOUT_MS=' .env || echo 'WA_GATEWAY_TIMEOUT_MS=10000'                    >> .env
+            sed -n 's/^\(WA_[A-Za-z0-9_]*\)=.*/  \1/p' .env
+
+            echo; echo "══ back up ══════════════════════════════════════════════════"
+            BAK="docker-compose.yml.bak.$(date +%Y%m%d-%H%M%S)"
+            cp docker-compose.yml "$BAK"
+            echo "$BAK"
+
+            if docker compose config | awk -v s="  $SVC:" '$0==s{f=1;next} /^  [a-z]/{f=0} f' \
+                 | grep -q 'WA_GATEWAY_URL'; then
+              echo "already wired; skipping the edit"
+            else
+              echo; echo "══ add the four variables to $SVC's environment ═════════════"
+              # `:-` and not `:?`: the backend must keep starting when the
+              # gateway is not part of a deployment. That is the whole reason
+              # the integration is optional.
+              # Two things this awk gets right, both found by testing it against a
+              # stand-in for the box rather than by reading it:
+              #
+              #   • `    environment:` is at FOUR spaces (services at 2, their
+              #     keys at 4), not six. The inserted variables go at six.
+              #   • `inservice` RESETS at every new top-level service. Without
+              #     that, a backend with no `environment:` block of its own
+              #     would inject these four lines into the next service's block
+              #     — silently giving the frontend the gateway key.
+              awk -v svc="  $SVC:" '
+                { print }
+                /^  [A-Za-z0-9_-]+:$/ { inservice = ($0 == svc) }
+                inservice && /^    environment:$/ && !done {
+                  print "      WA_GATEWAY_URL: ${WA_GATEWAY_URL:-}"
+                  print "      WA_GATEWAY_KEY: ${WA_GATEWAY_KEY:-}"
+                  print "      WA_WEBHOOK_SECRET: ${WA_WEBHOOK_SECRET:-}"
+                  print "      WA_GATEWAY_TIMEOUT_MS: ${WA_GATEWAY_TIMEOUT_MS:-10000}"
+                  done = 1
+                }
+              ' docker-compose.yml > /tmp/wa-be.yml
+
+              grep -q 'WA_GATEWAY_URL' /tmp/wa-be.yml || {
+                echo "Could not find an 'environment:' block under $SVC at the expected indent."
+                echo "Nothing was changed. The env map may use a different indentation —"
+                echo "add the four lines by hand per DEPLOYMENT.md §2.6."
+                exit 1
+              }
+              cp /tmp/wa-be.yml docker-compose.yml
+
+              if ! docker compose config >/dev/null; then
+                cp "$BAK" docker-compose.yml
+                echo "VALIDATION FAILED. Restored $BAK. The API was not touched."
+                exit 1
+              fi
+              echo "valid."
+            fi
+
+            echo; echo "══ migration 185 (additive: two new tables) ═════════════════"
+            docker compose run --rm --no-deps "$SVC" npm run migrate
+
+            echo; echo "══ restart the API ══════════════════════════════════════════"
+            docker compose up -d "$SVC"
+
+            echo; echo "══ health, with automatic rollback ══════════════════════════"
+            OK=0
+            for i in $(seq 1 24); do
+              if docker compose exec -T "$SVC" \
+                   node -e "fetch('http://127.0.0.1:5000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" \
+                   >/dev/null 2>&1; then
+                OK=1; break
+              fi
+              sleep 5
+            done
+            if [ "$OK" != "1" ]; then
+              echo "API DID NOT COME BACK HEALTHY. Restoring $BAK and restarting."
+              cp "$BAK" docker-compose.yml
+              docker compose up -d "$SVC"
+              docker compose logs --tail 60 "$SVC"
+              exit 1
+            fi
+            echo "API healthy."
+
+            echo; echo "══ backend -> gateway, over the docker network ══════════════"
+            docker compose exec -T "$SVC" node -e \
+              "fetch('http://myptstudio-whatsapp:8080/healthz').then(r=>console.log('gateway ->', r.status)).catch(e=>{console.log('UNREACHABLE:', e.message);process.exit(1)})"
+
+      # ── verify ─────────────────────────────────────────────────────────────
+      - name: Verify
+        if: inputs.stage == 'verify'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 10m
+          script_stop: true
+          script: |
+            set -e
+            cd "${{ env.ROOT }}"
+            SVC='${{ inputs.backend_service }}'
+
+            echo "══ containers ═══════════════════════════════════════════════"
+            docker compose ps
+
+            echo; echo "══ gateway readiness ════════════════════════════════════════"
+            docker compose exec -T whatsapp node -e \
+              "fetch('http://127.0.0.1:8080/readyz').then(r=>r.json()).then(o=>console.log(JSON.stringify(o,null,2)))"
+
+            echo; echo "══ metrics ══════════════════════════════════════════════════"
+            docker compose exec -T whatsapp sh -c \
+              'node -e "fetch(\"http://127.0.0.1:8080/metrics\",{headers:{\"X-Gateway-Key\":process.env.WA_GATEWAY_KEY}}).then(r=>r.json()).then(o=>console.log(JSON.stringify(o,null,2)))"'
+
+            echo; echo "══ reachable from the backend ═══════════════════════════════"
+            docker compose exec -T "$SVC" node -e \
+              "fetch('http://myptstudio-whatsapp:8080/healthz').then(r=>console.log('gateway ->', r.status))"
+
+            echo; echo "══ NOT reachable from outside — must show no published port ══"
+            docker compose config | awk '/^  whatsapp:/{f=1;next} /^  [a-z]/{f=0} f' | grep -c published \
+              | xargs -I{} sh -c 'echo "published ports: {}"; [ "{}" = "0" ] || exit 1'
+
+            echo; echo "══ errors in the last hour ══════════════════════════════════"
+            docker compose logs --since 1h whatsapp | grep '"level":50' || echo "none"
+
+            echo; echo "══ can the box reach WhatsApp? ══════════════════════════════"
+            curl -sS -o /dev/null -w 'web.whatsapp.com -> HTTP %{http_code}\n' \
+                 --max-time 15 https://web.whatsapp.com/ || echo "UNREACHABLE"
+
+      # ── uninstall ──────────────────────────────────────────────────────────
+      #
+      # docs/DEPLOYMENT.md §11 Level 4. Removes the container and the service
+      # block; KEEPS the volume, because deleting it forces every linked studio
+      # to re-scan a QR and there is no other copy of those credentials.
+      - name: Remove the gateway service
+        if: inputs.stage == 'uninstall'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 20m
+          script_stop: true
+          script: |
+            set -e
+            cd "${{ env.ROOT }}"
+
+            echo "══ back up the session volume BEFORE removing anything ══════"
+            VOL="$(docker volume ls --format '{{.Name}}' | grep 'whatsapp-sessions' | head -1)"
+            if [ -n "$VOL" ]; then
+              mkdir -p backups
+              docker run --rm -v "$VOL":/data:ro -v "$PWD/backups":/backup \
+                alpine tar czf "/backup/wa-sessions-uninstall-$(date +%F-%H%M).tar.gz" -C /data .
+              chmod 600 backups/wa-sessions-uninstall-*.tar.gz
+              ls -l backups/ | tail -3
+              echo "NOTE: that tarball is every linked studio's WhatsApp account."
+              echo "      Encrypt it and move it off-box (DEPLOYMENT.md §9.2)."
+            else
+              echo "no whatsapp-sessions volume found"
+            fi
+
+            echo; echo "══ stop and remove the container ════════════════════════════"
+            docker compose stop whatsapp || true
+            docker compose rm -f whatsapp || true
+
+            echo; echo "══ restore the newest pre-install compose backup ════════════"
+            BAK="$(ls -1t docker-compose.yml.bak.* 2>/dev/null | head -1)"
+            if [ -n "$BAK" ]; then
+              cp docker-compose.yml "docker-compose.yml.before-uninstall.$(date +%Y%m%d-%H%M%S)"
+              cp "$BAK" docker-compose.yml
+              echo "restored $BAK"
+              docker compose config >/dev/null && echo "valid"
+            else
+              echo "No backup found. Remove the 'whatsapp' service block by hand."
+            fi
+
+            echo; echo "══ the volume is KEPT ═══════════════════════════════════════"
+            docker volume ls | grep whatsapp-sessions || echo "(none)"
+            echo "Never 'docker volume rm' this on a rollback — DEPLOYMENT.md §11."
+
+      # ── Why a failure here is usually the box, not the workflow ───────────
+      - name: Diagnose what the VPS is answering on
+        if: failure()
+        continue-on-error: true
+        run: |
+          for port in 22 80 443; do
+            if timeout 10 bash -c "cat < /dev/null > /dev/tcp/${{ secrets.HOST }}/$port" 2>/dev/null; then
+              echo "port $port: OPEN"
+            else
+              echo "port $port: no answer within 10s"
+            fi
+          done
+          echo "If 443 is open and 22 is not, the box is up and SSH is being filtered."
+          echo "If none are open, the box or its network is down."
+          echo "If all are open, the failure is in the stage script above — read its output."
