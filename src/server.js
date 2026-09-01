@@ -456,6 +456,19 @@ app.use(cors({
 app.use('/api/webhooks/razorpay', require('./routes/razorpay-webhook'));
 
 // ────────────────────────
+// WHATSAPP GATEWAY WEBHOOK (raw body — must be before json middleware)
+// ────────────────────────
+// Same reason as Razorpay above: the HMAC covers the RAW body, so anything that
+// parses and re-serialises the JSON first changes the bytes and every signature
+// fails. The route registers its own express.raw() parser.
+//
+// Reached only from the gateway container over the Docker network, but mounted
+// on the public app all the same — so it is signed, timestamped against a ±5
+// minute window, and idempotent. Network position is a defence, never the only
+// one.
+app.use('/api/webhooks/whatsapp', require('./routes/whatsapp-webhook'));
+
+// ────────────────────────
 // BODY PARSING
 // ────────────────────────
 // ── The three endpoints that carry an image inside JSON ─────────────────────
@@ -848,6 +861,15 @@ app.use('/api/diet',              require('./routes/diet'));
 // '/api/qr' above, plus the member fingerprint enrolment behind it. Check-in
 // is QR only now. Note that '/api/auth/webauthn' — staff passkey LOGIN — is a
 // different system and is still mounted above.
+
+// MUST precede the generic '/api/integrations' mount below. integrations.js
+// owns '/:id/connect' and '/:id/disconnect' over a table of API keys, so
+// without this line '/whatsapp/connect' would match '/:id/connect' with
+// id='whatsapp' — storing an api_key nothing reads and reporting success.
+//
+// gate() is auth + feature flag and says nothing about role (see its comment
+// above); routes/whatsapp.js applies adminOnly itself.
+app.use('/api/integrations/whatsapp', ...gate('integrations'), require('./routes/whatsapp'));
 app.use('/api/integrations',      ...gate('integrations'), require('./routes/integrations'));
 app.use('/api/campaigns',         ...gate('communication'), require('./routes/campaigns'));
 app.use('/api/offers',            require('./routes/offers'));
