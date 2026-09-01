@@ -68,10 +68,20 @@ describe('production refuses to start with an INVALID security control value', (
     );
     expect(fullBlock).toMatch(/logger\.warn/);
     expect(fullBlock).toMatch(/disabled.*via env/);
-    // Should not exit for explicit 'off'
+    // Should not exit for explicit 'off'.
+    //
+    // Bounded at the NEXT `if (isProd` rather than `const express`. Two later,
+    // unrelated production-only guards — the Redis config check and the
+    // PLATFORM_SESSION_ENFORCE check — now sit between this block and the
+    // express require, each with its own legitimate process.exit(1). Slicing
+    // all the way to `const express` swept those in too, and this assertion
+    // failed for a reason that had nothing to do with the SECURITY_FLAGS
+    // warn-for-off behavior it exists to check — the disabled-flags warn
+    // block itself (below) has never called process.exit.
+    const disabledStart = SERVER.indexOf('const disabled = SECURITY_FLAGS');
     const warnBlock = SERVER.slice(
-      SERVER.indexOf('const disabled = SECURITY_FLAGS'),
-      SERVER.indexOf('const express', SERVER.indexOf('const disabled = SECURITY_FLAGS'))
+      disabledStart,
+      SERVER.indexOf('if (isProd', disabledStart)
     );
     expect(warnBlock).not.toMatch(/process\.exit\(1\)/);
   });
