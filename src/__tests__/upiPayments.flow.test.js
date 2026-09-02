@@ -183,6 +183,37 @@ describe('submitting a UTR', () => {
 //  APPROVAL
 // ════════════════════════════════════════════════════════════════════════════
 
+/**
+ * A membership end date comfortably in the future, and where three more months
+ * from it lands.
+ *
+ * Computed, not written down. This fixture used to hardcode 2026-09-01, which
+ * described an unexpired membership right up until 2026-09-02 — and from that
+ * morning on, the "extends rather than restarts" test below asserted the exact
+ * behaviour it exists to forbid, and failed on every run. A date that has to
+ * stay in the future cannot be a literal.
+ *
+ * Deliberately a year out rather than tomorrow: the property under test is
+ * which of two dates computeMembershipWindow() picks, and a boundary date
+ * would make the test sensitive to the clock ticking over mid-run.
+ */
+function futureEndDate() {
+  const d = new Date();
+  d.setUTCFullYear(d.getUTCFullYear() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Three months on from `iso`, by the same last-day-of-month rule as the lib. */
+function plusThreeMonths(iso) {
+  const [y, m, day] = iso.split('-').map(Number);
+  const lastDayOfTarget = new Date(Date.UTC(y, m - 1 + 3 + 1, 0)).getUTCDate();
+  const end = new Date(Date.UTC(y, m - 1 + 3, Math.min(day, lastDayOfTarget)));
+  return end.toISOString().slice(0, 10);
+}
+
+const EXISTING_END = futureEndDate();
+const EXTENDED_END = plusThreeMonths(EXISTING_END);
+
 function scriptHappyApproval() {
   on(/SELECT .* FROM payment_orders o WHERE o\.id = \$1 AND o\.organization_id = \$2 FOR UPDATE/s,
     { rows: [anOrder({ status: upi.ORDER_STATUS.VERIFICATION_PENDING })] });
@@ -191,11 +222,11 @@ function scriptHappyApproval() {
   on(/UPDATE payment_orders SET status = \$1 WHERE id = \$2 AND status = \$3/s,
     { rows: [], rowCount: 1 });
   on(/SELECT id, name, email, mobile, trainer_id, pt_end_date, organization_id FROM pt_clients/s,
-    { rows: [{ id: 'client-1', name: 'Rohit', trainer_id: 'trn-1', pt_end_date: '2026-09-01' }] });
+    { rows: [{ id: 'client-1', name: 'Rohit', trainer_id: 'trn-1', pt_end_date: EXISTING_END }] });
   on(/SELECT id, incentive_rate FROM trainers/s, { rows: [{ id: 'trn-1', incentive_rate: 0.5 }] });
   on(/INSERT INTO membership_payments/s, {
-    rows: [{ id: 'mp-1', receipt_no: 'RCP-20260726-100042', activated_from: '2026-09-01',
-             activated_to: '2026-12-01', amount: '10620.00' }],
+    rows: [{ id: 'mp-1', receipt_no: 'RCP-20260726-100042', activated_from: EXISTING_END,
+             activated_to: EXTENDED_END, amount: '10620.00' }],
   });
 }
 
@@ -223,12 +254,14 @@ describe('approval', () => {
   });
 
   test('extends an unexpired membership rather than restarting it', async () => {
-    scriptHappyApproval(); // existing pt_end_date is 2026-09-01, three months bought
+    scriptHappyApproval(); // pt_end_date is a year out, three months bought
     await upi.approve({ orderId: ORDER_ID, orgId: ORG, actor: ACTOR });
 
     const update = state.log.find((e) => /UPDATE pt_clients/.test(e.sql));
-    expect(update.params[0]).toBe('2026-09-01');   // activated_from
-    expect(update.params[1]).toBe('2026-12-01');   // activated_to
+    // Starts at the existing end date, NOT today: paying early must not cost
+    // the member the days they had left.
+    expect(update.params[0]).toBe(EXISTING_END);   // activated_from
+    expect(update.params[1]).toBe(EXTENDED_END);   // activated_to
   });
 
   test('guards the status transition so a double approve cannot double-activate', async () => {

@@ -60,6 +60,16 @@ function requireOrg(req, res) {
   return orgId;
 }
 
+/**
+ * States in which the gateway is already holding a socket open, or opening one.
+ *
+ * Mirrors isLive() in the gateway's src/domain/instance.ts. The two must agree:
+ * /connect below uses this to decide whether pressing Connect has to restart
+ * pairing, and calling it "live" when it is not leaves a studio with a button
+ * that does nothing (see the comment there).
+ */
+const LIVE_STATES = new Set(['connecting', 'connected', 'reconnecting']);
+
 /** This studio's instance row, or null. */
 async function loadInstance(orgId) {
   const { rows } = await pool.query(
@@ -150,9 +160,11 @@ router.get('/status', async (req, res, next) => {
 
 // ── POST /api/integrations/whatsapp/connect ─────────────────────────────────
 //
-// Creates the instance and starts pairing. Idempotent: pressing Connect twice,
-// or a retry after a dropped response, returns the existing instance rather
-// than creating a second one.
+// Creates the instance and starts pairing. Idempotent in the way that matters:
+// pressing Connect twice, or a retry after a dropped response, reuses the
+// existing instance rather than creating a second one — but it always leaves
+// pairing actually running, restarting it when the gateway says the instance
+// is not live. See the comment on that branch for the production bug this is.
 router.post('/connect', async (req, res, next) => {
   try {
     const orgId = requireOrg(req, res);
@@ -196,7 +208,67 @@ router.post('/connect', async (req, res, next) => {
       });
     }
 
-    return res.json({ success: true, state: (created.data && created.data.state) || 'connecting' });
+    // ── Why a create is not enough on its own ───────────────────────────────
+    //
+    // The gateway's create is idempotent, and idempotent there means it does
+    // not touch an instance that already exists: registry.create() returns
+    // that instance's CURRENT state and starts no socket. That is the right
+    // behaviour for a retried create — a lost response must not restart a live
+    // pairing — but it is not what this route promises.
+    //
+    // The row above is created once and then lives forever, so from the second
+    // press onwards every Connect took that branch. A studio whose first
+    // attempt did not complete — nobody scanned within WA_QR_MAX_ROUNDS, or
+    // the socket closed — was left with an instance no button could revive:
+    // Connect no-opped, no socket opened, no QR was written, and GET /qr
+    // answered 410 QR_EXPIRED forever after. On screen that is the pairing
+    // dialog reading "The code expired. Press Show a new code to try again."
+    // above a button that does exactly nothing. That is the state production
+    // was found in.
+    //
+    // `reconnect` is the call that actually starts pairing again, and it
+    // resets the connector rather than resuming it — which is precisely what
+    // someone pressing Connect is asking for. So: create to guarantee the
+    // instance exists, then restart it whenever the gateway reports it is not
+    // already holding a socket open.
+    let state = (created.data && created.data.state) || 'connecting';
+
+    if (!LIVE_STATES.has(state)) {
+      const restarted = await gateway.reconnect(orgId, row.instance_id, req.id);
+      if (restarted.ok) {
+        state = (restarted.data && restarted.data.state) || 'connecting';
+      } else if (restarted.code === 'INSTANCE_CONFLICT') {
+        // The gateway refuses to restart something already connected. The
+        // state we read a moment ago was simply stale — the studio asked to be
+        // connected and it is, so this is a success, not a failure.
+        state = 'connected';
+      } else {
+        logger.warn(
+          { org_id: orgId, code: restarted.code, status: restarted.status },
+          'whatsapp_connect_restart_failed'
+        );
+        return res.status(502).json({
+          success: false,
+          code: restarted.code || 'GATEWAY_UNREACHABLE',
+          message: 'Could not reach the WhatsApp service. Try again in a moment.',
+        });
+      }
+    }
+
+    // Keep the row in step with what we just asked for. The webhook confirms
+    // it a moment later; without this the card behind the pairing dialog keeps
+    // reporting the state the instance was in BEFORE this press, which reads
+    // as a connect that failed.
+    if (state !== row.status) {
+      await pool.query(
+        `UPDATE whatsapp_instances
+            SET status = $3, updated_at = NOW()
+          WHERE instance_id = $1 AND organization_id = $2`,
+        [row.instance_id, orgId, state]
+      );
+    }
+
+    return res.json({ success: true, state });
   } catch (err) {
     next(err);
     return undefined;
