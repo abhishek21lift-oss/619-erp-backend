@@ -40,6 +40,37 @@ const router = express.Router();
 // studio's WhatsApp number is an owner action.
 router.use(auth, adminOnly);
 
+// ── Why every response here is Cache-Control: no-store ──────────────────────
+//
+// Found in production: GET /qr answered 410 QR_EXPIRED once, and the pairing
+// dialog never showed a QR again for the rest of that session — even minutes
+// later, with the gateway confirmed (by hitting it directly) to be holding a
+// perfectly valid, unexpired QR and rewriting it every ~60 seconds as
+// designed. The gateway's own logs showed exactly ONE `GET /v1/instances/:id/qr`
+// for an eleven-minute window in which the studio's browser was polling every
+// two seconds — nothing else in the stack was asked.
+//
+// 410 is one of the status codes HTTP caching treats as cacheable BY DEFAULT
+// (RFC 7231 §6.1, alongside 200 and 404) when a response carries no explicit
+// caching directive. This router sent none, so Chromium's disk cache took the
+// first 410 as the standing answer and served it back to every identical GET
+// afterwards without a network round trip at all — confirmed in the
+// browser's own Network panel: repeated 410s sized "(disk cache)", 5-9ms,
+// while GET /status right next to them kept doing real 304 round trips every
+// time, because a 200 with changing content behaves differently under the
+// same heuristic. The studio was never looking at a broken pairing flow; it
+// was looking at its own browser's cached copy of the FIRST answer, forever.
+//
+// Every response through this router is either a one-shot pairing credential,
+// a live connection state, or the result of a state-changing action — none of
+// them is a case where serving yesterday's answer is preferable to asking
+// again, and QR/status in particular are polled specifically because they are
+// expected to change from one call to the next.
+router.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+
 /**
  * The studio this request acts for, or null after answering.
  *
