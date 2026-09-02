@@ -294,3 +294,63 @@ describe('disconnect versus delete', () => {
     expect(pool.query.mock.calls.some(([q]) => /DELETE FROM whatsapp_instances/i.test(q))).toBe(true);
   });
 });
+
+describe('nothing on this router is cached by the browser', () => {
+  // Production bug: GET /qr answered 410 QR_EXPIRED once, and the browser
+  // then served that SAME 410 back to every poll for the rest of the
+  // session — confirmed by hitting the gateway directly and finding it held
+  // a perfectly valid, unexpired QR the whole time nobody was asking it for
+  // one. 410 (like 200 and 404) is cacheable BY DEFAULT under HTTP semantics
+  // when a response carries no caching directive at all, and this router
+  // sent none. Every route here must say so explicitly, because every
+  // response here is either a one-shot pairing credential, a live
+  // connection state, or the result of an action — never something where
+  // yesterday's answer is an acceptable substitute for asking again.
+  it('marks a QR response no-store even when it 410s', async () => {
+    instanceExists();
+    global.fetch = jest.fn(async () => ({
+      ok: false,
+      status: 410,
+      json: async () => ({ error: { code: 'QR_EXPIRED', message: 'gone' } }),
+    }));
+
+    const res = await request(app).get('/api/integrations/whatsapp/qr');
+
+    expect(res.status).toBe(410);
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it('marks a QR response no-store when it succeeds too', async () => {
+    // The QR itself must never be replayed from the browser's disk cache
+    // either — a stale one is exactly as useless as a stale error, and it
+    // is a pairing credential besides.
+    instanceExists();
+    global.fetch = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ qr: 'a-real-pairing-credential', expires_in_ms: 20000 }),
+    }));
+
+    const res = await request(app).get('/api/integrations/whatsapp/qr');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it('marks status no-store', async () => {
+    instanceExists();
+    const res = await request(app).get('/api/integrations/whatsapp/status');
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it('marks a 404 no-store too', async () => {
+    // 404 is on the same "cacheable by default" list 410 is. Every no-row
+    // response (qr/reconnect/disconnect on an instance that does not exist)
+    // needs the same header, or the fix only covers the one status code that
+    // happened to be observed.
+    pool.query.mockResolvedValue({ rowCount: 0, rows: [] });
+    const res = await request(app).get('/api/integrations/whatsapp/qr');
+    expect(res.status).toBe(404);
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+});
