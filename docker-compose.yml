@@ -77,6 +77,22 @@ services:
       # this size. Set to 1 and drop the worker service to run single-process.
       RUN_WORKERS: '0'
       DATABASE_URL: ${DATABASE_URL}
+      # Both optional and both blank by default, so adding this line changes
+      # nothing until the box's .env sets them: TENANT_RLS_ENFORCE defaults to
+      # "on" inside the app itself (src/lib/tenantRlsFlag.js) with no env var
+      # needed, and ADMIN_DATABASE_URL defaults to DATABASE_URL when unset.
+      #
+      # It has to be declared here regardless, because Compose does not
+      # forward arbitrary host/`.env` variables into a container — only the
+      # ones an `environment:` line names. Before this line, setting
+      # ADMIN_DATABASE_URL in the box's .env would have done nothing: the
+      # value would sit on the host, never reach the api/worker processes,
+      # and server.js's boot guard (isProd && enforcement on && the two URLs
+      # equal) would keep refusing to start with the same error a missing
+      # ADMIN_DATABASE_URL produces — indistinguishable from never having set
+      # it at all.
+      ADMIN_DATABASE_URL: ${ADMIN_DATABASE_URL:-}
+      TENANT_RLS_ENFORCE: ${TENANT_RLS_ENFORCE:-}
       JWT_SECRET: ${JWT_SECRET}
       FRONTEND_URL: ${FRONTEND_URL}
       SMTP_HOST: ${SMTP_HOST:-}
@@ -116,6 +132,16 @@ services:
       # not read this: it documents that THIS is the process that drains.
       RUN_WORKERS: '1'
       DATABASE_URL: ${DATABASE_URL}
+      # See the identical pair on the api service above for why these two
+      # lines have to be here even though both are blank by default. The
+      # worker needs ADMIN_DATABASE_URL at least as much as the api process:
+      # every job here (renewal sweep, subscription expiry, notification
+      # fan-out) runs with no per-request org context at all, so once
+      # DATABASE_URL points at app_tenant, a worker still using it would
+      # match no tenant's RLS policy and silently process nothing — see
+      # db/pool.js's isPlatformWide()/useOwnerConnection().
+      ADMIN_DATABASE_URL: ${ADMIN_DATABASE_URL:-}
+      TENANT_RLS_ENFORCE: ${TENANT_RLS_ENFORCE:-}
       JWT_SECRET: ${JWT_SECRET}
       FRONTEND_URL: ${FRONTEND_URL}
       SMTP_HOST: ${SMTP_HOST:-}
