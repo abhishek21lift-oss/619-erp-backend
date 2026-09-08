@@ -50,7 +50,20 @@ router.get('/studios/:id/health', async (req, res, next) => {
     // Confirm the org exists first; the platform admin should not see
     // "this studio is healthy: 0 events" for a non-existent studio,
     // because that would look like health when it is "studio not found".
-    const { rows: orgs } = await pool.query('SELECT id, name, status FROM organizations WHERE id = $1', [req.params.id]);
+    //
+    // Also carries the studio's OWN subscription to 619 — subscription_status,
+    // plan_code, current_period_end. There used to be a separate
+    // `subscriptions` table for this, keyed by organization_id; it never
+    // existed on this database (only in an older migration set this box never
+    // ran), so the query below queried a relation Postgres had never heard of
+    // and this endpoint 500'd on every call. subscription.js and
+    // super-admin/subscriptions.js already read the studio's plan straight off
+    // `organizations` — these are the same columns.
+    const { rows: orgs } = await pool.query(
+      `SELECT id, name, status, subscription_status, plan_code, current_period_end
+         FROM organizations WHERE id = $1`,
+      [req.params.id]
+    );
     if (orgs.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
     const org = orgs[0];
 
@@ -80,14 +93,6 @@ router.get('/studios/:id/health', async (req, res, next) => {
       WHERE organization_id = $1
     `, [req.params.id]);
 
-    const { rows: [sub] } = await pool.query(`
-      SELECT status, ends_at, plan_code
-      FROM subscriptions
-      WHERE organization_id = $1
-      ORDER BY created_at DESC
-      LIMIT 1
-    `, [req.params.id]);
-
     const total = activity.total_events_24h;
     const errs  = activity.error_events_24h;
     const errRatio = total > 0 ? errs / total : 0;
@@ -110,7 +115,16 @@ router.get('/studios/:id/health', async (req, res, next) => {
           failed_24h: logins.failed_logins_24h,
         },
         storage: { object_count: storage.object_count },
-        subscription: sub ? { status: sub.status, ends_at: sub.ends_at, plan_code: sub.plan_code } : null,
+        // Field names unchanged (status, ends_at, plan_code) so the frontend
+        // contract at (platform)/platform/studios/[id]/page.tsx is untouched —
+        // only where the values come from changed. Always present now: a
+        // studio without a plan still has subscription_status ('trial' by
+        // default), which is a real answer, unlike the row this used to be.
+        subscription: {
+          status: org.subscription_status,
+          ends_at: org.current_period_end,
+          plan_code: org.plan_code,
+        },
       },
     });
   } catch (err) { next(err); }

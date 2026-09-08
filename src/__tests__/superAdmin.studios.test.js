@@ -89,13 +89,17 @@ describe('GET /api/platform/studios/:id/health', () => {
   });
 
   it('returns HEALTHY when there are events and <10% are errors', async () => {
-    // 1) org lookup, 2) activity, 3) logins, 4) storage, 5) subscription
+    // 1) org lookup (carries subscription_status/plan_code/current_period_end
+    // directly — there is no separate subscriptions query), 2) activity,
+    // 3) logins, 4) storage.
     pool.query
-      .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active' }] })
+      .mockResolvedValueOnce({ rows: [{
+        id: VALID_UUID, name: 'Acme', status: 'active',
+        subscription_status: 'active', plan_code: 'growth', current_period_end: null,
+      }] })
       .mockResolvedValueOnce({ rows: [{ total_events_24h: 100, error_events_24h: 5 }] })
       .mockResolvedValueOnce({ rows: [{ success_logins_24h: 12, failed_logins_24h: 0 }] })
-      .mockResolvedValueOnce({ rows: [{ object_count: 3 }] })
-      .mockResolvedValueOnce({ rows: [{ status: 'active', ends_at: null, plan_code: 'growth' }] });
+      .mockResolvedValueOnce({ rows: [{ object_count: 3 }] });
     const res = await request(app())
       .get(`/api/platform/studios/${VALID_UUID}/health`)
       .set('Authorization', `Bearer ${token()}`);
@@ -105,15 +109,18 @@ describe('GET /api/platform/studios/:id/health', () => {
     expect(res.body.data.activity.total_events_24h).toBe(100);
     expect(res.body.data.logins.status).toBe('HEALTHY');
     expect(res.body.data.subscription.plan_code).toBe('growth');
+    // Exactly 4 queries — not 5. A 5th (a reintroduced separate subscriptions
+    // lookup) would be the regression this whole fix exists to prevent.
+    expect(pool.query).toHaveBeenCalledTimes(4);
   });
 
   it('returns WARNING when errors exceed 10% of total events', async () => {
     pool.query
-      .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active' }] })
+      .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active',
+        subscription_status: 'trial', plan_code: null, current_period_end: null }] })
       .mockResolvedValueOnce({ rows: [{ total_events_24h: 10, error_events_24h: 5 }] })
       .mockResolvedValueOnce({ rows: [{ success_logins_24h: 0, failed_logins_24h: 0 }] })
-      .mockResolvedValueOnce({ rows: [{ object_count: 0 }] })
-      .mockResolvedValueOnce({ rows: [] });
+      .mockResolvedValueOnce({ rows: [{ object_count: 0 }] });
     const res = await request(app())
       .get(`/api/platform/studios/${VALID_UUID}/health`)
       .set('Authorization', `Bearer ${token()}`);
@@ -122,11 +129,11 @@ describe('GET /api/platform/studios/:id/health', () => {
 
   it('returns UNKNOWN when there are zero events (not "healthy: 0")', async () => {
     pool.query
-      .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active' }] })
+      .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active',
+        subscription_status: 'trial', plan_code: null, current_period_end: null }] })
       .mockResolvedValueOnce({ rows: [{ total_events_24h: 0, error_events_24h: 0 }] })
       .mockResolvedValueOnce({ rows: [{ success_logins_24h: 0, failed_logins_24h: 0 }] })
-      .mockResolvedValueOnce({ rows: [{ object_count: 0 }] })
-      .mockResolvedValueOnce({ rows: [] });
+      .mockResolvedValueOnce({ rows: [{ object_count: 0 }] });
     const res = await request(app())
       .get(`/api/platform/studios/${VALID_UUID}/health`)
       .set('Authorization', `Bearer ${token()}`);
@@ -137,11 +144,11 @@ describe('GET /api/platform/studios/:id/health', () => {
     async function runOnce(failed) {
       pool.query.mockReset();
       pool.query
-        .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active' }] })
+        .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active',
+          subscription_status: 'trial', plan_code: null, current_period_end: null }] })
         .mockResolvedValueOnce({ rows: [{ total_events_24h: 0, error_events_24h: 0 }] })
         .mockResolvedValueOnce({ rows: [{ success_logins_24h: 0, failed_logins_24h: failed }] })
-        .mockResolvedValueOnce({ rows: [{ object_count: 0 }] })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({ rows: [{ object_count: 0 }] });
       const res = await request(app())
         .get(`/api/platform/studios/${VALID_UUID}/health`)
         .set('Authorization', `Bearer ${token()}`);
@@ -153,17 +160,42 @@ describe('GET /api/platform/studios/:id/health', () => {
     expect(await runOnce(51)).toBe('WARNING');
   });
 
-  it('subscription is null when the studio has no subscription at all', async () => {
+  it('subscription reads from the organizations row, not a separate table', async () => {
+    // A studio that has never picked a plan still has a real
+    // subscription_status ('trial' by default on the organizations table) —
+    // this is a genuine answer, unlike the null the old, broken query
+    // produced for every studio because `subscriptions` did not exist.
     pool.query
-      .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active' }] })
+      .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active',
+        subscription_status: 'trial', plan_code: null, current_period_end: null }] })
       .mockResolvedValueOnce({ rows: [{ total_events_24h: 0, error_events_24h: 0 }] })
       .mockResolvedValueOnce({ rows: [{ success_logins_24h: 0, failed_logins_24h: 0 }] })
-      .mockResolvedValueOnce({ rows: [{ object_count: 0 }] })
-      .mockResolvedValueOnce({ rows: [] });
+      .mockResolvedValueOnce({ rows: [{ object_count: 0 }] });
     const res = await request(app())
       .get(`/api/platform/studios/${VALID_UUID}/health`)
       .set('Authorization', `Bearer ${token()}`);
-    expect(res.body.data.subscription).toBeNull();
+    expect(res.body.data.subscription).toEqual({ status: 'trial', ends_at: null, plan_code: null });
+  });
+
+  it('never queries a table named "subscriptions" — it does not exist in production', async () => {
+    // The regression this test exists to catch: an earlier version of this
+    // endpoint queried `FROM subscriptions WHERE organization_id = $1`, a
+    // table no migration on this database creates. Every call 500'd. Pinning
+    // the SQL text, not just the call count, so a future edit that
+    // reintroduces the table name — even inside a different query shape —
+    // fails here instead of in production.
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ id: VALID_UUID, name: 'Acme', status: 'active',
+        subscription_status: 'trial', plan_code: null, current_period_end: null }] })
+      .mockResolvedValueOnce({ rows: [{ total_events_24h: 0, error_events_24h: 0 }] })
+      .mockResolvedValueOnce({ rows: [{ success_logins_24h: 0, failed_logins_24h: 0 }] })
+      .mockResolvedValueOnce({ rows: [{ object_count: 0 }] });
+    await request(app())
+      .get(`/api/platform/studios/${VALID_UUID}/health`)
+      .set('Authorization', `Bearer ${token()}`);
+    for (const [sql] of pool.query.mock.calls) {
+      expect(sql).not.toMatch(/\bFROM\s+subscriptions\b/i);
+    }
   });
 });
 

@@ -103,6 +103,51 @@ describe('GET /api/platform/search — org_id always present', () => {
   });
 });
 
+describe('GET /api/platform/search — subscription kind reads organizations, not a phantom table', () => {
+  // The regression: this block used to query `FROM subscriptions s JOIN
+  // organizations o ...`, a table no migration on this database creates.
+  // Searching with kinds=subscription — or the default kinds list, once a
+  // studio matched by plan_code — 500'd the whole endpoint. A subscription is
+  // now a studio's own plan_code/subscription_status/current_period_end, so
+  // there is one row per matching org, not per historical subscription.
+
+  it('returns org_id on every subscription result', async () => {
+    mockKindsWithOneRow(['subscription'], 'subscription', {
+      id: 'org-1', plan_code: 'growth', subscription_status: 'active',
+      current_period_end: '2027-01-01T00:00:00Z', org_id: 'org-1', org_name: 'Acme Fitness',
+    });
+    const res = await request(app())
+      .get('/api/platform/search?q=growth&kinds=subscription')
+      .set('Authorization', `Bearer ${token()}`);
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].org_id).toBe('org-1');
+    expect(res.body.data[0].kind).toBe('subscription');
+    expect(res.body.data[0].title).toBe('growth · active');
+  });
+
+  it('never queries a table named "subscriptions" — it does not exist in production', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [] });
+    await request(app())
+      .get('/api/platform/search?q=growth&kinds=subscription')
+      .set('Authorization', `Bearer ${token()}`);
+    const [sql] = pool.query.mock.calls[0];
+    expect(sql).not.toMatch(/\bFROM\s+subscriptions\b/i);
+    expect(sql).toMatch(/\bFROM\s+organizations\b/i);
+  });
+
+  it('excludes organizations with no plan at all', async () => {
+    // `o.plan_code IS NOT NULL` — a studio still on no plan is not a
+    // "subscription" result; searching should not surface it under this kind.
+    pool.query.mockResolvedValueOnce({ rows: [] });
+    await request(app())
+      .get('/api/platform/search?q=growth&kinds=subscription')
+      .set('Authorization', `Bearer ${token()}`);
+    const [sql] = pool.query.mock.calls[0];
+    expect(sql).toMatch(/plan_code\s+IS\s+NOT\s+NULL/i);
+  });
+});
+
 describe('GET /api/platform/search — injection guards', () => {
   it('escapes % in the query so it matches literal %', async () => {
     // Use `ab%cd` (length 5) so the 2-char minimum is met but the %

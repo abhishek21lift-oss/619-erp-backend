@@ -144,21 +144,31 @@ router.get('/search', async (req, res, next) => {
     }
 
     if (kinds.includes('subscription')) {
+      // There is no separate subscriptions table — a studio's subscription to
+      // 619 lives on its own organizations row (subscription_status,
+      // plan_code, current_period_end), the same columns subscription.js and
+      // super-admin/subscriptions.js already read. This block used to query a
+      // `subscriptions` table that had no migration on this database at all,
+      // so searching for a plan or a studio's billing status 500'd the whole
+      // endpoint. "Subscription" here is now "a studio with a matching plan",
+      // one row per org rather than one per historical subscription — there
+      // is no separate id to project, so o.id serves as both id and org_id,
+      // matching how the 'studio' kind above does the same thing.
       const { rows } = await pool.query(`
-        SELECT s.id, s.plan_code, s.status, s.ends_at,
-               s.organization_id AS org_id, o.name AS org_name
-          FROM subscriptions s
-          JOIN organizations o ON o.id = s.organization_id
-         WHERE o.name ILIKE $1 ESCAPE '\\' OR s.plan_code ILIKE $1 ESCAPE '\\'
-         ORDER BY s.created_at DESC
+        SELECT o.id, o.plan_code, o.subscription_status, o.current_period_end,
+               o.id AS org_id, o.name AS org_name
+          FROM organizations o
+         WHERE o.plan_code IS NOT NULL
+           AND (o.name ILIKE $1 ESCAPE '\\' OR o.plan_code ILIKE $1 ESCAPE '\\')
+         ORDER BY o.created_at DESC
          LIMIT $2
       `, [pattern, perKindLimit]);
       rows.forEach(r => results.push({
         kind: 'subscription',
         id: r.id,
         org_id: r.org_id,
-        title: `${r.plan_code} · ${r.status}`,
-        subtitle: `${r.org_name} · ends ${r.ends_at ? new Date(r.ends_at).toISOString().slice(0, 10) : '—'}`,
+        title: `${r.plan_code} · ${r.subscription_status}`,
+        subtitle: `${r.org_name} · ends ${r.current_period_end ? new Date(r.current_period_end).toISOString().slice(0, 10) : '—'}`,
         url: `/platform/billing/subscriptions?org=${r.org_id}`,
       }));
     }
