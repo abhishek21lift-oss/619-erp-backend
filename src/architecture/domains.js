@@ -124,7 +124,11 @@ const DOMAINS = {
     tenancy: TENANCY.DIRECT,
     description: 'Prospects before they become clients.',
     dependsOn: ['tenancy', 'clients'],
-    tables: ['pt_leads', 'lead_followups', 'leads'],
+    // `leads` and `lead_followups` are NOT here. Migration 012 created them;
+    // 020_remove_lead_crm.sql dropped both. Neither exists after the
+    // migrations finish applying, in production or a fresh bootstrap —
+    // this domain owns only the table that is actually still there.
+    tables: ['pt_leads'],
   },
 
   clients: {
@@ -132,12 +136,17 @@ const DOMAINS = {
     tenancy: TENANCY.DIRECT,
     description: 'The PT client — the entity this product is built around.',
     dependsOn: ['tenancy', 'identity-access'],
+    // `clients` is NOT here. schema.sql declares it (the pre-multitenancy
+    // gym-ERP baseline schema.sql reconstructs for a fresh CI database), but
+    // 170_drop_legacy_clients_and_renewals.sql drops it — with a verification
+    // block that fails the migration if the table still exists afterward.
+    // `members` genuinely survives to today; it stays.
     tables: [
       'pt_clients', 'client_fitness_profiles', 'pt_consent_records',
       'pt_family_medical_history', 'pt_medical_clearances',
-      'clients', 'members',
+      'members',
     ],
-    legacyTables: ['clients', 'members'],
+    legacyTables: ['members'],
   },
 
   'packages-enrolment': {
@@ -145,12 +154,19 @@ const DOMAINS = {
     tenancy: TENANCY.DERIVED,
     description: 'What a client bought: packages, enrolment, renewal, freeze and session balance.',
     dependsOn: ['tenancy', 'clients'],
+    // `subscriptions` and `renewals` are NOT here. Both are schema.sql
+    // baseline tables; both are dropped — `subscriptions` by
+    // 021_remove_members_feature.sql (CASCADE), `renewals` by that same
+    // migration AND again, for a database old enough to still have it, by
+    // 170. Confirmed live in production: PR #105 found Command Centre code
+    // querying `subscriptions` directly and 500ing on every call, because
+    // the table these two names refer to has not existed since 021 applied.
     tables: [
       'pt_packages', 'pt_plans', 'pt_client_subscriptions', 'pt_client_renewals',
       'holds_freezes', 'session_balance', 'membership_actions',
-      'plans', 'subscriptions', 'member_memberships', 'membership_payments', 'renewals',
+      'plans', 'member_memberships', 'membership_payments',
     ],
-    legacyTables: ['plans', 'subscriptions', 'member_memberships', 'membership_payments', 'renewals'],
+    legacyTables: ['plans', 'member_memberships', 'membership_payments'],
   },
 
   finance: {
@@ -171,12 +187,27 @@ const DOMAINS = {
     tenancy: TENANCY.DIRECT,
     description: 'Employment records and what the studio pays its staff.',
     dependsOn: ['tenancy', 'finance', 'scheduling'],
+    // Neither `staff`/`staff_targets` nor `staff_new`/`staff_targets_new`
+    // are here. Migration 033 creates the "_new" pair and, in the same file,
+    // `ALTER TABLE ... RENAME TO staff` / `staff_targets` — so the "_new"
+    // names never persist past that one migration. Migration 064 then drops
+    // the renamed pair for good ("Removes the Staff & Access / Team
+    // Management module entirely, per explicit request. Both tables were
+    // empty (0 rows) at removal time"), and nothing recreates them after.
+    // Personnel management lives entirely on `trainers`/`pt_trainers` now,
+    // matching 064's own note that a `staff` ROLE VALUE on users.role is a
+    // separate, unrelated thing this migration did not touch.
+    //
+    // Production still carries `staff` and `staff_targets` as of this
+    // writing — 0 rows in both, and no current backend code reads either —
+    // an orphan the drop should have removed. That is 26th-and-27th-table
+    // territory (see the roadmap phase 2 reconciliation), not something this
+    // domain owns.
     tables: [
-      'pt_commissions', 'pt_payouts', 'staff_targets', 'staff_targets_new',
-      'revenue_targets', 'pt_trainers', 'trainers', 'staff', 'staff_new',
+      'pt_commissions', 'pt_payouts',
+      'revenue_targets', 'pt_trainers', 'trainers',
       'leave_requests',
     ],
-    legacyTables: ['staff_new', 'staff_targets_new'],
   },
 
   // ── Delivery ────────────────────────────────────────────────────────────
