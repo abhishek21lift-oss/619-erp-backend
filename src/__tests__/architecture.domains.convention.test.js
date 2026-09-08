@@ -26,12 +26,54 @@ const {
 const DB = path.join(__dirname, '..', 'db');
 
 /**
- * Every table the schema creates.
+ * Every table that exists after schema.sql and every migration finish
+ * applying, in order — i.e. what a fresh bootstrap actually ends up with.
  *
  * Read from src/db rather than a live connection so this runs in CI with no
  * database — the same reason every other convention test in this suite is
- * static. `CREATE TABLE IF NOT EXISTS` and a `public.` prefix are both in use,
- * and quoted identifiers appear in a couple of the older migrations.
+ * static. `CREATE TABLE IF NOT EXISTS` and a `public.` prefix are both in
+ * use, and quoted identifiers appear in a couple of the older migrations.
+ *
+ * ── Why CREATE alone is not enough ───────────────────────────────────────
+ *
+ * A first version of this function matched CREATE TABLE only, and reported
+ * 171 tables where the manifest — at the time — also claimed 171. They
+ * matched by construction, not because either was right: the scan simply
+ * counted every name a CREATE TABLE statement had ever mentioned, including
+ * seven this codebase's own history goes on to remove.
+ *
+ *   leads, lead_followups         created by 012, dropped by
+ *                                 020_remove_lead_crm.sql
+ *   subscriptions, renewals       schema.sql's baseline; dropped by
+ *                                 021_remove_members_feature.sql (CASCADE)
+ *   clients                      schema.sql's baseline; dropped by
+ *                                 170_drop_legacy_clients_and_renewals.sql,
+ *                                 which RAISEs an exception if the table is
+ *                                 somehow still there afterward
+ *   staff_new, staff_targets_new  created by 033_schema_fixes.sql and, in
+ *                                 the SAME migration, immediately
+ *                                 `ALTER TABLE ... RENAME TO staff` /
+ *                                 `staff_targets` — the "_new" names never
+ *                                 persist past that one file
+ *
+ * PR #105 is what exposed this isn't a theoretical gap: Command Centre code
+ * queried `subscriptions` directly and 500'd on every call, because the
+ * table has not existed since migration 021 — years before that code was
+ * written. A CREATE-only scan cannot tell a table like that from one that
+ * genuinely exists, and a manifest built from a CREATE-only scan will
+ * confidently assign an owner to a table that is not there.
+ *
+ * ── The fix ───────────────────────────────────────────────────────────────
+ *
+ * Every file's SQL is concatenated in application order (schema.sql, then
+ * every migration by filename) into one string, and CREATE / DROP / RENAME
+ * are matched with a single pass over that string — so statements are
+ * processed in the exact order they would execute in, including a table
+ * dropped and immediately recreated within the same migration (048 creates
+ * `pt_client_subscriptions`, 050 conditionally drops and unconditionally
+ * recreates it to fix a column-type bug; the net result — exists — falls
+ * out of processing both statements in order, without this function having
+ * to understand *why* 050's drop is conditional).
  */
 function schemaTables() {
   const files = [path.join(DB, 'schema.sql')];
@@ -40,13 +82,34 @@ function schemaTables() {
     if (f.endsWith('.sql')) files.push(path.join(migrations, f));
   }
 
-  const re = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:public\.)?["']?([a-z_][a-z0-9_]*)["']?\s*\(/gi;
-  const found = new Set();
+  const chunks = [];
   for (const file of files) {
     if (!fs.existsSync(file)) continue;
-    const sql = fs.readFileSync(file, 'utf8');
-    let m;
-    while ((m = re.exec(sql)) !== null) found.add(m[1].toLowerCase());
+    chunks.push(fs.readFileSync(file, 'utf8'));
+  }
+  // A separator with no SQL keywords in it, so a statement cannot span the
+  // join point — matters only for a table name split across a file boundary,
+  // which none of these files do, but cheap insurance against ever adding one.
+  const sql = chunks.join('\n-- === file boundary === \n');
+
+  const ident = '["\']?([a-z_][a-z0-9_]*)["\']?';
+  const stmt = new RegExp(
+    `CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(?:public\\.)?${ident}\\s*\\(`
+    + `|DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:public\\.)?${ident}\\b`
+    + `|ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:public\\.)?${ident}\\s+RENAME\\s+TO\\s+(?:public\\.)?${ident}\\b`,
+    'gi',
+  );
+
+  const found = new Set();
+  let m;
+  while ((m = stmt.exec(sql)) !== null) {
+    const [, created, dropped, renamedFrom, renamedTo] = m;
+    if (created) found.add(created.toLowerCase());
+    else if (dropped) found.delete(dropped.toLowerCase());
+    else if (renamedFrom) {
+      found.delete(renamedFrom.toLowerCase());
+      found.add(renamedTo.toLowerCase());
+    }
   }
   return found;
 }
@@ -149,10 +212,42 @@ describe('the manifest records the state the audit found', () => {
     // obsolete set written down. These are the tables the audit found still on
     // live read paths with no organization_id; roadmap phase 6 moves the reads
     // before anything is dropped.
+    //
+    // `clients` and `subscriptions` are deliberately NOT in this list, even
+    // though the original Phase 1 audit named both as legacy gap tables still
+    // awaiting retirement. They are not awaiting anything: migration 170
+    // dropped `clients` (with a verification block that RAISEs if it is
+    // somehow still there afterward), and migration 021 dropped `subscriptions`
+    // years earlier still. Both were already gone by the time that audit ran —
+    // it read old comments and route code rather than the migration history,
+    // and PR #105 is the bug that came of trusting it (Command Centre code
+    // querying a `subscriptions` table that had not existed since 021).
+    // Listing either here would assert a retirement this manifest also has to
+    // assert is impossible, since schemaTables() no longer contains them.
     const { legacyTables } = require('../architecture/domains');
     const legacy = legacyTables();
-    for (const t of ['clients', 'subscriptions', 'payments', 'members']) {
+    for (const t of ['payments', 'members']) {
       expect(legacy).toContain(t);
+    }
+    for (const t of ['clients', 'subscriptions']) {
+      expect(legacy).not.toContain(t);
+    }
+  });
+
+  it('does not carry an already-retired table as a live legacy entry', () => {
+    // The complement of the assertion above: every table this manifest DOES
+    // list as legacy must actually exist post-migration — legacyTables names
+    // something still on a live read path, not something already gone. If a
+    // future edit re-adds `clients`/`subscriptions`/`renewals`/`leads` (or any
+    // table a migration has since dropped) to a domain's legacyTables, this
+    // fails, because the ownership test below would fail first for the same
+    // reason: schemaTables() has already retired it.
+    const { legacyTables } = require('../architecture/domains');
+    const legacy = legacyTables();
+    const retired = ['clients', 'subscriptions', 'renewals', 'leads', 'lead_followups',
+      'staff', 'staff_new', 'staff_targets', 'staff_targets_new'];
+    for (const t of retired) {
+      expect(legacy).not.toContain(t);
     }
   });
 
