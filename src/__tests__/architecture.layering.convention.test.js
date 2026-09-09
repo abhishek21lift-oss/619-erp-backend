@@ -109,7 +109,11 @@ const BUDGETS = {
   'modules/progress/progress.routes.js': 33,
   'routes/profile.js': 29,
   'modules/pt-os/parq.routes.js': 28,
-  'modules/training/training.routes.js': 27,
+  // 27 → 18: the programmes cluster (list, read, create, patch, soft-delete,
+  // phases, weeks) moved into modules/training/training.repository.js. The
+  // remaining 18 are templates/prescriptions, assignments and the session read
+  // paths, which are the next entries to go.
+  'modules/training/training.routes.js': 18,
   'routes/auth-webauthn.js': 26,
   'routes/auth.js': 24,
   'routes/upi-payments.js': 21,
@@ -219,6 +223,9 @@ describe('the migration has a number attached to it', () => {
 
     expect(total).toBeLessThanOrEqual(ceiling);
     // Recorded so a reader of a failing run knows what "good" looked like.
-    expect(ceiling).toBe(782);
+    // 782 at the start of phase 5; 773 after the training programmes cluster
+    // moved to a repository. Lower it with each extraction — the number only
+    // means something if it tracks reality.
+    expect(ceiling).toBe(773);
   });
 });

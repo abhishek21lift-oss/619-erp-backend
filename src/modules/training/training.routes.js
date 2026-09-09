@@ -30,6 +30,7 @@ const { orgIdOf } = require('../../lib/tenant-db');
 const authz = require('./authz');
 const schemas = require('./training.schemas');
 const service = require('./training.service');
+const repo = require('./training.repository');
 const prescription = require('./prescription');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -48,125 +49,72 @@ function sendError(res, err) {
 }
 
 /** `col = $n` pairs for the fields present in `body`, from an allow-list. */
-function patchFrom(body, allowed, startAt = 1) {
-  const sets = [];
-  const values = [];
-  for (const key of allowed) {
-    if (body[key] === undefined) continue;
-    values.push(body[key]);
-    sets.push(`${key} = $${startAt + values.length - 1}`);
-  }
-  return { sets, values };
-}
+// Moved to training.repository.js, which is where SQL belongs. Still imported
+// here for the clusters that have not been extracted yet — templates,
+// assignments, sessions — and this line goes with the last of them.
+const { patchFrom } = repo;
 
 // ═══ Programs ══════════════════════════════════════════════════════════════
 
 router.get('/programs', auth, STAFF, wrap(async (req, res) => {
-  const params = [];
-  const org = authz.orgWhere(req, params, 'p.organization_id');
-  const filters = [];
-  if (req.query.client_id) { params.push(req.query.client_id); filters.push(`p.client_id = $${params.length}`); }
-  if (req.query.status)    { params.push(req.query.status);    filters.push(`p.status = $${params.length}`); }
-  // A trainer who is not admin/manager sees programmes for their own clients,
-  // plus the studio's unassigned templates (client_id IS NULL).
-  const trainer = authz.seesAllClients(req) || !req.user.trainer_id
-    ? ''
-    : (params.push(req.user.trainer_id),
-       ` AND (p.client_id IS NULL OR EXISTS (
-           SELECT 1 FROM pt_clients c WHERE c.id = p.client_id AND c.trainer_id = $${params.length}))`);
-
-  const { rows } = await pool.query(
-    `SELECT p.* FROM training_programs p
-      WHERE p.deleted_at IS NULL${org}${trainer}
-        ${filters.length ? `AND ${filters.join(' AND ')}` : ''}
-      ORDER BY p.created_at DESC LIMIT 200`,
-    params
-  );
+  const rows = await repo.listPrograms(req, {
+    clientId: req.query.client_id,
+    status: req.query.status,
+  });
   res.json({ data: rows });
 }));
 
 router.get('/programs/:id', auth, STAFF, wrap(async (req, res) => {
   const program = await authz.loadOwned(req, 'training_programs', req.params.id);
   if (!program) return notFound(res, 'Program');
-  const [phases, weeks] = await Promise.all([
-    pool.query('SELECT * FROM training_program_phases WHERE program_id = $1 ORDER BY phase_order', [program.id]),
-    pool.query('SELECT * FROM training_program_weeks  WHERE program_id = $1 ORDER BY week_number', [program.id]),
-  ]);
-  res.json({ data: { ...program, phases: phases.rows, weeks: weeks.rows } });
+  const { phases, weeks } = await repo.loadProgramParts(program.id);
+  res.json({ data: { ...program, phases, weeks } });
 }));
 
 router.post('/programs', auth, STAFF, validate(schemas.programCreate), wrap(async (req, res) => {
   const b = req.body;
   if (b.client_id && !await authz.canAccessClient(req, b.client_id)) return notFound(res, 'Client');
-  const { rows } = await pool.query(
-    `INSERT INTO training_programs
-       (organization_id, client_id, created_by, name, description, goal, program_type,
-        duration_weeks, start_date, end_date, notes)
-     VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,'GENERAL_FITNESS'),$8,$9,$10,$11) RETURNING *`,
-    [orgIdOf(req), b.client_id ?? null, req.user.id, b.name, b.description ?? null,
-     b.goal ?? null, b.program_type ?? null, b.duration_weeks ?? null,
-     b.start_date ?? null, b.end_date ?? null, b.notes ?? null]
-  );
-  await logActivity(req, 'training.program.create', 'training_programs', rows[0].id, { name: b.name }).catch(() => {});
-  res.status(201).json({ data: rows[0] });
+  const program = await repo.createProgram(req, b);
+  await logActivity(req, 'training.program.create', 'training_programs', program.id, { name: b.name }).catch(() => {});
+  res.status(201).json({ data: program });
 }));
 
 router.patch('/programs/:id', auth, STAFF, validate(schemas.programUpdate), wrap(async (req, res) => {
   if (!await authz.loadOwned(req, 'training_programs', req.params.id)) return notFound(res, 'Program');
-  // client_id is in the patch list below, and POST /programs guards the same
-  // field with this exact check. Without it here, a programme this studio
-  // legitimately owns could be re-pointed at ANOTHER studio's client — not a
-  // read of foreign data, but a foreign key written across the tenant
-  // boundary, which leaves the row reachable from two studios' client views.
+  // client_id is patchable, and POST /programs guards the same field with this
+  // exact check. Without it here, a programme this studio legitimately owns
+  // could be re-pointed at ANOTHER studio's client — not a read of foreign
+  // data, but a foreign key written across the tenant boundary, which leaves
+  // the row reachable from two studios' client views.
+  //
+  // It stays in the adapter on purpose: it is an authorisation decision about
+  // the request, and authorisation is what this layer is for. The repository
+  // is told which row to write, never whether the caller may.
   if (req.body.client_id !== undefined && req.body.client_id !== null
       && !await authz.canAccessClient(req, req.body.client_id)) {
     return notFound(res, 'Client');
   }
-  const { sets, values } = patchFrom(req.body, [
-    'name', 'description', 'goal', 'program_type', 'duration_weeks',
-    'status', 'start_date', 'end_date', 'notes', 'client_id',
-  ], 2);
-  if (!sets.length) return notFound(res, 'Nothing to update');
-  const { rows } = await pool.query(
-    `UPDATE training_programs SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $1 RETURNING *`,
-    [req.params.id, ...values]
-  );
-  res.json({ data: rows[0] });
+  const program = await repo.updateProgram(req.params.id, req.body);
+  // null means the body named no patchable field — answered exactly as before.
+  if (!program) return notFound(res, 'Nothing to update');
+  res.json({ data: program });
 }));
 
 router.delete('/programs/:id', auth, STAFF, wrap(async (req, res) => {
   if (!await authz.loadOwned(req, 'training_programs', req.params.id)) return notFound(res, 'Program');
-  // Soft delete. Sessions logged against this programme stay readable, which
-  // is the whole reason historical rows are never hard-deleted.
-  await pool.query('UPDATE training_programs SET deleted_at = NOW() WHERE id = $1', [req.params.id]);
+  await repo.softDeleteProgram(req.params.id);
   await logActivity(req, 'training.program.delete', 'training_programs', req.params.id, {}).catch(() => {});
   res.json({ data: { id: req.params.id, deleted: true } });
 }));
 
 router.post('/programs/:id/phases', auth, STAFF, validate(schemas.phaseCreate), wrap(async (req, res) => {
   if (!await authz.loadOwned(req, 'training_programs', req.params.id)) return notFound(res, 'Program');
-  const b = req.body;
-  const { rows } = await pool.query(
-    `INSERT INTO training_program_phases (program_id, name, phase_order, week_start, week_end, goal, notes)
-     VALUES ($1,$2,COALESCE($3,1),$4,$5,$6,$7) RETURNING *`,
-    [req.params.id, b.name, b.phase_order ?? null, b.week_start, b.week_end, b.goal ?? null, b.notes ?? null]
-  );
-  res.status(201).json({ data: rows[0] });
+  res.status(201).json({ data: await repo.createPhase(req.params.id, req.body) });
 }));
 
 router.post('/programs/:id/weeks', auth, STAFF, validate(schemas.weekCreate), wrap(async (req, res) => {
   if (!await authz.loadOwned(req, 'training_programs', req.params.id)) return notFound(res, 'Program');
-  const b = req.body;
-  const { rows } = await pool.query(
-    `INSERT INTO training_program_weeks (program_id, phase_id, week_number, name, notes, is_deload)
-     VALUES ($1,$2,$3,$4,$5,COALESCE($6,false))
-     ON CONFLICT (program_id, week_number) DO UPDATE
-        SET phase_id = EXCLUDED.phase_id, name = EXCLUDED.name,
-            notes = EXCLUDED.notes, is_deload = EXCLUDED.is_deload, updated_at = NOW()
-     RETURNING *`,
-    [req.params.id, b.phase_id ?? null, b.week_number, b.name ?? null, b.notes ?? null, b.is_deload ?? null]
-  );
-  res.status(201).json({ data: rows[0] });
+  res.status(201).json({ data: await repo.upsertWeek(req.params.id, req.body) });
 }));
 
 // ═══ Templates and prescriptions ═══════════════════════════════════════════
