@@ -381,9 +381,31 @@ const DOMAINS = {
       'platform_owners', 'platform_features', 'platform_announcements',
       'platform_billing_settings', 'platform_payment_settings', 'platform_ai_settings',
       'ai_platform_settings', 'system_alerts', 'system_logs',
-      'support_tickets', 'support_ticket_messages',
+      // `support_tickets` and `support_ticket_messages` are NOT here. See the
+      // `support` domain below: they carry organization_id and are read AND
+      // written by routes/support.js on the tenant plane, so classifying them
+      // as platform data was a misreading of "the platform console can see
+      // them" as "they belong to the platform". By that reasoning pt_clients
+      // would be platform data too — the console reads that as well, over the
+      // owner connection, which is how platform reads of tenant tables always
+      // work.
       'tenancy_known_gaps', 'tenancy_isolation_runs', 'admin_reset_intents',
     ],
+  },
+
+  // ── Support: tenant data with a platform-side console ───────────────────
+  support: {
+    plane: PLANE.TENANT,
+    tenancy: TENANCY.DIRECT,
+    description:
+      'Studio-raised support tickets and their conversation. Tenant data: a studio '
+      + 'opens a ticket, reads its own, and replies. The 619 operator answers from the '
+      + 'platform console over the owner connection, exactly as it reads any other '
+      + 'tenant table. Internal operator notes live in the same message table behind '
+      + 'is_internal and are excluded from the tenant both in SQL (lib/support.js) and '
+      + 'in the row policy (migration 189).',
+    dependsOn: ['tenancy', 'identity-access'],
+    tables: ['support_tickets', 'support_ticket_messages'],
   },
 
   audit: {

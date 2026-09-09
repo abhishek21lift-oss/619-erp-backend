@@ -256,3 +256,57 @@ describe('the grant is read on the owner connection, whatever org is named', () 
     }, { platformWide: true });
   });
 });
+
+describe('the whole platform handler runs on the owner connection, not just the grant', () => {
+  // The other half of the bug above, which the fix for it did not cover.
+  //
+  // hasPlatformGrant() wrapped its OWN query in runAsPlatform and then
+  // requirePlatformOwner called a bare next(). So the guard's private lookup
+  // was platform-wide and every query the actual handler made was not: with
+  // x-org-id pinned, auth.js opens a tenant-scoped context, the guard fixes
+  // that for one statement, and the entire Command Centre — studios, billing,
+  // announcements, audit, tenancy health — then reads platform tables as
+  // app_tenant.
+  //
+  // Those tables have RLS on and deliberately no app_tenant policy, so the
+  // console does not error. It renders zero rows, which looks like "no studios
+  // yet" rather than like a plane that is broken. Latent until
+  // TENANT_RLS_ENFORCE is on and ADMIN_DATABASE_URL differs — the deployment
+  // the whole mechanism exists for.
+  const { runWithTenantContext, isPlatformWide } = require('../lib/tenant-context');
+
+  /** A platform route whose HANDLER records the plane it actually ran in. */
+  function appRecordingHandlerPlane(seen) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.user = { id: 'usr-operator', role: 'super_admin' };
+      req.session = { aud: AUD_PLATFORM };
+      // Exactly what auth.js does for an operator arriving with x-org-id
+      // pinned: a tenant-scoped context, NOT a platform-wide one.
+      runWithTenantContext('org-a', next, { platformWide: false });
+    });
+    app.use('/api/platform', requirePlatformOwner, (_req, res) => {
+      seen.plane = isPlatformWide();
+      res.json({ ok: true });
+    });
+    return app;
+  }
+
+  it('the handler is platform-wide even when the operator has a studio pinned', async () => {
+    const seen = {};
+    await request(appRecordingHandlerPlane(seen)).get('/api/platform').expect(200);
+    expect(seen.plane).toBe(true);
+  });
+
+  it('and the tenant context is not leaked back out to the rest of the app', async () => {
+    // runAsPlatform must scope to the request, not replace the ambient store
+    // for whatever else is running in the process.
+    await runWithTenantContext('org-a', async () => {
+      const seen = {};
+      await request(appRecordingHandlerPlane(seen)).get('/api/platform').expect(200);
+      expect(seen.plane).toBe(true);
+      expect(isPlatformWide()).toBe(false);
+    }, { platformWide: false });
+  });
+});
