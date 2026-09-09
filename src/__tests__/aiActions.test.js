@@ -11,12 +11,17 @@ process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://u:p@127.0.0
 const mockQuery = jest.fn();
 jest.mock('../db/pool', () => ({ query: (...a) => mockQuery(...a) }));
 
-const mockSendText = jest.fn();
-const mockConfigured = jest.fn(() => true);
-jest.mock('../services/whatsappDelivery', () => ({
-  sendText: (...a) => mockSendText(...a),
-  sendTemplate: jest.fn(),
-  twilioWhatsappConfigured: () => mockConfigured(),
+// The transport, not Twilio. These actions now send on the STUDIO's own
+// connected WhatsApp — see modules/messaging/transport.js — so the fake stands
+// in for that resolution rather than for a platform credential.
+const mockSend = jest.fn();
+const mockResolveInstance = jest.fn(async () => ({ ok: true, instanceId: 'inst-1' }));
+jest.mock('../modules/messaging/transport', () => ({
+  send: (...a) => mockSend(...a),
+  resolveInstance: (...a) => mockResolveInstance(...a),
+  SendStatus: { SENT: 'sent', FAILED: 'failed', NOT_CONNECTED: 'not_connected', NOT_CONFIGURED: 'not_configured' },
+  PROVIDERS: { BAILEYS: 'baileys', TWILIO: 'twilio' },
+  isRetryable: (s) => s === 'failed',
 }));
 
 const { findAction, canRun, listFor, deliver, clampInt, MAX_RECIPIENTS } =
@@ -28,8 +33,9 @@ const reqAs = (user, body = {}) => ({ user, body, headers: {} });
 
 beforeEach(() => {
   mockQuery.mockReset();
-  mockSendText.mockReset();
-  mockConfigured.mockReturnValue(true);
+  mockSend.mockReset();
+  mockResolveInstance.mockReset();
+  mockResolveInstance.mockResolvedValue({ ok: true, instanceId: 'inst-1' });
 });
 
 describe('who may run an action', () => {
@@ -107,14 +113,30 @@ describe('recipients come from the server, scoped to the org', () => {
 });
 
 describe('the plan tells the truth before anybody confirms', () => {
-  test('an unconfigured channel is a warning on the plan, not a surprise after', async () => {
+  test('a studio with no connected WhatsApp is warned on the plan, not after', async () => {
     // This codebase already shipped one endpoint that answered "sent" whether
     // or not anything left the building. Not twice.
-    mockConfigured.mockReturnValue(false);
+    //
+    // The question this asks changed with the transport, and the old one had
+    // the wrong answer for every studio: it checked whether the PLATFORM held
+    // Twilio credentials, so a studio that had never paired WhatsApp was told
+    // their messages would be delivered.
+    mockResolveInstance.mockResolvedValue({ ok: false, reason: 'not_connected' });
     mockQuery.mockResolvedValue({ rows: [{ id: 'c1', name: 'A', mobile: '9990000001', balance_amount: 500 }] });
 
     const { warnings } = await findAction('dues_reminders').resolve(reqAs(admin), { min_balance: 1 });
-    expect(warnings.join(' ')).toMatch(/not configured/i);
+    expect(warnings.join(' ')).toMatch(/has not connected WhatsApp/i);
+  });
+
+  test('a studio WITH a connected number gets no such warning', async () => {
+    // The other half: a warning that is always present is a warning nobody
+    // reads, and the old check produced exactly that whenever the platform
+    // credentials were absent.
+    mockResolveInstance.mockResolvedValue({ ok: true, instanceId: 'inst-1' });
+    mockQuery.mockResolvedValue({ rows: [{ id: 'c1', name: 'A', mobile: '9990000001', balance_amount: 500 }] });
+
+    const { warnings } = await findAction('dues_reminders').resolve(reqAs(admin), { min_balance: 1 });
+    expect(warnings.join(' ')).not.toMatch(/connected WhatsApp/i);
   });
 
   test('clients with no mobile number are excluded and counted', async () => {
@@ -140,19 +162,22 @@ describe('the plan tells the truth before anybody confirms', () => {
 });
 
 describe('delivery reports what happened', () => {
-  test('not_configured is passed through as itself, not as sent and not as failed', async () => {
-    mockSendText.mockResolvedValue({ status: 'not_configured', provider_id: null });
-    const out = await deliver([{ id: 'c1', name: 'A', mobile: '999', body: 'hi' }]);
-    expect(out[0].status).toBe('not_configured');
+  test('not_connected is passed through as itself, not as sent and not as failed', async () => {
+    // The studio has not paired WhatsApp. Nothing broke and nothing was
+    // delivered, and reporting either 'sent' or 'failed' would be a lie about
+    // a different thing.
+    mockSend.mockResolvedValue({ status: 'not_connected', provider_id: null, error: 'not_connected' });
+    const out = await deliver('org-1', 'plan-1', [{ id: 'c1', name: 'A', mobile: '999', body: 'hi' }]);
+    expect(out[0].status).toBe('not_connected');
   });
 
   test('one failure does not lose the rest of the run', async () => {
-    mockSendText
+    mockSend
       .mockResolvedValueOnce({ status: 'sent' })
       .mockResolvedValueOnce({ status: 'failed', error: 'bad number' })
       .mockResolvedValueOnce({ status: 'sent' });
 
-    const out = await deliver([
+    const out = await deliver('org-1', 'plan-1', [
       { id: 'a', name: 'A', mobile: '1', body: 'x' },
       { id: 'b', name: 'B', mobile: '2', body: 'x' },
       { id: 'c', name: 'C', mobile: '3', body: 'x' },
@@ -160,14 +185,41 @@ describe('delivery reports what happened', () => {
     expect(out.map((r) => r.status)).toEqual(['sent', 'failed', 'sent']);
   });
 
-  test('sends to exactly the resolved numbers, once each', async () => {
-    mockSendText.mockResolvedValue({ status: 'sent' });
-    await deliver([
+  test('sends to exactly the resolved numbers, once each, for the calling studio', async () => {
+    mockSend.mockResolvedValue({ status: 'sent' });
+    await deliver('org-1', 'plan-1', [
       { id: 'a', name: 'A', mobile: '9990000001', body: 'one' },
       { id: 'b', name: 'B', mobile: '9990000002', body: 'two' },
     ]);
-    expect(mockSendText).toHaveBeenCalledTimes(2);
-    expect(mockSendText).toHaveBeenCalledWith({ to: '9990000001', body: 'one' });
-    expect(mockSendText).toHaveBeenCalledWith({ to: '9990000002', body: 'two' });
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    expect(mockSend).toHaveBeenCalledWith(
+      expect.objectContaining({ orgId: 'org-1', to: '9990000001', text: 'one' }),
+    );
+    expect(mockSend).toHaveBeenCalledWith(
+      expect.objectContaining({ orgId: 'org-1', to: '9990000002', text: 'two' }),
+    );
+  });
+
+  test('never falls back to a shared platform number', async () => {
+    // A bulk action is the worst place for a fallback: it would arrive to many
+    // clients at once from a number none of them recognise.
+    mockSend.mockResolvedValue({ status: 'sent' });
+    await deliver('org-1', 'plan-1', [{ id: 'a', name: 'A', mobile: '999', body: 'x' }]);
+    expect(mockSend).toHaveBeenCalledWith(
+      expect.objectContaining({ allowSharedProvider: false }),
+    );
+  });
+
+  test('gives each recipient a client_message_id derived from the plan', async () => {
+    // Stable across a re-delivery of the same plan, so the gateway's send-once
+    // recognises it rather than messaging the client a second time.
+    mockSend.mockResolvedValue({ status: 'sent' });
+    await deliver('org-1', 'plan-7', [
+      { id: 'a', name: 'A', mobile: '1', body: 'x' },
+      { id: 'b', name: 'B', mobile: '2', body: 'x' },
+    ]);
+    const ids = mockSend.mock.calls.map(([arg]) => arg.clientMessageId);
+    expect(ids).toEqual(['ai-action:plan-7:a', 'ai-action:plan-7:b']);
+    expect(new Set(ids).size).toBe(2);
   });
 });

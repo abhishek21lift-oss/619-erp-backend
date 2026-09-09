@@ -20,10 +20,15 @@
 //
 // The gateway is an optional component. If it is down, mis-deployed, or simply
 // not part of this deployment, the ERP must keep working: the WhatsApp card
-// shows a stale state, and everything else — including the existing Twilio
-// delivery path — is untouched. So the functions below return a result object
-// in the style of services/whatsappDelivery.js rather than throwing, and the
-// route layer decides what the studio sees.
+// shows a stale state and the rest of the product is untouched. So the
+// functions below return a result object rather than throwing, and the caller
+// decides what the studio sees.
+//
+// That degradation rule has one deliberate exception in the layer above.
+// modules/messaging/transport refuses to fall back to a shared provider for
+// AUTOMATED sends: a message that was supposed to come from the studio's own
+// number arriving from a platform number is worse for that studio than not
+// arriving at all. See the header there.
 
 const logger = require('./logger');
 
@@ -128,6 +133,28 @@ const gateway = {
 
   reconnect: (orgId, instanceId, requestId) =>
     call('POST', `/v1/instances/${instanceId}/reconnect`, { orgId, requestId }),
+
+  /**
+   * Send one text message on this studio's own connected number.
+   *
+   * `clientMessageId` is the ERP's id for the message and must be stable
+   * across the BullMQ job's retries — communication_logs.id is the value we
+   * use. The gateway claims it before sending and records the provider id
+   * against it after, so a retry of a job whose response was lost returns
+   * `{ duplicate: true }` with the ORIGINAL provider id rather than sending
+   * the studio's client the same message a second time.
+   *
+   * Like everything else here this returns a result rather than throwing, and
+   * the caller branches on `code`. INSTANCE_NOT_CONNECTED in particular is not
+   * an error to retry against the gateway — no amount of retrying reconnects a
+   * socket only the studio can restore by scanning a QR.
+   */
+  sendMessage: (orgId, instanceId, { to, text, clientMessageId }, requestId) =>
+    call('POST', `/v1/instances/${instanceId}/messages`, {
+      orgId,
+      requestId,
+      body: { to, text, client_message_id: clientMessageId },
+    }),
 
   /** Close the socket, KEEP credentials. Reconnecting needs no new QR. */
   disconnect: (orgId, instanceId, requestId) =>

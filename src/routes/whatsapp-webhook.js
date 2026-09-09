@@ -68,6 +68,61 @@ const STATUS_FOR_EVENT = {
   'whatsapp.instance.logged_out':   'logged_out',
 };
 
+/**
+ * Apply one message lifecycle event to communication_logs.
+ *
+ * ── Two different keys, and the reason for each ─────────────────────────────
+ *
+ * `sent` and `failed` are matched on the ERP's own id — the one it minted as
+ * communication_logs.id and handed the gateway as client_message_id — because
+ * at the moment they are emitted that is the only id both sides share.
+ *
+ * `delivered` and `read` are matched on the PROVIDER's message id, because
+ * WhatsApp's own receipts arrive keyed that way and the alternative would be
+ * for the gateway to hold a mapping across restarts. The ERP already stored
+ * that id in external_id when it processed `sent`, so the join exists here.
+ *
+ * ── Why a receipt for an unknown message is not an error ────────────────────
+ *
+ * A studio replying by hand from their phone produces receipts too, and the
+ * connector filters those on `fromMe` — but a message sent before this deploy,
+ * or one whose row was pruned, would also arrive with nothing to match. The
+ * count is returned and logged; the webhook still answers 2xx, because asking
+ * the gateway to retry an event that can never match is how a dead-letter list
+ * fills up with nothing actionable.
+ *
+ * Every statement is bound to `tenant_id` from the signed envelope, so an
+ * event naming another studio's message id updates nothing.
+ */
+async function applyMessageEvent(eventType, payload, tenantId, occurredAt) {
+  const repo = require('../modules/automation/automation.repository');
+  const kind = eventType.slice('whatsapp.message.'.length);
+
+  if (kind === 'delivered' || kind === 'read') {
+    const externalId = payload.provider_message_id;
+    if (!externalId) return 0;
+    return repo.applyReceipt(
+      tenantId,
+      externalId,
+      kind,
+      payload.delivered_at || payload.read_at || occurredAt || null
+    );
+  }
+
+  if (kind === 'failed') {
+    const logId = payload.client_message_id;
+    if (!logId) return 0;
+    return repo.markFailedByClientId(tenantId, logId, payload.reason_code || 'gateway_failed');
+  }
+
+  // `sent` is deliberately inert. The worker already recorded the send
+  // synchronously from the HTTP response, which carried the same provider id —
+  // and it did so before this event could arrive. Applying it again would at
+  // best be a no-op and at worst move a row that has since been delivered back
+  // to 'sent'.
+  return 0;
+}
+
 router.post('/', async (req, res) => {
   const secret = process.env.WA_WEBHOOK_SECRET;
   if (!secret) {
@@ -145,6 +200,19 @@ router.post('/', async (req, res) => {
       // non-2xx would make the gateway retry it forever.
       log.info({ status: 'ok', duplicate: true }, 'whatsapp_webhook_duplicate');
       return res.json({ received: true, duplicate: true });
+    }
+
+    // ── Message lifecycle events ────────────────────────────────────────────
+    //
+    // These update communication_logs rather than whatsapp_instances, so they
+    // branch before the instance-status lookup below. They are the delivery
+    // callbacks the table's sent_at / delivered_at / read_at columns and its
+    // 'delivered'/'read' status values have been waiting for since migration
+    // 012 — until now nothing wrote them, because nothing sent anything.
+    if (event_type.startsWith('whatsapp.message.')) {
+      const applied = await applyMessageEvent(event_type, event.payload || {}, tenant_id, occurred_at);
+      log.info({ status: 'ok', applied }, 'whatsapp_webhook_message_event');
+      return res.json({ received: true });
     }
 
     const status = STATUS_FOR_EVENT[event_type];

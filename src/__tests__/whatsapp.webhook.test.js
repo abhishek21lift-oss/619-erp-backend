@@ -322,3 +322,101 @@ describe('applying events', () => {
     expect(res.status).toBe(500);
   });
 });
+
+// ── Message lifecycle events ────────────────────────────────────────────────
+//
+// These are the delivery callbacks. They update communication_logs rather than
+// whatsapp_instances, and they are the reason that table has separate
+// delivered_at and read_at columns — which, until the automation engine
+// existed, nothing had ever written.
+describe('delivery receipts', () => {
+  /** Every UPDATE communication_logs this request issued. */
+  const logUpdates = () =>
+    pool.query.mock.calls
+      .filter(([sql]) => /UPDATE communication_logs/.test(sql))
+      .map(([sql, params]) => ({ sql: sql.replace(/\s+/g, ' ').trim(), params }));
+
+  test('a delivered receipt is matched on the provider message id', async () => {
+    // Keyed by the PROVIDER's id, because WhatsApp's own receipts arrive that
+    // way. The ERP stored it in external_id when it processed the send.
+    const res = await post(makeEvent({
+      event_type: 'whatsapp.message.delivered',
+      payload: { provider_message_id: 'WAMSG1', delivered_at: '2026-09-09T10:00:00.000Z' },
+    }));
+
+    expect(res.status).toBe(200);
+    const [update] = logUpdates();
+    expect(update.params[0]).toBe('WAMSG1');
+    expect(update.params[2]).toBe('delivered');
+  });
+
+  test('every receipt is bound to the tenant on the signed envelope', async () => {
+    // The HMAC makes forgery hard; this makes it ineffective. An event naming
+    // another studio's message id updates nothing.
+    await post(makeEvent({
+      event_type: 'whatsapp.message.read',
+      payload: { provider_message_id: 'WAMSG1', read_at: '2026-09-09T10:05:00.000Z' },
+    }));
+    expect(logUpdates()[0].params[1]).toBe(ORG);
+  });
+
+  test('a failure is matched on the id the ERP itself minted', async () => {
+    // At the moment a send fails there is no provider id — nothing was
+    // accepted — so client_message_id is the only id both sides share.
+    await post(makeEvent({
+      event_type: 'whatsapp.message.failed',
+      payload: { client_message_id: 'log-1', reason_code: 'send_failed', will_retry: true },
+    }));
+    const [update] = logUpdates();
+    expect(update.params).toEqual(['log-1', ORG, 'send_failed']);
+  });
+
+  test('a sent event changes nothing, because the worker already recorded it', async () => {
+    // The worker wrote the row synchronously from the HTTP response, which
+    // carried the same provider id, and did so before this event could arrive.
+    // Applying it again could pull a delivered row back to 'sent'.
+    const res = await post(makeEvent({
+      event_type: 'whatsapp.message.sent',
+      payload: { client_message_id: 'log-1', provider_message_id: 'WAMSG1', sent_at: new Date().toISOString() },
+    }));
+    expect(res.status).toBe(200);
+    expect(logUpdates()).toHaveLength(0);
+  });
+
+  test('a receipt never touches whatsapp_instances', async () => {
+    // A message event is not a connection event. Routing one through the
+    // instance status table would move a studio's connection state on the
+    // strength of a delivery receipt.
+    await post(makeEvent({
+      event_type: 'whatsapp.message.delivered',
+      payload: { provider_message_id: 'WAMSG1' },
+    }));
+    const touched = pool.query.mock.calls.map(([sql]) => sql).join(' ');
+    expect(touched).not.toMatch(/UPDATE whatsapp_instances/);
+  });
+
+  test('a receipt with no ids is acknowledged and applied to nothing', async () => {
+    // Answering non-2xx would make the gateway retry an event that can never
+    // match, which only fills the dead-letter list.
+    const res = await post(makeEvent({
+      event_type: 'whatsapp.message.delivered',
+      payload: {},
+    }));
+    expect(res.status).toBe(200);
+    expect(logUpdates()).toHaveLength(0);
+  });
+
+  test('receipts still go through the idempotency ledger', async () => {
+    // The gateway delivers at-least-once for message events too.
+    pool.query.mockReset();
+    pool.query.mockResolvedValueOnce({ rowCount: 0, rows: [] }); // claim refused
+    const res = await post(makeEvent({
+      event_type: 'whatsapp.message.delivered',
+      payload: { provider_message_id: 'WAMSG1' },
+    }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ duplicate: true });
+    expect(logUpdates()).toHaveLength(0);
+  });
+});

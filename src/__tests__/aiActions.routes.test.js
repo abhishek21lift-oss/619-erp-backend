@@ -16,11 +16,16 @@ jest.mock('../middleware/auth', () => ({
   adminOrManager: (_req, _res, next) => next(),
 }));
 
-const mockSendText = jest.fn();
-jest.mock('../services/whatsappDelivery', () => ({
-  sendText: (...a) => mockSendText(...a),
-  sendTemplate: jest.fn(),
-  twilioWhatsappConfigured: () => true,
+// The transport, not Twilio: these actions send on the STUDIO's own connected
+// WhatsApp now. `resolveInstance` answers the plan's "is this deliverable"
+// warning; `send` is the delivery itself.
+const mockSend = jest.fn();
+jest.mock('../modules/messaging/transport', () => ({
+  send: (...a) => mockSend(...a),
+  resolveInstance: async () => ({ ok: true, instanceId: 'inst-1' }),
+  SendStatus: { SENT: 'sent', FAILED: 'failed', NOT_CONNECTED: 'not_connected', NOT_CONFIGURED: 'not_configured' },
+  PROVIDERS: { BAILEYS: 'baileys', TWILIO: 'twilio' },
+  isRetryable: (st) => st === 'failed',
 }));
 
 const request = require('supertest');
@@ -52,8 +57,8 @@ const past = () => new Date(Date.now() - 1000).toISOString();
 
 beforeEach(() => {
   pool.query.mockReset();
-  mockSendText.mockReset();
-  mockSendText.mockResolvedValue({ status: 'sent' });
+  mockSend.mockReset();
+  mockSend.mockResolvedValue({ status: 'sent' });
   mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
 });
 
@@ -68,7 +73,7 @@ describe('planning', () => {
     expect(res.body.data.outward).toBe(true);
     expect(res.body.data.sample_message).toContain('Client 1');
     // The whole point: planning is read-only.
-    expect(mockSendText).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   test('a trainer is refused', async () => {
@@ -131,7 +136,7 @@ describe('executing', () => {
     const res = await planThenExecute({ executeClients: [CLIENT(1), CLIENT(2)] });
     expect(res.status).toBe(200);
     expect(res.body.data.sent).toBe(2);
-    expect(mockSendText).toHaveBeenCalledTimes(2);
+    expect(mockSend).toHaveBeenCalledTimes(2);
   });
 
   // The one that matters most. A client enrolled between reading and
@@ -141,14 +146,14 @@ describe('executing', () => {
     const res = await planThenExecute({ executeClients: [CLIENT(1), CLIENT(2), CLIENT(3)] });
     expect(res.status).toBe(409);
     expect(res.body.code).toBe('plan_stale');
-    expect(mockSendText).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   test('refuses when somebody dropped out of the list', async () => {
     const res = await planThenExecute({ executeClients: [CLIENT(1)] });
     expect(res.status).toBe(409);
     expect(res.body.code).toBe('plan_stale');
-    expect(mockSendText).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   // Two taps on Confirm. The claim UPDATE matches no row the second time.
@@ -156,7 +161,7 @@ describe('executing', () => {
     const res = await planThenExecute({ executeClients: [CLIENT(1), CLIENT(2)], claimRows: 0 });
     expect(res.status).toBe(409);
     expect(res.body.code).toBe('already_run');
-    expect(mockSendText).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   test('refuses a plan already marked consumed', async () => {
@@ -166,7 +171,7 @@ describe('executing', () => {
     });
     expect(res.status).toBe(409);
     expect(res.body.code).toBe('already_run');
-    expect(mockSendText).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   test('refuses an expired plan', async () => {
@@ -176,7 +181,7 @@ describe('executing', () => {
     });
     expect(res.status).toBe(409);
     expect(res.body.code).toBe('expired');
-    expect(mockSendText).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   test('the claim is conditional on not already being consumed', async () => {
@@ -198,7 +203,7 @@ describe('executing', () => {
       .post('/api/ai/actions/dues_reminders/execute')
       .send({ plan_id: 'plan-x' });
     expect(res.status).toBe(404);
-    expect(mockSendText).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   test('a plan cannot be redirected at a different action', async () => {
@@ -207,7 +212,7 @@ describe('executing', () => {
       .post('/api/ai/actions/dues_reminders/execute')
       .send({ plan_id: 'plan-1' });
     expect(res.status).toBe(400);
-    expect(mockSendText).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
   test('a trainer cannot execute even with a valid plan id', async () => {
@@ -222,14 +227,17 @@ describe('executing', () => {
   test('execute requires a plan — there is no unconfirmed path', async () => {
     const res = await request(app()).post('/api/ai/actions/dues_reminders/execute').send({});
     expect(res.status).toBe(400);
-    expect(mockSendText).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
-  test('reports not_configured honestly instead of counting it as sent', async () => {
-    mockSendText.mockResolvedValue({ status: 'not_configured' });
+  test('reports not_connected honestly instead of counting it as sent', async () => {
+    mockSend.mockResolvedValue({ status: 'not_connected', error: 'not_connected' });
     const res = await planThenExecute({ executeClients: [CLIENT(1), CLIENT(2)] });
     expect(res.status).toBe(200);
     expect(res.body.data.sent).toBe(0);
-    expect(res.body.data.tally.not_configured).toBe(2);
+    // Reported as what it is. 'not_connected' means the studio has not paired
+    // WhatsApp — nothing broke and nothing was delivered — and folding it into
+    // either 'sent' or 'failed' would be a lie about a different thing.
+    expect(res.body.data.tally.not_connected).toBe(2);
   });
 });

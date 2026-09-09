@@ -300,9 +300,25 @@ const DOMAINS = {
   messaging: {
     plane: PLANE.TENANT,
     tenancy: TENANCY.DIRECT,
-    description: 'WhatsApp device pairing and delivery. Talks to the external gateway service.',
-    dependsOn: ['tenancy'],
-    tables: ['whatsapp_instances', 'whatsapp_webhook_events'],
+    description:
+      'WhatsApp device pairing, delivery, and who is permitted to send automatically. '
+      + 'Talks to the external gateway service.',
+    // `compensation` because whatsapp_automation_trainer_grants references
+    // `trainers`, which that domain owns. Declared rather than left implicit:
+    // a foreign key IS a dependency, and the one direction that would be wrong
+    // is engagement → messaging → engagement, which this is not — compensation
+    // reaches only tenancy, finance and scheduling.
+    dependsOn: ['tenancy', 'compensation'],
+    tables: [
+      'whatsapp_instances', 'whatsapp_webhook_events',
+      // The permission gate for automated sending. It lives here rather than
+      // with automation_rules in `engagement` because it is about DELIVERY —
+      // whether this studio's WhatsApp may be used unattended, and on whose
+      // behalf — not about which events produce which messages. engagement
+      // already depends on messaging, so the direction holds: a rule cannot
+      // fire without permission, and permission knows nothing about rules.
+      'whatsapp_automation_settings', 'whatsapp_automation_trainer_grants',
+    ],
   },
 
   integrations: {

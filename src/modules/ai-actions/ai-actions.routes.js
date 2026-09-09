@@ -144,7 +144,9 @@ router.post('/actions/:id/execute', auth, wrap(async (req, res) => {
     return res.status(409).json({ error: 'That plan has already been run', code: 'already_run' });
   }
 
-  const results = await deliver(recipients);
+  // The organization comes from the authenticated session, never the plan
+  // body — the plan is re-derived above for the same reason.
+  const results = await deliver(tenantScope(req).orgId, planId, recipients);
   const tally = results.reduce((acc, r) => {
     acc[r.status] = (acc[r.status] || 0) + 1;
     return acc;
