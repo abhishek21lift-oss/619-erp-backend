@@ -243,7 +243,33 @@ async function requirePlatformOwner(req, res, next) {
   }
 
   req.isPlatformRequest = true;
-  next();
+
+  // ── The whole handler runs platform-wide, not just the grant lookup ───────
+  //
+  // hasPlatformGrant() above wraps its own query in runAsPlatform for a
+  // reason spelled out at length there: auth.js computes platform-wideness as
+  // `role === 'super_admin' && orgId == null`, and the frontend sends
+  // `x-org-id` from localStorage on EVERY request, so an operator who once
+  // pinned a studio in the org-switcher arrives with a non-null orgId and is
+  // therefore NOT platform-wide as far as db/pool.js is concerned.
+  //
+  // That reasoning does not stop at the grant lookup. Until this line, the
+  // guard fixed its own query and then called a bare next(), leaving every
+  // query the actual handler makes on the tenant connection. Post-cutover
+  // that means the entire Command Centre — studios, billing, announcements,
+  // audit, tenancy health — runs as app_tenant against platform tables that
+  // deliberately have no app_tenant policy, and renders empty. Not an error:
+  // zero rows, which reads as "no studios yet" rather than as a broken plane.
+  //
+  // Wrapping next() puts the whole downstream chain in the platform context,
+  // so db/pool.js routes it to the owner connection regardless of what the
+  // org-switcher last pinned. This is the "explicit Platform authorization
+  // boundary" the security contract asks for: the plane is decided by the
+  // route's guard, never by a header the browser happens to be replaying.
+  //
+  // AsyncLocalStorage propagates across the awaits inside the handler, so
+  // this covers the handler's own queries and anything it calls.
+  return runAsPlatform(next);
 }
 
 // ── Which plane does a path belong to? ──────────────────────────────────────

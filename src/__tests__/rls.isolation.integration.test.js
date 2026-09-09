@@ -370,18 +370,30 @@ describeIf('cross-tenant isolation, against a real database', () => {
       }
     });
 
-    it('leaves no table with RLS on and no policy, except the three that mean it', async () => {
+    it('leaves no table with RLS on and no app_tenant policy, except the one that means it', async () => {
       // The check that found this in the first place. A new table that lands
       // with the deny-all convention but no app_tenant policy goes quiet the
       // day DATABASE_URL points at app_tenant, and nothing else would say so.
       //
-      // The exceptions are listed with their reasons because the two kinds are
-      // not the same, and an unexplained allow-list is how the next one gets
-      // waved through:
+      // ── This test used to assert the opposite of that sentence ──────────
       //
-      //   agent_audit_log, agent_tasks — unused. They carry organization_id
-      //     and WILL need a tenant policy the day something writes them. They
-      //     are here because they are empty, not because they are correct.
+      // The query carried `OR 'public' = ANY(p.roles)`, so a table whose ONLY
+      // policy was the deny-all-for-anon/authenticated convention counted as
+      // "has a policy" and passed. That is precisely the shape the paragraph
+      // above says nothing else would catch, and it was the shape being waved
+      // through: fifty-five tenant-plane tables — the whole exercise library,
+      // workout logging, payments, commissions, payouts, subscriptions,
+      // notifications, settings, refresh tokens — sat behind RLS with no
+      // app_tenant policy at all, and this suite went green on every commit.
+      //
+      // Proved before removing the clause, against this very database:
+      // as postgres, `SELECT count(*) FROM system_settings` returned 8 and
+      // muscles 24; as app_tenant with a real app.org_id set, both returned 0.
+      // Zero rows, no error. Migration 188 closes the gap; the clause is gone
+      // so that the guard can see the next one.
+      //
+      // The remaining exception is listed with its reason because an
+      // unexplained allow-list is how the next one gets waved through:
       //
       //   platform_owners (migration 161) — deliberate, and permanent. It is
       //     the platform-authorization grant: it has no organization_id and
@@ -392,7 +404,28 @@ describeIf('cross-tenant isolation, against a real database', () => {
       //     middleware/platformAuth.js wraps the lookup in runAsPlatform
       //     precisely so that stays true even when the operator has an org
       //     pinned.
-      const EXPECTED_NO_POLICY = ['agent_audit_log', 'agent_tasks', 'platform_owners'];
+      // agent_audit_log and agent_tasks used to sit here too, excused as
+      // "unused, so empty, so harmless". Migration 188 gives them the same
+      // user_id → users walk every other per-user table gets, so the excuse
+      // is spent.
+      //
+      // The rest of the allow-list is DERIVED from the domain manifest rather
+      // than typed out, so it cannot rot: a table is excused only while
+      // src/architecture/domains.js declares it platform-plane, and that
+      // declaration is itself enforced by architecture.domains.convention.
+      // Add a tenant table with no policy and this fails; move a table to the
+      // platform plane to silence it and you have to defend that in the
+      // manifest, where the plane means something, instead of in an array
+      // here where it means nothing.
+      const { DOMAINS, PLANE } = require('../architecture/domains');
+      const EXPECTED_NO_POLICY = [
+        // Migration bookkeeping. Owned by no domain, written only by
+        // db/migrate.js on the owner connection, never read by a request.
+        '_migrations',
+        ...Object.values(DOMAINS)
+          .filter((d) => d.plane === PLANE.PLATFORM)
+          .flatMap((d) => d.tables),
+      ].sort();
 
       const { rows } = await owner.query(
         `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -400,9 +433,24 @@ describeIf('cross-tenant isolation, against a real database', () => {
             AND NOT EXISTS (
               SELECT 1 FROM pg_policies p
                WHERE p.schemaname = 'public' AND p.tablename = c.relname
-                 AND ('app_tenant' = ANY(p.roles) OR 'public' = ANY(p.roles)))
+                 AND 'app_tenant' = ANY(p.roles))
           ORDER BY 1`);
-      expect(rows.map((r) => r.relname)).toEqual(EXPECTED_NO_POLICY);
+
+      // Asserted as a direction, not an equality.
+      //
+      // The property that matters is "nothing the tenant plane needs has been
+      // left silently unreachable", so what must be empty is the set of
+      // unreachable tables that are NOT declared platform. The reverse — a
+      // platform-plane table that DOES carry an app_tenant policy — is a
+      // different question with legitimate answers: platform_payment_settings
+      // holds the UPI id every studio is told to pay into, so the tenant reads
+      // it (and, since migration 189, only reads it). Equality here would force
+      // that legitimate case to be silenced by deleting the read policy, which
+      // would break subscription checkout.
+      const unexplained = rows
+        .map((r) => r.relname)
+        .filter((t) => !EXPECTED_NO_POLICY.includes(t));
+      expect(unexplained).toEqual([]);
     });
 
     it('keeps app_tenant out of platform_owners entirely', async () => {
