@@ -36,11 +36,24 @@
 //
 // ── Scope ───────────────────────────────────────────────────────────────────
 //
-// Programmes, phases and weeks only, so far. Templates, prescriptions,
-// assignments and the session read paths are still in the adapter and are the
-// next entries to move; the layering budget in
-// architecture.layering.convention.test.js is what tracks that, and it only
-// ever ratchets down.
+// Everything training.routes.js used to reach the database for: programmes,
+// phases and weeks; templates and their prescriptions; assignments; the
+// session list and patch; performances, sets and cardio; personal records.
+// The adapter now holds no SQL at all, which is why its entry has gone from
+// the layering budget in architecture.layering.convention.test.js — that
+// register only ever ratchets down, and a file that reaches zero is deleted
+// from it rather than left at zero.
+//
+// What deliberately did NOT move: authorisation (authz.js walks back to the
+// client before any of these run), prescription validation (a coaching rule,
+// prescription.js), the screening gate, and query-string parsing. Those are
+// decisions about the REQUEST. This file is told which row to touch, never
+// whether the caller may.
+//
+// The multi-table, all-or-nothing session lifecycle stays in
+// training.service.js — see the note above about why the two files are
+// separate. The one transaction here (reorder) is a single statement that
+// must not half-apply, not a lifecycle.
 
 const pool = require('../../db/pool');
 const authz = require('./authz');
@@ -50,9 +63,9 @@ const { orgIdOf } = require('../../lib/tenant-db');
  * Build a SET clause from the fields a caller is allowed to patch.
  *
  * Lives here rather than in the adapter because it writes SQL, which is the
- * whole point of the layer. The adapter still imports it for the clusters
- * that have not moved yet — templates, assignments, sessions — and that
- * import disappears with the last of them.
+ * whole point of the layer. It is not exported any more: every caller is now
+ * a function in this file, and re-exporting it would invite the adapter to
+ * start composing SQL again.
  *
  * `startAt` is the first bind index, so a caller that has already bound $1
  * (usually the row id) passes 2.
@@ -174,8 +187,346 @@ async function upsertWeek(programId, b) {
   return rows[0];
 }
 
+// ── Templates and prescriptions ─────────────────────────────────────────────
+
+/** The columns a prescription may be created or patched with. */
+const PRESCRIPTION_COLS = [
+  'exercise_id', 'section', 'order_index', 'superset_group', 'circuit_group', 'prescription_type',
+  'target_sets', 'target_reps_min', 'target_reps_max', 'target_weight', 'weight_unit',
+  'target_rpe', 'target_rir', 'target_tempo', 'target_rest_seconds', 'percentage_1rm',
+  'percentage_metric', 'target_duration_seconds', 'target_distance', 'distance_unit',
+  'target_speed', 'target_incline', 'target_resistance', 'target_cadence', 'target_floors',
+  'target_steps', 'target_heart_rate', 'target_calories',
+  'target_pace_seconds', 'work_interval_seconds', 'rest_interval_seconds', 'target_rounds',
+  'warmup', 'optional', 'notes',
+];
+
+/** A studio's template library, optionally narrowed to one programme or week. */
+async function listTemplates(req, { programId, weekId } = {}) {
+  const params = [];
+  const org = authz.orgWhere(req, params);
+  const filters = [];
+  if (programId) { params.push(programId); filters.push(`program_id = $${params.length}`); }
+  if (weekId)    { params.push(weekId);    filters.push(`week_id = $${params.length}`); }
+
+  const { rows } = await pool.query(
+    `SELECT * FROM workout_templates
+      WHERE deleted_at IS NULL${org} ${filters.length ? `AND ${filters.join(' AND ')}` : ''}
+      ORDER BY day_number NULLS LAST, name LIMIT 200`,
+    params
+  );
+  return rows;
+}
+
+/**
+ * One template's prescriptions in display order, each carrying its exercise
+ * name.
+ *
+ * The LEFT JOIN is deliberate: an exercise deleted from the library must not
+ * make the day it appears in disappear.
+ */
+async function loadTemplateExercises(templateId) {
+  const { rows } = await pool.query(
+    `SELECT wte.*, e.name AS exercise_name
+       FROM workout_template_exercises wte
+       LEFT JOIN exercises e ON e.id = wte.exercise_id
+      WHERE wte.workout_template_id = $1
+      ORDER BY wte.section, wte.order_index`,
+    [templateId]
+  );
+  return rows;
+}
+
+async function createTemplate(req, b) {
+  const { rows } = await pool.query(
+    `INSERT INTO workout_templates
+       (organization_id, program_id, week_id, created_by, name, description,
+        day_number, day_label, goal, estimated_duration_minutes, notes)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+    [orgIdOf(req), b.program_id ?? null, b.week_id ?? null, req.user.id, b.name,
+      b.description ?? null, b.day_number ?? null, b.day_label ?? null, b.goal ?? null,
+      b.estimated_duration_minutes ?? null, b.notes ?? null]
+  );
+  return rows[0];
+}
+
+/**
+ * Add a prescription to a template.
+ *
+ * The column list is built from the fields actually present so a column left
+ * out keeps its database default, rather than being written as an explicit
+ * NULL over one. Names come from PRESCRIPTION_COLS and never from the request,
+ * so the interpolation cannot carry caller input into the statement.
+ */
+async function createPrescription(templateId, row) {
+  const cols = PRESCRIPTION_COLS.filter((c) => row[c] !== undefined);
+  const { rows } = await pool.query(
+    `INSERT INTO workout_template_exercises (workout_template_id, ${cols.join(', ')})
+     VALUES ($1, ${cols.map((_, i) => `$${i + 2}`).join(', ')}) RETURNING *`,
+    [templateId, ...cols.map((c) => row[c])]
+  );
+  return rows[0];
+}
+
+/**
+ * One prescription, scoped to its template.
+ *
+ * The template id is part of the WHERE rather than a separate check: the
+ * caller has already established that IT owns the template, and matching both
+ * ids in one statement is what makes reaching a prescription through the wrong
+ * template impossible rather than merely unlikely.
+ */
+async function loadPrescription(templateId, id) {
+  const { rows } = await pool.query(
+    'SELECT * FROM workout_template_exercises WHERE id = $1 AND workout_template_id = $2',
+    [id, templateId]
+  );
+  return rows[0] ?? null;
+}
+
+/** Patch a prescription. Null when the body named no patchable field. */
+async function updatePrescription(id, body) {
+  const { sets, values } = patchFrom(body, PRESCRIPTION_COLS, 2);
+  if (!sets.length) return null;
+  const { rows } = await pool.query(
+    `UPDATE workout_template_exercises SET ${sets.join(', ')}, updated_at = NOW()
+      WHERE id = $1 RETURNING *`,
+    [id, ...values]
+  );
+  return rows[0];
+}
+
+/** Delete a prescription, scoped to its template. True when a row went. */
+async function deletePrescription(templateId, id) {
+  const { rowCount } = await pool.query(
+    'DELETE FROM workout_template_exercises WHERE id = $1 AND workout_template_id = $2',
+    [id, templateId]
+  );
+  return rowCount > 0;
+}
+
+/**
+ * Reorder a template's prescriptions to the given sequence.
+ *
+ * One statement with an ordinality-derived index rather than a loop: a partial
+ * reorder that failed halfway would leave the day scrambled.
+ */
+async function reorderPrescriptions(templateId, exerciseIds) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE workout_template_exercises wte
+          SET order_index = v.idx - 1, updated_at = NOW()
+         FROM unnest($2::uuid[]) WITH ORDINALITY AS v(id, idx)
+        WHERE wte.id = v.id AND wte.workout_template_id = $1`,
+      [templateId, exerciseIds]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally { client.release(); }
+  return exerciseIds.length;
+}
+
+// ── Assignments ─────────────────────────────────────────────────────────────
+
+const ASSIGNMENT_PATCH_COLS = ['status', 'scheduled_date', 'notes'];
+
+/**
+ * Assignments visible to this caller, with the template and client names the
+ * board renders.
+ *
+ * The JOIN to pt_clients is not decoration: assignments are client-bound, so
+ * this is where authz's trainer rule gets a client row to apply itself to.
+ */
+async function listAssignments(req, { clientId, date, status } = {}) {
+  const params = [];
+  const org = authz.orgWhere(req, params, 'a.organization_id');
+  const trainer = authz.trainerWhere(req, params);
+  const filters = [];
+  if (clientId) { params.push(clientId); filters.push(`a.client_id = $${params.length}`); }
+  if (date)     { params.push(date);     filters.push(`a.scheduled_date = $${params.length}`); }
+  if (status)   { params.push(status);   filters.push(`a.status = $${params.length}`); }
+
+  const { rows } = await pool.query(
+    `SELECT a.*, t.name AS template_name, c.name AS client_name
+       FROM training_assignments a
+       JOIN pt_clients c ON c.id = a.client_id
+       LEFT JOIN workout_templates t ON t.id = a.workout_template_id
+      WHERE c.deleted_at IS NULL${org}${trainer}
+        ${filters.length ? `AND ${filters.join(' AND ')}` : ''}
+      ORDER BY a.scheduled_date DESC NULLS LAST, a.created_at DESC LIMIT 200`,
+    params
+  );
+  return rows;
+}
+
+/**
+ * Assign a template to a client.
+ *
+ * Two things are derived in SQL rather than in the caller, both because the
+ * database is the only place that can answer them consistently: an omitted
+ * trainer falls back to the client's own trainer, and the status follows from
+ * whether a date was given — an assignment with no date is ASSIGNED, one with
+ * a date is SCHEDULED.
+ */
+async function createAssignment(req, b) {
+  const { rows } = await pool.query(
+    `INSERT INTO training_assignments
+       (organization_id, program_id, workout_template_id, client_id, trainer_id, assigned_by,
+        scheduled_date, sequence_number, notes, status)
+     VALUES ($1,$2,$3,$4,COALESCE($5,(SELECT trainer_id FROM pt_clients WHERE id=$4)),$6,$7,$8,$9,
+             CASE WHEN $7::date IS NULL THEN 'ASSIGNED' ELSE 'SCHEDULED' END)
+     RETURNING *`,
+    [orgIdOf(req), b.program_id ?? null, b.workout_template_id, b.client_id,
+      b.trainer_id ?? null, req.user.id, b.scheduled_date ?? null,
+      b.sequence_number ?? null, b.notes ?? null]
+  );
+  return rows[0];
+}
+
+/** Patch an assignment. Null when the body named no patchable field. */
+async function updateAssignment(id, body) {
+  const { sets, values } = patchFrom(body, ASSIGNMENT_PATCH_COLS, 2);
+  if (!sets.length) return null;
+  const { rows } = await pool.query(
+    `UPDATE training_assignments SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $1 RETURNING *`,
+    [id, ...values]
+  );
+  return rows[0];
+}
+
+// ── Sessions ────────────────────────────────────────────────────────────────
+
+const SESSION_PATCH_COLS = ['client_notes', 'trainer_notes', 'overall_rpe', 'session_date'];
+
+/**
+ * Logged sessions visible to this caller, newest first.
+ *
+ * `limit` is already clamped by the adapter, which is where a query string is
+ * parsed. It is bound, never interpolated — boundedReads.convention.test.js
+ * pins that this query really carries the LIMIT rather than merely computing
+ * one.
+ */
+async function listSessions(req, { clientId, status, limit } = {}) {
+  const params = [];
+  const org = authz.orgWhere(req, params, 's.organization_id');
+  const trainer = authz.trainerWhere(req, params);
+  const filters = [];
+  if (clientId) { params.push(clientId); filters.push(`s.client_id = $${params.length}`); }
+  if (status)   { params.push(status);   filters.push(`s.status = $${params.length}`); }
+  params.push(limit);
+
+  const { rows } = await pool.query(
+    `SELECT s.* FROM training_sessions s
+       JOIN pt_clients c ON c.id = s.client_id
+      WHERE s.deleted_at IS NULL AND c.deleted_at IS NULL${org}${trainer}
+        ${filters.length ? `AND ${filters.join(' AND ')}` : ''}
+      ORDER BY s.session_date DESC, s.created_at DESC LIMIT $${params.length}`,
+    params
+  );
+  return rows;
+}
+
+/** Patch a session's notes. Null when the body named no patchable field. */
+async function updateSession(id, body) {
+  const { sets, values } = patchFrom(body, SESSION_PATCH_COLS, 2);
+  if (!sets.length) return null;
+  const { rows } = await pool.query(
+    `UPDATE training_sessions SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $1 RETURNING *`,
+    [id, ...values]
+  );
+  return rows[0];
+}
+
+// ── Performances, sets and cardio ───────────────────────────────────────────
+
+const SET_PATCH_COLS = [
+  'set_number', 'set_type', 'planned_reps', 'actual_reps', 'planned_weight', 'actual_weight',
+  'weight_unit', 'planned_rpe', 'actual_rpe', 'planned_rir', 'actual_rir',
+  'tempo', 'rest_seconds', 'duration_seconds', 'completed', 'failure', 'notes',
+];
+
+const CARDIO_PATCH_COLS = [
+  'cardio_type', 'duration_seconds', 'distance', 'distance_unit', 'average_speed', 'max_speed',
+  'speed_unit', 'incline', 'resistance', 'average_heart_rate', 'max_heart_rate',
+  'calories_burned', 'pace_seconds', 'pace_distance', 'cadence', 'floors_completed',
+  'steps_completed', 'elevation_gain',
+  'work_interval_seconds', 'rest_interval_seconds', 'rounds_completed', 'rpe', 'completed', 'notes',
+];
+
+/**
+ * Add an exercise to a logged session.
+ *
+ * The name is snapshotted from the library at log time and falls back to
+ * 'Exercise' — a session logged years ago must still read correctly after the
+ * exercise it used has been renamed or removed. The order index defaults to
+ * one past the current maximum, computed in the same statement so two devices
+ * logging at once cannot both claim the same slot.
+ */
+async function createPerformance(sessionId, b) {
+  const { rows } = await pool.query(
+    `INSERT INTO exercise_performances
+       (session_id, exercise_id, template_exercise_id, exercise_name, section, order_index, notes)
+     VALUES ($1,$2,$3,COALESCE((SELECT name FROM exercises WHERE id = $2), 'Exercise'),$4,
+             COALESCE($5, (SELECT COALESCE(MAX(order_index),-1)+1 FROM exercise_performances WHERE session_id=$1)),$6)
+     RETURNING *`,
+    [sessionId, b.exercise_id, b.template_exercise_id ?? null, b.section ?? null,
+      b.order_index ?? null, b.notes ?? null]
+  );
+  return rows[0];
+}
+
+/** Patch a set. Null when the body named no patchable field. */
+async function updateSet(id, body) {
+  const { sets, values } = patchFrom(body, SET_PATCH_COLS, 2);
+  if (!sets.length) return null;
+  const { rows } = await pool.query(
+    `UPDATE set_performances SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $1 RETURNING *`,
+    [id, ...values]
+  );
+  return rows[0];
+}
+
+async function deleteSet(id) {
+  await pool.query('DELETE FROM set_performances WHERE id = $1', [id]);
+}
+
+/** Patch a cardio effort. Null when the body named no patchable field. */
+async function updateCardio(id, body) {
+  const { sets, values } = patchFrom(body, CARDIO_PATCH_COLS, 2);
+  if (!sets.length) return null;
+  const { rows } = await pool.query(
+    `UPDATE cardio_performances SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $1 RETURNING *`,
+    [id, ...values]
+  );
+  return rows[0];
+}
+
+// ── Records ─────────────────────────────────────────────────────────────────
+
+/**
+ * A client's personal records.
+ *
+ * Live records by default; `history` includes superseded ones, which is the
+ * query the old boolean flags could not answer at all. The caller has already
+ * established that it may see this client — personal_records carries no
+ * organization_id of its own.
+ */
+async function listRecords(clientId, { history = false } = {}) {
+  const { rows } = await pool.query(
+    `SELECT * FROM personal_records
+      WHERE client_id = $1 ${history ? '' : 'AND superseded_at IS NULL'}
+      ORDER BY achieved_on DESC, created_at DESC LIMIT 200`,
+    [clientId]
+  );
+  return rows;
+}
+
 module.exports = {
-  patchFrom,
+  // Programmes
   listPrograms,
   loadProgramParts,
   createProgram,
@@ -183,4 +534,27 @@ module.exports = {
   softDeleteProgram,
   createPhase,
   upsertWeek,
+  // Templates and prescriptions
+  listTemplates,
+  loadTemplateExercises,
+  createTemplate,
+  createPrescription,
+  loadPrescription,
+  updatePrescription,
+  deletePrescription,
+  reorderPrescriptions,
+  // Assignments
+  listAssignments,
+  createAssignment,
+  updateAssignment,
+  // Sessions
+  listSessions,
+  updateSession,
+  // Performances, sets and cardio
+  createPerformance,
+  updateSet,
+  deleteSet,
+  updateCardio,
+  // Records
+  listRecords,
 };

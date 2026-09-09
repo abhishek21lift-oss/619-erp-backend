@@ -8,9 +8,10 @@
 //   route (adapter) → application service → domain service → repository → DB
 //
 // The adapter parses, validates, guards and serialises. It does not reach the
-// database. Today 50 of 57 adapter files do exactly that, 782 SQL literals in
-// total, and `routes/ai.js` alone issues 42 — so a test that simply forbids it
-// would fail on the first run and be skipped by the second week.
+// database. When this test was written 50 of 57 adapter files did exactly
+// that, 782 SQL literals in total, and `routes/ai.js` alone issues 42 — so a
+// test that simply forbids it would fail on the first run and be skipped by
+// the second week.
 //
 // ── Why a ratchet instead ───────────────────────────────────────────────────
 //
@@ -18,7 +19,10 @@
 // its budget; it may never hold more, and a file absent from the table may
 // hold none at all. That makes the migration measurable and safe in both
 // directions at once: phase 4 extracts one domain at a time and lowers its
-// entry, while nothing can quietly add a 783rd literal in the meantime.
+// entry, while nothing can quietly add a literal past the ceiling in the
+// meantime. modules/training/training.routes.js is the first file to finish
+// the trip: its entry is gone rather than zeroed, so the absolute rule now
+// applies to it.
 //
 // The numbers are a debt register, not a target. Every one of them is meant to
 // reach zero and be deleted from this file; when BUDGETS is empty the rule
@@ -109,11 +113,6 @@ const BUDGETS = {
   'modules/progress/progress.routes.js': 33,
   'routes/profile.js': 29,
   'modules/pt-os/parq.routes.js': 28,
-  // 27 → 18: the programmes cluster (list, read, create, patch, soft-delete,
-  // phases, weeks) moved into modules/training/training.repository.js. The
-  // remaining 18 are templates/prescriptions, assignments and the session read
-  // paths, which are the next entries to go.
-  'modules/training/training.routes.js': 18,
   'routes/auth-webauthn.js': 26,
   'routes/auth.js': 24,
   'routes/upi-payments.js': 21,
@@ -224,8 +223,10 @@ describe('the migration has a number attached to it', () => {
     expect(total).toBeLessThanOrEqual(ceiling);
     // Recorded so a reader of a failing run knows what "good" looked like.
     // 782 at the start of phase 5; 773 after the training programmes cluster
-    // moved to a repository. Lower it with each extraction — the number only
-    // means something if it tracks reality.
-    expect(ceiling).toBe(773);
+    // moved to a repository; 755 once the rest of that adapter followed and
+    // its entry was deleted outright — the first file in the register to
+    // reach zero. Lower it with each extraction — the number only means
+    // something if it tracks reality.
+    expect(ceiling).toBe(755);
   });
 });
