@@ -77,6 +77,8 @@ const ptClientCreateSchema = {
   }),
 };
 
+const automation = require('../automation/automation.triggers');
+
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // Tenant-scope predicate for by-id / aggregate pt_clients queries. Appends the
@@ -384,6 +386,10 @@ router.post('/clients', auth, requireRole('admin','manager','trainer'), validate
         orgIdOf(req),
       ]);
       cid = newCli.id;
+      // Fires only on a genuinely new client. The branch above this reuses an
+      // existing one, and a welcome message to somebody who enrolled last year
+      // is worse than none.
+      await automation.memberCreated(req, { clientId: cid });
     }
 
     const finalAmt = (base_amount || 0) - (discount || 0);
@@ -582,6 +588,18 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
        String(d.payment_method || 'CASH').toUpperCase(), `Renewal — ${packageType || c.package_type || 'PT package'}`,
        orgIdOf(req)]
     );
+
+    // The payment row carries no id we can read back here, so the event key is
+    // composed from what identifies this payment in practice: the client, the
+    // amount and the day. Two genuinely different payments of the same amount
+    // to the same client on one day would collapse into one event — rare, and
+    // the safe direction to be wrong in, since the alternative is a retried
+    // request messaging the client twice.
+    await automation.paymentReceived(req, {
+      clientId: req.params.id,
+      amount: paidNow,
+      eventKey: `renewal:${req.params.id}:${paidNow}:${new Date().toISOString().slice(0, 10)}`,
+    });
   }
 
   res.json({ data: rows[0] });
@@ -792,6 +810,13 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
        String(req.body.payment_method || 'CASH').toUpperCase(), 'Collected via client profile / enrolment',
        orgIdOf(req)]
     );
+
+    // Same composition as the renewal path above, and the same trade-off.
+    await automation.paymentReceived(req, {
+      clientId: req.params.id,
+      amount: delta,
+      eventKey: `profile:${req.params.id}:${delta}:${new Date().toISOString().slice(0, 10)}`,
+    });
   }
 
   // The resulting state only, not a before/after diff — this endpoint is a

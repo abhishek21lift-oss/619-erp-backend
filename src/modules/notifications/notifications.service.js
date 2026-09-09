@@ -3,6 +3,14 @@
 //
 // In production, channel adapters push to a queue (BullMQ). For demo we call
 // them inline. Each adapter is pluggable.
+//
+// ── One rule that is not optional ──────────────────────────────────────────
+//
+// The whatsapp adapter requires an organization on the recipient and refuses
+// to send without one. Every other channel here addresses an inbox or a device
+// that belongs to a person; WhatsApp addresses a number that belongs to a
+// STUDIO, and sending from the wrong one is not a degraded delivery — it is a
+// message the recipient reads as coming from somebody else.
 
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
@@ -62,12 +70,48 @@ const channels = {
     return { status: 'not_configured', provider_id: null };
   },
 
-  whatsapp: async ({ to, template, variables }) => {
+  /**
+   * WhatsApp, on the studio's own connected number.
+   *
+   * ── What this used to be ──────────────────────────────────────────────────
+   *
+   * `sendText({ to, template, variables })` straight to Twilio: one
+   * platform-wide number, configured from process.env, and — the part that
+   * matters — no organization anywhere in the call. A studio's client received
+   * a reminder from a number they had never seen, and there was nothing in the
+   * path that could have made it come from the studio's own WhatsApp, because
+   * tenancy was not an input.
+   *
+   * The organization now comes off the recipient and is required. A recipient
+   * without one fails closed rather than falling back: the fallback is not a
+   * degraded version of this, it is a message from a stranger.
+   *
+   * `notification_id` is the client_message_id, so a retried notification job
+   * is recognised by the gateway's send-once rather than delivering twice.
+   */
+  whatsapp: async ({ to, organization_id: orgId, body, template, variables, notification_id: notificationId }) => {
     if (!to) return { status: 'failed', error: 'no recipient' };
-    // One copy of the Twilio transport, shared with the whatsapp worker — see
-    // whatsappDelivery.js. The notification log records exactly what it returns.
-    const { sendText } = require('../../services/whatsappDelivery');
-    return sendText({ to, template, variables });
+    if (!orgId) {
+      // Loud, because this is the shape of the bug this channel had: an
+      // org-less send that used to succeed against a shared number.
+      logger.error({ template }, 'whatsapp notification has no organization — refusing to send');
+      return { status: 'failed', error: 'no_organization' };
+    }
+
+    const transport = require('../messaging/transport');
+    const text = body || (Array.isArray(variables) ? variables.join(' — ') : template || '');
+    const res = await transport.send({
+      orgId,
+      to,
+      text,
+      clientMessageId: notificationId || `notif:${orgId}:${to}:${template}`,
+      allowSharedProvider: false,
+    });
+    return {
+      status: res.status === transport.SendStatus.SENT ? 'sent' : res.status,
+      provider_id: res.provider_id || null,
+      error: res.error || null,
+    };
   },
 
   sms: async ({ to, body }) => {
@@ -188,7 +232,15 @@ async function deliverChannel(ch, type, recipient, data) {
   switch (ch) {
     case 'inapp':    adapterArgs = { user_id: recipient.user_id, title: tpl.title, body: tpl.body, link: data.link }; break;
     case 'email':    adapterArgs = { to: recipient.email, ...tpl.email }; break;
-    case 'whatsapp': adapterArgs = { to: recipient.phone, ...tpl.whatsapp }; break;
+    // The organization travels with the recipient. It is the only thing that
+    // can resolve the studio's own WhatsApp, and it is required — see the
+    // whatsapp adapter above.
+    case 'whatsapp': adapterArgs = {
+      to: recipient.phone,
+      organization_id: recipient.organization_id,
+      body: tpl.body,
+      ...tpl.whatsapp,
+    }; break;
     case 'sms':      adapterArgs = { to: recipient.phone, body: tpl.body }; break;
     case 'push':     adapterArgs = { device_token: recipient.device_token, title: tpl.title, body: tpl.body }; break;
     default: throw new Error(`Unknown channel: ${ch}`);

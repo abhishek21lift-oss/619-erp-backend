@@ -29,7 +29,7 @@
 
 const pool = require('../../db/pool');
 const { tenantScope } = require('../../lib/tenant-db');
-const { sendText, twilioWhatsappConfigured } = require('../../services/whatsappDelivery');
+const transport = require('../messaging/transport');
 
 /** Clamp an incoming number into a range, falling back for junk input. */
 function clampInt(value, { min, max, fallback }) {
@@ -92,8 +92,14 @@ const ACTIONS = [
 
       const { reachable, unreachable } = toRecipients(rows);
       const warnings = [];
-      if (!twilioWhatsappConfigured()) {
-        warnings.push('WhatsApp is not configured on this server — nothing will be delivered.');
+      // Asks whether THIS STUDIO has connected its own WhatsApp, not whether
+      // the server holds a platform credential. Those are different questions
+      // and the old one had the wrong answer for every studio: it reported
+      // "configured" whenever the platform's Twilio keys were present, which
+      // told a studio their messages would be delivered — from a number their
+      // clients have never seen.
+      if (!(await transport.resolveInstance(tenantScope(req).orgId)).ok) {
+        warnings.push('This studio has not connected WhatsApp — nothing will be delivered. Connect it in Settings → Integrations.');
       }
       if (unreachable.length) {
         warnings.push(`${unreachable.length} matching client${unreachable.length === 1 ? ' has' : 's have'} no mobile number and will be skipped.`);
@@ -141,8 +147,14 @@ const ACTIONS = [
 
       const { reachable, unreachable } = toRecipients(rows);
       const warnings = [];
-      if (!twilioWhatsappConfigured()) {
-        warnings.push('WhatsApp is not configured on this server — nothing will be delivered.');
+      // Asks whether THIS STUDIO has connected its own WhatsApp, not whether
+      // the server holds a platform credential. Those are different questions
+      // and the old one had the wrong answer for every studio: it reported
+      // "configured" whenever the platform's Twilio keys were present, which
+      // told a studio their messages would be delivered — from a number their
+      // clients have never seen.
+      if (!(await transport.resolveInstance(tenantScope(req).orgId)).ok) {
+        warnings.push('This studio has not connected WhatsApp — nothing will be delivered. Connect it in Settings → Integrations.');
       }
       if (unreachable.length) {
         warnings.push(`${unreachable.length} matching client${unreachable.length === 1 ? ' has' : 's have'} no mobile number and will be skipped.`);
@@ -171,13 +183,33 @@ const ACTIONS = [
  * mapped onto 'sent' or onto 'failed'. It is neither: nothing broke, and
  * nothing was delivered.
  */
-async function deliver(recipients) {
+async function deliver(orgId, planId, recipients) {
   const results = [];
   for (const r of recipients) {
-    // Sequential on purpose. This is an SMS gateway with per-account rate
-    // limits, and a studio-sized list finishes in seconds either way.
-    const out = await sendText({ to: r.mobile, body: r.body });
-    results.push({ id: r.id, name: r.name, status: out?.status ?? 'failed', error: out?.error ?? null });
+    // Sequential on purpose. WhatsApp applies per-account rate limits, and a
+    // studio-sized list finishes in seconds either way.
+    //
+    // The client_message_id is derived from the plan and the recipient rather
+    // than generated, so a confirmed plan that is somehow delivered twice — a
+    // retried request that got past the consumed_at claim — cannot message one
+    // client twice: the gateway recognises the id and returns the original
+    // send. `deliver` had no such protection when it posted to Twilio.
+    const out = await transport.send({
+      orgId,
+      to: r.mobile,
+      text: r.body,
+      clientMessageId: `ai-action:${planId}:${r.id}`,
+      // The studio's own number or nothing. An AI action is the studio
+      // messaging its own clients in bulk; a platform number would be worse
+      // here than anywhere, because it arrives to many people at once.
+      allowSharedProvider: false,
+    });
+    results.push({
+      id: r.id,
+      name: r.name,
+      status: out?.status ?? 'failed',
+      error: out?.error ?? null,
+    });
   }
   return results;
 }

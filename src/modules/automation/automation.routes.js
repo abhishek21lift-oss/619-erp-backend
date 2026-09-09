@@ -25,6 +25,7 @@ const { auth } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
 const { orgWhere, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
+const repo = require('./automation.repository');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -88,6 +89,107 @@ router.delete('/rules/:id', auth, requireRole('admin'), wrap(async (req, res) =>
   );
   if (rowCount === 0) return notFound(res, 'Rule');
   return res.status(204).end();
+}));
+
+// ── WhatsApp automation permission ──────────────────────────────────────────
+//
+// Two levels, because the question has two halves: does this STUDIO allow
+// automated sending, and may a message go out on behalf of THIS TRAINER. Both
+// must say yes before the engine queues anything, and both are re-checked in
+// the worker — a rule's delay can be hours, and a switch that only stops
+// messages nobody had queued yet is not a switch.
+//
+// ── Why these do not live in routes/settings.js with the other permissions ──
+//
+// Because that surface cannot hold them safely. `system_settings` has no
+// organization_id — verified in production, 35 rows shared by 6 studios — and
+// routes/settings.js writes it with ON CONFLICT (key), so one studio changing
+// a perm_* value changes it for the whole platform. That is tolerable for a
+// flag that hides a menu item. It is not tolerable for the flag that decides
+// whether a studio's clients get messaged, so migration 190 gives these their
+// own tenanted tables and they are served from here.
+//
+// No SQL in this file: it goes through automation.repository.js, which is
+// where the layering rule (architecture.layering.convention.test.js) puts it.
+
+/** The studio this request acts for, or null after answering. */
+function requireOrg(req, res) {
+  const orgId = orgIdOf(req);
+  if (!orgId) {
+    // A platform super_admin operating platform-wide has no studio, and
+    // "enable automated messaging" has no platform-wide meaning — it would
+    // mean every studio at once. Same refusal as routes/whatsapp.js.
+    res.status(400).json({
+      error: { code: 'ORG_REQUIRED', message: 'Select a studio before changing its automation settings.' },
+    });
+    return null;
+  }
+  return orgId;
+}
+
+router.get('/whatsapp-settings', auth, requireRole('admin', 'manager'), wrap(async (req, res) => {
+  const orgId = requireOrg(req, res);
+  if (!orgId) return undefined;
+  const [settings, trainers] = await Promise.all([
+    repo.settingsFor(orgId),
+    repo.trainersWithGrants(orgId),
+  ]);
+  return res.json({ data: { ...settings, trainers } });
+}));
+
+// admin only, not admin+manager. Switching automated messaging on is the
+// decision that lets this system message a studio's clients unattended, and it
+// belongs to whoever owns the studio's relationship with them.
+router.put('/whatsapp-settings', auth, requireRole('admin'), wrap(async (req, res) => {
+  const orgId = requireOrg(req, res);
+  if (!orgId) return undefined;
+
+  const { automation_enabled, daily_send_limit } = req.body || {};
+  if (automation_enabled !== undefined && typeof automation_enabled !== 'boolean') {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'automation_enabled must be a boolean' } });
+  }
+  let limit;
+  if (daily_send_limit !== undefined) {
+    limit = parseInt(daily_send_limit, 10);
+    // The column's CHECK would reject these anyway; answering 400 here means
+    // the studio sees "must be between 1 and 5000" rather than a 500.
+    if (!Number.isInteger(limit) || limit < 1 || limit > 5000) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'daily_send_limit must be between 1 and 5000' } });
+    }
+  }
+
+  const saved = await repo.upsertSettings(orgId, {
+    automationEnabled: automation_enabled === undefined ? null : automation_enabled,
+    dailySendLimit: limit === undefined ? null : limit,
+    updatedBy: req.user.id,
+  });
+  return res.json({ data: saved });
+}));
+
+router.put('/whatsapp-settings/trainers/:trainerId', auth, requireRole('admin'), wrap(async (req, res) => {
+  const orgId = requireOrg(req, res);
+  if (!orgId) return undefined;
+  const granted = await repo.grantTrainer(orgId, req.params.trainerId, req.user.id);
+  if (!granted) {
+    // Either not this studio's trainer, or already granted. Both are answered
+    // by reporting the state rather than by distinguishing them: a 404 that
+    // fires only for a foreign trainer id would confirm which ids exist
+    // elsewhere, and an "already granted" error is not a failure of anything.
+    const already = await repo.trainerIsGranted(orgId, req.params.trainerId);
+    if (!already) return notFound(res, 'Trainer');
+  }
+  return res.json({ data: { trainer_id: req.params.trainerId, whatsapp_automation_granted: true } });
+}));
+
+router.delete('/whatsapp-settings/trainers/:trainerId', auth, requireRole('admin'), wrap(async (req, res) => {
+  const orgId = requireOrg(req, res);
+  if (!orgId) return undefined;
+  // Revoking is idempotent and always succeeds: the state the caller asked for
+  // is the state that holds afterwards, whether or not a row was deleted. An
+  // error here would be a reason not to retry a revocation, which is the one
+  // operation that must always be easy.
+  await repo.revokeTrainer(orgId, req.params.trainerId);
+  return res.json({ data: { trainer_id: req.params.trainerId, whatsapp_automation_granted: false } });
 }));
 
 // ── Communication logs ──────────────────────────────────────────────────────
