@@ -44,6 +44,7 @@ function db({ settings, rules = [], client, sendsToday = 0, insertReturns = 'log
     }
     if (/FROM automation_rules/.test(sql)) return { rows: rules, rowCount: rules.length };
     if (/FROM pt_clients/.test(sql)) return { rows: client ? [client] : [], rowCount: client ? 1 : 0 };
+    if (/FROM pt_leads/.test(sql)) return { rows: db.lead ? [db.lead] : [], rowCount: db.lead ? 1 : 0 };
     if (/whatsapp_automation_trainer_grants/.test(sql)) {
       return { rows: db.grant ? [{ n: 1 }] : [], rowCount: db.grant ? 1 : 0 };
     }
@@ -61,7 +62,7 @@ const RULE = { id: 'rule-1', name: 'Thanks', template: 'Hi {{name}}, we got {{am
 const CLIENT = { id: 'client-1', name: 'Asha', phone: '+919876543210', trainer_id: 'trainer-a' };
 
 const emit = (over = {}) => engine.emit({
-  orgId: ORG_A, event: 'payment_received', clientId: 'client-1', eventKey: 'pay-1',
+  orgId: ORG_A, event: 'payment_received', subjectId: 'client-1', eventKey: 'pay-1',
   context: { amount: '₹2,500' }, ...over,
 });
 
@@ -74,6 +75,7 @@ beforeEach(() => {
   mockEnqueue.mockReset();
   mockEnqueue.mockResolvedValue({ id: 'job-1' });
   db.grant = true;
+  db.lead = null;
 });
 
 describe('the studio switch', () => {
@@ -371,5 +373,73 @@ describe('failure containment', () => {
     // must never roll one back.
     mockQuery.mockRejectedValue(new Error('connection terminated'));
     await expect(emit()).resolves.toMatchObject({ outcome: Outcome.NOT_ENQUEUED });
+  });
+});
+
+// ── Who the event is about ──────────────────────────────────────────────────
+//
+// Four of the twelve trigger events concern a lead rather than a client:
+// `lead_created` and `followup_due` name a pt_leads row, which is a separate
+// table from pt_clients until conversion. Resolving one through the client
+// lookup finds nothing, and the engine's answer to "no recipient" is silence —
+// so a wrong recipient type here is not an error anybody sees, it is a feature
+// that simply never fires.
+describe('the recipient type', () => {
+  const LEAD = { id: 'lead-1', name: 'Priya', phone: '+919812345678', trainer_id: 'trainer-a' };
+
+  test('a lead event resolves against pt_leads, not pt_clients', async () => {
+    db({ settings: ENABLED, rules: [RULE], client: null });
+    db.lead = LEAD;
+
+    const res = await engine.emit({
+      orgId: ORG_A, event: 'lead_created', recipientType: 'lead',
+      subjectId: 'lead-1', eventKey: 'lead-1',
+    });
+
+    expect(res.outcome).toBe(Outcome.QUEUED);
+    // `client: null` above is the point: had this fallen through to the client
+    // lookup it would have found nothing and queued nothing.
+    const [, params] = mockQuery.mock.calls.find(([sql]) => /FROM pt_leads/.test(sql));
+    expect(params).toEqual(['lead-1', ORG_A]);
+  });
+
+  test('the queued row records that the recipient is a lead', async () => {
+    // communication_logs has allowed recipient_type = 'lead' since migration
+    // 012, and an operator reading the log needs to know which table the id
+    // points at — 'client' on a lead's row makes it unresolvable.
+    db({ settings: ENABLED, rules: [RULE], client: null });
+    db.lead = LEAD;
+
+    await engine.emit({
+      orgId: ORG_A, event: 'lead_created', recipientType: 'lead',
+      subjectId: 'lead-1', eventKey: 'lead-1',
+    });
+
+    const [, params] = insertCalls()[0];
+    expect(params).toContain('lead');
+    expect(params).toContain('lead-1');
+  });
+
+  test('the default is still a client, so nothing existing had to change', async () => {
+    db({ settings: ENABLED, rules: [RULE], client: CLIENT });
+    await emit();
+    expect(insertCalls()[0][1]).toContain('client');
+  });
+
+  test('an unrecognised recipient type queues nothing', async () => {
+    // Deliberately not "falls back to client". A type this file does not know
+    // is a programming error, and the id it carries belongs to some other
+    // table — treating it as a client id would message whichever client
+    // happens to share it.
+    db({ settings: ENABLED, rules: [RULE], client: CLIENT });
+
+    const res = await engine.emit({
+      orgId: ORG_A, event: 'lead_created', recipientType: 'trainer',
+      subjectId: 'client-1', eventKey: 'x',
+    });
+
+    expect(res.outcome).toBe(Outcome.RECIPIENT_NOT_FOUND);
+    expect(insertCalls()).toHaveLength(0);
+    expect(mockEnqueue).not.toHaveBeenCalled();
   });
 });

@@ -216,6 +216,35 @@ async function clientRecipient(orgId, clientId) {
   return rows[0] || null;
 }
 
+/**
+ * A lead, in the same shape as a client, for the two lead-shaped events.
+ *
+ * `lead_created` and `followup_due` are about people who are NOT clients yet —
+ * pt_leads is deliberately independent of pt_clients until conversion
+ * (migration 119), so resolving a lead through clientRecipient would return
+ * nothing and the two events would silently never fire. communication_logs has
+ * carried `recipient_type = 'lead'` since migration 012 for exactly this.
+ *
+ * A lead has no `whatsapp` column — only `mobile` — so there is nothing to
+ * prefer between; the one number is the number.
+ *
+ * `trainer_id` is returned for the same reason it is on the client: the
+ * permission that governs an automated message is the permission of the
+ * trainer the person is assigned to. On pt_leads it is a bare TEXT column with
+ * no foreign key, so a lead can carry a trainer id this studio does not own —
+ * which changes nothing, because trainerIsGranted binds the org too and a
+ * foreign trainer simply has no grant here.
+ */
+async function leadRecipient(orgId, leadId) {
+  const { rows } = await pool.query(
+    `SELECT l.id, l.name, NULLIF(l.mobile, '') AS phone, l.trainer_id
+       FROM pt_leads l
+      WHERE l.id = $1 AND l.organization_id = $2`,
+    [leadId, orgId]
+  );
+  return rows[0] || null;
+}
+
 // ── The message log ─────────────────────────────────────────────────────────
 
 /**
@@ -339,6 +368,288 @@ async function markFailedByClientId(orgId, logId, reason) {
   return rowCount;
 }
 
+// ── The scheduled sweeps ────────────────────────────────────────────────────
+//
+// Six of the twelve trigger events are not produced by anything a user does.
+// Nobody presses a button to make a membership expire or a birthday arrive;
+// the event is a date passing. Those are found by a daily sweep, and these are
+// its queries.
+//
+// ── Why every one of them takes an orgId ────────────────────────────────────
+//
+// A sweep is the one place in this system where a global scan is the obvious
+// implementation and the wrong one. "Every client whose membership expires in
+// 7 days" across all studios, joined to each studio's rules, is a single
+// efficient query and one mistyped join condition away from messaging another
+// studio's clients with this studio's template. So the sweep runs per studio
+// and every statement below binds organization_id — the same rule the rest of
+// this file follows, for a sharper reason.
+//
+// The only statement that deliberately spans studios is orgsWithAutomationOn,
+// which returns ids and nothing else, and exists precisely so that the loop
+// above it is explicit rather than implied by a join.
+//
+// ── Why the date columns and not `status` ───────────────────────────────────
+//
+// pt_clients.status is a hand-maintained string ('active','expired','pending')
+// and 23 of production's 34 live clients do not have it in agreement with
+// their pt_end_date. A membership expiring is a fact about a date, so the date
+// is what these ask about. Where "is this person still a client" genuinely
+// matters — the re-engagement nudges, which must not chase people who left —
+// the test is `pt_end_date IS NULL OR pt_end_date >= CURRENT_DATE`, which is
+// the same fact rather than someone's memory of it.
+//
+// ── Why every date comes back as text ───────────────────────────────────────
+//
+// `to_char(..., 'YYYY-MM-DD')` rather than the DATE itself, because every one
+// of these dates ends up inside an idempotency key. node-postgres parses a
+// DATE into a JS Date at LOCAL midnight, and `.toISOString()` on that in any
+// timezone ahead of UTC yields the previous day — so a container running
+// TZ=Asia/Kolkata would key yesterday's date onto today's event and the dedupe
+// index would stop refusing the duplicate. Formatting in Postgres means the
+// date in the key is the same date the WHERE clause matched on, by
+// construction rather than by the deployment happening to run in UTC.
+//
+// ── Why they all filter on a phone number ───────────────────────────────────
+//
+// The engine checks this too, and would refuse the send. Doing it here as well
+// means a studio with 400 numberless clients does not produce 400 rows for the
+// engine to reject one at a time.
+
+/**
+ * The studios that have switched automation on.
+ *
+ * Deliberately not org-scoped — it IS the list of orgs, and returning ids only
+ * means nothing tenant-bearing crosses a studio boundary here. Everything the
+ * sweep does afterwards is scoped to one of these ids.
+ */
+async function orgsWithAutomationOn() {
+  const { rows } = await pool.query(
+    `SELECT organization_id
+       FROM whatsapp_automation_settings
+      WHERE automation_enabled = TRUE
+        AND organization_id IS NOT NULL`
+  );
+  return rows.map((r) => r.organization_id);
+}
+
+/**
+ * Which events this studio actually has an active rule for.
+ *
+ * The sweep asks this first and then runs only the matching queries. Without
+ * it, a studio with one birthday rule would still be scanned for expiring
+ * memberships, missed attendance and overdue follow-ups every single day, and
+ * the engine would discard every row for want of a rule. The work a studio has
+ * not asked for should not be done, not done and thrown away.
+ */
+async function activeTriggerEventsFor(orgId) {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT trigger_event
+       FROM automation_rules
+      WHERE organization_id = $1
+        AND is_active = TRUE
+        AND channel = 'whatsapp'`,
+    [orgId]
+  );
+  return rows.map((r) => r.trigger_event);
+}
+
+/**
+ * Clients whose membership ends in exactly `days` days.
+ *
+ * Exactly, not "within", because the caller runs this once per reminder bucket
+ * (7, 3, 1) and a range would put every client in every bucket they are still
+ * inside — three messages on the same day for someone one day out.
+ *
+ * The consequence is that a sweep which does not run on a given day loses that
+ * day's bucket. That is the same trade the membership reminder in
+ * renewal.worker.js has always made, and the alternative — remembering which
+ * buckets each client has already been sent — is what the dedupe key already
+ * does one layer up, at the point where it can also see the rule.
+ */
+async function membershipExpiringIn(orgId, days) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.name,
+            to_char(c.pt_end_date, 'YYYY-MM-DD') AS end_date,
+            (c.pt_end_date - CURRENT_DATE) AS days_remaining
+       FROM pt_clients c
+      WHERE c.organization_id = $1
+        AND c.deleted_at IS NULL
+        AND c.pt_end_date IS NOT NULL
+        AND (c.pt_end_date - CURRENT_DATE) = $2
+        AND COALESCE(NULLIF(c.whatsapp, ''), c.mobile) IS NOT NULL
+      ORDER BY c.id`,
+    [orgId, days]
+  );
+  return rows;
+}
+
+/**
+ * Clients whose membership ended yesterday.
+ *
+ * Yesterday rather than "any time in the past", so the query cannot wake up one
+ * morning and message every lapsed client a studio has ever had — which is
+ * exactly what would happen the first day this ships if it asked for
+ * `pt_end_date < CURRENT_DATE`. The dedupe key would stop the SECOND such
+ * message; nothing would stop the first.
+ */
+async function membershipExpiredYesterday(orgId) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.name, to_char(c.pt_end_date, 'YYYY-MM-DD') AS end_date
+       FROM pt_clients c
+      WHERE c.organization_id = $1
+        AND c.deleted_at IS NULL
+        AND c.pt_end_date = (CURRENT_DATE - 1)
+        AND COALESCE(NULLIF(c.whatsapp, ''), c.mobile) IS NOT NULL
+      ORDER BY c.id`,
+    [orgId]
+  );
+  return rows;
+}
+
+/**
+ * Current clients whose birthday is today.
+ *
+ * Current — `pt_end_date IS NULL OR >= CURRENT_DATE` — because a birthday
+ * message to someone who stopped training two years ago is not a courtesy, it
+ * is a studio that has not noticed they left. A studio that wants to reach
+ * lapsed clients has campaigns for that, where it can see who it is messaging.
+ *
+ * 29 February is matched on 29 February only. Postgres has no opinion about
+ * when a leap-day birthday falls in a common year and neither should this: the
+ * alternative is picking 28 February or 1 March on the client's behalf and
+ * being wrong for half of them.
+ */
+async function birthdaysToday(orgId) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.name, to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today
+       FROM pt_clients c
+      WHERE c.organization_id = $1
+        AND c.deleted_at IS NULL
+        AND c.dob IS NOT NULL
+        AND EXTRACT(MONTH FROM c.dob) = EXTRACT(MONTH FROM CURRENT_DATE)
+        AND EXTRACT(DAY   FROM c.dob) = EXTRACT(DAY   FROM CURRENT_DATE)
+        AND (c.pt_end_date IS NULL OR c.pt_end_date >= CURRENT_DATE)
+        AND COALESCE(NULLIF(c.whatsapp, ''), c.mobile) IS NOT NULL
+      ORDER BY c.id`,
+    [orgId]
+  );
+  return rows;
+}
+
+/**
+ * Current clients whose joining anniversary is today.
+ *
+ * `joining_date < CURRENT_DATE` excludes the joining day itself: a client who
+ * enrolled this morning has already had `member_created` fire, and "happy 0
+ * year anniversary" on the same day is the sort of thing that makes a studio
+ * turn automation off entirely.
+ */
+async function anniversariesToday(orgId) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.name,
+            to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today,
+            EXTRACT(YEAR FROM AGE(CURRENT_DATE, c.joining_date))::INT AS years
+       FROM pt_clients c
+      WHERE c.organization_id = $1
+        AND c.deleted_at IS NULL
+        AND c.joining_date IS NOT NULL
+        AND c.joining_date < CURRENT_DATE
+        AND EXTRACT(MONTH FROM c.joining_date) = EXTRACT(MONTH FROM CURRENT_DATE)
+        AND EXTRACT(DAY   FROM c.joining_date) = EXTRACT(DAY   FROM CURRENT_DATE)
+        AND (c.pt_end_date IS NULL OR c.pt_end_date >= CURRENT_DATE)
+        AND COALESCE(NULLIF(c.whatsapp, ''), c.mobile) IS NOT NULL
+      ORDER BY c.id`,
+    [orgId]
+  );
+  return rows;
+}
+
+/**
+ * Current clients who have not checked in for at least `days` days.
+ *
+ * ── Why only clients who have EVER checked in ───────────────────────────────
+ *
+ * A client with no attendance row at all has no last visit to miss — they may
+ * have enrolled yesterday, or the studio may not use check-in at all, and "we
+ * have not seen you since ∅" is not a message anybody should receive.
+ * Production has 34 clients and 12 attendance rows, so getting this wrong
+ * would nudge almost the entire roster on the first morning.
+ *
+ * What enforces it is the HAVING, not the join: with no rows, MAX(a.date) is
+ * NULL, `CURRENT_DATE - NULL` is NULL, and NULL >= 14 is not true. The inner
+ * join says the same thing a second time and is kept for legibility — mutating
+ * it to a LEFT JOIN alone changes no behaviour and no test, which is worth
+ * knowing before someone "fixes" the HAVING with a COALESCE and quietly turns
+ * every never-attended client into a fortnight-long absentee.
+ *
+ * ── Why `>= days` and not `= days` ──────────────────────────────────────────
+ *
+ * The opposite of membershipExpiringIn, and for the opposite reason. There are
+ * no buckets here — one absence produces one message — so the window is open
+ * ended and the dedupe key is the last visit date, which does not change until
+ * the client comes back. A sweep that misses a day therefore still sends the
+ * message the next day, rather than losing it, and a client who stays away for
+ * a year is messaged once rather than 350 times.
+ *
+ * ── Why the attendance rows are not org-filtered ────────────────────────────
+ *
+ * `c` is already bound to the studio and `a.ref_id` is a pt_clients primary
+ * key, so every row this joins belongs to a client this studio owns — the
+ * tenant boundary is the client, and it is enforced. Adding
+ * `a.organization_id = $1` on top would look stricter and behave worse: a
+ * legacy attendance row with a null organization_id would drop out of the MAX,
+ * and a client who trained yesterday would be told nobody has seen them.
+ */
+async function attendanceMissedFor(orgId, days) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.name,
+            to_char(MAX(a.date), 'YYYY-MM-DD') AS last_visit,
+            (CURRENT_DATE - MAX(a.date)) AS days_since
+       FROM pt_clients c
+       JOIN attendance_logs a
+         ON a.ref_id = c.id AND a.ref_type = 'client'
+      WHERE c.organization_id = $1
+        AND c.deleted_at IS NULL
+        AND (c.pt_end_date IS NULL OR c.pt_end_date >= CURRENT_DATE)
+        AND COALESCE(NULLIF(c.whatsapp, ''), c.mobile) IS NOT NULL
+      GROUP BY c.id, c.name
+     HAVING (CURRENT_DATE - MAX(a.date)) >= $2
+      ORDER BY c.id`,
+    [orgId, days]
+  );
+  return rows;
+}
+
+/**
+ * Leads whose follow-up date has arrived or passed.
+ *
+ * `<= CURRENT_DATE` rather than `=`, so a lead whose follow-up fell on a day
+ * the sweep did not run is still chased. The dedupe key is the follow-up date
+ * itself, which means the nudge repeats only when a human moves the date —
+ * which is precisely when the studio has decided to chase again.
+ *
+ * Converted and lost leads are excluded: a converted lead is a client now and
+ * has client events of its own, and chasing a lost one is the definition of
+ * the automation a studio complains about.
+ */
+async function followupsDue(orgId) {
+  const { rows } = await pool.query(
+    `SELECT l.id, l.name, l.status, l.interested_package,
+            to_char(l.follow_up_date, 'YYYY-MM-DD') AS follow_up_date
+       FROM pt_leads l
+      WHERE l.organization_id = $1
+        AND l.follow_up_date IS NOT NULL
+        AND l.follow_up_date <= CURRENT_DATE
+        AND l.status NOT IN ('converted', 'lost')
+        AND l.converted_client_id IS NULL
+        AND NULLIF(l.mobile, '') IS NOT NULL
+      ORDER BY l.id`,
+    [orgId]
+  );
+  return rows;
+}
+
 module.exports = {
   settingsFor,
   upsertSettings,
@@ -350,10 +661,19 @@ module.exports = {
   activeRulesFor,
   touchRule,
   clientRecipient,
+  leadRecipient,
   insertQueued,
   loadQueued,
   markSent,
   markFailed,
   applyReceipt,
   markFailedByClientId,
+  orgsWithAutomationOn,
+  activeTriggerEventsFor,
+  membershipExpiringIn,
+  membershipExpiredYesterday,
+  birthdaysToday,
+  anniversariesToday,
+  attendanceMissedFor,
+  followupsDue,
 };

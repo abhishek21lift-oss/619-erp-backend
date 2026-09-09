@@ -26,6 +26,7 @@ const { requireRole } = require('../../middleware/rbac');
 const { orgWhere, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
 const repo = require('./automation.repository');
+const automation = require('./automation.triggers');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -291,6 +292,21 @@ router.post('/session-balance/:id/use', auth, wrap(async (req, res) => {
   // stays deliberately vague for the same reason it is a 400 — it must not
   // reveal whether the id belongs to another studio.
   if (!rows[0]) return res.status(400).json({ error: { code: 'BALANCE_EXHAUSTED', message: 'No sessions remaining' } });
+
+  // `session_low` — after the decrement, never before it, and never inside the
+  // statement above. The UPDATE is the studio's sold inventory and has to stay
+  // one atomic statement; RETURNING * has already given us the new balance, so
+  // this needs no second read and cannot change what the client was charged.
+  //
+  // The trigger decides what "low" means and answers `not_low` most of the
+  // time. Awaited so that the queued row exists before the response, and
+  // unguarded because emit() does not throw — a broken automation must not
+  // turn a consumed session into a 500.
+  await automation.sessionLow(req, {
+    clientId: rows[0].client_id,
+    remaining: rows[0].remaining_sessions,
+  });
+
   return res.json({ data: rows[0] });
 }));
 

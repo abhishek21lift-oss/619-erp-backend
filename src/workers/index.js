@@ -23,6 +23,7 @@ async function startWorkers() {
   const { createAiWorker } = require('./ai.worker');
   const { createNotificationsWorker } = require('./notifications.worker');
   const { createRenewalWorker, scheduleRenewalCron } = require('./renewal.worker');
+  const { createAutomationWorker, scheduleAutomationSweep } = require('./automation.worker');
 
   const workers = [
     createEmailWorker(),
@@ -30,8 +31,22 @@ async function startWorkers() {
     createAiWorker(),
     createNotificationsWorker(),
     createRenewalWorker(),
+    createAutomationWorker(),
   ];
   await scheduleRenewalCron();
+
+  // Caught, unlike the line above it, and deliberately not by changing that
+  // line. An unregistered sweep schedule costs a studio one morning's
+  // reminders; a throw here would escape before `activeWorkers` is assigned
+  // below, so stopWorkers() would have nothing to close and the five workers
+  // just started would outlive the shutdown that was supposed to end them.
+  // Redis is optional in this stack, so "the cron could not be registered" is
+  // a condition this has to survive rather than a reason to abandon the boot.
+  try {
+    await scheduleAutomationSweep();
+  } catch (err) {
+    logger.error({ err: err.message }, 'automation sweep cron not scheduled');
+  }
 
   activeWorkers = workers;
   logger.info({ count: workers.length }, 'in-process workers started');
