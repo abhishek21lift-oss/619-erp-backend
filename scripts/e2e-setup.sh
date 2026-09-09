@@ -81,6 +81,47 @@ node src/db/migrate.js
 echo "==> Seed two studios"
 node scripts/seed-e2e.js
 
+# ── Optionally serve as app_tenant, the way production will after cutover ────
+#
+# Everything above must run as the owner: schema.sql and the migrations need
+# DDL rights, and seed-e2e.js writes both studios' rows in one pass. Only the
+# SERVING step changes.
+#
+# With E2E_TENANT_ROLE=on the API is started exactly as the cutover will leave
+# it — DATABASE_URL pointing at app_tenant (NOBYPASSRLS) and ADMIN_DATABASE_URL
+# keeping the owner credentials for platform-wide work — so the isolation suite
+# is answered by row-level security and not only by the WHERE clauses the
+# application remembers to write.
+#
+# Without it the API serves as the owner, which bypasses RLS entirely. That is
+# still worth running (it is what proves the application-layer scoping), but on
+# its own it cannot fail for the reason the cutover would break, and a suite
+# that cannot fail for that reason is not evidence about it.
+if [ "${E2E_TENANT_ROLE:-off}" = "on" ]; then
+  TENANT_PASSWORD="${E2E_TENANT_PASSWORD:-e2elocalproof}"
+  echo "==> Serving as app_tenant (RLS enforced)"
+  psql "$PSQL_URL" -v ON_ERROR_STOP=1 -q \
+    -c "ALTER ROLE app_tenant PASSWORD '$TENANT_PASSWORD';"
+
+  # The owner URL becomes the admin connection; DATABASE_URL swaps its
+  # credentials for app_tenant's and keeps everything else — same host, port,
+  # database and parameters — so the two can only differ in who is connecting.
+  export ADMIN_DATABASE_URL="$DATABASE_URL"
+  export DATABASE_URL="$(node -e '
+    const u = new URL(process.argv[1]);
+    u.username = "app_tenant";
+    u.password = process.argv[2];
+    console.log(u.toString());
+  ' "$DATABASE_URL" "$TENANT_PASSWORD")"
+
+  # Defaulted ON in the app, but stated here so the job reads as a description
+  # of the cutover configuration rather than relying on a default staying put.
+  export TENANT_RLS_ENFORCE=on
+
+  psql "$PSQL_URL" -v ON_ERROR_STOP=1 -qtA \
+    -c "SELECT '    app_tenant bypassrls=' || rolbypassrls FROM pg_roles WHERE rolname='app_tenant';"
+fi
+
 echo "==> API on :$PORT"
 node src/server.js &
 API_PID=$!
