@@ -69,6 +69,18 @@ const updates = () =>
     .filter(([sql]) => /^\s*UPDATE communication_logs/.test(sql))
     .map(([sql, params]) => ({ sql: sql.replace(/\s+/g, ' ').trim(), params }));
 
+/**
+ * The markSent statement, found by what it writes rather than by the literal
+ * `status = 'sent'`.
+ *
+ * That literal no longer appears: markSent moves the status through a CASE, so
+ * that a receipt which has already advanced the row to delivered or read is
+ * not pulled back to sent when the worker's send call finally returns. The
+ * assertions below are unchanged — external_id is what uniquely identifies
+ * this statement, and it is what they were really about.
+ */
+const sentUpdate = () => updates().find((u) => /external_id/.test(u.sql));
+
 beforeEach(() => {
   mockQuery.mockReset();
   mockGatewaySend.mockReset();
@@ -86,8 +98,10 @@ describe('the happy path', () => {
       expect.objectContaining({ to: ROW.recipient_phone, text: ROW.message }),
       undefined,
     );
-    const sent = updates().find((u) => /status = 'sent'/.test(u.sql));
+    const sent = sentUpdate();
     expect(sent.params).toEqual(['log-1', ORG_A, 'WAMSG1', 'baileys']);
+    // And it advances the status rather than asserting it — see FIX 1.
+    expect(sent.sql).toMatch(/status = CASE WHEN status IN \('delivered','read'\)/);
   });
 
   test('uses the log row id as the client_message_id, stable across retries', async () => {
@@ -226,7 +240,7 @@ describe('failures and retries', () => {
     const out = await processAutomationJob(job());
 
     expect(out).toMatchObject({ status: 'sent', provider_id: 'WAMSG-ORIGINAL', duplicate: true });
-    expect(updates().find((u) => /status = 'sent'/.test(u.sql)).params).toContain('WAMSG-ORIGINAL');
+    expect(sentUpdate().params).toContain('WAMSG-ORIGINAL');
   });
 
   test('an unreachable gateway is retryable', async () => {

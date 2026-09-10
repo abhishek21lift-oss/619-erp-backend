@@ -19,7 +19,17 @@ const ORG_A = '11111111-1111-4111-8111-111111111111';
 const ORG_B = '22222222-2222-4222-8222-222222222222';
 
 const mockQuery = jest.fn();
-jest.mock('../db/pool', () => ({ query: (...a) => mockQuery(...a) }));
+// `connect` as well as `query`: the daily-limit check and the INSERT now run
+// inside one transaction on a borrowed client (see
+// repository.insertQueuedWithinLimit), so a pool that only answers query()
+// would make the engine unrunnable here. The fake client routes to the same
+// mockQuery, which keeps every existing SQL-matching fixture below working and
+// lets the transaction's own statements be asserted on.
+const mockRelease = jest.fn();
+jest.mock('../db/pool', () => ({
+  query: (...a) => mockQuery(...a),
+  connect: async () => ({ query: (...a) => mockQuery(...a), release: mockRelease }),
+}));
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
 const mockEnqueue = jest.fn();
@@ -48,6 +58,8 @@ function db({ settings, rules = [], client, sendsToday = 0, insertReturns = 'log
     if (/whatsapp_automation_trainer_grants/.test(sql)) {
       return { rows: db.grant ? [{ n: 1 }] : [], rowCount: db.grant ? 1 : 0 };
     }
+    if (/^\s*(BEGIN|COMMIT|ROLLBACK)\s*$/i.test(sql)) return { rows: [], rowCount: 0 };
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [{}], rowCount: 1 };
     if (/COUNT\(\*\)::INT AS n/.test(sql)) return { rows: [{ n: sendsToday }], rowCount: 1 };
     if (/INSERT INTO communication_logs/.test(sql)) {
       return { rows: insertReturns ? [{ id: insertReturns }] : [], rowCount: insertReturns ? 1 : 0 };
@@ -72,6 +84,7 @@ const insertCalls = () =>
 
 beforeEach(() => {
   mockQuery.mockReset();
+  mockRelease.mockReset();
   mockEnqueue.mockReset();
   mockEnqueue.mockResolvedValue({ id: 'job-1' });
   db.grant = true;
@@ -230,6 +243,65 @@ describe('the trainer permission gate', () => {
 });
 
 describe('the daily limit', () => {
+  test('the count and the INSERT are one transaction, serialised per studio', async () => {
+    // The fix for the check-then-act race. Two events could both read 199
+    // against a limit of 200 and both insert, because a COUNT takes no lock.
+    // The order asserted here is the whole mechanism: BEGIN, then the advisory
+    // lock, then the count, then the insert, then COMMIT — a count read before
+    // the lock would be read outside the mutual exclusion it exists to be
+    // protected by.
+    //
+    // That the lock actually serialises is proved against real PostgreSQL in
+    // automation.concurrency.integration.test.js; a mock cannot demonstrate
+    // mutual exclusion.
+    db({ settings: { automation_enabled: true, daily_send_limit: 5 }, rules: [RULE], client: CLIENT, sendsToday: 0 });
+    await emit();
+
+    const shape = mockQuery.mock.calls
+      .map(([sql]) => sql)
+      .filter((sql) => /BEGIN|COMMIT|pg_advisory_xact_lock|COUNT\(\*\)::INT AS n|INSERT INTO communication_logs/.test(sql))
+      .map((sql) => /BEGIN/.test(sql) ? 'BEGIN'
+        : /COMMIT/.test(sql) ? 'COMMIT'
+          : /pg_advisory_xact_lock/.test(sql) ? 'LOCK'
+            : /COUNT/.test(sql) ? 'COUNT' : 'INSERT');
+
+    expect(shape).toEqual(['BEGIN', 'LOCK', 'COUNT', 'INSERT', 'COMMIT']);
+  });
+
+  test('the lock key is derived from the studio, so studios do not share a queue', async () => {
+    db({ settings: { automation_enabled: true, daily_send_limit: 5 }, rules: [RULE], client: CLIENT, sendsToday: 0 });
+    await emit();
+    const [, params] = mockQuery.mock.calls.find(([sql]) => /pg_advisory_xact_lock/.test(sql));
+    expect(params[1]).toBe(ORG_A);
+  });
+
+  test('every rule is checked, not just the first', async () => {
+    // One pre-loop check used to license the whole loop: an event matching
+    // four rules queued four messages on the strength of one reading. With a
+    // limit of 5 and 4 already used, exactly one of these two rules may fire.
+    const RULE_2 = { ...RULE, id: 'rule-2', name: 'Second' };
+    db({ settings: { automation_enabled: true, daily_send_limit: 5 }, rules: [RULE, RULE_2], client: CLIENT });
+
+    // The count answers 4 for the first rule and 5 for the second — what the
+    // database would really report once the first row exists.
+    let seen = 0;
+    const base = mockQuery.getMockImplementation();
+    mockQuery.mockImplementation(async (sql, params) => {
+      if (/COUNT\(\*\)::INT AS n/.test(sql)) {
+        const n = seen === 0 ? 4 : 5;
+        seen += 1;
+        return { rows: [{ n }], rowCount: 1 };
+      }
+      return base(sql, params);
+    });
+
+    const res = await emit();
+    expect(res.queued).toBe(1);
+    expect(mockEnqueue).toHaveBeenCalledTimes(1);
+    expect(res.results.map((r) => r.outcome))
+      .toEqual([Outcome.QUEUED, Outcome.DAILY_LIMIT_REACHED]);
+  });
+
   test('a studio at its limit queues nothing further', async () => {
     db({ settings: { automation_enabled: true, daily_send_limit: 5 }, rules: [RULE], client: CLIENT, sendsToday: 5 });
     const res = await emit();
@@ -312,6 +384,28 @@ describe('the queued job', () => {
     const res = await emit();
     expect(res.outcome).toBe(Outcome.NOT_ENQUEUED);
     expect(mockQuery.mock.calls.some(([sql]) => /status = 'failed'/.test(sql))).toBe(false);
+  });
+
+  test('and the row it leaves behind cannot be recreated by repeating the event', async () => {
+    // This is why automation.recovery.js exists. The row is written, the
+    // enqueue fails, and the dedupe key then makes the situation PERMANENT:
+    // the next identical business event is correctly refused as a duplicate of
+    // a message that was never sent. Nothing in the engine can fix that — the
+    // row is not the problem, the missing job is — so the repair has to come
+    // from outside, which is what the recovery sweep does.
+    db({ settings: ENABLED, rules: [RULE], client: CLIENT });
+    mockEnqueue.mockResolvedValue(null);
+    expect((await emit()).outcome).toBe(Outcome.NOT_ENQUEUED);
+
+    // The same event again, with the queue now healthy. The dedupe index
+    // refuses it, so no second row and no second job.
+    mockQuery.mockReset();
+    mockEnqueue.mockReset();
+    mockEnqueue.mockResolvedValue({ id: 'job-1' });
+    db({ settings: ENABLED, rules: [RULE], client: CLIENT, insertReturns: null });
+
+    expect((await emit()).outcome).toBe(Outcome.DUPLICATE_EVENT);
+    expect(mockEnqueue).not.toHaveBeenCalled();
   });
 });
 

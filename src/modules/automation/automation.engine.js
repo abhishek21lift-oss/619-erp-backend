@@ -200,26 +200,32 @@ async function emit({
       }
     }
 
-    const usedToday = await repo.sendsToday(orgId);
-    if (usedToday >= settings.daily_send_limit) {
-      logger.warn(
-        { org_id: orgId, event, used: usedToday, limit: settings.daily_send_limit },
-        'automation_daily_limit_reached'
-      );
-      return done(Outcome.DAILY_LIMIT_REACHED);
-    }
-
+    // ── The daily limit is checked INSIDE the insert, per rule ──────────────
+    //
+    // It used to be one read here, before the loop, compared and then acted
+    // on. That was wrong twice over. Between the read and the write, a
+    // concurrent event could take the last of the quota — two events both
+    // seeing 199 against a limit of 200 both proceed, and the studio's own
+    // WhatsApp number emits 201 messages. And within a single event, one
+    // pre-loop check licensed the whole loop: an event matching four rules
+    // queued four messages on the strength of one reading.
+    //
+    // Both disappear by moving the count into the same serialised transaction
+    // as the INSERT — see insertQueuedWithinLimit. Nothing else about the
+    // order changes: permission is still decided above, before any row exists.
     const vars = { ...context, name: context.name || recipient.name };
     const results = [];
     let queued = 0;
+    let limitReached = false;
 
     for (const rule of rules) {
       const dedupeKey = dedupeKeyFor(event, rule.id, eventKey || subjectId);
 
       // The row FIRST, then the job. A row with no job is a message that
       // visibly never went out; a job with no row is a message a client
-      // receives that this system has no record of.
-      const logId = await repo.insertQueued({
+      // receives that this system has no record of. The orphan that leaves
+      // behind is re-driven by automation.recovery.js.
+      const placed = await repo.insertQueuedWithinLimit({
         orgId,
         recipientType,
         recipientId: recipient.id,
@@ -229,8 +235,22 @@ async function emit({
         message: render(rule.template, vars),
         ruleId: rule.id,
         dedupeKey,
-      });
+      }, settings.daily_send_limit);
 
+      if (placed.outcome === 'daily_limit_reached') {
+        // Break rather than continue: the quota is per studio, so no later
+        // rule in this loop can fare better, and re-taking the lock once per
+        // rule to be told the same thing is pure contention.
+        limitReached = true;
+        logger.warn(
+          { org_id: orgId, event, used: placed.usedToday, limit: settings.daily_send_limit },
+          'automation_daily_limit_reached'
+        );
+        results.push({ ruleId: rule.id, outcome: Outcome.DAILY_LIMIT_REACHED });
+        break;
+      }
+
+      const logId = placed.logId;
       if (!logId) {
         // The same event already produced this message. Normal, not an error.
         results.push({ ruleId: rule.id, outcome: Outcome.DUPLICATE_EVENT });
@@ -266,7 +286,15 @@ async function emit({
       results.push({ ruleId: rule.id, logId, jobId: job.id, delayMs, outcome: Outcome.QUEUED });
     }
 
-    return { outcome: queued > 0 ? Outcome.QUEUED : results[0]?.outcome || Outcome.NO_ACTIVE_RULE, queued, results };
+    // `limitReached` with nothing queued is reported as DAILY_LIMIT_REACHED
+    // even though it is now discovered inside the loop, so the outcome a
+    // caller sees is unchanged by where the check moved to.
+    const outcome = queued > 0
+      ? Outcome.QUEUED
+      : limitReached
+        ? Outcome.DAILY_LIMIT_REACHED
+        : results[0]?.outcome || Outcome.NO_ACTIVE_RULE;
+    return { outcome, queued, results };
   } catch (err) {
     // The caller is inside a business transaction. Automation failing must not
     // roll back a payment, so this is logged and swallowed.
