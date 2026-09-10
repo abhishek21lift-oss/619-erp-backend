@@ -110,18 +110,39 @@ function dedupeKeyFor(triggerEvent, ruleId, eventKey) {
 }
 
 /**
+ * Who an event is about, and how to resolve them.
+ *
+ * Two, because four of the twelve trigger events are about people who are not
+ * clients: `lead_created` and `followup_due` concern a pt_leads row, which is
+ * deliberately a separate table until conversion. communication_logs has
+ * allowed `recipient_type = 'lead'` since migration 012.
+ *
+ * A map rather than an if/else so that an unrecognised type resolves to
+ * nothing and the event is refused, instead of quietly falling through to the
+ * client lookup and messaging whichever client happens to share that id.
+ */
+const RECIPIENT_RESOLVERS = Object.freeze({
+  client: (orgId, id) => repo.clientRecipient(orgId, id),
+  lead: (orgId, id) => repo.leadRecipient(orgId, id),
+});
+
+/**
  * Fire one business event for one studio.
  *
  * @param {object} args
  * @param {string} args.orgId       Server-resolved. NEVER from a request body.
  * @param {string} args.event       One of TRIGGER_EVENTS.
- * @param {string} args.clientId    The pt_clients row this is about.
+ * @param {string} args.subjectId   The row this is about — a pt_clients id, or
+ *                                  a pt_leads id when recipientType is 'lead'.
+ * @param {string} [args.recipientType] 'client' (default) or 'lead'.
  * @param {string} args.eventKey    Identifies the business object, for idempotency.
  * @param {object} [args.context]   Template variables.
  * @param {string} [args.requestId]
  * @returns {Promise<{outcome: string, queued: number, results: object[]}>}
  */
-async function emit({ orgId, event, clientId, eventKey, context = {}, requestId } = {}) {
+async function emit({
+  orgId, event, subjectId, recipientType = 'client', eventKey, context = {}, requestId,
+} = {}) {
   const done = (outcome, extra = {}) => ({ outcome, queued: 0, results: [], ...extra });
 
   if (!orgId) {
@@ -143,8 +164,14 @@ async function emit({ orgId, event, clientId, eventKey, context = {}, requestId 
     const rules = await repo.activeRulesFor(orgId, event);
     if (rules.length === 0) return done(Outcome.NO_ACTIVE_RULE);
 
-    const recipient = await repo.clientRecipient(orgId, clientId);
-    // Null covers both "no such client" and "another studio's client", and the
+    const resolve = RECIPIENT_RESOLVERS[recipientType];
+    if (!resolve) {
+      logger.error({ event, org_id: orgId, recipient_type: recipientType }, 'automation_emit_unknown_recipient_type');
+      return done(Outcome.RECIPIENT_NOT_FOUND);
+    }
+
+    const recipient = await resolve(orgId, subjectId);
+    // Null covers both "no such row" and "another studio's row", and the
     // answer is the same for both — which is the whole reason the lookup is
     // org-scoped rather than checked afterwards.
     if (!recipient) return done(Outcome.RECIPIENT_NOT_FOUND);
@@ -187,14 +214,14 @@ async function emit({ orgId, event, clientId, eventKey, context = {}, requestId 
     let queued = 0;
 
     for (const rule of rules) {
-      const dedupeKey = dedupeKeyFor(event, rule.id, eventKey || clientId);
+      const dedupeKey = dedupeKeyFor(event, rule.id, eventKey || subjectId);
 
       // The row FIRST, then the job. A row with no job is a message that
       // visibly never went out; a job with no row is a message a client
       // receives that this system has no record of.
       const logId = await repo.insertQueued({
         orgId,
-        recipientType: 'client',
+        recipientType,
         recipientId: recipient.id,
         recipientName: recipient.name,
         recipientPhone: recipient.phone,

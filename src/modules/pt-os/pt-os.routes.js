@@ -949,6 +949,15 @@ router.post('/leads', auth, requireRole('admin','manager','trainer'), validate(p
     interested_package || null, trainer_id || null, trainer_name || null,
     follow_up_date || null, notes || null,
   ]);
+  // `lead_created`. The first message a studio sends an enquiry is the one
+  // that has to be fast, which is exactly why it should not depend on somebody
+  // remembering to send it.
+  await automation.leadCreated(req, {
+    leadId: rows[0].id,
+    source: rows[0].source,
+    interestedPackage: rows[0].interested_package,
+  });
+
   res.status(201).json({ data: rows[0] });
 }));
 
@@ -973,6 +982,15 @@ router.patch('/leads/:id', auth, requireRole('admin','manager','trainer'), wrap(
     params
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
+
+  // `trial_scheduled`. Read off the row the UPDATE returned rather than off
+  // req.body, so a PATCH that changed only the notes on an already-booked lead
+  // is treated the same as the one that booked it — the dedupe key is what
+  // makes the difference, and it needs the row's actual status to do it.
+  if (rows[0].status === 'trial_scheduled') {
+    await automation.trialScheduled(req, { leadId: rows[0].id });
+  }
+
   res.json({ data: rows[0] });
 }));
 
