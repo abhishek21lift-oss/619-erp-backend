@@ -26,9 +26,26 @@ const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 const { logActivity } = require('../lib/activityLog');
 
-// Both ledgers, aliased to one shape. pt_payments has no branch_id — shimmed
-// NULL so the branch-scope clause (branch_id = $n OR branch_id IS NULL) keeps
-// treating those rows as visible.
+// The ledger. One table, one shape.
+//
+// ── What the UNION ALL that used to be here was doing ───────────────────────
+//
+// This selected from pt_payments and then UNION ALL'd the legacy `payments`
+// table, aliasing its columns into the same shape. The second half ended
+// `NULL::uuid AS organization_id` — because that table has no such column,
+// having never had one — and every caller then filtered on
+// `p.organization_id = $n`. A NULL never equals anything, so legacy rows were
+// invisible to a scoped read and visible to an unscoped one: an unscopable
+// ledger sitting behind a tenant filter that could not reach it.
+//
+// It held 0 rows, so nothing leaked. That is the data being safe, not the code
+// — one inserted row and this was a cross-tenant financial read. pt_payments
+// is the only payment ledger now, it carries organization_id, and the filter
+// applies to every row in it.
+//
+// branch_id and package_type are still selected as NULL: pt_payments has
+// neither, and the branch-scope clause (`branch_id = $n OR branch_id IS NULL`)
+// reads the shim as "visible", which is the behaviour these rows already had.
 const LEDGER_SQL = `
   SELECT p.id, p.client_id, c.name AS client_name, p.trainer_id,
          t.name AS trainer_name, p.amount, p.incentive_amt,
@@ -38,13 +55,6 @@ const LEDGER_SQL = `
   FROM pt_payments p
   LEFT JOIN pt_clients c ON c.id = p.client_id
   LEFT JOIN trainers   t ON t.id = p.trainer_id
-  UNION ALL
-  SELECT lp.id, lp.client_id, lp.client_name, lp.trainer_id,
-         lp.trainer_name, lp.amount, lp.incentive_amt,
-         UPPER(lp.method) AS method, lp.receipt_no,
-         lp.date, lp.notes, lp.deleted_at, lp.created_at,
-         lp.branch_id::text, lp.package_type, NULL::uuid AS organization_id
-  FROM payments lp
 `;
 
 // GET /api/payments
@@ -267,8 +277,7 @@ router.get('/stats', auth, async (req, res, next) => {
 // DELETE /api/payments/:id (admin only)
 //
 // Soft delete by default (sets deleted_at). The balance reversal still runs
-// so the client's paid/balance figures stay correct. Handles rows from either
-// ledger: tries pt_payments first (canonical), then the legacy payments table.
+// so the client's paid/balance figures stay correct.
 router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   const tx = await pool.connect();
   try {
@@ -304,42 +313,20 @@ router.delete('/:id', auth, adminOnly, async (req, res, next) => {
       return res.json({ message: 'Payment deleted' });
     }
 
-    // ── Legacy ledger ──
-    let payment;
-    let alreadyReversed = false;
-    if (req.query.hard === '1') {
-      const { rows } = await tx.query(
-        'DELETE FROM payments WHERE id=$1 RETURNING *', [req.params.id]
-      );
-      payment = rows[0];
-      if (payment && payment.deleted_at) alreadyReversed = true;
-    } else {
-      const { rows } = await tx.query(
-        `UPDATE payments
-            SET deleted_at = NOW(), updated_at = NOW()
-          WHERE id = $1 AND deleted_at IS NULL
-          RETURNING *`, [req.params.id]
-      );
-      payment = rows[0];
-    }
-
-    if (!payment) {
-      await tx.query('ROLLBACK');
-      return res.status(404).json({ error: 'Not found' });
-    }
-
-    if (!alreadyReversed) {
-      await tx.query(`
-        UPDATE pt_clients
-        SET paid_amount = GREATEST(0, paid_amount - $1),
-            balance_amount = balance_amount + $1,
-            updated_at = NOW()
-        WHERE id = $2`, [payment.amount, payment.client_id]
-      );
-    }
-    await tx.query('COMMIT');
-    await logActivity(req, 'payment.delete', 'payment', payment.id, null, payment);
-    res.json({ message: 'Payment deleted' });
+    // The legacy-ledger fallback that used to sit here is gone with the table.
+    //
+    // It ran when the pt_payments UPDATE above matched nothing, and issued
+    // `DELETE FROM payments WHERE id=$1` / `UPDATE payments SET deleted_at`
+    // with NO organization filter — the org clause built above was applied to
+    // the canonical statement only. Against a table with rows that is a
+    // cross-tenant delete by id; against this one it matched nothing, every
+    // time, because the table has been empty since PT-OS shipped.
+    //
+    // A payment id that does not resolve in pt_payments for this studio is now
+    // simply a 404 — which is what the fallback amounted to in practice, minus
+    // the unscoped write it would have performed had a row ever existed.
+    await tx.query('ROLLBACK');
+    return res.status(404).json({ error: 'Not found' });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
     next(err);

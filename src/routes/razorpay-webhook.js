@@ -5,7 +5,8 @@
 const express = require('express');
 const router  = express.Router();
 const crypto  = require('crypto');
-const pool    = require('../db/pool');
+// No database import here: this handler no longer writes. See the event
+// dispatch block below for what was removed and why.
 const logger  = require('../lib/logger');
 
 const WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || '';
@@ -49,43 +50,43 @@ router.post('/', async (req, res) => {
   logger.info({ eventType }, 'Razorpay webhook received');
 
   try {
-    if (eventType === 'payment.captured') {
-      const payment = event.payload?.payment?.entity;
-      if (payment?.id) {
-        await pool.query(
-          `UPDATE payments
-              SET gateway_status = 'captured',
-                  gateway_payload = $2,
-                  updated_at = NOW()
-            WHERE gateway_payment_id = $1`,
-          [payment.id, JSON.stringify(payment)],
-        );
-      }
-    } else if (eventType === 'payment.failed') {
-      const payment = event.payload?.payment?.entity;
-      if (payment?.id) {
-        await pool.query(
-          `UPDATE payments
-              SET gateway_status = 'failed',
-                  gateway_payload = $2,
-                  updated_at = NOW()
-            WHERE gateway_payment_id = $1`,
-          [payment.id, JSON.stringify(payment)],
-        );
-      }
-    } else if (eventType === 'refund.processed') {
-      const refund = event.payload?.refund?.entity;
-      if (refund?.payment_id) {
-        await pool.query(
-          `UPDATE payments
-              SET gateway_status = 'refunded',
-                  refund_id = $2,
-                  updated_at = NOW()
-            WHERE gateway_payment_id = $1`,
-          [refund.payment_id, refund.id],
-        );
-      }
+    // ── The three UPDATEs that used to live here are gone ──────────────────
+    //
+    // They read:
+    //
+    //   UPDATE payments SET gateway_status = 'captured', gateway_payload = $2
+    //    WHERE gateway_payment_id = $1
+    //
+    // and neither `gateway_payment_id`, `gateway_payload` nor `refund_id`
+    // exists on that table — it carries `gateway_txn_id` and no payload column
+    // at all. So every payment.captured, payment.failed and refund.processed
+    // event raised `column "gateway_payment_id" does not exist`, was caught by
+    // the handler below, logged, and answered 200 so that Razorpay would not
+    // retry. Silent, total loss of every gateway payment confirmation, for as
+    // long as this has been deployed.
+    //
+    // Nothing was lost in practice: production holds 26 payments, all CASH or
+    // UPI, and zero gateway payments have ever been recorded — which is what
+    // being broken since the beginning looks like from the data side.
+    //
+    // The legacy `payments` table is being dropped, and pt_payments has no
+    // gateway columns, so there is nothing to repoint this at. Recording
+    // gateway payments is a feature to be built on pt_payments deliberately,
+    // with the columns it needs and an organization_id on every row — not a
+    // repair of three statements that never worked.
+    //
+    // The signature verification above is untouched and still runs. This
+    // endpoint remains a valid, authenticated webhook receiver; it simply no
+    // longer claims to write a payment it cannot write.
+    if (eventType === 'payment.captured' || eventType === 'payment.failed'
+        || eventType === 'refund.processed') {
+      logger.info(
+        { eventType, payment_id: event.payload?.payment?.entity?.id
+          || event.payload?.refund?.entity?.payment_id || null },
+        'razorpay_payment_event_not_recorded'
+      );
     }
+
     // Unknown event types are acknowledged but ignored
     res.json({ received: true });
   } catch (err) {

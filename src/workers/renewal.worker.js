@@ -77,7 +77,22 @@ async function runAutoRenew() {
       const payment = order.status === 'created'
         ? await razorpay.capturePayment(order.id, m.price * 100)
         : null;
-      const charge = payment || { id: order.id, status: order.status, amount: m.price };
+      // Logged rather than discarded. The ledger row that used to record this
+      // charge is gone with the legacy `payments` table (see step 4), which
+      // means an auto-renew now moves money and writes nothing a read path can
+      // see. Until auto-renew is rebuilt on pt_clients/pt_payments, this log
+      // line is the only trace — so it carries the gateway ids needed to
+      // reconcile against a Razorpay statement by hand.
+      logger.info(
+        {
+          member_id: m.member_id,
+          amount: m.price,
+          order_id: order.id,
+          payment_id: payment ? payment.id : null,
+          status: payment ? payment.status : order.status,
+        },
+        'auto_renew_charged_without_ledger_entry'
+      );
 
       // 2. Create new membership
       const newEnd = new Date();
@@ -94,12 +109,22 @@ async function runAutoRenew() {
       // 3. Mark old as expired
       await client.query(`UPDATE member_memberships SET status='expired' WHERE id = $1`, [m.id]);
 
-      // 4. Record payment
-      await client.query(
-        `INSERT INTO payments (member_id, amount, method, date, gateway, gateway_txn_id, gateway_status, branch_id)
-         VALUES ($1,$2,'RAZORPAY', CURRENT_DATE, 'razorpay', $3, $4, COALESCE($5, 'br-main'))`,
-        [m.member_id, m.price, charge.id, charge.status, process.env.BRANCH_ID || null]
-      );
+      // 4. Record payment — removed with the legacy ledger.
+      //
+      // This wrote `INSERT INTO payments (member_id, ...)`. Two reasons it is
+      // gone rather than repointed:
+      //
+      //  · The table is being dropped. It has no organization_id, so every row
+      //    it ever wrote would have been unattributable to a studio.
+      //  · pt_payments is keyed on client_id and has no member_id, no gateway
+      //    columns and no branch_id. This flow is the gym-era membership model
+      //    — `members` and `member_memberships` both hold 0 rows in production
+      //    — so there is no client to key a canonical payment to.
+      //
+      // The charge itself still happens above and the membership rows are
+      // still written; what stops is the ledger entry, which no read path
+      // could see. When auto-renew is rebuilt on pt_clients it gets a
+      // pt_payments row with an organization_id, like every other payment.
 
       await client.query('COMMIT');
 

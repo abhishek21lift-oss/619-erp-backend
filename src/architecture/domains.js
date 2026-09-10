@@ -174,12 +174,14 @@ const DOMAINS = {
     tenancy: TENANCY.DIRECT,
     description: 'What a CLIENT pays the studio: payments, invoices, expenses, receipts.',
     dependsOn: ['tenancy', 'clients', 'packages-enrolment'],
+    // pt_payments is the single payment ledger. The legacy `payments` table
+    // that sat at the end of this list — and in legacyTables beside it — is
+    // dropped by migration 191; it had no organization_id, so nothing it held
+    // could be attributed to a studio.
     tables: [
       'pt_payments', 'payment_orders', 'payment_submissions', 'payment_settings',
       'payment_audit_logs', 'invoices', 'invoice_items', 'expenses', 'receipt_counter',
-      'payments',
     ],
-    legacyTables: ['payments'],
   },
 
   compensation: {

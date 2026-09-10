@@ -63,10 +63,22 @@ describe('payment writes are audited', () => {
     expect(logAt).toBeGreaterThan(commitAt);
   });
 
-  it('logs delete on both ledgers it can delete from (canonical pt_payments and the legacy table)', () => {
+  it('logs the delete on the one ledger it can delete from', () => {
+    // Two, until migration 191. The second was the legacy `payments` fallback,
+    // which ran when the pt_payments UPDATE matched nothing and carried no
+    // organization clause — a cross-tenant delete by id against a populated
+    // table, and a no-op against this one, which has been empty since PT-OS
+    // shipped. pt_payments is the only ledger now, so there is one delete to
+    // audit and it must still be audited.
     const del = payments.slice(payments.indexOf("router.delete('/:id'"));
     const calls = [...del.matchAll(/logActivity\(req, 'payment\.delete'/g)];
-    expect(calls.length).toBe(2);
+    expect(calls.length).toBe(1);
+    // And it stays after the COMMIT, for the same reason the create does: a
+    // log line written before a rollback is a record of something that did not
+    // happen.
+    const commitAt = del.indexOf("tx.query('COMMIT')");
+    expect(commitAt).toBeGreaterThan(-1);
+    expect(del.indexOf("logActivity(req, 'payment.delete'")).toBeGreaterThan(commitAt);
   });
 
   it('every logActivity call in this file is awaited', () => {

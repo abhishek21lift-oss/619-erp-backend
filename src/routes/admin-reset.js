@@ -21,9 +21,12 @@ const MAX_OTP_ATTEMPTS = 5;
 const OTP_LOCK_MS      = 15 * 60 * 1000; // 15 minutes
 
 const ALLOWED_TABLES = new Set([
-  'attendance_logs', 'payments', 'subscriptions', 'invoices', 'outstanding_dues',
+  // `payments` and `clients` are absent: both tables are dropped, and a reset
+  // routine naming a table that does not exist is a statement that can only
+  // ever raise. pt_payments below is the canonical ledger.
+  'attendance_logs', 'subscriptions', 'invoices', 'outstanding_dues',
   'client_goals', 'transformations', 'face_embeddings', 'notifications', 'message_logs',
-  'clients', 'clients_id_seq', 'payments_id_seq', 'attendance_logs_id_seq',
+  'clients_id_seq', 'payments_id_seq', 'attendance_logs_id_seq',
   'subscriptions_id_seq', 'invoices_id_seq',
   // PT-OS tables
   'pt_clients', 'pt_payments', 'pt_sessions', 'pt_assessments', 'pt_goals',
@@ -147,7 +150,6 @@ router.post('/reset-all-data', async (req, res) => {
     await client.query('BEGIN');
 
     await deleteIfExists(client, 'attendance_logs');
-    await deleteIfExists(client, 'payments');
     await deleteIfExists(client, 'subscriptions');
     await deleteIfExists(client, 'invoices');
     await dropIfExists(client, 'outstanding_dues');
