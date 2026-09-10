@@ -279,6 +279,131 @@ async function insertQueued(entry) {
   return rows[0] ? rows[0].id : null;
 }
 
+// ── The daily limit, enforced rather than consulted ─────────────────────────
+//
+// `sendsToday()` above answers a question. It cannot enforce anything, and the
+// engine used to use it as though it could:
+//
+//     const used = await repo.sendsToday(orgId);      // ← reads 199
+//     if (used >= limit) return DAILY_LIMIT_REACHED;  // ← 199 < 200, proceed
+//     await repo.insertQueued(...)                    // ← writes row 200
+//
+// Two automation events arriving at once both read 199, both decide they are
+// under the limit, and both insert: 201 messages against a limit of 200. The
+// window is small and it is not rare — a sweep morning queues every studio's
+// birthdays, expiries and absences within the same second, and the API serves
+// concurrent requests by design. The limit is a safety limit on how many
+// messages a studio's own WhatsApp number can emit in a day before Meta treats
+// it as spam, so exceeding it is not a counting error, it is the risk the
+// setting exists to bound.
+//
+// ── Why an advisory lock and not a cleverer statement ───────────────────────
+//
+// The obvious repair is one statement — INSERT ... SELECT WHERE (SELECT
+// count(*)) < limit — and it does not work. The count is a read, it takes no
+// lock, and under READ COMMITTED two concurrent transactions evaluate it
+// against the same snapshot and both proceed. Nothing about writing it as one
+// statement makes the check-then-act atomic.
+//
+// A counter table with `UPDATE ... WHERE used < limit` would be atomic, and it
+// would introduce a second source of truth that can drift from
+// communication_logs — the number enforced and the number the studio sees on
+// its own log page would be maintained by different code. So instead the count
+// stays exactly where it was, and the check-and-insert is serialised per
+// studio by a transaction-scoped advisory lock.
+//
+// ── Why this cannot let one studio consume another's quota ──────────────────
+//
+// The lock key is derived from the org id, so studios do not normally contend.
+// hashtext() is 32-bit, so two org ids CAN collide onto one key — and the
+// consequence of a collision is only that those two studios briefly serialise
+// against each other. It is not a correctness problem: the COUNT and the
+// INSERT inside the lock are both bound to `entry.orgId`, so a studio holding
+// the lock can only ever count and insert its own rows. A collision costs a
+// few milliseconds of waiting, never a row.
+//
+// pg_advisory_xact_lock releases on COMMIT or ROLLBACK — there is no unlock to
+// forget and no way for a crashed request to hold it.
+
+/**
+ * A fixed namespace for this lock, so it cannot collide with any other
+ * advisory lock this application takes for a different purpose.
+ */
+const DAILY_LIMIT_LOCK_NS = 619001;
+
+/**
+ * Count today's automated messages and queue one more, atomically, refusing
+ * both a duplicate event and a message over the studio's daily limit.
+ *
+ * Replaces the `sendsToday()` + compare + `insertQueued()` sequence with a
+ * single serialised operation. Returns which of the three things happened, so
+ * the engine keeps reporting the same outcomes it always did.
+ *
+ * @returns {Promise<{outcome: 'queued'|'duplicate_event'|'daily_limit_reached',
+ *                    logId: string|null, usedToday: number}>}
+ */
+async function insertQueuedWithinLimit(entry, dailyLimit) {
+  const limit = Number(dailyLimit);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Serialise this studio's check-and-insert. Taken FIRST, before the count,
+    // or the count would be read outside the mutual exclusion it exists to be
+    // protected by.
+    await client.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [
+      DAILY_LIMIT_LOCK_NS,
+      String(entry.orgId),
+    ]);
+
+    const { rows: counted } = await client.query(
+      `SELECT COUNT(*)::INT AS n
+         FROM communication_logs
+        WHERE organization_id = $1
+          AND automation_rule_id IS NOT NULL
+          AND created_at >= date_trunc('day', NOW())`,
+      [entry.orgId]
+    );
+    const usedToday = counted[0].n;
+
+    // `!Number.isFinite(limit)` covers a studio with no settings row, whose
+    // defaulted limit is 0 — closed, like every other default in this file.
+    if (!Number.isFinite(limit) || usedToday >= limit) {
+      await client.query('COMMIT');
+      return { outcome: 'daily_limit_reached', logId: null, usedToday };
+    }
+
+    const { rows } = await client.query(
+      `INSERT INTO communication_logs
+         (organization_id, recipient_type, recipient_id, recipient_name, recipient_phone,
+          channel, direction, template, message, status, automation_rule_id, automation_dedupe_key)
+       VALUES ($1,$2,$3,$4,$5,'whatsapp','outgoing',$6,$7,'queued',$8,$9)
+       ON CONFLICT (organization_id, automation_dedupe_key)
+         WHERE automation_dedupe_key IS NOT NULL DO NOTHING
+       RETURNING id`,
+      [
+        entry.orgId, entry.recipientType, entry.recipientId, entry.recipientName,
+        entry.recipientPhone, entry.template, entry.message, entry.ruleId, entry.dedupeKey,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    // No row means the dedupe index refused it — the same event already
+    // produced this message. Deliberately NOT counted against the limit, and
+    // deliberately still distinguished from a queued row: the engine reports
+    // DUPLICATE_EVENT, exactly as it did before this function existed.
+    return rows[0]
+      ? { outcome: 'queued', logId: rows[0].id, usedToday }
+      : { outcome: 'duplicate_event', logId: null, usedToday };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * The queued message a job refers to, scoped to the org ON THE ROW.
  *
@@ -299,24 +424,87 @@ async function loadQueued(orgId, logId) {
   return rows[0] || null;
 }
 
-/** Mark a message sent, recording which provider carried it and its id. */
+// ── The status ladder ───────────────────────────────────────────────────────
+//
+//   queued → sent → delivered → read
+//
+// It only ever moves forwards, and that is enforced in SQL rather than in the
+// callers, because the two things that move it run CONCURRENTLY and neither
+// can see the other:
+//
+//   · the worker, which calls markSent() when the gateway's HTTP response
+//     comes back, and
+//   · the webhook, which calls applyReceipt() when the gateway posts a
+//     delivery or read receipt.
+//
+// WhatsApp acknowledges a message to the sending socket and reports its
+// delivery over two different paths, and nothing orders them. A receipt can
+// therefore be applied while the worker's send call is still in flight — the
+// row reaches 'delivered', and then markSent() lands and writes 'sent' over
+// it. The message really was delivered; the log says it was merely sent, the
+// studio's delivery report under-counts, and no error is raised anywhere.
+//
+// `TERMINAL_STATUSES` is the set markSent and markFailed may not overwrite.
+// applyReceipt has its own CASE for the same reason — it has to distinguish
+// delivered from read, which this does not.
+const TERMINAL_STATUSES = "('delivered','read')";
+
+/**
+ * Mark a message sent, recording which provider carried it and its id.
+ *
+ * ── Why the CASE rather than `SET status = 'sent'` ──────────────────────────
+ *
+ * See the ladder above: a receipt may already have moved this row past 'sent',
+ * and a plain assignment would pull it back. The CASE makes the transition
+ * monotonic in the one place every caller goes through, so no caller has to
+ * remember — and, being a single UPDATE, it takes the row lock for the whole
+ * read-modify-write. A concurrent applyReceipt on the same row waits for it
+ * and then re-reads; there is no window between the check and the write.
+ *
+ * ── Why the facts are still recorded on a row it will not move ──────────────
+ *
+ * external_id, provider and sent_at are written even when the status stays
+ * 'delivered'. They are facts about the send, not about the ladder, and the
+ * row needs them: external_id is what a later receipt matches on, so refusing
+ * to record it would strand every receipt that follows.
+ *
+ * COALESCE on sent_at, not NOW(): a retried job must not restate when the
+ * message went out. The first send is the send.
+ */
 async function markSent(orgId, logId, { providerId, provider }) {
-  await pool.query(
+  const { rowCount } = await pool.query(
     `UPDATE communication_logs
-        SET status = 'sent', external_id = $3, provider = $4,
-            sent_at = NOW(), failure_reason = NULL
+        SET status = CASE WHEN status IN ${TERMINAL_STATUSES} THEN status ELSE 'sent' END,
+            external_id = COALESCE($3, external_id),
+            provider = COALESCE($4, provider),
+            sent_at = COALESCE(sent_at, NOW()),
+            failure_reason = NULL
       WHERE id = $1 AND organization_id = $2`,
     [logId, orgId, providerId, provider]
   );
+  return rowCount;
 }
 
+/**
+ * Record a delivery failure.
+ *
+ * Guarded by the same ladder, and for a sharper reason than markSent's: a
+ * message the client has demonstrably received must never end up logged as
+ * failed. That happens on the retry path — the gateway's send-once refuses a
+ * second attempt with DUPLICATE_MESSAGE, which arrives here as a failure,
+ * while the first attempt's message was delivered and its receipt already
+ * applied. markFailedByClientId has carried this guard since it was written;
+ * this is the same rule on the other entry point.
+ */
 async function markFailed(orgId, logId, { reason, provider }) {
-  await pool.query(
+  const { rowCount } = await pool.query(
     `UPDATE communication_logs
         SET status = 'failed', failure_reason = $3, provider = COALESCE($4, provider)
-      WHERE id = $1 AND organization_id = $2`,
+      WHERE id = $1 AND organization_id = $2
+        AND status NOT IN ${TERMINAL_STATUSES}`,
     [logId, orgId, reason, provider || null]
   );
+  return rowCount;
 }
 
 /**
@@ -366,6 +554,78 @@ async function markFailedByClientId(orgId, logId, reason) {
     [logId, orgId, reason]
   );
   return rowCount;
+}
+
+/**
+ * Queued automation rows that may have lost their BullMQ job.
+ *
+ * ── The gap this closes ─────────────────────────────────────────────────────
+ *
+ * The engine writes the row, then enqueues the job. That order is deliberate
+ * and stays — a job with no row is a message a client receives that this
+ * system has no record of, which is strictly worse than the reverse. But the
+ * reverse is not free: if the enqueue returns null (Redis down) or the process
+ * dies in between, the row sits at 'queued' forever. Its dedupe key then makes
+ * the situation permanent, because the next identical business event is
+ * correctly refused as a duplicate of a message that never went out.
+ *
+ * ── Why this returns CANDIDATES and not orphans ─────────────────────────────
+ *
+ * Being old and still queued does not mean the job is missing. A rule with a
+ * three-day delay leaves its row queued for three days by design. Only Redis
+ * knows whether the job exists, so the caller asks it — this narrows the set
+ * to something worth asking about.
+ *
+ * ── The two time bounds, which are both safety properties ───────────────────
+ *
+ * `olderThanSec` (lower bound) keeps the sweep away from rows the engine is
+ * still mid-flight on: a row inserted a millisecond ago has not failed to be
+ * enqueued, it simply has not been enqueued yet. Re-driving those would race
+ * the engine for no benefit.
+ *
+ * `maxAgeSec` (upper bound) is the one that matters. The gateway's send-once
+ * ledger is what guarantees a re-drive cannot deliver a second copy, and that
+ * ledger has a TTL (WA_SEND_DEDUPE_TTL_SEC). Past it the gateway can no longer
+ * recognise the message as one it has already sent, so a row older than the
+ * ledger's memory is left alone for a human to decide about rather than
+ * re-driven on a guarantee that has expired. Belt and braces — a row that
+ * genuinely never reached the gateway has nothing to duplicate — but the cost
+ * of being wrong here is a real client receiving the same message twice.
+ *
+ * ── Why the rule is joined ──────────────────────────────────────────────────
+ *
+ * To recover the REMAINING delay. Re-enqueueing a "three days before expiry"
+ * reminder with no delay would deliver it the moment the sweep noticed, which
+ * is the exact failure enqueueWhatsapp refuses to risk when it declines to
+ * send inline. The join carries the org on both sides, so a rule id can only
+ * ever be resolved against a rule this studio owns.
+ */
+async function orphanCandidates(orgId, { olderThanSec, maxAgeSec, limit = 200 }) {
+  const { rows } = await pool.query(
+    `SELECT c.id,
+            GREATEST(
+              0,
+              FLOOR(EXTRACT(EPOCH FROM (
+                c.created_at + make_interval(mins => COALESCE(r.delay_minutes, 0)) - NOW()
+              )) * 1000)
+            )::BIGINT AS remaining_delay_ms
+       FROM communication_logs c
+       LEFT JOIN automation_rules r
+              ON r.id = c.automation_rule_id
+             AND r.organization_id = c.organization_id
+      WHERE c.organization_id = $1
+        AND c.status = 'queued'
+        AND c.automation_rule_id IS NOT NULL
+        AND c.created_at <= NOW() - make_interval(secs => $2)
+        AND c.created_at >= NOW() - make_interval(secs => $3)
+      ORDER BY c.created_at
+      LIMIT $4`,
+    [orgId, olderThanSec, maxAgeSec, limit]
+  );
+  // BIGINT arrives as a string from node-postgres. Coerced here rather than at
+  // the call site so nobody passes "60000" to BullMQ's delay and gets a job
+  // scheduled by string concatenation.
+  return rows.map((r) => ({ id: r.id, remainingDelayMs: Number(r.remaining_delay_ms) }));
 }
 
 // ── The scheduled sweeps ────────────────────────────────────────────────────
@@ -663,11 +923,13 @@ module.exports = {
   clientRecipient,
   leadRecipient,
   insertQueued,
+  insertQueuedWithinLimit,
   loadQueued,
   markSent,
   markFailed,
   applyReceipt,
   markFailedByClientId,
+  orphanCandidates,
   orgsWithAutomationOn,
   activeTriggerEventsFor,
   membershipExpiringIn,

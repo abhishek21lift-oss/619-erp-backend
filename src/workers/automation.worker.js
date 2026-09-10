@@ -30,8 +30,10 @@ const { Worker } = require('bullmq');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 const { runSweep } = require('../modules/automation/automation.sweep');
+const { runRecovery } = require('../modules/automation/automation.recovery');
 
 const SWEEP_JOB_ID = 'automation-daily-sweep';
+const RECOVERY_JOB_ID = 'automation-orphan-recovery';
 
 /**
  * When the sweep runs.
@@ -44,9 +46,22 @@ const SWEEP_JOB_ID = 'automation-daily-sweep';
  */
 const DEFAULT_SWEEP_CRON = '30 3 * * *';
 
+/**
+ * How often to look for queued rows whose BullMQ job never made it.
+ *
+ * Every fifteen minutes, not daily. This is a repair for an outage — a Redis
+ * blip, a process killed mid-enqueue — and the row it repairs is a message a
+ * studio believes it has sent. Waiting until tomorrow morning to notice would
+ * make the repair useless for anything time-sensitive, which is most of what
+ * automation sends. It is cheap: with nothing stranded it is one indexed query
+ * per studio that has automation on.
+ */
+const DEFAULT_RECOVERY_CRON = '*/15 * * * *';
+
 async function processSweepJob(job) {
-  if (job.name !== 'daily') throw new Error(`Unknown automation job: ${job.name}`);
-  return runSweep();
+  if (job.name === 'daily') return runSweep();
+  if (job.name === 'recovery') return runRecovery();
+  throw new Error(`Unknown automation job: ${job.name}`);
 }
 
 function createAutomationWorker() {
@@ -85,6 +100,7 @@ function createAutomationWorker() {
  */
 async function scheduleAutomationSweep() {
   const cron = process.env.AUTOMATION_SWEEP_CRON || DEFAULT_SWEEP_CRON;
+  const recoveryCron = process.env.AUTOMATION_RECOVERY_CRON || DEFAULT_RECOVERY_CRON;
   const { automationSweepQueue } = require('../jobs/queue');
 
   const withTimeout = (p, ms) =>
@@ -116,12 +132,38 @@ async function scheduleAutomationSweep() {
     }
   ), 5000);
 
-  logger.info({ cron }, 'automation sweep cron scheduled');
-  return { jobSchedulerId: SWEEP_JOB_ID };
+  await withTimeout(automationSweepQueue.upsertJobScheduler(
+    RECOVERY_JOB_ID,
+    { pattern: recoveryCron },
+    {
+      name: 'recovery',
+      data: {},
+      opts: {
+        // attempts: 1 for the same reason the sweep uses it — this pass is
+        // idempotent by construction (a job that exists is not re-added, and a
+        // row that has left 'queued' is not a candidate), so the next interval
+        // is a better retry than an immediate one.
+        attempts: 1,
+        removeOnComplete: true,
+        removeOnFail: true,
+      },
+    }
+  ), 5000);
+
+  logger.info({ cron, recoveryCron }, 'automation sweep cron scheduled');
+  return {
+    sweep: { jobSchedulerId: SWEEP_JOB_ID },
+    recovery: { jobSchedulerId: RECOVERY_JOB_ID },
+    jobSchedulerId: SWEEP_JOB_ID,
+  };
 }
 
 if (require.main === module) {
+  // One pass of both, then exit — the shape an operator wants when re-driving
+  // by hand. Recovery runs after the sweep so anything the sweep queues and
+  // fails to enqueue in this same run is picked up before the process ends.
   runSweep()
+    .then(async (summary) => ({ summary, recovery: await runRecovery() }))
     .then((summary) => {
       logger.info({ summary }, 'automation sweep run finished');
       process.exit(0);
@@ -137,5 +179,7 @@ module.exports = {
   scheduleAutomationSweep,
   processSweepJob,
   SWEEP_JOB_ID,
+  RECOVERY_JOB_ID,
   DEFAULT_SWEEP_CRON,
+  DEFAULT_RECOVERY_CRON,
 };
