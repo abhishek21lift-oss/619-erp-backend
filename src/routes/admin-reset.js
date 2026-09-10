@@ -170,14 +170,13 @@ router.post('/reset-all-data', async (req, res) => {
     await deleteIfExists(client, 'pt_consent_records');
     await deleteIfExists(client, 'pt_client_renewals');
     await deleteIfExists(client, 'pt_client_subscriptions');
-    // Legacy tables (kept for backward compatibility; empty in production)
-    if ((await client.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists) {
-      await client.query(`UPDATE clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`);
-      await client.query(`DELETE FROM clients`);
-    }
+    // The `clients` branch that used to sit here is gone. It was guarded by a
+    // to_regclass() existence check and so never ran — migration 170 dropped
+    // that table — but a reset routine is the last place to leave a statement
+    // against a table that does not exist. pt_clients above is the only client
+    // table this system has.
 
     const seqs = [
-      'clients_id_seq',
       'payments_id_seq',
       'attendance_logs_id_seq',
       'subscriptions_id_seq',
@@ -253,11 +252,8 @@ router.post('/reset-outstanding-dues', async (req, res) => {
     await deleteIfExists(pool, 'payments');
     await deleteIfExists(pool, 'pt_payments');
     await deleteIfExists(pool, 'pt_client_renewals');
-    const hasLegacyClients = (await pool.query("SELECT to_regclass('public.clients') AS exists")).rows[0].exists;
-    if (hasLegacyClients) {
-      await pool.query(`UPDATE clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`).catch(() => {});
-    }
-    // Also reset PT client balances
+    // pt_clients is the only client table; the guarded `clients` reset that
+    // used to precede this was dead code against a dropped table.
     await pool.query(`UPDATE pt_clients SET balance_amount = 0 WHERE COALESCE(balance_amount, 0) <> 0`).catch(() => {});
     res.json({ success: true, message: 'Payments and dues-related data cleared safely, and client balances were reset to zero.' });
   } catch (err) {

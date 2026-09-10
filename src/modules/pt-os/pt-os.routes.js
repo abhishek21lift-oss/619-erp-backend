@@ -180,9 +180,71 @@ router.get('/dashboard', auth, wrap(async (req, res) => {
 router.get('/clients', auth, wrap(async (req, res) => {
   const trainerId = req.query.trainer_id;
   const tid = req.user.role === 'trainer' ? req.user.trainer_id : trainerId;
-  const rows = await svc.getActiveClients(tid, tenantScope(req));
+  // search/status/dues/limit/offset are inherited from the retired
+  // GET /api/clients, whose callers still pass them. Forwarded rather than
+  // dropped — see getActiveClients.
+  const rows = await svc.getActiveClients(tid, tenantScope(req), {
+    search: req.query.search,
+    status: req.query.status,
+    dues: req.query.dues,
+    limit: req.query.limit,
+    offset: req.query.offset,
+    includeDeleted: req.query.include_deleted === '1',
+  });
   res.json({ data: rows, total: rows.length });
 }));
+
+// ─── Inherited from the retired /api/clients mount ───────────
+//
+// These three were the only endpoints on that mount whose behaviour did not
+// already exist here; the other four (list, get, update, delete) duplicated a
+// pt-os handler over the same pt_clients table. All the SQL lives in
+// pt-os.service.js, so this adapter's literal count is unchanged.
+//
+// `/clients/search` MUST stay above `/clients/:id`, like /duplicates and
+// /birthdays above — otherwise Express matches "search" as an id.
+router.get('/clients/search', auth, wrap(async (req, res) => {
+  // A trainer sees only their own roster, and a trainer with no linked record
+  // sees nothing. Note what is passed for a non-trainer: the key is OMITTED,
+  // not set to null. searchClients treats undefined as "no restriction" and
+  // every other value — null included — as "restrict to this id", so a trainer
+  // whose trainer_id is null gets `trainer_id = NULL`, which matches nothing.
+  // Sending null for both cases is the bug this shape exists to prevent.
+  const rows = await svc.searchClients({
+    q: req.query.q,
+    limit: req.query.limit,
+    ...(req.user.role === 'trainer' ? { trainerId: req.user.trainer_id || null } : {}),
+    scope: tenantScope(req),
+    branch: req.branchScope,
+  });
+  res.json(rows);
+}));
+
+/**
+ * One client's check-in history and payment history.
+ *
+ * Both resolve the client first, org-scoped, and both then apply the trainer
+ * rule: a trainer may only read their own client, and a trainer with no linked
+ * record is refused rather than allowed through. 404 before 403 on purpose —
+ * a client that is not this studio's must not be distinguishable from one that
+ * does not exist, and answering 403 would confirm the id is real.
+ */
+async function clientHistory(req, res, load) {
+  const client = await svc.findClientForAccess(req.params.id, tenantScope(req));
+  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  if (req.user.role === 'trainer'
+      && (!req.user.trainer_id || client.trainer_id !== req.user.trainer_id)) {
+    return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied' } });
+  }
+  const rows = await load(req.params.id, { limit: req.query.limit, offset: req.query.offset });
+  return res.json(rows);
+}
+
+router.get('/clients/:id/attendance', auth, wrap((req, res) =>
+  clientHistory(req, res, svc.getClientAttendance)));
+
+router.get('/clients/:id/payments', auth, wrap((req, res) =>
+  clientHistory(req, res, svc.getClientPayments)));
 
 // ─── Duplicate Client Audit (MUST be before /clients/:id) ───
 router.get('/clients/duplicates', auth, adminOnly, wrap(async (req, res) => {

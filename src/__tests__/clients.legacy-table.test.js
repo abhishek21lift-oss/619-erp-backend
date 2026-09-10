@@ -1,4 +1,4 @@
-// Nothing mounted at /api/clients may touch the legacy `clients` table.
+// No runtime code anywhere may touch the legacy `clients` table.
 //
 // ── Why this table is different from every other one ────────────────────────
 //
@@ -22,12 +22,23 @@
 // ── Why a source scan and not a request test ────────────────────────────────
 //
 // The bug is not "returns the wrong answer" — it is "this query exists at all".
-// A request test would need a database with rows in a table that is supposed to
-// stay empty, and it would pass for the wrong reason (404) right up until the
-// day it stopped passing for the wrong reason.
+// A request test would need a database with rows in a table that no longer
+// exists, and it would pass for the wrong reason (404) right up until the day
+// it stopped passing for the wrong reason.
 //
-// The mount list is read out of server.js rather than hardcoded, so a second
-// router added to /api/clients is covered the day it is added.
+// ── Why this now scans everything instead of one mount ──────────────────────
+//
+// It used to read server.js for whatever was mounted at /api/clients and scan
+// only those files. That mount is gone: /api/clients was a second HTTP surface
+// over pt_clients and its handlers moved to /api/pt-os/clients. A guard scoped
+// to a mount that no longer exists would scan an empty list and pass
+// vacuously — the worst possible outcome for a security test.
+//
+// So the scan widened to every runtime .js under src/, which is also what the
+// rule always meant. The table is gone from the database (migration 170), so
+// ANY statement naming it is a query against nothing: a guaranteed 500 if it is
+// ever reached, not merely an unscopable read. There is no file left where it
+// would be acceptable.
 'use strict';
 
 const fs = require('fs');
@@ -45,33 +56,55 @@ const SERVER = path.join(SRC, 'server.js');
  */
 const LEGACY_SQL = /\b(?:FROM|UPDATE|INTO|JOIN)\s+(?<!_)clients\b/i;
 
-/** Which files does server.js mount at /api/clients? */
-function mountedAtApiClients() {
-  const server = fs.readFileSync(SERVER, 'utf8');
-  const files = [];
-  // app.use('/api/clients', ..., require('./routes/whatever'))
-  const re = /app\.use\(\s*'\/api\/clients'[^\n]*require\('(\.[^']+)'\)/g;
-  let m;
-  while ((m = re.exec(server)) !== null) files.push(m[1]);
-  return files;
+/**
+ * Every runtime .js file under src/, excluding tests and migrations.
+ *
+ * Tests are excluded because this very file quotes the forbidden SQL in order
+ * to prove its own regex works. Migrations are excluded because the history of
+ * the table — creating it, and 170 dropping it — is legitimately written in
+ * SQL that names it.
+ */
+function runtimeFiles(dir = SRC, out = []) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (e.name === '__tests__' || e.name === 'migrations' || e.name === 'node_modules') continue;
+      runtimeFiles(full, out);
+    } else if (e.name.endsWith('.js')) {
+      out.push(full);
+    }
+  }
+  return out;
 }
 
-function resolveRoute(rel) {
-  const base = path.join(SRC, rel);
-  return fs.existsSync(base) ? base : `${base}.js`;
-}
-
-describe('/api/clients and the un-scopable legacy table', () => {
-  test('at least one router is mounted there — the scan has something to scan', () => {
-    // Without this, deleting the mount entirely would make every assertion
-    // below pass against nothing at all.
-    expect(mountedAtApiClients().length).toBeGreaterThan(0);
+describe('the legacy clients table is gone and stays gone', () => {
+  test('the scan can see a meaningful number of files', () => {
+    // Without this, a broken walk would make every assertion below pass
+    // against nothing at all — which is exactly how the previous version of
+    // this guard would have failed silently once its mount was removed.
+    expect(runtimeFiles().length).toBeGreaterThan(50);
   });
 
-  test('no file mounted at /api/clients reads or writes the legacy `clients` table', () => {
+  test('/api/clients is no longer mounted at all', () => {
+    // The consolidation this guard now protects: one HTTP surface over
+    // pt_clients, at /api/pt-os/clients. A second mount reappearing is how the
+    // duplication started the first time.
+    const server = fs.readFileSync(SERVER, 'utf8');
+    const mounts = server
+      .split('\n')
+      .filter((l) => !l.trim().startsWith('//'))
+      .filter((l) => /app\.use\(\s*'\/api\/clients'/.test(l));
+    expect(mounts).toEqual([]);
+  });
+
+  test('routes/clients.js is gone, not merely unmounted', () => {
+    expect(fs.existsSync(path.join(SRC, 'routes', 'clients.js'))).toBe(false);
+  });
+
+  test('no runtime file reads or writes the legacy `clients` table', () => {
     const offenders = [];
-    for (const rel of mountedAtApiClients()) {
-      const file = resolveRoute(rel);
+    for (const file of runtimeFiles()) {
+      const rel = path.relative(SRC, file);
       const lines = fs.readFileSync(file, 'utf8').split('\n');
       lines.forEach((line, i) => {
         // Comments are the record of WHY these were removed; they quote the

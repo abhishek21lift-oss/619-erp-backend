@@ -737,7 +737,13 @@ app.use('/api/search',            auth, requireStaff, require('./routes/search')
 // org-scoped equivalents live under /api/pt-os/clients.
 // See src/__tests__/clients.legacy-table.test.js, which fails if anything
 // mounted here starts reading that table again.
-app.use('/api/clients',           userApiLimiter, auth, requireStaff, require('./routes/clients'));
+// /api/clients is retired. It was a second HTTP surface over pt_clients — the
+// legacy `clients` table it was named after was dropped by migration 170 and
+// nothing has read it since. Four of its seven endpoints duplicated a pt-os
+// handler over the same rows; the other three (search, :id/attendance,
+// :id/payments) moved to /api/pt-os/clients, where the rest of the client API
+// already lived. Removed outright rather than left as an alias: two URLs for
+// one resource is how the duplication started.
 
 // requireStaff: returns t.* per trainer PLUS month_revenue and
 // all_time_revenue. Staff earnings are not client-facing data.

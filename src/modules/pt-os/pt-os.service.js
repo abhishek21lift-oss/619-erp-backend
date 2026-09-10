@@ -150,11 +150,31 @@ async function getBalanceSheet(trainerId, scope = {}) {
   return rows;
 }
 
-async function getActiveClients(trainerId, scope = {}) {
-  // Returns ALL non-deleted PT clients so the "All Clients" page can show
-  // every status. The frontend applies its own status filter on top.
-  const where = ['c.deleted_at IS NULL'];
+/**
+ * The studio's PT clients, optionally filtered.
+ *
+ * ── Why the filters exist ───────────────────────────────────────────────────
+ *
+ * `search`, `status`, `dues`, `limit`, `offset` and `includeDeleted` are
+ * inherited from GET /api/clients, the retired second surface over this same
+ * table. Its callers pass them today — the command palette searches, the
+ * finance pages ask for 2000 rows, several pages ask for status 'active' — so
+ * dropping them on the way across would have been a silent functional
+ * regression dressed up as a consolidation. They are applied here rather than
+ * left to the frontend because "fetch everything and filter in the browser" is
+ * what the limit exists to prevent.
+ *
+ * Unfiltered behaviour is unchanged: no options still returns every
+ * non-deleted client, which is what the All Clients page relies on.
+ */
+async function getActiveClients(trainerId, scope = {}, opts = {}) {
+  const where = ['TRUE'];
   const params = [];
+
+  // Soft-deleted rows stay hidden unless explicitly asked for, which only an
+  // operator view does.
+  if (!opts.includeDeleted) where.push('c.deleted_at IS NULL');
+
   if (trainerId) {
     params.push(trainerId);
     where.push(`c.trainer_id = $${params.length}`);
@@ -163,6 +183,20 @@ async function getActiveClients(trainerId, scope = {}) {
     params.push(scope.orgId);
     where.push(`c.organization_id = $${params.length}`);
   }
+  if (opts.search && String(opts.search).trim()) {
+    params.push(`%${String(opts.search).trim()}%`);
+    const p = params.length;
+    where.push(`(c.name ILIKE $${p} OR c.mobile ILIKE $${p} OR c.client_id ILIKE $${p} OR c.email ILIKE $${p})`);
+  }
+  if (opts.status) {
+    params.push(opts.status);
+    where.push(`c.status = $${params.length}`);
+  }
+  if (opts.dues === '1' || opts.dues === true) {
+    where.push('c.balance_amount > 0');
+  }
+
+  const page = pageClause(opts.limit, opts.offset, params.length);
   const { rows } = await pool.query(`
     SELECT c.id, c.unique_id, c.client_id, c.name, c.gender, c.mobile, c.email,
            c.photo_url, c.dob, c.weight, c.notes, c.address, c.emergency_contact,
@@ -185,9 +219,30 @@ async function getActiveClients(trainerId, scope = {}) {
       GROUP BY client_id
     ) pp ON pp.client_id = c.id
     WHERE ${where.join(' AND ')}
-    ORDER BY c.name
-  `, params);
+    ORDER BY c.name${page.sql}
+  `, [...params, ...page.params]);
   return rows;
+}
+
+/**
+ * LIMIT/OFFSET, applied only when the caller actually asked for a page.
+ *
+ * Absent means NO limit, which is what this function has always done and what
+ * the All Clients page depends on — a studio with 600 clients must not
+ * silently see 500. The retired endpoint defaulted to 500 whether or not
+ * anyone asked, and that implicit truncation is not worth inheriting.
+ *
+ * The ceiling is 2000 rather than the old 1000 because the finance pages ask
+ * for exactly 2000 today; clamping them to 1000 would have been the same
+ * silent truncation from the other direction.
+ */
+function pageClause(limit, offset, alreadyBound) {
+  if (limit === undefined || limit === null || limit === '') return { sql: '', params: [] };
+  const capped = Math.min(Math.max(parseInt(limit, 10) || 500, 1), 2000);
+  return {
+    sql: ` LIMIT $${alreadyBound + 1} OFFSET $${alreadyBound + 2}`,
+    params: [capped, clampOffset(offset)],
+  };
 }
 
 async function getDashboardStats(scope = {}) {
@@ -627,11 +682,174 @@ async function getOpsSummary(scope = {}) {
   };
 }
 
+// ── The three endpoints inherited from routes/clients.js ────────────────────
+//
+// /api/clients and /api/pt-os/clients were two HTTP surfaces over one table.
+// Both read pt_clients; the legacy `clients` table they were named after was
+// dropped by migration 170 and no code has touched it since. Four of the seven
+// endpoints on the old mount duplicated a pt-os one outright (list, get,
+// update, delete); these three were the only behaviour that existed nowhere
+// else, so they move here and the old mount goes.
+//
+// They land in the SERVICE rather than in pt-os.routes.js deliberately. That
+// adapter carries a SQL-literal budget in architecture.layering.convention.test.js
+// which may only ever shrink, and the target architecture puts SQL behind the
+// adapter regardless. Three new statements in the handler would have raised the
+// debt to move code that already existed.
+//
+// Every security property of the originals is preserved below rather than
+// re-derived — see each function.
+
+/**
+ * Resolve a client for an access check, org-scoped.
+ *
+ * The port of findClientForRequest(). It returns the two fields the callers
+ * actually need — existence and whose trainer's client this is — rather than
+ * `SELECT *`, because the callers only ever used it to decide 404 vs 403.
+ *
+ * Null covers both "no such client" and "another studio's client", which is
+ * the same answer on purpose: an id belonging to a studio you are not in must
+ * be indistinguishable from one that was never there.
+ */
+async function findClientForAccess(clientId, scope = {}) {
+  const params = [clientId];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND organization_id = $${params.length}`;
+  }
+  const { rows } = await pool.query(
+    `SELECT id, trainer_id FROM pt_clients WHERE id = $1${orgClause}`,
+    params
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Search this studio's clients by name, mobile, client id or email.
+ *
+ * ── The three filters, and why each one survives the move ───────────────────
+ *
+ * · ORG. `scope.applyFilter` is the same tenant predicate every other read in
+ *   this file carries.
+ *
+ * · TRAINER. A trainer may only search their own roster, and a trainer account
+ *   with no linked trainer record matches NOTHING rather than the whole studio.
+ *   That fail-closed default is deliberate: the original comment records that
+ *   this route once lacked the check the list endpoint had, so the roster rule
+ *   could be sidestepped by calling /search instead of /. Restating it here
+ *   rather than relying on the caller is what keeps that from recurring.
+ *
+ * · BRANCH. pt_clients has no branch_id, so the subselect synthesises a NULL
+ *   one and the branch predicate is applied against it. That looks pointless
+ *   and is not: for a user WITH a branch (reception, trainer, member) the
+ *   predicate `branch_id = $n` against NULL is never true, so they match
+ *   nothing — which is exactly what branch-scope means by "legacy rows with a
+ *   NULL branch are not visible". Dropping the shim on the way across would
+ *   have turned "sees nothing" into "sees everything" for those roles, which
+ *   is a widening of access disguised as a simplification.
+ */
+async function searchClients({ q, limit = 20, trainerId, scope = {}, branch = null }) {
+  const term = String(q || '').trim();
+  if (!term) return [];
+
+  const capped = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+  const params = [`%${term}%`];
+  let where = '';
+
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    where += ` AND c.organization_id = $${params.length}`;
+  }
+  // `undefined` means "no trainer restriction"; ANY other value — null
+  // included — means "restrict to this trainer". The distinction is the
+  // fail-closed rule and it is easy to lose: a trainer account with no linked
+  // trainer record has trainer_id null, and treating null as "no filter" would
+  // hand that account the entire studio's roster. Passed through as a bound
+  // parameter, `c.trainer_id = NULL` is never true and it matches nothing,
+  // which is the intended answer.
+  if (trainerId !== undefined) {
+    params.push(trainerId);
+    where += ` AND c.trainer_id = $${params.length}`;
+  }
+
+  const branchSql = branch ? branch.appendTo(params) : { sql: 'TRUE', params };
+  const { rows } = await pool.query(
+    `SELECT c.*, t.name AS computed_trainer_name
+       FROM (SELECT pc.*, NULL::text AS branch_id FROM pt_clients pc) c
+       LEFT JOIN trainers t ON t.id = c.trainer_id
+      WHERE c.deleted_at IS NULL
+        AND (c.name ILIKE $1 OR c.mobile ILIKE $1 OR c.client_id ILIKE $1 OR c.email ILIKE $1)${where}
+        AND c.${branchSql.sql}
+      ORDER BY c.created_at DESC
+      LIMIT $${branchSql.params.length + 1}`,
+    [...branchSql.params, capped]
+  );
+  return rows;
+}
+
+/**
+ * One client's check-in history.
+ *
+ * No org predicate on attendance_logs, and that is not an omission: the caller
+ * has already resolved the client through findClientForAccess, which IS
+ * org-scoped, and ref_id is a pt_clients primary key. The tenant boundary is
+ * the client, and it is enforced one step earlier — adding
+ * `organization_id = $n` here would additionally drop legacy attendance rows
+ * whose org was never backfilled, hiding real visits.
+ */
+async function getClientAttendance(clientId, { limit = 200, offset = 0 } = {}) {
+  const { rows } = await pool.query(
+    `SELECT id, date, check_in_time, check_out_time, method, notes
+       FROM attendance_logs
+      WHERE ref_id = $1 AND ref_type = 'client'
+      ORDER BY date DESC, check_in_time DESC
+      LIMIT $2 OFFSET $3`,
+    [clientId, clampPage(limit, 200), clampOffset(offset)]
+  );
+  return rows;
+}
+
+/**
+ * One client's payment history.
+ *
+ * pt_payments, not `payments` — the latter is the gym-era ledger and is empty.
+ * The column aliases are kept exactly as the old endpoint returned them
+ * (method ← payment_method, receipt_no ← payment_ref) because a profile page
+ * renders these keys; `plan` stays dropped rather than faked, as there is no
+ * package on a pt_payments row. Org scoping is the caller's, as above.
+ */
+async function getClientPayments(clientId, { limit = 200, offset = 0 } = {}) {
+  const { rows } = await pool.query(
+    `SELECT id, amount, payment_method AS method, date,
+            payment_ref AS receipt_no, notes
+       FROM pt_payments
+      WHERE client_id = $1 AND deleted_at IS NULL
+      ORDER BY date DESC, created_at DESC
+      LIMIT $2 OFFSET $3`,
+    [clientId, clampPage(limit, 200), clampOffset(offset)]
+  );
+  return rows;
+}
+
+/** Page size, bounded the same way the old endpoints bounded it. */
+function clampPage(value, fallback) {
+  return Math.min(Math.max(parseInt(value, 10) || fallback, 1), 500);
+}
+
+function clampOffset(value) {
+  return Math.max(parseInt(value, 10) || 0, 0);
+}
+
 module.exports = {
   calculateMonthlyCommissions,
   getTrainerPayouts,
   getBalanceSheet,
   getActiveClients,
+  findClientForAccess,
+  searchClients,
+  getClientAttendance,
+  getClientPayments,
   getDashboardStats,
   getCommissionHistory,
   createPayout,

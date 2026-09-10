@@ -120,7 +120,6 @@ const BUDGETS = {
   'routes/attendance.js': 18,
   'routes/settings.js': 18,
   'routes/subscription.js': 18,
-  'routes/clients.js': 17,
   'routes/invoices.js': 17,
   'routes/qr-checkin.js': 15,
   'routes/trainers.js': 15,
@@ -227,6 +226,6 @@ describe('the migration has a number attached to it', () => {
     // its entry was deleted outright — the first file in the register to
     // reach zero. Lower it with each extraction — the number only means
     // something if it tracks reality.
-    expect(ceiling).toBe(755);
+    expect(ceiling).toBe(738);
   });
 });
