@@ -21,7 +21,12 @@ const path = require('path');
 const server = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
 
 const STAFF_ONLY = [
-  'clients',        // GET / returns c.* for up to 1000 rows
+  // 'clients' was here until /api/clients was retired — a second HTTP surface
+  // over pt_clients, whose handlers moved to /api/pt-os/clients. That mount
+  // takes its place on this list rather than the entry simply disappearing:
+  // the client API still exists and still must be staff-only, and a list that
+  // silently shrinks when a route moves is a guard that stops guarding.
+  'pt-os',          // the client API: roster, profile, search, history, money
   'progress',       // nine GETs whose client_id is optional
   'reports',        // revenue, dues, trainer performance
   'trainers',

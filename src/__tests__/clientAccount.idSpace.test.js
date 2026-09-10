@@ -118,35 +118,21 @@ describe('GET /api/payments — a client sees their own payments', () => {
   });
 });
 
-describe('GET /api/clients/:id — a client sees their own record', () => {
-  test('their own id is allowed through', async () => {
-    mockQueryImpl = async (sql, params) => {
-      const clean = String(sql).replace(/\s+/g, ' ').trim();
-      queries.push({ sql: clean, params });
-      if (/FROM pt_clients c/i.test(clean)) {
-        return { rows: [{ id: MY_CLIENT, name: 'Mine', trainer_id: null }], rowCount: 1 };
-      }
-      return { rows: [], rowCount: 0 };
-    };
-
-    const res = await request(app('/api/clients', '../routes/clients')).get(`/api/clients/${MY_CLIENT}`);
-    expect(res.status).not.toBe(404);
-  });
-
-  test("another client's record is refused", async () => {
-    mockQueryImpl = async (sql, params) => {
-      const clean = String(sql).replace(/\s+/g, ' ').trim();
-      queries.push({ sql: clean, params });
-      if (/FROM pt_clients c/i.test(clean)) {
-        return { rows: [{ id: OTHER_CLIENT, name: 'Theirs', trainer_id: null }], rowCount: 1 };
-      }
-      return { rows: [], rowCount: 0 };
-    };
-
-    const res = await request(app('/api/clients', '../routes/clients')).get(`/api/clients/${OTHER_CLIENT}`);
-    expect(res.status).toBe(404);
-  });
-});
+// The GET /api/clients/:id pair that used to sit here is gone with the route.
+//
+// /api/clients was retired: it was a second HTTP surface over pt_clients, and
+// its handlers moved to /api/pt-os/clients. Those two tests pinned a
+// member-role clamp INSIDE that handler — defence in depth, since the mount
+// itself carried requireStaff and a client account (role 'member') could never
+// reach it. With the handler deleted there is nothing left to clamp, and
+// re-pointing them at /api/pt-os/clients/:id would assert a member clamp that
+// handler has never had and does not need: /api/pt-os is requireStaff too.
+//
+// What the deletion does NOT remove is the finding this whole file exists for
+// — that a member must be clamped on pt_client_id and never on the legacy
+// member_id. Every route that still clamps a member is covered below, and the
+// source scan at the end of this file is what keeps a new one from reaching
+// for member_id.
 
 describe('requireSelfOrRole admits a real client account', () => {
   const { requireSelfOrRole } = require('../middleware/rbac');

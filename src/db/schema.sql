@@ -99,11 +99,31 @@ CREATE TABLE IF NOT EXISTS trainers (
 );
 
 
--- ─── CLIENTS (Members) ───────────────────────────────────────
--- Single source of truth for a gym member.
+-- ─── CLIENTS (legacy, TRANSIENT — dropped by migration 170) ──────
+--
+-- This table does not exist in any running database and no code reads it.
+-- pt_clients is the single canonical client table for the whole system.
+--
+-- ── Then why is it still here ───────────────────────────────────────────────
+--
+-- Because a bootstrap runs schema.sql and then every migration in order, and
+-- twenty-odd migrations between 001 and 169 alter, index, backfill from or
+-- reference this table. They ran that way on every database that exists. Remove
+-- the CREATE and the chain stops at 001_v4_upgrade.sql with `relation "clients"
+-- does not exist` — verified, not assumed.
+--
+-- So it is built, used by the migrations that expect it, and dropped by
+-- 170_drop_legacy_clients_and_renewals.sql a few hundred statements later. The
+-- alternative — making twenty applied migrations tolerant of a missing table —
+-- rewrites history every existing database has already executed, to delete a
+-- table that is already gone from all of them. That is a large risk for a
+-- cosmetic gain, so the honest fix is this heading rather than a diff.
+--
+-- If you are reading schema.sql to learn the client model, read pt_clients
+-- (migration 017). Not this.
+--
 -- Fields use both modern names (expiry_date, phone) and the legacy
--- column names (pt_end_date, mobile) that the existing API relies on.
--- New columns shadow the old ones via GENERATED or defaults.
+-- column names (pt_end_date, mobile) that the migrations below rely on.
 CREATE TABLE IF NOT EXISTS clients (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   client_id       TEXT        UNIQUE,      -- legacy FS#### code
