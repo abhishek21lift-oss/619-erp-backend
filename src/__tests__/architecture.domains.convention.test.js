@@ -226,10 +226,15 @@ describe('the manifest records the state the audit found', () => {
     // assert is impossible, since schemaTables() no longer contains them.
     const { legacyTables } = require('../architecture/domains');
     const legacy = legacyTables();
-    for (const t of ['payments', 'members']) {
+    for (const t of ['members']) {
       expect(legacy).toContain(t);
     }
-    for (const t of ['clients', 'subscriptions']) {
+    // `payments` joins clients and subscriptions on the retired side: migration
+    // 191 drops it, so schemaTables() no longer contains it and listing it as
+    // legacy would assert a retirement this manifest also has to assert is
+    // impossible. It had no organization_id at all — the reason it went rather
+    // than being scoped — and pt_payments is the ledger.
+    for (const t of ['clients', 'subscriptions', 'payments']) {
       expect(legacy).not.toContain(t);
     }
   });

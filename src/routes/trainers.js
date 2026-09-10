@@ -95,11 +95,17 @@ router.get('/:id', auth, async (req, res, next) => {
         (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1 AND status='active')::int              AS active_clients,
         (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1 AND status='expired')::int             AS expired_clients,
         (SELECT COALESCE(SUM(balance_amount),0) FROM pt_clients WHERE trainer_id=$1)::float          AS total_dues,
-        (SELECT COALESCE(SUM(amount),0) FROM pt_payments WHERE trainer_id=$1)::float                 AS lifetime_revenue,
+        -- deleted_at IS NULL on all three: a reversed payment is money the
+        -- studio does not have, and without it these totals contradict the
+        -- payment list and the trend chart below, which both exclude it.
         (SELECT COALESCE(SUM(amount),0) FROM pt_payments
-          WHERE trainer_id=$1 AND date >= DATE_TRUNC('month', NOW()))::float                       AS month_revenue,
+          WHERE trainer_id=$1 AND deleted_at IS NULL)::float                                       AS lifetime_revenue,
+        (SELECT COALESCE(SUM(amount),0) FROM pt_payments
+          WHERE trainer_id=$1 AND deleted_at IS NULL
+            AND date >= DATE_TRUNC('month', NOW()))::float                                         AS month_revenue,
         (SELECT COALESCE(SUM(incentive_amt),0) FROM pt_payments
-          WHERE trainer_id=$1 AND date >= DATE_TRUNC('month', NOW()))::float                       AS month_incentive
+          WHERE trainer_id=$1 AND deleted_at IS NULL
+            AND date >= DATE_TRUNC('month', NOW()))::float                                         AS month_incentive
     `, [req.params.id]);
 
     // Their clients
@@ -110,19 +116,36 @@ router.get('/:id', auth, async (req, res, next) => {
       ORDER BY created_at DESC LIMIT 100
     `, [req.params.id]);
 
-    // Recent payments collected by this trainer
+    // Recent payments collected by this trainer.
+    //
+    // This selected client_name, method and receipt_no from pt_payments —
+    // three columns that table has never had. They are the LEGACY ledger's
+    // names, left behind when the FROM was repointed and the column list was
+    // not, so every load of this page raised `column "client_name" does not
+    // exist`. The names are kept in the RESPONSE, because the trainer page
+    // renders those keys; they are now produced by aliasing the real columns
+    // and joining the client for their name.
     const { rows: payments } = await pool.query(`
-      SELECT id, client_name, amount, method, date, receipt_no, incentive_amt
-      FROM pt_payments WHERE trainer_id=$1
-      ORDER BY date DESC, created_at DESC LIMIT 30
+      SELECT p.id, c.name AS client_name, p.amount,
+             UPPER(p.payment_method) AS method, p.date,
+             p.payment_ref AS receipt_no, p.incentive_amt
+      FROM pt_payments p
+      LEFT JOIN pt_clients c ON c.id = p.client_id
+      WHERE p.trainer_id = $1 AND p.deleted_at IS NULL
+      ORDER BY p.date DESC, p.created_at DESC LIMIT 30
     `, [req.params.id]);
 
-    // 6-month revenue trend
+    // 6-month revenue trend.
+    //
+    // Read `FROM payments` — the legacy ledger, empty since PT-OS shipped — so
+    // this chart has been rendering a flat zero for every trainer while the
+    // aggregates above it, which already used pt_payments, showed real money.
     const { rows: monthly } = await pool.query(`
       SELECT TO_CHAR(DATE_TRUNC('month', date::date), 'Mon YY') AS month,
              COALESCE(SUM(amount),0)::float AS revenue
-      FROM payments
-      WHERE trainer_id=$1 AND date >= NOW() - INTERVAL '6 months'
+      FROM pt_payments
+      WHERE trainer_id=$1 AND deleted_at IS NULL
+        AND date >= NOW() - INTERVAL '6 months'
       GROUP BY DATE_TRUNC('month', date::date)
       ORDER BY DATE_TRUNC('month', date::date)
     `, [req.params.id]);

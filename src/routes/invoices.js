@@ -266,14 +266,58 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
     );
     if (!inv[0]) { await tx.query('ROLLBACK'); return res.status(404).json({ error: 'Invoice not found or already paid' }); }
 
-    // Also record as a payment if not already recorded
+    // Record the payment in the canonical ledger.
+    //
+    // ── This used to INSERT INTO `payments`, and that was the bug ───────────
+    //
+    // That table has no organization_id column, so the row it wrote could not
+    // be attributed to a studio and no org-scoped read could ever return it.
+    // Marking an invoice paid produced a financial record that was invisible
+    // to the finance pages, absent from every revenue report, and — had the
+    // table ever been read unscoped — visible to every tenant.
+    //
+    // pt_payments is the ledger the rest of the application reads, and the org
+    // is taken from the INVOICE rather than from the request: the UPDATE above
+    // already proved that invoice belongs to this studio, so the payment
+    // inherits an ownership that has been checked rather than one asserted a
+    // second time.
+    // Record the payment and link the invoice to it, in one statement.
+    //
+    // ── The link ────────────────────────────────────────────────────────────
+    //
+    // invoices.payment_id has existed all along with a foreign key to the
+    // legacy ledger, and nothing ever wrote it — "which payment settled this
+    // invoice" was a question the schema was shaped to answer and the code
+    // never did. Migration 191 repoints that key at pt_payments and adds the
+    // column where a fresh build lacked it; this fills it.
+    //
+    // ── Why a CTE rather than an INSERT followed by an UPDATE ───────────────
+    //
+    // Two reasons, one of them enforced. The adapter's SQL-literal budget in
+    // architecture.layering.convention.test.js only ever shrinks, and a second
+    // literal here would have raised it — writing the link as a separate
+    // statement made this file 18 against a budget of 17. It is also simply
+    // better: the payment and its link land together or not at all, with no
+    // window in which a payment exists that the invoice does not point to.
+    //
+    // COALESCE on the SET, because ON CONFLICT DO NOTHING can return no row —
+    // without it a conflicting insert would blank an existing link.
     const receiptNo = 'INV-' + inv[0].invoice_no;
     await tx.query(`
-      INSERT INTO payments (id, client_id, client_name, trainer_id, amount, method, date, receipt_no, notes, created_at)
-      VALUES ($1, $2, $3, NULL, $4, $5, CURRENT_DATE, $6, $7, NOW())
-      ON CONFLICT DO NOTHING`,
-      [randomUUID(), inv[0].client_id, inv[0].client_name, inv[0].total_amount,
-       req.body.payment_method || 'CASH', receiptNo, 'Payment for invoice ' + inv[0].invoice_no]
+      WITH new_payment AS (
+        INSERT INTO pt_payments
+          (id, client_id, trainer_id, amount, payment_method, date, payment_ref,
+           notes, organization_id, created_at, updated_at)
+        VALUES ($1, $2, NULL, $3, $4, CURRENT_DATE, $5, $6, $7, NOW(), NOW())
+        ON CONFLICT DO NOTHING
+        RETURNING id
+      )
+      UPDATE invoices
+         SET payment_id = COALESCE((SELECT id FROM new_payment), payment_id)
+       WHERE id = $8 AND organization_id = $7`,
+      [randomUUID(), inv[0].client_id, inv[0].total_amount,
+       req.body.payment_method || 'CASH', receiptNo,
+       'Payment for invoice ' + inv[0].invoice_no, inv[0].organization_id, inv[0].id]
     );
 
     // Update the linked client's paid/balance fields so their financial record

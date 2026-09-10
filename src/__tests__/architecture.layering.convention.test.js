@@ -147,7 +147,6 @@ const BUDGETS = {
   'modules/command-center/command-center.routes.js': 3,
   'routes/auth-google.js': 3,
   'routes/integrations.js': 3,
-  'routes/razorpay-webhook.js': 3,
   'routes/uploads.js': 2,
   'routes/whatsapp-webhook.js': 2,
   'routes/classes.js': 1,
@@ -226,6 +225,6 @@ describe('the migration has a number attached to it', () => {
     // its entry was deleted outright — the first file in the register to
     // reach zero. Lower it with each extraction — the number only means
     // something if it tracks reality.
-    expect(ceiling).toBe(738);
+    expect(ceiling).toBe(735);
   });
 });

@@ -223,7 +223,26 @@ BEGIN
 END $$;
 
 
--- ─── PAYMENTS ────────────────────────────────────────────────
+-- ─── PAYMENTS (legacy, TRANSIENT — dropped by migration 191) ─────
+--
+-- This table does not exist in any running database, and no code reads or
+-- writes it. pt_payments is the single payment ledger for the whole system:
+-- it carries organization_id on every row, which this one never had — there
+-- was nothing to scope a payment by, so any row here was unattributable to a
+-- studio and unreachable by a tenant-scoped read.
+--
+-- ── Then why is it still here ───────────────────────────────────────────────
+--
+-- Same reason as the `clients` block above: a bootstrap runs schema.sql and
+-- then every migration in order, and migrations between here and 191 alter,
+-- index and reference this table. Remove the CREATE and the chain stops with
+-- `relation "payments" does not exist`. So it is built, used by the migrations
+-- that expect it, and dropped by 191_drop_legacy_payments.sql — which refuses
+-- to run at all if the table has acquired a single row, because the entire
+-- argument for dropping rather than migrating is that it is empty.
+--
+-- If you are reading schema.sql to learn how payments work, read pt_payments
+-- (migration 011b) and routes/payments.js. Not this.
 CREATE TABLE IF NOT EXISTS payments (
   id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   receipt_no      TEXT        UNIQUE,

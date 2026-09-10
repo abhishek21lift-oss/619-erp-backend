@@ -197,39 +197,62 @@ describe('event dispatch', () => {
   const app = () => appWithSecret(SECRET);
   const send = (body) => post(app(), body, sign(body));
 
-  test('payment.captured marks the payment captured by gateway id', async () => {
-    await send(captured('pay_CAPTURE_1'));
+  // ── These three used to assert an UPDATE that could never have run ────────
+  //
+  // They pinned `UPDATE payments SET gateway_status = ... WHERE
+  // gateway_payment_id = $1`, and neither gateway_payment_id nor refund_id has
+  // ever existed on that table — it carried gateway_txn_id and no payload
+  // column at all. So every one of these events raised in production, was
+  // caught by the handler's own try/catch, and was answered 200 so Razorpay
+  // would not retry: silent, total loss of every gateway confirmation. The
+  // tests passed because the pool was mocked, and a mock will happily "run"
+  // SQL naming columns that do not exist.
+  //
+  // The legacy `payments` table is dropped (migration 191) and pt_payments has
+  // no gateway columns, so there is nothing to repoint this at. Recording
+  // gateway payments is a feature to be built deliberately on pt_payments,
+  // with an organization_id on every row. What these now pin is the honest
+  // behaviour in the meantime: acknowledge, log, write nothing.
 
-    const [q] = writes();
-    expect(q.sql).toMatch(/gateway_status = 'captured'/i);
-    expect(q.params[0]).toBe('pay_CAPTURE_1');
+  test('payment.captured is acknowledged and writes nothing', async () => {
+    const res = await send(captured('pay_CAPTURE_1'));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ received: true });
+    expect(writes()).toHaveLength(0);
   });
 
-  test('payment.failed marks the payment failed', async () => {
+  test('payment.failed is acknowledged and writes nothing', async () => {
     const body = JSON.stringify({
       event: 'payment.failed',
       payload: { payment: { entity: { id: 'pay_FAIL_1', error_reason: 'card_declined' } } },
     });
-    await send(body);
+    const res = await send(body);
 
-    const [q] = writes();
-    expect(q.sql).toMatch(/gateway_status = 'failed'/i);
-    expect(q.params[0]).toBe('pay_FAIL_1');
+    expect(res.status).toBe(200);
+    expect(writes()).toHaveLength(0);
   });
 
-  test('refund.processed keys off payment_id, not the refund id', async () => {
-    // The refund entity carries both. Writing WHERE gateway_payment_id =
-    // refund.id would silently match nothing and leave the payment unrefunded.
+  test('refund.processed is acknowledged and writes nothing', async () => {
     const body = JSON.stringify({
       event: 'refund.processed',
       payload: { refund: { entity: { id: 'rfnd_1', payment_id: 'pay_REFUNDED_1' } } },
     });
-    await send(body);
+    const res = await send(body);
 
-    const [q] = writes();
-    expect(q.sql).toMatch(/gateway_status = 'refunded'/i);
-    expect(q.params[0]).toBe('pay_REFUNDED_1');
-    expect(q.params[1]).toBe('rfnd_1');
+    expect(res.status).toBe(200);
+    expect(writes()).toHaveLength(0);
+  });
+
+  test('a gateway event is logged rather than dropped in silence', async () => {
+    // Not recording it is a deliberate gap, so it has to be visible. An
+    // operator reconciling a Razorpay statement against the ledger needs to be
+    // able to find the events the ledger does not contain.
+    await send(captured('pay_LOGGED_1'));
+    expect(mockLog.info).toHaveBeenCalledWith(
+      expect.objectContaining({ payment_id: 'pay_LOGGED_1' }),
+      'razorpay_payment_event_not_recorded',
+    );
   });
 
   test('an unknown event type is acknowledged and ignored', async () => {
@@ -253,21 +276,22 @@ describe('event dispatch', () => {
 });
 
 describe('failure handling', () => {
-  test('a database error is answered 200 and only logged — the swallow', async () => {
-    // Pinning current behaviour, not endorsing it. The route answers 200 on a
-    // failed write so Razorpay does not retry, which means a write that fails
-    // for ANY reason — including the missing-column problem described at the
-    // top of this file — is indistinguishable to the sender from success.
-    // If the handler is ever pointed at a real table, this is the line that
-    // decides whether a transient outage loses the event permanently.
+  test('the handler no longer touches the database at all', async () => {
+    // This replaces a test that mocked a rejected pool.query to prove the
+    // handler swallowed database errors and answered 200 anyway. That swallow
+    // is what hid the missing-column failure for as long as it did: a write
+    // failing for ANY reason was indistinguishable to Razorpay from success.
+    //
+    // There is no write left to fail. Asserting that directly is a stronger
+    // statement than asserting the swallow works, and it is the property that
+    // has to hold while gateway recording is unimplemented — if a query
+    // reappears here without an organization_id, this is what notices.
     const pool = require('../db/pool');
-    pool.query.mockRejectedValueOnce(new Error('column "gateway_status" does not exist'));
-
-    const body = captured('pay_DBERR');
+    const body = captured('pay_NO_DB');
     const res = await post(appWithSecret(SECRET), body, sign(body));
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true });
-    expect(mockLog.error).toHaveBeenCalled();
+    expect(pool.query).not.toHaveBeenCalled();
   });
 });
