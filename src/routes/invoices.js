@@ -5,6 +5,7 @@ const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
+const automation = require('../modules/automation/automation.triggers');
 
 // GET /api/invoices — List invoices
 router.get('/', auth, async (req, res, next) => {
@@ -336,6 +337,31 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
     }
 
     await tx.query('COMMIT');
+
+    // Marking an invoice paid IS money arriving, so the studio's
+    // payment_received automation fires here as it does on every other
+    // payment path. This one raised nothing, so a client invoiced and marked
+    // paid heard nothing while the same money taken at the desk messaged them.
+    //
+    // After COMMIT, outside the transaction, like every other call site.
+    //
+    // The INVOICE id is the event key here, not a payment id. The insert above
+    // carries ON CONFLICT DO NOTHING, so on a re-mark there may be no new
+    // payment row at all and a payment id would be an unstable identity for
+    // the event. "Invoice N was paid" happens once and the invoice id says so
+    // exactly — which is also what makes a double-submitted mark-as-paid one
+    // event rather than two messages to the client.
+    //
+    // Guarded on client_id because an invoice need not have one; the balance
+    // update above is guarded the same way.
+    if (inv[0].client_id) {
+      await automation.paymentReceived(req, {
+        clientId: inv[0].client_id,
+        amount: inv[0].total_amount,
+        eventKey: `invoice:${inv[0].id}`,
+      });
+    }
+
     res.json({ message: 'Invoice marked as paid', invoice: inv[0] });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});

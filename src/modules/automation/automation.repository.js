@@ -628,6 +628,99 @@ async function orphanCandidates(orgId, { olderThanSec, maxAgeSec, limit = 200 })
   return rows.map((r) => ({ id: r.id, remainingDelayMs: Number(r.remaining_delay_ms) }));
 }
 
+/**
+ * Failure reasons that a RECONNECT actually fixes.
+ *
+ * Everything transport.js reports for an unusable instance, and nothing else.
+ * `whatsapp_%` covers the `whatsapp_<state>` family it composes from the
+ * instance row (whatsapp_logged_out, whatsapp_disconnected,
+ * whatsapp_never_connected), and the three literals are the gateway's own
+ * codes plus the local pre-check's.
+ *
+ * Deliberately NOT included:
+ *
+ *   gateway_not_configured   a missing WA_GATEWAY_URL/KEY. Scanning a QR does
+ *                            not fix a deployment that has no gateway.
+ *   duplicate_in_flight      another attempt at this exact message is already
+ *                            running. Re-driving it is the one thing that
+ *                            could produce two messages to a real person.
+ *   no_organization,
+ *   no_recipient,
+ *   empty_message,
+ *   no_client_message_id     caller bugs. A reconnect changes nothing about
+ *                            them, and retrying forever would hide them.
+ *
+ * The rule is narrow on purpose: this re-sends messages to real people, so it
+ * only covers failures whose stated cause is "the studio's WhatsApp was not
+ * usable", which is exactly the condition a reconnect ends.
+ */
+const RECONNECT_FIXABLE = `(
+  failure_reason LIKE 'whatsapp\\_%'
+  OR failure_reason IN ('not_connected', 'instance_not_connected', 'instance_not_found')
+)`;
+
+/**
+ * Automation messages that failed because this studio's WhatsApp was down.
+ *
+ * `maxAgeSec` is the whole safety argument. These are messages to real
+ * clients, and a welcome note delivered three days after someone joined is
+ * worse than one never sent — it is confusing rather than merely missing. So
+ * the window is bounded and short by default, and anything older stays failed
+ * with its reason intact for an operator to read.
+ *
+ * Rows are returned oldest-first so a studio that was offline for a while gets
+ * its messages back in the order they were meant to go out.
+ */
+async function reconnectCandidates(orgId, { maxAgeSec, limit = 200 }) {
+  const { rows } = await pool.query(
+    `SELECT c.id,
+            GREATEST(
+              0,
+              FLOOR(EXTRACT(EPOCH FROM (
+                c.created_at + make_interval(mins => COALESCE(r.delay_minutes, 0)) - NOW()
+              )) * 1000)
+            )::BIGINT AS remaining_delay_ms
+       FROM communication_logs c
+       LEFT JOIN automation_rules r
+              ON r.id = c.automation_rule_id
+             AND r.organization_id = c.organization_id
+      WHERE c.organization_id = $1
+        AND c.channel = 'whatsapp'
+        AND c.status = 'failed'
+        AND c.automation_rule_id IS NOT NULL
+        AND c.created_at >= NOW() - make_interval(secs => $2)
+        AND ${RECONNECT_FIXABLE}
+      ORDER BY c.created_at
+      LIMIT $3`,
+    [orgId, maxAgeSec, limit]
+  );
+  return rows.map((r) => ({ id: r.id, remainingDelayMs: Number(r.remaining_delay_ms) }));
+}
+
+/**
+ * Move one failed row back to 'queued' so the worker will act on it.
+ *
+ * Conditional on it STILL being failed for a reconnect-fixable reason, and the
+ * rowCount is the caller's permission to enqueue. That is what makes two
+ * concurrent reconnect events — a retried webhook, or two instances flapping —
+ * produce one requeue: the second UPDATE matches nothing and its caller
+ * enqueues nothing.
+ *
+ * failure_reason is cleared because the row is no longer failed; the attempt
+ * that follows will write its own outcome.
+ */
+async function requeueFailed(orgId, logId) {
+  const { rowCount } = await pool.query(
+    `UPDATE communication_logs
+        SET status = 'queued', failure_reason = NULL
+      WHERE id = $1 AND organization_id = $2
+        AND status = 'failed'
+        AND ${RECONNECT_FIXABLE}`,
+    [logId, orgId]
+  );
+  return rowCount;
+}
+
 // ── The scheduled sweeps ────────────────────────────────────────────────────
 //
 // Six of the twelve trigger events are not produced by anything a user does.
@@ -930,6 +1023,8 @@ module.exports = {
   applyReceipt,
   markFailedByClientId,
   orphanCandidates,
+  reconnectCandidates,
+  requeueFailed,
   orgsWithAutomationOn,
   activeTriggerEventsFor,
   membershipExpiringIn,

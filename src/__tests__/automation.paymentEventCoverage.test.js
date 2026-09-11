@@ -35,6 +35,20 @@ const path = require('path');
 
 const SRC = path.join(__dirname, '..');
 
+/**
+ * A call that raises payment_received, in either of its two shapes.
+ *
+ * paymentReceived(req, …)      from a route handler
+ * paymentReceivedFor(orgId, …) from a service that has no request
+ *
+ * Both must count. The narrower /paymentReceived\s*\(/ does NOT match
+ * `paymentReceivedFor(` — the "For" sits between the name and the paren — so
+ * with only that pattern this guard reported lib/upiPayments.js as silent
+ * immediately after it was fixed. Caught by the guard failing on a correct
+ * file, which is the good direction for a guard to be wrong in.
+ */
+const RAISES_EVENT = /paymentReceived(?:For)?\s*\(/;
+
 /** Drop block and line comments so claims are about code, not prose. */
 function stripComments(s) {
   return s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
@@ -80,31 +94,28 @@ const writingHandlers = writers
   .filter((h) => /INSERT\s+INTO\s+pt_payments/i.test(h.chunk));
 
 /**
- * Writers that deliberately do NOT raise payment_received yet, and why.
+ * Writers that deliberately do NOT raise payment_received, and why.
  *
- * Both are real gaps of the same shape as the incident, not exemptions on
- * principle. They are listed rather than fixed in the same change because
- * neither is a one-line addition:
+ * EMPTY, and that is the point. It held two entries when this guard was
+ * written — lib/upiPayments.js and routes/invoices.js — and both have since
+ * been closed:
  *
- *   lib/upiPayments.js   is a service, not a route. It has no `req`, and the
- *                        trigger layer resolves the organization with
- *                        orgIdOf(req). Raising the event here needs a req-less
- *                        variant of paymentReceived, as the sweep already has
- *                        for membershipExpiring and birthday.
+ *   lib/upiPayments.js   is a service with no `req`, so it could not use the
+ *                        request-driven trigger. It now calls the req-less
+ *                        paymentReceivedFor with its own resolved orgId, the
+ *                        same shape the sweep-driven triggers use.
  *
- *   routes/invoices.js   writes the payment inside a CTE within a transaction
- *                        that uses savepoints, and has no post-commit section
- *                        to hang the emit on. Emitting inside the transaction
- *                        would message a client for a payment a rollback then
- *                        erased.
+ *   routes/invoices.js   turned out to have a perfectly good post-commit line
+ *                        after all; the earlier note claiming otherwise was
+ *                        wrong. It keys the event on the INVOICE id rather
+ *                        than a payment id, because its insert carries
+ *                        ON CONFLICT DO NOTHING and a re-mark may create no
+ *                        payment row to key on.
  *
- * Adding to this list is the thing to argue about in review; that is the point
- * of it being a list.
+ * Adding an entry back is the thing to argue about in review; that is the
+ * point of it being a list rather than a silence.
  */
-const KNOWN_GAPS = new Set([
-  'src/lib/upiPayments.js',
-  'src/routes/invoices.js',
-]);
+const KNOWN_GAPS = new Set([]);
 
 describe('every payment writer raises payment_received', () => {
   it('finds the payment writers at all', () => {
@@ -117,7 +128,7 @@ describe('every payment writer raises payment_received', () => {
     // distinction is the whole test.
     const silent = writingHandlers
       .filter((h) => !KNOWN_GAPS.has(h.file))
-      .filter((h) => !/paymentReceived\s*\(/.test(h.chunk))
+      .filter((h) => !RAISES_EVENT.test(h.chunk))
       .map((h) => h.handler);
 
     // A studio taking money through a silent handler gets no WhatsApp and no
@@ -149,11 +160,11 @@ describe('every payment writer raises payment_received', () => {
     // POST /api/pt-os/payments — the PT-OS payments screen. This is the one
     // that recorded a payment in production and sent nothing.
     expect(byFile['src/modules/pt-os/pt-os.routes.js']).toBeDefined();
-    expect(byFile['src/modules/pt-os/pt-os.routes.js']).toMatch(/paymentReceived\s*\(/);
+    expect(byFile['src/modules/pt-os/pt-os.routes.js']).toMatch(RAISES_EVENT);
 
     // POST /api/payments — the finance ledger, same gap.
     expect(byFile['src/routes/payments.js']).toBeDefined();
-    expect(byFile['src/routes/payments.js']).toMatch(/paymentReceived\s*\(/);
+    expect(byFile['src/routes/payments.js']).toMatch(RAISES_EVENT);
   });
 });
 
@@ -170,9 +181,9 @@ describe('the event is raised outside the transaction that owns the payment', ()
     const code = stripComments(fs.readFileSync(path.join(SRC, '..', file), 'utf8'));
     return code
       .split(/router\.(?:get|post|patch|put|delete)\(/)
-      .filter((chunk) => /paymentReceived\s*\(/.test(chunk))
+      .filter((chunk) => RAISES_EVENT.test(chunk))
       .map((chunk) => {
-        const at = chunk.search(/paymentReceived\s*\(/);
+        const at = chunk.search(RAISES_EVENT);
         const before = chunk.slice(0, at);
         return {
           opensTransaction: /BEGIN/.test(before),

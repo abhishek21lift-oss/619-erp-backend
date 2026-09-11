@@ -28,6 +28,7 @@ const QRCode = require('qrcode');
 const pool = require('../db/pool');
 const { genReceiptNo } = require('../db/receipts');
 const logger = require('./logger');
+const automation = require('../modules/automation/automation.triggers');
 
 // ── Status vocabulary ───────────────────────────────────────────────────────
 const ORDER_STATUS = Object.freeze({
@@ -776,6 +777,28 @@ async function approve({ orderId, orgId, actor }, db = pool) {
     });
 
     await tx.query('COMMIT');
+
+    // Money arrived, so the studio's payment_received automation fires — the
+    // same event the manual payment endpoints raise. Until now this path
+    // raised nothing: a member paid by UPI, an admin approved the UTR, and the
+    // client heard back from every payment route except this one.
+    //
+    // After COMMIT and outside the transaction, like every other call site: a
+    // rolled-back approval must never message the client, and automation must
+    // never be able to fail an approval. emit() does not throw.
+    //
+    // paymentReceivedFor rather than paymentReceived because this is a service
+    // with no `req` — see the trigger's own header. The organization is the
+    // caller's already-resolved orgId, never anything off a request body.
+    //
+    // The pt_payments row id is the event key, matching the manual endpoints,
+    // so a re-approval of the same submission cannot produce a second message.
+    await automation.paymentReceivedFor(orgId, {
+      clientId: member.id,
+      amount: order.total_amount,
+      eventKey: ptPaymentId,
+    });
+
     return {
       order: { ...order, status: ORDER_STATUS.APPROVED },
       submission, activation, member,

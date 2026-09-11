@@ -268,6 +268,36 @@ router.post('/', async (req, res) => {
       result.rowCount > 0 ? 'whatsapp_webhook_applied' : 'whatsapp_webhook_superseded'
     );
 
+    // ── A reconnection re-drives what was lost while it was down ───────────
+    //
+    // The worker marks a message `failed` when the studio's WhatsApp is
+    // unusable, and rightly does not retry it: no number of BullMQ attempts
+    // reconnects a socket only the studio can restore by scanning a QR. But
+    // nothing acted on the restore either. Production: a Welcome Message
+    // failed `whatsapp_logged_out` at 10:56, the studio reconnected at 11:04,
+    // and the message stayed failed permanently — its dedupe key means the
+    // business event can never produce another row.
+    //
+    // This is that missing half. Only on an APPLIED transition to connected:
+    // `applied: false` means this event was superseded by a newer one, and
+    // acting on a stale reconnect would re-drive against a status that has
+    // since moved on.
+    //
+    // Fire-and-forget, and caught. The studio's WhatsApp coming back must be
+    // recorded even if re-driving its backlog fails — and a throw here would
+    // answer 500, which makes the gateway redeliver an event that was applied
+    // correctly.
+    if (status === 'connected' && result.rowCount > 0) {
+      const { recoverAfterReconnect } = require('../modules/automation/automation.recovery');
+      recoverAfterReconnect(tenant_id)
+        .then((stats) => {
+          if (stats.requeued > 0 || stats.candidates > 0) {
+            log.info({ org_id: tenant_id, ...stats }, 'whatsapp_reconnect_recovery');
+          }
+        })
+        .catch((err) => log.error({ err: err.message, org_id: tenant_id }, 'whatsapp_reconnect_recovery_failed'));
+    }
+
     // 200 either way. `applied: false` means the row is already newer, which is
     // a correct outcome, not a failure to retry.
     return res.json({ received: true, applied: result.rowCount > 0 });

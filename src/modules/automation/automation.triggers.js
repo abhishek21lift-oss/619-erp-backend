@@ -35,13 +35,32 @@ const { orgIdOf } = require('../../lib/tenant-db');
  * site rather than hidden here.
  */
 async function paymentReceived(req, { clientId, amount, eventKey, currency = '₹' }) {
+  return paymentReceivedFor(orgIdOf(req), { clientId, amount, eventKey, currency, requestId: req.id });
+}
+
+/**
+ * The same event, for a caller that has an organization but no request.
+ *
+ * lib/upiPayments.js is a service: a UTR approval runs with an `orgId` and an
+ * `actor`, never a `req`, so the request-driven signature above could not be
+ * used there and the event simply was not raised — money arrived and the
+ * client heard nothing. Inventing a fake `req` to satisfy the signature is
+ * exactly what the sweep-driven triggers below refuse to do, and for the same
+ * reason: it invites the next reader to reach for req.user in a context that
+ * has none.
+ *
+ * The organization is the caller's own resolved value and must come from
+ * server-side context, never a request body — the same rule orgIdOf enforces
+ * on the other side.
+ */
+async function paymentReceivedFor(orgId, { clientId, amount, eventKey, currency = '₹', requestId }) {
   return emit({
-    orgId: orgIdOf(req),
+    orgId,
     event: 'payment_received',
     subjectId: clientId,
     eventKey,
     context: { amount: `${currency}${amount}`, amount_value: amount },
-    requestId: req.id,
+    requestId,
   });
 }
 
@@ -271,6 +290,8 @@ async function followupDue(orgId, { leadId, followUpDate, interestedPackage }) {
 module.exports = {
   // Request-driven: called from the handler that performs the business write.
   paymentReceived,
+  // Same event, for a service that has an organization but no request.
+  paymentReceivedFor,
   memberCreated,
   sessionLow,
   sessionLowThreshold,
