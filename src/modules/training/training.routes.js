@@ -1,19 +1,37 @@
 // HTTP for the training domain, mounted at /api/training.
 //
-// ── Why not /api/workouts ──────────────────────────────────────────────────
+// ── Programmes and templates only ──────────────────────────────────────────
 //
-// That path belongs to the old routes and still serves production. Mounting
-// the new domain beside it rather than over it keeps this slice additive: the
-// two can run together while the UI is rebuilt, and slice G repoints the old
-// path once nothing reads it. Taking the path now would mean cutting over the
-// frontend in the same change that introduces the API.
+// This module used to carry a second half: session logging, at /sessions,
+// /performances, /sets and /cardio, with its own tables behind it. That half
+// is gone, and the reason is worth keeping.
+//
+// It was built as the destination of a migration — 167 copied the pt-os
+// workout log across to this side, and the header above used to say "slice G
+// repoints the old path once nothing reads it". The cutover never happened.
+// Production answered the other way: /api/pt-os/workout-log kept taking every
+// real session (83 in the last 30 days before removal), while every single row
+// on this side — 48 sessions, 41 performances, 100 sets — carried migration
+// 167's `migrated_from` provenance and not one was created natively. The
+// session page that called these endpoints existed but nothing in the app
+// navigated to it.
+//
+// (Phrased without naming those tables next to a SQL keyword on purpose:
+// tenantScope.convention.test.js scans this file for table reads and does not
+// strip comments, so prose can read as an unscoped query.)
+//
+// So the duplicate was not two systems in use; it was one system and one
+// staging copy of it. workout_sessions is canonical. The copy's rows are
+// preserved in the `archive` schema by migration 193.
+//
+// What survives here is the half production does use: programmes, templates
+// and prescriptions, reached from the frontend as api.training.templates.
 //
 // ── What lives here and what does not ──────────────────────────────────────
 //
-// These handlers validate, authorise, and call. Anything spanning two tables,
-// anything needing a transaction, and every coaching rule lives in
-// training.service.js and the pure modules beside it. A handler that grew SQL
-// is a handler that will grow a second copy of a rule.
+// These handlers validate, authorise, and call. Anything spanning two tables
+// and every coaching rule lives in the pure modules beside this one. A handler
+// that grew SQL is a handler that will grow a second copy of a rule.
 //
 // That is now literally true rather than aspirational: this file holds no SQL
 // and does not import the pool. Every read and write goes through
@@ -33,7 +51,6 @@ const { validate } = require('../../middleware/validate');
 const { logActivity } = require('../../lib/activityLog');
 const authz = require('./authz');
 const schemas = require('./training.schemas');
-const service = require('./training.service');
 const repo = require('./training.repository');
 const prescription = require('./prescription');
 
@@ -44,13 +61,6 @@ const STAFF = requireRole('admin', 'manager', 'trainer');
 
 const notFound = (res, what) =>
   res.status(404).json({ error: { code: 'NOT_FOUND', message: `${what} not found` } });
-
-/** Turn a TrainingError into its response; re-throw anything else. */
-function sendError(res, err) {
-  if (!(err instanceof service.TrainingError)) throw err;
-  if (err.body) return res.status(err.status).json(err.body);
-  return res.status(err.status).json({ error: { code: err.code, message: err.message } });
-}
 
 // ═══ Programs ══════════════════════════════════════════════════════════════
 
@@ -207,151 +217,6 @@ router.put('/templates/:id/order', auth, STAFF, validate(schemas.reorder), wrap(
   res.json({ data: { id: template.id, reordered } });
 }));
 
-// ═══ Assignments ═══════════════════════════════════════════════════════════
-
-router.get('/assignments', auth, STAFF, wrap(async (req, res) => {
-  const rows = await repo.listAssignments(req, {
-    clientId: req.query.client_id,
-    date: req.query.date,
-    status: req.query.status,
-  });
-  res.json({ data: rows });
-}));
-
-router.post('/assignments', auth, STAFF, validate(schemas.assignmentCreate), wrap(async (req, res) => {
-  const b = req.body;
-  if (!await authz.canAccessClient(req, b.client_id)) return notFound(res, 'Client');
-  if (!await authz.loadOwned(req, 'workout_templates', b.workout_template_id)) {
-    return notFound(res, 'Workout template');
-  }
-
-  // The same gate as logging a session. Assigning a plan to a client the
-  // screening has flagged must fail for the same reason training them does.
-  const { checkScreeningGate } = require('../../lib/screeningGate');
-  const { blocked, warnings } = await checkScreeningGate(req, b.client_id);
-  if (blocked) return res.status(blocked.status).json(blocked.body);
-
-  const assignment = await repo.createAssignment(req, b);
-  await logActivity(req, 'training.assignment.create', 'training_assignments', assignment.id,
-    { client_id: b.client_id }).catch(() => {});
-  res.status(201).json({ data: assignment, screening_warnings: warnings });
-}));
-
-router.patch('/assignments/:id', auth, STAFF, validate(schemas.assignmentUpdate), wrap(async (req, res) => {
-  if (!await authz.loadOwned(req, 'training_assignments', req.params.id)) return notFound(res, 'Assignment');
-  const assignment = await repo.updateAssignment(req.params.id, req.body);
-  if (!assignment) return notFound(res, 'Nothing to update');
-  res.json({ data: assignment });
-}));
-
-// ═══ Sessions ══════════════════════════════════════════════════════════════
-
-router.get('/sessions', auth, STAFF, wrap(async (req, res) => {
-  // Clamped here rather than in the repository: reading a query string is what
-  // an adapter is for, and Postgres rejects a negative LIMIT outright, so
-  // `?limit=-1` must never reach SQL — boundedReads.convention.test.js pins
-  // both halves of this clamp.
-  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
-  const rows = await repo.listSessions(req, {
-    clientId: req.query.client_id,
-    status: req.query.status,
-    limit,
-  });
-  res.json({ data: rows });
-}));
-
-router.get('/sessions/:id', auth, STAFF, wrap(async (req, res) => {
-  const session = await authz.loadSession(req, req.params.id);
-  if (!session) return notFound(res, 'Session');
-  const performances = await service.loadPerformances(session.id);
-  res.json({ data: { ...session, performances } });
-}));
-
-router.post('/sessions', auth, STAFF, validate(schemas.sessionCreate), wrap(async (req, res) => {
-  try {
-    const out = await service.createSession(req, req.body);
-    res.status(201).json({ data: out.session, screening_warnings: out.screening_warnings });
-  } catch (err) { sendError(res, err); }
-}));
-
-router.post('/sessions/:id/seed', auth, STAFF, wrap(async (req, res) => {
-  try {
-    res.json({ data: await service.seedFromTemplate(req, req.params.id) });
-  } catch (err) { sendError(res, err); }
-}));
-
-router.post('/sessions/:id/start', auth, STAFF, wrap(async (req, res) => {
-  try {
-    res.json({ data: await service.startSession(req, req.params.id) });
-  } catch (err) { sendError(res, err); }
-}));
-
-router.post('/sessions/:id/complete', auth, STAFF, validate(schemas.sessionComplete),
-  wrap(async (req, res) => {
-    try {
-      const out = await service.completeSession(req, req.params.id, req.body);
-      res.json({
-        data: out.session,
-        summary: out.summary,
-        records: out.records,
-        already_complete: out.already_complete,
-      });
-    } catch (err) { sendError(res, err); }
-  }));
-
-router.patch('/sessions/:id', auth, STAFF, validate(schemas.sessionUpdate), wrap(async (req, res) => {
-  if (!await authz.loadSession(req, req.params.id)) return notFound(res, 'Session');
-  const session = await repo.updateSession(req.params.id, req.body);
-  if (!session) return notFound(res, 'Nothing to update');
-  res.json({ data: session });
-}));
-
-// ═══ Performances, sets and cardio ═════════════════════════════════════════
-
-router.post('/sessions/:id/exercises', auth, STAFF, validate(schemas.performanceCreate),
-  wrap(async (req, res) => {
-    const session = await authz.loadSession(req, req.params.id);
-    if (!session) return notFound(res, 'Session');
-    const performance = await repo.createPerformance(session.id, req.body);
-    res.status(201).json({ data: performance });
-  }));
-
-router.post('/performances/:id/sets', auth, STAFF, validate(schemas.setCreate), wrap(async (req, res) => {
-  try {
-    const out = await service.logSet(req, req.params.id, req.body);
-    // 200 rather than 201 for a replay: the row already existed, and the
-    // client's retry logic should be able to tell.
-    res.status(out.duplicate ? 200 : 201).json({ data: out.row, duplicate: out.duplicate });
-  } catch (err) { sendError(res, err); }
-}));
-
-router.post('/performances/:id/cardio', auth, STAFF, validate(schemas.cardioCreate), wrap(async (req, res) => {
-  try {
-    const out = await service.logCardio(req, req.params.id, req.body);
-    res.status(out.duplicate ? 200 : 201).json({ data: out.row, duplicate: out.duplicate });
-  } catch (err) { sendError(res, err); }
-}));
-
-router.patch('/sets/:id', auth, STAFF, validate(schemas.setUpdate), wrap(async (req, res) => {
-  if (!await authz.loadSet(req, req.params.id)) return notFound(res, 'Set');
-  const row = await repo.updateSet(req.params.id, req.body);
-  if (!row) return notFound(res, 'Nothing to update');
-  res.json({ data: row });
-}));
-
-router.delete('/sets/:id', auth, STAFF, wrap(async (req, res) => {
-  if (!await authz.loadSet(req, req.params.id)) return notFound(res, 'Set');
-  await repo.deleteSet(req.params.id);
-  res.json({ data: { id: req.params.id, deleted: true } });
-}));
-
-router.patch('/cardio/:id', auth, STAFF, validate(schemas.cardioUpdate), wrap(async (req, res) => {
-  if (!await authz.loadCardio(req, req.params.id)) return notFound(res, 'Cardio effort');
-  const row = await repo.updateCardio(req.params.id, req.body);
-  if (!row) return notFound(res, 'Nothing to update');
-  res.json({ data: row });
-}));
-
 // ═══ Meta ══════════════════════════════════════════════════════════════════
 //
 // The vocabulary, served rather than duplicated.
@@ -377,30 +242,15 @@ router.get('/meta', auth, STAFF, (_req, res) => {
       })),
       sections: prescription.SECTIONS,
       progression_types: require('./progression').PROGRESSION_TYPES,
-      record_types: require('./records').RECORD_TYPES,
-      set_types: ['WARMUP', 'WORKING', 'BACKOFF', 'DROP', 'AMRAP', 'FAILURE', 'CUSTOM'],
-      cardio_types: [
-        'TREADMILL', 'RUNNING', 'CYCLING', 'STATIONARY_BIKE', 'ROWING', 'ELLIPTICAL',
-        'STAIRMASTER', 'STEP_MILL', 'SKI_ERG', 'SWIMMING', 'WALKING', 'SKATING',
-        'PROWLER', 'JUMP_ROPE', 'HIIT', 'CIRCUIT', 'OTHER',
-      ],
+      // record_types, set_types and cardio_types were published here too. All
+      // three described how a session is LOGGED — the half of this module that
+      // is gone — not how a template is authored, and record_types read its
+      // list from records.js, which went with it. The pt-os logger owns that
+      // vocabulary now, and tracks personal bests as is_pr_* flags on
+      // workout_sets rather than as typed record rows.
       units: { weight: ['kg', 'lb'], distance: ['m', 'km', 'mile'] },
     },
   });
 });
-
-// ═══ Records ═══════════════════════════════════════════════════════════════
-
-router.get('/records', auth, STAFF, wrap(async (req, res) => {
-  const clientId = req.query.client_id;
-  if (!clientId) {
-    return res.status(400).json({ error: { code: 'CLIENT_REQUIRED', message: 'client_id is required' } });
-  }
-  if (!await authz.canAccessClient(req, clientId)) return notFound(res, 'Client');
-  // Live records by default; ?history=1 includes superseded ones, which is
-  // the query the old boolean flags could not answer at all.
-  const history = req.query.history === '1' || req.query.history === 'true';
-  res.json({ data: await repo.listRecords(clientId, { history }) });
-}));
 
 module.exports = router;
