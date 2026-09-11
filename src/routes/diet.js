@@ -73,6 +73,31 @@ router.post('/meals', auth, adminOrManager, async (req, res, next) => {
 // ─── DIET TEMPLATES ──────────────────────────────────────────
 
 // GET /api/diet/templates
+// GET /api/diet/templates
+//
+// Same SHARED shape as /meals above: a row with no organization_id is
+// product-seeded content every studio draws from, a row with one belongs to
+// that studio alone.
+//
+// This endpoint read the table unscoped until now, and that was a deferral
+// rather than a decision. Migration 106 gave the table its organization_id and
+// said so in as many words:
+//
+//   "It is NOT defensible for workout_plans and diet_templates: those are
+//    programmes a coach writes, and a programme name can carry a client's
+//    name, a pricing tier, or a method the studio considers its own."
+//
+//   "this migration does not change the existing GET routes … Narrowing them
+//    is a behaviour change for existing screens and belongs in its own change;
+//    this migration lays the column so that change becomes a one-line WHERE
+//    clause"
+//
+// This is that change. It is safe to make now precisely because it is
+// currently invisible: all 8 rows in production have organization_id IS NULL,
+// so the shared predicate returns the same 8 rows to all six studios that the
+// unscoped read did. What it stops is the NEXT row — POST /templates below
+// stamps orgIdOf(req), so every template authored from here on would otherwise
+// have been listed, with its full meal composition, to every other studio.
 router.get('/templates', auth, async (req, res, next) => {
   try {
     const { goal } = req.query;
@@ -80,6 +105,11 @@ router.get('/templates', auth, async (req, res, next) => {
     const params = [];
     let p = 1;
 
+    const scope = tenantScope(req);
+    if (scope.applyFilter) {
+      params.push(scope.orgId);
+      conds.push(`(dt.organization_id IS NULL OR dt.organization_id = $${p++})`);
+    }
     if (goal) { conds.push(`goal = $${p++}`); params.push(goal); }
 
     const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
@@ -186,10 +216,30 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
     if (!await clientInOrg(req, d.client_id))
       return res.status(404).json({ error: 'Client not found' });
 
+    // clientInOrg gates the client id. Nothing gated the TEMPLATE id, and the
+    // two are not the same check: a caller could pass their own client with
+    // another studio's diet_template_id, and the assignment row — stamped with
+    // the caller's own org — then carried a foreign template. GET /assignments
+    // joins diet_templates and is scoped by da.organization_id, so it would
+    // read that foreign template's name, goal and macro targets straight back
+    // out. Scoping the list endpoint above does not close this on its own;
+    // it only stops the id being easy to discover.
+    //
+    // Folded into the INSERT as a WHERE EXISTS rather than run as a second
+    // statement, because routes/diet.js carries a SQL-literal budget the
+    // layering ratchet only ever lets shrink. Zero rows back means the
+    // template is not visible to this caller — same shared shape as the reads:
+    // product-seeded (no org) or this studio's own.
+    const scope = tenantScope(req);
+    const templateGuard = scope.applyFilter
+      ? 'AND (dt.organization_id IS NULL OR dt.organization_id = $9)'
+      : '';
+
     const { rows } = await pool.query(`
       INSERT INTO diet_assignments (id, diet_template_id, client_id, trainer_id,
         start_date, end_date, status, notes, organization_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9
+       WHERE EXISTS (SELECT 1 FROM diet_templates dt WHERE dt.id = $2 ${templateGuard})
       ON CONFLICT (diet_template_id, client_id, status)
       DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date,
         organization_id = COALESCE(diet_assignments.organization_id, EXCLUDED.organization_id), updated_at = NOW()
@@ -198,6 +248,9 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
        d.start_date || new Date().toISOString().split('T')[0],
        d.end_date || null, 'active', d.notes || null, orgIdOf(req)]
     );
+    // 404 rather than 403, matching the client guard above: a caller who may
+    // not use a template should not learn whether its id exists.
+    if (!rows[0]) return res.status(404).json({ error: 'Diet template not found' });
     res.status(201).json({ message: 'Diet plan assigned', assignment: rows[0] });
   } catch (err) {
     next(err);
