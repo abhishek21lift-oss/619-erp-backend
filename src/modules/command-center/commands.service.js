@@ -344,11 +344,14 @@ const COMMANDS = {
       steps.push({ step: 'pause', done: true });
       await q.pause();
 
-      const drained = await drainQueue(q);
-      steps.push({ step: 'drain', ...drained });
-
-      await q.resume();
-      steps.push({ step: 'resume', done: true });
+      let drained;
+      try {
+        drained = await drainQueue(q);
+        steps.push({ step: 'drain', ...drained });
+      } finally {
+        await q.resume();
+        steps.push({ step: 'resume', done: true });
+      }
 
       const after = await health();
       steps.push({ step: 'verify', ...after });

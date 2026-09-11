@@ -37,12 +37,23 @@ const router = express.Router();
 
 /* ─── Guard ─────────────────────────────────────────────────────────────── */
 function requireConfigured(req, res, next) {
-  if (!process.env.OPENROUTER_API_KEY) {
+  const apiKey = process.env.AI_API_KEY || process.env.OPENROUTER_API_KEY;
+  const baseUrl = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
+
+  if (!apiKey) {
     return res.status(501).json({
       error: 'AI not configured',
-      message: 'OPENROUTER_API_KEY is not set in environment variables.',
+      message: 'AI_API_KEY / OPENROUTER_API_KEY is not set in environment variables.',
     });
   }
+
+  if (!baseUrl) {
+    return res.status(501).json({
+      error: 'AI not configured',
+      message: 'AI_BASE_URL is not configured.',
+    });
+  }
+
   next();
 }
 

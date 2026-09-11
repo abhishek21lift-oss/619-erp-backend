@@ -395,6 +395,24 @@ describe('recovery.run', () => {
     jest.useRealTimers();
     mockQueue.getActiveCount.mockResolvedValue(0);
   });
+
+  test('it resumes the queue when drain throws', async () => {
+    // The sibling case above covers a drain that gives up waiting. This is the
+    // other way out of that block: the drain THROWS. Without the try/finally
+    // the queue stays paused for good — the recovery button becomes the
+    // outage. run() surfaces a failed command by throwing (see the tail of
+    // run(): outcome 'error' is re-raised with status 500), so the resume has
+    // to be asserted around a rejection rather than a returned value.
+    mockQueue.getActiveCount.mockRejectedValueOnce(new Error('drain failed'));
+
+    await expect(
+      commands.run('recovery.run', { req, queue: 'email', confirm }),
+    ).rejects.toThrow(/drain failed/);
+
+    expect(mockQueue.pause).toHaveBeenCalled();
+    expect(mockQueue.resume).toHaveBeenCalled();
+  });
+
 });
 
 // ── drainQueue ──────────────────────────────────────────────────────────────
