@@ -1,9 +1,56 @@
 // src/routes/settings.js — Studio Settings CRUD
+//
+// ── Every statement here is scoped to one studio ───────────────────────────
+//
+// It did not used to be. system_settings had no organization_id and none of
+// the queries below filtered, so all six studios in production shared one set
+// of 35 rows: studio name, business email, phone, address, the geofence that
+// gates check-in, and the perm_* role permissions. Any staff user read another
+// studio's; any admin overwrote it, because the upserts conflicted on `key`
+// alone.
+//
+// Migration 194 gave the table an organization_id, moved the primary key to
+// (organization_id, key) and swapped its RLS policy from shared-read to
+// tenant_isolation. This file is the application half of that: orgIdOf(req)
+// for writes, tenantScope(req) for reads, and no path that can see or touch a
+// row belonging to another studio.
+//
+// settings.tenancy.integration.test.js proves it against a real database, and
+// settings.routeScoping.test.js pins that these handlers are the ones doing it.
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
+
+/**
+ * The org this request reads and writes settings for.
+ *
+ * Fails closed: a caller with no resolvable studio — including a platform
+ * super admin who has not picked one — gets null, and every query below binds
+ * that null so it matches no row and writes nothing. (orgIdOf() is
+ * tenantScope().orgId; the scope's applyFilter flag is deliberately NOT
+ * consulted, because "platform-wide" is the one mode this router must not
+ * have — it would mean reading or writing every studio's settings at once.) Settings are per-studio
+ * business configuration; there is no meaningful platform-wide view of them,
+ * so "all studios at once" is not a mode this router offers.
+ */
+function settingsOrg(req) {
+  return orgIdOf(req);
+}
+
+/** 400 when there is no studio to scope to, so a write cannot land nowhere. */
+function requireOrg(req, res) {
+  const orgId = settingsOrg(req);
+  if (!orgId) {
+    res.status(400).json({
+      error: { code: 'NO_ORG', message: 'Select a target studio before changing its settings.' },
+    });
+    return null;
+  }
+  return orgId;
+}
 
 // GET /api/settings — List all settings
 // ISSUE-028: Non-admin users receive a filtered view that excludes
@@ -11,7 +58,9 @@ const logger = require('../lib/logger');
 router.get('/', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      'SELECT key, value, type, description, updated_at FROM system_settings ORDER BY key'
+      `SELECT key, value, type, description, updated_at FROM system_settings
+        WHERE organization_id = $1 ORDER BY key`,
+      [settingsOrg(req)]
     );
 
     const isAdminLevel = ['admin', 'super_admin'].includes(req.user.role);
@@ -35,6 +84,8 @@ router.get('/', auth, async (req, res, next) => {
 // PUT /api/settings — Bulk update settings
 router.put('/', auth, adminOnly, async (req, res, next) => {
   try {
+    const orgId = requireOrg(req, res);
+    if (!orgId) return;
     const updates = req.body;
     if (!updates || typeof updates !== 'object')
       return res.status(400).json({ error: 'Body must be a key-value object' });
@@ -51,13 +102,14 @@ router.put('/', auth, adminOnly, async (req, res, next) => {
     });
 
     await pool.query(
-      `INSERT INTO system_settings (key, value, updated_at)
-       SELECT unnest($1::text[]), unnest($2::text[]), NOW()
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-      [keys, strVals]
+      `INSERT INTO system_settings (organization_id, key, value, updated_at)
+       SELECT $3, unnest($1::text[]), unnest($2::text[]), NOW()
+       ON CONFLICT (organization_id, key)
+       DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [keys, strVals, orgId]
     );
 
-    logger.info({ userId: req.user.id, keys }, 'Settings updated');
+    logger.info({ userId: req.user.id, orgId, keys }, 'Settings updated');
     res.json({ message: 'Settings updated', count: keys.length });
   } catch (err) {
     next(err);
@@ -67,7 +119,10 @@ router.put('/', auth, adminOnly, async (req, res, next) => {
 // GET /api/settings/studio — Full studio config for the Studio Settings page
 router.get('/studio', auth, async (req, res, next) => {
   try {
-    const { rows } = await pool.query('SELECT key, value, type FROM system_settings');
+    const org = settingsOrg(req);
+    const { rows } = await pool.query(
+      'SELECT key, value, type FROM system_settings WHERE organization_id = $1', [org]
+    );
     const settings = {};
     for (const r of rows) {
       if (r.type === 'boolean') settings[r.key] = r.value === 'true';
@@ -80,8 +135,9 @@ router.get('/studio', auth, async (req, res, next) => {
       `SELECT s.key AS branch_id, s.value AS name,
               COALESCE((SELECT COUNT(*) FROM pt_clients WHERE branch_id = s.key AND deleted_at IS NULL), 0) AS member_count
        FROM system_settings s
-       WHERE s.key LIKE 'branch_%' AND s.type = 'json'
-       ORDER BY s.key`
+       WHERE s.organization_id = $1 AND s.key LIKE 'branch_%' AND s.type = 'json'
+       ORDER BY s.key`,
+      [org]
     );
 
     res.json({ settings, branches });
@@ -100,8 +156,9 @@ router.get('/branches', auth, async (req, res, next) => {
               (value::jsonb)->>'status' AS status,
               COALESCE((SELECT COUNT(*) FROM pt_clients WHERE branch_id = s.key AND deleted_at IS NULL), 0)::int AS member_count
        FROM system_settings s
-       WHERE s.key LIKE 'branch_%' AND s.type = 'json'
-       ORDER BY s.key`
+       WHERE s.organization_id = $1 AND s.key LIKE 'branch_%' AND s.type = 'json'
+       ORDER BY s.key`,
+      [settingsOrg(req)]
     );
     res.json(rows);
   } catch (err) {
@@ -112,6 +169,8 @@ router.get('/branches', auth, async (req, res, next) => {
 // POST /api/settings/branches
 router.post('/branches', auth, adminOnly, async (req, res, next) => {
   try {
+    const orgId = requireOrg(req, res);
+    if (!orgId) return;
     const { name, location } = req.body;
     if (!name?.trim())
       return res.status(400).json({ error: 'Branch name is required' });
@@ -121,9 +180,9 @@ router.post('/branches', auth, adminOnly, async (req, res, next) => {
     const value = JSON.stringify({ name: name.trim(), location: location || '', status: 'active' });
 
     await pool.query(
-      `INSERT INTO system_settings (key, value, type, description, updated_by, updated_at)
-       VALUES ($1, $2, 'json', $3, $4, NOW())`,
-      [branchKey, value, 'Branch: ' + name.trim(), req.user.id]
+      `INSERT INTO system_settings (organization_id, key, value, type, description, updated_by, updated_at)
+       VALUES ($5, $1, $2, 'json', $3, $4, NOW())`,
+      [branchKey, value, 'Branch: ' + name.trim(), req.user.id, orgId]
     );
 
     res.status(201).json({ id, name: name.trim(), location: location || '', status: 'active', member_count: 0 });
@@ -135,11 +194,14 @@ router.post('/branches', auth, adminOnly, async (req, res, next) => {
 // PUT /api/settings/branches/:id
 router.put('/branches/:id', auth, adminOnly, async (req, res, next) => {
   try {
+    const orgId = requireOrg(req, res);
+    if (!orgId) return;
     const branchKey = 'branch_' + req.params.id;
     const { name, location, status } = req.body;
 
     const { rows: ex } = await pool.query(
-      'SELECT value FROM system_settings WHERE key=$1', [branchKey]
+      'SELECT value FROM system_settings WHERE key=$1 AND organization_id=$2',
+      [branchKey, orgId]
     );
     if (!ex[0]) return res.status(404).json({ error: 'Branch not found' });
 
@@ -153,8 +215,8 @@ router.put('/branches/:id', auth, adminOnly, async (req, res, next) => {
 
     await pool.query(
       `UPDATE system_settings SET value=$1, updated_by=$2, updated_at=NOW()
-       WHERE key=$3`,
-      [JSON.stringify(updated), req.user.id, branchKey]
+       WHERE key=$3 AND organization_id=$4`,
+      [JSON.stringify(updated), req.user.id, branchKey, orgId]
     );
 
     res.json({ id: req.params.id, ...updated });
@@ -176,10 +238,13 @@ router.put('/branches/:id', auth, adminOnly, async (req, res, next) => {
 // branch out of the way without moving its members can PUT status:'inactive'.
 router.delete('/branches/:id', auth, adminOnly, async (req, res, next) => {
   try {
+    const orgId = requireOrg(req, res);
+    if (!orgId) return;
     const branchKey = 'branch_' + req.params.id;
 
     const { rows: ex } = await pool.query(
-      'SELECT key FROM system_settings WHERE key=$1', [branchKey]
+      'SELECT key FROM system_settings WHERE key=$1 AND organization_id=$2',
+      [branchKey, orgId]
     );
     if (!ex[0]) return res.status(404).json({ error: 'Branch not found' });
 
@@ -195,7 +260,9 @@ router.delete('/branches/:id', auth, adminOnly, async (req, res, next) => {
       });
     }
 
-    await pool.query('DELETE FROM system_settings WHERE key=$1', [branchKey]);
+    await pool.query(
+      'DELETE FROM system_settings WHERE key=$1 AND organization_id=$2', [branchKey, orgId]
+    );
     res.json({ message: 'Branch deleted' });
   } catch (err) {
     next(err);
@@ -225,8 +292,9 @@ const GYM_DEFAULTS = {
 router.get('/gym', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT key, value, type FROM system_settings WHERE key = ANY($1::text[])`,
-      [GYM_KEYS]
+      `SELECT key, value, type FROM system_settings
+        WHERE key = ANY($1::text[]) AND organization_id = $2`,
+      [GYM_KEYS, settingsOrg(req)]
     );
     const result = { ...GYM_DEFAULTS };
     for (const r of rows) {
@@ -243,6 +311,8 @@ router.get('/gym', auth, async (req, res, next) => {
 // PUT /api/settings/gym
 router.put('/gym', auth, adminOnly, async (req, res, next) => {
   try {
+    const orgId = requireOrg(req, res);
+    if (!orgId) return;
     const body = req.body || {};
     const allowedKeys = GYM_KEYS.filter(k => body[k] !== undefined);
     if (!allowedKeys.length) return res.status(400).json({ error: 'No valid gym settings provided' });
@@ -255,13 +325,14 @@ router.put('/gym', auth, adminOnly, async (req, res, next) => {
     });
 
     await pool.query(
-      `INSERT INTO system_settings (key, value, updated_at)
-       SELECT unnest($1::text[]), unnest($2::text[]), NOW()
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-      [allowedKeys, strVals]
+      `INSERT INTO system_settings (organization_id, key, value, updated_at)
+       SELECT $3, unnest($1::text[]), unnest($2::text[]), NOW()
+       ON CONFLICT (organization_id, key)
+       DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [allowedKeys, strVals, orgId]
     );
 
-    logger.info({ userId: req.user.id, keys: allowedKeys }, 'Gym settings updated');
+    logger.info({ userId: req.user.id, orgId, keys: allowedKeys }, 'Gym settings updated');
     res.json({ success: true, message: 'Gym settings saved', count: allowedKeys.length });
   } catch (err) {
     next(err);
@@ -302,8 +373,9 @@ const PERM_DEFAULTS = {
 router.get('/permissions', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT key, value FROM system_settings WHERE key = ANY($1::text[])`,
-      [PERM_KEYS]
+      `SELECT key, value FROM system_settings
+        WHERE key = ANY($1::text[]) AND organization_id = $2`,
+      [PERM_KEYS, settingsOrg(req)]
     );
     const perms = { ...PERM_DEFAULTS };
     for (const r of rows) {
@@ -318,6 +390,8 @@ router.get('/permissions', auth, async (req, res, next) => {
 // PUT /api/settings/permissions
 router.put('/permissions', auth, adminOnly, async (req, res, next) => {
   try {
+    const orgId = requireOrg(req, res);
+    if (!orgId) return;
     const updates = req.body;
     if (!updates || typeof updates !== 'object')
       return res.status(400).json({ error: 'Body must be a key-value object' });
@@ -325,11 +399,15 @@ router.put('/permissions', auth, adminOnly, async (req, res, next) => {
     const keys = PERM_KEYS.filter(k => updates[k] !== undefined);
     if (keys.length) {
       const strVals = keys.map(k => updates[k] ? 'true' : 'false');
+      // Role permissions are per-studio. Unscoped, an admin in one studio
+      // toggling perm_trainer_finance changed what trainers could reach in
+      // every other studio — a cross-tenant authorization change.
       await pool.query(
-        `INSERT INTO system_settings (key, value, updated_at)
-         SELECT unnest($1::text[]), unnest($2::text[]), NOW()
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-        [keys, strVals]
+        `INSERT INTO system_settings (organization_id, key, value, updated_at)
+         SELECT $3, unnest($1::text[]), unnest($2::text[]), NOW()
+         ON CONFLICT (organization_id, key)
+         DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [keys, strVals, orgId]
       );
     }
     res.json({ message: 'Permissions updated' });

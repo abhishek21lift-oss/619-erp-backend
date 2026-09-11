@@ -263,14 +263,42 @@ describe('POST /api/ai/chat — new conversation', () => {
   });
 
   it('preserves client_id handling on a new conversation', async () => {
-    pool.query.mockResolvedValueOnce({ rows: [{ id: 'new-conv-2' }] });
+    // The ownership check now runs before the conversation is opened, so the
+    // INSERT is no longer the first query. Found by name rather than by
+    // position — an index made this assertion about call ORDER when it is
+    // about what the INSERT binds.
+    //
+    // mockResolvedValueOnce feeds the ownership lookup, which must find the
+    // client for it to be persisted; the default mock answers the INSERT.
+    pool.query.mockResolvedValueOnce({ rows: [{ ok: 1 }], rowCount: 1 });
     routedStream.mockImplementation(streamChunks(['ok']));
 
     await request(app)
       .post('/api/ai/chat')
       .send({ message: 'Coach me', client_id: 'cli-9' });
 
-    expect(pool.query.mock.calls[0][1]).toEqual(['usr-1', 'cli-9', 'Coach me']);
+    const insert = pool.query.mock.calls.find(
+      ([sql]) => sql.includes('INSERT INTO ai_conversations'));
+    expect(insert).toBeTruthy();
+    expect(insert[1]).toEqual(['usr-1', 'cli-9', 'Coach me']);
+  });
+
+  it('does not persist a client_id the caller studio does not own', async () => {
+    // The defect this guard exists for: the conversation row is opened with no
+    // client rather than with another studio's. The request still succeeds and
+    // still answers — a foreign id degrades to empty context, exactly as an
+    // unknown or archived one does.
+    pool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // not ours
+    routedStream.mockImplementation(streamChunks(['ok']));
+
+    await request(app)
+      .post('/api/ai/chat')
+      .send({ message: 'Coach me', client_id: 'cli-in-another-studio' });
+
+    const insert = pool.query.mock.calls.find(
+      ([sql]) => sql.includes('INSERT INTO ai_conversations'));
+    expect(insert).toBeTruthy();
+    expect(insert[1]).toEqual(['usr-1', null, 'Coach me']);
   });
 });
 

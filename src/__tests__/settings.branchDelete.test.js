@@ -75,7 +75,11 @@ describe('DELETE /settings/branches/:id', () => {
     expect(res.status).toBe(200);
     // The client types this as { message: string } and shows it on success.
     expect(res.body).toEqual({ message: 'Branch deleted' });
-    expect(deleteQuery().params).toEqual([BRANCH_KEY]);
+    // The caller's studio is bound alongside the key. Without it, an admin in
+    // one studio could delete another studio's branch by id — system_settings
+    // rows were shared until migration 194 gave them an owner.
+    expect(deleteQuery().params).toEqual([BRANCH_KEY, 'org-1']);
+    expect(deleteQuery().sql).toMatch(/organization_id\s*=\s*\$2/i);
   });
 
   test('addresses the row by its prefixed settings key, not the bare id', async () => {
