@@ -1,7 +1,7 @@
 'use strict';
 const logger = require('../logger');
 
-const BASE_URL     = 'https://openrouter.ai/api/v1';
+const BASE_URL     = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
 const SITE_URL     = process.env.FRONTEND_URL || 'https://619fitness.app';
 const SITE_NAME    = 'MY PT STUDIO';
 
@@ -24,9 +24,9 @@ function defaultTimeoutMs() {
 }
 
 function getApiKey() {
-  const key = process.env.OPENROUTER_API_KEY;
+  const key = process.env.AI_API_KEY || process.env.OPENROUTER_API_KEY;
   if (!key) {
-    const err = new Error('OPENROUTER_API_KEY is not configured');
+    const err = new Error('AI_API_KEY / OPENROUTER_API_KEY is not configured');
     err.code = 'NOT_CONFIGURED';
     throw err;
   }
@@ -181,8 +181,9 @@ async function pingModel(model) {
   try {
     await chatCompletion({
       model,
-      messages: [{ role: 'user', content: 'ping' }],
-      max_tokens: 1,
+      messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
+      max_tokens: 20,
+      temperature: 0,
       timeout: 30_000,
     });
     return { model, status: 'ok', latency_ms: Date.now() - start };
