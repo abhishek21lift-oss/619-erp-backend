@@ -63,13 +63,19 @@ const PARENT_SQL = /SELECT name, dob, gender, mobile FROM pt_clients WHERE id=\$
 const CHILD_TABLES = /pt_goals|pt_assessments|weekly_checkins/;
 
 function clientDispatch({ client = CLIENT_ROWS, goals = GOAL_ROWS, assess = ASSESS_ROWS, checkins = CHECKIN_ROWS } = {}) {
+  // node-postgres always returns rowCount alongside rows, and lib/orgGuard's
+  // clientInOrg() reads it — the client-ownership gate this route now runs
+  // before opening a conversation. A rows-only mock made `rowCount > 0` read
+  // as `undefined > 0`, so every request 404'd on a client the fixture says is
+  // legitimate. Derived rather than hand-written so it cannot drift from rows.
+  const reply = (rows) => Promise.resolve({ rows, rowCount: rows.length });
   return jest.fn((sql, _params) => {
-    if (sql.includes('ai_conversations WHERE id')) return Promise.resolve({ rows: [{ id: 'conv-1' }] });
-    if (sql.includes('pt_clients WHERE id')) return Promise.resolve({ rows: client });
-    if (sql.includes('pt_goals')) return Promise.resolve({ rows: goals });
-    if (sql.includes('pt_assessments')) return Promise.resolve({ rows: assess });
-    if (sql.includes('weekly_checkins')) return Promise.resolve({ rows: checkins });
-    return Promise.resolve({ rows: [] });
+    if (sql.includes('ai_conversations WHERE id')) return reply([{ id: 'conv-1' }]);
+    if (sql.includes('pt_clients WHERE id')) return reply(client);
+    if (sql.includes('pt_goals')) return reply(goals);
+    if (sql.includes('pt_assessments')) return reply(assess);
+    if (sql.includes('weekly_checkins')) return reply(checkins);
+    return reply([]);
   });
 }
 

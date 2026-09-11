@@ -6,6 +6,7 @@ const express    = require('express');
 const pool       = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
+const { clientInOrg } = require('../lib/orgGuard');
 const logger     = require('../lib/logger');
 
 // Null-safe tenant param: a tenant user gets their org id (queries then filter
@@ -415,6 +416,32 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
   // the SSE headers so the failure is a JSON 404, and before any message
   // read/write so a foreign conversation can never reach the prompt, RAG,
   // tools, or the model. Unknown and foreign UUIDs answer identically.
+  // `client_id` arrives in the request body and was PERSISTED unchecked onto
+  // the conversation row below.
+  //
+  // The read paths were already safe: buildClientContext() and
+  // loadAuthoritativeClient() both await the org-scoped pt_clients lookup
+  // first and return nothing for a foreign id before any child query runs. So
+  // this was never a leak. What it was is referential pollution — a
+  // conversation in the caller's studio pointing at another studio's client,
+  // the foothold lib/orgGuard.js was written to remove.
+  //
+  // ── Why this sanitises rather than refuses ────────────────────────────────
+  //
+  // Rejecting with a 404 was the first attempt and it was wrong. This route
+  // deliberately makes a foreign client, an unknown client and a soft-deleted
+  // client behave identically — all three yield empty context and a normal
+  // answer — and ai.chat.clientContext.test.js pins that. A 404 would also
+  // have started refusing a caller's OWN archived client, which is a working
+  // feature, not an attack.
+  //
+  // Dropping the id keeps every one of those behaviours and still fixes the
+  // defect: the conversation is opened with no client rather than with
+  // someone else's. The context builder below is handed the original id and
+  // reaches the same empty result through its own org-scoped gate, so the
+  // answer the user gets is unchanged.
+  const ownedClientId = client_id && await clientInOrg(req, client_id) ? client_id : null;
+
   let convId = conversation_id;
   if (convId) {
     try {
@@ -451,7 +478,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       const title = message.slice(0, 60).trim();
       const { rows } = await pool.query(
         `INSERT INTO ai_conversations (user_id, client_id, title) VALUES ($1,$2,$3) RETURNING id`,
-        [req.user.id, client_id || null, title]
+        [req.user.id, ownedClientId, title]
       );
       convId = rows[0].id;
     }

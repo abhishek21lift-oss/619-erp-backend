@@ -271,10 +271,23 @@ describe('POST /api/ai/chat — bounded conversation history (F-5)', () => {
       .post('/api/ai/chat')
       .send({ message: 'hi', conversation_id: 'conv-1', client_id: 'cli-1' });
 
-    const clientGate = pool.query.mock.calls.find(([sql]) => sql.includes('pt_clients WHERE'));
+    // Two org-scoped pt_clients lookups run now: lib/orgGuard's ownership
+    // check, which decides whether the client id may be PERSISTED on the
+    // conversation, and buildClientContext's parent gate, which decides
+    // whether the client's data may reach the prompt. This names the second —
+    // the one this test is about — rather than taking whichever came first.
+    const clientGate = pool.query.mock.calls.find(
+      ([sql]) => sql.includes('SELECT name, dob, gender, mobile FROM pt_clients'));
     expect(clientGate).toBeTruthy();
     expect(clientGate[0]).toContain('organization_id=$2');
     expect(clientGate[1]).toEqual(['cli-1', 'org-1']);
+
+    // …and the ownership check ran too, org-bound, before the conversation
+    // was touched.
+    const ownership = pool.query.mock.calls.find(
+      ([sql]) => sql.includes('SELECT 1 FROM pt_clients'));
+    expect(ownership).toBeTruthy();
+    expect(ownership[1]).toEqual(['cli-1', 'org-1']);
     expect(historyMessages().map(m => m.content)).toEqual(['msg-1', 'msg-2', 'msg-3', 'Q4']);
   });
 
