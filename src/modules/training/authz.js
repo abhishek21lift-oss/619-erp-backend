@@ -106,95 +106,6 @@ async function canAccessClient(req, clientId) {
   return rowCount > 0;
 }
 
-/**
- * The session, if this request may see it. Otherwise null.
- *
- * Joins to pt_clients so the trainer rule is applied against the CLIENT's
- * trainer, and checks the org on both the session and the client — a row
- * whose two org columns disagree is corrupt, and should be unreachable rather
- * than reachable through whichever one the query happened to name.
- */
-async function loadSession(req, sessionId, client = pool) {
-  if (!sessionId) return null;
-  const params = [sessionId];
-  const org = orgWhere(req, params, 's.organization_id');
-  const trainer = trainerWhere(req, params);
-  const { rows } = await client.query(
-    `SELECT s.* FROM training_sessions s
-       JOIN pt_clients c ON c.id = s.client_id
-      WHERE s.id = $1 AND s.deleted_at IS NULL AND c.deleted_at IS NULL${org}${trainer}`,
-    params
-  );
-  return rows[0] ?? null;
-}
-
-/**
- * An exercise performance, reached through its session.
- *
- * This is the walk-up-the-tree the header describes: performances carry no
- * organization_id, so the only safe route to one is through the session that
- * owns it and the client that owns THAT.
- */
-async function loadPerformance(req, performanceId, client = pool) {
-  if (!performanceId) return null;
-  const params = [performanceId];
-  const org = orgWhere(req, params, 's.organization_id');
-  const trainer = trainerWhere(req, params);
-  const { rows } = await client.query(
-    `SELECT ep.*, s.client_id, s.organization_id, s.status AS session_status
-       FROM exercise_performances ep
-       JOIN training_sessions s ON s.id = ep.session_id
-       JOIN pt_clients c        ON c.id = s.client_id
-      WHERE ep.id = $1 AND s.deleted_at IS NULL AND c.deleted_at IS NULL${org}${trainer}`,
-    params
-  );
-  return rows[0] ?? null;
-}
-
-/** A set, reached through performance → session → client. */
-async function loadSet(req, setId, client = pool) {
-  if (!setId) return null;
-  const params = [setId];
-  const org = orgWhere(req, params, 's.organization_id');
-  const trainer = trainerWhere(req, params);
-  const { rows } = await client.query(
-    `SELECT sp.*, s.id AS session_id, s.client_id
-       FROM set_performances sp
-       JOIN exercise_performances ep ON ep.id = sp.exercise_performance_id
-       JOIN training_sessions s      ON s.id = ep.session_id
-       JOIN pt_clients c             ON c.id = s.client_id
-      WHERE sp.id = $1 AND s.deleted_at IS NULL AND c.deleted_at IS NULL${org}${trainer}`,
-    params
-  );
-  return rows[0] ?? null;
-}
-
-/** A cardio effort, reached the same way. */
-async function loadCardio(req, cardioId, client = pool) {
-  if (!cardioId) return null;
-  const params = [cardioId];
-  const org = orgWhere(req, params, 's.organization_id');
-  const trainer = trainerWhere(req, params);
-  const { rows } = await client.query(
-    `SELECT cp.*, s.id AS session_id, s.client_id
-       FROM cardio_performances cp
-       JOIN exercise_performances ep ON ep.id = cp.exercise_performance_id
-       JOIN training_sessions s      ON s.id = ep.session_id
-       JOIN pt_clients c             ON c.id = s.client_id
-      WHERE cp.id = $1 AND s.deleted_at IS NULL AND c.deleted_at IS NULL${org}${trainer}`,
-    params
-  );
-  return rows[0] ?? null;
-}
-
-/**
- * A program or template, by org alone.
- *
- * No trainer clause: a studio's programme library is shared, and a trainer
- * building from a colleague's template is the normal case rather than a leak.
- * The CLIENT-bound rows (assignments, sessions) are where the trainer rule
- * bites, which is where a client's private history actually lives.
- */
 async function loadOwned(req, table, id, client = pool) {
   const ALLOWED = ['training_programs', 'workout_templates', 'training_assignments'];
   if (!ALLOWED.includes(table)) throw new Error(`loadOwned: unsupported table ${table}`);
@@ -212,5 +123,5 @@ async function loadOwned(req, table, id, client = pool) {
 module.exports = {
   ALL_CLIENT_ROLES, seesAllClients,
   orgWhere, trainerWhere,
-  canAccessClient, loadSession, loadPerformance, loadSet, loadCardio, loadOwned,
+  canAccessClient, loadOwned,
 };

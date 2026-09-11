@@ -346,7 +346,6 @@ describe('list endpoints clamp their page size at both ends', () => {
   // clamped variable was simply no longer referenced by the SQL.
   it.each([
     ['modules/pt-os/pt-os.routes.js', /ORDER BY s\.session_date DESC, s\.start_time\s*\n\s*LIMIT \$\$\{params\.length\}/],
-    ['modules/training/training.repository.js', /ORDER BY s\.session_date DESC, s\.created_at DESC LIMIT \$\$\{params\.length\}/],
     ['modules/command-center/alerts.service.js', /last_seen_at DESC\s*\n\s*LIMIT \$1/],
     ['modules/notifications/notifications.service.js', /ORDER BY created_at DESC LIMIT \$2/],
   ])('%s actually applies its LIMIT to the query', (rel, re) => {

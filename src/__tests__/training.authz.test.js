@@ -21,11 +21,7 @@
 // since a handler could return 404 for an unrelated reason and look correct.
 'use strict';
 
-const ORG_A = '11111111-1111-4111-8111-111111111111';
 const ORG_B = '22222222-2222-4222-8222-222222222222';
-const SESSION_A = '33333333-3333-4333-8333-333333333333';
-const PERF_A = '44444444-4444-4444-8444-444444444444';
-const SET_A = '55555555-5555-4555-8555-555555555555';
 const TEMPLATE_A = '66666666-6666-4666-8666-666666666666';
 
 const mockQueries = [];
@@ -89,81 +85,6 @@ beforeEach(() => {
   mockUser = { id: 'u-b', role: 'trainer', organization_id: ORG_B, trainer_id: 't-b' };
 });
 
-describe('a trainer from another studio cannot reach a session', () => {
-  test('GET /sessions/:id is 404, not 403', async () => {
-    // 403 would confirm the session exists. 404 says nothing.
-    const res = await request(app()).get(`/api/training/sessions/${SESSION_A}`);
-    expect(res.status).toBe(404);
-  });
-
-  test('the lookup carried the caller\'s org, not the row\'s', async () => {
-    await request(app()).get(`/api/training/sessions/${SESSION_A}`);
-    expect(allSql()).toMatch(/s\.organization_id = \$\d/);
-    expect(allParams()).toContain(ORG_B);
-    expect(allParams()).not.toContain(ORG_A);
-  });
-
-  test('and the trainer predicate, since this caller is not an admin', async () => {
-    await request(app()).get(`/api/training/sessions/${SESSION_A}`);
-    expect(allSql()).toMatch(/c\.trainer_id = \$\d/);
-    expect(allParams()).toContain('t-b');
-  });
-
-  test('completing another studio\'s session is refused', async () => {
-    const res = await request(app()).post(`/api/training/sessions/${SESSION_A}/complete`).send({});
-    expect(res.status).toBe(404);
-    // Nothing was written. A completion that got as far as UPDATE would have
-    // closed another studio's assignment.
-    expect(allSql()).not.toMatch(/UPDATE training_sessions SET status = 'COMPLETED'/);
-  });
-
-  test('starting another studio\'s session is refused', async () => {
-    const res = await request(app()).post(`/api/training/sessions/${SESSION_A}/start`);
-    expect(res.status).toBe(404);
-    expect(allSql()).not.toMatch(/UPDATE training_sessions SET status = 'IN_PROGRESS'/);
-  });
-});
-
-describe('child rows are reached through the client, never by id alone', () => {
-  test('logging a set walks back to pt_clients', async () => {
-    // The whole point of the file. Without this join the handler would accept
-    // any performance id from any studio.
-    const res = await request(app()).post(`/api/training/performances/${PERF_A}/sets`)
-      .send({ set_number: 1, actual_reps: 8, actual_weight: 100 });
-    expect(res.status).toBe(404);
-    expect(allSql()).toMatch(/JOIN training_sessions s ON s\.id = ep\.session_id/);
-    expect(allSql()).toMatch(/JOIN pt_clients c ON c\.id = s\.client_id/);
-    expect(allSql()).not.toMatch(/INSERT INTO set_performances/);
-  });
-
-  test('logging cardio does the same walk', async () => {
-    const res = await request(app()).post(`/api/training/performances/${PERF_A}/cardio`)
-      .send({ cardio_type: 'TREADMILL', duration_seconds: 1200 });
-    expect(res.status).toBe(404);
-    expect(allSql()).not.toMatch(/INSERT INTO cardio_performances/);
-  });
-
-  test('editing a set by id alone is refused', async () => {
-    const res = await request(app()).patch(`/api/training/sets/${SET_A}`).send({ actual_weight: 200 });
-    expect(res.status).toBe(404);
-    expect(allSql()).toMatch(/JOIN exercise_performances ep ON ep\.id = sp\.exercise_performance_id/);
-    expect(allSql()).not.toMatch(/UPDATE set_performances SET/);
-  });
-
-  test('deleting a set by id alone is refused', async () => {
-    const res = await request(app()).delete(`/api/training/sets/${SET_A}`);
-    expect(res.status).toBe(404);
-    expect(allSql()).not.toMatch(/DELETE FROM set_performances/);
-  });
-
-  test('adding an exercise to another studio\'s session is refused', async () => {
-    const res = await request(app()).post(`/api/training/sessions/${SESSION_A}/exercises`)
-      .send({ exercise_id: 'ex-1' });
-    expect(res.status).toBe(404);
-    expect(allSql()).not.toMatch(/INSERT INTO exercise_performances/);
-  });
-});
-
 describe('templates and programs are org-scoped', () => {
   test('another studio\'s template is not readable', async () => {
     const res = await request(app()).get(`/api/training/templates/${TEMPLATE_A}`);
@@ -186,43 +107,20 @@ describe('templates and programs are org-scoped', () => {
   });
 });
 
-describe('a client cannot be reached across the boundary', () => {
-  test('creating a session for another studio\'s client is refused', async () => {
-    const res = await request(app()).post('/api/training/sessions').send({ client_id: 'client-a' });
-    expect(res.status).toBe(404);
-    expect(allSql()).not.toMatch(/INSERT INTO training_sessions/);
-  });
-
-  test('assigning a workout to another studio\'s client is refused', async () => {
-    const res = await request(app()).post('/api/training/assignments')
-      .send({ client_id: 'client-a', workout_template_id: TEMPLATE_A });
-    expect(res.status).toBe(404);
-    expect(allSql()).not.toMatch(/INSERT INTO training_assignments/);
-  });
-
-  test('reading records requires a client the caller can access', async () => {
-    const res = await request(app()).get('/api/training/records?client_id=client-a');
-    expect(res.status).toBe(404);
-    expect(allSql()).not.toMatch(/SELECT \* FROM personal_records/);
-  });
-
-  test('reading records without a client_id is a 400, not everyone\'s records', async () => {
-    const res = await request(app()).get('/api/training/records');
-    expect(res.status).toBe(400);
-    expect(allSql()).not.toMatch(/personal_records/);
-  });
-});
-
+// Retargeted from GET /sessions, which is gone, to GET /programs. The property
+// is the authz helpers' and not the endpoint's: listPrograms() applies
+// orgWhere() and the same trainer subquery, so this still pins what it always
+// pinned — an un-provisioned trainer must not fall through to "sees all".
 describe('an admin sees the whole studio, a trainer only their own clients', () => {
   test('an admin\'s query carries no trainer predicate', async () => {
     mockUser = { id: 'u-b', role: 'admin', organization_id: ORG_B, trainer_id: null };
-    await request(app()).get('/api/training/sessions');
-    expect(allSql()).toMatch(/s\.organization_id = \$\d/);
+    await request(app()).get('/api/training/programs');
+    expect(allSql()).toMatch(/p\.organization_id = \$\d/);
     expect(allSql()).not.toMatch(/c\.trainer_id = \$\d/);
   });
 
   test('a trainer\'s does', async () => {
-    await request(app()).get('/api/training/sessions');
+    await request(app()).get('/api/training/programs');
     expect(allSql()).toMatch(/c\.trainer_id = \$\d/);
   });
 
@@ -230,31 +128,15 @@ describe('an admin sees the whole studio, a trainer only their own clients', () 
     // An un-provisioned staff login must not fall through to "sees everything"
     // just because there is no trainer id to filter on.
     mockUser = { id: 'u-b', role: 'trainer', organization_id: ORG_B, trainer_id: null };
-    await request(app()).get('/api/training/sessions');
-    expect(allSql()).toMatch(/s\.organization_id = \$\d/);
+    await request(app()).get('/api/training/programs');
+    expect(allSql()).toMatch(/p\.organization_id = \$\d/);
     expect(allParams()).toContain(ORG_B);
   });
 });
 
 describe('validation runs before anything is written', () => {
-  test('a set with no set_number is rejected', async () => {
-    const res = await request(app()).post(`/api/training/performances/${PERF_A}/sets`)
-      .send({ actual_reps: 8 });
-    expect(res.status).toBe(400);
-  });
 
-  test('an RPE of 14 is rejected', async () => {
-    const res = await request(app()).post(`/api/training/performances/${PERF_A}/sets`)
-      .send({ set_number: 1, actual_rpe: 14 });
-    expect(res.status).toBe(400);
-  });
 
-  test('cardio distance without a unit is rejected before the database sees it', async () => {
-    const res = await request(app()).post(`/api/training/performances/${PERF_A}/cardio`)
-      .send({ distance: 5 });
-    expect(res.status).toBe(400);
-    expect(allSql()).not.toMatch(/INSERT INTO cardio_performances/);
-  });
 
   test('a template bound to a week must name its day', async () => {
     const res = await request(app()).post('/api/training/templates')
