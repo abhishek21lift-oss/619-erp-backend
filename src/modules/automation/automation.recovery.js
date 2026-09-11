@@ -205,4 +205,135 @@ async function runRecovery() {
   return summary;
 }
 
-module.exports = { runRecovery, recoverOrg, graceSeconds, maxAgeSeconds, RecoveryOutcome };
+/**
+ * How far back a reconnect re-drives.
+ *
+ * THE safety knob of this feature, and the reason it is a knob rather than a
+ * constant. These are messages to real people. A welcome note that arrives two
+ * minutes after a studio reconnects is the feature working; the same note three
+ * days later is worse than one that never arrived, because the client has to
+ * work out what it refers to.
+ *
+ * Two hours by default: long enough to cover a phone that lost its session over
+ * lunch or a router that dropped overnight-and-was-fixed-in-the-morning, short
+ * enough that nothing arrives with no context left. Raise it deliberately, per
+ * deployment, if a studio would rather have late messages than none.
+ *
+ * Anything older is left `failed` with its reason intact, which is a true
+ * statement an operator can read, rather than deleted or silently retried.
+ */
+function reconnectMaxAgeSeconds() {
+  const n = parseInt(process.env.AUTOMATION_RECONNECT_MAX_AGE_SEC, 10);
+  return Number.isInteger(n) && n > 0 ? n : 7200; // 2 hours
+}
+
+/**
+ * Re-drive the messages one studio lost while its WhatsApp was disconnected.
+ *
+ * ── The gap this closes ─────────────────────────────────────────────────────
+ *
+ * recoverOrg above finds rows whose JOB went missing. This finds rows whose
+ * job ran, reached the transport, and was correctly told the studio's WhatsApp
+ * was unusable. The worker marks those `failed` rather than throwing, on the
+ * sound reasoning that no number of BullMQ retries reconnects a socket only
+ * the studio can restore by scanning a QR.
+ *
+ * But nothing then acted on the reconnection. Production: a Welcome Message
+ * failed `whatsapp_logged_out` at 10:56, the studio reconnected at 11:04, and
+ * that message stayed failed for good — and permanently, because its dedupe
+ * key means the same business event will never produce another row. The studio
+ * did everything right and the client still heard nothing.
+ *
+ * ── Why this cannot send twice ──────────────────────────────────────────────
+ *
+ *  1. Only rows still `failed` for a reconnect-fixable reason are candidates,
+ *     and requeueFailed re-asserts that in its own WHERE. Its rowCount is the
+ *     permission to enqueue, so two concurrent reconnect events produce one
+ *     requeue and one job.
+ *  2. The job id is unchanged and deterministic — `wa-auto-<logId>` — so
+ *     BullMQ refuses a duplicate while the job exists, and the queue is asked
+ *     whether one exists before anything is added.
+ *  3. The gateway's send-once ledger is keyed on the same log row id, so even
+ *     a worker that sent and died before recording it cannot deliver twice.
+ *  4. The age window is bounded, so a row can never be re-driven after that
+ *     ledger has forgotten it.
+ *
+ * Called from the webhook that observes the reconnection, and deliberately
+ * fire-and-forget there: a studio's WhatsApp coming back must be recorded even
+ * if re-driving its backlog fails.
+ */
+async function recoverAfterReconnect(orgId, { maxAge = reconnectMaxAgeSeconds() } = {}) {
+  const stats = { candidates: 0, requeued: 0, jobPresent: 0, failed: 0, unavailable: 0 };
+  if (!orgId) return stats;
+
+  // The studio switch, checked once before the work rather than per row. The
+  // trainer grant and the instance itself are re-checked by the worker at send
+  // time, as they are for every other path — see processAutomationJob.
+  const settings = await repo.settingsFor(orgId);
+  if (!settings.automation_enabled) return stats;
+
+  const candidates = await repo.reconnectCandidates(orgId, { maxAgeSec: maxAge });
+  stats.candidates = candidates.length;
+  if (candidates.length === 0) return stats;
+
+  const redis = require('../../lib/redis');
+  if (!(await redis.ensureReady())) {
+    stats.unavailable = candidates.length;
+    logger.warn({ org_id: orgId, candidates: candidates.length }, 'automation_reconnect_queue_unavailable');
+    return stats;
+  }
+
+  const { whatsappQueue } = require('../../jobs/queue');
+  const { enqueueWhatsapp } = require('../../services/whatsapp.service');
+
+  for (const row of candidates) {
+    const jobId = `wa-auto-${row.id}`;
+    try {
+      const existing = await whatsappQueue.getJob(jobId);
+      if (existing) {
+        // A job from the original attempt is still around. Removing it so the
+        // row could be re-queued would race whatever is holding it; leaving it
+        // is correct, and the row stays failed until the next reconnect.
+        stats.jobPresent += 1;
+        continue;
+      }
+
+      // The row moves back to 'queued' BEFORE the enqueue, and its rowCount is
+      // what authorises the enqueue. The worker refuses any row that is not
+      // 'queued', so the order matters: enqueueing first would race a job
+      // against the row it needs.
+      if (!(await repo.requeueFailed(orgId, row.id))) {
+        stats.jobPresent += 1;
+        continue;
+      }
+
+      const job = await enqueueWhatsapp(
+        'automation',
+        { logId: row.id, orgId, requestId: `reconnect-${jobId}` },
+        { delay: row.remainingDelayMs, jobId }
+      );
+
+      if (job) {
+        stats.requeued += 1;
+        logger.info({ org_id: orgId, log_id: row.id, job_id: jobId }, 'automation_reconnect_requeued');
+      } else {
+        // Redis went away between ensureReady and here. The row is back at
+        // 'queued', which is the state recoverOrg is for, so it is not lost.
+        stats.unavailable += 1;
+      }
+    } catch (err) {
+      stats.failed += 1;
+      logger.error({ err: err.message, org_id: orgId, log_id: row.id }, 'automation_reconnect_row_failed');
+    }
+  }
+
+  if (stats.requeued > 0) {
+    logger.info({ org_id: orgId, ...stats }, 'automation_reconnect_complete');
+  }
+  return stats;
+}
+
+module.exports = {
+  runRecovery, recoverOrg, graceSeconds, maxAgeSeconds, RecoveryOutcome,
+  recoverAfterReconnect, reconnectMaxAgeSeconds,
+};
