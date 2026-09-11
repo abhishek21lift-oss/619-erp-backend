@@ -9,6 +9,17 @@ const logger = require('../../lib/logger');
 
 const CANCEL_GRACE_HOURS = 2;     // free cancel if > 2h before start
 
+// attendance_logs.method carries a CHECK constraint; the legacy `attendance`
+// table's check_in_method did not. The check-in route takes `method` straight
+// from the request body without validating it, so a caller posting
+// {"method":"turnstile"} used to write that string verbatim and would now get
+// a 500 from a constraint violation instead. Clamping keeps the endpoint's
+// contract: an unrecognised method degrades to 'manual' rather than failing
+// the check-in, and the raw value the caller sent is still recorded verbatim
+// on bookings.check_in_method by checkIn()'s own UPDATE, so nothing is lost.
+const ATTENDANCE_METHODS = new Set(['face', 'manual', 'qr', 'biometric']);
+const attendanceMethod = (m) => (ATTENDANCE_METHODS.has(m) ? m : 'manual');
+
 /**
  * Push a booking to (or remove it from) the member's own Google Calendar.
  *
@@ -309,15 +320,54 @@ async function checkIn(bookingId, { method = 'manual' }, ctx = {}) {
   );
   if (r.rows.length === 0) throw new HttpError(400, 'BAD_STATE', 'Booking not confirmed or already attended');
 
-  // Mirror to attendance table. organization_id comes from the booking row
-  // that was just verified, not from ctx — so the mirror cannot land in a
-  // different studio from the booking it mirrors even if the two disagree.
+  // Mirror into attendance_logs, the canonical register.
+  //
+  // This used to write a second table, `attendance`, and nothing in the
+  // product ever read it. Every attendance surface — the register at
+  // /api/attendance, the QR dashboard, the AI attendance_summary tool, the
+  // automation missed-visit sweep, the client portal's own history and the
+  // super-admin analytics — reads attendance_logs. So a check-in taken
+  // through a class booking was recorded where no screen, report or
+  // automation would ever look at it.
+  //
+  // organization_id still comes from the booking row that was just verified
+  // rather than from ctx, so the mirror cannot land in a different studio
+  // from the booking it mirrors even if the two disagree.
+  //
+  // Two deliberate differences from the legacy write:
+  //
+  //  · The conflict clause keeps the FIRST check-in of the day instead of
+  //    overwriting it. That is the convention routes/attendance.js and
+  //    routes/qr-checkin.js already follow on this table, and it is the
+  //    correct one — a second check-in should not rewrite when someone
+  //    actually arrived. Sharing a table means sharing its semantics.
+  //  · booking_id has no column here, so the link is carried in `notes`.
+  //    It is not restated on conflict: a row written by a QR scan or by the
+  //    register keeps its own note rather than having it clobbered. If the
+  //    class-booking flow is ever revived in earnest, booking_id deserves a
+  //    real column rather than free text — today `bookings` holds 0 rows.
+  //
+  // ref_name is left NULL, as the legacy write also left it. Filling it would
+  // mean a name subselect against the `members` table, which carries no
+  // organization_id — there is nothing to scope such a read by. Writing the
+  // register a name obtained from an untenanted lookup is a worse trade than
+  // a blank one, and tenantColumns.convention.test.js refuses it outright:
+  // it flagged exactly that subselect when this was first written, comment
+  // included, since its scanner reads comments as SQL too.
   const b = r.rows[0];
   await pool.query(
-    `INSERT INTO attendance (type, ref_id, member_id, booking_id, branch_id, date, check_in, status, check_in_method, organization_id)
-     VALUES ('client', $1, $1, $2, COALESCE($4, 'br-main'), CURRENT_DATE, NOW()::time, 'present', $3, $5)
-     ON CONFLICT (type, ref_id, date) DO UPDATE SET check_in = EXCLUDED.check_in, status = 'present'`,
-    [b.member_id, b.id, method, process.env.BRANCH_ID || null, b.organization_id]
+    `INSERT INTO attendance_logs
+       (ref_id, ref_type, date, check_in_time, method, status,
+        notes, branch_id, organization_id)
+     VALUES ($1, 'client', CURRENT_DATE, NOW(), $2, 'present', $3,
+             COALESCE($4, 'br-main'), $5)
+     ON CONFLICT (ref_id, ref_type, date) DO UPDATE
+       SET check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
+           status        = 'present',
+           method        = CASE WHEN attendance_logs.method = 'manual' THEN EXCLUDED.method
+                                ELSE attendance_logs.method END`,
+    [b.member_id, attendanceMethod(method), `Class booking ${b.id}`,
+     process.env.BRANCH_ID || null, b.organization_id]
   );
   return b;
 }
