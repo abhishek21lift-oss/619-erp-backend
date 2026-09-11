@@ -25,6 +25,7 @@ const { paymentSchemas } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 const { logActivity } = require('../lib/activityLog');
+const automation = require('../modules/automation/automation.triggers');
 
 // The ledger. One table, one shape.
 //
@@ -203,6 +204,23 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
     // connection, and a row logged before the transaction actually lands
     // would describe a payment that, on rollback, never happened.
     await logActivity(req, 'payment.create', 'pt_payment', id, rows[0]);
+
+    // Same reasoning as logActivity above, and the same placement: after
+    // COMMIT, on its own connection, outside the transaction. A rolled-back
+    // payment must not message the client, and automation must never be able
+    // to fail a payment.
+    //
+    // This endpoint recorded payments without emitting payment_received, so a
+    // studio's automation stayed silent for money taken through the finance
+    // ledger while firing for the same money taken through the client profile.
+    // The payment id is the event key, so a retried request dedupes to one
+    // event while two genuine payments of equal amount on one day stay two.
+    await automation.paymentReceived(req, {
+      clientId: d.client_id,
+      amount,
+      eventKey: id,
+    });
+
     res.status(201).json({ message: 'Payment recorded', payment: rows[0] });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
