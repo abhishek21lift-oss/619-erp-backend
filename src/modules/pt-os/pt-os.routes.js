@@ -371,32 +371,95 @@ router.get('/clients/:id/enrollment-pdf', auth, wrap(async (req, res) => {
   res.send(buffer);
 }));
 
+// The CURRENT PT TERM's money is defined HERE, once, and nowhere else.
+//
+// Three tables carry financial numbers for a PT client, and before this none
+// of them was authoritative on its own:
+//
+//   pt_clients.final_amount     the CURRENT term's fee. Set at enrollment,
+//                               overwritten by /renew. Always current-term.
+//   pt_clients.paid_amount      LIFETIME paid, not this term's. /renew does
+//                               `paid_amount + paidNow`, and every payment
+//                               increments it, so it accumulates across terms.
+//   pt_clients.balance_amount   `final_amount - paid_amount`, which mixes a
+//                               current-term fee with a lifetime payment total
+//                               and therefore understates the balance for any
+//                               client who has ever renewed.
+//   pt_client_subscriptions     a per-term SNAPSHOT, written once at
+//                               enrollment/renewal and never updated again.
+//                               No payment path touches it, so the moment a
+//                               client pays anything after enrolling, its
+//                               amount_paid/balance_amount are stale.
+//
+// The profile page used to read the subscription snapshot in preference to
+// the client row, which is backwards: the snapshot is the one source that is
+// guaranteed NOT to reflect later payments. Production showed both failure
+// modes — a client whose only snapshot row was written with zeros still shows
+// 0/0/0 while the client row and the payment ledger both said 80000/60000/
+// 20000; and a renewed client whose lifetime paid (20000) is not their
+// current term's paid (11000).
+//
+// So the rule is: the current term's numbers come from the LIVE client row,
+// and subscription history is used ONLY to subtract terms that are already
+// closed:
+//
+//   fee     = final_amount                       (already current-term)
+//   paid    = paid_amount - SUM(prior terms)     (lifetime minus closed terms)
+//   balance = GREATEST(fee - paid, 0)
+//
+// "Prior" means a subscription whose start_date is strictly before the
+// client's current pt_start_date. A row with a NULL start_date, or one
+// starting on/after the current term, is never treated as prior — so a junk
+// or zero-value snapshot can only ever be ignored, never subtracted. That is
+// deliberate: this must fail towards the live record, not towards history.
+//
+// pt_payments is NOT the source of "paid this term" even though it is the one
+// complete ledger, because it carries no term attribution: `date` is the
+// data-entry date (CURRENT_DATE at the time of recording), so a renewed
+// client's older payments routinely carry dates inside the current term. A
+// date window over that ledger would over-count. Attributing payments to
+// terms needs a subscription_id on pt_payments, which is a schema change and
+// a backfill this fix deliberately does not make.
 router.get('/clients/:id', auth, wrap(async (req, res) => {
   const params = [req.params.id];
   const orgClause = orgWhere(req, params, 'c.organization_id');
   const { rows } = await pool.query(`
-    SELECT c.*,
+    SELECT t.*,
+           GREATEST(t.current_term_fee - t.current_term_paid, 0) AS current_term_balance,
            CASE
-             WHEN c.pt_end_date IS NOT NULL AND c.pt_end_date::TEXT != ''
-             THEN c.pt_end_date::DATE - CURRENT_DATE
-             ELSE NULL
-           END AS days_left,
-           COALESCE(pp.total_incentives, 0) AS total_earned_commission,
-           CASE
-             WHEN c.balance_amount > 0
-              AND c.pt_end_date IS NOT NULL AND c.pt_end_date::TEXT != ''
-              AND c.pt_end_date::DATE < CURRENT_DATE THEN 'OVERDUE'
-             WHEN c.balance_amount > 0 THEN 'DUE'
+             WHEN GREATEST(t.current_term_fee - t.current_term_paid, 0) > 0
+              AND t.pt_end_date IS NOT NULL AND t.pt_end_date::TEXT != ''
+              AND t.pt_end_date::DATE < CURRENT_DATE THEN 'OVERDUE'
+             WHEN GREATEST(t.current_term_fee - t.current_term_paid, 0) > 0 THEN 'DUE'
              ELSE 'CLEAR'
            END AS due_status
-    FROM pt_clients c
-    LEFT JOIN (
-      SELECT client_id, SUM(incentive_amt) AS total_incentives
-      FROM pt_payments
-      WHERE deleted_at IS NULL
-      GROUP BY client_id
-    ) pp ON pp.client_id = c.id
-    WHERE c.id = $1 AND c.deleted_at IS NULL${orgClause}
+    FROM (
+      SELECT c.*,
+             CASE
+               WHEN c.pt_end_date IS NOT NULL AND c.pt_end_date::TEXT != ''
+               THEN c.pt_end_date::DATE - CURRENT_DATE
+               ELSE NULL
+             END AS days_left,
+             COALESCE(pp.total_incentives, 0) AS total_earned_commission,
+             COALESCE(c.final_amount, 0) AS current_term_fee,
+             GREATEST(COALESCE(c.paid_amount, 0) - COALESCE(prior.paid, 0), 0) AS current_term_paid
+      FROM pt_clients c
+      LEFT JOIN (
+        SELECT client_id, SUM(incentive_amt) AS total_incentives
+        FROM pt_payments
+        WHERE deleted_at IS NULL
+        GROUP BY client_id
+      ) pp ON pp.client_id = c.id
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(s.amount_paid), 0) AS paid
+        FROM pt_client_subscriptions s
+        WHERE s.client_id = c.id
+          AND s.start_date IS NOT NULL
+          AND c.pt_start_date IS NOT NULL
+          AND s.start_date < c.pt_start_date
+      ) prior ON TRUE
+      WHERE c.id = $1 AND c.deleted_at IS NULL${orgClause}
+    ) t
   `, params);
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   res.json({ data: rows[0] });
