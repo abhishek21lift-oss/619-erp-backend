@@ -775,6 +775,10 @@ app.use('/api/attendance',        auth, requireStaff, ...gate('attendance'), req
 // implementation, and the migration target was the unsafe one. Do not
 // reintroduce a v1 reports router without organization_id on its tables.
 app.use('/api/reports',           userApiLimiter, ...staffGate('insights'), require('./routes/reports'));
+// Canonical Insights — ONE source of truth (Metric Engine → Insights Engine).
+// /api/reports above is the frozen compatibility surface delegating to the
+// same engine; new clients must use these routes. Same guard, same feature.
+app.use('/api/insights',         userApiLimiter, ...staffGate('insights'), require('./modules/insights/insights.routes'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
 // requireStaff: staff leave requests — who is off, when, and why. HR data

@@ -58,6 +58,14 @@ router.get('/stats', auth, async (req, res, next) => {
     const params = [];
     let p = 1;
 
+    // Canonical with GET / list: trainers see only expenses they created.
+    // (The list endpoint has this clamp; stats was missing it and returned
+    // studio-wide totals to any trainer session.)
+    if (req.user.role === 'trainer') {
+      conditions.push(`e.created_by = $${p++}`);
+      params.push(req.user.id);
+    }
+
     if (from) { conditions.push(`expense_date >= $${p++}`); params.push(from); }
     if (to)   { conditions.push(`expense_date <= $${p++}`); params.push(to); }
 
