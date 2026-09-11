@@ -1699,6 +1699,42 @@ router.post('/payments', auth, wrap(async (req, res) => {
     }
 
     await tx.query('COMMIT');
+
+    // ── The automation event, which this endpoint never emitted ────────────
+    //
+    // Money can arrive through five paths in this codebase. Before this, only
+    // two of them told automation about it: /clients/:id/renew and the
+    // enrolment PATCH on /clients/:id. This one — the endpoint the PT-OS
+    // client payments screen actually calls, as the comment above says —
+    // recorded the payment, updated the balance, and stopped.
+    //
+    // So a studio with an active payment_received rule and a CONNECTED
+    // WhatsApp saw messages for some payments and silence for others, with no
+    // failed row and nothing in the queue to explain the difference. It was
+    // not a delivery failure; the message was never asked for. Production on
+    // 2026-09-11 shows all three of it: two payments recorded through the
+    // profile PATCH both sent within two seconds, and one recorded here, in
+    // between them, produced no communication_logs row at all.
+    //
+    // AFTER the commit, deliberately, and outside the transaction. A
+    // rolled-back payment must never message the client, and automation must
+    // never be able to fail a payment. emit() does not throw, but it also has
+    // no business holding a transaction open. This matches how logActivity is
+    // sequenced in routes/payments.js for the same reason.
+    //
+    // The payment's own id is the event key. The two older call sites compose
+    // one from client + amount + date because they have no payment id to hand
+    // and say so; here we do. That makes two genuine same-amount payments on
+    // one day two events rather than one, while a retried request still
+    // dedupes to one.
+    if (client_id) {
+      await automation.paymentReceived(req, {
+        clientId: client_id,
+        amount: numAmount,
+        eventKey: rows[0].id,
+      });
+    }
+
     res.status(201).json({ data: rows[0] });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
