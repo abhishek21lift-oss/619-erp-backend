@@ -268,7 +268,10 @@ const DOMAINS = {
     description: 'Check-in. QR is the supported path; face and biometric are gym-ERP inheritance.',
     dependsOn: ['tenancy', 'clients'],
     tables: [
-      'attendance', 'attendance_logs', 'qr_tokens',
+      // `attendance` is gone — migration 192. It was a second register that
+      // only one writer wrote and nothing read; attendance_logs is the table
+      // every attendance surface in the product actually reads.
+      'attendance_logs', 'qr_tokens',
       'face_descriptors', 'face_checkin_logs', 'biometric_attendance',
     ],
     legacyTables: ['face_descriptors', 'face_checkin_logs', 'biometric_attendance'],

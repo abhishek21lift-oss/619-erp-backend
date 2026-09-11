@@ -37,6 +37,9 @@
 'use strict';
 
 const ORG_B = '22222222-2222-4222-8222-222222222222';
+// The other studio's id. Only needed where a case has to make the caller's
+// org and the booking's org actually differ.
+const ORG_A = '11111111-1111-4111-8111-111111111111';
 
 const mockQueries = [];
 let mockRows = [];
@@ -94,7 +97,7 @@ describe('bookings service is bounded by the caller\'s studio', () => {
     it('never reaches the attendance mirror when the booking is not the caller\'s', async () => {
       await expect(svc.checkIn('booking-owned-by-A', {}, ctxB)).rejects.toThrow();
       // A row written here would have landed in studio A on studio B's say-so.
-      expect(touching('attendance')).toHaveLength(0);
+      expect(touching('attendance_logs')).toHaveLength(0);
     });
 
     it('stamps the attendance mirror from the booking, not from the caller', async () => {
@@ -103,10 +106,69 @@ describe('bookings service is bounded by the caller\'s studio', () => {
       mockRows = [{ id: 'bk-1', member_id: 'm-1', organization_id: ORG_B }];
       await svc.checkIn('bk-1', { method: 'manual' }, ctxB);
 
-      const insert = touching('attendance')[0];
-      expect(insert.sql).toMatch(/INSERT INTO attendance/i);
+      const insert = touching('attendance_logs')[0];
+      expect(insert.sql).toMatch(/INSERT INTO attendance_logs/i);
       expect(insert.sql).toMatch(/organization_id/);
       expect(insert.params).toContain(ORG_B);
+    });
+
+    // `touching` anchors on \battendance\b, and the `_` in attendance_logs is a
+    // word character — so this genuinely distinguishes the two tables rather
+    // than matching the canonical one by accident.
+    it('writes the canonical table and not the legacy one', async () => {
+      mockRows = [{ id: 'bk-1', member_id: 'm-1', organization_id: ORG_B }];
+      await svc.checkIn('bk-1', { method: 'manual' }, ctxB);
+
+      expect(touching('attendance_logs')).toHaveLength(1);
+      expect(touching('attendance')).toHaveLength(0);
+    });
+
+    it('takes the org from the booking even when the caller carries none', async () => {
+      // The case the assertion above cannot reach. When ctx has no
+      // organization_id the UPDATE runs without an org clause, so the caller's
+      // org and the booking's org are no longer forced equal — and every other
+      // fixture here sets them to the same value, which let a swap of
+      // b.organization_id for ctx.organization_id pass the whole suite.
+      // Stamping from ctx here would write undefined into a NOT NULL column.
+      mockRows = [{ id: 'bk-1', member_id: 'm-1', organization_id: ORG_A }];
+      await svc.checkIn('bk-1', { method: 'manual' }, {});
+
+      const insert = touching('attendance_logs')[0];
+      expect(insert.params).toContain(ORG_A);
+      expect(insert.params).not.toContain(undefined);
+    });
+
+    it('clamps an unrecognised check-in method rather than failing the check-in', async () => {
+      // attendance_logs.method carries a CHECK the legacy table did not, and
+      // the route passes req.body.method through unvalidated. Without the
+      // clamp this reaches Postgres as 'turnstile' and 500s.
+      mockRows = [{ id: 'bk-1', member_id: 'm-1', organization_id: ORG_B }];
+      await svc.checkIn('bk-1', { method: 'turnstile' }, ctxB);
+
+      const insert = touching('attendance_logs')[0];
+      expect(insert.params).toContain('manual');
+      expect(insert.params).not.toContain('turnstile');
+    });
+
+    it('passes a recognised method through untouched', async () => {
+      // The clamp must not flatten every method to 'manual' — that would make
+      // the register claim every class check-in was typed in by hand.
+      mockRows = [{ id: 'bk-1', member_id: 'm-1', organization_id: ORG_B }];
+      await svc.checkIn('bk-1', { method: 'qr' }, ctxB);
+
+      expect(touching('attendance_logs')[0].params).toContain('qr');
+    });
+
+    it('keeps the earliest check-in of the day on conflict', async () => {
+      // Sharing a table means sharing its semantics: routes/attendance.js and
+      // routes/qr-checkin.js both COALESCE so a second check-in cannot rewrite
+      // when someone actually arrived. The legacy write overwrote it.
+      mockRows = [{ id: 'bk-1', member_id: 'm-1', organization_id: ORG_B }];
+      await svc.checkIn('bk-1', { method: 'manual' }, ctxB);
+
+      const { sql } = touching('attendance_logs')[0];
+      expect(sql).toMatch(/ON CONFLICT \(ref_id, ref_type, date\) DO UPDATE/i);
+      expect(sql).toMatch(/check_in_time\s*=\s*COALESCE\(attendance_logs\.check_in_time/i);
     });
   });
 

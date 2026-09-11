@@ -404,22 +404,35 @@ CREATE INDEX IF NOT EXISTS atlog_date_idx ON attendance_logs (date DESC);
 CREATE INDEX IF NOT EXISTS atlog_type_idx ON attendance_logs (ref_type, date DESC);
 
 
--- ─── ATTENDANCE (class-booking mirror) ───────────────────────
--- Distinct from attendance_logs above, and NOT a leftover: the bookings and
--- members services read and write this table today
--- (modules/bookings/bookings.service.js mirrors a check-in into it,
--- modules/members/members.service.js reads a member's history out of it).
+-- ─── ATTENDANCE (legacy, TRANSIENT — dropped by migration 192) ───────────────
 --
--- It was never in any tracked file — it exists on the live database because
--- it was created out of band, exactly like the `exercises` columns that
--- migration 069 later reconciled. The visible symptom was migration 010
--- failing on a fresh database with "relation attendance does not exist" when
--- it tried to index it.
+-- Do not write new code against this table. It exists here ONLY so the
+-- migration chain can replay on a fresh database, and migration 192 drops it
+-- again at the end of that chain. A database built from this file plus every
+-- migration ends with no `attendance` table at all.
 --
--- The shape is taken from what the code actually uses; the composite UNIQUE
--- is required by the bookings service's ON CONFLICT (type, ref_id, date).
--- IF NOT EXISTS, so a database that already has its own copy keeps it
--- untouched.
+-- Why the CREATE cannot simply be deleted: three earlier migrations name it
+-- unguarded and would fail on a fresh bootstrap without it —
+--   010_indexes_and_soft_delete.sql   CREATE INDEX … ON attendance (ref_id)
+--   176_classes_bookings_tenant_columns.sql  ALTER TABLE attendance ADD
+--                                     COLUMN organization_id, and the org index
+-- and 001_v4_upgrade.sql backfills attendance_logs from it (guarded on the v3
+-- `ref_name` column, so it no-ops on a fresh install). Editing migrations that
+-- every database has already executed, to remove a table that ends up dropped
+-- anyway, is a large risk for a cosmetic gain — the same call made for
+-- `clients` (migration 170) and `payments` (191).
+--
+-- What it was: a second attendance register written only by
+-- modules/bookings/bookings.service.js checkIn(). Nothing ever read it back —
+-- every attendance surface in the product reads attendance_logs above — so a
+-- class check-in recorded here appeared on no screen and in no report. That
+-- writer now writes attendance_logs. (An earlier version of this comment also
+-- named modules/members/members.service.js as a reader; no such file exists.)
+--
+-- The shape below is the one the code used, not production's, which drifted
+-- further (a `leave` status, trainer_id/trainer_name, pt_session_id,
+-- device_id). Neither matters after 192; the production shape is recorded in
+-- 192_drop_legacy_attendance.ROLLBACK.md.
 CREATE TABLE IF NOT EXISTS attendance (
   id               TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
   type             TEXT        NOT NULL DEFAULT 'client'
