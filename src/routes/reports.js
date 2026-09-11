@@ -57,11 +57,29 @@ router.get('/monthly', auth, async (req, res, next) => {
 
 // GET /api/reports/trainer-summary (admin only)
 // Trainer summary from PT clients and PT payments only (legacy tables are empty).
-router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
+// One handler, two paths. These were two byte-identical copies of the same
+// 14-line query — so a fix to one (the org predicates below, say) silently
+// left the other wrong, which is the whole argument against an alias that is
+// a second implementation rather than a second route.
+//
+// ── Tenant isolation ───────────────────────────────────────────────────────
+//
+// The org predicate used to sit only on the driving `trainers` row, on the
+// reasoning that "the client/payment joins hang off trainer_id, so scoping
+// trainers scopes the whole summary". That holds only while no client or
+// payment ever references a trainer in another studio, which nothing
+// enforces — there is no cross-org check on those foreign keys.
+//
+// Measured before this change: zero such rows in production, so this was a
+// latent hole rather than a live leak. It is closed now because "safe because
+// of a property of today's data" is not isolation, and the predicate belongs
+// in the JOIN's ON clause rather than the WHERE — on a LEFT JOIN a WHERE
+// predicate on the joined table would also drop trainers who have no clients
+// at all, turning a scoping fix into a silently shorter report. The same
+// ON-not-WHERE rule is already pinned for PT-OS by
+// ptOs.reportingTenantScope.test.js.
+async function trainerSummary(req, res, next) {
   try {
-    // Tenant isolation: scope to the caller's org via the driving `trainers`
-    // table (null-safe for platform super admins). The client/payment joins
-    // hang off trainer_id, so scoping trainers scopes the whole summary.
     const { rows } = await pool.query(`
       SELECT t.id, t.name, t.specialization,
         COUNT(ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
@@ -70,7 +88,9 @@ router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
         COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.deleted_at IS NULL), 0) AS total_revenue
       FROM trainers t
       LEFT JOIN pt_clients  ptc ON ptc.trainer_id = t.id
+                                AND ($1::uuid IS NULL OR ptc.organization_id = $1)
       LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
+                                AND ($1::uuid IS NULL OR ptp.organization_id = $1)
       WHERE t.status = 'active'
         AND ($1::uuid IS NULL OR t.organization_id = $1)
       GROUP BY t.id, t.name, t.specialization
@@ -81,34 +101,13 @@ router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}
 
-// GET /api/reports/trainers — alias for /trainer-summary (used by frontend Reports page)
-// Trainer summary from PT clients and PT payments only (legacy tables are empty).
-router.get('/trainers', auth, adminOnly, async (req, res, next) => {
-  try {
-    // Tenant isolation: scope to the caller's org via the driving `trainers`
-    // table (null-safe for platform super admins).
-    const { rows } = await pool.query(`
-      SELECT t.id, t.name, t.specialization,
-        COUNT(ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
-        COUNT(ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
-        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.date >= DATE_TRUNC('month',NOW()) AND ptp.deleted_at IS NULL), 0) AS month_revenue,
-        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.deleted_at IS NULL), 0) AS total_revenue
-      FROM trainers t
-      LEFT JOIN pt_clients  ptc ON ptc.trainer_id = t.id
-      LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
-      WHERE t.status = 'active'
-        AND ($1::uuid IS NULL OR t.organization_id = $1)
-      GROUP BY t.id, t.name, t.specialization
-      ORDER BY total_revenue DESC`,
-      [orgParam(req)]
-    );
-    res.json(rows);
-  } catch (err) {
-    next(err);
-  }
-});
+// GET /api/reports/trainer-summary
+router.get('/trainer-summary', auth, adminOnly, trainerSummary);
+// GET /api/reports/trainers — the same report, kept because the Reports page
+// has called this path for as long as it has existed.
+router.get('/trainers', auth, adminOnly, trainerSummary);
 
 // GET /api/reports/revenue — total collected revenue for a date range
 // From PT payments only (legacy `payments` table is empty).

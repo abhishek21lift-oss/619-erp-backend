@@ -669,14 +669,21 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
     INSERT INTO pt_client_renewals
       (client_id, client_name, trainer_name, old_package, new_package,
        old_end_date, new_start_date, new_end_date, duration_months,
-       base_amount, discount, final_amount, paid_amount, balance_amount, notes)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       base_amount, discount, final_amount, paid_amount, balance_amount, notes,
+       organization_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
   `, [
     req.params.id, c.name, c.trainer_name,
     c.package_type, packageType || c.package_type,
     c.pt_end_date, d.pt_start_date, ptEndDate, d.duration_months,
     baseAmt, disc, finalAmt, paidNow, Math.max(finalAmt - paidNow, 0),
     d.notes || null,
+    // Stamped from the CLIENT, not from the caller's header — the same rule
+    // payments.routes.test.js pins for pt_payments. Migration 196 added the
+    // column; before it, this table could only be scoped by joining back to
+    // pt_clients, and five rows whose client was later deleted became
+    // permanently unattributable.
+    c.organization_id,
   ]);
 
   // Also write to pt_client_subscriptions (canonical term history used by the profile page)

@@ -88,33 +88,51 @@ router.get('/:id', auth, async (req, res, next) => {
       ? scrubForNonAdmin(rows[0])
       : rows[0];
 
+    // Everything below reads rows belonging to this trainer. Reaching here
+    // already proves the TRAINER is in the caller's studio — the lookup above
+    // 404s otherwise — but that is scoping by derivation: it holds only while
+    // no client or payment references a trainer in another studio, and no
+    // constraint enforces that. Measured before this change: zero such rows
+    // in production, so this was latent rather than leaking. Each query now
+    // carries the predicate itself, null-safe so a platform super admin
+    // operating platform-wide still sees everything.
+    const orgArg = orgIdOf(req);
+
     // Aggregated stats for this trainer
     const { rows: stats } = await pool.query(`
       SELECT
-        (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1)::int                                  AS total_clients,
-        (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1 AND status='active')::int              AS active_clients,
-        (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1 AND status='expired')::int             AS expired_clients,
-        (SELECT COALESCE(SUM(balance_amount),0) FROM pt_clients WHERE trainer_id=$1)::float          AS total_dues,
+        (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1
+          AND ($2::uuid IS NULL OR organization_id = $2))::int                                     AS total_clients,
+        (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1 AND status='active'
+          AND ($2::uuid IS NULL OR organization_id = $2))::int                                     AS active_clients,
+        (SELECT COUNT(*) FROM pt_clients WHERE trainer_id=$1 AND status='expired'
+          AND ($2::uuid IS NULL OR organization_id = $2))::int                                     AS expired_clients,
+        (SELECT COALESCE(SUM(balance_amount),0) FROM pt_clients WHERE trainer_id=$1
+          AND ($2::uuid IS NULL OR organization_id = $2))::float                                    AS total_dues,
         -- deleted_at IS NULL on all three: a reversed payment is money the
         -- studio does not have, and without it these totals contradict the
         -- payment list and the trend chart below, which both exclude it.
         (SELECT COALESCE(SUM(amount),0) FROM pt_payments
-          WHERE trainer_id=$1 AND deleted_at IS NULL)::float                                       AS lifetime_revenue,
+          WHERE trainer_id=$1 AND deleted_at IS NULL
+            AND ($2::uuid IS NULL OR organization_id = $2))::float                                 AS lifetime_revenue,
         (SELECT COALESCE(SUM(amount),0) FROM pt_payments
           WHERE trainer_id=$1 AND deleted_at IS NULL
+            AND ($2::uuid IS NULL OR organization_id = $2)
             AND date >= DATE_TRUNC('month', NOW()))::float                                         AS month_revenue,
         (SELECT COALESCE(SUM(incentive_amt),0) FROM pt_payments
           WHERE trainer_id=$1 AND deleted_at IS NULL
+            AND ($2::uuid IS NULL OR organization_id = $2)
             AND date >= DATE_TRUNC('month', NOW()))::float                                         AS month_incentive
-    `, [req.params.id]);
+    `, [req.params.id, orgArg]);
 
     // Their clients
     const { rows: clients } = await pool.query(`
       SELECT id, client_id, name, mobile, package_type, pt_end_date,
              status, balance_amount, paid_amount, final_amount
       FROM pt_clients WHERE trainer_id=$1
+        AND ($2::uuid IS NULL OR organization_id = $2)
       ORDER BY created_at DESC LIMIT 100
-    `, [req.params.id]);
+    `, [req.params.id, orgArg]);
 
     // Recent payments collected by this trainer.
     //
@@ -132,8 +150,9 @@ router.get('/:id', auth, async (req, res, next) => {
       FROM pt_payments p
       LEFT JOIN pt_clients c ON c.id = p.client_id
       WHERE p.trainer_id = $1 AND p.deleted_at IS NULL
+        AND ($2::uuid IS NULL OR p.organization_id = $2)
       ORDER BY p.date DESC, p.created_at DESC LIMIT 30
-    `, [req.params.id]);
+    `, [req.params.id, orgArg]);
 
     // 6-month revenue trend.
     //
@@ -145,10 +164,11 @@ router.get('/:id', auth, async (req, res, next) => {
              COALESCE(SUM(amount),0)::float AS revenue
       FROM pt_payments
       WHERE trainer_id=$1 AND deleted_at IS NULL
+        AND ($2::uuid IS NULL OR organization_id = $2)
         AND date >= NOW() - INTERVAL '6 months'
       GROUP BY DATE_TRUNC('month', date::date)
       ORDER BY DATE_TRUNC('month', date::date)
-    `, [req.params.id]);
+    `, [req.params.id, orgArg]);
 
     // Hide salary-related stats from non-admin viewers
     if (!isAdmin && req.user.trainer_id !== rows[0].id) {

@@ -776,6 +776,17 @@ app.use('/api/attendance',        auth, requireStaff, ...gate('attendance'), req
 // reintroduce a v1 reports router without organization_id on its tables.
 app.use('/api/reports',           userApiLimiter, ...staffGate('insights'), require('./routes/reports'));
 
+// The canonical metric layer. Every figure it returns is built from
+// modules/insights/definitions.js, which is the one place a business metric
+// is defined — the audit that produced it found seven definitions of "active
+// client", two of "present", and a renewal rate that was computed only in the
+// browser, as active/(active+expired).
+//
+// Mounted BESIDE /api/reports rather than over it: the existing endpoints
+// serve working screens, and repointing them is a migration with its own
+// risk. The first step is having one definition to migrate TO.
+app.use('/api/insights',          userApiLimiter, ...staffGate('insights'), require('./modules/insights/insights.routes'));
+
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
 // requireStaff: staff leave requests — who is off, when, and why. HR data
 // about employees, org-scoped but not role-scoped.
