@@ -226,18 +226,23 @@ const DOMAINS = {
   training: {
     plane: PLANE.TENANT,
     tenancy: TENANCY.DERIVED,
-    description: 'The programme and its execution: exercises, plans, logged sets, records.',
+    description: 'The programme and its execution: exercises, plans, logged sets.',
     dependsOn: ['tenancy', 'clients', 'scheduling'],
+    // One chain, library to logged set:
+    //   exercises → workout_plans → workout_exercises → workout_assignments
+    //             → workout_sessions → workout_session_exercises → workout_sets
+    //
+    // The training-domain tables that used to be listed here are in the
+    // `archive` schema: the session half from 193, the program/template half
+    // from 195. They are deliberately absent rather than commented out — this
+    // registry answers "what does this domain own", and it owns none of them.
     tables: [
       'exercises', 'exercise_categories', 'exercise_muscles', 'exercise_relations',
       'exercise_versions', 'exercise_favorites', 'exercise_recent_usage',
-      'exercise_performances', 'muscles', 'muscle_volume_landmarks', 'equipment_types',
-      'workout_plans', 'workout_templates', 'workout_template_exercises',
-      'workout_exercises', 'workout_assignments', 'workout_sessions',
-      'workout_session_exercises', 'workout_sets', 'set_performances',
-      'cardio_performances', 'personal_records', 'strength_logs',
-      'training_programs', 'training_program_phases', 'training_program_weeks',
-      'training_assignments', 'training_sessions',
+      'muscles', 'muscle_volume_landmarks', 'equipment_types',
+      'workout_plans', 'workout_exercises', 'workout_assignments',
+      'workout_sessions', 'workout_session_exercises', 'workout_sets',
+      'strength_logs',
     ],
   },
 

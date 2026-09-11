@@ -106,22 +106,20 @@ async function canAccessClient(req, clientId) {
   return rowCount > 0;
 }
 
-async function loadOwned(req, table, id, client = pool) {
-  const ALLOWED = ['training_programs', 'workout_templates', 'training_assignments'];
-  if (!ALLOWED.includes(table)) throw new Error(`loadOwned: unsupported table ${table}`);
-  if (!id) return null;
-  const params = [id];
-  const org = orgWhere(req, params);
-  const softDelete = table === 'training_assignments' ? '' : ' AND deleted_at IS NULL';
-  const { rows } = await client.query(
-    `SELECT * FROM ${table} WHERE id = $1${softDelete}${org}`,
-    params
-  );
-  return rows[0] ?? null;
-}
+// `loadOwned` was here: the row-level guard every /api/training handler called
+// before touching a program or a template. Its whole allow-list —
+// training_programs, workout_templates, training_assignments — now lives in the
+// `archive` schema (193 and 195), so the function could only ever have raised
+// "relation does not exist". It went with the routes that called it.
+//
+// What stays is the part that was never about the training domain. orgWhere,
+// trainerWhere and canAccessClient are the shared answer to the trainer
+// fall-through described above, they are still the only implementation of it,
+// and trainerFallthrough.authz.test.js pins their behaviour against the four
+// times that bug has been written by hand.
 
 module.exports = {
   ALL_CLIENT_ROLES, seesAllClients,
   orgWhere, trainerWhere,
-  canAccessClient, loadOwned,
+  canAccessClient,
 };

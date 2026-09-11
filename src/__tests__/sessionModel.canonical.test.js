@@ -41,10 +41,24 @@ const path = require('path');
 
 const SRC = path.join(__dirname, '..');
 
-/** The tables migration 193 moved out of `public`. */
+/**
+ * The tables migrations 193 and 195 moved out of `public`.
+ *
+ * 193 took the session half on the evidence above. 195 took the prescription
+ * half — training_programs → phases → weeks → workout_templates →
+ * workout_template_exercises — on evidence of the same shape and one extra
+ * fact that settled it: once 193 archived training_assignments, nothing
+ * downstream could assign or log a template, so the authoring half had no path
+ * to a client at all. It held 0 programmes and 1 template whose four
+ * prescriptions were the builder's untouched defaults, one of them a treadmill
+ * run stored as WEIGHT_REPS 3×10 — the exact shape migration 164 was written
+ * to abolish.
+ */
 const ARCHIVED = [
   'training_sessions', 'exercise_performances', 'set_performances',
   'cardio_performances', 'personal_records', 'training_assignments',
+  'training_programs', 'training_program_phases', 'training_program_weeks',
+  'workout_templates', 'workout_template_exercises',
 ];
 
 /** Runtime .js under src/, excluding tests and migrations. */
@@ -77,7 +91,7 @@ function offenders(table) {
 describe('the archived training-session tables have no runtime reader', () => {
   it('scans a real set of runtime files', () => {
     expect(files.length).toBeGreaterThan(50);
-    expect(files.some((f) => f.endsWith(path.join('modules', 'training', 'training.routes.js')))).toBe(true);
+    expect(files.some((f) => f.endsWith(path.join('routes', 'workouts.js')))).toBe(true);
     expect(files.some((f) => f.endsWith(path.join('modules', 'pt-os', 'workout-log.routes.js')))).toBe(true);
   });
 
@@ -124,19 +138,48 @@ describe('the canonical models survive, and stay distinct', () => {
     expect(ptos).not.toMatch(/INSERT INTO pt_sessions[\s\S]{0,400}?exercise/i);
   });
 
-  it('the training module keeps its templates half and loses its sessions half', () => {
-    const routes = fs.readFileSync(
-      path.join(SRC, 'modules', 'training', 'training.routes.js'), 'utf8');
-    // Survives — 9 frontend call sites use api.training.templates.
-    expect(routes).toMatch(/router\.get\('\/templates'/);
-    expect(routes).toMatch(/router\.get\('\/programs'/);
-    expect(routes).toMatch(/router\.get\('\/meta'/);
-    // Gone.
-    for (const p of ['/sessions', '/performances/:id/sets', '/sets/:id', '/cardio/:id', '/records']) {
-      expect(routes).not.toContain(`router.get('${p}'`);
-      expect(routes).not.toContain(`router.post('${p}'`);
-      expect(routes).not.toContain(`router.patch('${p}'`);
+  it('the /api/workouts prescription API is the only one mounted', () => {
+    const server = fs.readFileSync(path.join(SRC, 'server.js'), 'utf8');
+    // The survivor. Asserted on the mount rather than on the router file, so
+    // deleting the mount while leaving routes/workouts.js on disk still fails.
+    expect(server).toMatch(/app\.use\('\/api\/workouts',/);
+    expect(server).toMatch(/app\.use\('\/api\/exercises',/);
+    // Both halves of the training domain are retired, so nothing should mount
+    // its router — and the router itself should not exist to be mounted.
+    expect(server).not.toMatch(/app\.use\('\/api\/training'/);
+    for (const f of ['training.routes.js', 'training.repository.js', 'training.schemas.js',
+                     'prescription.js', 'progression.js', 'units.js']) {
+      expect(fs.existsSync(path.join(SRC, 'modules', 'training', f))).toBe(false);
     }
+  });
+
+  it('authz.js survives, without its archived-table loader', () => {
+    // The one file left in modules/training, and it was never about training:
+    // orgWhere/trainerWhere/canAccessClient are the shared fix for the trainer
+    // fall-through that has been written by hand four times (see
+    // trainerFallthrough.authz.test.js). loadOwned went with the routes — its
+    // whole allow-list is in the archive schema now, so it could only throw.
+    const authz = fs.readFileSync(
+      path.join(SRC, 'modules', 'training', 'authz.js'), 'utf8');
+    expect(authz).toMatch(/exports = \{[\s\S]*canAccessClient/);
+    expect(authz).not.toMatch(/^async function loadOwned/m);
+    expect(require('../modules/training/authz').loadOwned).toBeUndefined();
+  });
+
+  it('migration 195 refuses to archive a programme somebody actually built', () => {
+    const mig = fs.readFileSync(
+      path.join(SRC, 'db', 'migrations', '195_archive_training_program_tables.sql'), 'utf8');
+
+    // Same shape as 193's guard below: pinned to the abort, and counted, so a
+    // check downgraded to a notice fails here rather than archiving anyway.
+    const guard = mig.slice(0, mig.indexOf('CREATE SCHEMA'));
+    const aborts = guard.match(/RAISE EXCEPTION\s*\n?\s*'195 refused/g) || [];
+    expect(aborts).toHaveLength(2);
+    expect(mig).toMatch(/SET SCHEMA archive/);
+    expect(mig).not.toMatch(/DROP TABLE/i);
+    // The canonical chain is verified by the migration itself, not assumed.
+    expect(mig).toMatch(/workout_plans/);
+    expect(mig).toMatch(/workout_sets/);
   });
 
   it('migration 193 refuses to archive a training domain that is genuinely in use', () => {
