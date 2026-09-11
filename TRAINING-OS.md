@@ -1,183 +1,154 @@
-# Training OS — state, runbook, and what happens next
+# Training OS — what it was, and why there is now one workout module
 
-The workout system rewrite: new schema, new API, new UI, and the migration off
-the old `workout_*` tables. This file exists so a fresh session can pick the
-work up without re-deriving any of it.
-
-Read this first. Then read the linked PR descriptions for the reasoning behind
-each piece — the decisions are written down there, not summarised here.
+This file used to be the runbook for a cutover from the `workout_*` tables to a
+new training domain. That cutover is finished, in the opposite direction to the
+one it planned. Read this before touching anything workout-shaped, so the
+argument does not get re-litigated from the old plan.
 
 ---
 
-## 1. Connecting Supabase (do this on your own machine)
+## 1. The shape of the problem
 
-Claude Code sessions running in the cloud **cannot** authorise an MCP server:
-the OAuth flow needs an interactive terminal. So Supabase access has to be set
-up locally, once.
+Two complete stacks authored and recorded a workout:
+
+| | legacy | Training OS |
+|---|---|---|
+| prescribe | `workout_plans` → `workout_exercises` | `training_programs` → `phases` → `weeks` → `workout_templates` → `workout_template_exercises` |
+| assign | `workout_assignments` | `training_assignments` |
+| log | `workout_sessions` → `workout_session_exercises` → `workout_sets` | `training_sessions` → `exercise_performances` → `set_performances` / `cardio_performances` |
+| API | `/api/workouts` | `/api/training` |
+| builder | `components/pt-os/builder/` | `components/pt-os/training/` |
+
+Migrations 164–166 built the right-hand column; 167 copied the log into it. The
+plan was that the app would move over and the left-hand column would be dropped.
+
+## 2. What production said
+
+The app never moved over, and the evidence was one-sided in both halves.
+
+**Sessions (settled by migration 193).** `workout_sessions` held 123 rows, 83 in
+the last 30 days. `training_sessions` held 48, every one of them carrying
+`metadata->>'migrated_from'` — copies made by 167, not a single row created by
+its own API. `set_performances` was 100 for 100 `client_token LIKE 'legacy:%'`.
+
+**Prescriptions (settled by migration 195).** `workout_plans` held 60 rows and
+409 exercises, newest the same day as the newest session. `training_programs`
+held **zero**. `workout_templates` held **one**, whose four prescriptions were
+the builder's untouched defaults — including a treadmill run stored as
+`WEIGHT_REPS 3×10`, which is precisely the bug migration 164 was written to
+abolish.
+
+And the fact that settled it independently of any row count: once 193 archived
+`training_assignments`, nothing downstream could assign or log a workout
+template. The Training OS builder's output had nowhere to go.
+
+## 3. Where things are now
+
+**One chain, library to logged set:**
+
+```
+exercises
+  → workout_plans → workout_exercises          (prescribe)
+  → workout_assignments                        (assign)
+  → workout_sessions → workout_session_exercises → workout_sets   (log)
+  → /api/pt-os/workout-log/{progress,volume-summary,analytics}     (report)
+```
+
+- **API:** `/api/workouts` (plans, assignment), `/api/exercises` (library),
+  `/api/pt-os/workout-log/*` (logging, analytics, landmarks).
+  `/api/training` is gone.
+- **UI:** `/pt-os/workout-plans` (index, labelled "Workouts"),
+  `/pt-os/workout-plans/[id]`, `/pt-os/workout-plans/[id]/builder`,
+  `/pt-os/workout-plans/[id]/builder/add-exercises`, `/pt-os/workout-log`,
+  `/pt-os/today`, `/pt-os/exercise-library`.
+- **Retired, with redirects in `next.config.js`:** `/pt-os/training/templates`,
+  `/pt-os/training/templates/[id]`, and the client-scoped builder twin at
+  `/pt-os/clients/[id]/training/builder[/add-exercises]`.
+- **`modules/training/`** holds only `authz.js`, and that file was never about
+  training: `orgWhere` / `trainerWhere` / `canAccessClient` are the shared fix
+  for the trainer fall-through, pinned by `trainerFallthrough.authz.test.js`.
+
+**Archived, not dropped.** Eleven tables live in the `archive` schema with every
+row and constraint intact — six moved by 193, five by 195. Nothing in the
+application reads that schema. Each migration has a `.ROLLBACK.md` beside it.
+
+```sql
+-- what is still there
+SELECT table_name FROM information_schema.tables WHERE table_schema = 'archive';
+```
+
+## 4. What the legacy schema cannot express
+
+Worth writing down, because it is the real argument the Training OS was built
+on, and it survives the Training OS being retired. `workout_exercises` has
+`sets INTEGER NOT NULL DEFAULT 3` and `reps INTEGER NOT NULL DEFAULT 12`, so
+every prescription must claim sets and reps. There is no `prescription_type`,
+no section (warm-up vs main vs cool-down), and no cardio columns — distance,
+duration, incline, pace and heart rate have nowhere to go.
+
+It does already carry `week_number`, `progression_type`/`progression_amount`/
+`progression_every_weeks`, `version`/`parent_plan_id`, `superset_group`,
+`target_weight`, `tempo`, `rpe`, `warmup_sets` and a `config` JSONB.
+
+**If cardio prescription is wanted, widen `workout_exercises`.** Make the
+sets/reps columns nullable behind a `prescription_type`, and add the cardio
+columns. That is a migration against the table 409 live rows already sit in.
+It is not a reason to stand up a second prescription domain — that is what was
+tried, and this file is the result.
+
+## 5. Guardrails
+
+These fail loudly if the consolidation is undone by accident:
+
+- `sessionModel.canonical.test.js` — no runtime file may query any of the 11
+  archived tables; `/api/training` may not be re-mounted; the deleted training
+  modules may not reappear; 193's and 195's refusal guards are counted, so
+  downgrading one to a notice fails here.
+- `architecture.domains.convention.test.js` — every table in the schema has
+  exactly one owning domain. Its `ARCHIVED` set is the list of tables that left
+  `public`; add to it when a migration archives another.
+- `trainerFallthrough.authz.test.js` — `modules/training/authz.js` behaviour.
+- Frontend `workout-plan-flow.test.tsx` / `workout-programme-create.test.tsx` —
+  one add-exercises route, and the client-scoped builder must not come back.
+
+## 6. Still open
+
+- **32 sessions sit in `IN_PROGRESS` and are actually abandoned** — now in
+  `archive.training_sessions`, so they no longer pollute any live query. Only
+  worth touching if that archive is ever read.
+- **The AI workout generator does not persist.**
+  `POST /api/ai/workout/generate` streams a plan back as JSON and writes
+  nothing, so a trainer reads the generated programme and retypes it into the
+  builder. Three surfaces call it — `/ai/workout-generator`,
+  `ClientAiGenerateCard`, and `AiCoachPanel type="workout"` — all through the
+  one implementation, so this is a missing write path, not a duplicate one.
+- **`workout_exercises.week_number` is 1 on all 409 rows.** Weeks beyond the
+  first are resolved arithmetically by `modules/pt-os/progression.js` rather
+  than stored, so a deload week still cannot be authored.
+
+## 7. Connecting Supabase locally
+
+A cloud Claude Code session cannot complete the MCP OAuth flow; set it up once
+on your own machine.
 
 ```bash
 claude mcp add --scope project --transport http supabase \
   "https://mcp.supabase.com/mcp?features=docs%2Caccount%2Cdatabase%2Cdebugging%2Cdevelopment%2Cfunctions%2Cbranching"
-
-claude          # starts an interactive session, prompts to approve the server
-/mcp            # inside the session: check status, authenticate
+claude          # approve the server, then /mcp to authenticate
 ```
-
-`--scope project` writes `.mcp.json` into the current directory. Run it from
-whichever repo you want the config shared with, and commit that file if you
-want everyone to get it.
-
-Without this, a session can still do everything except query the database
-directly — it will ask you to run SQL and paste the result, which works but is
-slow.
 
 Project ref: `adffjnztzrolibtuvhgc`.
 
----
-
-## 2. What is built and merged
-
-Backend (`619-erp-backend`):
-
-| | |
-|---|---|
-| #74 | Slice A — domain: migrations 164–166, units/prescription/records/progression/volume |
-| #75 | Slice B — authz helpers, every child row joined back to `pt_clients` |
-| #76 | Slice C — the API at `/api/training`, behind `gate('programs')` |
-| #77 | Slice G.1 — migration 167 copies the old log; records backfill script |
-
-Frontend (`619-erp-frontend`):
-
-| | |
-|---|---|
-| #149 | Slice D — API client, `PrescriptionEditor`, `useTrainingMeta` |
-| #150 | The workout day builder and the page that mounts it |
-| #151 | Slice E — the session logger: durable queue, cardio, rest timer |
-| #152 | The workouts index — the builder's front door *(open at time of writing)* |
-
-Routes now live: `/pt-os/training/templates`, `/pt-os/training/templates/[id]`,
-`/pt-os/training/sessions/[id]`.
-
----
-
-## 3. What production actually contains
-
-Measured, not assumed. Re-check before relying on it — people are still using
-the old screens, so these numbers move.
-
-| | |
-|---|---|
-| Old sessions | 49 (was 47 when this work started) |
-| Old sets | 100 |
-| Migrated | 1:1, verified by count |
-| `personal_records` | 43, all live, none superseded |
-
-**The `completed` flag on old sets is real, and must be respected.**
-
-| session status | sets logged | ticked | |
-|---|---|---|---|
-| `completed` | 44 | 29 | 66% |
-| `in_progress` | 56 | 3 | 5% |
-
-Ticking tracks session completion almost perfectly. If it had been optional UI
-clutter the two rates would match. **Do not backfill it** — analytics showing
-~29 completed sets out of 100 logged is the truth about what was performed.
-"Fixing" it would inflate every client's training volume threefold with work
-nobody did.
-
----
-
-## 4. What happens next, in order
-
-1. **Start-a-session flow.** `/pt-os/training/sessions/[id]` is still
-   URL-only — the same problem #152 just fixed for the builder. Needs an entry
-   point from the client page that creates a session and lands on the logger.
-2. **Client session history** reading the new tables.
-3. **Slice F — analytics.** Filters on `completed`; see §3.
-4. **Freeze writes to the old tables.** See the runbook below; the re-migration
-   step is not optional.
-5. **Drop the old tables.** A separate migration, only after 4 has been live.
-
----
-
-## 5. Runbook
-
-### Re-running the migration (safe, idempotent)
-
-Deploy applies it automatically. To force it, or to pick up rows logged since:
-
-```bash
-cd /opt/myptstudio
-docker compose run --rm --no-deps backend npm run migrate
-```
-
-**Before the freeze (step 4 above), run this again.** The old screens are still
-in use — session counts moved 47 → 48 → 49 during a single working session — so
-anything logged between the last run and the freeze would otherwise never reach
-the new tables. Migration 167 is idempotent precisely so this is cheap.
-
-### Rebuilding personal records
-
-Not run by the deploy. Run after any re-migration:
-
-```bash
-docker compose run --rm --no-deps backend npm run backfill:training-records -- --dry-run
-docker compose run --rm --no-deps backend npm run backfill:training-records
-```
-
-It converges: a second run must report `0 records written`. **If it does not,
-that is a bug** — the quantisation fix in `records.js` has regressed and repeat
-sets are re-registering as PRs.
-
-### Verifying a migration run
-
-```sql
-SELECT (SELECT count(*) FROM workout_sessions)                          AS old_sessions,
-       (SELECT count(*) FROM training_sessions
-         WHERE metadata->>'migrated_from' IS NOT NULL)                  AS migrated_sessions,
-       (SELECT count(*) FROM workout_sets)                              AS old_sets,
-       (SELECT count(*) FROM set_performances
-         WHERE client_token LIKE 'legacy:%')                            AS migrated_sets;
-```
-
-Both pairs must match.
-
----
-
-## 6. Open decisions
-
-**32 migrated sessions sit in `IN_PROGRESS` and are actually abandoned.**
-They are historical, with 56 sets written down and 3 done. Migration 167
-mapped `in_progress` → `IN_PROGRESS` faithfully, but they will show as
-"currently training" forever and pollute any in-flight query. The schema has
-`ABANDONED` for this. Needs a small follow-up migration, with the reason
-recorded in `metadata` rather than silently flipped. **Not yet decided.**
-
-**The mobile keyboard fix (#147) has never run on a real device.** It cannot be
-verified in jsdom — the whole bug is a WebKit user-gesture requirement. Worth
-sixty seconds on a real phone against the Relationship dropdown, the exercise
-picker, ⌘K, and the mobile search sheet.
-
-**Two `.env.example` inconsistencies**, offered and never resolved: a duplicate
-`EMAIL_FROM` with conflicting values, and `SMTP_PORT` documented as 465 while
-the code defaults to 587.
-
----
-
-## 7. Things that will bite you
+## 8. Things that will bite you
 
 - **A page module may only export the page.** Next fails the build on any extra
-  export — helpers go in `lib/` or `components/`. Cost two builds to learn.
-- **Convention tests are ratchets and they are load-bearing.** `palette.test.ts`
-  (no off-palette hex), `scale.test.ts` (no new font sizes, 14.5px deliberately
-  removed), `pull-refresh-optout.test.ts` (every fixed-inset overlay needs
-  `data-no-pull-refresh`), `tenantScope.convention.test.js`. All three caught
-  real regressions in this work.
+  export — helpers go in `lib/` or `components/`.
+- **Convention tests are ratchets and they are load-bearing.** `palette.test.ts`,
+  `scale.test.ts`, `pull-refresh-optout.test.ts`, `tenantScope.convention.test.js`.
 - **`use(params)` suspends.** Page tests need a `Suspense` boundary *inside an
   awaited `act`*, or nothing renders and the failure looks like a broken mock.
-- **DB-backed backend tests** run against `RLS_TEST_DATABASE_URL`, inside a
-  transaction that is always rolled back. They fail loudly in CI if the URL is
-  missing rather than skipping silently. Locally: `./scripts/rls-proof-setup.sh`.
-- **Three suites fail locally in a bare container** (`rls.isolation`,
-  `exercises.visibility`, `auth.forgotPassword`) — unseeded database, no redis.
-  They fail identically on unmodified `main`. Not regressions.
+- **DB-backed backend tests** run against `RLS_TEST_DATABASE_URL` inside a
+  transaction that is always rolled back. Without the URL, 11 suites skip.
+- **Migrations must not open their own transaction.** `migrate.js` wraps each
+  file together with the `_migrations` insert that records it; enforced by
+  `migrations.transactionControl.test.js`.

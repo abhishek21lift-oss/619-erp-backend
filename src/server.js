@@ -853,14 +853,13 @@ app.use('/api/workouts',          ...gate('programs'), require('./routes/workout
 // without it has no use for either.
 app.use('/api/exercises',         ...gate('programs'), require('./routes/exercises'));
 
-// The new training domain (migrations 164-166). Mounted BESIDE /api/workouts
-// rather than over it: the old routes still serve production, and this slice
-// is additive so the two can run together while the UI is rebuilt. Slice G
-// repoints /api/workouts once nothing reads it.
-//
-// Same feature gate as the old one — a studio without 'programs' does not get
-// a degraded builder, it does not get the route.
-app.use('/api/training',          ...gate('programs'), require('./modules/training/training.routes'));
+// '/api/training' was mounted here — the training domain's prescription API
+// (migrations 164-166), meant to replace '/api/workouts' once the UI was
+// rebuilt. It never did. 193 archived that domain's session half after
+// production showed workout_sessions was the real log, and 195 archived its
+// program/template half for the same reason: nothing had been authored
+// through it, and since 193 nothing downstream could assign or log a template
+// anyway. '/api/workouts' above is the one prescription API.
 app.use('/api/diet',              require('./routes/diet'));
 // '/api/biometric-attend' and '/api/webauthn' were mounted here: a second
 // check-in path (fingerprint / GPS) writing the same attendance_logs rows as

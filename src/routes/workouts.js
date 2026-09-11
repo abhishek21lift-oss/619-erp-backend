@@ -9,94 +9,11 @@ const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
 
-// ─── EXERCISES (COMPATIBILITY) ────────────────────────────────
-//
-// The Exercise Library now lives in routes/exercises.js and serves
-// /api/exercises. These two readers stay because older clients still call
-// them; they read the same table, so nothing has forked.
-//
-// The write endpoints that used to live here (POST/PUT/DELETE
-// /api/workouts/exercises) are GONE, not deprecated. They wrote the flat
-// legacy columns directly and knew nothing about slugs, the muscle join
-// table, version history or ownership — a write through them would have
-// produced a row the new library could not filter, search or attribute.
-// Creation and editing go through /api/exercises, which is the only path
-// that maintains all of it.
-//
-// Both readers below now exclude soft-deleted and archived rows, so an
-// exercise retired in the new library disappears here too.
-
-// GET /api/workouts/exercises  →  prefer GET /api/exercises
-router.get('/exercises', auth, async (req, res, next) => {
-  try {
-    const { muscle_group, body_part, equipment, exercise_type, difficulty, search } = req.query;
-    const conds = ['is_active = true', 'deleted_at IS NULL', 'archived_at IS NULL'];
-    const params = [];
-    let p = 1;
-
-    if (muscle_group)   { conds.push(`muscle_group = $${p++}`);   params.push(muscle_group); }
-    if (body_part)      { conds.push(`body_part = $${p++}`);       params.push(body_part); }
-    if (equipment)      { conds.push(`equipment = $${p++}`);       params.push(equipment); }
-    if (exercise_type)  { conds.push(`exercise_type = $${p++}`);   params.push(exercise_type); }
-    if (difficulty)     { conds.push(`difficulty = $${p++}`);      params.push(difficulty); }
-    if (search)         { conds.push(`name ILIKE $${p++}`);        params.push(`%${search}%`); }
-
-    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 1000);
-    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-    params.push(limit, offset);
-    const { rows } = await pool.query(
-      `SELECT id, name, slug, muscle_group, body_part, target_muscle, secondary_muscles,
-              equipment, difficulty, instructions, gif_url, exercise_type,
-              force, mechanic, sets_default, reps_default, rest_seconds,
-              video_url, image_url, is_active, source_id, created_at
-       FROM exercises WHERE ${conds.join(' AND ')} ORDER BY body_part, name
-       LIMIT $${params.length - 1} OFFSET $${params.length}`,
-      params
-    );
-    res.json(rows);
-  } catch (err) {
-    if (err.message?.includes('does not exist')) return res.json([]);
-    next(err);
-  }
-});
-
-// GET /api/workouts/exercises/meta  →  prefer GET /api/exercises/meta
-router.get('/exercises/meta', auth, async (req, res, next) => {
-  try {
-    const { body_part, equipment, exercise_type, difficulty, search } = req.query;
-    const hasFilters = body_part || equipment || exercise_type || difficulty || search;
-    const live = 'is_active = true AND deleted_at IS NULL AND archived_at IS NULL';
-
-    const { rows: [meta] } = await pool.query(`
-      SELECT
-        array_agg(DISTINCT body_part    ORDER BY body_part)    FILTER (WHERE body_part IS NOT NULL)    AS body_parts,
-        array_agg(DISTINCT equipment    ORDER BY equipment)    FILTER (WHERE equipment IS NOT NULL)    AS equipment_types,
-        array_agg(DISTINCT exercise_type ORDER BY exercise_type) FILTER (WHERE exercise_type IS NOT NULL) AS exercise_types,
-        array_agg(DISTINCT difficulty   ORDER BY difficulty)   FILTER (WHERE difficulty IS NOT NULL)   AS difficulties,
-        COUNT(*)::int AS total
-      FROM exercises WHERE ${live}
-    `);
-
-    if (!hasFilters) return res.json(meta);
-
-    const conds = [live];
-    const params = [];
-    let p = 1;
-    if (body_part)     { conds.push(`body_part = $${p++}`);     params.push(body_part); }
-    if (equipment)     { conds.push(`equipment = $${p++}`);     params.push(equipment); }
-    if (exercise_type) { conds.push(`exercise_type = $${p++}`); params.push(exercise_type); }
-    if (difficulty)    { conds.push(`difficulty = $${p++}`);    params.push(difficulty); }
-    if (search)        { conds.push(`name ILIKE $${p++}`);      params.push(`%${search}%`); }
-
-    const { rows: [cnt] } = await pool.query(
-      `SELECT COUNT(*)::int AS total FROM exercises WHERE ${conds.join(' AND ')}`,
-      params
-    );
-    res.json({ ...meta, total: cnt.total });
-  } catch (err) {
-    next(err);
-  }
-});
+// '/api/workouts/exercises' and '/exercises/meta' were here: read-only
+// duplicates of /api/exercises kept for older clients. There are none — the
+// web app calls /api/exercises everywhere and the WhatsApp service calls
+// neither — so they were two more list endpoints over the same table, free to
+// drift from the library that owns it. The Exercise Library is routes/exercises.js.
 
 
 // ─── WORKOUT PLANS ────────────────────────────────────────────

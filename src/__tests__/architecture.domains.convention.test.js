@@ -75,6 +75,29 @@ const DB = path.join(__dirname, '..', 'db');
  * out of processing both statements in order, without this function having
  * to understand *why* 050's drop is conditional).
  */
+/**
+ * Tables that left `public` for `archive` — 193 took the training domain's
+ * session half, 195 its program/template half.
+ *
+ * Listed by hand rather than detected, because both migrations do the move
+ * inside a `FOREACH t IN ARRAY ARRAY[...]` loop as
+ * `EXECUTE format('ALTER TABLE public.%I SET SCHEMA archive', t)`. The table
+ * name never appears in a literal ALTER statement, so the scanner below cannot
+ * see it however the regex is written. Detecting the loop instead would mean
+ * parsing PL/pgSQL, which is a great deal of machinery for a list that grows
+ * once a year.
+ *
+ * The rows still exist and are still queryable as `archive.<table>`. They are
+ * absent from the manifest because it records what the application owns, and
+ * the application owns none of these.
+ */
+const ARCHIVED = new Set([
+  'training_sessions', 'exercise_performances', 'set_performances',
+  'cardio_performances', 'personal_records', 'training_assignments',
+  'training_programs', 'training_program_phases', 'training_program_weeks',
+  'workout_templates', 'workout_template_exercises',
+]);
+
 function schemaTables() {
   const files = [path.join(DB, 'schema.sql')];
   const migrations = path.join(DB, 'migrations');
@@ -111,6 +134,7 @@ function schemaTables() {
       found.add(renamedTo.toLowerCase());
     }
   }
+  for (const t of ARCHIVED) found.delete(t);
   return found;
 }
 
