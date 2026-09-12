@@ -55,25 +55,29 @@ describe('the queries behind a client avatar select photo_url', () => {
     expect(queryWith(src, 'due_status', 'ORDER BY balance_amount DESC')).toMatch(/\bphoto_url\b/);
   });
 
-  test('the dues report — the single pt_clients select', () => {
-    // Three needles would previously locate a two-arm union (legacy `clients`
-    // + `pt_clients` + an outer select carrying photo_url back out). The
-    // legacy arm is gone; reports.js now holds TWO queries over pt_clients:
-    // the row list this test guards, and /dues/summary, which aggregates the
-    // same population without a LIMIT so the Outstanding KPI stops being the
-    // sum of the top 100 debtors. That aggregate selects balance_amount and
-    // nothing else — no photo, nothing to expose — but it matches the old
-    // two-needle locator, and queryWith deliberately throws on an ambiguous
-    // match rather than quietly guarding whichever query it happened to find
-    // first. It did exactly that.
+  test('the dues rows — the single pt_clients select', () => {
+    // This query moved. It lived in routes/reports.js; the Insights
+    // consolidation made metric-engine.getDuesRows the one place debtor rows
+    // are read, and reports.js GET /dues now delegates to it. The guard has to
+    // follow the SQL, not the route — the column it protects is just as easy
+    // to drop in its new home.
     //
-    // `ORDER BY balance_amount DESC LIMIT 100` is the discriminator: the list
-    // orders and caps, the aggregate does neither. Preferred over matching on
-    // photo_url, which is the thing being asserted — that would make the
+    // metric-engine holds TWO queries over pt_clients for dues: these rows,
+    // and getDuesSummary, which aggregates the same population without a LIMIT
+    // so the Outstanding KPI stops being the sum of the top 100 debtors. That
+    // aggregate selects SUMs and COUNTs only — no photo, nothing to expose —
+    // but it matches a loose locator, and queryWith deliberately throws on an
+    // ambiguous match rather than quietly guarding whichever query it found
+    // first.
+    //
+    // `ORDER BY balance_amount DESC LIMIT $` is the discriminator: the row
+    // list orders and caps (the cap is a bound parameter now, not the literal
+    // 100 it used to be), the aggregate does neither. Preferred over matching
+    // on photo_url, which is the thing being asserted — that would make the
     // guard circular by locating the query via the column whose presence it
     // then checks.
-    const sql = queryWith(read('routes', 'reports.js'),
-      'FROM pt_clients', 'ORDER BY balance_amount DESC LIMIT 100');
+    const sql = queryWith(read('modules', 'insights', 'metric-engine.js'),
+      'FROM pt_clients', 'ORDER BY balance_amount DESC LIMIT $');
     // Once: photo_url is selected straight off the single pt_clients table.
     // Miss it and the avatar silently falls back to initials.
     expect(sql.match(/photo_url/g) || []).toHaveLength(1);

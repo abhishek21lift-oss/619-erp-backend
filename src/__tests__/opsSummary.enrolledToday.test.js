@@ -141,7 +141,10 @@ describe('getOpsSummary contract', () => {
 // already scoped, which is exactly how it survived — nothing about the code
 // around it looked wrong.
 describe('the per-trainer totals query', () => {
-  const trainerSessionsQuery = () => queryWith('FROM pt_trainers t', 'LEFT JOIN pt_sessions s');
+  // `trainers`, not `pt_trainers`: the latter is empty in production and no
+  // foreign key references it, so this panel listed nobody. See
+  // ptOs.payouts.tenantIsolation.test.js for the verification.
+  const trainerSessionsQuery = () => queryWith('FROM trainers t', 'LEFT JOIN pt_sessions s');
 
   it('lists only this organization\'s trainers', () => {
     expect(trainerSessionsQuery()).toContain('t.organization_id = $1');
@@ -172,8 +175,15 @@ describe('the per-trainer totals query', () => {
     // pool.query(`…`) with no second argument is what the leak looked like.
     // The template is interpolated with $1, so a missing bindings array would
     // now throw rather than quietly return the platform.
-    const src = SRC.slice(SRC.indexOf('FROM pt_trainers t') - 900);
-    expect(src).toContain('`, bareParams);');
+    //
+    // Anchored on THIS query's own text and read forward to its argument
+    // list. The previous form sliced from the first `FROM trainers t` in the
+    // file to the very end, so it would have passed on any of the other three
+    // queries' bareParams.
+    const at = SRC.indexOf('LEFT JOIN pt_sessions s');
+    expect(at).toBeGreaterThan(-1);
+    const call = SRC.slice(at, SRC.indexOf(');', at) + 2);
+    expect(call).toContain('`, bareParams);');
   });
 });
 
