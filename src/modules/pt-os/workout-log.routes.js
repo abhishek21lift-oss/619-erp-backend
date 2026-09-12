@@ -740,7 +740,30 @@ router.get('/workout-log/today', auth, wrap(async (req, res) => {
             AND a.status = 'active'
             AND a.start_date <= $1::date
             AND (a.end_date IS NULL OR a.end_date >= $1::date)
-          ORDER BY a.start_date DESC
+          -- An assignment that actually prescribes THIS weekday wins, and only
+          -- then the most recent one.
+          --
+          -- Ordering by start_date alone is what made an assigned programme
+          -- invisible. A client here commonly holds several active assignments
+          -- — an upper/lower split is two, and nothing retires the old plan
+          -- when a new one is written — so this LIMIT 1 was choosing between
+          -- them on recency, a property that has nothing to do with whether
+          -- the chosen plan says anything about today. Pick the one that is
+          -- silent on this weekday and the client renders as a rest day while
+          -- their actual workout sits in the assignment next to it.
+          --
+          -- Measured against production before changing it: 26 of 55
+          -- programmed client-days across the week resolved to the wrong
+          -- assignment and showed as rest days — 8 of 14 on a Tuesday.
+          --
+          -- week_number = 1 to match planned_exercises below, so the row this
+          -- picks and the count it then displays cannot disagree.
+          ORDER BY (EXISTS (
+                     SELECT 1 FROM workout_exercises we
+                      WHERE we.workout_plan_id = a.workout_plan_id
+                        AND we.day_of_week = $2
+                        AND we.week_number = 1)) DESC,
+                   a.start_date DESC
           LIMIT 1
        ) wa ON TRUE
        LEFT JOIN workout_plans wp ON wp.id = wa.workout_plan_id
@@ -760,9 +783,13 @@ router.get('/workout-log/today', auth, wrap(async (req, res) => {
       -- bottom; among the rest, timed before untimed, then by name so the list
       -- is stable between refreshes.
       ORDER BY
+        -- week_number = 1 here too: without it a plan whose week 3 alone
+        -- touches this weekday sorted as a training day while displaying
+        -- "0 exercises", which is the same disagreement in a different place.
         (r.source_rank = 2 AND wp.id IS NOT NULL AND NOT EXISTS (
            SELECT 1 FROM workout_exercises we
-            WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2)),
+            WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
+              AND we.week_number = 1)),
         (r.start_time IS NULL),
         r.start_time,
         c.name`,

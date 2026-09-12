@@ -463,7 +463,17 @@ async function getOpsSummary(scope = {}) {
         FROM workout_assignments a
         JOIN workout_plans wp ON wp.id = a.workout_plan_id
        WHERE a.client_id = s.client_id AND a.status = 'active'
-       ORDER BY a.start_date DESC
+       -- The plan that prescribes the session's own day first, then recency.
+       -- Same defect as the Today roster's LATERAL: a client with an
+       -- upper/lower split holds two active assignments, and choosing between
+       -- them on start_date told the trainer they were about to coach Lower
+       -- while the booking fell on an Upper day.
+       ORDER BY (EXISTS (
+                  SELECT 1 FROM workout_exercises we
+                   WHERE we.workout_plan_id = a.workout_plan_id
+                     AND we.day_of_week = EXTRACT(ISODOW FROM s.session_date)::int
+                     AND we.week_number = 1)) DESC,
+                a.start_date DESC
        LIMIT 1
     ) wa ON TRUE
     WHERE s.session_date = $1 AND s.deleted_at IS NULL${orgS}
@@ -479,8 +489,14 @@ async function getOpsSummary(scope = {}) {
   // panel, because it teaches the trainer to stop looking at it.
   //
   // day_of_week is ISO (1 = Monday) to match workout_exercises.
+  // DISTINCT ON: one row per CLIENT, not per assignment. A client with an
+  // upper/lower split has two active assignments, and on a day both prescribe
+  // they were listed twice — the same person, twice, in a panel counting who
+  // is in today. Seen in production: two of the seven rows were duplicates.
+  // The most recent assignment wins, matching the Today roster's tie-break.
   const { rows: today_unscheduled } = await pool.query(`
-    SELECT
+    SELECT * FROM (
+    SELECT DISTINCT ON (a.client_id)
       a.id AS assignment_id, a.client_id,
       c.name AS client_name, c.photo_url AS client_photo,
       wp.id AS plan_id, wp.name AS plan_name,
@@ -504,7 +520,14 @@ async function getOpsSummary(scope = {}) {
         WHERE s.client_id = a.client_id AND s.session_date = $1 AND s.deleted_at IS NULL
      )
      ${apply ? 'AND a.organization_id = $2' : ''}
-   ORDER BY c.name
+   -- DISTINCT ON requires its own key to lead ORDER BY, so the name order the
+   -- panel reads in is restored by the wrapper — and the cap stays in SQL with
+   -- it. Doing the sort and the slice in JS instead would have made this an
+   -- unbounded read of every matching assignment, which is exactly what
+   -- boundedReads.convention.test.js exists to stop.
+   ORDER BY a.client_id, a.start_date DESC
+    ) q
+   ORDER BY q.client_name
    LIMIT 25
   `, sessParams);
 

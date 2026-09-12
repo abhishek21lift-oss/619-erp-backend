@@ -140,6 +140,46 @@ describe('getOpsSummary contract', () => {
 // dashboard. It sat in the middle of a function whose every other query was
 // already scoped, which is exactly how it survived — nothing about the code
 // around it looked wrong.
+describe('the programme panel lists a client once', () => {
+  // A client with an upper/lower split holds two active assignments, and this
+  // query JOINs assignments — so on a day both plans prescribe, the same
+  // person appeared twice in a panel whose job is counting who is in today.
+  // Seen in production: two of the seven rows were the same two people.
+  // `a.id AS assignment_id` is unique to this query — today_enrolled also
+  // joins workout_assignments and also uses NOT EXISTS, so those two needles
+  // matched both and queryWith throws on an ambiguous match by design.
+  // Deliberately not keyed on DISTINCT ON, which is the thing being asserted.
+  const q = () => queryWith('a.id AS assignment_id', 'planned_exercises');
+
+  it('deduplicates by client, not by assignment', () => {
+    expect(q()).toContain('DISTINCT ON (a.client_id)');
+  });
+
+  it('orders by the DISTINCT ON key first, as Postgres requires', () => {
+    // The INNER ORDER BY — the one belonging to the DISTINCT ON. There are two
+    // now, and lastIndexOf finds the outer name sort, which would pass this on
+    // the wrong clause. Without its key leading, DISTINCT ON is a syntax error,
+    // so the panel would 500 rather than duplicate — worth pinning either way.
+    expect(q()).toMatch(/ORDER BY\s+a\.client_id,\s*a\.start_date DESC/);
+  });
+
+  it('keeps the most recent assignment, matching the Today roster', () => {
+    expect(q()).toMatch(/a\.client_id,\s*a\.start_date DESC/);
+  });
+
+  it('restores name order and keeps the cap in SQL', () => {
+    // DISTINCT ON dictates the inner ordering, so the name sort the panel
+    // reads in happens in an outer wrapper — and the LIMIT rides with it.
+    // Sorting and slicing in JS instead would turn this into an unbounded
+    // read of every matching assignment.
+    const sql = q();
+    const outer = sql.slice(sql.lastIndexOf(') q'));
+    expect(outer).toMatch(/ORDER BY\s+q\.client_name/);
+    expect(outer).toMatch(/LIMIT 25/);
+    expect(SRC).not.toContain('today_unscheduled.splice');
+  });
+});
+
 describe('the per-trainer totals query', () => {
   // `trainers`, not `pt_trainers`: the latter is empty in production and no
   // foreign key references it, so this panel listed nobody. See
