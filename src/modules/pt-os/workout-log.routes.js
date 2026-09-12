@@ -21,6 +21,9 @@ const { logActivity } = require('../../lib/activityLog');
 const { calc1RM } = require('../progress/fitness-scoring');
 const { checkScreeningGate } = require('../../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+// The canonical Today rule. This adapter serialises it; it does not
+// re-implement it — see pt-os.service.getTodayRoster.
+const svc = require('./pt-os.service');
 const { clientInOrg } = require('../../lib/orgGuard');
 const { today: studioToday } = require('../../lib/appTime');
 const { weekOf, resolveWeek } = require('./progression');
@@ -614,187 +617,14 @@ router.delete('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'tr
 // Scoped like every other read here: tenant first, then — for a trainer who
 // is not an admin — their own clients only.
 router.get('/workout-log/today', auth, wrap(async (req, res) => {
-  const date = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
-    ? req.query.date
-    : studioToday();
-
-  // ISO weekday: Postgres ISODOW gives Monday=1, matching
-  // workout_exercises.day_of_week and the WEEKDAYS array above.
-  const { rows: dowRows } = await pool.query('SELECT EXTRACT(ISODOW FROM $1::date)::int AS dow', [date]);
-  const dow = dowRows[0].dow;
-
-  // 'Mon' … 'Sun', the literal tokens the enrolment form stores in
-  // preferred_training_days. Derived from the requested date rather than from
-  // "now", so ?date= still works.
-  const dayToken = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][dow - 1];
-
-  const params = [date, dow, dayToken];
-  const scope = tenantScope(req);
-  // $4 when filtering. Each source carries its own org column, so the filter
-  // is applied per-source inside the union rather than once at the end —
-  // otherwise a foreign row could enter the candidate set and be deduplicated
-  // against a local one.
-  const org = scope.applyFilter ? (params.push(scope.orgId), `$${params.length}`) : null;
-
-  // A trainer who is not admin/manager sees only their own clients. Mirrors
-  // the ownership rule used across pt-os reads. Applied once, at the end,
-  // because it is a property of the CLIENT rather than of the source.
-  let trainerClause = '';
-  if (!['admin', 'manager', 'super_admin'].includes(req.user.role) && req.user.trainer_id) {
-    params.push(req.user.trainer_id);
-    trainerClause = `AND c.trainer_id = $${params.length}`;
-  }
-
-  // pt_clients.preferred_workout_time is free text holding TWO formats, and
-  // sorting it as text is nonsense: the enrolment form's dropdown writes
-  // '6:00 AM' while its custom field is an <input type="time"> that writes
-  // '06:00'. As strings, '1:00 PM' < '5:00 AM' — the afternoon slot sorts
-  // before the dawn one — and slicing five characters off '5:00 AM' yields
-  // '5:00 '. Both are parsed to a real TIME here, and anything that matches
-  // neither shape becomes NULL so it sorts last rather than corrupting the
-  // order of the rows around it.
-  const PREFERRED_TIME = `
-    CASE
-      WHEN c2.preferred_workout_time ~* '^[0-9]{1,2}:[0-9]{2}\\s*(AM|PM)$'
-        THEN to_timestamp(trim(c2.preferred_workout_time), 'HH12:MI AM')::time
-      WHEN c2.preferred_workout_time ~ '^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$'
-        THEN c2.preferred_workout_time::time
-      ELSE NULL
-    END`;
-
-  const { rows } = await pool.query(
-    `WITH candidates AS (
-       -- Booked: a real appointment, already a TIME column.
-       SELECT s.client_id,
-              s.start_time       AS start_time,
-              1                  AS source_rank
-         FROM pt_sessions s
-        WHERE s.session_date = $1::date
-          AND s.deleted_at IS NULL
-          AND s.status <> 'cancelled'
-          ${org ? `AND s.organization_id = ${org}` : ''}
-
-       UNION ALL
-
-       -- Programme: the plan prescribes this weekday. No time — a plan says
-       -- which day, never which hour.
-       SELECT wa.client_id, NULL::time, 2
-         FROM workout_assignments wa
-         JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-        WHERE wa.status = 'active'
-          AND wa.start_date <= $1::date
-          AND (wa.end_date IS NULL OR wa.end_date >= $1::date)
-          ${org ? `AND wa.organization_id = ${org}` : ''}
-
-       UNION ALL
-
-       -- Enrolment: the day picker on the enrolment form, which is required,
-       -- so every enrolled client has one. Whole-token match — a LIKE would
-       -- let 'Thursday-ish' match 'Thu'.
-       SELECT c2.id, ${PREFERRED_TIME}, 3
-         FROM pt_clients c2
-        WHERE c2.deleted_at IS NULL
-          AND c2.status = 'active'
-          AND c2.preferred_training_days IS NOT NULL
-          AND $3 = ANY(string_to_array(replace(c2.preferred_training_days, ' ', ''), ','))
-          ${org ? `AND c2.organization_id = ${org}` : ''}
-     ),
-     -- One row per client. MIN(source_rank) keeps the most specific reason
-     -- they are on the list; MIN(start_time) keeps the earliest time any
-     -- source gave, and stays NULL when none did.
-     roster AS (
-       SELECT client_id,
-              MIN(start_time)  AS start_time,
-              MIN(source_rank) AS source_rank
-         FROM candidates
-        GROUP BY client_id
-     )
-     SELECT r.client_id,
-            r.start_time,
-            r.source_rank,
-            c.name               AS client_name,
-            c.photo_url          AS client_photo,
-            wa.id                AS assignment_id,
-            wp.id                AS plan_id,
-            wp.name              AS plan_name,
-            wa.progress_pct,
-            ws.id                AS session_id,
-            ws.status            AS session_status,
-            -- week 1 only, like every other count of a plan's exercises.
-            -- Weeks a trainer has edited have rows of their own, so without
-            -- the filter a plan whose week 6 was edited reports Monday twice
-            -- over: "8 exercises planned" for a four-exercise day.
-            COALESCE((SELECT COUNT(*) FROM workout_exercises we
-                       WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
-                         AND we.week_number = 1), 0) AS planned_exercises
-       FROM roster r
-       JOIN pt_clients c ON c.id = r.client_id AND c.deleted_at IS NULL
-       -- LEFT, not INNER: a client can be on today's roster with no programme
-       -- at all, which is the state this endpoint used to make invisible.
-       -- LATERAL with LIMIT 1 because two active assignments would otherwise
-       -- fan one client into two rows.
-       LEFT JOIN LATERAL (
-         SELECT a.id, a.workout_plan_id, a.progress_pct
-           FROM workout_assignments a
-          WHERE a.client_id = r.client_id
-            AND a.status = 'active'
-            AND a.start_date <= $1::date
-            AND (a.end_date IS NULL OR a.end_date >= $1::date)
-          -- An assignment that actually prescribes THIS weekday wins, and only
-          -- then the most recent one.
-          --
-          -- Ordering by start_date alone is what made an assigned programme
-          -- invisible. A client here commonly holds several active assignments
-          -- — an upper/lower split is two, and nothing retires the old plan
-          -- when a new one is written — so this LIMIT 1 was choosing between
-          -- them on recency, a property that has nothing to do with whether
-          -- the chosen plan says anything about today. Pick the one that is
-          -- silent on this weekday and the client renders as a rest day while
-          -- their actual workout sits in the assignment next to it.
-          --
-          -- Measured against production before changing it: 26 of 55
-          -- programmed client-days across the week resolved to the wrong
-          -- assignment and showed as rest days — 8 of 14 on a Tuesday.
-          --
-          -- week_number = 1 to match planned_exercises below, so the row this
-          -- picks and the count it then displays cannot disagree.
-          ORDER BY (EXISTS (
-                     SELECT 1 FROM workout_exercises we
-                      WHERE we.workout_plan_id = a.workout_plan_id
-                        AND we.day_of_week = $2
-                        AND we.week_number = 1)) DESC,
-                   a.start_date DESC
-          LIMIT 1
-       ) wa ON TRUE
-       LEFT JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-       -- Nothing stops a client having two logs on one date, and a plain join
-       -- fans them into two rows. Tested against live data, where one client
-       -- already has two. An in-progress session wins, so "Resume" points at
-       -- the live one.
-       LEFT JOIN LATERAL (
-         SELECT s.id, s.status
-           FROM workout_sessions s
-          WHERE s.client_id = r.client_id AND s.session_date = $1::date
-          ORDER BY (s.status = 'in_progress') DESC, s.created_at DESC
-          LIMIT 1
-       ) ws ON TRUE
-      WHERE TRUE ${trainerClause}
-      -- Clock order. Rest days (nothing prescribed and no booking) sink to the
-      -- bottom; among the rest, timed before untimed, then by name so the list
-      -- is stable between refreshes.
-      ORDER BY
-        -- week_number = 1 here too: without it a plan whose week 3 alone
-        -- touches this weekday sorted as a training day while displaying
-        -- "0 exercises", which is the same disagreement in a different place.
-        (r.source_rank = 2 AND wp.id IS NOT NULL AND NOT EXISTS (
-           SELECT 1 FROM workout_exercises we
-            WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
-              AND we.week_number = 1)),
-        (r.start_time IS NULL),
-        r.start_time,
-        c.name`,
-    params
-  );
+  // The rule lives in the service — see svc.getTodayRoster. This adapter
+  // decides who is asking and how the answer is shaped, nothing more.
+  const isStaff = ['admin', 'manager', 'super_admin'].includes(req.user.role);
+  const { date, dow, rows } = await svc.getTodayRoster({
+    date: req.query.date,
+    scope: tenantScope(req),
+    trainerId: isStaff ? null : (req.user.trainer_id || null),
+  });
 
   res.json({
     data: {

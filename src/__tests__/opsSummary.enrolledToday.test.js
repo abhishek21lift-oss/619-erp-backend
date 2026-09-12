@@ -140,43 +140,58 @@ describe('getOpsSummary contract', () => {
 // dashboard. It sat in the middle of a function whose every other query was
 // already scoped, which is exactly how it survived — nothing about the code
 // around it looked wrong.
-describe('the programme panel lists a client once', () => {
-  // A client with an upper/lower split holds two active assignments, and this
-  // query JOINs assignments — so on a day both plans prescribe, the same
-  // person appeared twice in a panel whose job is counting who is in today.
-  // Seen in production: two of the seven rows were the same two people.
-  // `a.id AS assignment_id` is unique to this query — today_enrolled also
-  // joins workout_assignments and also uses NOT EXISTS, so those two needles
-  // matched both and queryWith throws on an ambiguous match by design.
-  // Deliberately not keyed on DISTINCT ON, which is the thing being asserted.
-  const q = () => queryWith('a.id AS assignment_id', 'planned_exercises');
+describe('the programme panel is derived, not a second query', () => {
+  // This panel used to carry its own query over workout_assignments, and it
+  // drifted from the roster that answers the same question on /pt-os/today:
+  // the copy here was missing the assignment date window, the client-status
+  // check and trainer ownership. Four of the six rows it returned in
+  // production were clients whose status is not active.
+  //
+  // It is derived from getTodayRoster now, so those three rules cannot differ
+  // between the two screens again — there is only one place they are written.
 
-  it('deduplicates by client, not by assignment', () => {
-    expect(q()).toContain('DISTINCT ON (a.client_id)');
+  it('calls the canonical rule instead of querying assignments itself', () => {
+    expect(SRC).toContain('const roster = await getTodayRoster(');
+    // The old duplicate is gone, not merely bypassed. Both markers were
+    // unique to it: the DISTINCT ON it used to deduplicate, and the
+    // assignment_id it selected as a row identity.
+    expect(SRC).not.toContain('DISTINCT ON (a.client_id)');
+    expect(SRC).not.toContain('a.id AS assignment_id');
+    // Three reads of workout_assignments survive and all three are wanted:
+    // the roster's plan-resolving LATERAL, the booked-session plan lookup,
+    // and today_enrolled's NOT EXISTS. Counting them pins that no FOURTH
+    // appears — which is what a re-added panel query would be.
+    expect(SRC.match(/FROM workout_assignments a\b/g) || []).toHaveLength(3);
   });
 
-  it('orders by the DISTINCT ON key first, as Postgres requires', () => {
-    // The INNER ORDER BY — the one belonging to the DISTINCT ON. There are two
-    // now, and lastIndexOf finds the outer name sort, which would pass this on
-    // the wrong clause. Without its key leading, DISTINCT ON is a syntax error,
-    // so the panel would 500 rather than duplicate — worth pinning either way.
-    expect(q()).toMatch(/ORDER BY\s+a\.client_id,\s*a\.start_date DESC/);
+  it('keeps only programme days the plan actually prescribes', () => {
+    // source_rank 2 is the roster's own "why is this client here" — and it
+    // already means "not booked", because booked outranks programme in
+    // MIN(source_rank). planned_exercises > 0 drops rest days, which is what
+    // this panel has always meant by "says they train today".
+    expect(SRC).toContain("r.source_rank === 2 && Number(r.planned_exercises) > 0");
   });
 
-  it('keeps the most recent assignment, matching the Today roster', () => {
-    expect(q()).toMatch(/a\.client_id,\s*a\.start_date DESC/);
+  it('lists a client once, because the roster groups by client', () => {
+    const roster = SRC.slice(SRC.indexOf('async function getTodayRoster'));
+    expect(roster).toContain('GROUP BY client_id');
+    expect(roster).toContain('MIN(source_rank)');
   });
 
-  it('restores name order and keeps the cap in SQL', () => {
-    // DISTINCT ON dictates the inner ordering, so the name sort the panel
-    // reads in happens in an outer wrapper — and the LIMIT rides with it.
-    // Sorting and slicing in JS instead would turn this into an unbounded
-    // read of every matching assignment.
-    const sql = q();
-    const outer = sql.slice(sql.lastIndexOf(') q'));
-    expect(outer).toMatch(/ORDER BY\s+q\.client_name/);
-    expect(outer).toMatch(/LIMIT 25/);
-    expect(SRC).not.toContain('today_unscheduled.splice');
+  it('passes the trainer through, so the panel cannot outrank the roster', () => {
+    // Before the merge getOpsSummary took only a tenant scope, so a trainer's
+    // dashboard listed every client in the studio while the same question on
+    // /pt-os/today showed them only their own.
+    expect(SRC).toMatch(/async function getOpsSummary\(scope = \{\}, trainerId = null\)/);
+    expect(SRC).toContain('getTodayRoster({ date: today, scope, trainerId })');
+  });
+
+  it('still sorts by name and caps the list', () => {
+    // The roster is in clock order; this panel reads in name order and shows
+    // at most 25, as it always did.
+    const block = SRC.slice(SRC.indexOf('const today_unscheduled = roster.rows'));
+    expect(block.slice(0, 800)).toMatch(/localeCompare/);
+    expect(block.slice(0, 800)).toMatch(/\.slice\(0, 25\)/);
   });
 });
 

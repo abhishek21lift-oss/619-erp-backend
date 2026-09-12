@@ -99,7 +99,10 @@ describe('the queries behind a client avatar select photo_url', () => {
   });
 
   test('today\'s workout log — the name that appears on /pt-os/today', () => {
-    const src = read('modules', 'pt-os', 'workout-log.routes.js');
+    // The roster query moved out of the adapter into the service when the two
+    // Today implementations were merged into one rule. The avatar is just as
+    // easy to drop in its new home, so the guard follows the SQL.
+    const src = read('modules', 'pt-os', 'pt-os.service.js');
     expect(src).toMatch(/c\.photo_url\s+AS\s+client_photo/);
   });
 });

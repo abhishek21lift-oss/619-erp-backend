@@ -22,7 +22,22 @@
 const fs = require('fs');
 const path = require('path');
 
+// The roster query moved out of the adapter and into the service, where SQL
+// belongs (architecture.layering.convention.test.js). It is now THE canonical
+// Today rule with two callers — GET /workout-log/today and getOpsSummary's
+// programme panel — so this guard follows it rather than guarding whichever
+// copy happened to stay behind.
 const SRC = fs.readFileSync(
+  path.join(__dirname, '..', 'modules', 'pt-os', 'pt-os.service.js'),
+  'utf8',
+);
+
+/**
+ * The adapter. The RULE moved to the service; shaping the response did not,
+ * because that is adapter work — so the `the response` block below reads this
+ * file and everything above it reads the rule.
+ */
+const ADAPTER = fs.readFileSync(
   path.join(__dirname, '..', 'modules', 'pt-os', 'workout-log.routes.js'),
   'utf8',
 );
@@ -103,6 +118,71 @@ describe('all three sources are asked', () => {
     // Whole-token match: a LIKE would let 'Thursday-ish' match 'Thu'.
     expect(q).toContain("$3 = ANY(string_to_array(replace(c2.preferred_training_days, ' ', ''), ','))");
     expect(code(q)).not.toMatch(/LIKE/i);
+  });
+});
+
+// ── The three rules that had drifted ──────────────────────────────────────
+//
+// getOpsSummary used to carry its own copy of this question, and the copy was
+// missing exactly these three. Four of the six rows its programme panel
+// returned in production were clients whose status is not active; the other
+// two gaps were latent, which is worse — a dated assignment or a trainer
+// login would have exposed them with no warning.
+//
+// They are pinned individually because they are the difference between the
+// two screens agreeing and quietly disagreeing again, and because losing any
+// one of them changes WHO a studio sees rather than breaking anything loudly.
+
+describe('assignment status and dates', () => {
+  const q = rosterQuery();
+
+  it('takes only active assignments', () => {
+    expect(code(q)).toContain("wa.status = 'active'");
+  });
+
+  it('ignores one that has not started, or has ended', () => {
+    // Both halves: start_date alone would let a future programme fill today,
+    // end_date alone would let an expired one keep filling it forever.
+    expect(code(q)).toContain('wa.start_date <= $1::date');
+    expect(code(q)).toContain('wa.end_date IS NULL OR wa.end_date >= $1::date');
+  });
+
+  it('applies the same window again when resolving the client\'s plan', () => {
+    // The candidate arm decides WHETHER a client is on the list; the LATERAL
+    // decides WHICH plan is shown. An expired assignment winning the LATERAL
+    // would name a programme the client is no longer on.
+    const lateral = code(q).slice(code(q).indexOf('FROM workout_assignments a'));
+    expect(lateral).toContain("a.status = 'active'");
+    expect(lateral).toContain('a.start_date <= $1::date');
+    expect(lateral).toContain('a.end_date IS NULL OR a.end_date >= $1::date');
+  });
+});
+
+describe('client status', () => {
+  it('never lists a client who is not active, or is deleted', () => {
+    // The enrolment arm is where a client enters the candidate set on their
+    // own account, so the status rule lives there; the final join drops
+    // deleted clients whichever source found them.
+    const q = code(rosterQuery());
+    expect(q).toContain("c2.status = 'active'");
+    expect(q).toContain('c2.deleted_at IS NULL');
+    expect(q).toContain('c.deleted_at IS NULL');
+  });
+});
+
+describe('trainer ownership', () => {
+  it('is a property of the client, applied once', () => {
+    // Not per-source: a client belongs to a trainer regardless of why they
+    // are on today's list.
+    expect(SRC).toContain('AND c.trainer_id = $');
+  });
+
+  it('reaches getOpsSummary too, so the dashboard cannot outrank the roster', () => {
+    // The dashboard's programme panel is derived from this rule now. Before
+    // the merge it had no trainer scoping at all, so a trainer's dashboard
+    // listed every client in the studio while /pt-os/today showed them only
+    // their own — the same question, two answers.
+    expect(SRC).toMatch(/getTodayRoster\(\{ date: today, scope, trainerId \}\)/);
   });
 });
 
@@ -222,12 +302,12 @@ describe('the response', () => {
   it('says why each client is on the list', () => {
     // The UI labels the row from this rather than guessing from which fields
     // are null.
-    expect(SRC).toContain("source,");
-    expect(SRC).toContain("r.source_rank === 1 ? 'booked'");
+    expect(ADAPTER).toContain("source,");
+    expect(ADAPTER).toContain("r.source_rank === 1 ? 'booked'");
   });
 
   it('normalises the time to HH:MM', () => {
-    expect(SRC).toContain("String(r.start_time).slice(0, 5)");
+    expect(ADAPTER).toContain("String(r.start_time).slice(0, 5)");
   });
 
   it('only calls a programme client a rest day', () => {
@@ -235,6 +315,6 @@ describe('the response', () => {
     // an assignment. A booked client with no plan also has zero planned
     // exercises, and greying out the one row with a real appointment on it
     // would be the worst possible row to hide.
-    expect(SRC).toContain("is_rest_day: source === 'programme' && planned === 0");
+    expect(ADAPTER).toContain("is_rest_day: source === 'programme' && planned === 0");
   });
 });
