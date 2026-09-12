@@ -159,14 +159,43 @@ describe('assignment status and dates', () => {
 });
 
 describe('client status', () => {
-  it('never lists a client who is not active, or is deleted', () => {
-    // The enrolment arm is where a client enters the candidate set on their
-    // own account, so the status rule lives there; the final join drops
-    // deleted clients whichever source found them.
+  // Asserted PER ARM, because the first version of this guard was not and
+  // missed the bug it was written for. It checked that "c2.status = 'active'"
+  // appeared somewhere in the query, which the enrolment arm satisfied on its
+  // own — so the programme arm, which had no client check at all, passed.
+  // Production was still rostering expired and pending clients off programmes
+  // they were last on: 11 of 22 non-active clients hold an active assignment,
+  // because nothing retires the assignment when a package ends.
+  const arms = () => {
     const q = code(rosterQuery());
-    expect(q).toContain("c2.status = 'active'");
-    expect(q).toContain('c2.deleted_at IS NULL');
-    expect(q).toContain('c.deleted_at IS NULL');
+    const [, programme, enrolment] = q.split('UNION ALL');
+    return { programme, enrolment, all: q };
+  };
+
+  it('checks the client on the PROGRAMME arm, not just the enrolment one', () => {
+    const { programme } = arms();
+    expect(programme).toMatch(/JOIN pt_clients \w+ ON \w+\.id = wa\.client_id/);
+    expect(programme).toMatch(/\w+\.status = 'active'/);
+    expect(programme).toMatch(/\w+\.deleted_at IS NULL/);
+  });
+
+  it('checks the client on the enrolment arm', () => {
+    const { enrolment } = arms();
+    expect(enrolment).toContain("c2.status = 'active'");
+    expect(enrolment).toContain('c2.deleted_at IS NULL');
+  });
+
+  it('leaves a BOOKED slot exempt on purpose', () => {
+    // Somebody scheduled that appointment deliberately. Making a real booking
+    // vanish because a package lapsed mid-renewal is the worse failure, so the
+    // booked arm checks the session and not the client's status.
+    const [booked] = code(rosterQuery()).split('UNION ALL');
+    expect(booked).toContain('FROM pt_sessions s');
+    expect(booked).not.toMatch(/status = 'active'/);
+  });
+
+  it('drops deleted clients whichever source found them', () => {
+    expect(arms().all).toContain('c.deleted_at IS NULL');
   });
 });
 

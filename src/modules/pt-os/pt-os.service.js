@@ -504,6 +504,24 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
        SELECT wa.client_id, NULL::time, 2
          FROM workout_assignments wa
          JOIN workout_plans wp ON wp.id = wa.workout_plan_id
+         -- The client has to be live too, not just the assignment.
+         --
+         -- This arm checked the ASSIGNMENT's status and dates and nothing
+         -- about the person it belongs to, so a client whose package expired
+         -- kept being rostered by the programme they were last on. Eleven of
+         -- production's twenty-two non-active clients hold an active
+         -- assignment — nothing retires the assignment when the package ends —
+         -- so this was most of them.
+         --
+         -- Same rule the enrolment arm below already applies: both are the
+         -- system INFERRING that someone is coming in, and an inference about
+         -- a client who is no longer active is just wrong. A booked slot is
+         -- deliberately exempt — somebody scheduled that appointment on
+         -- purpose, and making a real booking vanish because a package lapsed
+         -- mid-renewal is the worse failure.
+         JOIN pt_clients wc ON wc.id = wa.client_id
+                           AND wc.deleted_at IS NULL
+                           AND wc.status = 'active'
         WHERE wa.status = 'active'
           AND wa.start_date <= $1::date
           AND (wa.end_date IS NULL OR wa.end_date >= $1::date)
