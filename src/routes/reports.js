@@ -1,8 +1,17 @@
-// src/routes/reports.js
+// src/routes/reports.js — COMPATIBILITY SURFACE over the canonical Metric Engine.
+//
+// Canonical: src/modules/insights/metric-engine.js + metric-definitions.js.
+// This router owns NO formulas: every handler delegates to the engine so
+// /api/reports/* and /api/insights/* can never disagree. New clients must use
+// /api/insights/* (see src/modules/insights/insights.routes.js); these routes
+// stay mounted with `Deprecation: true` + Sunset-style Link headers until the
+// migration is proven safe. Response shapes are frozen — do not "improve" them
+// here, change the canonical endpoint and map here if needed.
 const router = require('express').Router();
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
+const engine = require('../modules/insights/metric-engine');
 
 // Null-safe tenant param: a tenant user gets their org id (queries then filter
 // `organization_id = $x`); a platform super admin operating platform-wide gets
@@ -13,135 +22,78 @@ function orgParam(req) {
   return scope.applyFilter ? scope.orgId : null;
 }
 
-// GET /api/reports/monthly
-// Monthly revenue from PT payments only (legacy `payments` table is empty).
+// GET /api/reports/monthly — canonical: metric-engine.getMonthlyRevenue
+// (finance/pt_payments, deleted_at IS NULL, org-scoped). Shape frozen.
 router.get('/monthly', auth, async (req, res, next) => {
   try {
+    res.set('Deprecation', 'true');
+    res.set('Link', '</api/insights/revenue/monthly>; rel="successor-version"');
     const { year = new Date().getFullYear() } = req.query;
     const isTrainer = req.user.role === 'trainer';
     const tid = isTrainer ? req.user.trainer_id : null;
-    const params = tid ? [parseInt(year), tid] : [parseInt(year)];
-    const trainerWhere = tid ? 'AND p.trainer_id=$2' : '';
-    // Tenant isolation: scope PT revenue to the caller's org (null-safe for
-    // platform super admins).
-    params.push(orgParam(req));
-    const ptOrgWhere = `AND ($${params.length}::uuid IS NULL OR p.organization_id = $${params.length})`;
-
-    const { rows } = await pool.query(`
-      SELECT
-        month_num,
-        month_name,
-        COUNT(*) AS payment_count,
-        COALESCE(SUM(revenue), 0) AS revenue,
-        COALESCE(SUM(incentives), 0) AS incentives
-      FROM (
-        SELECT
-          EXTRACT(MONTH FROM p.date::date) AS month_num,
-          TO_CHAR(DATE_TRUNC('month', p.date::date), 'Month') AS month_name,
-          p.amount AS revenue,
-          p.incentive_amt AS incentives
-        FROM pt_payments p
-        WHERE EXTRACT(YEAR FROM p.date::date) = $1
-          AND p.deleted_at IS NULL
-          ${trainerWhere}
-          ${ptOrgWhere}
-      ) combined
-      GROUP BY month_num, month_name
-      ORDER BY month_num`, params
-    );
+    const scope = tenantScope(req);
+    const rows = await engine.getMonthlyRevenue({
+      year,
+      orgId: scope.applyFilter ? scope.orgId : null,
+      trainerId: tid,
+    });
     res.json(rows);
   } catch (err) {
     next(err);
   }
 });
 
-// GET /api/reports/trainer-summary (admin only)
-// Trainer summary from PT clients and PT payments only (legacy tables are empty).
-// One handler, two paths. These were two byte-identical copies of the same
-// 14-line query — so a fix to one (the org predicates below, say) silently
-// left the other wrong, which is the whole argument against an alias that is
-// a second implementation rather than a second route.
-//
-// ── Tenant isolation ───────────────────────────────────────────────────────
-//
-// The org predicate used to sit only on the driving `trainers` row, on the
-// reasoning that "the client/payment joins hang off trainer_id, so scoping
-// trainers scopes the whole summary". That holds only while no client or
-// payment ever references a trainer in another studio, which nothing
-// enforces — there is no cross-org check on those foreign keys.
-//
-// Measured before this change: zero such rows in production, so this was a
-// latent hole rather than a live leak. It is closed now because "safe because
-// of a property of today's data" is not isolation, and the predicate belongs
-// in the JOIN's ON clause rather than the WHERE — on a LEFT JOIN a WHERE
-// predicate on the joined table would also drop trainers who have no clients
-// at all, turning a scoping fix into a silently shorter report. The same
-// ON-not-WHERE rule is already pinned for PT-OS by
-// ptOs.reportingTenantScope.test.js.
-async function trainerSummary(req, res, next) {
+// GET /api/reports/trainer-summary (admin only) — canonical:
+// metric-engine.getTrainerSummary. Shape frozen.
+router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT t.id, t.name, t.specialization,
-        COUNT(ptc.id) FILTER (WHERE ptc.status='active' AND ptc.deleted_at IS NULL) AS active_clients,
-        COUNT(ptc.id) FILTER (WHERE ptc.deleted_at IS NULL) AS total_clients,
-        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.date >= DATE_TRUNC('month',NOW()) AND ptp.deleted_at IS NULL), 0) AS month_revenue,
-        COALESCE(SUM(ptp.amount) FILTER (WHERE ptp.deleted_at IS NULL), 0) AS total_revenue
-      FROM trainers t
-      LEFT JOIN pt_clients  ptc ON ptc.trainer_id = t.id
-                                AND ($1::uuid IS NULL OR ptc.organization_id = $1)
-      LEFT JOIN pt_payments ptp ON ptp.trainer_id = t.id
-                                AND ($1::uuid IS NULL OR ptp.organization_id = $1)
-      WHERE t.status = 'active'
-        AND ($1::uuid IS NULL OR t.organization_id = $1)
-      GROUP BY t.id, t.name, t.specialization
-      ORDER BY total_revenue DESC`,
-      [orgParam(req)]
-    );
-    res.json(rows);
+    res.set('Deprecation', 'true');
+    res.set('Link', '</api/insights/trainers>; rel="successor-version"');
+    const scope = tenantScope(req);
+    res.json(await engine.getTrainerSummary({
+      orgId: scope.applyFilter ? scope.orgId : null,
+    }));
   } catch (err) {
     next(err);
   }
-}
+});
 
-// GET /api/reports/trainer-summary
-router.get('/trainer-summary', auth, adminOnly, trainerSummary);
-// GET /api/reports/trainers — the same report, kept because the Reports page
-// has called this path for as long as it has existed.
-router.get('/trainers', auth, adminOnly, trainerSummary);
+// GET /api/reports/trainers — DEPRECATED alias for /trainer-summary.
+// Same canonical source (metric-engine.getTrainerSummary). Kept for
+// compatibility; new code must call /api/insights/trainers.
+router.get('/trainers', auth, adminOnly, async (req, res, next) => {
+  try {
+    res.set('Deprecation', 'true');
+    res.set('Link', '</api/insights/trainers>; rel="successor-version"');
+    const scope = tenantScope(req);
+    res.json(await engine.getTrainerSummary({
+      orgId: scope.applyFilter ? scope.orgId : null,
+    }));
+  } catch (err) {
+    next(err);
+  }
+});
 
-// GET /api/reports/revenue — total collected revenue for a date range
-// From PT payments only (legacy `payments` table is empty).
-// Called by api.reports.revenue() in the frontend.
+// GET /api/reports/revenue — canonical: metric-engine.getRevenue.
+// Shape frozen: { count, total, total_incentives }.
 router.get('/revenue', auth, async (req, res, next) => {
   try {
+    res.set('Deprecation', 'true');
+    res.set('Link', '</api/insights/revenue>; rel="successor-version"');
     const { from, to, year } = req.query;
-    const conditions = ['p.deleted_at IS NULL'];
-    const params = [];
-    let p = 1;
-
-    if (from) { conditions.push(`p.date >= $${p++}`); params.push(from); }
-    if (to)   { conditions.push(`p.date <= $${p++}`); params.push(to); }
+    const scope = tenantScope(req);
+    // Preserve legacy year-only behaviour: year without from/to means Jan 1 - Dec 31.
+    let f = from, tt = to;
     if (year && !from && !to) {
-      conditions.push(`EXTRACT(YEAR FROM p.date::date) = $${p++}`);
-      params.push(parseInt(year));
+      f = `${parseInt(year, 10)}-01-01`;
+      tt = `${parseInt(year, 10)}-12-31`;
     }
-
-    const where = 'WHERE ' + conditions.join(' AND ');
-
-    // Tenant isolation: scope PT revenue to the caller's org.
-    params.push(orgParam(req));
-    const orgIdx = params.length;
-
-    const { rows } = await pool.query(`
-      SELECT
-        COUNT(*)::int                AS count,
-        COALESCE(SUM(p.amount), 0)   AS total,
-        COALESCE(SUM(p.incentive_amt), 0) AS total_incentives
-      FROM pt_payments p
-      ${where}
-        AND ($${orgIdx}::uuid IS NULL OR organization_id = $${orgIdx})
-    `, params);
-    res.json(rows[0]);
+    const r = await engine.getRevenue({
+      from: f, to: tt,
+      orgId: scope.applyFilter ? scope.orgId : null,
+      trainerId: req.user.role === 'trainer' ? req.user.trainer_id || null : null,
+    });
+    res.json({ count: r.count, total: r.total, total_incentives: r.total_incentives });
   } catch (err) {
     next(err);
   }
@@ -170,79 +122,35 @@ router.get('/revenue', auth, async (req, res, next) => {
 // and a second copy on the server is how the two drift apart later.
 router.get('/dues/summary', auth, async (req, res, next) => {
   try {
+    res.set('Deprecation', 'true');
+    res.set('Link', '</api/insights/dues/summary>; rel="successor-version"');
     const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
-    const params = [];
-    let trainerFilter = '';
-    if (tid) {
-      params.push(tid);
-      trainerFilter = ` AND trainer_id = $${params.length}`;
-    }
-
-    params.push(orgParam(req));
-    const orgIdx = params.length;
-
-    // Defaults match the page's current bands; a caller may override them.
+    const scope = tenantScope(req);
     const high = Number.isFinite(Number(req.query.high)) ? Number(req.query.high) : 10000;
     const medium = Number.isFinite(Number(req.query.medium)) ? Number(req.query.medium) : 3000;
-    params.push(high);
-    const highIdx = params.length;
-    params.push(medium);
-    const medIdx = params.length;
-
-    const { rows } = await pool.query(`
-      SELECT
-        COALESCE(SUM(balance_amount), 0)                           AS total_outstanding,
-        COUNT(*)::int                                              AS debtor_count,
-        COUNT(*) FILTER (WHERE balance_amount >= $${highIdx})::int      AS high_risk_count,
-        COUNT(*) FILTER (WHERE balance_amount >= $${medIdx}
-                           AND balance_amount <  $${highIdx})::int      AS medium_risk_count
-      FROM pt_clients
-      WHERE balance_amount > 0 AND deleted_at IS NULL
-        AND ($${orgIdx}::uuid IS NULL OR organization_id = $${orgIdx})
-      ${trainerFilter}`,
-      params
-    );
-
-    const r = rows[0] || {};
-    res.json({
-      total_outstanding: Number(r.total_outstanding || 0),
-      debtor_count: Number(r.debtor_count || 0),
-      high_risk_count: Number(r.high_risk_count || 0),
-      medium_risk_count: Number(r.medium_risk_count || 0),
-    });
+    res.json(await engine.getDuesSummary({
+      high, medium,
+      orgId: scope.applyFilter ? scope.orgId : null,
+      trainerId: tid,
+    }));
   } catch (err) {
     next(err);
   }
 });
 
-// GET /api/reports/dues
-//
-// Capped at 100 rows (see the LIMIT below). Anything needing a TOTAL rather
-// than a page of rows must use /dues/summary above — summing what this returns
-// gives the top hundred debtors, not the studio.
+// GET /api/reports/dues — top-100 debtor ROWS (tables only).
+// Totals must use /dues/summary. Canonical rows: metric-engine.getDuesRows.
 router.get('/dues', auth, async (req, res, next) => {
   try {
+    res.set('Deprecation', 'true');
+    res.set('Link', '</api/insights/dues>; rel="successor-version"');
     const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
-    const params = [];
-    let trainerFilter = '';
-    if (tid) {
-      params.push(tid);
-      trainerFilter = ` AND trainer_id = $${params.length}`;
-    }
-    // Tenant isolation: scope PT dues to the caller's org.
-    params.push(orgParam(req));
-    const orgIdx = params.length;
-    const { rows } = await pool.query(`
-      SELECT id, client_id, name, mobile, trainer_name, photo_url,
-             balance_amount, pt_end_date, status
-      FROM pt_clients
-      WHERE balance_amount > 0 AND deleted_at IS NULL
-        AND ($${orgIdx}::uuid IS NULL OR organization_id = $${orgIdx})
-        ${trainerFilter}
-      ORDER BY balance_amount DESC LIMIT 100`,
-      params
-    );
-    res.json(rows);
+    const scope = tenantScope(req);
+    res.json(await engine.getDuesRows({
+      orgId: scope.applyFilter ? scope.orgId : null,
+      trainerId: tid,
+      limit: 100,
+    }));
   } catch (err) {
     next(err);
   }
@@ -262,14 +170,16 @@ router.get('/dues', auth, async (req, res, next) => {
 
 /** Sum of this month's revenue for the caller's scope. */
 async function currentMonthRevenue(req) {
-  const params = [orgParam(req)];
-  const { rows } = await pool.query(`
-    SELECT COALESCE(SUM(p.amount), 0) AS achieved
-    FROM pt_payments p
-   WHERE p.deleted_at IS NULL
-     AND date_trunc('month', p.date::date) = date_trunc('month', CURRENT_DATE)
-     AND ($1::uuid IS NULL OR p.organization_id = $1)`, params);
-  return Number(rows[0]?.achieved ?? 0);
+  // Canonical: same source as /monthly (pt_payments, deleted_at IS NULL).
+  const scope = tenantScope(req);
+  const now = new Date();
+  const f = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+  const last = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
+  const r = await engine.getRevenue({
+    from: f, to: last,
+    orgId: scope.applyFilter ? scope.orgId : null,
+  });
+  return Number(r.total ?? 0);
 }
 
 // GET /api/reports/revenue-target — this month's target, progress and lock state.

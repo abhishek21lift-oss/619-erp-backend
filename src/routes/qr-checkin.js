@@ -18,7 +18,7 @@ const logger   = require('../lib/logger');
 const { auth } = require('../middleware/auth');
 const { requireStaff } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
-const insightsRepo = require('../modules/insights/insights.repository');
+const metricEngine = require('../modules/insights/metric-engine');
 
 // ── AUD-004 (P1): this router is a MIXED surface ────────────────────────────
 //
@@ -541,12 +541,13 @@ router.get('/my-history', auth, async (req, res) => {
     // an aggregate has to be its own query over the whole population, not a
     // reduce over the page being displayed.
     //
-    // The SQL lives in modules/insights, beside the studio-facing attendance
-    // metric, so both use one definition of "attended" (present OR late).
-    // They did not: this endpoint counted both while the attendance page
-    // counted 'present' alone, so one person had two attendance rates.
+    // The SQL lives in the canonical Metric Engine, beside the studio-facing
+    // attendance metric, so both use one definition of a visit — present OR
+    // late (CHECKED_IN_STATUSES). They did not: this endpoint counted both
+    // while the attendance page counted 'present' alone, so one person had two
+    // attendance rates depending on who was looking.
     const { history: rows, stats: agg, presentDates } =
-      await insightsRepo.selfAttendanceHistory(refId, refType, limit);
+      await metricEngine.getSelfAttendanceHistory({ refId, refType, limit });
 
     let currentStreak = 0;
     let longestStreak = 0;

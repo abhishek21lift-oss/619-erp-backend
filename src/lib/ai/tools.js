@@ -374,23 +374,40 @@ const TOOLS = [
     roles: ['admin', 'manager'],
     test: (msg) => /\b(outstanding|pending)\s+dues?\b|\bwho owes\b|\bunpaid\b|\bbalance\s+(due|owed)\b/i.test(msg),
     async run(req) {
+      // Canonical dues: totals are unbounded aggregates (same population as
+      // /api/reports/dues/summary); the top-10 rows are for naming names only.
+      // Summing the top-10 and presenting it as the studio total understated
+      // dues for any studio with more than ten debtors.
       const org = orgFilters(req);
       const params = [];
       let orgFilter = '';
       if (org.apply) { orgFilter = 'AND organization_id = $1'; params.push(org.orgId); }
-      const { rows } = await pool.query(
-        `SELECT name, balance_amount FROM pt_clients
-         WHERE deleted_at IS NULL AND balance_amount > 0 ${orgFilter}
-         ORDER BY balance_amount DESC LIMIT 10`,
-        params
-      );
-      const total = rows.reduce((s, r) => s + Number(r.balance_amount), 0);
-      return { rows, total };
+      const [{ rows: totals }, { rows }] = await Promise.all([
+        pool.query(
+          `SELECT COALESCE(SUM(balance_amount), 0) AS total,
+                  COUNT(*) AS debtor_count
+             FROM pt_clients
+            WHERE deleted_at IS NULL AND balance_amount > 0 ${orgFilter}`,
+          params
+        ),
+        pool.query(
+          `SELECT name, balance_amount FROM pt_clients
+            WHERE deleted_at IS NULL AND balance_amount > 0 ${orgFilter}
+            ORDER BY balance_amount DESC LIMIT 10`,
+          params
+        ),
+      ]);
+      return {
+        rows,
+        total: Number(totals[0]?.total || 0),
+        debtor_count: Number(totals[0]?.debtor_count || 0),
+      };
     },
-    format: ({ rows, total }) => {
+    format: ({ rows, total, debtor_count }) => {
       if (!rows.length) return 'No clients currently have an outstanding balance.';
       const top = rows.map((r) => `${r.name}: ${fmtINR(r.balance_amount)}`).join(', ');
-      return `Outstanding dues: ${fmtINR(total)} total across ${rows.length} client${rows.length === 1 ? '' : 's'} (top: ${top}).`;
+      const n = debtor_count || rows.length;
+      return `Outstanding dues: ${fmtINR(total)} total across ${n} client${n === 1 ? '' : 's'} (top: ${top}).`;
     },
   },
 

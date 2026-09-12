@@ -1215,14 +1215,14 @@ router.put('/commissions/:trainerId', auth, adminOnly, wrap(async (req, res) => 
   const beforeParams = [req.params.trainerId];
   const beforeOrg = orgWhere(req, beforeParams);
   const { rows: before } = await pool.query(
-    `SELECT id, name, incentive_rate FROM pt_trainers WHERE id = $1${beforeOrg}`, beforeParams
+    `SELECT id, name, incentive_rate FROM trainers WHERE id = $1${beforeOrg}`, beforeParams
   );
   if (before.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Trainer not found' } });
 
   const updParams = [rate, req.params.trainerId];
   const updOrg = orgWhere(req, updParams);
   await pool.query(
-    `UPDATE pt_trainers SET incentive_rate = $1, updated_at = NOW() WHERE id = $2${updOrg}`,
+    `UPDATE trainers SET incentive_rate = $1, updated_at = NOW() WHERE id = $2${updOrg}`,
     updParams
   );
 
@@ -1261,7 +1261,7 @@ router.post('/payouts/mark-all-paid', auth, adminOnly, wrap(async (req, res) => 
   let orgClause = '';
   if (scope.applyFilter) {
     params.push(scope.orgId);
-    orgClause = ` AND trainer_id IN (SELECT id FROM pt_trainers WHERE organization_id = $${params.length})`;
+    orgClause = ` AND trainer_id IN (SELECT id FROM trainers WHERE organization_id = $${params.length})`;
   }
   const { rowCount } = await pool.query(
     `UPDATE pt_payouts SET status = 'paid', paid_at = NOW(), updated_at = NOW()
@@ -1285,7 +1285,7 @@ router.put('/payouts/:trainerId', auth, adminOnly, wrap(async (req, res) => {
   const scope = tenantScope(req);
   if (scope.applyFilter) {
     const { rowCount } = await pool.query(
-      `SELECT 1 FROM pt_trainers WHERE id = $1 AND organization_id = $2`,
+      `SELECT 1 FROM trainers WHERE id = $1 AND organization_id = $2`,
       [req.params.trainerId, scope.orgId]
     );
     if (rowCount === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Trainer not found' } });
@@ -1377,7 +1377,7 @@ router.get('/trainer-performance', auth, adminOrManager, wrap(async (req, res) =
       COALESCE(SUM(c.trainer_commission) FILTER (WHERE c.status = 'active'), 0) AS monthly_commission,
       COALESCE(SUM(p.amount) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_payment_revenue,
       COALESCE(SUM(p.incentive_amt) FILTER (WHERE p.deleted_at IS NULL), 0) AS total_incentives
-    FROM pt_trainers t
+    FROM trainers t
     LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL${cOrg}
     LEFT JOIN pt_payments p ON p.trainer_id = t.id AND p.deleted_at IS NULL${pOrg}
     WHERE t.deleted_at IS NULL AND t.status = 'active'${tOrg}
@@ -1614,7 +1614,7 @@ router.get('/payments', auth, wrap(async (req, res) => {
     FROM pt_payments p
     LEFT JOIN pt_clients c ON c.id = p.client_id
     LEFT JOIN trainers t ON t.id = p.trainer_id
-    LEFT JOIN pt_trainers ptt ON ptt.id = p.trainer_id
+    LEFT JOIN trainers ptt ON ptt.id = p.trainer_id
     WHERE ${where.join(' AND ')}
     ORDER BY p.date DESC
   `, params);

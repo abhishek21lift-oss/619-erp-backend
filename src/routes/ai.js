@@ -1279,21 +1279,21 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
   const toDate   = to   ? new Date(to)   : new Date();
 
   try {
-    // Tenant isolation: an org admin sees only their own gym's business data;
-    // a platform super admin operating platform-wide ($3/$1 = NULL) sees all.
-    // pt_client_renewals has no organization_id, so it is scoped via a join to
-    // its client's org (LEFT JOIN so a super admin still counts orphan rows).
+    // Canonical business data: ONE source of truth via the Metric Engine.
+    // (Previously six hand-rolled queries that disagreed with /api/reports on
+    // revenue/dues/renewals. The LLM prompt shape below is unchanged so models
+    // and clients keep working — the NUMBERS behind it are now canonical.)
     const org = orgParam(req);
-    const [revenueRes, membersRes, sessionsRes, trainersRes, renewalsRes, duesRes] = await Promise.all([
-      pool.query(
-        `SELECT
-           COALESCE(SUM(amount),0) AS total_revenue,
-           COUNT(*)                AS total_payments
-         FROM pt_payments WHERE date BETWEEN $1 AND $2 AND deleted_at IS NULL
-           AND ($3::uuid IS NULL OR organization_id = $3)`,
-        [fromDate, toDate, org]
-      ),
-      pool.query(
+    const engine = require('../modules/insights/metric-engine');
+    const { buildBusinessInsights } = require('../modules/insights/insights-engine');
+    const [rev, renew, dues, trainers, overview] = await Promise.all([
+      engine.getRevenue({ from: fromDate, to: toDate, orgId: org }),
+      engine.getRenewals({ from: fromDate, to: toDate, orgId: org }),
+      engine.getDuesSummary({ orgId: org }),
+      engine.getTrainerSummary({ orgId: org }),
+      engine.getOverview({ from: fromDate, to: toDate, orgId: org }),
+    ]);
+    const membersRes = await pool.query(
         `SELECT
            COUNT(*) FILTER (WHERE status='active')   AS active_members,
            COUNT(*) FILTER (WHERE status='inactive') AS inactive_members,
@@ -1301,52 +1301,34 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
          FROM pt_clients WHERE deleted_at IS NULL
            AND ($3::uuid IS NULL OR organization_id = $3)`,
         [fromDate, toDate, org]
-      ),
-      pool.query(
+      );
+    const sessionsRes = await pool.query(
         `SELECT COUNT(*) AS total_sessions,
                 COUNT(DISTINCT client_id) AS active_clients
          FROM pt_sessions WHERE session_date BETWEEN $1 AND $2
            AND ($3::uuid IS NULL OR organization_id = $3)`,
         [fromDate, toDate, org]
-      ),
-      pool.query(
-        `SELECT t.name AS trainer_name,
-                COUNT(s.id) AS sessions,
-                COALESCE(SUM(p.amount),0) AS revenue
-         FROM trainers t
-         LEFT JOIN pt_sessions s ON s.trainer_id=t.id AND s.session_date BETWEEN $1 AND $2
-         LEFT JOIN pt_payments p ON p.trainer_id=t.id AND p.date BETWEEN $1 AND $2 AND p.deleted_at IS NULL
-         WHERE t.deleted_at IS NULL
-           AND ($3::uuid IS NULL OR t.organization_id = $3)
-         GROUP BY t.id, t.name ORDER BY revenue DESC`,
-        [fromDate, toDate, org]
-      ),
-      pool.query(
-        `SELECT COUNT(*) AS total_renewals,
-                COALESCE(SUM(r.paid_amount),0) AS renewal_revenue
-         FROM pt_client_renewals r
-         LEFT JOIN pt_clients c ON c.id = r.client_id
-         WHERE r.renewed_at BETWEEN $1 AND $2
-           AND ($3::uuid IS NULL OR c.organization_id = $3)`,
-        [fromDate, toDate, org]
-      ),
-      pool.query(
-        `SELECT COUNT(*) AS clients_with_dues,
-                COALESCE(SUM(balance_amount) FILTER (WHERE balance_amount > 0),0) AS total_dues
-         FROM pt_clients WHERE deleted_at IS NULL AND balance_amount > 0
-           AND ($1::uuid IS NULL OR organization_id = $1)`,
-        [org]
-      ),
-    ]);
+      );
 
     const bizData = {
       period: { from: fromDate.toISOString().slice(0,10), to: toDate.toISOString().slice(0,10) },
-      revenue:  revenueRes.rows[0],
+      revenue:  { total_revenue: rev.total, total_payments: rev.count },
       members:  membersRes.rows[0],
       sessions: sessionsRes.rows[0],
-      trainers: trainersRes.rows,
-      renewals: renewalsRes.rows[0],
-      outstanding_dues: duesRes.rows[0],
+      trainers: trainers.map((tr) => ({ trainer_name: tr.name, sessions: null, revenue: tr.total_revenue })),
+      renewals: {
+        total_renewals: renew.renewal_transactions,
+        renewal_revenue: renew.renewal_revenue,
+        // TRUE conversion (was: raw renewal count with no denominator).
+        expired_cohort: renew.expired_cohort,
+        renewed_of_cohort: renew.renewed_of_cohort,
+        renewal_rate: renew.renewal_rate,
+        active_share_pct: renew.active_share_pct,
+      },
+      outstanding_dues: { clients_with_dues: dues.debtor_count, total_dues: dues.total_outstanding },
+      // Deterministic engine output: the LLM must quote these, not invent KPIs
+      // (previously it was asked for retention_rate_pct with no SQL behind it).
+      deterministic_insights: buildBusinessInsights(overview),
     };
 
     const userPrompt = `Analyse the following gym business data and generate an executive insights report:\n\n${JSON.stringify(bizData, null, 2)}`;

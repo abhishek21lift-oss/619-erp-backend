@@ -375,7 +375,10 @@ const DOMAINS = {
     description:
       'Reporting and search. Owns no tables and writes nothing — it reads through the '
       + 'owning domains, which is what keeps a reporting query from becoming a second, '
-      + 'unscoped read path onto somebody else\'s data.',
+      + 'unscoped read path onto somebody else\'s data. Canonical implementation is '
+      + 'src/modules/insights/ (metric-definitions.js → metric-engine.js → '
+      + 'insights-engine.js → insights.routes.js at /api/insights/*); src/routes/reports.js '
+      + 'is the frozen compatibility surface delegating to the same engine.',
     dependsOn: [
       'clients', 'packages-enrolment', 'finance', 'scheduling', 'training',
       'attendance', 'compensation', 'engagement',
