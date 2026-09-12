@@ -61,7 +61,25 @@ function db({
   });
 }
 
-const job = (data = {}) => ({ id: 'job-1', data: { type: 'automation', logId: 'log-1', orgId: ORG_A, ...data } });
+/**
+ * A job in the shape BullMQ really hands a processor.
+ *
+ * `opts.attempts` and `attemptsMade` are load-bearing and were missing here,
+ * which is how the retry bug below survived a green suite: the fixture could
+ * not express "this is attempt 2 of 3", so no test ever ran the second attempt
+ * and nobody noticed that it did nothing.
+ *
+ * `attemptsMade` counts attempts that have already FINISHED — BullMQ
+ * increments it after the processor settles — so it is 0 during the first run.
+ * jobs/queue.js configures attempts: 3 for every queue, so that is the default
+ * here too.
+ */
+const job = (data = {}, { attempts = 3, attemptsMade = 0 } = {}) => ({
+  id: 'job-1',
+  opts: { attempts },
+  attemptsMade,
+  data: { type: 'automation', logId: 'log-1', orgId: ORG_A, ...data },
+});
 
 /** The UPDATE statements this run issued, as normalised text. */
 const updates = () =>
@@ -218,6 +236,91 @@ describe('failures and retries', () => {
     db();
     mockGatewaySend.mockResolvedValue({ ok: false, status: 500, data: null, code: 'INTERNAL' });
     await expect(processAutomationJob(job())).rejects.toThrow();
+  });
+
+  test('a retryable failure leaves the row QUEUED, so the next attempt re-sends', async () => {
+    // ── The bug this pins ──────────────────────────────────────────────────
+    //
+    // The failure path used to call markFailed() unconditionally, before
+    // deciding whether to throw. So:
+    //
+    //   attempt 1   markFailed() → row is 'failed' → throw
+    //   attempt 2   loadQueued() → status 'failed', not 'queued'
+    //               → returns { skipped: 'already_failed' }, job COMPLETES
+    //
+    // Three attempts and exponential backoff were configured in jobs/queue.js
+    // and none of them could ever send anything. One transient blip dropped
+    // the studio's message permanently, and the job finished green.
+    //
+    // The row therefore has to still say 'queued' after a retryable failure.
+    db();
+    mockGatewaySend.mockResolvedValue({ ok: false, status: 0, data: null, code: 'GATEWAY_UNREACHABLE' });
+
+    await expect(processAutomationJob(job())).rejects.toThrow();
+
+    const wrote = updates();
+    // The reason is recorded…
+    expect(wrote.some((u) => /SET failure_reason = \$3/.test(u.sql))).toBe(true);
+    // …and nothing moved the row to 'failed'.
+    expect(wrote.some((u) => /SET status = 'failed'/.test(u.sql))).toBe(false);
+  });
+
+  test("the note is bound to status = 'queued' so it cannot pull a delivered row back", async () => {
+    // A receipt can land while this attempt is in flight. Recording the
+    // attempt's failure must not stamp a reason on a message the client has
+    // already received.
+    db();
+    mockGatewaySend.mockResolvedValue({ ok: false, status: 0, data: null, code: 'GATEWAY_UNREACHABLE' });
+    await expect(processAutomationJob(job())).rejects.toThrow();
+
+    const note = updates().find((u) => /SET failure_reason = \$3/.test(u.sql));
+    expect(note.sql).toMatch(/WHERE id = \$1 AND organization_id = \$2 AND status = 'queued'/);
+  });
+
+  test('the LAST attempt marks the row failed rather than leaving a ghost', async () => {
+    // Attempt 3 of 3: BullMQ will not run this job again. If the row were left
+    // 'queued' here it would stay that way forever — the studio watching a
+    // message that nothing will ever send, and automation.recovery declining
+    // to re-drive it because the retained failed job still exists.
+    db();
+    mockGatewaySend.mockResolvedValue({ ok: false, status: 0, data: null, code: 'GATEWAY_UNREACHABLE' });
+
+    const out = await processAutomationJob(job({}, { attempts: 3, attemptsMade: 2 }));
+
+    expect(out).toMatchObject({ status: 'failed', reason: 'gateway_unreachable' });
+    expect(updates().some((u) => /SET status = 'failed'/.test(u.sql))).toBe(true);
+  });
+
+  test('agrees with BullMQ about whether another attempt is coming', async () => {
+    // The predicate is BullMQ's own (attemptsMade + 1 < opts.attempts). If the
+    // two ever disagree, one direction leaves ghosts and the other burns the
+    // message a retry away from success — so it is pinned against the boundary
+    // rather than against one example.
+    db();
+    mockGatewaySend.mockResolvedValue({ ok: false, status: 0, data: null, code: 'GATEWAY_UNREACHABLE' });
+
+    // attempts: 1 — there is no second attempt, so the first is terminal.
+    const out = await processAutomationJob(job({}, { attempts: 1, attemptsMade: 0 }));
+    expect(out.status).toBe('failed');
+    expect(updates().some((u) => /SET status = 'failed'/.test(u.sql))).toBe(true);
+
+    // attempts: 3, attemptsMade: 1 — one more is coming, so it must throw.
+    mockQuery.mockClear();
+    db();
+    await expect(processAutomationJob(job({}, { attempts: 3, attemptsMade: 1 }))).rejects.toThrow();
+    expect(updates().some((u) => /SET status = 'failed'/.test(u.sql))).toBe(false);
+  });
+
+  test('a non-retryable failure is terminal on the FIRST attempt', async () => {
+    // Nothing is gained by leaving a disconnected studio's message queued
+    // through three attempts: no retry reconnects a socket only they can
+    // restore. It fails immediately, with the reason the UI explains.
+    db({ instance: null });
+
+    const out = await processAutomationJob(job());
+
+    expect(out.status).toBe('failed');
+    expect(updates().some((u) => /SET status = 'failed'/.test(u.sql))).toBe(true);
   });
 
   test('a duplicate already in flight at the gateway does NOT retry', async () => {

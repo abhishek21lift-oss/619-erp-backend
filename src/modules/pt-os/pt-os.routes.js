@@ -713,24 +713,40 @@ router.post('/clients/:id/renew', auth, requireRole('admin','manager','trainer')
       );
       if (tr[0]) { ledgerTrainerId = tr[0].id; incentiveRate = tr[0].incentive_rate ?? 0.5; }
     }
-    await pool.query(
+    // RETURNING id, because the id is what the automation event is keyed on.
+    // See the event below.
+    const { rows: paid } = await pool.query(
       `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes, organization_id)
-       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6,$7)`,
+       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6,$7)
+       RETURNING id`,
       [req.params.id, ledgerTrainerId, paidNow, Math.round(paidNow * incentiveRate),
        String(d.payment_method || 'CASH').toUpperCase(), `Renewal — ${packageType || c.package_type || 'PT package'}`,
        orgIdOf(req)]
     );
 
-    // The payment row carries no id we can read back here, so the event key is
-    // composed from what identifies this payment in practice: the client, the
-    // amount and the day. Two genuinely different payments of the same amount
-    // to the same client on one day would collapse into one event — rare, and
-    // the safe direction to be wrong in, since the alternative is a retried
-    // request messaging the client twice.
+    // The payment's own id is the event key, the same as every other payment
+    // trigger in this codebase.
+    //
+    // It used to be `renewal:<client>:<amount>:<new Date().toISOString()…>`,
+    // composed because "the payment row carries no id we can read back here" —
+    // which was true only for as long as the INSERT above declined to return
+    // one. That composition was wrong in both directions. Two genuinely
+    // separate payments of the same amount from one client on one day
+    // collapsed into a single event, so the second one's message was suppressed
+    // as a duplicate. And the date came from `new Date()` in the Node process,
+    // which is UTC: for a studio in IST every payment taken between midnight
+    // and 05:30 local was keyed to the PREVIOUS day, so a payment late on one
+    // evening and another early the next morning shared a key and the second
+    // client heard nothing. automation.sweep.js documents that exact trap —
+    // "a Node process is not guaranteed to agree with the database about what
+    // day it is" — and this was the one place still falling into it.
+    //
+    // A payment id is stable across a retried request, unique across payments,
+    // and carries no clock at all, so all three problems go away together.
     await automation.paymentReceived(req, {
       clientId: req.params.id,
       amount: paidNow,
-      eventKey: `renewal:${req.params.id}:${paidNow}:${new Date().toISOString().slice(0, 10)}`,
+      eventKey: paid[0].id,
     });
   }
 
@@ -945,19 +961,22 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
       );
       if (tr[0]) { ledgerTrainerId = tr[0].id; incentiveRate = tr[0].incentive_rate ?? 0.5; }
     }
-    await pool.query(
+    const { rows: paid } = await pool.query(
       `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes, organization_id)
-       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6,$7)`,
+       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6,$7)
+       RETURNING id`,
       [req.params.id, ledgerTrainerId, delta, Math.round(delta * incentiveRate),
        String(req.body.payment_method || 'CASH').toUpperCase(), 'Collected via client profile / enrolment',
        orgIdOf(req)]
     );
 
-    // Same composition as the renewal path above, and the same trade-off.
+    // The payment's own id, for the reasons set out at the renewal path above:
+    // the composite key it replaces collapsed two same-amount payments on one
+    // day into one event, and took its date from the Node process in UTC.
     await automation.paymentReceived(req, {
       clientId: req.params.id,
       amount: delta,
-      eventKey: `profile:${req.params.id}:${delta}:${new Date().toISOString().slice(0, 10)}`,
+      eventKey: paid[0].id,
     });
   }
 

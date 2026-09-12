@@ -100,20 +100,24 @@ async function applyMessageEvent(eventType, payload, tenantId, occurredAt, clien
 
   if (kind === 'delivered' || kind === 'read') {
     const externalId = payload.provider_message_id;
-    if (!externalId) return 0;
-    return repo.applyReceipt(
+    if (!externalId) return { applied: 0, subject: null };
+    const applied = await repo.applyReceipt(
       tenantId,
       externalId,
       kind,
       payload.delivered_at || payload.read_at || occurredAt || null,
       { client }
     );
+    return { applied, subject: externalId };
   }
 
   if (kind === 'failed') {
     const logId = payload.client_message_id;
-    if (!logId) return 0;
-    return repo.markFailedByClientId(tenantId, logId, payload.reason_code || 'gateway_failed', { client });
+    if (!logId) return { applied: 0, subject: null };
+    const applied = await repo.markFailedByClientId(
+      tenantId, logId, payload.reason_code || 'gateway_failed', { client }
+    );
+    return { applied, subject: logId };
   }
 
   // `sent` is deliberately inert. The worker already recorded the send
@@ -121,7 +125,37 @@ async function applyMessageEvent(eventType, payload, tenantId, occurredAt, clien
   // and it did so before this event could arrive. Applying it again would at
   // best be a no-op and at worst move a row that has since been delivered back
   // to 'sent'.
-  return 0;
+  //
+  // The provider id is still returned so the ledger records WHICH message the
+  // event was about. That is what makes a later unmatched receipt diagnosable:
+  // the id the gateway believes it sent under, next to the id a receipt came
+  // looking for, in two rows of the same table.
+  return { applied: 0, subject: payload.provider_message_id || payload.client_message_id || null };
+}
+
+/**
+ * Stamp the claim row with what the event referred to and what it changed.
+ *
+ * The statement lives in the repository, like every other write this handler
+ * performs; this is the adapter half. A separate UPDATE rather than more
+ * columns on the claim INSERT, because the
+ * claim has to be taken BEFORE the work — it is what serialises two concurrent
+ * redeliveries — and `applied_rows` is only known after. Same transaction, so
+ * the outcome commits with the work it describes or not at all: there is no
+ * state in which the ledger claims an event applied 1 row and the row is
+ * unchanged.
+ *
+ * Never allowed to fail the request. This is observability; a webhook that
+ * answered 500 because it could not write a diagnostic column would turn the
+ * thing meant to explain a problem into one.
+ */
+async function recordOutcome(client, eventId, subject, applied) {
+  const repo = require('../modules/automation/automation.repository');
+  try {
+    await repo.recordEventOutcome(eventId, subject, applied, { client });
+  } catch (err) {
+    logger.warn({ err: err.message, event_id: eventId }, 'whatsapp_webhook_outcome_not_recorded');
+  }
 }
 
 router.post('/', async (req, res) => {
@@ -235,9 +269,20 @@ router.post('/', async (req, res) => {
     // 'delivered'/'read' status values have been waiting for since migration
     // 012 — until now nothing wrote them, because nothing sent anything.
     if (event_type.startsWith('whatsapp.message.')) {
-      const applied = await applyMessageEvent(event_type, event.payload || {}, tenant_id, occurred_at, client);
+      const { applied, subject } = await applyMessageEvent(
+        event_type, event.payload || {}, tenant_id, occurred_at, client
+      );
+      await recordOutcome(client, event_id, subject, applied);
       await client.query('COMMIT');
-      log.info({ status: 'ok', applied }, 'whatsapp_webhook_message_event');
+      // `applied: 0` on a receipt is the signal worth having: the event was
+      // genuine and verified, and it matched no message this ERP sent. Logged
+      // at warn (not info) with the id it was looking for, and recorded on the
+      // ledger row so the answer survives log retention.
+      if (applied === 0 && (event_type.endsWith('.delivered') || event_type.endsWith('.read'))) {
+        log.warn({ status: 'ok', applied, subject_key: subject }, 'whatsapp_webhook_receipt_unmatched');
+      } else {
+        log.info({ status: 'ok', applied, subject_key: subject }, 'whatsapp_webhook_message_event');
+      }
       return res.json({ received: true });
     }
 
@@ -246,6 +291,7 @@ router.post('/', async (req, res) => {
       // Acknowledged and ignored. The gateway may ship a new event type before
       // this deploy does, and retrying something we will never understand
       // only fills the dead-letter list.
+      await recordOutcome(client, event_id, null, 0);
       await client.query('COMMIT');
       log.info({ status: 'ok', applied: false }, 'whatsapp_webhook_unknown_type');
       return res.json({ received: true });
@@ -289,6 +335,8 @@ router.post('/', async (req, res) => {
         occurred_at || null,
       ]
     );
+
+    await recordOutcome(client, event_id, instance_id, result.rowCount);
 
     // Committed BEFORE the re-drive below. That enqueues real sends to real
     // people, and a transaction that later rolled back would have it acting on
