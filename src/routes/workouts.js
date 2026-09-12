@@ -1110,8 +1110,19 @@ router.post('/assign', auth, adminManagerOrTrainer, async (req, res, next) => {
       INSERT INTO workout_assignments (id, workout_plan_id, client_id, trainer_id,
         start_date, end_date, status, notes, organization_id)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      ON CONFLICT (workout_plan_id, client_id, status)
+      -- Keyed on (plan, client) since 197. It used to include status, which
+      -- made status part of row identity: re-assigning a plan to a client
+      -- whose row had been paused found no conflict and inserted a SECOND
+      -- row, leaving one client holding two assignments for one plan. That is
+      -- the condition that made a programme invisible on the dashboard (#127),
+      -- so the key had to narrow before status could ever move.
+      --
+      -- Re-assigning therefore REVIVES the existing row rather than forking
+      -- it: a client who lapsed and came back gets their programme, its
+      -- progress and its notes, not a blank second copy.
+      ON CONFLICT (workout_plan_id, client_id)
       DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date,
+        end_date = EXCLUDED.end_date,
         organization_id = COALESCE(workout_assignments.organization_id, EXCLUDED.organization_id), updated_at = NOW()
       RETURNING *`,
       [randomUUID(), d.workout_plan_id, d.client_id, req.user.trainer_id || null,
