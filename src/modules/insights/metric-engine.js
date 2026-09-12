@@ -17,7 +17,7 @@
  * functions instead of embedding their own SQL for the same metric.
  */
 const pool = require('../../db/pool');
-const { METRICS } = require('./metric-definitions');
+const { METRICS, CHECKED_IN_STATUSES } = require('./metric-definitions');
 
 function num(v, fallback = 0) {
   const n = Number(v);
@@ -448,6 +448,75 @@ async function getOverview({ from, to, year, orgId = null, trainerId = null } = 
   };
 }
 
+/**
+ * One person's OWN attendance history, and the stats over it.
+ *
+ * Self-scoped rather than org-scoped: the caller is asking about themselves and
+ * refId comes from their session, never from the request. It belongs here
+ * anyway, because it is the same metric as getAttendanceStats above — a visit
+ * is present + late — and the two disagreed until it moved. The member-facing
+ * endpoint counted both, the studio-facing attendance page counted 'present'
+ * alone, so one person had two attendance rates depending on who was looking.
+ *
+ * ── Why the stats are their own query ──────────────────────────────────────
+ *
+ * `limit` bounds the history LIST, and only that. GET /api/qr/my-history used
+ * to derive total_days, total_present, this_month, avg_duration and both
+ * streaks from that same capped array, so past 90 records the denominator
+ * stopped growing: a member who had attended 200 times was shown their rate
+ * over the most recent 90, labelled as their overall rate, and `total_days`
+ * read 90 forever. Same fault /api/reports/dues had — the reason
+ * getDuesSummary exists separately from getDuesRows.
+ */
+async function getSelfAttendanceHistory({ refId, refType, limit = 90 } = {}) {
+  const cap = Math.min(Math.max(Number(limit) || 90, 1), 365);
+
+  const { rows: history } = await pool.query(
+    `SELECT date, status, check_in_time, check_out_time, method, duration_minutes
+       FROM attendance_logs
+      WHERE ref_id = $1 AND ref_type = $2
+      ORDER BY date DESC
+      LIMIT $3`,
+    [refId, refType, cap]
+  );
+
+  const { rows: agg } = await pool.query(
+    `SELECT COUNT(*)::int AS total_days,
+            COUNT(*) FILTER (WHERE a.status = ANY($3))::int AS total_present,
+            COUNT(*) FILTER (WHERE a.status = ANY($3)
+                             AND a.date >= DATE_TRUNC('month', CURRENT_DATE))::int AS this_month,
+            ROUND(AVG(a.duration_minutes) FILTER (WHERE a.duration_minutes > 0))::int AS avg_duration
+       FROM attendance_logs a
+      WHERE a.ref_id = $1 AND a.ref_type = $2`,
+    [refId, refType, CHECKED_IN_STATUSES]
+  );
+
+  // Streaks walk back a year, so they need a year of dates — not whatever
+  // fraction of one the display page happened to include.
+  const { rows: streak } = await pool.query(
+    `SELECT a.date
+       FROM attendance_logs a
+      WHERE a.ref_id = $1 AND a.ref_type = $2
+        AND a.status = ANY($3)
+        AND a.date >= CURRENT_DATE - INTERVAL '365 days'`,
+    [refId, refType, CHECKED_IN_STATUSES]
+  );
+
+  const s = agg[0] || {};
+  return {
+    history,
+    stats: {
+      total_days: num(s.total_days, 0),
+      total_present: num(s.total_present, 0),
+      this_month: num(s.this_month, 0),
+      avg_duration: s.avg_duration == null ? null : num(s.avg_duration, 0),
+    },
+    presentDates: new Set(
+      streak.map((r) => (r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date)))
+    ),
+  };
+}
+
 module.exports = {
   getRevenue,
   getMonthlyRevenue,
@@ -455,6 +524,7 @@ module.exports = {
   getDuesRows,
   getAttendanceStats,
   getAttendanceToday,
+  getSelfAttendanceHistory,
   getRenewals,
   getRenewalRows,
   getTrainerSummary,

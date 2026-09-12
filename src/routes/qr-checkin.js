@@ -18,6 +18,7 @@ const logger   = require('../lib/logger');
 const { auth } = require('../middleware/auth');
 const { requireStaff } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const metricEngine = require('../modules/insights/metric-engine');
 
 // ── AUD-004 (P1): this router is a MIXED surface ────────────────────────────
 //
@@ -529,19 +530,24 @@ router.get('/my-history', auth, async (req, res) => {
     else if (u.trainer_id) { refId = u.trainer_id; refType = 'trainer'; }
 
     const limit = Math.min(Math.max(parseInt(req.query.limit || '90', 10) || 90, 1), 365);
-    const { rows } = await pool.query(
-      `SELECT date, status, check_in_time, check_out_time, method, duration_minutes
-         FROM attendance_logs
-        WHERE ref_id = $1 AND ref_type = $2
-        ORDER BY date DESC
-        LIMIT $3`,
-      [refId, refType, limit]
-    );
 
-    // Calculate streaks
-    const presentDates = new Set(
-      rows.filter((r) => r.status === 'present' || r.status === 'late').map((r) => r.date)
-    );
+    // The list is paginated; the stats are NOT computed from it.
+    //
+    // They used to be. `rows` is capped at `limit` (90 by default), so past
+    // 90 records the denominator stopped growing: a member who had attended
+    // 200 times saw a rate over their most recent 90 days presented as their
+    // overall attendance rate, and `total_days` read 90 forever. It is the
+    // same fault /api/reports/dues had, which is why /dues/summary exists —
+    // an aggregate has to be its own query over the whole population, not a
+    // reduce over the page being displayed.
+    //
+    // The SQL lives in the canonical Metric Engine, beside the studio-facing
+    // attendance metric, so both use one definition of a visit — present OR
+    // late (CHECKED_IN_STATUSES). They did not: this endpoint counted both
+    // while the attendance page counted 'present' alone, so one person had two
+    // attendance rates depending on who was looking.
+    const { history: rows, stats: agg, presentDates } =
+      await metricEngine.getSelfAttendanceHistory({ refId, refType, limit });
 
     let currentStreak = 0;
     let longestStreak = 0;
@@ -564,19 +570,8 @@ router.get('/my-history', auth, async (req, res) => {
       d.setDate(d.getDate() - 1);
     }
 
-    const totalPresent = rows.filter((r) => r.status === 'present' || r.status === 'late').length;
-    const totalDays    = rows.length;
-    const thisMonthRows = rows.filter((r) => {
-      const month = new Date().toISOString().slice(0, 7);
-      return r.date && r.date.toString().startsWith(month);
-    });
-    const thisMonthPresent = thisMonthRows.filter((r) => r.status === 'present' || r.status === 'late').length;
-
-    // Avg duration if tracked
-    const durRows = rows.filter((r) => r.duration_minutes > 0);
-    const avgDuration = durRows.length
-      ? Math.round(durRows.reduce((s, r) => s + r.duration_minutes, 0) / durRows.length)
-      : null;
+    const totalPresent = agg.total_present;
+    const totalDays = agg.total_days;
 
     res.json({
       history: rows,
@@ -585,9 +580,13 @@ router.get('/my-history', auth, async (req, res) => {
         total_days: totalDays,
         current_streak: currentStreak,
         longest_streak: longestStreak,
-        this_month: thisMonthPresent,
+        this_month: agg.this_month,
+        // Kept as 0 rather than null for a member with no attendance at all:
+        // this is a member-facing contract the portal already renders, and
+        // "0 of 0 days" is not the misleading case — the misleading case was
+        // the capped denominator above.
         attendance_rate: totalDays ? Math.round((totalPresent / totalDays) * 100) : 0,
-        avg_duration_minutes: avgDuration,
+        avg_duration_minutes: agg.avg_duration,
       },
     });
   } catch (err) {
