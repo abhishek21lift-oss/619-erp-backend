@@ -1914,7 +1914,16 @@ router.post('/clients/merge-duplicates', auth, adminOnly, wrap(async (req, res) 
 
 // ─── Operations Summary (today's sessions, renewals, dues) ──────────────────
 router.get('/dashboard/ops', auth, wrap(async (req, res) => {
-  const data = await svc.getOpsSummary(tenantScope(req));
+  // Trainer ownership passed through, because the programme panel is derived
+  // from the canonical Today rule now and that rule enforces it. Before the
+  // merge this endpoint had no trainer scoping at all, so a trainer's
+  // dashboard listed every client in the studio while /pt-os/today — the same
+  // question, the other screen — showed them only their own.
+  const isStaff = ['admin', 'manager', 'super_admin'].includes(req.user.role);
+  const data = await svc.getOpsSummary(
+    tenantScope(req),
+    isStaff ? null : (req.user.trainer_id || null),
+  );
   res.json({ data });
 }));
 

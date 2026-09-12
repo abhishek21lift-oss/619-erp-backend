@@ -106,7 +106,7 @@ function rel(file) {
  */
 const BUDGETS = {
   'modules/pt-os/pt-os.routes.js': 93,
-  'modules/pt-os/workout-log.routes.js': 49,
+  'modules/pt-os/workout-log.routes.js': 45,
   'routes/exercises.js': 43,
   'routes/workouts.js': 43,
   'routes/ai.js': 42,
@@ -225,6 +225,6 @@ describe('the migration has a number attached to it', () => {
     // its entry was deleted outright — the first file in the register to
     // reach zero. Lower it with each extraction — the number only means
     // something if it tracks reality.
-    expect(ceiling).toBe(734);
+    expect(ceiling).toBe(730);
   });
 });
