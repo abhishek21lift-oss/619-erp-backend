@@ -893,6 +893,16 @@ router.patch('/clients/:id', auth, requireRole('admin','manager','trainer'), wra
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
+  // A client leaving active status retires their programmes; coming back
+  // restores them. Before this, nothing ever moved an assignment out of
+  // 'active' — 28 of production's 53 belonged to somebody expired, pending or
+  // deleted, and the Today roster had to compensate at read time (#129).
+  //
+  // Derived from the client row by the service, not from req.body, so it is
+  // right whether the caller sent a status explicitly or the enrolment
+  // promotion above set one. No-ops when nothing needs moving.
+  await svc.syncClientAssignments(rows[0].id);
+
   // Term history: unlike /clients/:id/renew, this endpoint (the actual
   // enrollment action — see the enroll page) never wrote a row into
   // pt_client_subscriptions, so a client's first term never appeared on
@@ -998,6 +1008,9 @@ router.delete('/clients/:id', auth, requireRole('admin','manager'), wrap(async (
     RETURNING id
   `, params);
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  // Their programmes go with them. Cancelled rather than paused: a deleted
+  // client is not coming back, and nothing should roster them again.
+  await svc.syncClientAssignments(rows[0].id);
   await logActivity(req, 'client.delete', 'pt_client', rows[0].id);
   res.json({ message: 'Client deleted' });
 }));

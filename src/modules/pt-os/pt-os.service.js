@@ -415,6 +415,54 @@ async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy, 
 }
 
 /**
+ * syncClientAssignments — keep a client's programmes in step with the client.
+ *
+ * `workout_assignments.status` was write-once until migration 197: the INSERT
+ * set 'active' and nothing ever moved it, so 28 of production's 53 active
+ * assignments belonged to somebody who was expired, pending or soft-deleted.
+ * A client kept being rostered by the programme they were last on, and every
+ * read filtering `status = 'active'` was filtering on a constant.
+ *
+ * Called wherever a client's status changes. Derives the target state from
+ * the client row rather than from the caller's intent, so it is idempotent
+ * and cannot disagree with 197's backfill — the rule is written once, here.
+ *
+ *   client soft-deleted        → cancelled
+ *   client not active          → paused    (from active only)
+ *   client active              → active    (from paused only)
+ *
+ * Only active ↔ paused moves automatically. 'completed' and 'cancelled' are
+ * terminal: a programme somebody finished or a deleted client's plan is not
+ * resurrected by a status edit. The one way out of a terminal state is an
+ * explicit re-assignment, which the upsert in routes/workouts.js handles.
+ *
+ * Safe to call when nothing changes — it rewrites no row whose status is
+ * already right, so it costs one statement and no writes in the common case.
+ */
+async function syncClientAssignments(clientId) {
+  if (!clientId) return 0;
+  const { rowCount } = await pool.query(
+    `UPDATE workout_assignments a
+        SET status = CASE
+              WHEN c.deleted_at IS NOT NULL          THEN 'cancelled'
+              WHEN c.status IS DISTINCT FROM 'active' THEN 'paused'
+              ELSE 'active'
+            END,
+            updated_at = NOW()
+       FROM pt_clients c
+      WHERE c.id = a.client_id
+        AND a.client_id = $1
+        AND (
+          (c.deleted_at IS NOT NULL AND a.status IN ('active', 'paused'))
+          OR (c.deleted_at IS NULL AND c.status IS DISTINCT FROM 'active' AND a.status = 'active')
+          OR (c.deleted_at IS NULL AND c.status = 'active' AND a.status = 'paused')
+        )`,
+    [clientId]
+  );
+  return rowCount;
+}
+
+/**
  * getTodayRoster — THE canonical answer to "who is training today".
  *
  * One rule, one query, two callers: GET /workout-log/today serialises it
@@ -1071,6 +1119,7 @@ function clampOffset(value) {
 }
 
 module.exports = {
+  syncClientAssignments,
   getTodayRoster,
   calculateMonthlyCommissions,
   getTrainerPayouts,
