@@ -152,7 +152,7 @@ const METRICS = {
   trainer_revenue: {
     label: 'Trainer revenue collected',
     owner: 'compensation',
-    table: 'pt_payments JOIN trainers',
+    table: 'pt_payments + trainers',
     formula: 'SUM(pt_payments.amount) per trainer WHERE pt_payments.deleted_at IS NULL AND org on BOTH sides',
     unit: 'INR',
   },
