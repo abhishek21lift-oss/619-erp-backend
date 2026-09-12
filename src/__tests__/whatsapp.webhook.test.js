@@ -16,7 +16,27 @@ const crypto = require('crypto');
 process.env.JWT_SECRET = 'test-secret-at-least-32-characters-long!!';
 process.env.WA_WEBHOOK_SECRET = 'test-webhook-secret-at-least-32-characters!';
 
-jest.mock('../db/pool', () => ({ query: jest.fn() }));
+// The handler claims the idempotency ledger and applies the event on ONE
+// transaction now, so the mock has to hand out a client. It delegates to the
+// same query mock every assertion below already reads, and records BEGIN /
+// COMMIT / ROLLBACK so the transaction itself can be asserted — which is the
+// property that stops a failed apply from keeping its claim.
+jest.mock('../db/pool', () => {
+  const query = jest.fn();
+  const txn = [];
+  const client = {
+    query: jest.fn((sql, params) => {
+      const verb = typeof sql === 'string' ? sql.trim().toUpperCase() : '';
+      if (verb === 'BEGIN' || verb === 'COMMIT' || verb === 'ROLLBACK') {
+        txn.push(verb);
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      }
+      return query(sql, params);
+    }),
+    release: jest.fn(),
+  };
+  return { query, connect: jest.fn(async () => client), __client: client, __txn: txn };
+});
 
 const request = require('supertest');
 const express = require('express');
@@ -218,6 +238,63 @@ describe('idempotency', () => {
     pool.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
     const res = await post(makeEvent());
     expect(res.status).toBe(200);
+  });
+
+  // ── The claim is worthless unless the work goes with it ──────────────────
+  //
+  // These two ran as separate autocommitted statements, claim first. So a
+  // failure AFTER the claim lost the event permanently: the 500 asked the
+  // gateway to retry, and the retry hit ON CONFLICT and was answered
+  // "duplicate" without ever applying anything. The studio's message simply
+  // never reached delivered, and no error anywhere said why.
+  //
+  // Production had four sent WhatsApp messages, six delivery receipts and zero
+  // delivered_at. The receipts were historical — the applying code was not yet
+  // deployed when they arrived, and the join is sound today — but the hole that
+  // would have swallowed them silently is real, and this is it.
+
+  it('runs the claim and the work in ONE transaction', async () => {
+    pool.__txn.length = 0;
+    await post(makeEvent());
+    // BEGIN before the claim, COMMIT after the work. Not two autocommits.
+    expect(pool.__txn[0]).toBe('BEGIN');
+    expect(pool.__txn).toContain('COMMIT');
+    expect(pool.__txn).not.toContain('ROLLBACK');
+  });
+
+  it('rolls the claim BACK when applying the event fails', async () => {
+    pool.__txn.length = 0;
+    pool.query
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })              // claim taken
+      .mockRejectedValueOnce(new Error('deadlock detected'));         // the work fails
+
+    const res = await post(makeEvent());
+
+    // 500 asks the gateway to retry — and the rollback is what makes that
+    // honest, because the retry now finds no claim and applies for real.
+    expect(res.status).toBe(500);
+    expect(pool.__txn).toContain('ROLLBACK');
+    expect(pool.__txn).not.toContain('COMMIT');
+  });
+
+  it('releases the connection even when the work throws', async () => {
+    // A leaked client per failed webhook exhausts the pool, and the gateway
+    // retries on failure — so the leak compounds exactly when it hurts most.
+    pool.__client.release.mockClear();
+    pool.query
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockRejectedValueOnce(new Error('boom'));
+
+    await post(makeEvent());
+    expect(pool.__client.release).toHaveBeenCalled();
+  });
+
+  it('does not hold a transaction open for a duplicate', async () => {
+    pool.__txn.length = 0;
+    pool.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    await post(makeEvent());
+    expect(pool.__txn).toContain('ROLLBACK');
+    expect(pool.__txn).not.toContain('COMMIT');
   });
 
   it('claims atomically with ON CONFLICT rather than select-then-insert', async () => {

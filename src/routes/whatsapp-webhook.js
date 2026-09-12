@@ -94,7 +94,7 @@ const STATUS_FOR_EVENT = {
  * Every statement is bound to `tenant_id` from the signed envelope, so an
  * event naming another studio's message id updates nothing.
  */
-async function applyMessageEvent(eventType, payload, tenantId, occurredAt) {
+async function applyMessageEvent(eventType, payload, tenantId, occurredAt, client) {
   const repo = require('../modules/automation/automation.repository');
   const kind = eventType.slice('whatsapp.message.'.length);
 
@@ -105,14 +105,15 @@ async function applyMessageEvent(eventType, payload, tenantId, occurredAt) {
       tenantId,
       externalId,
       kind,
-      payload.delivered_at || payload.read_at || occurredAt || null
+      payload.delivered_at || payload.read_at || occurredAt || null,
+      { client }
     );
   }
 
   if (kind === 'failed') {
     const logId = payload.client_message_id;
     if (!logId) return 0;
-    return repo.markFailedByClientId(tenantId, logId, payload.reason_code || 'gateway_failed');
+    return repo.markFailedByClientId(tenantId, logId, payload.reason_code || 'gateway_failed', { client });
   }
 
   // `sent` is deliberately inert. The worker already recorded the send
@@ -182,13 +183,36 @@ router.post('/', async (req, res) => {
     operation: 'whatsapp.webhook',
   });
 
+  // ── One transaction for the claim AND the work it authorises ──────────────
+  //
+  // These used to be two autocommitted statements, and the claim went first.
+  // That made the ledger a record of "an event arrived", not of "an event was
+  // applied" — so any failure AFTER the claim lost the event permanently:
+  //
+  //   1. INSERT the claim            → committed immediately
+  //   2. apply the event             → throws (a deadlock, a blip, anything)
+  //   3. answer 500                  → the gateway dutifully retries
+  //   4. the retry hits ON CONFLICT  → "duplicate", returns without applying
+  //
+  // The comment on the catch below promised that a database blip "delays the
+  // update rather than losing it". The opposite was true, and nothing would
+  // have said so: the studio simply never sees that message reach delivered.
+  //
+  // Sharing one transaction makes the claim conditional on the work. A failure
+  // rolls both back, so the gateway's retry finds no claim and genuinely
+  // re-applies. A duplicate is still answered 2xx and still does nothing.
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
     // ── Idempotency ─────────────────────────────────────────────────────────
     //
     // The INSERT is the claim. ON CONFLICT DO NOTHING with a checked rowCount
     // is atomic; a SELECT-then-INSERT would let two concurrent redeliveries
     // both see "not present" and both apply the update.
-    const claim = await pool.query(
+    //
+    // Two concurrent redeliveries still serialise here: the loser blocks on
+    // the winner's uncommitted row and sees rowCount 0 once it commits.
+    const claim = await client.query(
       `INSERT INTO whatsapp_webhook_events (event_id, event_type, organization_id, instance_id, occurred_at)
        VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, NOW()))
        ON CONFLICT (event_id) DO NOTHING`,
@@ -198,6 +222,7 @@ router.post('/', async (req, res) => {
     if (claim.rowCount === 0) {
       // A duplicate IS success from the sender's point of view — answering
       // non-2xx would make the gateway retry it forever.
+      await client.query('ROLLBACK');
       log.info({ status: 'ok', duplicate: true }, 'whatsapp_webhook_duplicate');
       return res.json({ received: true, duplicate: true });
     }
@@ -210,7 +235,8 @@ router.post('/', async (req, res) => {
     // 'delivered'/'read' status values have been waiting for since migration
     // 012 — until now nothing wrote them, because nothing sent anything.
     if (event_type.startsWith('whatsapp.message.')) {
-      const applied = await applyMessageEvent(event_type, event.payload || {}, tenant_id, occurred_at);
+      const applied = await applyMessageEvent(event_type, event.payload || {}, tenant_id, occurred_at, client);
+      await client.query('COMMIT');
       log.info({ status: 'ok', applied }, 'whatsapp_webhook_message_event');
       return res.json({ received: true });
     }
@@ -220,6 +246,7 @@ router.post('/', async (req, res) => {
       // Acknowledged and ignored. The gateway may ship a new event type before
       // this deploy does, and retrying something we will never understand
       // only fills the dead-letter list.
+      await client.query('COMMIT');
       log.info({ status: 'ok', applied: false }, 'whatsapp_webhook_unknown_type');
       return res.json({ received: true });
     }
@@ -238,7 +265,7 @@ router.post('/', async (req, res) => {
     // gateway's, and the gateway is trusted here (it holds the signing secret),
     // but scoping costs nothing and means a gateway bug cannot rewrite another
     // studio's row.
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE whatsapp_instances
           SET status          = $3,
               phone_e164      = COALESCE($4, phone_e164),
@@ -262,6 +289,11 @@ router.post('/', async (req, res) => {
         occurred_at || null,
       ]
     );
+
+    // Committed BEFORE the re-drive below. That enqueues real sends to real
+    // people, and a transaction that later rolled back would have it acting on
+    // a reconnection the database never recorded.
+    await client.query('COMMIT');
 
     log.info(
       { status: 'ok', applied: result.rowCount > 0, new_status: status },
@@ -302,10 +334,21 @@ router.post('/', async (req, res) => {
     // a correct outcome, not a failure to retry.
     return res.json({ received: true, applied: result.rowCount > 0 });
   } catch (err) {
+    // Roll the claim back with the work. This is what makes the 500 below
+    // honest: the gateway retries, finds no claim, and applies the event for
+    // real. Before the two shared a transaction the claim survived and the
+    // retry was answered "duplicate", so the event was lost for good.
+    //
+    // A failed ROLLBACK is swallowed — the connection is being released either
+    // way, and masking the original error with a teardown error would hide the
+    // reason this request failed.
+    await client.query('ROLLBACK').catch(() => {});
     // 500 so the gateway retries. Its outbox is durable and bounded, so a
-    // database blip delays the update rather than losing it.
+    // database blip now delays the update rather than losing it.
     log.error({ status: 'error', err: err.message }, 'whatsapp_webhook_failed');
     return res.status(500).json({ error: 'Webhook processing failed' });
+  } finally {
+    client.release();
   }
 });
 

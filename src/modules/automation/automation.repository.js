@@ -525,9 +525,9 @@ async function markFailed(orgId, logId, { reason, provider }) {
  * independently of the status for the same reason: delivered_at is a fact
  * about the message even when the row has already moved past it.
  */
-async function applyReceipt(orgId, externalId, kind, occurredAt) {
+async function applyReceipt(orgId, externalId, kind, occurredAt, { client = pool } = {}) {
   const at = occurredAt || new Date().toISOString();
-  const { rowCount } = await pool.query(
+  const { rowCount } = await client.query(
     `UPDATE communication_logs
         SET status = CASE
               WHEN $3 = 'read' THEN 'read'
@@ -546,8 +546,8 @@ async function applyReceipt(orgId, externalId, kind, occurredAt) {
 }
 
 /** A gateway-reported send failure, matched on the id the ERP chose. */
-async function markFailedByClientId(orgId, logId, reason) {
-  const { rowCount } = await pool.query(
+async function markFailedByClientId(orgId, logId, reason, { client = pool } = {}) {
+  const { rowCount } = await client.query(
     `UPDATE communication_logs
         SET status = 'failed', failure_reason = $3
       WHERE id = $1 AND organization_id = $2 AND status <> 'delivered' AND status <> 'read'`,
