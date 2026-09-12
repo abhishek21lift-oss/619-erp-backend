@@ -204,3 +204,81 @@ describe('the event is raised outside the transaction that owns the payment', ()
       .toEqual({ file, raisingInsideAnOpenTransaction: 0 });
   });
 });
+
+describe('the event key is a payment identity, not a clock reading', () => {
+  // ── Two bugs that shared one cause ────────────────────────────────────────
+  //
+  // Two of the six payment call sites keyed their event on a composite —
+  //
+  //   `renewal:${clientId}:${amount}:${new Date().toISOString().slice(0, 10)}`
+  //
+  // — because "the payment row carries no id we can read back here". That was
+  // true only for as long as the INSERT above it declined to RETURN one, and
+  // it cost two separate silent message losses in production:
+  //
+  //   1. Two genuinely different payments of the same amount from one client
+  //      on one day produce the SAME key. The second is refused by the dedupe
+  //      index as a duplicate of the first, so that client is never told their
+  //      money arrived. No failed row, no queued row — the dedupe index did
+  //      exactly what it was built to do, to an event that was not a replay.
+  //
+  //   2. `new Date()` is the Node process, and it reports UTC. A studio in IST
+  //      taking a payment at any time between midnight and 05:30 gets the
+  //      PREVIOUS day's date in the key — so a payment late one evening and
+  //      another early the next morning collide, and the second client hears
+  //      nothing. automation.sweep.js documents this exact trap at length and
+  //      keeps every date in SQL because of it; these two call sites were the
+  //      last places still reaching for the JS clock.
+  //
+  // A payment id has neither problem: unique per payment, stable across a
+  // retried request, and carrying no clock at all.
+
+  const CALL_SITES = [
+    'src/modules/pt-os/pt-os.routes.js',
+    'src/routes/payments.js',
+    'src/routes/invoices.js',
+    'src/lib/upiPayments.js',
+  ];
+
+  /** The `eventKey:` argument of every payment event raised in a file. */
+  const eventKeysIn = (file) => {
+    const code = stripComments(fs.readFileSync(path.join(SRC, '..', file), 'utf8'));
+    return code
+      .split(RAISES_EVENT)
+      .slice(1)
+      .map((chunk) => chunk.match(/eventKey:\s*([^\n,]+)/))
+      .filter(Boolean)
+      .map((m) => m[1].trim());
+  };
+
+  it.each(CALL_SITES.map((f) => [f]))('%s builds no event key from the JS clock', (file) => {
+    for (const key of eventKeysIn(file)) {
+      // `new Date()`, `Date.now()`, `toISOString()` — any of them makes the key
+      // depend on the Node process's idea of the day rather than on the
+      // payment. The database is the only clock this system agrees on.
+      expect({ file, key }).toEqual({ file, key: expect.not.stringMatching(/new Date|Date\.now|toISOString/) });
+    }
+  });
+
+  it.each(CALL_SITES.map((f) => [f]))('%s keys every payment event on an id', (file) => {
+    for (const key of eventKeysIn(file)) {
+      // Either a bare identifier (`id`, `ptPaymentId`, `rows[0].id`,
+      // `paid[0].id`) or a template whose only interpolation is one — never a
+      // composite of attributes that two different payments can share.
+      expect({ file, key }).toEqual({
+        file,
+        key: expect.stringMatching(/^(?:[A-Za-z_$][\w$.[\]]*|`[^`]*\$\{[^}]+\}`)$/),
+      });
+      expect({ file, key }).toEqual({ file, key: expect.not.stringMatching(/\}:\$\{/) });
+    }
+  });
+
+  it('every payment call site was actually examined', () => {
+    // A regex that quietly matches nothing would pass both guards above
+    // without reading a line of the thing it claims to check. Six call sites
+    // exist across the four files; this fails if that stops being true rather
+    // than silently narrowing.
+    const total = CALL_SITES.reduce((n, f) => n + eventKeysIn(f).length, 0);
+    expect(total).toBe(6);
+  });
+});

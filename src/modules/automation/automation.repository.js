@@ -508,6 +508,30 @@ async function markFailed(orgId, logId, { reason, provider }) {
 }
 
 /**
+ * Record why an attempt failed, WITHOUT moving the row off 'queued'.
+ *
+ * The worker calls this between attempts. The distinction from markFailed is
+ * the whole point: 'queued' is what makes the next attempt re-send, because
+ * processAutomationJob refuses to send a row whose status has already moved.
+ * Marking the row failed on the first attempt is what silently disabled the
+ * retry budget — see the comment there.
+ *
+ * Bound to `status = 'queued'` so it cannot pull a row backwards: if a receipt
+ * or a concurrent send moved the row on while this attempt was in flight, the
+ * write does nothing rather than stamping a failure reason on a message the
+ * client has already received.
+ */
+async function noteAttemptFailure(orgId, logId, reason) {
+  const { rowCount } = await pool.query(
+    `UPDATE communication_logs
+        SET failure_reason = $3
+      WHERE id = $1 AND organization_id = $2 AND status = 'queued'`,
+    [logId, orgId, reason || null]
+  );
+  return rowCount;
+}
+
+/**
  * Apply a delivery receipt from the gateway, matched on the provider's id.
  *
  * ── Why this is org-scoped when external_id is globally unique ──────────────
@@ -541,6 +565,38 @@ async function applyReceipt(orgId, externalId, kind, occurredAt, { client = pool
             read_at = CASE WHEN $3 = 'read' THEN COALESCE(read_at, $4::timestamptz) ELSE read_at END
       WHERE external_id = $1 AND organization_id = $2`,
     [externalId, orgId, kind, at]
+  );
+  return rowCount;
+}
+
+/**
+ * Stamp a claimed webhook event with what it referred to and what it changed.
+ *
+ * ── The production question this answers ────────────────────────────────────
+ *
+ * `whatsapp_webhook_events` recorded that an event arrived and nothing else,
+ * which left one measurement unreadable: 6 `whatsapp.message.delivered` events
+ * received, verified, claimed and answered 200 — and 0 communication_logs rows
+ * with delivered_at set. Either those receipts were the studio's own hand-sent
+ * messages (the gateway forwards a receipt for every message the account sent,
+ * and `fromMe` is true for one the trainer typed on their phone), in which
+ * case they correctly matched nothing — or the provider id on a receipt does
+ * not match the external_id recorded at send time, and every delivery receipt
+ * this product will ever receive is being discarded. The ledger could not tell
+ * the two apart, so neither could anyone else.
+ *
+ * `applied_rows = 0` is therefore a real and wanted value, not a missing one.
+ *
+ * Takes the caller's transaction client: the outcome has to commit with the
+ * work it describes, or the ledger could claim an event applied a row that was
+ * rolled back.
+ */
+async function recordEventOutcome(eventId, subject, applied, { client = pool } = {}) {
+  const { rowCount } = await client.query(
+    `UPDATE whatsapp_webhook_events
+        SET subject_key = COALESCE($2, subject_key), applied_rows = $3
+      WHERE event_id = $1`,
+    [eventId, subject || null, Number.isFinite(applied) ? applied : null]
   );
   return rowCount;
 }
@@ -1020,8 +1076,10 @@ module.exports = {
   loadQueued,
   markSent,
   markFailed,
+  noteAttemptFailure,
   applyReceipt,
   markFailedByClientId,
+  recordEventOutcome,
   orphanCandidates,
   reconnectCandidates,
   requeueFailed,

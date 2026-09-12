@@ -406,6 +406,143 @@ describe('applying events', () => {
 // whatsapp_instances, and they are the reason that table has separate
 // delivered_at and read_at columns — which, until the automation engine
 // existed, nothing had ever written.
+describe('what the ledger records about an event', () => {
+  // ── The production question this exists to answer ─────────────────────────
+  //
+  // Measured on the live database: 6 `whatsapp.message.delivered` events
+  // received, verified, claimed and answered 200 — and 0 communication_logs
+  // rows with delivered_at set. Two completely different explanations, and the
+  // ledger could not separate them.
+  //
+  // Either those receipts were the studio's OWN hand-sent messages (the
+  // gateway forwards a receipt for every message the account sent, and
+  // `fromMe` is true for one the trainer typed on their phone), in which case
+  // they correctly matched nothing. Or the provider id on a receipt does not
+  // match the external_id recorded at send time, and every delivery receipt
+  // this product will ever receive is being silently discarded.
+  //
+  // The first is fine. The second means the delivery-state UI never populates.
+  // Telling them apart needed the id the event carried and the number of rows
+  // it changed, stored next to the claim that proves it was not a replay.
+
+  const ledgerWrites = () =>
+    pool.query.mock.calls
+      .filter(([sql]) => /UPDATE whatsapp_webhook_events/.test(sql))
+      .map(([sql, params]) => ({ sql: sql.replace(/\s+/g, ' ').trim(), params }));
+
+  test('a receipt that matched nothing is recorded as matching nothing', async () => {
+    // applied_rows = 0 is the whole point. It is a real outcome, not an
+    // absence of one, and it must survive log retention.
+    pool.query.mockImplementation(async (sql) => {
+      if (/UPDATE communication_logs/.test(sql)) return { rowCount: 0, rows: [] };
+      return { rowCount: 1, rows: [] };
+    });
+
+    const res = await post(makeEvent({
+      event_type: 'whatsapp.message.delivered',
+      payload: { provider_message_id: 'WAMSG-NOBODY' },
+    }));
+
+    expect(res.status).toBe(200);
+    const [write] = ledgerWrites();
+    expect(write.params[1]).toBe('WAMSG-NOBODY');
+    expect(write.params[2]).toBe(0);
+  });
+
+  test('a receipt that landed records the row it changed', async () => {
+    const res = await post(makeEvent({
+      event_type: 'whatsapp.message.read',
+      payload: { provider_message_id: 'WAMSG1' },
+    }));
+
+    expect(res.status).toBe(200);
+    expect(ledgerWrites()[0].params).toEqual([expect.any(String), 'WAMSG1', 1]);
+  });
+
+  test('an inert sent event still records WHICH message it was about', async () => {
+    // `sent` changes nothing by design. Recording its provider id anyway is
+    // what makes a later unmatched receipt diagnosable: the id the gateway
+    // sent under, and the id a receipt came looking for, in two rows of one
+    // table.
+    await post(makeEvent({
+      event_type: 'whatsapp.message.sent',
+      payload: { client_message_id: 'log-1', provider_message_id: 'WAMSG1' },
+    }));
+
+    const [write] = ledgerWrites();
+    expect(write.params[1]).toBe('WAMSG1');
+    expect(write.params[2]).toBe(0);
+  });
+
+  test('the outcome commits with the work it describes, in the same transaction', async () => {
+    // Written through the transaction client, not the pool. Otherwise the
+    // ledger could claim an event applied a row that was rolled back.
+    pool.__txn.length = 0;
+    pool.__client.query.mockClear();
+
+    await post(makeEvent({
+      event_type: 'whatsapp.message.delivered',
+      payload: { provider_message_id: 'WAMSG1' },
+    }));
+
+    const onClient = pool.__client.query.mock.calls
+      .filter(([sql]) => typeof sql === 'string' && /UPDATE whatsapp_webhook_events/.test(sql));
+    expect(onClient).toHaveLength(1);
+    expect(pool.__txn).toContain('COMMIT');
+  });
+
+  test('a connection event records the instance and whether it was superseded', async () => {
+    // An out-of-order event that lost the last_event_at guard applies 0 rows.
+    // That is the same "genuine but changed nothing" outcome a stray receipt
+    // has, and it is worth the same record.
+    pool.query.mockImplementation(async (sql) => {
+      if (/UPDATE whatsapp_instances/.test(sql)) return { rowCount: 0, rows: [] };
+      return { rowCount: 1, rows: [] };
+    });
+
+    await post(makeEvent());
+
+    const [write] = ledgerWrites();
+    expect(write.params[1]).toBe(INSTANCE);
+    expect(write.params[2]).toBe(0);
+  });
+
+  test('a failure to record the outcome never fails the webhook', async () => {
+    // This is observability. A webhook that answered 500 because it could not
+    // write a diagnostic column would ask the gateway to redeliver an event it
+    // had already applied — turning the thing meant to explain a problem into
+    // one.
+    pool.query.mockImplementation(async (sql) => {
+      if (/UPDATE whatsapp_webhook_events/.test(sql)) throw new Error('column does not exist');
+      return { rowCount: 1, rows: [] };
+    });
+
+    const res = await post(makeEvent({
+      event_type: 'whatsapp.message.delivered',
+      payload: { provider_message_id: 'WAMSG1' },
+    }));
+
+    expect(res.status).toBe(200);
+  });
+
+  test('a duplicate writes no outcome at all', async () => {
+    // It did no work, so it has no outcome — and overwriting the original
+    // event's applied_rows with a replay's zero would erase the answer.
+    pool.query.mockImplementation(async (sql) => {
+      if (/INSERT INTO whatsapp_webhook_events/.test(sql)) return { rowCount: 0, rows: [] };
+      return { rowCount: 1, rows: [] };
+    });
+
+    const res = await post(makeEvent({
+      event_type: 'whatsapp.message.delivered',
+      payload: { provider_message_id: 'WAMSG1' },
+    }));
+
+    expect(res.body).toMatchObject({ duplicate: true });
+    expect(ledgerWrites()).toHaveLength(0);
+  });
+});
+
 describe('delivery receipts', () => {
   /** Every UPDATE communication_logs this request issued. */
   const logUpdates = () =>

@@ -62,6 +62,25 @@ async function enqueueWhatsapp(type, data = {}, opts = {}) {
 }
 
 /**
+ * Will BullMQ run this job again if the processor throws?
+ *
+ * Mirrors BullMQ's own predicate (`Job.shouldRetryJob`: attemptsMade + 1 <
+ * opts.attempts), evaluated against the same values, so the two cannot
+ * disagree about whether another attempt is coming. `attemptsMade` counts
+ * attempts that have already FINISHED — it is 0 during the first run and is
+ * incremented after the processor returns or throws.
+ *
+ * Deliberately conservative on missing data: a job with no opts is treated as
+ * single-attempt, so an unknown shape marks the row failed rather than leaving
+ * it queued forever waiting for a retry that is not coming.
+ */
+function willRetry(job) {
+  const attempts = Number(job?.opts?.attempts);
+  if (!Number.isFinite(attempts)) return false;
+  return Number(job?.attemptsMade || 0) + 1 < attempts;
+}
+
+/**
  * Deliver one queued automated message.
  *
  * ── Everything is re-checked here, and none of it is redundant ─────────────
@@ -142,20 +161,49 @@ async function processAutomationJob(job) {
     return { status: 'sent', provider_id: result.provider_id, duplicate: Boolean(result.duplicate) };
   }
 
-  await repo.markFailed(orgId, logId, {
-    reason: result.error || result.status,
-    provider: result.provider,
-  });
+  const reason = result.error || result.status;
 
   // Throwing is what asks BullMQ to retry, so only genuinely transient
   // failures throw. A disconnected WhatsApp is not transient in any sense the
   // queue can help with — no number of retries reconnects a socket that only
   // the studio can restore by scanning a QR — so it ends the job and leaves a
   // failed row saying exactly that.
-  if (transport.isRetryable(result.status) && result.retryable !== false) {
-    throw new Error(result.error || 'whatsapp delivery failed');
+  const retryable = transport.isRetryable(result.status) && result.retryable !== false;
+
+  if (retryable && willRetry(job)) {
+    // ── Why the row is NOT marked failed here ─────────────────────────────
+    //
+    // It used to be, unconditionally, immediately above the throw — and that
+    // silently disabled the entire retry budget. The sequence was:
+    //
+    //   attempt 1  markFailed() → row is 'failed' → throw
+    //   attempt 2  loadQueued() → status is 'failed', not 'queued'
+    //              → return { skipped: 'already_failed' }
+    //   the job COMPLETES, and nothing ever sends the message
+    //
+    // So one transient blip — a gateway restart, a lost packet,
+    // GATEWAY_UNREACHABLE — dropped the studio's message permanently, and the
+    // three attempts and exponential backoff configured in jobs/queue.js
+    // never sent anything a second time. Worse, the job finished in the
+    // 'completed' state, so the failure was invisible to an operator reading
+    // the queue: the only trace was one log line and a communication_logs row
+    // reading 'failed' with no explanation of why nothing was retried.
+    //
+    // The row therefore stays 'queued' while attempts remain, which is the
+    // true statement — this message is still going out — and is what lets the
+    // next attempt actually re-send it. The reason is recorded without moving
+    // the status, so the studio sees what the last attempt hit while it is
+    // still in flight.
+    await repo.noteAttemptFailure(orgId, logId, reason);
+    throw new Error(reason || 'whatsapp delivery failed');
   }
-  return { status: 'failed', reason: result.error || result.status };
+
+  // Terminal for this message: either the failure is one no retry can fix, or
+  // this was the last attempt. Either way the row must stop saying 'queued' —
+  // a row left queued with no job behind it is a message the studio is waiting
+  // on that nothing will ever send.
+  await repo.markFailed(orgId, logId, { reason, provider: result.provider });
+  return { status: 'failed', reason };
 }
 
 /**
