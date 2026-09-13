@@ -25,6 +25,7 @@ jest.mock('../db/pool', () => ({ query: jest.fn() }));
 const pool = require('../db/pool');
 const {
   loadDigitalTwin, describeTwin, limitationsLine, adherenceInputs, screenPlanExercises,
+  resolveLandmarks,
 } = require('../modules/pt-os/client-context');
 const { buildConstraints } = require('../modules/pt-os/programming-rules');
 
@@ -46,12 +47,14 @@ const regions = (overrides = {}) => [
  * `rows` maps a table name to the rows that table should return; anything not
  * named answers empty, which is the production-normal case for most of these.
  */
-function mockPool({ client = CLIENT, tables = {} } = {}) {
+function mockPool({ client = CLIENT, tables = {}, landmarks = [] } = {}) {
   const seen = [];
   pool.query.mockReset();
   pool.query.mockImplementation((sql) => {
     seen.push(sql);
     if (/FROM pt_clients/.test(sql)) return Promise.resolve({ rows: client ? [client] : [] });
+    // The studio's weekly set ranges, resolved once per twin.
+    if (/FROM muscle_volume_landmarks/.test(sql)) return Promise.resolve({ rows: landmarks });
     for (const [table, rows] of Object.entries(tables)) {
       if (new RegExp(`FROM ${table}\\b`).test(sql)) return Promise.resolve({ rows });
     }
@@ -123,8 +126,8 @@ describe('the twin the generator is handed', () => {
     mockPool({
       tables: {
         workout_sets: [
-          { exercise_name: 'Barbell Squat', weight_kg: 60, reps: 8, rpe: null, rir: null, completed: true, session_date: '2026-09-01', muscle_group: 'Legs' },
-          { exercise_name: 'Barbell Squat', weight_kg: 60, reps: 8, rpe: null, rir: null, completed: false, session_date: '2026-09-01', muscle_group: 'Legs' },
+          { exercise_name: 'Barbell Squat', weight_kg: 60, reps: 8, rpe: null, rir: null, completed: true, session_date: '2026-09-01', target_muscle: 'Quadriceps' },
+          { exercise_name: 'Barbell Squat', weight_kg: 60, reps: 8, rpe: null, rir: null, completed: false, session_date: '2026-09-01', target_muscle: 'Quadriceps' },
         ],
       },
     });
@@ -133,14 +136,14 @@ describe('the twin the generator is handed', () => {
     expect(twin.history.totals.sets).toBe(1);
     expect(twin.history.totals.sets_not_completed).toBe(1);
     // Weekly volume rides on the same rows rather than a second query.
-    expect(twin.rules.volume.groups[0]).toMatchObject({ group: 'Legs', latest_sets: 1 });
+    expect(twin.rules.volume.muscles[0]).toMatchObject({ muscle: 'Quadriceps', latest_sets: 1 });
   });
 
   it('counts a set whose exercise was typed free-hand as unattributable', async () => {
     mockPool({
       tables: {
         workout_sets: [
-          { exercise_name: 'Bulgarian split squats', weight_kg: 15, reps: 10, completed: true, session_date: '2026-09-01', muscle_group: null },
+          { exercise_name: 'Bulgarian split squats', weight_kg: 15, reps: 10, completed: true, session_date: '2026-09-01', target_muscle: null },
         ],
       },
     });
@@ -237,7 +240,7 @@ describe('what the model is actually told', () => {
   it('forbids a progression claim the data cannot support', async () => {
     const text = describeTwin(await twinWith({
       workout_sets: [
-        { exercise_name: 'Barbell Squat', weight_kg: 60, reps: 8, completed: true, session_date: '2026-09-01', muscle_group: 'Legs' },
+        { exercise_name: 'Barbell Squat', weight_kg: 60, reps: 8, completed: true, session_date: '2026-09-01', target_muscle: 'Quadriceps' },
       ],
     }));
     // One session. The engine says so rather than letting the model guess.
@@ -377,3 +380,70 @@ describe('screening the exercises a plan actually named', () => {
     expect(sql).toMatch(/regexp_replace\(lower\(btrim\(name\)\), '\[\^a-z0-9\]\+', ' ', 'g'\) = ANY/);
   });
 });
+
+describe('the studio\'s own volume ranges', () => {
+  // The defect this replaced: programming-rules.js hardcoded weekly set ranges
+  // keyed on the coarse muscle_group, while muscle_volume_landmarks already
+  // held finer ones a trainer edits in analytics/LandmarkEditor. A studio that
+  // tuned its ranges saw them honoured on the analytics screen and silently
+  // ignored by the programming engine.
+
+  const rowsFor = (rows) => {
+    pool.query.mockReset();
+    pool.query.mockImplementation(() => Promise.resolve({ rows }));
+  };
+
+  it('asks for the studio\'s rows as well as the platform defaults', async () => {
+    rowsFor([]);
+    await resolveLandmarks('org-1');
+    const [sql, params] = pool.query.mock.calls[0];
+    const flat = String(sql).replace(/\s+/g, ' ');
+    // Without the org half of this predicate the query returns only the
+    // seeded defaults, and every studio override is invisible — which is
+    // exactly the bug being fixed.
+    expect(flat).toMatch(/organization_id IS NULL OR \(\$1::uuid IS NOT NULL AND organization_id = \$1\)/);
+    expect(params).toEqual(['org-1']);
+  });
+
+  it('lets the studio\'s row win over the platform default', async () => {
+    rowsFor([]);
+    await resolveLandmarks('org-1');
+    const flat = String(pool.query.mock.calls[0][0]).replace(/\s+/g, ' ');
+    // DISTINCT ON keeps the FIRST row per muscle, so the NULL organization —
+    // the shared default — has to sort last for "mine, else the shared one" to
+    // hold. NULLS FIRST silently reverses the precedence and the override
+    // never applies. The same ordering workout-log.routes.js has always used.
+    expect(flat).toMatch(/DISTINCT ON \(target_muscle\)/);
+    expect(flat).toMatch(/ORDER BY target_muscle, organization_id NULLS LAST/);
+  });
+
+  it('keys on the library\'s spelling, not the table\'s', async () => {
+    // The table stores "middle back"; exercises.target_muscle says
+    // "Middle Back", and the set rows carry the library's spelling. Keying on
+    // the raw value means every multi-word muscle silently loses its range.
+    rowsFor([
+      { target_muscle: 'middle back', mev_sets: 8, mrv_sets: 25 },
+      { target_muscle: 'chest', mev_sets: 8, mrv_sets: 22 },
+    ]);
+    const out = await resolveLandmarks('org-1');
+    expect([...out.keys()].sort()).toEqual(['Chest', 'Middle Back']);
+    expect(out.get('Middle Back')).toEqual({ mev_sets: 8, mrv_sets: 25 });
+  });
+
+  it('passes the resolved ranges into the twin\'s volume verdict', async () => {
+    mockPool({
+      tables: {
+        workout_sets: [
+          { exercise_name: 'Lat Pulldown', weight_kg: 40, reps: 10, completed: true, session_date: '2026-09-01', target_muscle: 'Lats' },
+        ],
+      },
+      landmarks: [{ target_muscle: 'lats', mev_sets: 10, mrv_sets: 25 }],
+    });
+    const twin = await loadDigitalTwin('cl-1', 'org-1');
+    // One set against a minimum of ten. The verdict exists only because the
+    // studio's range reached the engine.
+    expect(twin.rules.volume.below).toEqual(['Lats']);
+    expect(twin.rules.volume.muscles[0]).toMatchObject({ muscle: 'Lats', mev_sets: 10 });
+  });
+});
+

@@ -26,7 +26,7 @@
 const {
   buildConstraints, screenExercise, screenLibrary, volumeLandmarks,
   deloadTriggers, evaluate,
-  VERDICTS, REGIONS, LANDMARKS, MOBILITY_REGION_KEY, POSTURE_REGION,
+  VERDICTS, REGIONS, MOBILITY_REGION_KEY, POSTURE_REGION,
   PARQ_REGION, PARQ_REFERRAL, PARQ_UNLOCATED,
   WEEKS_OVER_MRV_FOR_DELOAD, LOW_READINESS,
 } = require('../modules/pt-os/programming-rules');
@@ -123,8 +123,22 @@ describe('the vocabulary the rules match on', () => {
       .toEqual(['Biceps']);
   });
 
-  it('has a landmark for every muscle group the library uses', () => {
-    expect(Object.keys(LANDMARKS).sort()).toEqual([...LIB_GROUPS].sort());
+  it('knows which of its muscle names also match a coarse muscle_group', () => {
+    // screenExercise matches a constraint's muscles against BOTH target_muscle
+    // and muscle_group, because the library populates them independently. Two
+    // names live in both vocabularies, so a shoulder or chest rule catches an
+    // exercise tagged only at group level as well. Pinned because the overlap
+    // is load-bearing and invisible from either list alone.
+    const used = new Set(Object.values(REGIONS).flatMap((r) => r.muscles));
+    expect(LIB_GROUPS.filter((g) => used.has(g)).sort()).toEqual(['Chest', 'Shoulders']);
+  });
+
+  it('states no volume ranges of its own', () => {
+    // They belong to muscle_volume_landmarks, which a studio edits in
+    // analytics. Hardcoding them here meant a gym that tuned its ranges saw
+    // them honoured on one screen and ignored by the engine.
+    expect(Object.keys(require('../modules/pt-os/programming-rules')))
+      .not.toContain('LANDMARKS');
   });
 });
 
@@ -382,61 +396,74 @@ describe('coverage', () => {
   });
 });
 
-describe('weekly volume against the landmarks', () => {
-  // LIVE. The best-logged client in production, joined to the library:
-  //   2026-W34  Arms 12, Chest 9, Shoulders 9, Core 9, unattributable 3
-  //   2026-W35  Legs 12, Arms 10, Shoulders 6, Back 3,  unattributable 3
+describe('weekly volume against the studio\'s own ranges', () => {
+  // LIVE. The best-logged client in production, joined to the library and
+  // keyed on target_muscle — the key the landmarks table and the analytics
+  // screen both use. The first version of this grouped on muscle_group, so
+  // quadriceps, hamstrings, glutes and calves shared one number.
   const live = [
-    { week: '2026-W34', groups: { Arms: 12, Chest: 9, Shoulders: 9, Core: 9 }, unattributable: 3 },
-    { week: '2026-W35', groups: { Legs: 12, Arms: 10, Shoulders: 6, Back: 3 }, unattributable: 3 },
+    { week: '2026-W34', muscles: { Triceps: 6, Biceps: 6, Chest: 9, Shoulders: 9, Abdominals: 9 }, unattributable: 3 },
+    { week: '2026-W35', muscles: { Quadriceps: 12, Biceps: 10, Shoulders: 6, Lats: 3 }, unattributable: 3 },
   ];
 
-  it('finds the real under-trained group', () => {
-    const out = volumeLandmarks(live);
-    // Back: 3 sets in the latest week against a minimum of 10. That is a real
-    // finding on real data, and it is the kind of thing a trainer writing from
-    // memory misses.
-    expect(out.under_mev).toContain('Back');
-    expect(out.groups.find((g) => g.group === 'Back')).toMatchObject({ latest_sets: 3, status: 'under_mev' });
+  /** The platform defaults, as production seeds them. */
+  const ranges = new Map([
+    ['Chest', { mev_sets: 8, mrv_sets: 22 }],
+    ['Lats', { mev_sets: 10, mrv_sets: 25 }],
+    ['Quadriceps', { mev_sets: 8, mrv_sets: 20 }],
+    ['Shoulders', { mev_sets: 8, mrv_sets: 26 }],
+    ['Biceps', { mev_sets: 8, mrv_sets: 26 }],
+    ['Triceps', { mev_sets: 6, mrv_sets: 24 }],
+    ['Abdominals', { mev_sets: 6, mrv_sets: 25 }],
+  ]);
+
+  it('measures against the range the studio set, not a constant', () => {
+    const out = volumeLandmarks(live, ranges);
+    // Lats: 3 sets in the latest week against a minimum of 10. A real finding
+    // on real data, measured against a number this gym can change.
+    expect(out.below).toContain('Lats');
+    expect(out.muscles.find((m) => m.muscle === 'Lats'))
+      .toMatchObject({ latest_sets: 3, mev_sets: 10, status: 'below' });
+    expect(out.basis).toContain("the studio's own weekly set ranges");
+  });
+
+  it('honours a studio override in place of the default', () => {
+    // A gym that decides 4 sets of lats is enough for this population gets
+    // that answer, rather than the engine insisting on the seeded 10.
+    const tuned = new Map(ranges).set('Lats', { mev_sets: 2, mrv_sets: 25 });
+    expect(volumeLandmarks(live, tuned).below).not.toContain('Lats');
   });
 
   it('reports the sets it could not attribute rather than dropping them', () => {
     // 29 of 408 completed production sets have no exercise_id and cannot be
-    // joined. A muscle group that looks untrained may just be the half of the
-    // log that would not join.
-    expect(volumeLandmarks(live).unattributable_sets).toBe(6);
+    // joined. A muscle that looks untrained may just be the part of the log
+    // that would not join.
+    expect(volumeLandmarks(live, ranges).unattributable_sets).toBe(6);
   });
 
-  it('separates a group trained too little from one never trained', () => {
-    const out = volumeLandmarks(live);
-    expect(out.under_mev).not.toContain('Legs');
-    expect(out.untrained).toEqual([]);
-    const oneGroup = volumeLandmarks([{ week: '2026-W35', groups: { Chest: 12 } }]);
-    // Never trained is a different conversation from under-trained, and may
-    // well be deliberate.
-    expect(oneGroup.under_mev).toEqual([]);
-    expect(oneGroup.untrained.sort()).toEqual(['Arms', 'Back', 'Core', 'Legs', 'Shoulders']);
-  });
-
-  it('refuses to judge cardio in sets', () => {
-    const out = volumeLandmarks([{ week: '2026-W35', groups: { Cardio: 2 } }]);
-    expect(LANDMARKS.Cardio).toBeNull();
-    expect(out.groups[0].status).toBeNull();
-    expect(out.under_mev).toEqual([]);
+  it('counts a muscle with no range rather than judging it', () => {
+    // Six of the library's eighteen target muscles have no row — Forearms,
+    // Neck, Adductors, Abductors, Lower Back, Cardiovascular. A default
+    // verdict would be a judgement nobody made, which is the same refusal
+    // the analytics screen makes.
+    const out = volumeLandmarks([{ week: '2026-W35', muscles: { Forearms: 2 } }], ranges);
+    expect(out.muscles[0]).toMatchObject({ muscle: 'Forearms', status: null, mev_sets: null });
+    expect(out.below).toEqual([]);
+    expect(out.unranged).toEqual(['Forearms']);
   });
 
   it('counts weeks over the ceiling only while they are still consecutive', () => {
     // An over-reaching week followed by a normal one is history, not a trigger.
     const spike = [
-      { week: '2026-W30', groups: { Chest: 30 } },
-      { week: '2026-W31', groups: { Chest: 12 } },
+      { week: '2026-W30', muscles: { Chest: 30 } },
+      { week: '2026-W31', muscles: { Chest: 12 } },
     ];
-    expect(volumeLandmarks(spike).groups[0].weeks_over_mrv).toBe(0);
+    expect(volumeLandmarks(spike, ranges).muscles[0].weeks_over_mrv).toBe(0);
     const sustained = [
-      { week: '2026-W30', groups: { Chest: 30 } },
-      { week: '2026-W31', groups: { Chest: 26 } },
+      { week: '2026-W30', muscles: { Chest: 30 } },
+      { week: '2026-W31', muscles: { Chest: 26 } },
     ];
-    expect(volumeLandmarks(sustained).groups[0].weeks_over_mrv).toBe(2);
+    expect(volumeLandmarks(sustained, ranges).muscles[0].weeks_over_mrv).toBe(2);
   });
 });
 
@@ -458,9 +485,9 @@ describe('deload triggers', () => {
 
   it('fires on sustained volume over the ceiling', () => {
     const volume = volumeLandmarks([
-      { week: '2026-W34', groups: { Chest: 30 } },
-      { week: '2026-W35', groups: { Chest: 26 } },
-    ]);
+      { week: '2026-W34', muscles: { Chest: 30 } },
+      { week: '2026-W35', muscles: { Chest: 26 } },
+    ], new Map([['Chest', { mev_sets: 8, mrv_sets: 22 }]]));
     const out = deloadTriggers({ history: noHistory, volume });
     expect(out.deload_indicated).toBe(true);
     expect(out.triggers[0]).toMatchObject({ trigger: 'volume_over_mrv' });
@@ -496,7 +523,8 @@ describe('the whole evaluation', () => {
       client: { workout_experience_level: 'intermediate' },
       equipment: ['Barbell', 'Bodyweight', 'Cable'],
       exercises: Object.values(LIB),
-      weeklyGroups: [{ week: '2026-W35', groups: { Legs: 12, Back: 3 }, unattributable: 3 }],
+      weeklySets: [{ week: '2026-W35', muscles: { Quadriceps: 12, Lats: 3 }, unattributable: 3 }],
+      landmarks: new Map([['Quadriceps', { mev_sets: 8, mrv_sets: 20 }], ['Lats', { mev_sets: 10, mrv_sets: 25 }]]),
     });
 
     expect(out.may_program).toBe(true);
@@ -510,7 +538,7 @@ describe('the whole evaluation', () => {
     expect(out.library.caution.map((e) => e.name)).toEqual(['Barbell Squat']);
     // The unlocated joint-problems caution reaches the trainer as text.
     expect(out.unlocated.map((c) => c.evidence)).toEqual(['joint_problems']);
-    expect(out.volume.under_mev).toEqual(['Back']);
+    expect(out.volume.below).toEqual(['Lats']);
     expect(out.coverage.sources_present).toEqual(['parq', 'mobility', 'posture']);
   });
 

@@ -51,11 +51,12 @@ const CLIENTS = [
   { id: 'b', name: 'Paying, silent', pt_start_date: ago(60), pt_end_date: ago(-30), last_session: ago(25) },
 ];
 
-function mockDb({ clients = CLIENTS, sets = [] } = {}) {
+function mockDb({ clients = CLIENTS, sets = [], landmarks = [] } = {}) {
   pool.query.mockReset();
   pool.query.mockImplementation((sql) => Promise.resolve({
     rows: /FROM pt_clients/.test(String(sql)) ? clients
-      : /FROM workout_sets/.test(String(sql)) ? sets : [],
+      : /FROM workout_sets/.test(String(sql)) ? sets
+        : /FROM muscle_volume_landmarks/.test(String(sql)) ? landmarks : [],
   }));
 }
 
@@ -76,13 +77,19 @@ describe('the sweep', () => {
     expect(data.clients_detail[0].signals[0].id).toBe('gone_quiet');
   });
 
-  it('costs two queries, not two per client', async () => {
+  it('costs three queries, not three per client', async () => {
     await request(app).get('/api/pt-os/signals');
     // Loading each client's context in turn would be ~10 queries each. For a
     // 34-client studio that is 340 round trips to render a dashboard.
-    expect(pool.query).toHaveBeenCalledTimes(2);
+    //
+    // Three, not two, since the volume ranges came from the studio's own
+    // muscle_volume_landmarks rather than a constant in the engine — and they
+    // are resolved ONCE for the sweep, not per client, because the ranges
+    // belong to the gym.
+    expect(pool.query).toHaveBeenCalledTimes(3);
     expect(sqls()[0]).toMatch(/FROM pt_clients/);
-    expect(sqls()[1]).toMatch(/FROM workout_sets/);
+    expect(sqls().some((q) => /FROM workout_sets/.test(q))).toBe(true);
+    expect(sqls().filter((q) => /FROM muscle_volume_landmarks/.test(q))).toHaveLength(1);
   });
 
   it('bounds the set pull rather than reading a whole history', async () => {
@@ -95,8 +102,9 @@ describe('the sweep', () => {
 describe('scoping', () => {
   it('scopes both queries to the studio independently', async () => {
     await request(app).get('/api/pt-os/signals');
-    // Neither query is trusted because the other was filtered.
-    for (const sql of sqls()) expect(sql).toMatch(/c\.organization_id = \$1/);
+    // Neither client-scoped query is trusted because the other was filtered.
+    const scoped = sqls().filter((q) => !/muscle_volume_landmarks/.test(q));
+    for (const sql of scoped) expect(sql).toMatch(/c\.organization_id = \$1/);
     for (const call of pool.query.mock.calls) expect(call[1][0]).toBe(ORG);
   });
 
@@ -105,8 +113,13 @@ describe('scoping', () => {
     await request(app).get('/api/pt-os/signals?trainer_id=tr-someone-else');
 
     // The same rule GET /clients uses. A signals sweep that showed more than
-    // the client list would be a way around it.
-    for (const call of pool.query.mock.calls) expect(call[1][1]).toBe('tr-1');
+    // the client list would be a way around it. The landmark query carries no
+    // trainer — the ranges are the studio's, and every trainer sees the same
+    // ones.
+    for (const [sql, params] of pool.query.mock.calls) {
+      if (/muscle_volume_landmarks/.test(String(sql))) continue;
+      expect(params[1]).toBe('tr-1');
+    }
   });
 
   it('lets an admin see the studio, or narrow to one trainer', async () => {
@@ -127,3 +140,43 @@ describe('scoping', () => {
     expect(pool.query).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('the studio\'s ranges reach the sweep', () => {
+  it('raises a volume signal measured against what this gym set', async () => {
+    mockDb({
+      clients: [CLIENTS[0]],
+      sets: [{
+        client_id: 'a', exercise_name: 'Lat Pulldown', weight_kg: 40, reps: 10,
+        completed: true, session_date: ago(2), target_muscle: 'Lats',
+      }],
+      landmarks: [{ target_muscle: 'lats', mev_sets: 10, mrv_sets: 25 }],
+    });
+
+    const res = await request(app).get('/api/pt-os/signals');
+    const client = res.body.data.clients_detail.find((c) => c.client_id === 'a');
+    const signal = client.signals.find((s) => s.id === 'undertrained');
+
+    // One set against this studio's minimum of ten. Before the fix the engine
+    // compared against its own hardcoded "Back: 10" and could not see a
+    // per-muscle range at all.
+    expect(signal).toBeTruthy();
+    expect(signal.evidence).toBe('Lats 1 sets vs 10 minimum');
+  });
+
+  it('says nothing about a muscle the studio has set no range for', async () => {
+    mockDb({
+      clients: [CLIENTS[0]],
+      sets: [{
+        client_id: 'a', exercise_name: 'Wrist Curl', weight_kg: 10, reps: 15,
+        completed: true, session_date: ago(2), target_muscle: 'Forearms',
+      }],
+      landmarks: [],
+    });
+
+    const res = await request(app).get('/api/pt-os/signals');
+    // Six of the library's eighteen target muscles have no row. A verdict on
+    // one would be a judgement nobody made.
+    expect(res.body.data.clients_with_signals).toBe(0);
+  });
+});
+
