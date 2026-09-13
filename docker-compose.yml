@@ -170,5 +170,52 @@ services:
     # membership row written.
     stop_grace_period: 30s
 
+# ── Container restart for the Command Center's recovery ladder ──────────────
+#
+# Rungs 4 and 5 (restart worker, restart API) are OFF until this is wired up.
+# The console shows them disabled with the reason attached rather than hiding
+# them, so nothing here is required to run the platform.
+#
+# Why a proxy and not the socket. Anything holding /var/run/docker.sock is root
+# on the host: the Docker API includes `containers/create` (any image, any
+# command, any bind mount) and `containers/{id}/exec`. Mounting the socket into
+# the API container to gain a restart button would trade a restart button for a
+# remote root shell. The proxy below exposes POST and nothing else, and the ERP
+# client (modules/command-center/container-recovery.js) can only construct
+# `POST /containers/{id}/restart` — two independent limits, in two files, one of
+# which is asserted by a test.
+#
+# To enable: uncomment the service, uncomment the container_name lines on api
+# and worker above so the names are stable rather than compose-generated, and
+# set DOCKER_PROXY_URL / CC_WORKER_CONTAINER / CC_API_CONTAINER in .env.
+#
+#  docker-socket-proxy:
+#    image: tecnativa/docker-socket-proxy:0.1.2
+#    restart: unless-stopped
+#    environment:
+#      # POST is what a restart needs. Everything else stays off, INCLUDING
+#      # the ones that look harmless: CONTAINERS=1 would allow listing and
+#      # inspecting every container on the host, and EXEC=1 or a writable
+#      # IMAGES would give away the box.
+#      POST: '1'
+#      CONTAINERS: '1'
+#      EXEC: '0'
+#      IMAGES: '0'
+#      VOLUMES: '0'
+#      NETWORKS: '0'
+#      INFO: '0'
+#      SERVICES: '0'
+#      SWARM: '0'
+#      SYSTEM: '0'
+#      TASKS: '0'
+#    volumes:
+#      # Read-only on the proxy side as well. The proxy is the only thing on
+#      # this host that ever sees the socket.
+#      - /var/run/docker.sock:/var/run/docker.sock:ro
+#    # Never published to the host. Only the api container needs to reach it,
+#    # and it does so over the compose network by service name.
+#    expose:
+#      - '2375'
+
 volumes:
   redis-data:
