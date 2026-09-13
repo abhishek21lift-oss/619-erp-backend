@@ -90,7 +90,16 @@ function distributed() {
   return redis.isConfigured() && redis.isReady();
 }
 
-function client() { return redis.getClient(); }
+/**
+ * The FAIL-FAST client, deliberately, not the shared one.
+ *
+ * Every primitive below is on a request path and every one of them is written
+ * to fall back when Redis errors. The shared client is configured for BullMQ —
+ * offline queue on, retries uncapped — so during an outage a command is queued
+ * rather than rejected and the fallback never runs; the request simply hangs.
+ * See lib/redis.js getFailFastClient().
+ */
+function client() { return redis.getFailFastClient(); }
 
 // ── Cooldowns ───────────────────────────────────────────────────────────────
 

@@ -1,5 +1,11 @@
 jest.mock('../db/pool', () => ({ query: jest.fn(), totalCount: 3, idleCount: 2, waitingCount: 0 }));
 jest.mock('../lib/fileStorage', () => ({ saveFile: jest.fn() }));
+const mockSnapshotCollect = jest.fn();
+jest.mock('../modules/command-center', () => ({
+  registerCollectors: jest.fn(),
+  snapshot: { collect: (...a) => mockSnapshotCollect(...a) },
+  registry: {},
+}));
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = { id: 'op-1', name: 'Owner', role: 'super_admin' }; next(); },
   adminOnly: (_req, _res, next) => next(),
@@ -165,16 +171,43 @@ describe('Audit Centre — GET /audit/export', () => {
 });
 
 describe('System Health — GET /system-health', () => {
-  it('reports the database up with a measured latency', async () => {
-    pool.query
-      .mockResolvedValueOnce({ rows: [{}] })                                              // SELECT 1
-      .mockResolvedValueOnce({ rows: [{ applied: 120, latest: '120_x.sql', applied_at: null }] })
-      .mockResolvedValueOnce({ rows: [{ bytes: '8068119' }] })
-      .mockResolvedValueOnce({ rows: [{ n: 2 }] });                                       // errors 24h
+  // ── /system-health is now a PROJECTION of the Command Center snapshot ────
+  //
+  // It used to run its own `SELECT 1`, read `_migrations` itself, call
+  // process.memoryUsage() itself and summarise the queues itself — duplicating
+  // four collectors with a different grading vocabulary (up/down vs the five
+  // states), so a database at 900ms with an exhausted pool was `up` here and
+  // `critical` on the card beside it. These tests therefore drive the snapshot
+  // rather than the pool: one probe, one grading, one answer.
+
+  it('reports the database up with a measured latency, from the card', async () => {
+    mockSnapshotCollect.mockResolvedValueOnce({
+      status: 'healthy',
+      observability: { total: 8, probed: 8, unavailable: 0, not_configured: 0, timed_out: 0, stale: 0, coverage: 1 },
+      degraded_reasons: [],
+      collected_at: new Date().toISOString(),
+      duration_ms: 12,
+      cards: {
+        database: {
+          name: 'database', status: 'healthy', reason: null, scope: 'platform',
+          data: {
+            latency_ms: 4, size_bytes: 8068119,
+            pool: { total: 3, idle: 2, waiting: 0 },
+            migrations: { applied: 120, latest: '120_x.sql', applied_at: null },
+          },
+        },
+        runtime: {
+          name: 'runtime', status: 'healthy', scope: 'process',
+          data: { uptime_seconds: 10, node_version: 'v22', memory: { rss_bytes: 1, heap_used_bytes: 2, heap_total_bytes: 3 } },
+        },
+      },
+    });
+    pool.query.mockResolvedValueOnce({ rows: [{ n: 2 }] });   // the 24h error count
 
     const res = await request(app()).get('/api/super-admin/system-health');
 
     expect(res.status).toBe(200);
+    expect(res.body.status).toBe('healthy');
     expect(res.body.database.status).toBe('up');
     expect(typeof res.body.database.latency_ms).toBe('number');
     expect(res.body.database.size_bytes).toBe(8068119);
@@ -185,12 +218,25 @@ describe('System Health — GET /system-health', () => {
 
   it('still answers 200 with status=down when the database is unreachable', async () => {
     // Health must render during an outage — that is exactly when it is opened.
-    pool.query.mockRejectedValue(new Error('ECONNREFUSED'));
+    mockSnapshotCollect.mockResolvedValueOnce({
+      status: 'critical',
+      observability: { total: 8, probed: 7, unavailable: 0, not_configured: 0, timed_out: 0, stale: 0, coverage: 0.88 },
+      degraded_reasons: [{ card: 'database', status: 'critical', scope: 'platform', reason: 'ECONNREFUSED' }],
+      collected_at: new Date().toISOString(), duration_ms: 9,
+      cards: {
+        database: { name: 'database', status: 'critical', reason: 'ECONNREFUSED', scope: 'platform', data: {} },
+      },
+    });
+    pool.query.mockRejectedValue(new Error('ECONNREFUSED'));   // the 24h count also fails
 
     const res = await request(app()).get('/api/super-admin/system-health');
 
     expect(res.status).toBe(200);
     expect(res.body.database.status).toBe('down');
     expect(res.body.database.error).toMatch(/ECONNREFUSED/);
+    // The two fields it never had: the canonical rollup the frontend reads,
+    // and how much of the platform this reading actually covers.
+    expect(res.body.status).toBe('critical');
+    expect(res.body.observability.coverage).toBe(0.88);
   });
 });

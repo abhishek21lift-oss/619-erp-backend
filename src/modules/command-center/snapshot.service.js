@@ -15,6 +15,7 @@
 'use strict';
 
 const registry = require('./registry');
+const contract = require('./telemetry-contract');
 
 /** name -> { at: epochMs, value: result } */
 const cache = new Map();
@@ -123,10 +124,26 @@ async function collect(opts = {}) {
     // and those are wildly different claims to put a green dot on.
     observability: observabilityOf(cards),
     degraded_reasons: degradedReasons(cards),
+    // ── A card that grades itself healthy but has lost fields ─────────────
+    //
+    // Present only when something is wrong, so the normal payload is
+    // unchanged. A collector whose payload has drifted away from what the
+    // console renders is the quietest failure in this system: the card stays
+    // green, the numbers render as em-dashes, and an em-dash is
+    // indistinguishable from a metric that is legitimately absent. Surfaced
+    // here so it reaches an operator rather than only a CI run.
+    ...(contractViolations(cards).length
+      ? { contract_violations: contractViolations(cards) }
+      : {}),
     collected_at: new Date().toISOString(),
     duration_ms: Date.now() - started,
     cards: byName,
   };
+}
+
+/** Cards claiming a reading whose payload has lost a field the console renders. */
+function contractViolations(cards) {
+  return cards.flatMap((c) => contract.violations(c));
 }
 
 /** How much of the platform this snapshot actually saw. */
@@ -187,5 +204,5 @@ function invalidate(name) {
 
 module.exports = {
   collect, invalidate, MAX_CONCURRENT_PROBES,
-  observabilityOf, degradedReasons, _mapBounded: mapBounded,
+  observabilityOf, degradedReasons, contractViolations, _mapBounded: mapBounded,
 };

@@ -21,6 +21,7 @@
 
 const { STATUS, result, unavailable, degraded } = require('../registry');
 const redis = require('../../../lib/redis');
+const { QUEUE_NAMES } = require('../../../jobs/queue');
 
 const NAME = 'queues';
 
@@ -71,13 +72,31 @@ async function collect() {
   const queues = [];
   const problems = [];
 
-  for (const [name, s] of Object.entries(stats || {})) {
+  // ── collectQueueStats returns an ARRAY ────────────────────────────────────
+  //
+  // It maps over QUEUE_NAMES and filters, so each element carries its own
+  // `.name`; there is no key to read. This used to be `Object.entries(stats)`,
+  // which on an array yields ["0", obj], ["1", obj] … — so every queue was
+  // named after its index.
+  //
+  // That was not cosmetic. Three things broke silently:
+  //
+  //   * The card listed queues called 0,1,2,3,4,5 and the problem strings read
+  //     `0: 12 jobs waiting`, naming nothing an operator could act on.
+  //   * CRITICAL_QUEUES.has(name) became has("0"), which is never true — so
+  //     membership-renewals has never once been graded harder than any other
+  //     queue, and the "one failed renewal is critical" rule had never fired.
+  //   * recovery.run looks its queue up by name and never found it, so its
+  //     verification had nothing to read.
+  //
+  // Found by driving the real endpoint against a real Redis; the unit tests
+  // could not see it because their double passed an object keyed by name,
+  // which is the shape the collector WANTED rather than the one it gets.
+  for (const s of Array.isArray(stats) ? stats : Object.values(stats || {})) {
     // queueHealth returns null for a queue it could not reach.
-    if (!s) {
-      queues.push({ name, reachable: false });
-      problems.push({ severity: STATUS.CRITICAL, text: `Queue "${name}" unreachable` });
-      continue;
-    }
+    if (!s) continue;
+    const name = s.name;
+    if (!name) continue;
 
     const waiting = s.waiting ?? 0;
     const failed = s.failed ?? 0;
@@ -117,6 +136,23 @@ async function collect() {
     if (s.paused) {
       problems.push({ severity: STATUS.WARNING, text: `${name}: paused` });
     }
+  }
+
+  // ── A queue that vanished is not a queue that is fine ────────────────────
+  //
+  // collectQueueStats() does `.filter(Boolean)`, so a queue it could not reach
+  // is ABSENT from the result rather than present-and-null. Left alone, that
+  // is the quietest failure available: the card renders five healthy queues
+  // instead of six and nothing anywhere says the sixth could not be read.
+  //
+  // The old code had a `if (!s)` branch for this, which could never fire —
+  // the filter upstream had already removed them. Comparing against the
+  // declared set is what actually detects it.
+  const seen = new Set(queues.map((q) => q.name));
+  for (const name of QUEUE_NAMES) {
+    if (seen.has(name)) continue;
+    queues.push({ name, reachable: false });
+    problems.push({ severity: STATUS.CRITICAL, text: `Queue "${name}" unreachable` });
   }
 
   const worst = problems.some((p) => p.severity === STATUS.CRITICAL)
