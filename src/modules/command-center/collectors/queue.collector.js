@@ -19,7 +19,7 @@
 //     harder than the other queues.
 'use strict';
 
-const { STATUS, result, unavailable } = require('../registry');
+const { STATUS, result, unavailable, degraded } = require('../registry');
 const redis = require('../../../lib/redis');
 
 const NAME = 'queues';
@@ -33,8 +33,35 @@ const FAILED_CRIT = Number(process.env.CC_QUEUE_FAILED_CRIT) || 25;
 const CRITICAL_QUEUES = new Set(['membership-renewals']);
 
 async function collect() {
+  const degradation = require('../redis-degradation');
+
+  // ── Three Redis states, three different cards ────────────────────────────
+  //
+  // These used to be one: `!isConfigured()` returned UNAVAILABLE and anything
+  // else fell through to a probe that would hang or throw. That collapsed the
+  // two cases an operator most needs told apart.
+  //
+  //   not configured  a deployment choice. EXPECTED, so it does not degrade
+  //                   the platform rollup — but it is still shown, with what
+  //                   it costs, because "no Redis" means renewals never run.
+  //   configured but  the real incident. The queues are not merely unreadable;
+  //   unreachable     each one has a DEFINED fallback and they are not the
+  //                   same fallback. DEGRADED, naming the mode per queue.
+  //   up              probe normally.
   if (!redis.isConfigured()) {
-    return unavailable(NAME, 'REDIS_URL is not set — queues run inline, nothing to drain');
+    const d = degradation.describe('not_configured');
+    return {
+      ...unavailable(NAME, d.headline, true),
+      data: { degradation: d },
+    };
+  }
+
+  if (!redis.isReady()) {
+    // Not CRITICAL: work is still happening for three of the five queues, and
+    // calling that an outage overstates it. Not UNAVAILABLE either: we know
+    // exactly what is going on, which is the opposite of unobservable.
+    const d = degradation.describe('down');
+    return degraded(NAME, d.headline, { degradation: d });
   }
 
   const { collectQueueStats, summarize } = require('../../../lib/queueHealth');

@@ -114,11 +114,70 @@ async function collect(opts = {}) {
   for (const c of cards) byName[c.name] = c;
 
   return {
-    status: registry.rollup(cards.map((c) => c.status)),
+    status: registry.rollup(cards),
+    // ── How much of the platform was actually measured ────────────────────
+    //
+    // The single most important field on this payload, and the one that was
+    // missing. A status line on its own cannot distinguish "I checked eight
+    // things and they are fine" from "I checked two things and they are fine",
+    // and those are wildly different claims to put a green dot on.
+    observability: observabilityOf(cards),
+    degraded_reasons: degradedReasons(cards),
     collected_at: new Date().toISOString(),
     duration_ms: Date.now() - started,
     cards: byName,
   };
+}
+
+/** How much of the platform this snapshot actually saw. */
+function observabilityOf(cards) {
+  const unexpected = cards.filter(
+    (c) => c.status === registry.STATUS.UNAVAILABLE && !c.expected,
+  );
+  const expected = cards.filter(
+    (c) => c.status === registry.STATUS.UNAVAILABLE && c.expected,
+  );
+  const timedOut = cards.filter((c) => c.status === registry.STATUS.TIMEOUT);
+  const stale = cards.filter((c) => c.cached === true);
+
+  const probed = cards.length - unexpected.length - expected.length - timedOut.length;
+  return {
+    total: cards.length,
+    /** Cards backed by a probe that actually answered this pass or is cached. */
+    probed,
+    /** Probes that could not run and SHOULD have: we are blind here. */
+    unavailable: unexpected.length,
+    /** Capabilities this deployment has deliberately not wired up. */
+    not_configured: expected.length,
+    timed_out: timedOut.length,
+    /** Served from the TTL cache rather than freshly probed. */
+    stale: stale.length,
+    /**
+     * The honest headline. 1.0 means every card was measured; anything less
+     * means the status above is a statement about part of the platform.
+     * `not_configured` is excluded from the denominator — a capability that
+     * does not exist here is not something we failed to see.
+     */
+    coverage: cards.length - expected.length === 0
+      ? 1
+      : Math.round((probed / (cards.length - expected.length)) * 100) / 100,
+  };
+}
+
+/** Why the rollup is not green, in words, before anyone opens a card. */
+function degradedReasons(cards) {
+  const out = [];
+  for (const c of cards) {
+    if (c.status === registry.STATUS.HEALTHY) continue;
+    if (c.status === registry.STATUS.UNAVAILABLE && c.expected) continue;
+    out.push({
+      card: c.name,
+      status: c.status,
+      scope: c.scope ?? registry.SCOPE.PLATFORM,
+      reason: c.reason ?? null,
+    });
+  }
+  return out;
 }
 
 /** Drop cached values so the next collect re-probes. */
@@ -126,4 +185,7 @@ function invalidate(name) {
   if (name) cache.delete(name); else cache.clear();
 }
 
-module.exports = { collect, invalidate, MAX_CONCURRENT_PROBES, _mapBounded: mapBounded };
+module.exports = {
+  collect, invalidate, MAX_CONCURRENT_PROBES,
+  observabilityOf, degradedReasons, _mapBounded: mapBounded,
+};

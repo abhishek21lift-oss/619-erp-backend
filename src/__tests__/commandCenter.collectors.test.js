@@ -102,19 +102,51 @@ describe('queue collector', () => {
   beforeEach(() => { jest.resetModules(); });
 
   function withQueues(stats) {
-    jest.doMock('../lib/redis', () => ({ isConfigured: () => true }));
+    jest.doMock('../lib/redis', () => ({ isConfigured: () => true, isReady: () => true }));
     jest.doMock('../lib/queueHealth', () => ({
       collectQueueStats: async () => stats,
       summarize: () => ({ status: 'ok' }),
     }));
   }
 
-  test('no Redis means UNAVAILABLE — inline sends are a supported mode', async () => {
-    jest.doMock('../lib/redis', () => ({ isConfigured: () => false }));
+  test('no Redis means UNAVAILABLE, and EXPECTED — a deployment choice', async () => {
+    jest.doMock('../lib/redis', () => ({ isConfigured: () => false, isReady: () => false }));
     const card = await load().collect();
 
     expect(card.status).toBe(STATUS.UNAVAILABLE);
+    // `expected` is what keeps a box that deliberately runs without Redis from
+    // reading amber forever. See registry.rollup().
+    expect(card.expected).toBe(true);
     expect(card.reason).toMatch(/inline/i);
+  });
+
+  test('no Redis still says what it COSTS, per queue', async () => {
+    // The folklore is "Redis is optional, producers fall back to inline". That
+    // is wrong in the way that matters: renewals do not fall back at all.
+    jest.doMock('../lib/redis', () => ({ isConfigured: () => false, isReady: () => false }));
+    const card = await load().collect();
+
+    const modes = Object.fromEntries(
+      card.data.degradation.queues.map((q) => [q.queue, q.mode]),
+    );
+    expect(modes.email).toBe('inline');
+    expect(modes.whatsapp).toBe('deferred');
+    expect(modes['membership-renewals']).toBe('stopped');
+    expect(card.reason).toMatch(/membership-renewals/);
+  });
+
+  test('Redis configured but UNREACHABLE is DEGRADED, not unavailable', async () => {
+    // The real incident, and the case that used to fall through to a probe
+    // that would hang. Work is still happening for three of five queues, so
+    // this is not an outage — and we know exactly what is going on, which is
+    // the opposite of unobservable.
+    jest.doMock('../lib/redis', () => ({ isConfigured: () => true, isReady: () => false }));
+    const card = await load().collect();
+
+    expect(card.status).toBe(STATUS.DEGRADED);
+    expect(card.reason).toMatch(/HAVE STOPPED/);
+    expect(card.reason).toMatch(/flush on recovery/);
+    expect(card.data.degradation.active).toBe(true);
   });
 
   test('drained queues are healthy', async () => {
