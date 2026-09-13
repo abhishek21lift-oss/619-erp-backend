@@ -526,6 +526,7 @@ router.post('/plans/from-generation', auth, adminManagerOrTrainer, async (req, r
     logger.info({
       generation_id: generationId, plan_id: out.plan_id,
       saved: out.saved, unresolved: out.unresolved.length,
+      assigned: out.assigned, other_active: out.other_active_assignments,
     }, 'workout_plan_saved_from_generation');
 
     // `unresolved` is part of the success payload, not an error. About one
@@ -540,6 +541,15 @@ router.post('/plans/from-generation', auth, adminManagerOrTrainer, async (req, r
       saved: out.saved,
       unresolved: out.unresolved,
       unknown_days: out.unknown_days,
+      // Whether it is LIVE, and what else is. A saved plan that is not
+      // assigned never reaches Today and no session can ever be attributed
+      // back to it — the bug acceptGeneration now fixes — so the answer is
+      // reported rather than assumed. `other_active_assignments` above zero
+      // means the session log can no longer auto-link this client to one
+      // plan, which is the trainer's to resolve, not ours.
+      assigned: out.assigned,
+      assignment_id: out.assignment_id,
+      other_active_assignments: out.other_active_assignments,
     });
   } catch (err) {
     next(err);

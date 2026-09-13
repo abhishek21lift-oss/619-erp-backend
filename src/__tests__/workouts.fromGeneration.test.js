@@ -19,11 +19,21 @@
 
 process.env.JWT_SECRET = 'test-secret-at-least-32-characters-long!!';
 
+// The pooled client's query and the pool's own share ONE implementation, so a
+// test can route every statement from one place — but they are recorded
+// separately as well. Without that, a write moved OUT of the transaction and
+// onto the pool is invisible: both land in the same call list, in the same
+// order, and every assertion about BEGIN/COMMIT still passes. That mutation
+// survived the first round of this suite.
 jest.mock('../db/pool', () => {
   const query = jest.fn();
   const release = jest.fn();
-  const client = { query, release };
-  return { query, connect: jest.fn(async () => client), __client: client };
+  const onClient = [];
+  const client = {
+    query: jest.fn((...args) => { onClient.push(String(args[0])); return query(...args); }),
+    release,
+  };
+  return { query, connect: jest.fn(async () => client), __client: client, __onClient: onClient };
 });
 
 let mockUser;
@@ -61,6 +71,7 @@ function mockDb({ generation = { id: 'gen-1', client_id: 'cl-1', proposed_plan: 
   library = LIBRARY, acceptRows = 1 } = {}) {
   pool.query.mockReset();
   pool.connect.mockClear();
+  pool.__onClient.length = 0;
   pool.query.mockImplementation((sql) => {
     const s = String(sql);
     if (/FROM ai_workout_generations/.test(s)) return Promise.resolve({ rows: generation ? [generation] : [] });
@@ -71,6 +82,8 @@ function mockDb({ generation = { id: 'gen-1', client_id: 'cl-1', proposed_plan: 
 }
 
 const sqls = () => pool.query.mock.calls.map(([s]) => String(s).replace(/\s+/g, ' '));
+/** Only the statements issued on the TRANSACTION's connection. */
+const txSqls = () => pool.__onClient.map((s) => s.replace(/\s+/g, ' '));
 const post = (body = { generation_id: 'gen-1' }) =>
   request(app).post('/api/workouts/plans/from-generation').send(body);
 
@@ -190,5 +203,104 @@ describe('what it refuses', () => {
     const res = await post({});
     expect(res.status).toBe(400);
     expect(pool.query).not.toHaveBeenCalled();
+  });
+});
+
+describe('the proposal has to actually reach the client', () => {
+  // ── The bug this describes ──────────────────────────────────────────────
+  //
+  // Accepting a proposal used to write a workout_plans row and stop. Nothing
+  // assigned it to anybody, and three things followed that nobody had noticed:
+  //
+  //   · Today lists clients by ACTIVE ASSIGNMENT whose plan prescribes the
+  //     weekday, so the programme the AI wrote could not be started from the
+  //     screen a trainer actually uses;
+  //   · workout_sessions.workout_assignment_id could never point at it;
+  //   · so no logged session could ever be attributed back to the proposal,
+  //     which made the outcome half of the loop structurally impossible
+  //     rather than merely unbuilt.
+  //
+  // Measured on production at the time: 6 recorded generations, 0 accepted,
+  // and 29 of 34 clients with no active assignment at all.
+
+  it('assigns the plan to the client, in the same transaction', async () => {
+    const res = await post();
+    const all = sqls();
+
+    expect(all.some((s) => /INSERT INTO workout_assignments/.test(s))).toBe(true);
+    expect(res.body.assigned).toBe(true);
+    expect(res.body.assignment_id).toEqual(expect.any(String));
+
+    // On the TRANSACTION's own connection, between BEGIN and COMMIT. Asserting
+    // the position in the combined call list is not enough on its own: a write
+    // moved onto the pool appears in exactly the same place there, so it would
+    // still read as transactional while rolling back would leave it behind.
+    const tx = txSqls();
+    const assignAt = tx.findIndex((s) => /INSERT INTO workout_assignments/.test(s));
+    expect(assignAt).toBeGreaterThan(-1);
+    expect(tx.indexOf('BEGIN')).toBeLessThan(assignAt);
+    expect(assignAt).toBeLessThan(tx.indexOf('COMMIT'));
+    // And the plan a rollback would have to take with it.
+    expect(tx.some((s) => /INSERT INTO workout_plans/.test(s))).toBe(true);
+  });
+
+  it('takes the trainer from the client record rather than the caller', async () => {
+    await post();
+    const assign = sqls().find((s) => /INSERT INTO workout_assignments/.test(s));
+    expect(assign).toMatch(/SELECT trainer_id FROM pt_clients/);
+  });
+
+  it('adds an assignment and retires nothing', async () => {
+    await post();
+    const all = sqls();
+    // The engine never overwrites a programme a trainer chose. Anything that
+    // completed or cancelled the client's existing assignments would be this
+    // system deciding for them.
+    expect(all.some((s) => /UPDATE workout_assignments/.test(s))).toBe(false);
+    expect(all.some((s) => /DELETE FROM workout_assignments/.test(s))).toBe(false);
+  });
+
+  it('tells the trainer what else the client is already on', async () => {
+    // Above zero, the session log can no longer auto-link this client to one
+    // plan — it links only when there is exactly one active assignment — so
+    // attribution becomes theirs to make by hand. They are told, not guessed for.
+    pool.query.mockImplementation((sql) => {
+      const s = String(sql);
+      if (/FROM ai_workout_generations/.test(s)) {
+        return Promise.resolve({ rows: [{ id: 'gen-1', client_id: 'cl-1', proposed_plan: PROPOSED, accepted_plan_id: null }] });
+      }
+      if (/FROM exercises/.test(s)) return Promise.resolve({ rows: LIBRARY });
+      if (/UPDATE ai_workout_generations/.test(s)) return Promise.resolve({ rowCount: 1, rows: [] });
+      if (/COUNT\(\*\)::int AS n/.test(s)) return Promise.resolve({ rows: [{ n: 4 }] });
+      return Promise.resolve({ rows: [], rowCount: 1 });
+    });
+
+    const res = await post();
+    expect(res.body.other_active_assignments).toBe(4);
+  });
+
+  it('excludes the assignment it just made from that count', async () => {
+    await post();
+    const count = sqls().find((s) => /COUNT\(\*\)::int AS n/.test(s));
+    expect(count).toMatch(/status = 'active'/);
+    expect(count).toMatch(/id <> \$2/);
+  });
+
+  it('writes no assignment when the save fails', async () => {
+    // A caller with no organization never reaches the assignment at all: the
+    // exercise lookup refuses an org-less request outright (see
+    // lookupExercisesByName), so nothing resolves and the save is rejected
+    // before the transaction opens. acceptGeneration still guards on orgId —
+    // it is exported and other callers could reach it — but through this route
+    // that guard is unreachable, and the property worth pinning is this one:
+    // a failed save leaves no orphan assignment pointing at a plan that was
+    // never written.
+    mockUser = { id: 'u-tr', role: 'trainer', organization_id: null, trainer_id: 'tr-1' };
+    const res = await post();
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('NOTHING_RESOLVED');
+    expect(sqls().some((s) => /INSERT INTO workout_assignments/.test(s))).toBe(false);
+    expect(sqls().some((s) => /INSERT INTO workout_plans/.test(s))).toBe(false);
   });
 });

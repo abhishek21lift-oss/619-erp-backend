@@ -235,3 +235,122 @@ describe('storage', () => {
     expect(pool.query.mock.calls[0][1][2]).toBe(50);
   });
 });
+
+describe('reading back what the accepted plans actually did', () => {
+  const { planOutcomes } = require('../modules/pt-os/programming-memory');
+  const { VERDICTS } = require('../modules/pt-os/plan-outcomes');
+
+  const accepted = (o = {}) => ({
+    id: 'g-1',
+    accepted_at: '2026-08-01',
+    accepted_plan_id: 'plan-1',
+    sessions_per_week: 3,
+    duration_weeks: 8,
+    assignment_id: 'asg-1',
+    plan_exercise_names: ['Bench Press'],
+    ...o,
+  });
+
+  /** Route each query by what it selects from. */
+  function db({ generations = [accepted()], sessions = [], sets = [] } = {}) {
+    pool.query.mockImplementation((sql) => {
+      const s = String(sql);
+      if (/FROM ai_workout_generations/.test(s)) return Promise.resolve({ rows: generations });
+      if (/FROM workout_sets/.test(s)) return Promise.resolve({ rows: sets });
+      if (/FROM workout_sessions/.test(s)) return Promise.resolve({ rows: sessions });
+      return Promise.resolve({ rows: [] });
+    });
+  }
+
+  const sqlOf = (re) => pool.query.mock.calls.map(([s]) => String(s).replace(/\s+/g, ' '))
+    .find((s) => re.test(s));
+
+  it('says nothing about a client with no accepted proposal, without querying further', async () => {
+    db({ generations: [] });
+    const out = await planOutcomes('cl-1', 'org-1', { today: '2026-09-13' });
+    expect(out.accepted).toBe(0);
+    expect(out.has_outcomes).toBe(false);
+    // One query, not three. A client with nothing accepted is the common case
+    // and must not cost two more round trips on the generation path.
+    expect(pool.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('scopes the read to the organization in the statement', async () => {
+    db();
+    await planOutcomes('cl-1', 'org-1', { today: '2026-09-13' });
+    expect(sqlOf(/FROM ai_workout_generations/)).toMatch(/organization_id = \$2/);
+  });
+
+  it('keeps a proposal whose plan was never assigned, as unmeasurable', async () => {
+    // A LEFT join, deliberately. Proposals accepted before acceptGeneration
+    // started creating assignments have no assignment row, and dropping them
+    // would hide exactly the history that explains why nothing can be measured.
+    db({ generations: [accepted({ assignment_id: null })] });
+    const out = await planOutcomes('cl-1', 'org-1', { today: '2026-09-13' });
+
+    expect(sqlOf(/FROM ai_workout_generations/)).toMatch(/LEFT JOIN workout_assignments/);
+    expect(out.accepted).toBe(1);
+    expect(out.unmeasurable).toBe(1);
+    expect(out.has_outcomes).toBe(false);
+  });
+
+  it('does not go looking for sessions when nothing is attributable', async () => {
+    db({ generations: [accepted({ assignment_id: null })] });
+    await planOutcomes('cl-1', 'org-1', { today: '2026-09-13' });
+    expect(sqlOf(/FROM workout_sessions/)).toBeUndefined();
+  });
+
+  it('counts only sessions logged on or after the plan was accepted', async () => {
+    // The client's earlier training is not evidence about a plan that did not
+    // exist yet. Counting it would credit every new proposal with the work
+    // that preceded it — which, for a client who trains steadily, would make
+    // every proposal look like a success on the day it was saved.
+    db({
+      generations: [accepted({ accepted_at: '2026-08-01' })],
+      sessions: [
+        { workout_assignment_id: 'asg-1', session_date: '2026-07-20', status: 'completed' },
+        { workout_assignment_id: 'asg-1', session_date: '2026-08-05', status: 'completed' },
+      ],
+    });
+    const out = await planOutcomes('cl-1', 'org-1', { today: '2026-09-13' });
+    expect(out.decisive.sessions_completed).toBe(1);
+  });
+
+  it('attributes a session only to the assignment it was logged against', async () => {
+    db({
+      generations: [accepted({ id: 'g-1', assignment_id: 'asg-1' })],
+      sessions: [
+        { workout_assignment_id: 'asg-2', session_date: '2026-08-05', status: 'completed' },
+        { workout_assignment_id: 'asg-2', session_date: '2026-08-12', status: 'completed' },
+      ],
+    });
+    const out = await planOutcomes('cl-1', 'org-1', { today: '2026-09-13' });
+    // Another plan's sessions are another plan's. This one was not trained.
+    expect(out.decisive.verdict).toBe(VERDICTS.NOT_TAKEN_UP);
+  });
+
+  it('never matches a session by the free-text programme name', async () => {
+    db();
+    await planOutcomes('cl-1', 'org-1', { today: '2026-09-13' });
+    const sessionSql = sqlOf(/FROM workout_sessions/);
+    // program_name holds 25 distinct strings across 84 production rows and is
+    // typed by hand. Matching on it would let one client's "Upper/Lower"
+    // absorb another's, and a wrong outcome teaches the engine the opposite
+    // of the truth — worse than a missing one.
+    expect(sessionSql).not.toMatch(/program_name/);
+    expect(sessionSql).toMatch(/workout_assignment_id = ANY/);
+  });
+
+  it('reads the whole history in three queries, not three per proposal', async () => {
+    db({
+      generations: [accepted({ id: 'g-1', assignment_id: 'asg-1' }),
+        accepted({ id: 'g-2', assignment_id: 'asg-2' }),
+        accepted({ id: 'g-3', assignment_id: 'asg-3' })],
+      sessions: [{ workout_assignment_id: 'asg-1', session_date: '2026-08-05', status: 'completed' }],
+      sets: [],
+    });
+    await planOutcomes('cl-1', 'org-1', { today: '2026-09-13' });
+    // This runs while a trainer waits on a generation.
+    expect(pool.query).toHaveBeenCalledTimes(3);
+  });
+});

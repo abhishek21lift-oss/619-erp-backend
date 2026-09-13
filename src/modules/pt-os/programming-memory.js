@@ -36,6 +36,7 @@ const pool = require('../../db/pool');
 const { planExercises, normaliseName } = require('./plan-critic');
 const { materialise } = require('./plan-materialise');
 const { resolveExerciseNames } = require('./client-context');
+const { outcomeOf, summariseOutcomes } = require('./plan-outcomes');
 
 /** Times a trainer must do the same thing before it reads as a preference. */
 const MIN_REPEATS_FOR_PATTERN = 2;
@@ -302,6 +303,9 @@ async function acceptGeneration({ generationId, orgId, userId, name = null } = {
   }
 
   const planId = randomUUID();
+  const assignmentId = randomUUID();
+  let wasAssigned = false;
+  let otherActive = 0;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -328,6 +332,56 @@ async function acceptGeneration({ generationId, orgId, userId, name = null } = {
           ex.tempo, ex.rpe, ex.config ? JSON.stringify(ex.config) : null],
       );
     }
+
+    // ── Give it to the client ───────────────────────────────────────────
+    //
+    // Until this existed, accepting a proposal wrote a workout_plans row and
+    // stopped. That plan was not assigned to anybody, which meant three things
+    // nobody had noticed:
+    //
+    //   · it never appeared on Today, which lists clients by ACTIVE ASSIGNMENT
+    //     whose plan prescribes the weekday — so the programme the AI wrote
+    //     could not be started from the screen a trainer actually uses;
+    //   · workout_sessions.workout_assignment_id could never point at it, so
+    //     no logged session could ever be attributed back to the proposal;
+    //   · therefore no outcome could ever be measured, and the closed loop
+    //     this engine is for was structurally impossible rather than merely
+    //     unbuilt. See plan-outcomes.js.
+    //
+    // Same transaction as the plan and the stamp: a plan that exists with no
+    // assignment is exactly the state described above, and half-committing it
+    // would recreate the bug one row at a time.
+    //
+    // It ADDS an assignment and retires nothing. Silently completing whatever
+    // the client is already on would be the system overwriting a programme a
+    // trainer chose, which this engine does not do — so the count of what else
+    // is active comes back in the result for the trainer to act on instead.
+    let assigned = false;
+    if (orgId) {
+      await client.query(
+        `INSERT INTO workout_assignments
+           (id, workout_plan_id, client_id, trainer_id, start_date, status, organization_id)
+         VALUES ($1, $2, $3, (SELECT trainer_id FROM pt_clients WHERE id = $3),
+                 CURRENT_DATE, 'active', $4)`,
+        [assignmentId, planId, generation.client_id, orgId],
+      );
+      assigned = true;
+    }
+
+    // How many OTHER programmes this client is already on. It decides whether
+    // a logged session can auto-link to one plan at all: the session log links
+    // automatically only when there is exactly one active assignment, and
+    // measured on production 29 of 34 clients had none and four had between
+    // four and seven. A trainer who is about to create the second needs to be
+    // told, because from then on attribution is theirs to make by hand.
+    const { rows: others } = await client.query(
+      `SELECT COUNT(*)::int AS n
+         FROM workout_assignments
+        WHERE client_id = $1 AND status = 'active' AND id <> $2`,
+      [generation.client_id, assignmentId],
+    );
+    otherActive = others[0]?.n ?? 0;
+    wasAssigned = assigned;
 
     // The accept stamp rides the SAME transaction. Marking it outside would
     // leave a plan that exists with a proposal that still reads as rejected,
@@ -360,11 +414,109 @@ async function acceptGeneration({ generationId, orgId, userId, name = null } = {
     saved: built.counts.saved,
     unresolved: built.unresolved,
     unknown_days: built.unknown_days,
+    // Whether the programme is actually live for this client, and what else
+    // is. Reported rather than assumed: a save that produced a plan nobody is
+    // assigned to is the failure this endpoint used to have silently.
+    assignment_id: wasAssigned ? assignmentId : null,
+    assigned: wasAssigned,
+    other_active_assignments: otherActive,
   };
+}
+
+
+/**
+ * What became of the proposals this client actually kept.
+ *
+ * The read behind plan-outcomes.js. One query for the accepted proposals and
+ * the plan each became, one for the sessions logged against them, one for the
+ * sets in those sessions — three round trips for the whole history rather than
+ * three per proposal, because this runs on the path that generates a programme
+ * and a trainer is waiting on it.
+ *
+ * Only sessions ON OR AFTER the acceptance date count. A client's earlier
+ * training is not evidence about a plan that did not exist yet, and counting
+ * it would credit every new proposal with the work that preceded it.
+ */
+async function planOutcomes(clientId, orgId, { today, limit = MEMORY_WINDOW } = {}) {
+  if (!clientId) return summariseOutcomes([]);
+
+  const { rows: accepted } = await pool.query(
+    `SELECT g.id, g.accepted_at, g.accepted_plan_id,
+            p.sessions_per_week, p.duration_weeks,
+            a.id AS assignment_id,
+            COALESCE(
+              (SELECT array_agg(e.name)
+                 FROM workout_exercises we
+                 JOIN exercises e ON e.id = we.exercise_id
+                WHERE we.workout_plan_id = g.accepted_plan_id),
+              ARRAY[]::text[]
+            ) AS plan_exercise_names
+       FROM ai_workout_generations g
+       JOIN workout_plans p ON p.id = g.accepted_plan_id
+       -- LEFT, deliberately. A proposal accepted before acceptGeneration
+       -- started creating assignments has no row here, and it must come back
+       -- as unmeasurable rather than vanish from the history.
+       LEFT JOIN workout_assignments a
+              ON a.workout_plan_id = g.accepted_plan_id
+             AND a.client_id = g.client_id
+      WHERE g.client_id = $1
+        AND g.accepted_plan_id IS NOT NULL
+        AND ($2::uuid IS NULL OR g.organization_id = $2)
+      ORDER BY g.accepted_at DESC
+      LIMIT $3`,
+    [clientId, orgId || null, Math.max(1, Math.min(50, limit))],
+  );
+  if (!accepted.length) return summariseOutcomes([]);
+
+  const assignmentIds = accepted.map((r) => r.assignment_id).filter(Boolean);
+  let sessions = [];
+  let sets = [];
+
+  if (assignmentIds.length) {
+    ({ rows: sessions } = await pool.query(
+      `SELECT ws.id, ws.workout_assignment_id, ws.session_date, ws.status
+         FROM workout_sessions ws
+        WHERE ws.workout_assignment_id = ANY($1::text[])
+        ORDER BY ws.session_date`,
+      [assignmentIds],
+    ));
+
+    if (sessions.length) {
+      ({ rows: sets } = await pool.query(
+        `SELECT ws.workout_assignment_id, ws.session_date,
+                wse.exercise_name, s.weight_kg, s.reps, s.rpe, s.rir, s.completed
+           FROM workout_sets s
+           JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+           JOIN workout_sessions ws ON ws.id = wse.session_id
+          WHERE ws.workout_assignment_id = ANY($1::text[])
+          ORDER BY ws.session_date`,
+        [assignmentIds],
+      ));
+    }
+  }
+
+  const asOf = today || new Date().toISOString().slice(0, 10);
+  const onOrAfter = (rowDate, acceptedAt) => {
+    const d = rowDate ? String(rowDate).slice(0, 10) : null;
+    const a = acceptedAt ? String(acceptedAt).slice(0, 10) : null;
+    return Boolean(d && a && d >= a);
+  };
+
+  const rows = accepted.map((generation) => outcomeOf({
+    generation,
+    sessions: sessions.filter((x) => x.workout_assignment_id === generation.assignment_id
+      && onOrAfter(x.session_date, generation.accepted_at)),
+    sets: sets.filter((x) => x.workout_assignment_id === generation.assignment_id
+      && onOrAfter(x.session_date, generation.accepted_at)),
+    today: asOf,
+  }));
+
+  return summariseOutcomes(rows);
 }
 
 module.exports = {
   acceptGeneration,
+  planOutcomes,
   recordGeneration,
   markAccepted,
   recentGenerations,
