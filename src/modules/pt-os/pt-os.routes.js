@@ -11,6 +11,7 @@ const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
 const { today: studioToday } = require('../../lib/appTime');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
+const { sweepRoster } = require('./client-context');
 const { buildEnrollmentPdf } = require('../../lib/ptEnrollmentPdf');
 const { buildSnapshot } = require('./client-snapshot');
 const { generateCoach } = require('./coach-ai');
@@ -177,6 +178,42 @@ router.get('/dashboard', auth, wrap(async (req, res) => {
 }));
 
 // ─── Active PT clients ───────────────────────────────────────
+// GET /signals
+//
+// What the roster says without being asked.
+//
+// ── Why this endpoint exists ───────────────────────────────────────────────
+//
+// Every other read in this module answers a question about ONE client, when
+// somebody opens them. Measured on the live database: 1 client had trained in
+// the last 7 days, 16 last trained 15-30 days ago, and nothing anywhere raised
+// a flag about any of them.
+//
+// Two reasons, both specific. client-snapshot.js's `missed_workout` fires only
+// on a session that was scheduled and not completed — correct for a missed
+// appointment, and blind to a client who simply stops booking. And every alert
+// it does raise is computed on profile open, so finding the seven clients who
+// matter meant opening thirty-four profiles.
+//
+// This sweeps instead. A trainer sees their own clients; an admin sees the
+// studio. Read-only, and it decides nothing — the signals carry evidence and a
+// recommendation, and the trainer decides.
+router.get('/signals', auth, wrap(async (req, res) => {
+  // A trainer is pinned to their own roster regardless of what they ask for;
+  // anyone else may narrow to one trainer. The same rule GET /clients uses,
+  // because a signals sweep that showed more than the client list would be a
+  // way around it.
+  const tid = req.user.role === 'trainer' ? req.user.trainer_id : (req.query.trainer_id || null);
+  const weeks = Number(req.query.weeks);
+
+  const data = await sweepRoster(orgIdOf(req), {
+    trainerId: tid,
+    windowWeeks: Number.isFinite(weeks) && weeks > 0 ? weeks : undefined,
+    today: studioToday(),
+  });
+  res.json({ data });
+}));
+
 router.get('/clients', auth, wrap(async (req, res) => {
   const trainerId = req.query.trainer_id;
   const tid = req.user.role === 'trainer' ? req.user.trainer_id : trainerId;
