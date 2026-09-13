@@ -24,6 +24,9 @@ const { logUsage, getUserUsage, getModelStats } = require('../lib/ai/usage');
 const { retrieveContext }              = require('../lib/ai/knowledgeBase');
 const { runTools }                     = require('../lib/ai/tools');
 const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
+// The client's digital twin: the assessments, the screen and the logged sets
+// that this file could not see. See modules/pt-os/client-context.js.
+const { loadDigitalTwin, describeTwin, limitationsLine } = require('../modules/pt-os/client-context');
 const {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -696,7 +699,92 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   const missing  = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
 
+  // ── The digital twin ─────────────────────────────────────────────────────
+  //
+  // Everything this route could not previously see: the PAR-Q gate, the
+  // mobility and posture findings, and every set the client has logged. It
+  // re-runs the org-scoped pt_clients check rather than trusting this one,
+  // which costs an indexed lookup and keeps the module's isolation property
+  // true of the module rather than of its callers.
+  //
+  // Fail-closed by omission, never by error: if this throws, generation stops,
+  // because the alternative is writing a programme with the safety screen
+  // silently absent — which is exactly the state this whole change exists to
+  // end.
+  let twin;
+  try {
+    twin = await loadDigitalTwin(client_id, org, {
+      equipmentText: p.equipment,
+      exercises: ctx.exercises,
+    });
+  } catch (err) {
+    logger.error({ err: err.message }, 'ai_workout_twin_load_failed');
+    return res.status(503).json({ error: 'AI workout generation failed', message: 'client context unavailable' });
+  }
+  if (!twin) return res.status(404).json({ error: 'Client not found' });
+
+  // ── The gate ─────────────────────────────────────────────────────────────
+  //
+  // The rules module reports one flag, `may_program`, which is true only when
+  // a PAR-Q says "cleared". Whether to refuse on it is this route's decision,
+  // not the module's, and the two halves of "not cleared" are not the same
+  // thing:
+  //
+  //   · An explicit non-clearance — pending, referred, refused — is the studio
+  //     having looked at this client and said not yet. Generating anyway would
+  //     be this route overruling the trainer who filled that form in. Refused,
+  //     with the reason, because the next action is to resolve the gate rather
+  //     than to read a plan.
+  //
+  //   · `unknown` means no PAR-Q exists. 19 of the 34 clients in production
+  //     are in this state, and refusing them would take a working feature away
+  //     from more than half the roster on the day this ships. So generation
+  //     proceeds — but the prompt says, in capitals, that nobody has screened
+  //     this client and that an empty limitation list means nothing was looked
+  //     at, and the response carries the same warning for the UI. What is NOT
+  //     acceptable is the old behaviour, where an unscreened client silently
+  //     produced "Injuries: none".
+  //
+  // If a studio wants unscreened clients refused outright, this is the one
+  // place to change it: drop the status check and refuse on `may_program`.
+  const gateStatus = twin.rules.gate.status;
+  if (!twin.rules.may_program && gateStatus !== 'unknown') {
+    logger.warn({ req_id: req.id, gate: gateStatus }, 'ai_workout_generate_gate_blocked');
+    return res.status(409).json({
+      error: 'Client is not cleared to train',
+      code: 'NOT_CLEARED',
+      gate: gateStatus,
+      message: `The PAR-Q gate for this client reads "${gateStatus}". Resolve it before generating a programme.`,
+    });
+  }
+
+  // What the generator used to say for every client alive: "none", taken from
+  // free-text columns that are empty for all 34 of them —
+  // client_fitness_profiles has no rows at all. The resolved text is still
+  // passed through and still wins its own precedence: this ADDS the assessed
+  // screen to it rather than replacing a trainer's own words.
+  p.injuries = limitationsLine(twin, p.injuries);
+
+  logger.info({
+    req_id: req.id,
+    screened: twin.rules.coverage.screened,
+    sources: twin.rules.coverage.sources_present,
+    constraints: twin.rules.constraints.length,
+    exercises_blocked: twin.rules.library.counts.blocked,
+    has_history: twin.history.has_history,
+    deload_triggers_evaluated: twin.rules.deload.evaluated,
+  }, 'ai_workout_client_context');
+
+  // ── Ordering is load-bearing ─────────────────────────────────────────────
+  //
+  // The screen goes FIRST, before a word about the client's goals. A model
+  // that reads "goal: muscle gain, wants to bench" and only then reaches
+  // "shoulder pain, do not load" has already begun writing the programme it
+  // then has to argue itself out of. Constraints first is the cheapest
+  // correctness measure in this file.
   const userPrompt = [
+    describeTwin(twin),
+    '',
     'CLIENT AUTHORITATIVE DATA:',
     `- Age: ${p.age}`,
     `- Gender: ${p.gender}`,
@@ -728,12 +816,21 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   // EXERCISE LIBRARY (AUTHORIZED): top matching exercises through the
   // library's own tenancy predicate (built-ins shared, customs = author's org
   // + author only). A short, complete one-liner per exercise.
-  if (ctx.exercises.length) {
+  //
+  // SCREENED as well as authorized: exercises stage 2 blocked for this client
+  // are not in this list at all. Sending them with a "do not use" note beside
+  // them asks the model to hold a prohibition in working memory across a long
+  // generation, and the one time it slips, the client gets the exercise their
+  // painful shoulder cannot do. Omission cannot slip. The excluded names and
+  // the reason for each are in the screen above, so the trainer can still see
+  // what was taken away and why.
+  const offered = [...twin.rules.library.allowed, ...twin.rules.library.caution];
+  if (offered.length) {
     const txt = (v) => (Array.isArray(v) ? v.join('; ') : v);
     userPrompt.push(
       '',
-      'EXERCISE LIBRARY (AUTHORIZED):',
-      ...ctx.exercises.map((x) => [
+      'EXERCISE LIBRARY (AUTHORIZED AND SCREENED):',
+      ...offered.map((x) => [
         `- ${x.name}${x.muscle_group || x.body_part ? ` (${x.muscle_group || x.body_part})` : ''}`,
         x.equipment ? `, ${x.equipment}` : '',
         x.difficulty ? `, ${x.difficulty}` : '',
@@ -745,6 +842,9 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
         txt(x.coaching_cues) ? ` | cues: ${txt(x.coaching_cues)}` : '',
         txt(x.safety_tips) ? ` | safety: ${txt(x.safety_tips)}` : '',
         txt(x.contraindications) ? ` | avoid if: ${txt(x.contraindications)}` : '',
+        x.verdict === 'caution' && x.reasons?.length
+          ? ` | USE WITH CARE: ${x.reasons.map((r) => r.because).join('; ')}`
+          : '',
       ].join('')),
     );
   }
@@ -845,7 +945,32 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
-    send({ type: 'done', data: plan, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
+    // The screen travels with the plan. A trainer approving this needs to see
+    // what the rules removed and what was never assessed — a plan that arrives
+    // with no provenance is one they have to take on faith, and the whole
+    // point of deciding these by rule was that they could be checked.
+    send({
+      type: 'done',
+      data: plan,
+      model: streamMeta.model,
+      tier: streamMeta.tier,
+      used_fallback: streamMeta.used_fallback,
+      screen: {
+        gate: twin.rules.gate,
+        screened: twin.rules.coverage.screened,
+        sources: twin.rules.coverage.sources_present,
+        constraints: twin.rules.constraints.map((c) => ({
+          verdict: c.verdict, region: c.region, label: c.label,
+          source: c.source, evidence: c.evidence, note: c.note,
+        })),
+        referrals: twin.rules.referrals,
+        excluded_exercises: twin.rules.library.blocked.map((e) => ({
+          name: e.name, reasons: e.reasons.map((r) => r.because),
+        })),
+        deload: twin.rules.deload,
+        not_assessed: twin.brief.missing,
+      },
+    });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_generate_error');
     if (!res.headersSent) {

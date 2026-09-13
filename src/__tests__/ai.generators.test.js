@@ -121,6 +121,30 @@ function mockQueries(overrides = {}) {
     // RAG + exercise-library retrieval: no matching docs/exercises by default.
     'ai_document_chunks': [],
     'FROM exercises e': [],
+
+    // ── The digital twin's reads ──────────────────────────────────────────
+    //
+    // The generator now loads the client's safety screen and training history
+    // (modules/pt-os/client-context.js), so its read set is wider than
+    // loadAuthoritativeClient's. These needles are deliberately GENERAL and
+    // deliberately last: the specific `...WHERE client_id=$1` entries above
+    // still win for the original loader, and anything else touching the same
+    // table falls through to here rather than silently answering empty.
+    //
+    // Every one defaults to no rows, which is the production-normal case —
+    // 19 of 34 clients have no PAR-Q, 31 have no mobility or posture screen,
+    // and weekly_checkins is empty for the whole studio.
+    'FROM pt_clients': overrides['FROM pt_clients WHERE id=$1'] ?? [CLIENT],
+    'FROM pt_parq_forms': [],
+    'FROM pt_posture_assessments': [],
+    'FROM pt_mobility_performance_assessments': [],
+    'FROM pt_lifestyle_assessments': [],
+    'FROM pt_nutrition_assessments': [],
+    'FROM pt_goals': [GOAL],
+    'FROM pt_assessments': [ASSESSMENT],
+    'FROM weekly_checkins': [],
+    'FROM workout_sessions': [],
+    'FROM workout_sets s': [],
     ...overrides,
   };
   pool.query.mockImplementation((sql) => {
@@ -588,6 +612,9 @@ describe('RAG: authorized knowledge in workout/generate', () => {
       if (sql.includes('ai_document_chunks')) return Promise.reject(new Error('embeddings down'));
       if (sql.includes('FROM exercises e')) return Promise.resolve({ rows: [] });
       if (sql.includes('FROM pt_clients WHERE id=$1')) return Promise.resolve({ rows: [CLIENT] });
+      // The digital twin re-runs its own org-scoped client lookup, spelled
+      // differently — without this it finds no client and the route 404s.
+      if (sql.includes('FROM pt_clients')) return Promise.resolve({ rows: [CLIENT] });
       if (sql.includes('FROM pt_goals WHERE client_id=$1')) return Promise.resolve({ rows: [GOAL] });
       if (sql.includes('FROM pt_assessments WHERE client_id=$1')) return Promise.resolve({ rows: [ASSESSMENT] });
       return Promise.resolve({ rows: [] });
@@ -623,7 +650,9 @@ describe('RAG: authorized knowledge in workout/generate', () => {
     expect(res.status).toBe(200);
     const prompt = promptOf(routedStream.mock.calls[0][0]);
 
-    expect(prompt).toContain('EXERCISE LIBRARY (AUTHORIZED):');
+    // Renamed when the stage-2 screen was wired in: what reaches the model is
+    // now the authorized library MINUS anything blocked for this client.
+    expect(prompt).toContain('EXERCISE LIBRARY (AUTHORIZED AND SCREENED):');
     expect(prompt).toContain('Barbell Back Squat (Legs), barbell, intermediate, 4 sets x 8-12 reps, tempo 3-1-2-0');
     expect(prompt).toContain('cues: knees track over toes');
     expect(prompt).toContain('avoid if: knee pain');
@@ -674,6 +703,9 @@ describe('RAG: authorized knowledge in workout/generate', () => {
       if (sql.includes('ai_document_chunks')) return Promise.reject(new Error('embeddings down'));
       if (sql.includes('FROM exercises e')) return Promise.resolve({ rows: [] });
       if (sql.includes('FROM pt_clients WHERE id=$1')) return Promise.resolve({ rows: [CLIENT] });
+      // The digital twin re-runs its own org-scoped client lookup, spelled
+      // differently — without this it finds no client and the route 404s.
+      if (sql.includes('FROM pt_clients')) return Promise.resolve({ rows: [CLIENT] });
       if (sql.includes('FROM pt_goals WHERE client_id=$1')) return Promise.resolve({ rows: [GOAL] });
       if (sql.includes('FROM pt_assessments WHERE client_id=$1')) return Promise.resolve({ rows: [ASSESSMENT] });
       return Promise.resolve({ rows: [] });
