@@ -27,7 +27,26 @@ const logger = require('../lib/logger');
  * kept so that anything still constructing them keeps working — they are
  * documented as the non-tenanted legacy path in processWhatsappJob.
  */
-const WHATSAPP_TYPES = new Set(['automation', 'text', 'template']);
+// ── One job type, deliberately ─────────────────────────────────────────────
+//
+// 'text' and 'template' used to be here too. They predate tenancy on this path
+// and carry no organization at all, so processWhatsappJob sent them through
+// services/whatsappDelivery — a single platform-wide Twilio number — with no
+// communication_logs row written anywhere. A message to a studio's client,
+// from a number that studio has never heard of, with no record that it
+// happened.
+//
+// Nothing produces them: every call site passes 'automation'
+// (automation.engine once, automation.recovery twice, verified). But a Set is
+// the enforcement point, and while those two strings were in it the hazard was
+// one careless caller away from being live — on a path where the failure is
+// invisible, because there is no row to notice.
+//
+// Removing them means such a job now fails loudly at enqueue instead. That is
+// the right trade: transport.js already carries the shared provider under
+// `allowSharedProvider` for callers that genuinely want it, WITH an
+// organization and a logged row, which is the whole difference.
+const WHATSAPP_TYPES = new Set(['automation']);
 
 /**
  * Enqueue one WhatsApp job.
@@ -209,25 +228,17 @@ async function processAutomationJob(job) {
 /**
  * Worker processor for the 'whatsapp' queue.
  *
- * `text` and `template` are the legacy shapes. They predate tenancy in this
- * path and carry no organization, so they cannot resolve a studio's own
- * number; they go to the shared provider and are kept working rather than
- * silently rerouted. Nothing in this codebase produces them any more.
+ * One shape, matching WHATSAPP_TYPES above. A job of any other type fails
+ * rather than being carried by the org-less legacy transport that used to sit
+ * here — see the comment on WHATSAPP_TYPES for what that transport actually
+ * did. A job already in Redis from before this deploy dead-letters visibly,
+ * which is the outcome to want: a message nobody can trace, sent from a number
+ * the studio does not own, is not a degraded success.
  */
 async function processWhatsappJob(job) {
   const { type } = job.data || {};
-
-  if (type === 'automation') return processAutomationJob(job);
-
-  const { sendText, sendTemplate } = require('./whatsappDelivery');
-  const deliver = type === 'template' ? sendTemplate : type === 'text' ? sendText : null;
-  if (!deliver) throw new Error(`Unknown whatsapp job type: ${type}`);
-
-  const res = await deliver(job.data);
-  if (res.status === 'failed') {
-    throw new Error(res.error || 'whatsapp delivery failed');
-  }
-  return res;
+  if (type !== 'automation') throw new Error(`Unknown whatsapp job type: ${type}`);
+  return processAutomationJob(job);
 }
 
 module.exports = {
