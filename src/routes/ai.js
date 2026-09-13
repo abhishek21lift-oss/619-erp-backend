@@ -2,6 +2,7 @@
 // src/routes/ai.js — Multi-model AI routes for MY PT STUDIO
 // All models are resolved from env vars; no hardcoded model names here.
 
+const { randomUUID } = require('crypto');
 const express    = require('express');
 const pool       = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
@@ -32,6 +33,10 @@ const {
   auditPlan, scorePlan, buildRevisionInstruction, parseCritique, describeAudit,
   planExercises, CRITIC_SYSTEM_PROMPT,
 } = require('../modules/pt-os/plan-critic');
+// What we proposed before, and what the trainer did with it.
+const {
+  recordGeneration, recentGenerations, buildMemory, describeMemory,
+} = require('../modules/pt-os/programming-memory');
 const {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -780,6 +785,23 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     deload_triggers_evaluated: twin.rules.deload.evaluated,
   }, 'ai_workout_client_context');
 
+  // ── Programming memory ───────────────────────────────────────────────────
+  //
+  // What was proposed for this client before, and what the trainer did with
+  // it. Without this every generation starts from nothing, and a studio can
+  // reject the same suggestion twenty times and get it again on the
+  // twenty-first.
+  //
+  // Best-effort: an empty memory is the honest state for a client nobody has
+  // generated for, and it is also what a failed read should look like. A
+  // generation must not fail because its history could not be fetched.
+  let memory = null;
+  try {
+    memory = buildMemory(await recentGenerations(client_id, org));
+  } catch (err) {
+    logger.warn({ err: err.message }, 'ai_workout_memory_read_failed');
+  }
+
   // ── Ordering is load-bearing ─────────────────────────────────────────────
   //
   // The screen goes FIRST, before a word about the client's goals. A model
@@ -790,6 +812,9 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   const userPrompt = [
     describeTwin(twin),
     '',
+    // After the screen, before the goals: a preference must never be read
+    // ahead of a constraint, and describeMemory says so in its own last line.
+    ...(memory && memory.proposals ? [describeMemory(memory), ''] : []),
     'CLIENT AUTHORITATIVE DATA:',
     `- Age: ${p.age}`,
     `- Gender: ${p.gender}`,
@@ -1057,6 +1082,43 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       critique_points: critique.critique.length,
     }, 'ai_workout_plan_audited');
 
+    // ── Remember it ──────────────────────────────────────────────────────
+    //
+    // Written whether or not the trainer ever uses this plan, because the
+    // proposals nobody accepts are the ones with something to say: 95
+    // generations had produced 9 live plans when this was added, and none of
+    // those 86 rejections was recorded anywhere.
+    //
+    // The screen and the audit are frozen alongside it rather than recomputed
+    // later. The rules change as this engine is built, and re-scoring an old
+    // proposal against new rules would make the history unreadable.
+    //
+    // Best-effort, and last: the trainer has their plan either way, and a
+    // generation that succeeded must not fail because its bookkeeping did.
+    let generationId = null;
+    try {
+      generationId = await recordGeneration({
+        id: randomUUID(),
+        orgId: org,
+        clientId: client_id,
+        createdBy: req.user?.id,
+        requestId: req.id,
+        model: streamMeta.model,
+        revised,
+        qualityScore: quality.score,
+        plan,
+        screen: {
+          gate: twin.rules.gate,
+          screened: twin.rules.coverage.screened,
+          sources: twin.rules.coverage.sources_present,
+          constraints: twin.rules.constraints,
+        },
+        audit: { violations: audit.violations, unverified: audit.unverified, counts: audit.counts },
+      });
+    } catch (err) {
+      logger.warn({ err: err.message }, 'ai_workout_generation_record_failed');
+    }
+
     logUsage({
       user_id:           req.user.id,
       model:             streamMeta.model,
@@ -1080,6 +1142,9 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       // model thought of it. Separate fields, never merged: `audit` is
       // checkable fact, `critique` is opinion, and a list that mixes them
       // teaches the reader to skim both.
+      // The trainer's client sends this back when they save a plan from this
+      // proposal — that is what turns a generation into a comparable outcome.
+      generation_id: generationId,
       audit: {
         violations: audit.violations,
         unverified: audit.unverified,

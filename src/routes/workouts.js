@@ -8,6 +8,8 @@ const { auth, adminManagerOrTrainer } = require('../middleware/auth');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
+const { markAccepted } = require('../modules/pt-os/programming-memory');
+const logger = require('../lib/logger');
 
 // '/api/workouts/exercises' and '/exercises/meta' were here: read-only
 // duplicates of /api/exercises kept for older clients. There are none — the
@@ -498,6 +500,30 @@ router.post('/plans', auth, adminManagerOrTrainer, async (req, res, next) => {
            num(ex.sort_order, 0), num(ex.sets, 3), num(ex.reps, 12),
            num(ex.rest_seconds, 60), ex.notes || null, ...exerciseParams(ex)]
         );
+      }
+    }
+
+    // ── Close the loop ────────────────────────────────────────────────────
+    //
+    // When this plan came from an AI proposal, the client sends back the
+    // generation_id it was given. Linking the two is what turns a suggestion
+    // into a comparable outcome: from here the engine can ask what the
+    // trainer changed about what it proposed, which is the only feedback it
+    // has ever had about its own selection.
+    //
+    // Org-scoped inside the UPDATE rather than trusted from here, and
+    // best-effort: a plan the trainer just saved must not fail to save
+    // because its provenance could not be stamped.
+    if (d.generation_id) {
+      try {
+        const linked = await markAccepted(String(d.generation_id), id, orgIdOf(req));
+        if (!linked) {
+          // Already linked, another studio's row, or an id that never existed.
+          // Worth a line, never worth an error: the plan is saved either way.
+          logger.warn({ generation_id: d.generation_id, plan_id: id }, 'workout_plan_generation_link_missed');
+        }
+      } catch (err) {
+        logger.warn({ err: err.message }, 'workout_plan_generation_link_failed');
       }
     }
 

@@ -83,9 +83,14 @@ const planWith = (names) => ({
 });
 
 /** Shoulder pain on the mobility screen: blocks Bench Press, allows the squat. */
-function mockDb() {
+function mockDb({ history = [] } = {}) {
   pool.query.mockReset();
   pool.query.mockImplementation((sql) => {
+    // Programming memory: the proposal ledger this generation reads and writes.
+    if (/INSERT INTO ai_workout_generations/.test(sql)) {
+      return Promise.resolve({ rows: [{ id: 'gen-1' }] });
+    }
+    if (/FROM ai_workout_generations/.test(sql)) return Promise.resolve({ rows: history });
     const rows =
       /FROM pt_clients/.test(sql) ? [CLIENT]
         : /FROM pt_parq_forms/.test(sql)
@@ -283,5 +288,106 @@ describe('what the audit could not check', () => {
     expect(done.audit.unverified).toEqual([{ day: 'Monday', position: 1, name: 'Overhead Press' }]);
     expect(done.audit.violations).toEqual([]);
     expect(done.quality.components.evidence).toBeLessThan(10);
+  });
+});
+
+describe('programming memory', () => {
+  /** A stored proposal whose saved plan dropped the bench press. */
+  const pastRow = () => ({
+    id: 'g-old',
+    created_at: '2026-08-01T00:00:00Z',
+    quality_score: 100,
+    revised: false,
+    proposed_plan: {
+      weekly_schedule: {
+        Monday: { exercises: [{ name: 'Bench Press' }, { name: 'Barbell Squat' }] },
+      },
+    },
+    accepted_plan_id: 'plan-old',
+    accepted_at: '2026-08-01T01:00:00Z',
+    accepted_exercises: ['Barbell Squat', 'Dumbbell Bench Press'],
+  });
+
+  it('records every proposal, accepted or not, with its screen frozen', async () => {
+    mockDb();
+    routedStream.mockReturnValue(streamOnce(JSON.stringify(planWith(['Barbell Squat', 'Barbell Squat']))));
+
+    const res = await request(app).post('/api/ai/workout/generate').send(BODY);
+    const done = doneOf(res.text);
+
+    const insert = pool.query.mock.calls.find(([sql]) => /INSERT INTO ai_workout_generations/.test(sql));
+    expect(insert).toBeDefined();
+    // 95 generations had produced 9 live plans when this was added. The
+    // proposals nobody accepts are the ones with something to say, so the row
+    // is written before anyone has decided anything.
+    expect(done.generation_id).toBe('gen-1');
+
+    const params = insert[1];
+    expect(params[2]).toBe('client-1');
+    // The screen is stored as it stood for THIS generation rather than
+    // recomputed later against rules that have since changed.
+    expect(JSON.parse(params[9])).toMatchObject({ screened: true, gate: { cleared: true } });
+  });
+
+  it('tells the next generation what the trainer changed last time', async () => {
+    mockDb({ history: [pastRow(), pastRow()] });
+    routedStream.mockReturnValue(streamOnce(JSON.stringify(planWith(['Barbell Squat', 'Barbell Squat']))));
+
+    await request(app).post('/api/ai/workout/generate').send(BODY);
+    const prompt = routedStream.mock.calls[0][0].messages.find((m) => m.role === 'user').content;
+
+    expect(prompt).toContain('WHAT THIS TRAINER DID WITH YOUR LAST SUGGESTIONS');
+    expect(prompt).toContain('Repeatedly REMOVED from your proposals: Bench Press (2x)');
+    expect(prompt).toContain('Repeatedly ADDED by the trainer: Dumbbell Bench Press (2x)');
+    // Memory feeds selection, never permission.
+    expect(prompt).toContain('preferences, not permissions');
+  });
+
+  it('puts the safety screen ahead of the trainer\'s preferences', async () => {
+    mockDb({ history: [pastRow(), pastRow()] });
+    routedStream.mockReturnValue(streamOnce(JSON.stringify(planWith(['Barbell Squat', 'Barbell Squat']))));
+
+    await request(app).post('/api/ai/workout/generate').send(BODY);
+    const prompt = routedStream.mock.calls[0][0].messages.find((m) => m.role === 'user').content;
+
+    // A preference read before a constraint is a preference that can override
+    // one. Ordering is not the only guard — describeMemory says so in words —
+    // but it is the cheapest.
+    const screen = prompt.indexOf('SAFETY SCREEN');
+    const mem = prompt.indexOf('WHAT THIS TRAINER DID WITH YOUR LAST SUGGESTIONS');
+    const goals = prompt.indexOf('CLIENT AUTHORITATIVE DATA:');
+    expect(screen).toBeLessThan(mem);
+    // And specifically BETWEEN the screen and the goals, which is what the
+    // route claims. Pinned because a preference pushed to the end of a long
+    // prompt, below every instruction, reads as an afterthought — a placement
+    // that satisfies "safety first" while quietly costing the memory its
+    // weight.
+    expect(mem).toBeLessThan(goals);
+  });
+
+  it('says nothing about memory for a client with no proposal history', async () => {
+    mockDb({ history: [] });
+    routedStream.mockReturnValue(streamOnce(JSON.stringify(planWith(['Barbell Squat', 'Barbell Squat']))));
+
+    await request(app).post('/api/ai/workout/generate').send(BODY);
+    const prompt = routedStream.mock.calls[0][0].messages.find((m) => m.role === 'user').content;
+    expect(prompt).not.toContain('WHAT THIS TRAINER DID WITH YOUR LAST SUGGESTIONS');
+  });
+
+  it('still generates when the ledger is unreadable', async () => {
+    mockDb();
+    pool.query.mockImplementationOnce(() => Promise.resolve({ rows: [CLIENT] }));
+    const original = pool.query.getMockImplementation();
+    pool.query.mockImplementation((sql) => (/ai_workout_generations/.test(sql)
+      ? Promise.reject(new Error('ledger down'))
+      : original(sql)));
+    routedStream.mockReturnValue(streamOnce(JSON.stringify(planWith(['Barbell Squat', 'Barbell Squat']))));
+
+    const res = await request(app).post('/api/ai/workout/generate').send(BODY);
+    // The trainer has their plan either way. Bookkeeping must not cost a
+    // generation they waited thirty seconds for.
+    expect(res.status).toBe(200);
+    expect(doneOf(res.text).data).toBeTruthy();
+    expect(doneOf(res.text).generation_id).toBeNull();
   });
 });
