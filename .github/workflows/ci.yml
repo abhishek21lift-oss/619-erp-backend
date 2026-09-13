@@ -103,6 +103,105 @@ jobs:
       - name: Run tests
         run: npm test -- --passWithNoTests
 
+  # ── Job 3: the seam between this repo and the WhatsApp gateway ─────
+  #
+  # Every test of the send path in THIS repo mocks the gateway, and every test
+  # in 619-erp-whatsapp exercises the gateway without this caller. So the HTTP
+  # contract between them — field names, headers, the error envelope, and the
+  # error CODES transport.js branches on — was verified by nobody, and a rename
+  # on either side passed both suites.
+  #
+  # What that costs is specific: transport.js reports SENT on a successful call
+  # and reads res.data.provider_message_id for the id a delivery receipt is
+  # later matched on. Rename that field and every send is still recorded SENT,
+  # with provider_id null — a message the studio believes was delivered and
+  # which no receipt can ever match. This job is what notices.
+  #
+  # It needs no WhatsApp account: the gateway's null connector runs the whole
+  # service and never reports `connected`, so the happy send is not claimed —
+  # only that a NOT-CONNECTED instance is refused rather than reported sent,
+  # that one studio cannot reach another's instance, and that the codes and
+  # shapes are the real ones.
+  gateway-seam:
+    name: WhatsApp gateway seam
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        # The gateway keeps its send ledger, QR state and outbox in Redis.
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v4
+        with: { path: backend }
+
+      - name: Checkout the gateway
+        uses: actions/checkout@v4
+        with:
+          repository: abhishek21lift-oss/619-erp-whatsapp
+          # Its default branch is not `main`. Pinned explicitly so a rename
+          # fails loudly here rather than silently checking out something else.
+          ref: feature/whatsapp-gateway-mvp
+          path: gateway
+          # The repository is public, so the default token resolves it. The
+          # fallback keeps this working if it is ever made private and a PAT
+          # is added, matching the frontend E2E job's convention.
+          token: ${{ secrets.E2E_REPO_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - name: Install the gateway
+        working-directory: gateway
+        run: npm ci
+
+      - name: Start the gateway on the null connector
+        working-directory: gateway
+        env:
+          NODE_ENV: test
+          PORT: '5199'
+          HOST: 127.0.0.1
+          LOG_LEVEL: warn
+          REDIS_URL: redis://127.0.0.1:6379
+          # No Baileys, no pairing, no WhatsApp account. See the job comment.
+          WA_CONNECTOR: 'null'
+          WA_BACKEND_URL: http://127.0.0.1:5198
+          WA_GATEWAY_KEY: ci-gateway-key-0123456789abcdef0123456789abcdef
+          WA_WEBHOOK_SECRET: ci-webhook-secret-fedcba9876543210fedcba98765432
+          WA_SESSION_DIR: /tmp/wa/sessions
+          WA_MANIFEST_PATH: /tmp/wa/instances.json
+          WA_QUARANTINE_DIR: /tmp/wa/quarantine
+        run: |
+          mkdir -p /tmp/wa/sessions /tmp/wa/quarantine
+          nohup npx tsx src/server.ts > /tmp/wa/gateway.log 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -sf --max-time 2 http://127.0.0.1:5199/healthz >/dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::the gateway never became healthy"
+          cat /tmp/wa/gateway.log
+          exit 1
+
+      - name: Install backend
+        working-directory: backend
+        run: npm ci
+
+      - name: Assert the contract against the running gateway
+        working-directory: backend
+        env:
+          WA_GATEWAY_URL: http://127.0.0.1:5199
+          WA_GATEWAY_KEY: ci-gateway-key-0123456789abcdef0123456789abcdef
+        run: node scripts/assert-gateway-seam.js
+
+      - name: Gateway log
+        if: always()
+        run: tail -40 /tmp/wa/gateway.log || true
+
   # ── Job 3: Security audit ──────────────────────────────────────────
   security:
     name: Dependency Audit
