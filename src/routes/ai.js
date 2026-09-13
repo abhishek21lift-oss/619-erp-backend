@@ -35,8 +35,11 @@ const {
 } = require('../modules/pt-os/plan-critic');
 // What we proposed before, and what the trainer did with it.
 const {
-  recordGeneration, recentGenerations, buildMemory, describeMemory,
+  recordGeneration, recentGenerations, buildMemory, describeMemory, planOutcomes,
 } = require('../modules/pt-os/programming-memory');
+const { describeOutcomes } = require('../modules/pt-os/plan-outcomes');
+// The studio's today, not the server's. Same clock every other pt-os read uses.
+const { today: studioToday } = require('../lib/appTime');
 const {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -802,6 +805,22 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     logger.warn({ err: err.message }, 'ai_workout_memory_read_failed');
   }
 
+  // ── And what happened AFTER the trainer kept one ─────────────────────────
+  //
+  // The memory above closes at the click. It cannot tell a plan the client
+  // trained for six weeks from one they never started, because both read as
+  // "accepted". This is the other half: whether the programmes this client was
+  // actually given were trained, and whether the lifts they prescribed moved.
+  //
+  // Same best-effort rule, for the same reason — and the same honest empty
+  // state, which on this studio's data is currently the only state there is.
+  let outcomes = null;
+  try {
+    outcomes = await planOutcomes(client_id, org, { today: studioToday() });
+  } catch (err) {
+    logger.warn({ err: err.message }, 'ai_workout_outcomes_read_failed');
+  }
+
   // ── Ordering is load-bearing ─────────────────────────────────────────────
   //
   // The screen goes FIRST, before a word about the client's goals. A model
@@ -815,6 +834,11 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     // After the screen, before the goals: a preference must never be read
     // ahead of a constraint, and describeMemory says so in its own last line.
     ...(memory && memory.proposals ? [describeMemory(memory), ''] : []),
+    // After the trainer's preferences, because an outcome is a stronger fact
+    // than a preference and the model should read it last of the two — but
+    // still before the goals, for the same reason the screen comes before
+    // them: what already failed is a constraint on what to write next.
+    ...(outcomes && outcomes.accepted ? [describeOutcomes(outcomes), ''] : []),
     'CLIENT AUTHORITATIVE DATA:',
     `- Age: ${p.age}`,
     `- Gender: ${p.gender}`,
