@@ -447,3 +447,76 @@ describe('the studio\'s own volume ranges', () => {
   });
 });
 
+
+describe('when did this client last actually train', () => {
+  const { sweepRoster, TRAINING_HAPPENED } = require('../modules/pt-os/client-context');
+
+  // ── The wrong answer this replaced ───────────────────────────────────────
+  //
+  // `last_session` was MAX(session_date) WHERE status = 'completed'. Measured
+  // on production the day it changed: 22 sessions held logged sets while
+  // sitting in 'in_progress', and one client who had trained the previous day
+  // was reported as 41 days silent — which on a GONE_DAYS threshold of 21
+  // renders to the trainer as "Paying, and stopped coming. Contact them this
+  // week." Two more clients had sets logged and no completed session at all,
+  // so they read as "Paid but has never trained".
+  //
+  // The conflation: workout_sessions.status is a UI workflow state — did
+  // somebody tap Finish — and the schema lets it be set with no evidence (17
+  // of 54 completed production sessions hold zero sets). Whether the client
+  // TRAINED is answered by a logged set.
+
+  const sqlOf = (re) => pool.query.mock.calls.map(([s]) => String(s).replace(/\s+/g, ' '))
+    .find((s) => re.test(s));
+
+  beforeEach(() => {
+    pool.query.mockReset();
+    pool.query.mockResolvedValue({ rows: [] });
+  });
+
+  it('counts a session the trainer marked complete', () => {
+    expect(TRAINING_HAPPENED.replace(/\s+/g, ' ')).toContain("ws.status = 'completed'");
+  });
+
+  it('also counts a session that carries a logged set', () => {
+    // The half that was missing. A set is somebody standing in the gym putting
+    // a number in; no workflow tap is more authoritative than that.
+    const one = TRAINING_HAPPENED.replace(/\s+/g, ' ');
+    expect(one).toMatch(/OR EXISTS/);
+    expect(one).toMatch(/JOIN workout_sets s ON s\.session_exercise_id = wse\.id/);
+    expect(one).toMatch(/WHERE wse\.session_id = ws\.id/);
+  });
+
+  it('is the definition the roster sweep actually uses', async () => {
+    await sweepRoster('org-1', { today: '2026-09-13' });
+    const clientSql = sqlOf(/FROM pt_clients c/);
+    expect(clientSql).toMatch(/MAX\(ws\.session_date\)/);
+    // Not a second copy of the rule written out again beside it.
+    expect(clientSql).toContain(TRAINING_HAPPENED.replace(/\s+/g, ' '));
+  });
+
+  it('never narrows back to completed alone', async () => {
+    await sweepRoster('org-1', { today: '2026-09-13' });
+    const clientSql = sqlOf(/FROM pt_clients c/);
+    // The exact shape of the bug: a bare status test with nothing beside it.
+    expect(clientSql).not.toMatch(/client_id = c\.id AND ws\.status = 'completed'\) AS last_session/);
+  });
+
+  it('keeps the sweep org-scoped while it is at it', async () => {
+    await sweepRoster('org-1', { today: '2026-09-13' });
+    expect(sqlOf(/FROM pt_clients c/)).toMatch(/c\.organization_id = \$1/);
+  });
+
+  it('does not widen the counters that measure a prescription', () => {
+    // Deliberately narrow. recomputeAssignmentProgress and the public stats
+    // count COMPLETED sessions against what a plan asked for; silently
+    // swapping this definition in would change what a studio's progress bar
+    // and public numbers mean, and that needs its own evidence.
+    const fs = require('fs');
+    const path = require('path');
+    const log = fs.readFileSync(
+      path.join(__dirname, '..', 'modules', 'pt-os', 'workout-log.routes.js'), 'utf8',
+    );
+    expect(log).toMatch(/ws\.status = 'completed'\) AS completed_count/);
+  });
+});

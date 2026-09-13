@@ -527,7 +527,8 @@ async function sweepRoster(orgId, { trainerId = null, windowWeeks = DEFAULT_WIND
     `SELECT c.id, c.name, c.pt_start_date, c.pt_end_date, c.status,
             (SELECT MAX(ws.session_date)
                FROM workout_sessions ws
-              WHERE ws.client_id = c.id AND ws.status = 'completed') AS last_session
+              WHERE ws.client_id = c.id
+                AND ${TRAINING_HAPPENED}) AS last_session
        FROM pt_clients c
       WHERE c.deleted_at IS NULL
         AND ($1::uuid IS NULL OR c.organization_id = $1)
@@ -586,11 +587,54 @@ async function sweepRoster(orgId, { trainerId = null, windowWeeks = DEFAULT_WIND
   return summariseRoster(rows);
 }
 
+/**
+ * When did this client last actually train?
+ *
+ * ── Why this is not `status = 'completed'` ─────────────────────────────────
+ *
+ * It was, and that produced a wrong answer on the trainer's screen. Measured
+ * on production the day this changed: 22 sessions sat in `in_progress` with
+ * sets logged against them, and one client — who had trained the previous day
+ * — was being reported as 41 days silent, which on a GONE_DAYS threshold of 21
+ * renders as "Paying, and stopped coming. Contact them this week." Two more
+ * clients had logged sets and no completed session at all, so they read as
+ * "Paid but has never trained".
+ *
+ * The root cause is a conflation. `workout_sessions.status` is a UI WORKFLOW
+ * state — did the trainer tap Finish — and the schema lets it be set with no
+ * evidence at all (17 of 54 completed sessions in production hold zero sets).
+ * Whether the client TRAINED is a different question, and a logged set answers
+ * it unambiguously: somebody stood in the gym and put a number in.
+ *
+ * So a session counts as training when the trainer marked it complete OR it
+ * carries at least one logged set. Both are evidence that the client was
+ * there; neither alone is sufficient, because trainers do both.
+ *
+ * ── Deliberately narrow ────────────────────────────────────────────────────
+ *
+ * Exported as one string so this definition has exactly one home, but it is
+ * applied ONLY where the question is "was the client here". It is not swapped
+ * into `recomputeAssignmentProgress` or the public stats counters: those count
+ * completed sessions against a prescription, and widening them silently would
+ * change what a studio's progress bar and public numbers mean. Those are
+ * separate decisions and they need their own evidence.
+ */
+const TRAINING_HAPPENED = `(
+  ws.status = 'completed'
+  OR EXISTS (
+    SELECT 1
+      FROM workout_session_exercises wse
+      JOIN workout_sets s ON s.session_exercise_id = wse.id
+     WHERE wse.session_id = ws.id
+  )
+)`;
+
 /** Cap on one sweep's set pull. Production's whole studio is 408. */
 const MAX_SWEEP_SETS = 20000;
 
 module.exports = {
   loadDigitalTwin,
+  TRAINING_HAPPENED,
   resolveLandmarks,
   screenPlanExercises,
   resolveExerciseNames,
