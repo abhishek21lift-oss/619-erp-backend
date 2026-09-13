@@ -24,8 +24,9 @@ jest.mock('../db/pool', () => ({ query: jest.fn() }));
 
 const pool = require('../db/pool');
 const {
-  loadDigitalTwin, describeTwin, limitationsLine, adherenceInputs,
+  loadDigitalTwin, describeTwin, limitationsLine, adherenceInputs, screenPlanExercises,
 } = require('../modules/pt-os/client-context');
+const { buildConstraints } = require('../modules/pt-os/programming-rules');
 
 const CLIENT = {
   id: 'cl-1', name: 'Test Client', gender: 'male', dob: '1995-01-01',
@@ -290,5 +291,89 @@ describe('the limitations line that replaces the empty column', () => {
       pt_mobility_performance_assessments: [{ body_regions: regions() }],
     }));
     expect(line).toBe('none found — the client has been screened and is clear');
+  });
+});
+
+describe('screening the exercises a plan actually named', () => {
+  /**
+   * The four names that collide under normalisation, as production holds them.
+   *
+   * They were checked when the matcher was written: of 890 exercises exactly
+   * four normalise onto another, every pair shares one target_muscle — and
+   * every pair DIFFERS in equipment. "Leg Press" is both a Bodyweight row and
+   * a Machine row, so with an equipment filter one blocks and one allows.
+   */
+  const LEG_PRESS_BODYWEIGHT = {
+    name: 'Leg Press', muscle_group: 'Legs', target_muscle: 'Quadriceps',
+    movement_pattern: 'General', equipment: 'Bodyweight', difficulty: 'beginner',
+  };
+  const LEG_PRESS_MACHINE = { ...LEG_PRESS_BODYWEIGHT, equipment: 'Machine' };
+
+  const screenFor = (equipment) => buildConstraints({
+    parq: { workout_gate_status: 'cleared', past_history: {}, current_health: {} },
+    equipment,
+  });
+
+  function mockLibrary(rows) {
+    pool.query.mockReset();
+    pool.query.mockImplementation((sql) => Promise.resolve({
+      rows: /FROM exercises/.test(sql) ? rows : [],
+    }));
+  }
+
+  it('takes the stricter verdict when two library rows share a name', async () => {
+    mockLibrary([LEG_PRESS_BODYWEIGHT, LEG_PRESS_MACHINE]);
+    const out = await screenPlanExercises(['Leg Press'], {
+      orgId: 'org-1', userId: 'u1', screen: screenFor(['Bodyweight']),
+    });
+    // A studio with no machines has no machine leg press. Letting the
+    // bodyweight twin clear the name would hand the client an exercise the
+    // gym does not have — and on a safety constraint rather than an equipment
+    // one, it would clear an exercise the rules excluded.
+    expect(out.get('leg press').verdict).toBe('block');
+  });
+
+  it('does not invent a verdict when neither row is constrained', async () => {
+    mockLibrary([LEG_PRESS_BODYWEIGHT, LEG_PRESS_MACHINE]);
+    const out = await screenPlanExercises(['Leg Press'], {
+      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+    });
+    expect(out.get('leg press').verdict).toBe('allow');
+  });
+
+  it('returns nothing for a name the library does not hold', async () => {
+    mockLibrary([]);
+    const out = await screenPlanExercises(['Overhead Press'], {
+      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+    });
+    // Absent from the map, so the audit reports it unverified rather than
+    // clearing it — see plan-critic.js on why fuzzy matching is unsafe here.
+    expect(out.size).toBe(0);
+  });
+
+  it('fails closed without an org or a user', async () => {
+    mockLibrary([LEG_PRESS_MACHINE]);
+    for (const args of [{ orgId: null, userId: 'u1' }, { orgId: 'org-1', userId: null }]) {
+      const out = await screenPlanExercises(['Leg Press'], { ...args, screen: screenFor(null) });
+      expect(out.size).toBe(0);
+    }
+    // Nothing was cleared by an unscoped read, because no read happened.
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it('queries by normalised name through the library\'s own tenancy predicate', async () => {
+    mockLibrary([]);
+    await screenPlanExercises(['  BENCH-PRESS ', 'Bench Press'], {
+      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+    });
+    const [sql, params] = pool.query.mock.calls[0];
+    expect(sql).toMatch(/organization_id IS NULL OR \(organization_id = \$1::uuid AND created_by = \$2\)/);
+    // Both spellings collapse to one lookup value.
+    expect(params[2]).toEqual(['bench press']);
+    // The COLUMN has to be folded the same way the parameter was. Comparing a
+    // normalised parameter against a raw name matches nothing for any name
+    // carrying punctuation — which fails safe (everything unverified) and
+    // silently guts the audit's reach, so it is pinned rather than trusted.
+    expect(sql).toMatch(/regexp_replace\(lower\(btrim\(name\)\), '\[\^a-z0-9\]\+', ' ', 'g'\) = ANY/);
   });
 });

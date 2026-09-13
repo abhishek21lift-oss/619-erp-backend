@@ -26,7 +26,12 @@ const { runTools }                     = require('../lib/ai/tools');
 const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // The client's digital twin: the assessments, the screen and the logged sets
 // that this file could not see. See modules/pt-os/client-context.js.
-const { loadDigitalTwin, describeTwin, limitationsLine } = require('../modules/pt-os/client-context');
+const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
+// Checking the plan the model returned against the rules that shaped it.
+const {
+  auditPlan, scorePlan, buildRevisionInstruction, parseCritique, describeAudit,
+  planExercises, CRITIC_SYSTEM_PROMPT,
+} = require('../modules/pt-os/plan-critic');
 const {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -929,12 +934,128 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     }
     if (step.value && typeof step.value === 'object') streamMeta = step.value;
 
-    const plan = extractJson(fullContent);
+    let plan = extractJson(fullContent);
     if (!plan) {
       send({ type: 'error', message: 'Could not parse AI response as JSON' });
       res.end();
       return;
     }
+
+    // ── Audit ────────────────────────────────────────────────────────────
+    //
+    // Stage 3 put the screen at the top of the prompt and left blocked
+    // exercises out of the library the model was given. Neither is
+    // enforcement — the model writes free text and nothing looked at it. This
+    // does, against the same rules, without asking a model anything.
+    //
+    // The lookup is its own: the prompt was given a dozen library rows and a
+    // model may name anything, so screening only those would answer "no
+    // blocked exercise" for every blocked movement that was not retrieved.
+    const requested = { training_days: p.training_days, duration_weeks: p.duration_weeks };
+    const auditWith = async (candidate) => {
+      const screened = await screenPlanExercises(
+        planExercises(candidate).map((e) => e.name),
+        { orgId: org, userId: req.user?.id, screen: twin.rules },
+      );
+      return auditPlan(candidate, { screened, requested });
+    };
+
+    let audit = await auditWith(plan);
+    let revised = false;
+
+    // ── One revision, and only one ───────────────────────────────────────
+    //
+    // Spent only on findings a second pass can actually fix: a prescribed
+    // exclusion, or the wrong number of training days. Minor completeness
+    // gaps are reported to the trainer instead — they are a line to fill in,
+    // not a reason to spend another generation and another thirty seconds of
+    // somebody waiting.
+    //
+    // One, because a model that ignored an explicit "replace this exercise"
+    // instruction once will usually ignore it twice, and a loop that keeps
+    // paying to find that out turns one bad generation into four. If the
+    // revision does not fix it, the violation ships visibly and the trainer
+    // decides.
+    if (audit.needs_revision) {
+      const instruction = buildRevisionInstruction(audit);
+      try {
+        const retry = await routedChat({
+          intent: 'workout',
+          temperature: 0.2,      // correction, not invention
+          max_tokens: 8000,
+          messages: [
+            { role: 'system', content: buildWorkoutSystemPrompt(trainerName) },
+            { role: 'user', content: userPromptText },
+            { role: 'assistant', content: JSON.stringify(plan) },
+            { role: 'user', content: instruction },
+          ],
+        });
+        const fixed = extractJson(retry?.content || '');
+        if (fixed) {
+          const reaudit = await auditWith(fixed);
+          // Keep the revision only if it is actually better. A second pass
+          // that fixes the shoulder and drops half the session is not a fix,
+          // and shipping it because it was newer would make the loop a
+          // liability.
+          if (reaudit.counts.critical <= audit.counts.critical
+            && reaudit.counts.major <= audit.counts.major) {
+            plan = fixed;
+            audit = reaudit;
+            revised = true;
+          }
+        }
+      } catch (err) {
+        // The first plan is still a plan, and its violations are still
+        // reported. A failed revision must not cost the trainer the
+        // generation they already waited for.
+        logger.warn({ err: err.message }, 'ai_workout_revision_failed');
+      }
+    }
+
+    const quality = scorePlan(audit);
+
+    // ── The critic ───────────────────────────────────────────────────────
+    //
+    // A second model, asked only what a rule cannot answer: whether the
+    // selection serves the goal, whether the week balances, whether the
+    // progression suits this client's actual history. Advisory, kept in its
+    // own field, and never able to clear something the rules excluded.
+    //
+    // Best-effort by design: no key, a timeout, or an unparseable answer
+    // leaves `critique` empty and changes nothing else. The audit is the part
+    // that must always run.
+    let critique = { critique: [], verdict: null };
+    try {
+      const reviewed = await routedChat({
+        intent: 'workout',
+        temperature: 0.3,
+        max_tokens: 900,
+        messages: [
+          { role: 'system', content: CRITIC_SYSTEM_PROMPT },
+          {
+            role: 'user',
+            content: [
+              describeTwin(twin), '', describeAudit(audit), '',
+              'THE PROGRAMME:', JSON.stringify(plan),
+            ].join('\n'),
+          },
+        ],
+      });
+      critique = parseCritique(reviewed?.content);
+    } catch (err) {
+      logger.warn({ err: err.message }, 'ai_workout_critique_failed');
+    }
+
+    logger.info({
+      req_id: req.id,
+      critical: audit.counts.critical,
+      major: audit.counts.major,
+      minor: audit.counts.minor,
+      unverified: audit.unverified.length,
+      revised,
+      quality: quality.score,
+      critique_points: critique.critique.length,
+    }, 'ai_workout_plan_audited');
 
     logUsage({
       user_id:           req.user.id,
@@ -955,6 +1076,19 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       model: streamMeta.model,
       tier: streamMeta.tier,
       used_fallback: streamMeta.used_fallback,
+      // What the rules found in the model's own output, and what a second
+      // model thought of it. Separate fields, never merged: `audit` is
+      // checkable fact, `critique` is opinion, and a list that mixes them
+      // teaches the reader to skim both.
+      audit: {
+        violations: audit.violations,
+        unverified: audit.unverified,
+        counts: audit.counts,
+        revised,
+      },
+      quality,
+      critique: critique.critique,
+      critique_verdict: critique.verdict,
       screen: {
         gate: twin.rules.gate,
         screened: twin.rules.coverage.screened,
