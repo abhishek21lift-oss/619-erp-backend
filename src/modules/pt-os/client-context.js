@@ -48,7 +48,8 @@ const pool = require('../../db/pool');
 const { buildBrief } = require('./training-brief');
 const { buildRecovery } = require('./recovery');
 const { buildTrainingHistory, isoWeek } = require('./training-history');
-const { evaluate, equipmentFrom, weeklyMuscleGroups } = require('./programming-rules');
+const { evaluate, equipmentFrom, weeklyMuscleGroups, screenExercise } = require('./programming-rules');
+const { normaliseName } = require('./plan-critic');
 
 /** How far back the training history looks, in weeks. */
 const DEFAULT_WINDOW_WEEKS = 12;
@@ -363,8 +364,61 @@ function limitationsLine(twin, typed = null) {
     : 'UNKNOWN — nobody has screened this client';
 }
 
+/**
+ * Screen the exercises a generated plan actually named.
+ *
+ * The prompt was given a dozen library rows; a model may name anything. So
+ * the audit does its own lookup rather than reusing that retrieval — without
+ * this, "was a blocked exercise prescribed?" could only be answered for the
+ * handful of exercises that happened to be retrieved, and would answer "no"
+ * for every other blocked movement in the library.
+ *
+ * Matching is by NORMALISED NAME ONLY — case, punctuation and whitespace
+ * folded, nothing fuzzy. plan-critic.js records the measurement behind that:
+ * trigram similarity resolves "Overhead Press" to "Overhead Lat", which would
+ * clear a shoulder-loading press through a lat exercise's row for a client
+ * with shoulder pain. A name this cannot match is left out of the result and
+ * reported by the audit as unverified.
+ *
+ * Tenancy is the exercise library's own predicate, identical to the one the
+ * prompt retrieval uses: built-ins are shared, a studio's custom exercises
+ * are visible only to their author inside their own org. Fail-closed — no org
+ * or no user returns an empty map, so nothing is cleared by an unscoped read.
+ */
+async function screenPlanExercises(names = [], { orgId, userId, screen } = {}) {
+  const wanted = [...new Set(names.map(normaliseName).filter(Boolean))];
+  if (!wanted.length || !orgId || !userId || !screen) return new Map();
+
+  const { rows } = await pool.query(
+    `SELECT name, muscle_group, body_part, target_muscle, movement_pattern, equipment, difficulty
+       FROM exercises
+      WHERE deleted_at IS NULL AND archived_at IS NULL
+        AND (organization_id IS NULL OR (organization_id = $1::uuid AND created_by = $2))
+        AND regexp_replace(lower(btrim(name)), '[^a-z0-9]+', ' ', 'g') = ANY($3::text[])`,
+    [orgId, userId, wanted],
+  );
+
+  const out = new Map();
+  for (const row of rows) {
+    const key = normaliseName(row.name);
+    const result = screenExercise(row, screen);
+    const prior = out.get(key);
+    // Four library names normalise onto another (verified: all four pairs
+    // share one target_muscle). Where that happens the STRICTER verdict wins,
+    // so an ambiguous name can never be cleared by its more permissive twin.
+    if (!prior || RANK_OF[result.verdict] > RANK_OF[prior.verdict]) {
+      out.set(key, { name: row.name, verdict: result.verdict, reasons: result.reasons });
+    }
+  }
+  return out;
+}
+
+/** Verdict ordering, so the stricter of two matches wins. */
+const RANK_OF = Object.freeze({ allow: 0, caution: 1, block: 2 });
+
 module.exports = {
   loadDigitalTwin,
+  screenPlanExercises,
   describeTwin,
   limitationsLine,
   adherenceInputs,
