@@ -114,27 +114,45 @@ CREATE INDEX IF NOT EXISTS ai_workout_generations_accepted_idx
   ON ai_workout_generations (accepted_plan_id)
   WHERE accepted_plan_id IS NOT NULL;
 
--- ── Reachable only through the API ─────────────────────────────────────────
+-- ── RLS: both halves, because either alone is broken ───────────────────────
 --
--- Without this the table is readable through PostgREST with the publishable
--- key, which bypasses the API and every tenant check inside it — and this
--- table holds a client's safety screen, constraints and clinical findings
--- frozen into JSON. Deny-all is the right policy because nothing is meant to
--- reach it except the service role the API connects as.
+-- The deny-all keeps the table off PostgREST with the publishable key, which
+-- would otherwise bypass the API and every tenant check in it — and this table
+-- holds a client's safety screen, constraints and clinical findings frozen
+-- into JSON.
+--
+-- The tenant_isolation policy and its GRANT are what let the application read
+-- and write it AT ALL. The API connects as app_tenant, so a table with RLS on
+-- and no app_tenant policy is not a locked-down table, it is a dead one: every
+-- insert fails on permission, and because this ledger is written best-effort
+-- the failure would be swallowed and the whole feature would be silently inert
+-- in production while passing every test that mocks the pool.
+--
+-- The first draft of this migration had only the deny-all. It took
+-- rls.isolation.integration.test.js — which runs against a real Postgres and
+-- is skipped locally for want of one — to say so.
 ALTER TABLE ai_workout_generations ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON ai_workout_generations FROM anon, authenticated;
 
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_policies
-     WHERE schemaname = 'public' AND tablename = 'ai_workout_generations'
-       AND policyname = 'deny_all_direct_access'
-  ) THEN
-    CREATE POLICY deny_all_direct_access ON ai_workout_generations
-      FOR ALL USING (false) WITH CHECK (false);
-  END IF;
-END $$;
+DROP POLICY IF EXISTS deny_all_direct_access ON ai_workout_generations;
+CREATE POLICY deny_all_direct_access ON ai_workout_generations
+  FOR ALL USING (false) WITH CHECK (false);
+
+-- Declared exactly as migration 157 declares every other tenant table's: FOR
+-- ALL TO app_tenant, with a WITH CHECK as well as a USING. Without the role
+-- the policy does not apply to the one the application connects as; without
+-- WITH CHECK it would constrain reads but not writes, so a row could land in
+-- another studio even though reads were filtered.
+--
+-- The strict form rather than 157's `OR organization_id IS NULL` variant: that
+-- exists for tables holding platform-seeded rows, and this one starts empty
+-- and is only ever written by a request that already has an org.
+DROP POLICY IF EXISTS tenant_isolation ON ai_workout_generations;
+CREATE POLICY tenant_isolation ON ai_workout_generations FOR ALL TO app_tenant
+  USING (organization_id::text = current_setting('app.org_id', true))
+  WITH CHECK (organization_id::text = current_setting('app.org_id', true));
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ai_workout_generations TO app_tenant;
 
 COMMENT ON TABLE ai_workout_generations IS
   'One row per AI workout generation: what was proposed, what the rules knew '
@@ -150,6 +168,25 @@ COMMENT ON COLUMN ai_workout_generations.accepted_plan_id IS
   'The workout_plans row a trainer saved from this proposal, or NULL. NULL is '
   'the common case and is a finding, not a gap: 95 generations had produced 9 '
   'live plans when this table was added.';
+
+-- ── Verification ───────────────────────────────────────────────────────────
+--
+-- A migration that silently half-applied is how a ledger ends up unwritable.
+-- This makes that an error at apply time rather than a discovery later.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+     WHERE schemaname = 'public' AND tablename = 'ai_workout_generations'
+       AND policyname = 'tenant_isolation' AND 'app_tenant' = ANY(roles)
+  ) THEN
+    RAISE EXCEPTION '199: tenant_isolation policy for app_tenant is missing — the ledger would be unwritable';
+  END IF;
+
+  IF NOT has_table_privilege('app_tenant', 'ai_workout_generations', 'INSERT') THEN
+    RAISE EXCEPTION '199: app_tenant cannot INSERT — the ledger would be unwritable';
+  END IF;
+END $$;
 
 DO $$
 DECLARE generations BIGINT; live_plans BIGINT;
