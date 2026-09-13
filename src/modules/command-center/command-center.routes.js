@@ -20,8 +20,53 @@ const logCapture = require('./logCapture');
 const tickets = require('./tickets');
 const stream = require('./stream');
 const pool = require('../../db/pool');
+const { runAsPlatform } = require('../../lib/tenant-context');
 
 registerCollectors();
+
+// ── Every read here is platform-wide, and has to SAY so ─────────────────────
+//
+// db/pool.js picks the owner connection only when isPlatformWide() is true,
+// and middleware/auth.js computes that as
+//
+//     req.user.role === 'super_admin' && orgId == null
+//
+// The frontend sends `x-org-id` from localStorage on every request, so an
+// operator who has ever pinned a studio in the org switcher arrives with
+// orgId set. platformWide is then false, and every query below runs as
+// app_tenant with RLS applied — on a console whose entire job is to report
+// the state of the whole platform.
+//
+// What that does, measured against the live policies:
+//
+//   ai_usage_log         tenant_isolation via users.organization_id
+//                        -> AI telemetry for ONE studio, labelled platform-wide
+//   login_events         tenant_isolation (plus org-less rows)
+//                        -> the security card grades one studio's failed logins
+//   refresh_tokens       tenant_isolation via users
+//                        -> "active sessions" counts one studio
+//   admin_invitations    tenant_isolation
+//                        -> SMTP delivery history for one studio
+//   system_alerts        no app_tenant policy at all -> ZERO ROWS
+//   system_logs          no app_tenant policy at all -> ZERO ROWS
+//   platform_ai_settings no app_tenant policy at all -> ZERO ROWS
+//
+// None of those raise an error. The Alert Center simply shows no alerts, the
+// log history shows nothing, and the AI and security cards show a single
+// tenant's numbers under a platform heading — which is worse than an outage,
+// because an operator acts on it.
+//
+// This is not a new failure mode; it is the one middleware/platformAuth.js
+// already documents for platform_owners and already fixes with runAsPlatform.
+// The Command Center never got the same treatment. Fixed here, once, at the
+// router rather than at ~30 call sites: runAsPlatform opens the
+// AsyncLocalStorage context that db/pool.js reads, and next() runs inside it,
+// so every handler below — and every async continuation it starts — resolves
+// to the owner connection regardless of what the operator has pinned.
+//
+// Latent until TENANT_RLS_ENFORCE is on AND ADMIN_DATABASE_URL differs, which
+// is precisely the deployment the RLS work exists for.
+router.use((req, res, next) => runAsPlatform(() => next()));
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 

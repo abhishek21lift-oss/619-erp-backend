@@ -70,7 +70,13 @@ jest.mock('../modules/command-center/snapshot.service', () => ({
 // keeping its own idea of "healthy". A recovery routine that disagreed with the
 // console about whether it succeeded would be worse than no routine.
 jest.mock('../modules/command-center/collectors/queue.collector', () => ({
-  NAME: 'queues', collect: mockQueueCollect,
+  // The REAL thresholds, not invented ones. recovery.run grades the queue with
+  // the collector's own numbers so the routine and the card cannot disagree
+  // about what "too many waiting" means; a test that supplied its own would be
+  // testing a third definition.
+  ...jest.requireActual('../modules/command-center/collectors/queue.collector'),
+  NAME: 'queues',
+  collect: mockQueueCollect,
 }));
 
 const commands = require('../modules/command-center/commands.service');
@@ -218,7 +224,10 @@ describe('capabilities absent on this deployment', () => {
     // The reason has to be actionable — it names the missing thing and where
     // the fix is written down.
     expect(err.message).toMatch(/docker\.sock/);
-    expect(err.message).toMatch(/COMMAND-CENTER-PLAN/);
+    // Names the REMEDY, not a document. The rung is now genuinely runnable —
+    // container-recovery.js implements it — so the reason an operator gets has
+    // to be the environment variable that turns it on, not a plan to write it.
+    expect(err.message).toMatch(/DOCKER_PROXY_URL/);
   });
 
   test('unavailability is checked before the confirmation gate', async () => {
@@ -340,11 +349,33 @@ describe('recovery.run', () => {
     expect(mockQueue.resume).toHaveBeenCalled();
   });
 
-  test('reports success when the queue comes back healthy', async () => {
+  test('reports success when a BROKEN queue comes back healthy', async () => {
+    // Broken first, healthy after — the only shape that earns "recovered".
+    mockQueueCollect
+      .mockResolvedValueOnce({
+        name: 'queues', status: 'critical',
+        data: { queues: [{ name: 'email', reachable: true, waiting: 400, active: 0, failed: 0, starved: true }] },
+      })
+      .mockResolvedValueOnce({
+        name: 'queues', status: 'healthy',
+        data: { queues: [{ name: 'email', reachable: true, waiting: 0, active: 2, failed: 0, starved: false }] },
+      });
+
     const out = await commands.run('recovery.run', { req, queue: 'email', confirm });
+    expect(out.output.outcome).toBe('recovered');
     expect(out.output.recovered).toBe(true);
     // Nothing further is proposed, because nothing further is needed.
     expect(out.output.next_rung).toBeNull();
+  });
+
+  test('does NOT claim credit for a queue that was never broken', async () => {
+    // The reflexive press. Both readings are healthy, so nothing was recovered
+    // — and saying otherwise trains an operator to believe the button fixed
+    // something.
+    const out = await commands.run('recovery.run', { req, queue: 'email', confirm });
+    expect(out.output.outcome).toBe('was_not_broken');
+    expect(out.output.recovered).toBe(false);
+    expect(out.output.summary).toMatch(/already healthy/i);
   });
 
   test('when it does NOT recover, it names the next rung and says it cannot run it', async () => {

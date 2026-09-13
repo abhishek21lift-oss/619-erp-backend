@@ -33,14 +33,131 @@ const redis = require('../../lib/redis');
 const pool = require('../../db/pool');
 const email = require('../../lib/email');
 const { QUEUE_NAMES } = require('../../jobs/queue');
+const dockerRecovery = require('./container-recovery');
+const queueCollector = require('./collectors/queue.collector');
 
-/** Rungs 4 and 5 of the recovery ladder need the Docker socket — see D6. */
-const DOCKER_REASON =
-  'Requires the Docker socket. The API container has no /var/run/docker.sock; '
-  + 'see COMMAND-CENTER-PLAN.md §2 for the socket-proxy compose change.';
+/**
+ * Rungs 4 and 5 of the recovery ladder.
+ *
+ * The reason now comes from container-recovery.js rather than a constant here,
+ * because the capability is real: it is a compose change away rather than a
+ * code change away, and a hardcoded "this can never work" would be wrong the
+ * moment the proxy is wired up. Kept as an export because the console and the
+ * tests both name it.
+ */
+const DOCKER_REASON = dockerRecovery.unavailableReason();
 
 /** Last run per command, for the cooldown. */
 const lastRun = new Map();
+
+// ── Grading a queue, so "recovered" means something ─────────────────────────
+
+/**
+ * Is this ONE queue healthy, and if not, exactly why?
+ *
+ * Separate from the collector's card status on purpose. The card rolls up every
+ * queue, so it answers "is the queue subsystem healthy" — which is the right
+ * question for a dashboard tile and the wrong one for "did the thing I just did
+ * to the email queue work".
+ *
+ * Returns `ok: null` for "cannot tell", which is a distinct answer from `false`
+ * and must never be collapsed into either. A queue that does not appear in the
+ * card is not a healthy queue and it is not a broken one; it is a queue we have
+ * no reading for, and a recovery routine that guesses there is lying.
+ *
+ * @returns {{ ok: boolean|null, problems: string[], checked: string[] }}
+ */
+function gradeQueue(q) {
+  if (!q) {
+    return {
+      ok: null,
+      problems: ['no reading: the queue did not appear in the health card'],
+      checked: [],
+    };
+  }
+  if (q.reachable === false) {
+    return { ok: false, problems: ['the queue is unreachable'], checked: ['reachable'] };
+  }
+
+  const problems = [];
+  // Every one of these is a condition the collector itself grades on, so the
+  // routine and the console cannot disagree about what healthy means.
+  if (q.paused) problems.push('the queue is still paused');
+  if (q.starved) problems.push(`${q.waiting} waiting with nothing active — no worker is draining`);
+  const failCrit = queueCollector.CRITICAL_QUEUES.has(q.name) ? 1 : queueCollector.FAILED_CRIT;
+  if ((q.failed ?? 0) >= failCrit) problems.push(`${q.failed} failed job(s)`);
+  if ((q.waiting ?? 0) >= queueCollector.WAITING_WARN) problems.push(`${q.waiting} jobs waiting`);
+
+  return {
+    ok: problems.length === 0,
+    problems,
+    checked: ['reachable', 'paused', 'draining', 'failed', 'backlog'],
+  };
+}
+
+/**
+ * Turn a before/after pair into the verdict the console renders.
+ *
+ * Four outcomes, not a boolean:
+ *
+ *   recovered      it was broken, it is not now, and we checked the conditions
+ *                  that made it broken rather than one proxy for them.
+ *   not_recovered  still failing at least one named condition.
+ *   was_not_broken nothing was wrong before we started. Reported distinctly so
+ *                  the ladder does not take credit for a no-op — this is the
+ *                  case an operator hits when they press the button reflexively.
+ *   unverifiable   we have no post-recovery reading. NOT success. An empty
+ *                  `waiting` count is what a dead worker looks like, so the
+ *                  absence of a signal is never taken as the presence of health.
+ */
+function recoveryVerdict(before, after, drained) {
+  const checks = {
+    post_health_read: after.ok !== null,
+    in_flight_work_finished: drained ? drained.drained === true : null,
+    conditions_checked: after.checked,
+  };
+
+  if (after.ok === null) {
+    return {
+      outcome: 'unverifiable',
+      summary: 'The recovery steps ran, but the queue could not be read afterwards, '
+        + 'so there is no evidence it worked. Treat this as unresolved.',
+      checks,
+    };
+  }
+  if (after.ok === false) {
+    return {
+      outcome: 'not_recovered',
+      summary: `Still unhealthy after the ladder: ${after.problems.join('; ')}.`,
+      checks,
+    };
+  }
+  if (before.ok === true) {
+    return {
+      outcome: 'was_not_broken',
+      summary: 'The queue was already healthy before the ladder ran, and still is. '
+        + 'Nothing was recovered because nothing was wrong.',
+      checks,
+    };
+  }
+  if (drained && drained.drained === false) {
+    // The queue grades clean, but jobs that were running when we paused never
+    // finished inside the window. Saying "recovered" would hide that.
+    return {
+      outcome: 'not_recovered',
+      summary: `The queue grades healthy, but ${drained.active} job(s) were still running `
+        + `after ${Math.round(drained.waited_ms / 1000)}s and never finished. `
+        + 'Something is stuck inside a job, not in the queue.',
+      checks,
+    };
+  }
+  return {
+    outcome: 'recovered',
+    summary: `Recovered. Before: ${before.ok === null ? 'no reading' : before.problems.join('; ')}. `
+      + 'After: reachable, not paused, draining, no failed jobs, no backlog.',
+    checks,
+  };
+}
 
 function assertQueue(name) {
   // The only client-chosen value any handler accepts, and it must be one of the
@@ -335,7 +452,7 @@ const COMMANDS = {
         const { collect } = require('./collectors/queue.collector');
         const card = await collect();
         const mine = (card.data?.queues ?? []).find((x) => x.name === name) ?? null;
-        return { status: card.status, queue: mine };
+        return { status: card.status, queue: mine, verdict: gradeQueue(mine) };
       };
 
       const before = await health();
@@ -356,18 +473,49 @@ const COMMANDS = {
       const after = await health();
       steps.push({ step: 'verify', ...after });
 
-      const recovered = after.status === 'healthy'
-        || (after.queue && after.queue.waiting === 0);
+      // ── What "recovered" is allowed to mean ─────────────────────────────
+      //
+      // It used to mean:
+      //
+      //     after.status === 'healthy' || after.queue.waiting === 0
+      //
+      // The second arm is the problem, and it is not a corner case. An empty
+      // queue is the NORMAL state of a queue whose worker has died: nothing is
+      // draining, but nothing new is arriving either, so `waiting` sits at 0
+      // and the button reports success. The same arm reports success for a
+      // queue with 40 failed jobs, for a queue that is unreachable and
+      // therefore reports nothing, and for one still paused.
+      //
+      // It exists because the first arm is too strict in the other direction:
+      // `card.status` rolls up EVERY queue, so an unrelated sick queue would
+      // mark this recovery a failure. The fix for that is to grade THIS queue
+      // rather than to add an arm that grades nothing.
+      //
+      // So the verdict now comes from gradeQueue(), which names the specific
+      // conditions, and there are four outcomes rather than a boolean — because
+      // "we could not tell" is a real answer and collapsing it into `false`
+      // (or, worse, into `true`) is how an operator ends up trusting a button
+      // that never checked anything.
+      const verdict = recoveryVerdict(before.verdict, after.verdict, drained);
 
       return {
         queue: name,
-        recovered: Boolean(recovered),
+        recovered: verdict.outcome === 'recovered',
+        outcome: verdict.outcome,
+        // The sentence an operator reads. Never "OK".
+        summary: verdict.summary,
+        // What was actually checked, so the verdict is arguable rather than
+        // asserted — the same property the Guardian's confidence figure has.
+        verified: verdict.checks,
+        residual_problems: after.verdict.problems,
+        health_before: before.verdict,
+        health_after: after.verdict,
         steps,
         // Honest about where the ladder stops on this deployment.
-        next_rung: recovered ? null : {
+        next_rung: verdict.outcome === 'recovered' ? null : {
           command: 'worker.restart',
-          available: false,
-          reason: DOCKER_REASON,
+          available: !dockerRecovery.unavailableReason(),
+          reason: dockerRecovery.unavailableReason(),
         },
       };
     },
@@ -377,22 +525,45 @@ const COMMANDS = {
   // Present so the console shows the whole ladder and says exactly what is
   // missing, rather than hiding the rungs and looking complete.
 
+  // ── Recovery ladder, rungs 4–5 ────────────────────────────────────────────
+  //
+  // These reach Docker, and therefore they reach the host. What keeps that from
+  // being a remote shell is container-recovery.js: one verb, targets resolved
+  // from the environment rather than from the caller, and a socket-proxy rather
+  // than the socket. See that file's header — the constraints are properties
+  // asserted by tests, not conventions.
+  //
+  // `unavailable` is computed per target, so a deployment that wires the worker
+  // but not the API gets one runnable rung and one explained one.
+
   'worker.restart': {
     label: 'Restart worker container',
     description: 'Rung 4: restarts the worker container after pause/drain/resume did not recover it.',
     blastRadius: 'The worker stops for a few seconds. In-flight jobs get SIGTERM with a 30s grace.',
     destructive: true,
-    get unavailable() { return DOCKER_REASON; },
-    async run() { throw new Error(DOCKER_REASON); },
+    cooldownMs: 60_000,
+    get unavailable() { return dockerRecovery.unavailableReason('worker'); },
+    async run() {
+      const out = await dockerRecovery.restart('worker');
+      if (!out.ok) throw new Error(out.reason);
+      return out;
+    },
   },
 
   'container.restart': {
     label: 'Restart API container',
     description: 'Rung 5: last resort before paging a human.',
-    blastRadius: 'The API is unreachable for a few seconds. Every in-flight request fails.',
+    blastRadius:
+      'The API is unreachable for a few seconds. Every in-flight request fails — '
+      + 'INCLUDING THIS ONE, so the response may never arrive even when the restart works.',
     destructive: true,
-    get unavailable() { return DOCKER_REASON; },
-    async run() { throw new Error(DOCKER_REASON); },
+    cooldownMs: 60_000,
+    get unavailable() { return dockerRecovery.unavailableReason('api'); },
+    async run() {
+      const out = await dockerRecovery.restart('api');
+      if (!out.ok) throw new Error(out.reason);
+      return out;
+    },
   },
 };
 
@@ -509,4 +680,7 @@ async function run(name, { req, queue, confirm, dryRun = false } = {}) {
 /** Tests only. */
 function _resetCooldowns() { lastRun.clear(); }
 
-module.exports = { COMMANDS, list, run, drainQueue, _resetCooldowns, DOCKER_REASON, registry };
+module.exports = {
+  COMMANDS, list, run, drainQueue, _resetCooldowns, DOCKER_REASON, registry,
+  gradeQueue, recoveryVerdict, dockerRecovery,
+};
