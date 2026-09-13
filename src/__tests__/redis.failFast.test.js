@@ -112,3 +112,29 @@ describe('the fail-fast client rejects rather than waiting', () => {
     delete process.env.REDIS_COMMAND_TIMEOUT_MS;
   }, 10_000);
 });
+
+// ── The orchestrator probe stays separate, and stays cheap ─────────────────
+//
+// /api/health and the Command Center snapshot answer different questions for
+// different callers. Collapsing them is a tempting "consolidation" and would
+// be wrong in both directions: routing a liveness check through the collector
+// registry makes it expensive enough to cause restart loops during the exact
+// incident it exists to survive, and routing the console through this throws
+// away every grade, threshold and reason the cards carry.
+
+describe('/api/health is not the Command Center', () => {
+  const src = code('lib/health.js');
+
+  it('does not pull in the collector registry', () => {
+    expect(src).not.toMatch(/command-center/);
+    expect(src).not.toMatch(/snapshot\.collect/);
+  });
+
+  it('bounds its Redis probe rather than calling the client bare', () => {
+    // The shared client keeps ioredis's offline queue, so an unbounded command
+    // during an outage waits for the process lifetime. redis.ping() carries
+    // ensureReady()'s timeout; client.ping() would not.
+    expect(src).toMatch(/redis\.ping\(\)/);
+    expect(src).not.toMatch(/getClient\(\)\.ping\(\)/);
+  });
+});
