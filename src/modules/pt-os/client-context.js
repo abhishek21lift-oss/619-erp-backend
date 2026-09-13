@@ -50,6 +50,8 @@ const { buildRecovery } = require('./recovery');
 const { buildTrainingHistory, isoWeek } = require('./training-history');
 const { evaluate, equipmentFrom, weeklyMuscleGroups, screenExercise } = require('./programming-rules');
 const { normaliseName } = require('./plan-critic');
+const { volumeLandmarks, deloadTriggers } = require('./programming-rules');
+const { detectSignals, summariseRoster } = require('./training-signals');
 
 /** How far back the training history looks, in weeks. */
 const DEFAULT_WINDOW_WEEKS = 12;
@@ -416,9 +418,96 @@ async function screenPlanExercises(names = [], { orgId, userId, screen } = {}) {
 /** Verdict ordering, so the stricter of two matches wins. */
 const RANK_OF = Object.freeze({ allow: 0, caution: 1, block: 2 });
 
+/**
+ * Every client in the studio, and what their data says without being asked.
+ *
+ * ── Why this is two queries and not thirty-four ───────────────────────────
+ *
+ * The obvious shape — loop the roster, load each client's twin — is ~10
+ * queries per client. For 34 clients that is 340 round trips to answer a
+ * question a trainer wants on a dashboard. So the roster and the sets are
+ * fetched once each and grouped in memory.
+ *
+ * The set pull is bounded by the window and by MAX_SWEEP_SETS. Production
+ * holds 408 completed sets in total, so the whole studio's history costs one
+ * query today; the cap exists so a studio that later imports years of logs
+ * degrades into an incomplete sweep rather than an unbounded read.
+ *
+ * ── Tenancy ───────────────────────────────────────────────────────────────
+ *
+ * Both queries are org-scoped in their own WHERE clause rather than one being
+ * trusted because the other was filtered. `trainerId` narrows further to the
+ * clients that trainer owns, which is what a trainer's own dashboard must
+ * show — an admin passes none and sees the studio.
+ */
+async function sweepRoster(orgId, { trainerId = null, windowWeeks = DEFAULT_WINDOW_WEEKS, today } = {}) {
+  const weeks = Math.max(1, Math.min(104, Number(windowWeeks) || DEFAULT_WINDOW_WEEKS));
+
+  const { rows: clients } = await pool.query(
+    `SELECT c.id, c.name, c.pt_start_date, c.pt_end_date, c.status,
+            (SELECT MAX(ws.session_date)
+               FROM workout_sessions ws
+              WHERE ws.client_id = c.id AND ws.status = 'completed') AS last_session
+       FROM pt_clients c
+      WHERE c.deleted_at IS NULL
+        AND ($1::uuid IS NULL OR c.organization_id = $1)
+        AND ($2::text IS NULL OR c.trainer_id = $2)
+      ORDER BY c.name`,
+    [orgId || null, trainerId || null],
+  );
+  if (!clients.length) return summariseRoster([]);
+
+  const { rows: sets } = await pool.query(
+    `SELECT ws.client_id, wse.exercise_name, s.weight_kg, s.reps, s.rpe, s.rir,
+            s.completed, ws.session_date, e.muscle_group
+       FROM workout_sets s
+       JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+       JOIN workout_sessions ws ON ws.id = wse.session_id
+       JOIN pt_clients c ON c.id = ws.client_id
+       LEFT JOIN exercises e ON e.id = wse.exercise_id
+      WHERE c.deleted_at IS NULL
+        AND ($1::uuid IS NULL OR c.organization_id = $1)
+        AND ($2::text IS NULL OR c.trainer_id = $2)
+        AND ws.session_date >= CURRENT_DATE - ($3 * INTERVAL '1 week')
+      ORDER BY ws.session_date DESC
+      LIMIT ${MAX_SWEEP_SETS}`,
+    [orgId || null, trainerId || null, weeks],
+  );
+
+  const byClient = new Map();
+  for (const row of sets) {
+    if (!byClient.has(row.client_id)) byClient.set(row.client_id, []);
+    byClient.get(row.client_id).push(row);
+  }
+
+  const asOf = today || new Date().toISOString().slice(0, 10);
+  const rows = clients.map((client) => {
+    const clientSets = byClient.get(client.id) || [];
+    // No assignment is passed, so adherence answers null rather than scoring
+    // a client against a plan that does not exist. 24 of the 29 clients with
+    // logged sessions are in exactly that state.
+    const history = buildTrainingHistory({ sets: clientSets, windowWeeks: weeks });
+    const volume = volumeLandmarks(weeklyMuscleGroups(clientSets, isoWeek));
+    return detectSignals({
+      client,
+      today: asOf,
+      lastSession: client.last_session ? String(client.last_session).slice(0, 10) : null,
+      history,
+      volume,
+      deload: deloadTriggers({ history, volume }),
+    });
+  });
+
+  return summariseRoster(rows);
+}
+
+/** Cap on one sweep's set pull. Production's whole studio is 408. */
+const MAX_SWEEP_SETS = 20000;
+
 module.exports = {
   loadDigitalTwin,
   screenPlanExercises,
+  sweepRoster,
   describeTwin,
   limitationsLine,
   adherenceInputs,
