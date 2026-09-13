@@ -457,3 +457,47 @@ describe('plan rosters — real progress, and only the clients you may see', () 
     expect(res.body[0].progress).toBe(73);
   });
 });
+
+describe('closing the loop — a saved plan remembers the proposal it came from', () => {
+  // Until migration 199 nothing recorded that a plan had come from the AI, so
+  // the moment one was saved it became indistinguishable from a plan a trainer
+  // typed by hand — and "what did the trainer change about what we suggested"
+  // had no answer at all. 95 generations had produced 9 live plans.
+
+  it('stamps the generation when the client sends one back', async () => {
+    mockUser = TRAINER_A;
+    const res = await request(app).post('/api/workouts/plans')
+      .send({ name: 'From AI', generation_id: 'gen-7' });
+
+    expect(res.status).toBe(201);
+    const link = pool.query.mock.calls.find(([sql]) =>
+      /UPDATE ai_workout_generations/.test(String(sql)));
+    expect(link).toBeDefined();
+    // Org-scoped inside the UPDATE rather than trusted from the route: a write
+    // that relies on its caller having checked is one bad caller away from
+    // letting one studio stamp another's row.
+    expect(String(link[0]).replace(/\s+/g, ' ')).toMatch(/organization_id = \$3/);
+    expect(link[1][2]).toBe(ORG_A);
+  });
+
+  it('does not touch the ledger when the plan was written by hand', async () => {
+    mockUser = TRAINER_A;
+    await request(app).post('/api/workouts/plans').send({ name: 'Hand written' });
+    expect(sqls().some((s) => /ai_workout_generations/.test(s))).toBe(false);
+  });
+
+  it('still saves the plan when the stamp fails', async () => {
+    mockUser = TRAINER_A;
+    pool.query.mockImplementation((sql) => (/ai_workout_generations/.test(String(sql))
+      ? Promise.reject(new Error('ledger down'))
+      : Promise.resolve({ rows: [{ id: PLAN, organization_id: ORG_A }] })));
+
+    const res = await request(app).post('/api/workouts/plans')
+      .send({ name: 'From AI', generation_id: 'gen-7' });
+
+    // The trainer just saved this. Provenance bookkeeping must never be the
+    // reason their work does not persist.
+    expect(res.status).toBe(201);
+  });
+});
+

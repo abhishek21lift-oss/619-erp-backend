@@ -348,6 +348,12 @@ const DOMAINS = {
       'ai_documents', 'ai_document_chunks', 'ai_conversations', 'ai_messages',
       'ai_usage_log', 'ai_action_plans', 'ai_model_rates', 'ai_provider_settings',
       'agent_tasks', 'agent_audit_log', 'organization_ai_limits',
+      // The programming engine's proposal ledger (migration 199): what the AI
+      // suggested for a client, the screen and audit as they stood at the
+      // time, and whether a trainer accepted it. Owned here rather than by
+      // `training` because a proposal is not a plan — most are never accepted
+      // and never become one.
+      'ai_workout_generations',
     ],
   },
 
