@@ -31,8 +31,11 @@
 // the safety screen — those stay deterministic, and an override here can only
 // narrow what is suggested, never widen what is permitted.
 
+const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
 const { planExercises, normaliseName } = require('./plan-critic');
+const { materialise } = require('./plan-materialise');
+const { resolveExerciseNames } = require('./client-context');
 
 /** Times a trainer must do the same thing before it reads as a preference. */
 const MIN_REPEATS_FOR_PATTERN = 2;
@@ -242,7 +245,126 @@ function describeMemory(memory) {
   return L.join('\n');
 }
 
+/**
+ * Save a proposal as a real programme, and link the two.
+ *
+ * ── Why the plan comes from the ledger, not the request ───────────────────
+ *
+ * The obvious API would take the generated plan in the request body. This
+ * takes only an id and reads the plan back from ai_workout_generations, and
+ * that is the whole security model of the endpoint:
+ *
+ *   · What gets saved is exactly what was generated, screened and audited.
+ *     A body-shaped API would let a caller post any plan at all and have it
+ *     filed as an accepted AI proposal — including exercises the safety screen
+ *     had excluded, with the screen's own record attached saying they were not.
+ *   · The accept link cannot be wrong, because there is nothing to correlate.
+ *
+ * ── Everything, or nothing ────────────────────────────────────────────────
+ *
+ * Plan, exercises and the accept stamp are one transaction. A half-saved
+ * programme is worse than a failed save: the trainer sees a plan in their list
+ * with three of nine exercises and no way to tell which six are missing.
+ *
+ * The exception is exercises that do not resolve to the library, which are
+ * expected rather than exceptional — about one name in eight, measured — and
+ * are reported by name and day instead of failing the save.
+ */
+async function acceptGeneration({ generationId, orgId, userId, name = null } = {}) {
+  if (!generationId) return { ok: false, reason: 'no_generation' };
+
+  const { rows } = await pool.query(
+    `SELECT id, client_id, proposed_plan, accepted_plan_id
+       FROM ai_workout_generations
+      WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2)`,
+    [generationId, orgId || null],
+  );
+  const generation = rows[0];
+  // Not this studio's, or never existed. One answer for both, so the endpoint
+  // cannot be used to probe which generation ids exist.
+  if (!generation) return { ok: false, reason: 'not_found' };
+  if (generation.accepted_plan_id) {
+    return { ok: false, reason: 'already_accepted', plan_id: generation.accepted_plan_id };
+  }
+
+  const proposed = generation.proposed_plan || {};
+  const resolver = await resolveExerciseNames(
+    planExercises(proposed).map((e) => e.name),
+    { orgId, userId },
+  );
+  const built = materialise(proposed, resolver);
+
+  if (!built.exercises.length) {
+    // Saving an empty plan and calling the proposal accepted would poison the
+    // memory: it would compare a full proposal against nothing and read every
+    // exercise as one the trainer removed.
+    return { ok: false, reason: 'nothing_resolved', unresolved: built.unresolved };
+  }
+
+  const planId = randomUUID();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `INSERT INTO workout_plans
+         (id, name, description, goal, difficulty, duration_weeks, sessions_per_week,
+          is_template, is_active, created_by, organization_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, false, true, $8, $9)`,
+      [planId, name || built.plan.name, proposed.description || null,
+        built.plan.goal, built.plan.difficulty,
+        built.plan.duration_weeks, built.plan.sessions_per_week,
+        userId || null, orgId || null],
+    );
+
+    for (const ex of built.exercises) {
+      await client.query(
+        `INSERT INTO workout_exercises
+           (id, workout_plan_id, exercise_id, day_of_week, week_number, sort_order,
+            sets, reps, rest_seconds, notes, tempo, rpe, config)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [randomUUID(), planId, ex.exercise_id, ex.day_of_week, ex.week_number, ex.sort_order,
+          ex.sets ?? 3, ex.reps ?? 10, ex.rest_seconds ?? 60, ex.notes,
+          ex.tempo, ex.rpe, ex.config ? JSON.stringify(ex.config) : null],
+      );
+    }
+
+    // The accept stamp rides the SAME transaction. Marking it outside would
+    // leave a plan that exists with a proposal that still reads as rejected,
+    // which is the one state the memory cannot recover from.
+    const { rowCount } = await client.query(
+      `UPDATE ai_workout_generations
+          SET accepted_plan_id = $2, accepted_at = NOW()
+        WHERE id = $1 AND accepted_plan_id IS NULL`,
+      [generationId, planId],
+    );
+    if (!rowCount) {
+      // Another request accepted it while this one was building. Theirs wins.
+      await client.query('ROLLBACK');
+      return { ok: false, reason: 'already_accepted' };
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  return {
+    ok: true,
+    plan_id: planId,
+    client_id: generation.client_id,
+    name: name || built.plan.name,
+    saved: built.counts.saved,
+    unresolved: built.unresolved,
+    unknown_days: built.unknown_days,
+  };
+}
+
 module.exports = {
+  acceptGeneration,
   recordGeneration,
   markAccepted,
   recentGenerations,

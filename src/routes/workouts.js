@@ -8,7 +8,7 @@ const { auth, adminManagerOrTrainer } = require('../middleware/auth');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
-const { markAccepted } = require('../modules/pt-os/programming-memory');
+const { markAccepted, acceptGeneration } = require('../modules/pt-os/programming-memory');
 const logger = require('../lib/logger');
 
 // '/api/workouts/exercises' and '/exercises/meta' were here: read-only
@@ -468,6 +468,84 @@ router.get('/plans/:id', auth, async (req, res, next) => {
 });
 
 // POST /api/workouts/plans
+// POST /api/workouts/plans/from-generation
+//
+// Save an AI proposal as a real programme.
+//
+// ── What this closes ───────────────────────────────────────────────────────
+//
+// The generator has never been able to save. Every consumer of a generated
+// plan renders it — the client card's preview says "nothing has been saved" in
+// so many words — and the one dialog that creates a plan creates an empty one
+// for the builder to fill by hand. Production: 95 generations, 9 live plans,
+// and the nine were typed.
+//
+// So stages 4 and 5 had nothing to attach to. The audit judged plans nobody
+// could keep, and the memory could never see a trainer's edits because there
+// was never an accepted proposal to diff against.
+//
+// ── It takes an id, not a plan ─────────────────────────────────────────────
+//
+// The plan is read back from the ledger rather than accepted from the body.
+// A body-shaped API would let any caller post any plan and have it filed as an
+// accepted AI proposal — including exercises the safety screen excluded, with
+// that screen's own record attached saying they were not. See acceptGeneration.
+router.post('/plans/from-generation', auth, adminManagerOrTrainer, async (req, res, next) => {
+  const { generation_id: generationId, name } = req.body || {};
+  if (!generationId) return res.status(400).json({ error: 'generation_id is required' });
+
+  try {
+    const out = await acceptGeneration({
+      generationId: String(generationId),
+      orgId: orgIdOf(req),
+      userId: req.user.id,
+      name: typeof name === 'string' && name.trim() ? name.trim() : null,
+    });
+
+    if (!out.ok) {
+      // 409 for "already accepted" rather than 400: the caller did nothing
+      // wrong, the state moved. The existing plan id comes back so the UI can
+      // navigate to it instead of showing a failure for work that succeeded.
+      if (out.reason === 'already_accepted') {
+        return res.status(409).json({
+          error: 'This proposal has already been saved',
+          code: 'ALREADY_ACCEPTED',
+          plan_id: out.plan_id ?? null,
+        });
+      }
+      if (out.reason === 'nothing_resolved') {
+        return res.status(422).json({
+          error: 'None of the exercises in this plan are in the library',
+          code: 'NOTHING_RESOLVED',
+          unresolved: out.unresolved,
+        });
+      }
+      return res.status(404).json({ error: 'Generation not found' });
+    }
+
+    logger.info({
+      generation_id: generationId, plan_id: out.plan_id,
+      saved: out.saved, unresolved: out.unresolved.length,
+    }, 'workout_plan_saved_from_generation');
+
+    // `unresolved` is part of the success payload, not an error. About one
+    // exercise name in eight does not resolve — measured on what trainers
+    // themselves have logged — so the trainer is told which ones to add in the
+    // builder rather than left to notice a short session.
+    res.status(201).json({
+      message: `Saved ${out.saved} exercise${out.saved === 1 ? '' : 's'}`,
+      plan_id: out.plan_id,
+      client_id: out.client_id,
+      name: out.name,
+      saved: out.saved,
+      unresolved: out.unresolved,
+      unknown_days: out.unknown_days,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/plans', auth, adminManagerOrTrainer, async (req, res, next) => {
   const d = req.body;
   if (!d.name?.trim())

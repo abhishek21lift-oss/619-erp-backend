@@ -387,18 +387,46 @@ function limitationsLine(twin, typed = null) {
  * are visible only to their author inside their own org. Fail-closed — no org
  * or no user returns an empty map, so nothing is cleared by an unscoped read.
  */
-async function screenPlanExercises(names = [], { orgId, userId, screen } = {}) {
+async function lookupExercisesByName(names = [], { orgId, userId } = {}) {
   const wanted = [...new Set(names.map(normaliseName).filter(Boolean))];
-  if (!wanted.length || !orgId || !userId || !screen) return new Map();
+  if (!wanted.length || !orgId || !userId) return [];
 
   const { rows } = await pool.query(
-    `SELECT name, muscle_group, body_part, target_muscle, movement_pattern, equipment, difficulty
+    `SELECT id, name, muscle_group, body_part, target_muscle, movement_pattern, equipment, difficulty
        FROM exercises
       WHERE deleted_at IS NULL AND archived_at IS NULL
         AND (organization_id IS NULL OR (organization_id = $1::uuid AND created_by = $2))
         AND regexp_replace(lower(btrim(name)), '[^a-z0-9]+', ' ', 'g') = ANY($3::text[])`,
     [orgId, userId, wanted],
   );
+  return rows;
+}
+
+/**
+ * Normalised name → the library row to file it under.
+ *
+ * The same lookup the screen uses, returning the id rather than a verdict:
+ * saving a generated plan needs an exercise_id, which is NOT NULL with a
+ * foreign key, and a name that does not resolve cannot be stored at all.
+ *
+ * Where two library rows normalise onto one name — four pairs do, every one
+ * sharing a target_muscle — the FIRST is kept and the choice is arbitrary by
+ * admission. That is safe here in a way it is not for screening: both rows are
+ * the same exercise, so filing under either is correct, whereas clearing a
+ * safety verdict from the more permissive twin would not be.
+ */
+async function resolveExerciseNames(names = [], { orgId, userId } = {}) {
+  const out = new Map();
+  for (const row of await lookupExercisesByName(names, { orgId, userId })) {
+    const key = normaliseName(row.name);
+    if (!out.has(key)) out.set(key, { id: row.id, name: row.name });
+  }
+  return out;
+}
+
+async function screenPlanExercises(names = [], { orgId, userId, screen } = {}) {
+  if (!screen) return new Map();
+  const rows = await lookupExercisesByName(names, { orgId, userId });
 
   const out = new Map();
   for (const row of rows) {
@@ -507,6 +535,7 @@ const MAX_SWEEP_SETS = 20000;
 module.exports = {
   loadDigitalTwin,
   screenPlanExercises,
+  resolveExerciseNames,
   sweepRoster,
   describeTwin,
   limitationsLine,
