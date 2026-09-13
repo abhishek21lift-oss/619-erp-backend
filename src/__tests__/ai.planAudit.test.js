@@ -91,6 +91,7 @@ function mockDb({ history = [] } = {}) {
       return Promise.resolve({ rows: [{ id: 'gen-1' }] });
     }
     if (/FROM ai_workout_generations/.test(sql)) return Promise.resolve({ rows: history });
+    if (/FROM muscle_volume_landmarks/.test(sql)) return Promise.resolve({ rows: [] });
     const rows =
       /FROM pt_clients/.test(sql) ? [CLIENT]
         : /FROM pt_parq_forms/.test(sql)

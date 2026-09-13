@@ -223,28 +223,30 @@ function detectSignals({
   // under-trained muscle group on somebody who has not been in for a month is
   // a symptom of the silence, not a separate finding.
   if (volume && volume.weeks_observed && (quietFor === null || quietFor < QUIET_DAYS)) {
-    if (volume.under_mev.length) {
+    // The ranges are the studio's own, edited in analytics, so a finding here
+    // is measured against what this gym decided rather than a constant.
+    if (volume.below.length) {
       push({
         id: 'undertrained',
         severity: SEVERITY.INFO,
-        headline: `Below the working range on ${volume.under_mev.join(', ')}`,
-        evidence: volume.groups
-          .filter((g) => volume.under_mev.includes(g.group))
-          .map((g) => `${g.group} ${g.latest_sets} sets vs ${g.landmark.mev} minimum`)
+        headline: `Below the working range on ${volume.below.join(', ')}`,
+        evidence: volume.muscles
+          .filter((m) => volume.below.includes(m.muscle))
+          .map((m) => `${m.muscle} ${m.latest_sets} sets vs ${m.mev_sets} minimum`)
           .join('; '),
         recommendation: 'Add a set or two per session, or a second exposure in the week.',
       });
     }
-    if (volume.over_mrv.length) {
+    if (volume.above.length) {
       push({
         id: 'overreaching',
         severity: SEVERITY.WARNING,
-        headline: `Above the recoverable range on ${volume.over_mrv.join(', ')}`,
-        evidence: volume.groups
-          .filter((g) => volume.over_mrv.includes(g.group))
-          .map((g) => `${g.group} ${g.latest_sets} sets vs ${g.landmark.mrv} ceiling`)
+        headline: `Above the recoverable range on ${volume.above.join(', ')}`,
+        evidence: volume.muscles
+          .filter((m) => volume.above.includes(m.muscle))
+          .map((m) => `${m.muscle} ${m.latest_sets} sets vs ${m.mrv_sets} ceiling`)
           .join('; '),
-        recommendation: 'Cut volume on that group before it costs a session.',
+        recommendation: 'Cut volume on that muscle before it costs a session.',
       });
     }
   } else if (volume && !volume.weeks_observed) {

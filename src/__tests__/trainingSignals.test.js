@@ -50,10 +50,16 @@ const client = (o = {}) => ({
 const detect = (o = {}) => detectSignals({ client: client(), today: TODAY, ...o });
 
 /** Completed sets for one exercise across N distinct sessions. */
-const sets = (name, loads, muscle = 'Legs') => loads.map((weight_kg, i) => ({
+const sets = (name, loads, muscle = 'Quadriceps') => loads.map((weight_kg, i) => ({
   exercise_name: name, weight_kg, reps: 8, rpe: null, rir: null,
-  completed: true, session_date: daysAgo(20 - i * 3), muscle_group: muscle,
+  completed: true, session_date: daysAgo(20 - i * 3), target_muscle: muscle,
 }));
+
+/** The studio's ranges, as the platform seeds them. */
+const RANGES = new Map([
+  ['Lats', { mev_sets: 10, mrv_sets: 25 }],
+  ['Chest', { mev_sets: 8, mrv_sets: 22 }],
+]);
 
 describe('the term decides what silence means', () => {
   it('flags a client who is paying and not coming', () => {
@@ -182,12 +188,13 @@ describe('training signals reuse stages 1 and 2', () => {
 });
 
 describe('volume', () => {
-  const volume = (n) => volumeLandmarks([{ week: '2026-W37', groups: { Back: n } }]);
+  const volume = (n) => volumeLandmarks([{ week: '2026-W37', muscles: { Lats: n } }], RANGES);
 
   it('flags an under-trained group for someone actually training', () => {
     const s = detect({ lastSession: daysAgo(2), volume: volume(3) })
       .signals.find((x) => x.id === 'undertrained');
-    expect(s.evidence).toContain('Back 3 sets vs 10 minimum');
+    // Measured against the studio's own range, not a constant in the engine.
+    expect(s.evidence).toContain('Lats 3 sets vs 10 minimum');
   });
 
   it('stays quiet about volume for a client who has gone quiet', () => {
@@ -198,7 +205,7 @@ describe('volume', () => {
   });
 
   it('flags overreaching as louder than under-training', () => {
-    const over = volumeLandmarks([{ week: '2026-W37', groups: { Back: 30 } }]);
+    const over = volumeLandmarks([{ week: '2026-W37', muscles: { Lats: 30 } }], RANGES);
     const s = detect({ lastSession: daysAgo(2), volume: over })
       .signals.find((x) => x.id === 'overreaching');
     expect(s.severity).toBe(SEVERITY.WARNING);
@@ -208,9 +215,9 @@ describe('volume', () => {
 describe('deload', () => {
   it('passes through a trigger that actually fired', () => {
     const volume = volumeLandmarks([
-      { week: '2026-W36', groups: { Chest: 30 } },
-      { week: '2026-W37', groups: { Chest: 26 } },
-    ]);
+      { week: '2026-W36', muscles: { Chest: 30 } },
+      { week: '2026-W37', muscles: { Chest: 26 } },
+    ], RANGES);
     const history = buildTrainingHistory({ sets: sets('Bench Press', [60, 60, 60], 'Chest') });
     const s = detect({ lastSession: daysAgo(2), history, volume, deload: deloadTriggers({ history, volume }) })
       .signals.find((x) => x.id === 'deload_due');

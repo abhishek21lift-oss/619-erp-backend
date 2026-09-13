@@ -216,35 +216,32 @@ const DIFFICULTY_CEILING = Object.freeze({
 });
 
 /**
- * Weekly hard sets per muscle group: minimum effective, adaptive, maximum
- * recoverable.
+ * Volume landmarks are the STUDIO'S, not this file's.
  *
- * ── Read this before trusting the numbers ─────────────────────────────────
+ * The first version of this module hardcoded weekly set ranges here, keyed on
+ * the library's coarse `muscle_group` — seven values, so quadriceps,
+ * hamstrings, glutes and calves shared one number called "Legs" — and
+ * documented at length why they had to be coarse.
  *
- * These are published strength-and-conditioning heuristics, not values derived
- * from this studio's own outcomes. The studio has 379 attributable completed
- * sets across two logged weeks — nowhere near enough to fit landmarks to, and
- * saying so is more useful than a number that looks earned and is not.
+ * They did not. `muscle_volume_landmarks` already existed: twelve seeded rows
+ * keyed on `target_muscle`, an `organization_id` column so a studio can set
+ * its own, and a UI (analytics/LandmarkEditor) where a trainer edits them.
+ * workout-log.routes.js has been resolving and serving them the whole time.
  *
- * They are also stated against a COARSE grouping. The library's muscle_group
- * has seven values, so "Legs" is quadriceps, hamstrings, glutes and calves in
- * one bucket and "Arms" is biceps and triceps. Published landmarks are
- * per-muscle, so the ranges below are widened to account for that, and the
- * per-target_muscle split is reported alongside every verdict so a trainer can
- * see what a "Legs 20" was actually made of.
+ * So the constants were worse than redundant. A studio that tuned its ranges
+ * saw them respected on the analytics screen and silently ignored by the
+ * programming engine, which judged the same client against numbers nobody in
+ * the building had chosen.
  *
- * Cardio is null on purpose. Sets are the wrong unit for it and a landmark
- * would be a category error, so it is counted and not judged.
+ * The ranges now arrive as an argument, resolved by the caller through the
+ * same "the studio's row, else the platform default" query the analytics
+ * screen uses. This file states no ranges of its own.
+ *
+ * Note what is gone with them: the "adaptive" middle band. The table holds
+ * mev_sets and mrv_sets. The MAV this file used to report sat between them
+ * with nothing behind it, which made `above_mav` a verdict no measurement
+ * supported.
  */
-const LANDMARKS = Object.freeze({
-  Chest: { mev: 8, mav: 16, mrv: 22 },
-  Back: { mev: 10, mav: 20, mrv: 26 },
-  Legs: { mev: 10, mav: 20, mrv: 28 },
-  Shoulders: { mev: 8, mav: 18, mrv: 24 },
-  Arms: { mev: 6, mav: 16, mrv: 24 },
-  Core: { mev: 4, mav: 12, mrv: 20 },
-  Cardio: null,
-});
 
 /**
  * The equipment vocabulary, exactly as the library spells it.
@@ -289,24 +286,28 @@ function equipmentFrom(text) {
 }
 
 /**
- * Completed sets → the weekly per-muscle-group counts volumeLandmarks reads.
+ * Completed sets → the weekly per-muscle counts volumeLandmarks reads.
  *
- * `sets` carry a session_date and the muscle_group their exercise joins to.
+ * Keyed on `target_muscle`, matching the landmarks table and the analytics
+ * screen. The first version grouped on `muscle_group`, which has seven values,
+ * so no per-muscle range could be applied to any of the four leg muscles.
+ *
+ * `sets` carry a session_date and the target_muscle their exercise joins to.
  * 29 of 408 completed sets in production have no exercise_id — a name typed
  * free-hand into the log — so they cannot be attributed to a muscle at all.
  * They are counted as `unattributable` rather than dropped, because a group
  * that looks untrained may simply be the part of the log that would not join.
  */
-function weeklyMuscleGroups(sets = [], isoWeekOf) {
+function weeklyMuscleSets(sets = [], isoWeekOf) {
   const byWeek = new Map();
   for (const s of sets) {
     if (s?.completed !== true) continue;
     const week = isoWeekOf(s.session_date);
     if (!week) continue;
-    if (!byWeek.has(week)) byWeek.set(week, { week, groups: {}, unattributable: 0 });
+    if (!byWeek.has(week)) byWeek.set(week, { week, muscles: {}, unattributable: 0 });
     const row = byWeek.get(week);
-    const group = str(s.muscle_group);
-    if (group) row.groups[group] = (row.groups[group] || 0) + 1;
+    const muscle = str(s.target_muscle);
+    if (muscle) row.muscles[muscle] = (row.muscles[muscle] || 0) + 1;
     else row.unattributable += 1;
   }
   return [...byWeek.values()].sort((a, b) => (a.week < b.week ? -1 : 1));
@@ -641,63 +642,65 @@ function screenLibrary(exercises = [], screen = {}) {
  * `unattributable` rather than dropped, because a muscle group that looks
  * under-trained may simply be the part of the log that would not join.
  */
-function volumeLandmarks(weeks = []) {
-  const groups = new Map();
+function volumeLandmarks(weeks = [], landmarks = new Map()) {
+  const muscles = new Map();
   let unattributable = 0;
 
   for (const w of weeks) {
     unattributable += Number(w?.unattributable) || 0;
-    for (const [group, sets] of Object.entries(w?.groups || {})) {
+    for (const [muscle, sets] of Object.entries(w?.muscles || {})) {
       const n = Number(sets);
       if (!Number.isFinite(n)) continue;
-      if (!groups.has(group)) groups.set(group, []);
-      groups.get(group).push({ week: w.week, sets: n });
+      if (!muscles.has(muscle)) muscles.set(muscle, []);
+      muscles.get(muscle).push({ week: w.week, sets: n });
     }
   }
 
-  const rows = [...groups.entries()].map(([group, series]) => {
-    const mark = LANDMARKS[group] ?? null;
+  const rows = [...muscles.entries()].map(([muscle, series]) => {
+    const lm = landmarks.get(muscle) ?? {};
+    const mev = Number.isFinite(Number(lm.mev_sets)) ? Number(lm.mev_sets) : null;
+    const mrv = Number.isFinite(Number(lm.mrv_sets)) ? Number(lm.mrv_sets) : null;
     const latest = series[series.length - 1] ?? null;
     const mean = series.length
-      ? Math.round((series.reduce((s, x) => s + x.sets, 0) / series.length) * 10) / 10
+      ? Math.round((series.reduce((sum, x) => sum + x.sets, 0) / series.length) * 10) / 10
       : null;
 
     // Consecutive from the END of the series. An over-reaching week eight
     // weeks ago that was followed by a normal one is history, not a deload
     // trigger; what matters is whether it is still happening.
     let weeksOverMrv = 0;
-    if (mark) {
-      for (let i = series.length - 1; i >= 0 && series[i].sets > mark.mrv; i -= 1) weeksOverMrv += 1;
+    if (mrv !== null) {
+      for (let i = series.length - 1; i >= 0 && series[i].sets > mrv; i -= 1) weeksOverMrv += 1;
     }
 
     return {
-      group,
+      muscle,
       weeks: series,
       latest_sets: latest?.sets ?? null,
       mean_sets: mean,
-      landmark: mark,
-      // Null rather than a word when the group has no landmark — Cardio is
-      // counted in sets and judging it in sets would be a category error.
-      status: mark && latest
-        ? (latest.sets > mark.mrv ? 'over_mrv'
-          : latest.sets < mark.mev ? 'under_mev'
-            : latest.sets > mark.mav ? 'above_mav' : 'in_range')
-        : null,
+      mev_sets: mev,
+      mrv_sets: mrv,
+      // The same vocabulary and the same refusal the analytics screen uses:
+      // null when the studio has no range for this muscle, because a default
+      // verdict would be a judgement nobody made. Six of the library's
+      // eighteen target muscles are unranged today.
+      status: (mev === null && mrv === null) || !latest ? null
+        : mev !== null && latest.sets < mev ? 'below'
+          : mrv !== null && latest.sets > mrv ? 'above'
+            : 'within',
       weeks_over_mrv: weeksOverMrv,
     };
   }).sort((a, b) => (b.latest_sets ?? 0) - (a.latest_sets ?? 0));
 
   return {
-    groups: rows,
-    under_mev: rows.filter((r) => r.status === 'under_mev').map((r) => r.group),
-    over_mrv: rows.filter((r) => r.status === 'over_mrv').map((r) => r.group),
-    // Groups with no sets at all this window are NOT under_mev — they are
-    // untrained, which is a different conversation and may be deliberate.
-    untrained: Object.keys(LANDMARKS).filter((g) => LANDMARKS[g] && !groups.has(g)),
+    muscles: rows,
+    below: rows.filter((r) => r.status === 'below').map((r) => r.muscle),
+    above: rows.filter((r) => r.status === 'above').map((r) => r.muscle),
+    // Trained, but against no range — counted and not judged.
+    unranged: rows.filter((r) => r.status === null).map((r) => r.muscle),
     unattributable_sets: unattributable,
     weeks_observed: new Set(weeks.map((w) => w?.week).filter(Boolean)).size,
-    // Stated so nobody reads these as this studio's own numbers.
-    basis: 'published training-volume heuristics, adapted to the library\'s coarse muscle groups',
+    basis: "the studio's own weekly set ranges, or the platform defaults where it has set none",
   };
 }
 
@@ -748,12 +751,12 @@ function deloadTriggers({ history = null, recovery = null, volume = null } = {})
   if (!volume || !volume.weeks_observed) {
     unobservable.push({ trigger: 'volume_over_mrv', reason: 'no attributable weekly volume' });
   } else {
-    const sustained = (volume.groups || []).filter((g) => g.weeks_over_mrv >= WEEKS_OVER_MRV_FOR_DELOAD);
+    const sustained = (volume.muscles || []).filter((m) => m.weeks_over_mrv >= WEEKS_OVER_MRV_FOR_DELOAD);
     if (sustained.length) {
       triggers.push({
         trigger: 'volume_over_mrv',
         evidence: sustained
-          .map((g) => `${g.group} above ${g.landmark.mrv} sets for ${g.weeks_over_mrv} weeks`)
+          .map((m) => `${m.muscle} above ${m.mrv_sets} sets for ${m.weeks_over_mrv} weeks`)
           .join('; '),
       });
     }
@@ -789,11 +792,11 @@ function deloadTriggers({ history = null, recovery = null, volume = null } = {})
  */
 function evaluate({
   parq, mobility, posture, lifestyle, client, equipment,
-  exercises = [], history = null, recovery = null, weeklyGroups = [],
+  exercises = [], history = null, recovery = null, weeklySets = [], landmarks = new Map(),
 } = {}) {
   const screen = buildConstraints({ parq, mobility, posture, lifestyle, client, equipment });
   const library = screenLibrary(exercises, screen);
-  const volume = volumeLandmarks(weeklyGroups);
+  const volume = volumeLandmarks(weeklySets, landmarks);
   const deload = deloadTriggers({ history, recovery, volume });
 
   return {
@@ -817,7 +820,7 @@ function evaluate({
 
 module.exports = {
   equipmentFrom,
-  weeklyMuscleGroups,
+  weeklyMuscleSets,
   EQUIPMENT,
   buildConstraints,
   screenExercise,
@@ -827,7 +830,6 @@ module.exports = {
   evaluate,
   VERDICTS,
   REGIONS,
-  LANDMARKS,
   MOBILITY_REGIONS,
   POSTURE_ISSUES,
   PARQ_REGION,
