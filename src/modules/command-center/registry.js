@@ -30,6 +30,31 @@ const STATUS = {
   TIMEOUT: 'timeout',
 };
 
+/**
+ * Whose state does a card describe?
+ *
+ * This is not decoration. `runtime` reports the event-loop lag and heap of ONE
+ * Node process; `http` reports the request-timing ring of ONE process. On a
+ * deployment with two API replicas, a green runtime card means "the container
+ * that happened to serve this request is fine", which is a materially weaker
+ * claim than the one the same green dot makes on the database card beside it.
+ *
+ * An operator reading a wall of identical tiles has no way to know which is
+ * which, so the card carries it and the UI can say so.
+ *
+ * PLATFORM is the default deliberately: a collector that does not declare a
+ * scope is treated as describing the platform, and the mistake that direction
+ * — a process-local card mislabelled platform-wide — is the one that
+ * overstates. It is caught by the test that pins the real build's split rather
+ * than by hoping each author remembers.
+ */
+const SCOPE = {
+  /** True of the whole platform: the database, Redis, the queues, the tenants. */
+  PLATFORM: 'platform',
+  /** True only of the API process that answered this request. */
+  PROCESS: 'process',
+};
+
 const SEVERITY_ORDER = [
   STATUS.HEALTHY,
   STATUS.UNAVAILABLE,
@@ -219,15 +244,21 @@ const registry = new Map();
  * @param {number} [opts.ttlMs=0]  serve a cached value for this long. Sampling
  *   memory every second is free; asking Docker to list containers every second
  *   is not, and neither is a Postgres stats query.
+ * @param {'platform'|'process'} [opts.scope='platform'] whose state this
+ *   describes. See SCOPE above.
  */
 function register(name, collect, opts = {}) {
   if (registry.has(name)) throw new Error(`Collector already registered: ${name}`);
   if (typeof collect !== 'function') throw new Error(`Collector ${name} must be a function`);
+  if (opts.scope && !Object.values(SCOPE).includes(opts.scope)) {
+    throw new Error(`Collector ${name} has an unknown scope: ${opts.scope}`);
+  }
   registry.set(name, {
     name,
     collect,
     timeoutMs: opts.timeoutMs ?? 3000,
     ttlMs: opts.ttlMs ?? 0,
+    scope: opts.scope ?? SCOPE.PLATFORM,
   });
 }
 
@@ -236,7 +267,7 @@ function names() { return [...registry.keys()]; }
 function clear() { registry.clear(); inflight.clear(); }
 
 module.exports = {
-  STATUS, SEVERITY_ORDER, rollup,
+  STATUS, SCOPE, SEVERITY_ORDER, rollup,
   result, unavailable, runCollector,
   register, get, names, clear,
   inflightCount,

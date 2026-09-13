@@ -25,6 +25,10 @@ const mockQueueNames = ['email', 'whatsapp', 'ai', 'notifications', 'membership-
 // hope that the code path was not taken.
 const mockRedis = {
   isConfigured: jest.fn(() => true),
+  // Configured but NOT connected, so coordination.js uses its in-process
+  // fallback and these tests exercise the allow-list rather than Redis. The
+  // shared-cooldown path has its own file: commandCenter.coordination.test.js.
+  isReady: jest.fn(() => false),
   ping: jest.fn(async () => 'PONG'),
   getClient: jest.fn(() => { throw new Error('commands must not take a raw Redis client'); }),
   flushdb: jest.fn(),

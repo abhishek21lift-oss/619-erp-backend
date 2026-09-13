@@ -102,13 +102,29 @@ router.get('/command-center/snapshot', wrap(async (req, res) => {
  * behind a proxy — which it does here.
  */
 router.post('/command-center/stream-ticket', wrap(async (req, res) => {
-  const { ticket, expires_in_ms } = tickets.issue(req.user);
+  const { ticket, expires_in_ms } = await tickets.issue(req.user);
   res.json({ data: { ticket, expires_in_ms, path: stream.PATH, tick_ms: stream.TICK_MS } });
 }));
 
-/** The card names this build knows about, for the client to render a grid. */
+/**
+ * The card names this build knows about, for the client to render a grid —
+ * each with the SCOPE of what it measures.
+ *
+ * `runtime` and `http` describe the one API process that answered; everything
+ * else describes the platform. An operator reading a wall of identical green
+ * tiles cannot otherwise tell that two of them make a much weaker claim than
+ * the rest, and behind a second replica that difference is the whole story.
+ */
 router.get('/command-center/cards', wrap(async (_req, res) => {
-  res.json({ data: { cards: registry.names(), statuses: Object.values(registry.STATUS) } });
+  res.json({
+    data: {
+      cards: registry.names(),
+      statuses: Object.values(registry.STATUS),
+      scopes: Object.fromEntries(
+        registry.names().map((n) => [n, registry.get(n)?.scope ?? registry.SCOPE.PLATFORM]),
+      ),
+    },
+  });
 }));
 
 /**
@@ -398,7 +414,19 @@ router.get('/command-center/logs/history', wrap(async (req, res) => {
     };
   }
 
-  res.json({ data: { lines: rows, stats, next_before } });
+  res.json({
+    data: {
+      lines: rows,
+      stats,
+      next_before,
+      // The counterpart to the note on /logs above. That one is this process's
+      // ring buffer; this one is durable and spans both containers, and an
+      // operator moving between the two tabs needs to know which they are
+      // reading — the tabs otherwise look like the same data at two depths.
+      scope_note: 'Persisted platform-wide: errors and above from every container '
+        + `(api and worker), retained ${logCapture.retentionDays()} days.`,
+    },
+  });
 }));
 
 module.exports = router;

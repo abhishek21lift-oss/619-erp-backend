@@ -59,19 +59,28 @@ const CONSECUTIVE_TO_OPEN = 2;
 const CONSECUTIVE_TO_CLEAR = 3;
 
 /**
- * Consecutive-observation counters, per fingerprint: { bad, good }.
+ * How long a silent fingerprint keeps its counters.
  *
- * In memory rather than in the table because this is transient observation
- * state, not history — and losing it on restart is correct, not a bug: a fresh
- * process has made no observations. Open alerts live in Postgres and survive.
+ * Long enough to span several 60s ticks and a rolling deploy; short enough that
+ * a collector that is removed does not leave a key behind forever. Transient
+ * observation state, not history — history is the alert rows in Postgres.
  */
-const streaks = new Map();
+const STREAK_TTL_MS = 15 * 60 * 1000;
 
-function streakFor(fp) {
-  let s = streaks.get(fp);
-  if (!s) { s = { bad: 0, good: 0 }; streaks.set(fp, s); }
-  return s;
-}
+/**
+ * Consecutive-observation counters, per fingerprint.
+ *
+ * Shared across processes via coordination.js rather than held in a Map here.
+ * With one counter per instance the damping window silently multiplied by the
+ * number of instances — and, worse, `streaks.delete(fingerprint)` after a
+ * manual resolve cleared only the memory of the process that served the
+ * request, so another instance still holding `bad: 2` would re-open the alert
+ * an operator had just closed by hand, on its very next tick.
+ *
+ * Falls back to in-process counters when Redis is unreachable. Damping is a
+ * noise control: losing it costs an early alert, never a missed one.
+ */
+const streaks = require('./coordination');
 
 /** Human titles. Falls back to the collector name for one registered later. */
 const TITLES = {
@@ -298,12 +307,13 @@ async function evaluateOnce({ fresh = false } = {}) {
   for (const card of Object.values(snap.cards)) {
     out.evaluated += 1;
     const fp = card.name;
-    const streak = streakFor(fp);
 
     if (ALERTING.has(card.status)) {
-      streak.good = 0;
-      streak.bad += 1;
-      if (streak.bad < CONSECUTIVE_TO_OPEN) continue;
+      // One indivisible move: increment `bad` and zero `good`. A process that
+      // did those as two writes and died between them would leave a
+      // fingerprint two observations from opening and one from closing.
+      const bad = await streaks.bumpStreak(fp, 'bad', STREAK_TTL_MS);
+      if (bad < CONSECUTIVE_TO_OPEN) continue;
 
       try {
         const before = await pool.query(
@@ -335,9 +345,8 @@ async function evaluateOnce({ fresh = false } = {}) {
     }
 
     // Healthy, or unavailable — neither is a problem to alert on.
-    streak.bad = 0;
-    streak.good += 1;
-    if (streak.good < CONSECUTIVE_TO_CLEAR) continue;
+    const good = await streaks.bumpStreak(fp, 'good', STREAK_TTL_MS);
+    if (good < CONSECUTIVE_TO_CLEAR) continue;
 
     try {
       const closed = await autoResolve(fp);
@@ -508,7 +517,9 @@ async function resolve(id, req) {
   // The condition may still be true — a manual resolve does not fix anything.
   // Clearing the streak means the next bad observation starts counting from
   // zero and re-opens honestly, rather than the alert springing back instantly.
-  streaks.delete(rows[0].fingerprint);
+  // Shared, so it clears for every instance rather than only the one that
+  // happened to serve this request.
+  await streaks.clearStreak(rows[0].fingerprint);
 
   await logActivity(req, 'command_center.alert.resolve', 'system_alert', id, {
     source: rows[0].source, severity: rows[0].severity, occurrences: rows[0].occurrences,
@@ -517,10 +528,11 @@ async function resolve(id, req) {
 }
 
 /** Tests only. */
-function _resetStreaks() { streaks.clear(); }
+function _resetStreaks() { streaks._reset(); }
 
 module.exports = {
   evaluate, list, acknowledge, resolve, notify, claimNotification,
   ALERTING, CONSECUTIVE_TO_OPEN, CONSECUTIVE_TO_CLEAR, SEVERITY_RANK, titleFor,
+  STREAK_TTL_MS,
   _resetStreaks,
 };

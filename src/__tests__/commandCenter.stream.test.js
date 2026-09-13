@@ -145,49 +145,52 @@ beforeEach(async () => {
 
 // ── Tickets ─────────────────────────────────────────────────────────────────
 
+/** A freshly minted ticket string. Tickets are async now: the store may be Redis. */
+const nextTicket = async () => (await tickets.issue(OPERATOR)).ticket;
+
 describe('tickets', () => {
-  test('a ticket is redeemable exactly once', () => {
-    const { ticket } = tickets.issue(OPERATOR);
-    expect(tickets.redeem(ticket)).toEqual({ userId: 'usr_1', email: 'ops@myptstudio.com' });
-    expect(tickets.redeem(ticket)).toBeNull();
+  test('a ticket is redeemable exactly once', async () => {
+    const { ticket } = await tickets.issue(OPERATOR);
+    expect(await tickets.redeem(ticket)).toEqual({ userId: 'usr_1', email: 'ops@myptstudio.com' });
+    expect(await tickets.redeem(ticket)).toBeNull();
   });
 
-  test('an unknown or malformed ticket is refused without throwing', () => {
-    expect(tickets.redeem('nope')).toBeNull();
-    expect(tickets.redeem('')).toBeNull();
-    expect(tickets.redeem(undefined)).toBeNull();
-    expect(tickets.redeem(null)).toBeNull();
-    expect(tickets.redeem({ ticket: 'object' })).toBeNull();
+  test('an unknown or malformed ticket is refused without throwing', async () => {
+    expect(await tickets.redeem('nope')).toBeNull();
+    expect(await tickets.redeem('')).toBeNull();
+    expect(await tickets.redeem(undefined)).toBeNull();
+    expect(await tickets.redeem(null)).toBeNull();
+    expect(await tickets.redeem({ ticket: 'object' })).toBeNull();
   });
 
-  test('an expired ticket is refused AND removed, so a replay finds nothing', () => {
+  test('an expired ticket is refused AND removed, so a replay finds nothing', async () => {
     const realNow = Date.now;
     const t0 = realNow();
     Date.now = () => t0;
-    const { ticket } = tickets.issue(OPERATOR);
+    const { ticket } = await tickets.issue(OPERATOR);
 
     // Past the window.
     Date.now = () => t0 + tickets.TTL_MS + 1;
-    expect(tickets.redeem(ticket)).toBeNull();
+    expect(await tickets.redeem(ticket)).toBeNull();
 
     // Back inside it. If the failed redemption had left the record behind, the
     // ticket would come back to life here — which is the bug this guards.
     Date.now = () => t0;
-    expect(tickets.redeem(ticket)).toBeNull();
+    expect(await tickets.redeem(ticket)).toBeNull();
 
     Date.now = realNow;
   });
 
-  test('outstanding tickets are capped, evicting the oldest', () => {
-    const first = tickets.issue(OPERATOR).ticket;
-    for (let i = 0; i < tickets.MAX_OUTSTANDING; i += 1) tickets.issue(OPERATOR);
+  test('outstanding tickets are capped, evicting the oldest', async () => {
+    const first = await nextTicket();
+    for (let i = 0; i < tickets.MAX_OUTSTANDING; i += 1) await tickets.issue(OPERATOR);
     expect(tickets._size()).toBeLessThanOrEqual(tickets.MAX_OUTSTANDING);
-    expect(tickets.redeem(first)).toBeNull();
+    expect(await tickets.redeem(first)).toBeNull();
   });
 
-  test('two tickets are never equal', () => {
+  test('two tickets are never equal', async () => {
     const seen = new Set();
-    for (let i = 0; i < 50; i += 1) seen.add(tickets.issue(OPERATOR).ticket);
+    for (let i = 0; i < 50; i += 1) seen.add(await nextTicket());
     expect(seen.size).toBe(50);
   });
 });
@@ -196,7 +199,7 @@ describe('tickets', () => {
 
 describe('handshake', () => {
   test('a valid ticket connects and the first snapshot arrives immediately', async () => {
-    const { ticket } = tickets.issue(OPERATOR);
+    const { ticket } = await tickets.issue(OPERATOR);
     const ws = await connect({ ticket });
 
     const hello = await nextFrame(ws, 'hello');
@@ -219,7 +222,7 @@ describe('handshake', () => {
   });
 
   test('a ticket already spent on one socket cannot open a second', async () => {
-    const { ticket } = tickets.issue(OPERATOR);
+    const { ticket } = await tickets.issue(OPERATOR);
     const ws = await connect({ ticket });
     await expect(connect({ ticket })).rejects.toMatchObject({ status: 401 });
     ws.close();
@@ -227,13 +230,13 @@ describe('handshake', () => {
   });
 
   test('another path on the same server is refused with 404, not left hanging', async () => {
-    const { ticket } = tickets.issue(OPERATOR);
+    const { ticket } = await tickets.issue(OPERATOR);
     await expect(connect({ ticket, path: '/api/something-else' }))
       .rejects.toMatchObject({ status: 404 });
   });
 
   test('a disallowed Origin is refused with 403 and does not spend the ticket', async () => {
-    const { ticket } = tickets.issue(OPERATOR);
+    const { ticket } = await tickets.issue(OPERATOR);
     await expect(connect({ ticket, origin: 'https://evil.example' }))
       .rejects.toMatchObject({ status: 403 });
 
@@ -246,14 +249,14 @@ describe('handshake', () => {
   });
 
   test('the allowed Origin connects', async () => {
-    const { ticket } = tickets.issue(OPERATOR);
+    const { ticket } = await tickets.issue(OPERATOR);
     const ws = await connect({ ticket, origin: 'https://myptstudio.com' });
     expect(ws.readyState).toBe(WebSocket.OPEN);
     ws.close();
     await closed(ws);
   });
 
-  test('originAllowed permits a missing Origin — the ticket is the gate', () => {
+  test('originAllowed permits a missing Origin — the ticket is the gate', async () => {
     expect(stream._originAllowed(undefined, ['https://myptstudio.com'])).toBe(true);
     expect(stream._originAllowed('https://evil.example', ['https://myptstudio.com'])).toBe(false);
     // An unconfigured allow-list must not lock the operator out of their own
@@ -268,7 +271,7 @@ describe('the tick', () => {
   test('does not run until a client connects, and stops when the last one leaves', async () => {
     expect(stream._isLooping()).toBe(false);
 
-    const { ticket } = tickets.issue(OPERATOR);
+    const { ticket } = await tickets.issue(OPERATOR);
     const ws = await connect({ ticket });
     await nextFrame(ws, 'snapshot');
     expect(stream._isLooping()).toBe(true);
@@ -291,8 +294,8 @@ describe('the tick', () => {
     // CLIENT passed it. The property that actually distinguishes the two is the
     // rate — a shared loop collects once per tick however many people are
     // watching; per-client loops collect N times.
-    const a = await connect({ ticket: tickets.issue(OPERATOR).ticket });
-    const b = await connect({ ticket: tickets.issue(OPERATOR).ticket });
+    const a = await connect({ ticket: await nextTicket() });
+    const b = await connect({ ticket: await nextTicket() });
     await Promise.all([nextFrame(a, 'snapshot'), nextFrame(b, 'snapshot')]);
 
     // Both connections did their own immediate on-connect collect. Measure from
@@ -322,7 +325,7 @@ describe('the tick', () => {
   });
 
   test('a collect that rejects sends an error frame and keeps the stream alive', async () => {
-    const ws = await connect({ ticket: tickets.issue(OPERATOR).ticket });
+    const ws = await connect({ ticket: await nextTicket() });
     await nextFrame(ws, 'snapshot');
 
     mockCollect.mockRejectedValueOnce(new Error('database is on fire'));
@@ -337,7 +340,7 @@ describe('the tick', () => {
   });
 
   test('the refresh message forces a fresh collect, and is rate limited', async () => {
-    const ws = await connect({ ticket: tickets.issue(OPERATOR).ticket });
+    const ws = await connect({ ticket: await nextTicket() });
     await nextFrame(ws, 'snapshot');
 
     mockCollect.mockClear();
@@ -358,7 +361,7 @@ describe('the tick', () => {
   });
 
   test('an unknown or malformed client message is ignored, not answered', async () => {
-    const ws = await connect({ ticket: tickets.issue(OPERATOR).ticket });
+    const ws = await connect({ ticket: await nextTicket() });
     await nextFrame(ws, 'snapshot');
 
     mockCollect.mockClear();
@@ -380,7 +383,7 @@ describe('the tick', () => {
 
 describe('a peer that has stopped draining', () => {
   test('is skipped rather than buffered, and dropped if it never recovers', async () => {
-    const ws = await connect({ ticket: tickets.issue(OPERATOR).ticket });
+    const ws = await connect({ ticket: await nextTicket() });
     await nextFrame(ws, 'snapshot');
 
     // The server's own handle for this socket. `bufferedAmount` is a live
@@ -412,10 +415,10 @@ describe('capacity', () => {
   test('the client cap is enforced with 503, and frees up on disconnect', async () => {
     const open = [];
     for (let i = 0; i < stream.MAX_CLIENTS; i += 1) {
-      open.push(await connect({ ticket: tickets.issue(OPERATOR).ticket }));
+      open.push(await connect({ ticket: await nextTicket() }));
     }
 
-    await expect(connect({ ticket: tickets.issue(OPERATOR).ticket }))
+    await expect(connect({ ticket: await nextTicket() }))
       .rejects.toMatchObject({ status: 503 });
 
     open[0].close();
@@ -423,7 +426,7 @@ describe('capacity', () => {
     // The server's own view of the socket closing is not instantaneous.
     expect(await waitUntil(() => stream._clientCount() === stream.MAX_CLIENTS - 1)).toBe(true);
 
-    const late = await connect({ ticket: tickets.issue(OPERATOR).ticket });
+    const late = await connect({ ticket: await nextTicket() });
     expect(late.readyState).toBe(WebSocket.OPEN);
 
     for (const ws of [...open.slice(1), late]) ws.close();

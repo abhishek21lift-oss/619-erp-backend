@@ -39,12 +39,18 @@ let registered = false;
 /** Idempotent: server.js and the tests may both call this. */
 function registerCollectors() {
   if (registered) return;
-  registry.register(runtime.NAME, runtime.collect, { timeoutMs: 1000, ttlMs: 0 });
+  // PROCESS scope: event-loop lag and heap belong to THIS container, not to
+  // the platform. Behind two replicas a green runtime card says nothing about
+  // the other one, and the console has to be able to say so.
+  registry.register(runtime.NAME, runtime.collect,
+    { timeoutMs: 1000, ttlMs: 0, scope: registry.SCOPE.PROCESS });
   registry.register(redisCollector.NAME, redisCollector.collect, { timeoutMs: 3000, ttlMs: 1000 });
   registry.register(queueCollector.NAME, queueCollector.collect, { timeoutMs: 5000, ttlMs: 2000 });
   registry.register(databaseCollector.NAME, databaseCollector.collect, { timeoutMs: 5000, ttlMs: 5000 });
-  // http reads an in-memory ring — free, so no cache.
-  registry.register(httpCollector.NAME, httpCollector.collect, { timeoutMs: 1000, ttlMs: 0 });
+  // http reads an in-memory ring — free, so no cache, and PROCESS scope for
+  // the same reason as runtime: the ring holds this container's requests.
+  registry.register(httpCollector.NAME, httpCollector.collect,
+    { timeoutMs: 1000, ttlMs: 0, scope: registry.SCOPE.PROCESS });
   // ai/security aggregate over log tables; 10s is well inside a useful window
   // and keeps the console off the product's own database load.
   registry.register(aiCollector.NAME, aiCollector.collect, { timeoutMs: 5000, ttlMs: 10_000 });

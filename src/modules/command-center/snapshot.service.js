@@ -100,12 +100,14 @@ async function collect(opts = {}) {
 
     if (!opts.fresh) {
       const hit = cached(name, entry.ttlMs);
-      if (hit) return hit;
+      // Stamped here rather than inside the collector: a collector should not
+      // have to know, or be able to misreport, whose state it describes.
+      if (hit) return { ...hit, scope: entry.scope };
     }
 
     const value = await registry.runCollector(entry);
     if (entry.ttlMs) cache.set(name, { at: Date.now(), value });
-    return value;
+    return { ...value, scope: entry.scope };
   });
 
   const byName = {};

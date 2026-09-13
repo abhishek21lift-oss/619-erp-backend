@@ -34,6 +34,7 @@ const pool = require('../../db/pool');
 const email = require('../../lib/email');
 const { QUEUE_NAMES } = require('../../jobs/queue');
 const dockerRecovery = require('./container-recovery');
+const coordination = require('./coordination');
 const queueCollector = require('./collectors/queue.collector');
 
 /**
@@ -47,8 +48,6 @@ const queueCollector = require('./collectors/queue.collector');
  */
 const DOCKER_REASON = dockerRecovery.unavailableReason();
 
-/** Last run per command, for the cooldown. */
-const lastRun = new Map();
 
 // ── Grading a queue, so "recovered" means something ─────────────────────────
 
@@ -633,16 +632,41 @@ async function run(name, { req, queue, confirm, dryRun = false } = {}) {
     };
   }
 
-  // Cooldown. Stops a double-click firing a restart twice and a stuck operator
-  // hammering a probe that is already timing out.
-  const since = Date.now() - (lastRun.get(name) ?? 0);
-  if (cmd.cooldownMs && since < cmd.cooldownMs) {
-    const err = new Error(`Ran ${Math.round(since / 1000)}s ago; wait ${Math.ceil((cmd.cooldownMs - since) / 1000)}s`);
+  // ── Cooldown ──────────────────────────────────────────────────────────────
+  //
+  // Stops a double-click firing a restart twice and a stuck operator hammering
+  // a probe that is already timing out. It is the last guard after the typed
+  // confirmation on the destructive rungs, which is exactly why it could not
+  // stay a Map in this process: a second API container has its own, so two
+  // clicks that land on two instances both pass.
+  //
+  // Claimed rather than checked-then-set, for the same reason the alert
+  // announcement is: read, decide, write is not a guard when two callers can
+  // be inside it.
+  const cooldown = await coordination.claimCooldown(name, cmd.cooldownMs);
+  if (!cooldown.ok) {
+    const err = new Error(`Ran recently; wait ${Math.ceil(cooldown.retry_in_ms / 1000)}s`);
     err.status = 429;
     err.code = 'COOLDOWN';
+    err.retry_in_ms = cooldown.retry_in_ms;
     throw err;
   }
-  lastRun.set(name, Date.now());
+
+  // ── Pre-flight health, for the destructive rungs only ─────────────────────
+  //
+  // "What did the platform look like when you pressed this" is the first
+  // question asked after an incident, and the answer used to be nowhere. It is
+  // captured for destructive commands and not for the read-only probes,
+  // because for `database.test` the reading IS the output and a second one
+  // would be noise.
+  //
+  // The BEFORE reading is deliberately allowed to come from the TTL cache: it
+  // describes the state the operator was looking at when they decided to
+  // press, which is the cached state the console had just rendered. The AFTER
+  // reading is fresh, because a cached one could predate the command entirely
+  // and would be evidence of nothing.
+  const capturesHealth = Boolean(cmd.destructive);
+  const healthBefore = capturesHealth ? await platformHealth() : null;
 
   const started = Date.now();
   let outcome = 'ok';
@@ -653,19 +677,42 @@ async function run(name, { req, queue, confirm, dryRun = false } = {}) {
   } catch (err) {
     outcome = 'error';
     error = err.message;
-    logger.error({ err: err.message, command: name }, 'command-center command failed');
+    logger.error({ err: err.message, command: name, request_id: req?.id ?? null },
+      'command-center command failed');
   }
 
   const duration = Date.now() - started;
+  const healthAfter = capturesHealth ? await platformHealth({ fresh: true }) : null;
 
   // Audited whether it worked or not: a failed restart is more interesting
   // than a successful one, and "who pressed this" is the question asked after.
+  //
+  // The correlation id is req.id, set by middleware/requestId.js from an
+  // inbound x-request-id or a fresh uuid. Without it the audit row, the
+  // application log lines the command produced, and the nginx access line are
+  // three records of one action with nothing joining them — which is exactly
+  // the reconstruction an operator is doing when they open this table.
   await logActivity(req, `command_center.${name}`, 'command_center', name, {
+    request_id: req?.id ?? null,
+    actor: {
+      id: req?.user?.id ?? null,
+      name: req?.user?.name ?? null,
+      email: req?.user?.email ?? null,
+    },
     queue: queue ?? null,
     outcome,
     duration_ms: duration,
     destructive: Boolean(cmd.destructive),
+    confirmed: cmd.destructive ? confirm === name : null,
+    // The failure reason, in the operator's words rather than a stack.
     error,
+    health_before: healthBefore,
+    health_after: healthAfter,
+    // Lifted from the command's own result where it computes one, so the audit
+    // records the verdict the operator was shown rather than a second opinion.
+    verdict: output && typeof output === 'object' && output.outcome
+      ? { outcome: output.outcome, summary: output.summary ?? null }
+      : null,
   }).catch(() => { /* auditing must not mask the result */ });
 
   if (outcome === 'error') {
@@ -674,13 +721,40 @@ async function run(name, { req, queue, confirm, dryRun = false } = {}) {
     throw err;
   }
 
-  return { command: name, queue: queue ?? null, outcome, duration_ms: duration, output };
+  return {
+    command: name,
+    queue: queue ?? null,
+    outcome,
+    duration_ms: duration,
+    request_id: req?.id ?? null,
+    output,
+  };
+}
+
+/**
+ * A compact platform reading for the audit trail.
+ *
+ * Statuses only — the full snapshot is kilobytes of nested data per card, and
+ * an audit row is not a place to store a copy of the console. Never throws:
+ * failing to take a reading must not fail the command the operator pressed.
+ */
+async function platformHealth(opts = {}) {
+  try {
+    const snap = await snapshot.collect(opts);
+    const cards = {};
+    for (const [cardName, card] of Object.entries(snap.cards ?? {})) {
+      cards[cardName] = card.status;
+    }
+    return { status: snap.status, cards, collected_at: snap.collected_at };
+  } catch (err) {
+    return { status: 'unknown', cards: {}, reason: err.message };
+  }
 }
 
 /** Tests only. */
-function _resetCooldowns() { lastRun.clear(); }
+function _resetCooldowns() { coordination._reset(); }
 
 module.exports = {
   COMMANDS, list, run, drainQueue, _resetCooldowns, DOCKER_REASON, registry,
-  gradeQueue, recoveryVerdict, dockerRecovery,
+  gradeQueue, recoveryVerdict, dockerRecovery, coordination, platformHealth,
 };
