@@ -248,7 +248,7 @@ function attach(server, opts = {}) {
   heartbeat.unref?.();
   wss.on('close', () => clearInterval(heartbeat));
 
-  upgradeHandler = (req, socket, head) => {
+  upgradeHandler = async (req, socket, head) => {
     let pathname;
     try {
       pathname = new URL(req.url, 'http://placeholder').pathname;
@@ -272,7 +272,7 @@ function attach(server, opts = {}) {
     }
 
     const ticket = new URL(req.url, 'http://placeholder').searchParams.get('ticket');
-    const operator = tickets.redeem(ticket);
+    const operator = await tickets.redeem(ticket);
     if (!operator) {
       // Deliberately indistinguishable between "no ticket", "wrong ticket",
       // "already spent" and "expired": all four are the same event to a client

@@ -267,10 +267,22 @@ describe('super-admin API — the H-03 split', () => {
   it('keeps super-admin.routes.js a mount list, not a route file', () => {
     // The regrowth guard. If a new endpoint is appended here instead of to a
     // domain router, this fails and points at the right place to put it.
+    //
+    // The size bound counts CODE lines, not total lines. It used to count
+    // both, which made a file that is mostly explanation indistinguishable
+    // from a file that is mostly routes — and pushed back on exactly the
+    // thing this mount most needs written down: WHY a middleware sits ahead
+    // of twenty sub-routers. A cap that is paid for in comments is a cap that
+    // gets satisfied by deleting the reasoning.
     const src = fs.readFileSync(ROOT, 'utf8');
     const inlineRoutes = [...src.matchAll(/^router\.(get|post|put|patch|delete)\(/gm)];
     expect(inlineRoutes.map((m) => m[0])).toEqual([]);
-    expect(src.split('\n').length).toBeLessThan(80);
+
+    const code = src
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('//') && !l.startsWith('*') && !l.startsWith('/*'));
+    expect(code.length).toBeLessThan(40);
   });
 
   it('mounts every domain router that exists on disk', () => {

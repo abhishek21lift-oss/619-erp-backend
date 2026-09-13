@@ -59,19 +59,28 @@ const CONSECUTIVE_TO_OPEN = 2;
 const CONSECUTIVE_TO_CLEAR = 3;
 
 /**
- * Consecutive-observation counters, per fingerprint: { bad, good }.
+ * How long a silent fingerprint keeps its counters.
  *
- * In memory rather than in the table because this is transient observation
- * state, not history — and losing it on restart is correct, not a bug: a fresh
- * process has made no observations. Open alerts live in Postgres and survive.
+ * Long enough to span several 60s ticks and a rolling deploy; short enough that
+ * a collector that is removed does not leave a key behind forever. Transient
+ * observation state, not history — history is the alert rows in Postgres.
  */
-const streaks = new Map();
+const STREAK_TTL_MS = 15 * 60 * 1000;
 
-function streakFor(fp) {
-  let s = streaks.get(fp);
-  if (!s) { s = { bad: 0, good: 0 }; streaks.set(fp, s); }
-  return s;
-}
+/**
+ * Consecutive-observation counters, per fingerprint.
+ *
+ * Shared across processes via coordination.js rather than held in a Map here.
+ * With one counter per instance the damping window silently multiplied by the
+ * number of instances — and, worse, `streaks.delete(fingerprint)` after a
+ * manual resolve cleared only the memory of the process that served the
+ * request, so another instance still holding `bad: 2` would re-open the alert
+ * an operator had just closed by hand, on its very next tick.
+ *
+ * Falls back to in-process counters when Redis is unreachable. Damping is a
+ * noise control: losing it costs an early alert, never a missed one.
+ */
+const streaks = require('./coordination');
 
 /** Human titles. Falls back to the collector name for one registered later. */
 const TITLES = {
@@ -187,6 +196,76 @@ async function autoResolve(fingerprint) {
 }
 
 /**
+ * Claim the right to announce an alert, atomically.
+ *
+ * ── The race this closes ───────────────────────────────────────────────────
+ *
+ * The old sequence was read, act, stamp:
+ *
+ *     SELECT notified_at ...            -- both passes see NULL
+ *     await notify(row)                 -- both email every super admin
+ *     UPDATE SET notified_at = NOW()    -- both stamp it, second is a no-op
+ *
+ * and there are three callers who can be in it at once: the 60s interval in
+ * server.js, an operator pressing "Evaluate alerts now", and — once a second
+ * API instance exists — the other container's interval. The window is not
+ * narrow, either: `notify` writes one row per super admin and then opens an
+ * SMTP connection per super admin, so the read-to-stamp gap is however long
+ * the mail provider takes.
+ *
+ * The comment in server.js says overlapping ticks are safe because migration
+ * 150's partial unique index cannot double-OPEN an alert. That is true, and it
+ * is about a different column. Nothing made the ANNOUNCEMENT once-only.
+ *
+ * A conditional UPDATE is the fix, and it is the whole fix: Postgres takes a
+ * row lock, so exactly one of any number of concurrent passes sees
+ * `notified_at IS NULL` still true and gets a row back. The losers get zero
+ * rows and say nothing.
+ *
+ * ── Claim-then-send, deliberately ──────────────────────────────────────────
+ *
+ * The stamp is written BEFORE the channels are attempted, which makes this
+ * at-most-once rather than at-least-once. If the process dies between the
+ * claim and the send, that alert is never announced.
+ *
+ * That is the right way round for this system. `notify` never throws — a
+ * failed channel is already logged and recorded — and the alert row itself is
+ * durable and on screen in the Alert Center regardless. So the cost of a lost
+ * announcement is one missed email about a condition the console is already
+ * showing; the cost of a duplicate is every platform operator being paged
+ * twice for one incident, which is how people start filtering the alerts.
+ *
+ * @returns {Promise<boolean>} true when THIS caller may announce.
+ */
+async function claimNotification(alertId) {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE system_alerts
+          SET notified_at = NOW()
+        WHERE id = $1 AND notified_at IS NULL
+        RETURNING id`,
+      [alertId],
+    );
+    return rows.length > 0;
+  } catch (err) {
+    // Failing to claim means NOT announcing. An alert that cannot be stamped
+    // would otherwise be announced on every tick for the life of the incident.
+    logger.warn({ err: err.message, alert: alertId }, 'alert notification claim failed');
+    return false;
+  }
+}
+
+/**
+ * The evaluation currently in flight, if any.
+ *
+ * Same reasoning as the collector registry: the interval and the operator's
+ * "Evaluate alerts now" button can land together, and two passes over the same
+ * cards do no useful work the first was not already doing. The claim above
+ * makes a concurrent pass SAFE; this makes it unnecessary.
+ */
+let inflightEvaluation = null;
+
+/**
  * One evaluation pass.
  *
  * Reads the snapshot the console already reads — no second set of probes, and
@@ -200,6 +279,21 @@ async function autoResolve(fingerprint) {
  * @returns {Promise<{opened, escalated, ongoing, resolved, evaluated}>}
  */
 async function evaluate({ fresh = false } = {}) {
+  // A `fresh` caller may not ride a non-fresh pass: "evaluate now" is an
+  // operator asking for current readings, and handing them the tick's cached
+  // ones would be answering a different question.
+  if (inflightEvaluation && !fresh) return inflightEvaluation;
+
+  const run = evaluateOnce({ fresh });
+  if (!inflightEvaluation) {
+    inflightEvaluation = run;
+    const clear = () => { if (inflightEvaluation === run) inflightEvaluation = null; };
+    run.then(clear, clear);
+  }
+  return run;
+}
+
+async function evaluateOnce({ fresh = false } = {}) {
   const out = { opened: [], escalated: [], ongoing: 0, resolved: [], evaluated: 0 };
 
   let snap;
@@ -213,12 +307,13 @@ async function evaluate({ fresh = false } = {}) {
   for (const card of Object.values(snap.cards)) {
     out.evaluated += 1;
     const fp = card.name;
-    const streak = streakFor(fp);
 
     if (ALERTING.has(card.status)) {
-      streak.good = 0;
-      streak.bad += 1;
-      if (streak.bad < CONSECUTIVE_TO_OPEN) continue;
+      // One indivisible move: increment `bad` and zero `good`. A process that
+      // did those as two writes and died between them would leave a
+      // fingerprint two observations from opening and one from closing.
+      const bad = await streaks.bumpStreak(fp, 'bad', STREAK_TTL_MS);
+      if (bad < CONSECUTIVE_TO_OPEN) continue;
 
       try {
         const before = await pool.query(
@@ -237,10 +332,9 @@ async function evaluate({ fresh = false } = {}) {
         else out.ongoing += 1;
 
         // Notify only when the row has never been announced, or an escalation
-        // cleared the stamp. This is the whole reason notified_at is a column.
-        if (!row.notified_at) {
+        // cleared the stamp — and CLAIM the right to do so before doing it.
+        if (!row.notified_at && await claimNotification(row.id)) {
           const channels = await notify(row);
-          await pool.query('UPDATE system_alerts SET notified_at = NOW() WHERE id = $1', [row.id]);
           logger.info({ alert: row.id, source: row.source, severity: row.severity, channels },
             'system alert announced');
         }
@@ -251,9 +345,8 @@ async function evaluate({ fresh = false } = {}) {
     }
 
     // Healthy, or unavailable — neither is a problem to alert on.
-    streak.bad = 0;
-    streak.good += 1;
-    if (streak.good < CONSECUTIVE_TO_CLEAR) continue;
+    const good = await streaks.bumpStreak(fp, 'good', STREAK_TTL_MS);
+    if (good < CONSECUTIVE_TO_CLEAR) continue;
 
     try {
       const closed = await autoResolve(fp);
@@ -424,7 +517,9 @@ async function resolve(id, req) {
   // The condition may still be true — a manual resolve does not fix anything.
   // Clearing the streak means the next bad observation starts counting from
   // zero and re-opens honestly, rather than the alert springing back instantly.
-  streaks.delete(rows[0].fingerprint);
+  // Shared, so it clears for every instance rather than only the one that
+  // happened to serve this request.
+  await streaks.clearStreak(rows[0].fingerprint);
 
   await logActivity(req, 'command_center.alert.resolve', 'system_alert', id, {
     source: rows[0].source, severity: rows[0].severity, occurrences: rows[0].occurrences,
@@ -433,10 +528,11 @@ async function resolve(id, req) {
 }
 
 /** Tests only. */
-function _resetStreaks() { streaks.clear(); }
+function _resetStreaks() { streaks._reset(); }
 
 module.exports = {
-  evaluate, list, acknowledge, resolve, notify,
+  evaluate, list, acknowledge, resolve, notify, claimNotification,
   ALERTING, CONSECUTIVE_TO_OPEN, CONSECUTIVE_TO_CLEAR, SEVERITY_RANK, titleFor,
+  STREAK_TTL_MS,
   _resetStreaks,
 };

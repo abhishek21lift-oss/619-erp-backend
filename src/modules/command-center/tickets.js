@@ -37,91 +37,85 @@
 // stateless ticket is valid for its whole lifetime no matter how many sockets
 // present it. Keeping the state is what makes "once" enforceable.
 //
-// ── Why in-process memory is the right store ─────────────────────────────────
+// ── Where the state lives ────────────────────────────────────────────────────
 //
-// One API container serves this deployment, and the ticket is redeemed by the
-// same process that issued it, seconds later. Redis would add a dependency to
-// the login path of the console you open *because* Redis might be down. If
-// this is ever load-balanced across processes, the redemption fails closed —
-// the operator sees a reconnect, not a security hole — and that is when to
-// move the store, not before.
+// It used to be a Map in this module, on the argument that one API container
+// serves this deployment and the ticket is redeemed by the process that issued
+// it seconds later. That argument was sound and it stops being sound the first
+// time a second replica exists: a ticket minted on A and presented to B is
+// simply unknown, so the console cannot connect at all behind a load balancer.
+// It fails closed, which is the right direction and still a broken console.
+//
+// The store is now modules/command-center/coordination.js, which keeps tickets
+// in Redis when Redis is up and in memory when it is not. Two properties are
+// preserved exactly:
+//
+//   SINGLE-USE. Redis redemption is an atomic get-and-delete in Lua, so two
+//   sockets presenting the same ticket cannot both win. The local path deletes
+//   before it validates, as it always did.
+//
+//   NO CROSS-STORE REPLAY. The ticket carries a one-character prefix naming
+//   the store that minted it, so a Redis ticket is never redeemed from memory
+//   and vice versa. A Redis-minted ticket whose Redis has gone away is refused
+//   rather than looked up locally: single-use is a security property, and a
+//   ticket whose uniqueness cannot be checked is not a ticket.
+//
+// The old worry — adding a Redis dependency to the console you open *because*
+// Redis might be down — is answered by the fallback rather than by avoidance:
+// with Redis unreachable, minting returns a local ticket and the console works
+// exactly as it does today.
 'use strict';
 
-const crypto = require('crypto');
+const coordination = require('./coordination');
 
 /** How long a ticket stays redeemable. Long enough for one page load. */
 const TTL_MS = Number(process.env.COMMAND_CENTER_TICKET_TTL_MS) || 30_000;
 
 /**
- * A ceiling on outstanding tickets.
+ * A ceiling on outstanding LOCAL tickets.
  *
- * Every ticket costs a small object until it is spent or expires, and the
- * issuing route is reachable by an authenticated super admin — so this is not
- * defence against an attacker, it is defence against a reconnect loop that
- * mints a ticket every second for a week.
+ * Only meaningful for the in-memory fallback: the Redis path expires its own
+ * keys and needs no sweeping. This is not defence against an attacker — the
+ * issuing route is behind the full platform guard — it is defence against a
+ * reconnect loop minting a ticket a second for a week.
  */
-const MAX_OUTSTANDING = 100;
-
-/** ticket -> { userId, email, issuedAt, expiresAt } */
-const outstanding = new Map();
-
-function sweep(now = Date.now()) {
-  for (const [key, rec] of outstanding) {
-    if (rec.expiresAt <= now) outstanding.delete(key);
-  }
-}
+const MAX_OUTSTANDING = coordination.MAX_LOCAL_TICKETS;
 
 /**
  * Mint a ticket for an operator who has already passed the full
- * auth -> requireSuperAdmin -> requireSuperAdminMfa chain.
+ * auth -> requireSuperAdmin -> requireSuperAdminMfa -> requirePlatformOwner
+ * chain.
  *
  * @param {{ id: string|number, email?: string }} user
- * @returns {{ ticket: string, expires_in_ms: number }}
+ * @returns {Promise<{ ticket: string, expires_in_ms: number }>}
  */
-function issue(user) {
-  const now = Date.now();
-  sweep(now);
-
-  // Map preserves insertion order, so the first key is the oldest. Evicting it
-  // is correct rather than merely convenient: the oldest unspent ticket is the
-  // one closest to expiring anyway.
-  while (outstanding.size >= MAX_OUTSTANDING) {
-    outstanding.delete(outstanding.keys().next().value);
-  }
-
-  // 256 bits. base64url so it survives a query string with no escaping.
-  const ticket = crypto.randomBytes(32).toString('base64url');
-  outstanding.set(ticket, {
-    userId: user.id,
-    email: user.email,
-    issuedAt: now,
-    expiresAt: now + TTL_MS,
-  });
-
+async function issue(user) {
+  const ticket = await coordination.putTicket(
+    { userId: user.id, email: user.email, issuedAt: Date.now() },
+    TTL_MS,
+  );
   return { ticket, expires_in_ms: TTL_MS };
 }
 
 /**
  * Spend a ticket.
  *
- * Deleted on the way out whether or not it had expired, so a presented ticket
- * is never presentable twice — a replay of an expired ticket must not leave a
- * live one behind it in the map.
- *
- * @returns {{ userId: string|number, email?: string } | null} null when the
- *   ticket is unknown, already spent, or past its window.
+ * @returns {Promise<{ userId: string|number, email?: string } | null>} null when
+ *   the ticket is unknown, already spent, past its window, or minted into a
+ *   store this process cannot reach.
  */
-function redeem(ticket) {
-  if (typeof ticket !== 'string' || !ticket) return null;
-  const rec = outstanding.get(ticket);
+async function redeem(ticket) {
+  const rec = await coordination.takeTicket(ticket);
   if (!rec) return null;
-  outstanding.delete(ticket);
-  if (rec.expiresAt <= Date.now()) return null;
+  // The window is enforced by the store (PX on Redis, expiresAt locally). This
+  // is the belt: a clock skew or a future change to the store must not be able
+  // to hand back a credential minted an hour ago.
+  if (typeof rec.issuedAt === 'number' && Date.now() - rec.issuedAt > TTL_MS) return null;
   return { userId: rec.userId, email: rec.email };
 }
 
-/** Test/diagnostic only. */
-function _size() { sweep(); return outstanding.size; }
-function _clear() { outstanding.clear(); }
+/** Test/diagnostic only: outstanding tickets in the in-memory fallback. */
+function _size() { return coordination.localTicketCount(); }
+function _clear() { coordination._reset(); }
 
 module.exports = { issue, redeem, TTL_MS, MAX_OUTSTANDING, _size, _clear };

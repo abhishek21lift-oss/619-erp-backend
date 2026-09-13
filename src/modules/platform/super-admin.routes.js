@@ -31,6 +31,44 @@
 // was: `router.use(x)` adds no prefix.
 
 const router = require('express').Router();
+const { runAsPlatform } = require('../../lib/tenant-context');
+
+// ── The control plane reads as the PLATFORM, at one door ────────────────────
+//
+// db/pool.js routes a query to the owner connection only when isPlatformWide()
+// is true, and middleware/auth.js computes that as
+//
+//     req.user.role === 'super_admin' && orgId == null
+//
+// The frontend forwards `x-org-id` from localStorage on every request
+// (lib/http.ts), so an operator who has ever pinned a studio in the org
+// switcher arrives with an org id — and every query below then runs as
+// app_tenant, under RLS, on the API whose entire job is to cross tenants.
+//
+// Nothing raises. Tables with a tenant_isolation policy quietly return ONE
+// studio's rows under a platform heading; tables with no app_tenant policy at
+// all (system_alerts, system_logs, platform_ai_settings, platform_owners)
+// return nothing. A directory becomes a short list, a platform total becomes a
+// tenant total, and the console looks fine.
+//
+// This is not a new discovery. middleware/platformAuth.js hit it on the grant
+// lookup and fixed it there; super-admin/users.js hit it on the directory and
+// wraps each of its own queries. Measured across this mount: 221 queries in 20
+// sub-routers, of which 3 were protected. The remedy cannot be "every future
+// author remembers" — it has to be structural, and this is the structure: one
+// middleware, ahead of every sub-router, opening the context that db/pool.js
+// reads.
+//
+// Safe by inspection as well as by construction: no route under this mount
+// reads the caller's ambient org (no currentOrgId, no tenantScope, no
+// orgWhere, no req.user.organization_id), because every one of them takes the
+// studio it operates on from an explicit path or query parameter. The only
+// behaviour that changes is the pinned-operator case, which was broken.
+//
+// Nested runAsPlatform is a no-op, so the Command Center router keeps its own
+// copy of this guard: it is the router that must never lose the property, and
+// the cost of stating it twice is nothing.
+router.use((req, res, next) => runAsPlatform(() => next()));
 
 // Mounted before organizations, which owns PATCH/DELETE /users/:id.
 //

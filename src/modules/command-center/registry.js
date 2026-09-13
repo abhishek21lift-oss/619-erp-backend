@@ -30,6 +30,31 @@ const STATUS = {
   TIMEOUT: 'timeout',
 };
 
+/**
+ * Whose state does a card describe?
+ *
+ * This is not decoration. `runtime` reports the event-loop lag and heap of ONE
+ * Node process; `http` reports the request-timing ring of ONE process. On a
+ * deployment with two API replicas, a green runtime card means "the container
+ * that happened to serve this request is fine", which is a materially weaker
+ * claim than the one the same green dot makes on the database card beside it.
+ *
+ * An operator reading a wall of identical tiles has no way to know which is
+ * which, so the card carries it and the UI can say so.
+ *
+ * PLATFORM is the default deliberately: a collector that does not declare a
+ * scope is treated as describing the platform, and the mistake that direction
+ * — a process-local card mislabelled platform-wide — is the one that
+ * overstates. It is caught by the test that pins the real build's split rather
+ * than by hoping each author remembers.
+ */
+const SCOPE = {
+  /** True of the whole platform: the database, Redis, the queues, the tenants. */
+  PLATFORM: 'platform',
+  /** True only of the API process that answered this request. */
+  PROCESS: 'process',
+};
+
 const SEVERITY_ORDER = [
   STATUS.HEALTHY,
   STATUS.UNAVAILABLE,
@@ -76,28 +101,106 @@ function unavailable(name, reason) {
   return result(name, { status: STATUS.UNAVAILABLE, reason });
 }
 
+// ── In-flight probes ────────────────────────────────────────────────────────
+//
+// name -> { promise, startedAt, controller }  for a probe that has not settled.
+//
+// This is the mechanism behind two of the properties the console needs, and it
+// is worth being explicit that it is ONE mechanism and not two.
+//
+//   COALESCING. Eight operators pressing Refresh, the alert tick, and
+//   `health.check` all want a fresh read at the same second. Without this they
+//   get nine concurrent sweeps: nine pg_stat_statements scans, nine sets of six
+//   BullMQ round trips, against the database and the 256mb Redis the console
+//   exists to protect. With it, whoever asks first starts the probe and
+//   everybody else awaits that same promise. A `fresh` caller joins an
+//   already-running probe deliberately — a probe that started 40ms ago IS
+//   fresh, and starting a second one to prove it defeats the point.
+//
+//   NO RUNAWAY WORK. A probe that blows its deadline is abandoned by its
+//   caller, but the underlying query does not stop existing. Without this map,
+//   the next tick one second later starts ANOTHER one on top of it, and a
+//   database that has gone slow accumulates a probe per second until it falls
+//   over — the observability tool finishing off the thing it was watching.
+//   Here a slow collector has exactly one probe outstanding, ever.
+const inflight = new Map();
+
 /**
- * Run one collector with its own deadline.
+ * Run one collector with its own deadline, coalescing concurrent callers.
  *
  * Never rejects. A collector that throws becomes a CRITICAL card carrying the
  * message; one that hangs becomes TIMEOUT. Both are renderable.
+ *
+ * ── Cancellation is real where it can be, and honest where it cannot ────────
+ *
+ * Each probe gets an AbortController whose signal is handed to the collector
+ * and aborted on the deadline. A collector doing HTTP or holding a socket can
+ * honour it and stop. `pool.query` cannot be cancelled from the client side, so
+ * for the database collector the signal is advisory and the real bound is the
+ * in-flight map above: the work is abandoned, but it is never multiplied.
+ * Saying that plainly matters more than pretending every probe is killable.
  *
  * The timer is unref'd so a pending probe cannot hold the process open — the
  * same trick lib/queueHealth.js uses, and the reason its probes do not wedge
  * the test suite.
  */
-async function runCollector(entry) {
+function runCollector(entry) {
+  const { name } = entry;
+
+  const existing = inflight.get(name);
+  // The already-settled TIMEOUT card, handed back immediately. A caller who
+  // arrives while a hung probe is outstanding gets the honest answer at once
+  // and does NOT open a second query against whatever is hanging.
+  if (existing) return existing.outcome;
+
+  const { outcome, work } = startCollector(entry);
+  inflight.set(name, { outcome, work, startedAt: Date.now() });
+
+  // ── Cleared when the WORK settles, not when the RACE does ─────────────────
+  //
+  // These are different moments and the difference is the entire mechanism. A
+  // probe that blows its deadline resolves `outcome` after `timeoutMs` while
+  // the query behind it is still open. Releasing the slot then would let the
+  // next tick start another one a second later — the exact pile-up this map
+  // exists to prevent. The slot is held until the underlying work actually
+  // finishes, however long that takes, and only then may the card be re-probed.
+  //
+  // This also happens to be what keeps an abandoned probe from becoming an
+  // unhandled rejection: the query that finally fails two minutes after the
+  // card already said TIMEOUT settles a promise nobody is awaiting. Both
+  // Promise.race inside startCollector and this `clear` attach a rejection
+  // handler to it, so a late failure is consumed rather than reaching
+  // process.on('unhandledRejection') — which on this process logs
+  // `{"reason":{}}` and tells an operator nothing.
+  const clear = () => { if (inflight.get(name)?.work === work) inflight.delete(name); };
+  work.then(clear, clear);
+
+  return outcome;
+}
+
+/**
+ * @returns {{ outcome: Promise<object>, work: Promise<object> }}
+ *   `outcome` settles at the deadline or when the collector answers, whichever
+ *   is first; `work` settles only when the collector itself is done.
+ */
+function startCollector(entry) {
   const { name, collect, timeoutMs } = entry;
   const started = Date.now();
+  const controller = new AbortController();
 
   let timer;
   const deadline = new Promise((resolve) => {
     timer = setTimeout(
-      () => resolve(result(name, {
-        status: STATUS.TIMEOUT,
-        latency_ms: Date.now() - started,
-        reason: `Probe exceeded ${timeoutMs}ms`,
-      })),
+      () => {
+        // Abort BEFORE resolving, so a collector that honours the signal is
+        // already unwinding by the time the caller is handed a TIMEOUT card.
+        try { controller.abort(new Error(`Probe exceeded ${timeoutMs}ms`)); } catch { /* older runtimes */ }
+        resolve(result(name, {
+          status: STATUS.TIMEOUT,
+          latency_ms: Date.now() - started,
+          reason: `Probe exceeded ${timeoutMs}ms`,
+        }));
+      },
       timeoutMs,
     );
     if (typeof timer.unref === 'function') timer.unref();
@@ -105,7 +208,7 @@ async function runCollector(entry) {
 
   const work = (async () => {
     try {
-      const value = await collect();
+      const value = await collect({ signal: controller.signal });
       // A collector may return a finished result (to set its own status and
       // reason) or just its data, in which case it is healthy by default.
       const out = value && typeof value === 'object' && 'status' in value
@@ -122,12 +225,12 @@ async function runCollector(entry) {
     }
   })();
 
-  try {
-    return await Promise.race([work, deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
+  const outcome = Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+  return { outcome, work };
 }
+
+/** How many probes are outstanding right now. Diagnostics and tests. */
+function inflightCount() { return inflight.size; }
 
 // ── Registry ────────────────────────────────────────────────────────────────
 
@@ -141,24 +244,31 @@ const registry = new Map();
  * @param {number} [opts.ttlMs=0]  serve a cached value for this long. Sampling
  *   memory every second is free; asking Docker to list containers every second
  *   is not, and neither is a Postgres stats query.
+ * @param {'platform'|'process'} [opts.scope='platform'] whose state this
+ *   describes. See SCOPE above.
  */
 function register(name, collect, opts = {}) {
   if (registry.has(name)) throw new Error(`Collector already registered: ${name}`);
   if (typeof collect !== 'function') throw new Error(`Collector ${name} must be a function`);
+  if (opts.scope && !Object.values(SCOPE).includes(opts.scope)) {
+    throw new Error(`Collector ${name} has an unknown scope: ${opts.scope}`);
+  }
   registry.set(name, {
     name,
     collect,
     timeoutMs: opts.timeoutMs ?? 3000,
     ttlMs: opts.ttlMs ?? 0,
+    scope: opts.scope ?? SCOPE.PLATFORM,
   });
 }
 
 function get(name) { return registry.get(name) || null; }
 function names() { return [...registry.keys()]; }
-function clear() { registry.clear(); }
+function clear() { registry.clear(); inflight.clear(); }
 
 module.exports = {
-  STATUS, SEVERITY_ORDER, rollup,
+  STATUS, SCOPE, SEVERITY_ORDER, rollup,
   result, unavailable, runCollector,
   register, get, names, clear,
+  inflightCount,
 };
