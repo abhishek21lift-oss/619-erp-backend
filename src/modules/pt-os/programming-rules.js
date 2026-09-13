@@ -246,6 +246,72 @@ const LANDMARKS = Object.freeze({
   Cardio: null,
 });
 
+/**
+ * The equipment vocabulary, exactly as the library spells it.
+ *
+ * The generator receives equipment as free text from the request body — "full
+ * gym", "dumbbells only", "home setup" — because no column holds it. Matching
+ * that against the library therefore means parsing, and parsing that fails
+ * must fail OPEN: an unrecognised phrase applies no filter and says so, rather
+ * than silently blocking every exercise the studio owns.
+ */
+const EQUIPMENT = Object.freeze([
+  'Bodyweight', 'Barbell', 'Dumbbell', 'Cable', 'Machine', 'Kettlebell',
+  'Resistance Band', 'Medicine Ball', 'Exercise Ball', 'Foam Roller',
+  'EZ Curl Bar', 'Other',
+]);
+
+/** Phrases that mean "everything", and so mean no filter at all. */
+const UNRESTRICTED_EQUIPMENT = Object.freeze(['full gym', 'fully equipped', 'commercial gym', 'everything', 'all equipment']);
+
+/**
+ * Equipment named in free text, as library values — or null for no filter.
+ *
+ * Bodyweight is added whenever any filter is produced. That is the one
+ * inference this file makes, and it is here rather than hidden: a client with
+ * "dumbbells at home" can still do a push-up, and a filter that excluded
+ * bodyweight would leave a home programme with nothing to fall back on. It is
+ * additive only — it can never remove an exercise the text allowed.
+ */
+function equipmentFrom(text) {
+  const t = String(text ?? '').toLowerCase().trim();
+  if (!t) return null;
+  if (UNRESTRICTED_EQUIPMENT.some((p) => t.includes(p))) return null;
+
+  const found = EQUIPMENT.filter((e) => {
+    const k = e.toLowerCase();
+    // "dumbbells" and "resistance bands" are how people write these, so the
+    // plural has to match the singular the library stores.
+    return t.includes(k) || t.includes(`${k}s`);
+  });
+  if (!found.length) return null;
+  return found.includes('Bodyweight') ? found : ['Bodyweight', ...found];
+}
+
+/**
+ * Completed sets → the weekly per-muscle-group counts volumeLandmarks reads.
+ *
+ * `sets` carry a session_date and the muscle_group their exercise joins to.
+ * 29 of 408 completed sets in production have no exercise_id — a name typed
+ * free-hand into the log — so they cannot be attributed to a muscle at all.
+ * They are counted as `unattributable` rather than dropped, because a group
+ * that looks untrained may simply be the part of the log that would not join.
+ */
+function weeklyMuscleGroups(sets = [], isoWeekOf) {
+  const byWeek = new Map();
+  for (const s of sets) {
+    if (s?.completed !== true) continue;
+    const week = isoWeekOf(s.session_date);
+    if (!week) continue;
+    if (!byWeek.has(week)) byWeek.set(week, { week, groups: {}, unattributable: 0 });
+    const row = byWeek.get(week);
+    const group = str(s.muscle_group);
+    if (group) row.groups[group] = (row.groups[group] || 0) + 1;
+    else row.unattributable += 1;
+  }
+  return [...byWeek.values()].sort((a, b) => (a.week < b.week ? -1 : 1));
+}
+
 /** Consecutive weeks above MRV before overreaching is a call rather than a week. */
 const WEEKS_OVER_MRV_FOR_DELOAD = 2;
 
@@ -750,6 +816,9 @@ function evaluate({
 }
 
 module.exports = {
+  equipmentFrom,
+  weeklyMuscleGroups,
+  EQUIPMENT,
   buildConstraints,
   screenExercise,
   screenLibrary,
