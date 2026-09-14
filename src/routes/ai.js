@@ -28,6 +28,7 @@ const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // The client's digital twin: the assessments, the screen and the logged sets
 // that this file could not see. See modules/pt-os/client-context.js.
 const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
+const { resolveClientFacts, describeFacts } = require('../modules/pt-os/client-facts');
 // Checking the plan the model returned against the rules that shaped it.
 const {
   auditPlan, scorePlan, buildRevisionInstruction, parseCritique, describeAudit,
@@ -354,33 +355,31 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerci
   };
 }
 
-// Resolve the values that go into the workout prompt. Every value the
-// database holds wins over the request body; the body only fills gaps the
-// database does not hold. Weight prefers the latest assessment reading, then
-// the enrolment weight on pt_clients, then the latest weekly check-in.
-function resolveWorkoutInputs({ client, profile, goals, latestAssessment, latestCheckin, lifestyle, workoutAssignments }, body) {
-  const latestWeight = firstDefined(latestAssessment?.weight, client.weight, latestCheckin?.weight);
-  const height       = firstDefined(profile?.height_cm, client.height);
-  const goal         = firstDefined(profile?.goal, client.goal, goals[0]?.goal_type);
-  const experience   = firstDefined(client.workout_experience_level, profile?.fitness_level, lifestyle?.workout_experience_level);
-  const injuries     = firstDefined(profile?.injuries, client.injuries);
-  const frequency    = firstDefined(client.frequency);
-  const trainingDays = /^[1-7]$/.test(String(frequency ?? '')) ? Number(frequency) : (Number(body.training_days) || 4);
-  const active       = workoutAssignments[0] || null;
+// The workout prompt's NON-FACT context: the things that describe the
+// engagement rather than the person.
+//
+// The eight client facts themselves — age, gender, weight, height, goal,
+// experience, training days, equipment — moved to
+// modules/pt-os/client-facts.js, which resolves them from named columns and
+// reports what it could not find instead of filling the gap. This function
+// deliberately keeps none of them, so there is exactly one place that can
+// decide what the model is told about a client.
+//
+// `duration_weeks` stays here and stays defaulted, because it is not a fact
+// about the client at all: it is how long a programme the trainer wants. The
+// active assignment's own length wins when there is one.
+function resolveWorkoutExtras({ client, profile, goals, workoutAssignments }, body) {
+  const active = workoutAssignments[0] || null;
   const durationWeeks = active?.start_date && active?.end_date
     ? Math.max(1, Math.ceil((new Date(active.end_date) - new Date(active.start_date)) / 604800000))
     : (Number(body.duration_weeks) || 8);
 
   return {
-    age:      ageFromDob(client.dob) ?? (Number(body.age) || null),
-    gender:   firstDefined(client.gender, body.gender),
-    weight_kg: firstDefined(latestWeight, body.weight_kg),
-    height_cm: firstDefined(height, body.height_cm),
-    goal:     firstDefined(goal, body.goal),
-    experience_level: firstDefined(experience, body.experience_level),
-    injuries: firstDefined(injuries, body.injuries) || 'none',
-    equipment: body.equipment || 'full gym',
-    training_days:  trainingDays,
+    // Free-text limitations a trainer typed. Never defaulted to "none": the
+    // old `|| 'none'` printed a clean bill of health for every client nobody
+    // had ever written a note about. limitationsLine() adds the assessed
+    // screen to whatever this holds.
+    injuries: firstDefined(profile?.injuries, client.injuries),
     duration_weeks: durationWeeks,
     health_conditions: firstDefined(client.health_conditions, arrayToText(profile?.health_conditions)),
     previous_trainer_experience: client.previous_trainer_experience === true,
@@ -659,6 +658,85 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
    2. WORKOUT PLAN GENERATOR  (SSE streaming — bypasses Render 30s timeout)
    POST /api/ai/workout/generate
    ═══════════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════
+   2a. WHAT THE GENERATOR WOULD USE   GET /api/ai/workout/context/:client_id
+   ═══════════════════════════════════════════════════════════════════════════
+
+   The same resolution the generator runs, without generating anything.
+
+   A trainer pressing "generate" used to have no way of knowing what the
+   engine was about to be told, which mattered most precisely when the answer
+   was wrong: the page filled the gaps in a thin client record with 175cm,
+   75kg, male, beginner, four days a week, and nothing on screen said so. The
+   plan came back looking exactly as authoritative as one written for a client
+   whose record was complete.
+
+   This endpoint is the fix for that half of the problem. It answers, before a
+   token is spent: which facts the studio holds and which column each came
+   from, which it does not hold, whether the PAR-Q gate is open, what the
+   client is currently training, and how much history there is to program
+   from. Cheap enough to run on page load — no retrieval, no model.
+*/
+router.get('/workout/context/:client_id', auth, async (req, res) => {
+  const clientId = req.params.client_id;
+  const org = orgParam(req);
+
+  let ctx;
+  try {
+    // No ragQuery and no exerciseQuery: this is a summary of the client, not
+    // a generation, and retrieval is the expensive half.
+    ctx = await loadAuthoritativeClient(clientId, org);
+  } catch (err) {
+    logger.error({ err: err.message }, 'ai_workout_context_load_failed');
+    return res.status(503).json({ error: 'Client context unavailable' });
+  }
+  if (!ctx) return res.status(404).json({ error: 'Client not found' });
+
+  const { facts, data_quality: dataQuality, active_assignment: active } = resolveClientFacts(ctx, {});
+
+  // Best-effort: the safety gate and the training history are the two things
+  // a trainer most wants to see before generating, and neither is worth
+  // failing this summary over. An unreachable twin reports as unknown rather
+  // than as cleared.
+  let twin = null;
+  try {
+    twin = await loadDigitalTwin(clientId, org, { equipmentText: facts.equipment?.value ?? null });
+  } catch (err) {
+    logger.warn({ err: err.message }, 'ai_workout_context_twin_failed');
+  }
+
+  res.json({
+    client: { id: ctx.client.id, name: ctx.client.name },
+    facts,
+    data_quality: dataQuality,
+    safety: twin
+      ? {
+        gate: twin.rules.gate,
+        may_program: twin.rules.may_program,
+        screened: twin.rules.coverage.screened,
+        sources_present: twin.rules.coverage.sources_present,
+        constraints: twin.rules.constraints.length,
+        not_assessed: twin.brief.missing,
+      }
+      : null,
+    current_program: active
+      ? {
+        name: active.plan_name || null,
+        status: active.status || null,
+        start_date: active.start_date || null,
+        end_date: active.end_date || null,
+      }
+      : null,
+    // Whether there is anything to progress FROM. `has_history` false is the
+    // common case on a new client and is not a fault — but a trainer reading
+    // "progression" in a generated plan should know whether it was derived
+    // from logged sets or chosen from first principles.
+    training_history: twin
+      ? { has_history: twin.history.has_history, window_weeks: twin.window_weeks }
+      : null,
+  });
+});
+
 router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   const { client_id } = req.body || {};
   if (!client_id) return res.status(400).json({ error: 'client_id is required' });
@@ -704,13 +782,39 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     retrieval_latency_ms: Math.max(retrievalStats.rag?.latencyMs ?? 0, retrievalStats.exercise?.latencyMs ?? 0),
   }, 'ai_generate_rag_retrieval');
 
-  const p = resolveWorkoutInputs(ctx, req.body || {});
-  const required = {
-    age: p.age, gender: p.gender, weight_kg: p.weight_kg,
-    height_cm: p.height_cm, goal: p.goal, experience_level: p.experience_level,
-  };
-  const missing  = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
-  if (missing.length) return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
+  // ── What this studio actually knows about this client ────────────────────
+  //
+  // Resolved from named columns, with anything the database does not hold
+  // reported as missing rather than filled in. The request body is consulted
+  // ONLY for facts no column holds, and whatever it supplies is carried as
+  // the trainer's stated value for the rest of the request — in the prompt,
+  // in the response and in the ledger row — never as a fact about the client.
+  //
+  // This is the replacement for a browser that used to post height 175,
+  // weight 75, gender male, experience beginner and four training days for
+  // every client whose record was thin, all of which the prompt then printed
+  // under the heading "CLIENT AUTHORITATIVE DATA".
+  const { facts, data_quality: dataQuality } = resolveClientFacts(ctx, req.body || {});
+  const p = resolveWorkoutExtras(ctx, req.body || {});
+  const val = (f) => facts[f]?.value ?? null;
+
+  // Three facts decide exercise selection, volume and the shape of the week.
+  // Without them there is nothing to program from, and the honest answer is
+  // to say which ones are missing rather than to invent them and produce a
+  // plan that looks authoritative.
+  //
+  // 422 rather than 400: the request is well-formed, the record is not. The
+  // field list is what the trainer's screen turns into "needs your input".
+  if (dataQuality.blocking.length) {
+    logger.info({ req_id: req.id, blocking: dataQuality.blocking }, 'ai_workout_generate_missing_client_data');
+    return res.status(422).json({
+      error: 'This client\'s record is missing information the programme needs',
+      code: 'MISSING_CLIENT_DATA',
+      missing: dataQuality.blocking,
+      data_quality: dataQuality,
+      message: `Record ${dataQuality.blocking.join(', ')} on the client, or supply them with this request.`,
+    });
+  }
 
   // ── The digital twin ─────────────────────────────────────────────────────
   //
@@ -727,7 +831,10 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   let twin;
   try {
     twin = await loadDigitalTwin(client_id, org, {
-      equipmentText: p.equipment,
+      // Null when no equipment is recorded or stated. The screen then applies
+      // no equipment gate, which is what it already did for the old 'full gym'
+      // default — the difference is that the prompt no longer CLAIMS a full gym.
+      equipmentText: val('equipment'),
       exercises: ctx.exercises,
     });
   } catch (err) {
@@ -839,16 +946,8 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     // still before the goals, for the same reason the screen comes before
     // them: what already failed is a constraint on what to write next.
     ...(outcomes && outcomes.accepted ? [describeOutcomes(outcomes), ''] : []),
-    'CLIENT AUTHORITATIVE DATA:',
-    `- Age: ${p.age}`,
-    `- Gender: ${p.gender}`,
-    `- Weight: ${p.weight_kg} kg`,
-    `- Height: ${p.height_cm} cm`,
-    `- Goal: ${p.goal}`,
-    `- Experience level: ${p.experience_level}`,
-    `- Injuries / limitations: ${p.injuries}`,
-    `- Available equipment: ${p.equipment}`,
-    `- Training days per week: ${p.training_days}`,
+    describeFacts(facts),
+    `- Injuries / limitations: ${p.injuries || 'NOT RECORDED'}`,
   ];
   if (p.health_conditions) userPrompt.push(`- Health conditions: ${p.health_conditions}`);
   if (p.previous_trainer_experience) userPrompt.push('- Previously worked with a trainer: yes');
@@ -909,7 +1008,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     `Generate a ${p.duration_weeks}-week workout plan for this client using the client facts above and the authorized MY PT STUDIO methodology.`,
     '',
     'TRAINING FREQUENCY:',
-    `The client trains ${p.training_days} days per week. Generate exactly ${p.training_days} sessions per week — one per training day, never fewer and never more, and never silently change the frequency.`,
+    `The client trains ${val('training_days')} days per week. Generate exactly ${val('training_days')} sessions per week — one per training day, never fewer and never more, and never silently change the frequency.`,
     '',
     'SESSION STRUCTURE:',
     'Each training day must contain: a session title, the training focus, a warm-up, main exercises, accessories, and cool-down/recovery guidance when appropriate.',
@@ -1000,7 +1099,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     // The lookup is its own: the prompt was given a dozen library rows and a
     // model may name anything, so screening only those would answer "no
     // blocked exercise" for every blocked movement that was not retrieved.
-    const requested = { training_days: p.training_days, duration_weeks: p.duration_weeks };
+    const requested = { training_days: val('training_days'), duration_weeks: p.duration_weeks };
     const auditWith = async (candidate) => {
       const screened = await screenPlanExercises(
         planExercises(candidate).map((e) => e.name),
@@ -1138,6 +1237,16 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
           constraints: twin.rules.constraints,
         },
         audit: { violations: audit.violations, unverified: audit.unverified, counts: audit.counts },
+        // What the engine knew, and what it did not. Frozen with the
+        // proposal for the same reason the screen is: a ledger row that
+        // cannot say the height was never recorded cannot answer why the
+        // programme avoided a loaded carry six months later.
+        inputs: {
+          facts,
+          duration_weeks: p.duration_weeks,
+          injuries_text: p.injuries || null,
+        },
+        dataQuality,
       });
     } catch (err) {
       logger.warn({ err: err.message }, 'ai_workout_generation_record_failed');
@@ -1169,6 +1278,11 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       // The trainer's client sends this back when they save a plan from this
       // proposal — that is what turns a generation into a comparable outcome.
       generation_id: generationId,
+      // Which facts came from the studio's records, which the trainer stated
+      // for this one generation, and which nobody holds. The trainer sees
+      // this beside the plan, because "NOT RECORDED" changes how much of the
+      // programme they should trust without checking.
+      data_quality: dataQuality,
       audit: {
         violations: audit.violations,
         unverified: audit.unverified,
