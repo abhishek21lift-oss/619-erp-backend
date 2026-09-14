@@ -26,6 +26,107 @@
 /** Sections a brief can carry, in the order a trainer would want to read them. */
 const SECTIONS = ['readiness', 'body', 'capacity', 'limitations', 'lifestyle', 'goal', 'history'];
 
+/**
+ * How old a section may be before it is reported as stale, in days.
+ *
+ * ── Why this exists ────────────────────────────────────────────────────────
+ *
+ * Every section below already carries an `as_of`, and nothing read it. So a
+ * mobility screen taken two years ago fed the programme with exactly the same
+ * authority as one taken last Tuesday — and worse, an ABSENT finding in a
+ * stale screen was being read as "nothing wrong there", when what it actually
+ * means is "nothing was wrong there, two years ago, before the injury they
+ * have not told us about".
+ *
+ * Stale is not missing and it is not fresh. It is a third thing: real data
+ * whose age is itself a fact the trainer should weigh. So it is reported
+ * rather than discarded — discarding it would throw away the only screen the
+ * studio has, and silently trusting it is what this fixes.
+ *
+ * The numbers are clinical judgement, not physics, which is why they live in
+ * one named table rather than scattered through the code:
+ *
+ *   readiness    365  a PAR-Q is conventionally re-screened annually, and
+ *                     health changes
+ *   limitations  180  posture and mobility move with training, injury and
+ *                     desk time; half a year is generous
+ *   capacity     180  a fitness test older than a training block no longer
+ *                     describes current capacity
+ *   body          90  weight and composition move fastest of all
+ *   lifestyle    180  sleep, stress and occupation change with life
+ *   goal         180  a goal nobody has revisited in half a year may not be
+ *                     the goal any more
+ *
+ * `history` has no threshold: it describes the active assignment, whose
+ * currency is its own status rather than its age.
+ */
+const STALE_AFTER_DAYS = Object.freeze({
+  readiness: 365,
+  limitations: 180,
+  capacity: 180,
+  body: 90,
+  lifestyle: 180,
+  goal: 180,
+});
+
+/** Whole days between a YYYY-MM-DD and today, or null when undatable. */
+function ageInDays(asOf, today = new Date()) {
+  if (!asOf) return null;
+  const then = new Date(`${String(asOf).slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(then.getTime())) return null;
+  const now = new Date(`${today.toISOString().slice(0, 10)}T00:00:00Z`);
+  const days = Math.floor((now - then) / 86400000);
+  return days >= 0 ? days : null;
+}
+
+/**
+ * The date a section speaks as of.
+ *
+ * Most sections carry one `as_of`. `limitations` does not: it composes two
+ * independent assessments, posture and mobility, either of which may be absent
+ * on its own, and it nests a date under each.
+ *
+ * That nesting is why the first version of this function silently skipped the
+ * single most safety-relevant section on the page — it read `s.as_of`, found
+ * undefined, and moved on. The unit tests missed it because their fixtures were
+ * synthetic sections with a flat date; a live client with a 2023 mobility screen
+ * is what found it.
+ *
+ * The NEWEST of the nested dates wins. A section is as current as its freshest
+ * evidence: a posture screen taken last week means the trainer has looked at
+ * this client recently, even if the mobility screen beside it is older. Taking
+ * the oldest would cry stale at a studio that is assessing properly.
+ */
+function sectionDate(section, s) {
+  if (!s) return null;
+  if (section === 'limitations') {
+    const dates = [s.posture?.as_of, s.mobility?.as_of].filter(Boolean).sort();
+    return dates.length ? dates[dates.length - 1] : null;
+  }
+  return s.as_of ?? null;
+}
+
+/**
+ * Which present sections are older than their threshold.
+ *
+ * A section with no date is NOT reported stale — it is undated, which is a
+ * different complaint and one this function has no evidence for. Saying "stale"
+ * about something whose age is unknown would be the same class of mistake as
+ * the defaults this engine exists to remove.
+ */
+function staleness(sections = {}, today = new Date()) {
+  const out = [];
+  for (const [section, threshold] of Object.entries(STALE_AFTER_DAYS)) {
+    const s = sections[section];
+    if (!s?.present) continue;
+    const asOf = sectionDate(section, s);
+    const days = ageInDays(asOf, today);
+    if (days === null) continue;
+    if (days > threshold) out.push({ section, as_of: asOf, age_days: days, stale_after_days: threshold });
+  }
+  return out;
+}
+
 /** Whole years between a date of birth and today, or null. */
 function ageFrom(dob) {
   if (!dob) return null;
@@ -295,6 +396,8 @@ function buildBrief({
   } : { present: false };
 
   const missing = SECTIONS.filter((k) => !sections[k].present);
+  // Present, dated, and older than a trainer should silently trust.
+  const stale = staleness(sections);
 
   return {
     client: {
@@ -309,6 +412,9 @@ function buildBrief({
     // Named explicitly rather than left for the reader to notice. A brief that
     // hides its gaps gets designed against as though it were complete.
     missing,
+    // The same argument for age. An assessment nobody has repeated in two
+    // years is not a current description of anybody.
+    stale,
     completeness_pct: Math.round(((SECTIONS.length - missing.length) / SECTIONS.length) * 100),
   };
 }
@@ -320,4 +426,7 @@ function dateOf(v) {
   return s ? String(s).slice(0, 10) : null;
 }
 
-module.exports = { buildBrief, ageFrom, labelsFrom, mobilityFindings, textFrom, SECTIONS };
+module.exports = {
+  buildBrief, ageFrom, labelsFrom, mobilityFindings, textFrom, SECTIONS,
+  staleness, ageInDays, sectionDate, STALE_AFTER_DAYS,
+};

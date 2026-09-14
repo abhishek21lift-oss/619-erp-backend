@@ -14,7 +14,8 @@
 // a value this module cannot source is reported MISSING, with no third option.
 
 const {
-  resolveClientFacts, describeFacts, countDays, ageFromDob, FIELDS, BLOCKING,
+  resolveClientFacts, describeFacts, countDays, ageFromDob,
+  FIELDS, BLOCKING, STATED_SUPERSEDES,
 } = require('../modules/pt-os/client-facts');
 
 const bare = (over = {}) => ({
@@ -122,13 +123,56 @@ describe('training frequency reads the column the rest of the product writes', (
   });
 });
 
-describe('equipment has no column, and says so', () => {
+describe('equipment', () => {
   // training_mode is Offline / Online / Hybrid — where a client trains, not
-  // what they can lift with. Nothing in the schema records equipment, so the
-  // honest answer is missing. The old default claimed "full gym" for everyone.
+  // what they can lift with.
   test('training_mode is never mistaken for an equipment record', () => {
     const { facts } = resolveClientFacts(bare({ training_mode: 'Offline' }));
     expect(facts.equipment.origin).toBe('missing');
+  });
+
+  test('the studio\'s recorded equipment is the authoritative answer', () => {
+    const ctx = bare();
+    ctx.studioEquipment = 'Barbell, Dumbbell, Cable';
+    expect(resolveClientFacts(ctx).facts.equipment).toEqual({
+      value: 'Barbell, Dumbbell, Cable',
+      source: 'system_settings.studio_equipment',
+      origin: 'recorded',
+    });
+  });
+
+  // ── The one field where a statement beats the record ────────────────────
+  //
+  // And it is an exception for a safety reason, not a convenience one. The
+  // studio's list says what the gym owns; "dumbbells only today" says what is
+  // actually available this session. Preferring the fuller list would ungate
+  // exercises the trainer has just said cannot be done — the old "full gym"
+  // default wearing a better hat.
+  test('a trainer stating today\'s equipment narrows the studio list', () => {
+    const ctx = bare();
+    ctx.studioEquipment = 'Barbell, Cable, Machine, Dumbbell';
+    const { facts } = resolveClientFacts(ctx, { equipment: 'dumbbells only today' });
+    expect(facts.equipment).toEqual({ value: 'dumbbells only today', source: 'trainer', origin: 'stated' });
+  });
+
+  test('and that exception applies to equipment ALONE', () => {
+    expect(STATED_SUPERSEDES).toEqual(['equipment']);
+    // The anti-fabrication rule is unchanged everywhere else: a request body
+    // still cannot rewrite who the client is.
+    const ctx = bare({ goal: 'fat_loss', workout_experience_level: 'advanced', sessions_per_week: 5, dob: '1990-01-01' });
+    const { facts } = resolveClientFacts(ctx, {
+      goal: 'strength', experience_level: 'beginner', training_days: 2, age: 21,
+    });
+    expect(facts.goal.value).toBe('fat_loss');
+    expect(facts.experience_level.value).toBe('advanced');
+    expect(facts.training_days.value).toBe(5);
+    expect(facts.age.origin).toBe('recorded');
+  });
+
+  test('an empty statement does not blank the studio list', () => {
+    const ctx = bare();
+    ctx.studioEquipment = 'Barbell';
+    expect(resolveClientFacts(ctx, { equipment: '   ' }).facts.equipment.origin).toBe('recorded');
   });
 });
 

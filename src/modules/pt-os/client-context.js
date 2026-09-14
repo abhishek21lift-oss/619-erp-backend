@@ -340,6 +340,23 @@ function describeTwin(twin) {
     L.push('', `NOT ASSESSED — you may recommend measuring these, but must not describe them: ${brief.missing.join(', ')}.`);
   }
 
+  // ── Age is a fact about the evidence ─────────────────────────────────────
+  //
+  // A screen the studio took two years ago fed this prompt with exactly the
+  // authority of one taken last week, and the more dangerous half is the
+  // silence: an ABSENT finding in a stale screen reads as "nothing wrong
+  // there", when it means "nothing was wrong there, two years ago, before
+  // whatever they have not mentioned since".
+  //
+  // Said rather than acted on. Dropping a stale screen would throw away the
+  // only evidence the studio has; trusting it silently is what this replaces.
+  if (brief.stale?.length) {
+    L.push('', 'STALE — on file but old. Treat these as weaker evidence, and say in the plan that they are worth repeating. An absence of findings in a stale screen is NOT evidence that nothing is wrong now:');
+    for (const st of brief.stale) {
+      L.push(`- ${st.section}: last assessed ${st.as_of} (${st.age_days} days ago; treated as current for up to ${st.stale_after_days}).`);
+    }
+  }
+
   return L.join('\n');
 }
 

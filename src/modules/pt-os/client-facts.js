@@ -53,6 +53,27 @@ const FIELDS = [
 const BLOCKING = ['goal', 'experience_level', 'training_days'];
 
 /**
+ * Fields where a trainer's statement for THIS generation beats the record.
+ *
+ * The default is the opposite, and deliberately so: a request body must never
+ * be able to rewrite a client's age, goal or experience, because that is how
+ * the browser used to invent people.
+ *
+ * Equipment is the one exception, and it is an exception for a safety reason
+ * rather than a convenience one. The studio's list says what the gym owns; a
+ * trainer typing "dumbbells only today" is saying what is actually available
+ * for this session — the rack is booked, the client is training at home, half
+ * the floor is being refitted. Preferring the studio's fuller list there would
+ * ungate exercises the trainer has just said cannot be done, which is the same
+ * failure as the old "full gym" default wearing a better hat.
+ *
+ * Note the direction: a statement here can only NARROW what is available, so
+ * the exception runs towards caution. It is still recorded as `stated`, so
+ * nothing downstream mistakes it for the studio's standing inventory.
+ */
+const STATED_SUPERSEDES = ['equipment'];
+
+/**
  * How many training days `preferred_training_days` names.
  *
  * Stored as the free text the enrolment form joins, e.g. "Mon, Wed, Fri".
@@ -123,6 +144,7 @@ function resolveClientFacts(ctx, stated = {}) {
   const {
     client = {}, profile = null, goals = [], latestAssessment = null,
     latestCheckin = null, lifestyle = null, workoutAssignments = [],
+    studioEquipment = null,
   } = ctx || {};
 
   const resolved = {
@@ -171,11 +193,21 @@ function resolveClientFacts(ctx, stated = {}) {
       return n !== null && n >= 1 && n <= 7 ? n : null;
     }),
 
-    // No authoritative source, and saying so is the honest answer.
-    // `training_mode` is Offline / Online / Hybrid — where a client trains,
-    // not what they can lift with — so nothing in the schema records their
-    // equipment. It stays missing unless a trainer states it.
-    equipment: null,
+    // ── Equipment ────────────────────────────────────────────────────────
+    //
+    // No column on pt_clients records this, and `training_mode` is
+    // Offline / Online / Hybrid — WHERE a client trains, not what they can
+    // lift with. The authoritative answer, where a studio has recorded one,
+    // is the studio's own equipment list in the org-scoped settings store.
+    //
+    // Still missing when the studio has not recorded it, and MISSING is the
+    // only honest answer then: the old default claimed "full gym" for every
+    // client alive, and because equipment feeds the safety screen through
+    // equipmentFrom(), that default was quietly ungating equipment-restricted
+    // exercises for clients who may own a resistance band.
+    equipment: fromSources([
+      ['system_settings.studio_equipment', studioEquipment],
+    ], text),
   };
 
   const facts = {};
@@ -184,7 +216,9 @@ function resolveClientFacts(ctx, stated = {}) {
   const missing = [];
 
   for (const field of FIELDS) {
-    const hit = resolved[field];
+    const supersedable = STATED_SUPERSEDES.includes(field)
+      && text(stated[field]) !== null;
+    const hit = supersedable ? null : resolved[field];
     if (hit) {
       facts[field] = hit;
       recorded.push({ field, source: hit.source });
@@ -255,7 +289,7 @@ function describeFacts(facts) {
 }
 
 module.exports = {
-  FIELDS, BLOCKING, resolveClientFacts, describeFacts,
+  FIELDS, BLOCKING, STATED_SUPERSEDES, resolveClientFacts, describeFacts,
   // Exported for the tests that pin the parsing rather than the resolution.
   countDays, ageFromDob,
 };
