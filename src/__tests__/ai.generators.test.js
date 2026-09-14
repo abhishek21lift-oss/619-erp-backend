@@ -205,8 +205,8 @@ describe('workout/generate', () => {
     // Database values, not the browser's.
     expect(prompt).toContain(`Age: ${expectedAge()}`);
     expect(prompt).toContain('Gender: female');
-    expect(prompt).toContain('Weight: 71.3 kg');      // latest assessment beats pt_clients.weight
-    expect(prompt).toContain('Height: 160 cm');
+    expect(prompt).toContain('Weight (kg): 71.3');    // latest assessment beats pt_clients.weight
+    expect(prompt).toContain('Height (cm): 160');
     expect(prompt).toContain('Goal: weight_loss');
     expect(prompt).toContain('Experience level: beginner');
     expect(prompt).toContain('Training days per week: 4'); // pt_clients.frequency
@@ -252,7 +252,7 @@ describe('workout/generate', () => {
     // profile.height_cm beats pt_clients.height; with no enrolment-level
     // experience, profile.fitness_level beats the lifestyle assessment and
     // the body's 'advanced' claim.
-    expect(prompt).toContain('Height: 158.5 cm');
+    expect(prompt).toContain('Height (cm): 158.5');
     expect(prompt).toContain('Experience level: intermediate');
     expect(prompt).toContain('Injuries / limitations: left knee');
     expect(prompt).toContain('Health conditions: asthma');
@@ -318,23 +318,73 @@ describe('workout/generate', () => {
     expect(event[0].exercise_count).toBe(0);
   });
 
-  test('a client with no recorded profile and no body values still 400s with the same message shape', async () => {
+  // ── A bare record is refused by NAME, not filled in ──────────────────────
+  //
+  // This used to 400 with "Missing required fields: age, gender, height_cm,
+  // experience_level" — and the Client Profile card made sure it never fired,
+  // by posting age 30, gender male, height 175 and experience "beginner" for
+  // exactly this client. The generator then wrote a programme for a person the
+  // browser had invented.
+  //
+  // 422 now, and only for the three facts a programme genuinely cannot be
+  // written without. Age, gender and height are NOT among them: nothing in
+  // this engine reads a height, and a trainer who has never measured a client
+  // still knows how to prescribe a row. Those are reported missing, printed to
+  // the model as NOT RECORDED and frozen into the ledger — not invented, and
+  // not treated as a reason to refuse.
+  test('a bare record is refused, naming the fields that block programming', async () => {
     mockQueries({
       'FROM pt_clients WHERE id=$1': [{
         id: 'client-1', name: 'Bare', gender: null, dob: null, weight: null,
         height: null, goal: null, workout_experience_level: null, frequency: null,
+        sessions_per_week: null, preferred_training_days: null,
         health_conditions: null, previous_trainer_experience: false,
       }],
       'FROM workout_assignments wa': [],
     });
     const res = await request(app).post('/api/ai/workout/generate').send({ client_id: 'client-1' });
 
-    expect(res.status).toBe(400);
-    // weight and goal are still supplied by the (DB-authoritative) latest
-    // assessment and active goal rows; the record itself has no age source,
-    // gender, height or experience to fall back on.
-    expect(res.body.error).toBe('Missing required fields: age, gender, height_cm, experience_level');
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('MISSING_CLIENT_DATA');
+    // `goal` is NOT in the list: the shared fixture has an active pt_goals
+    // row, and the resolver reads it. That is the point — a fact the database
+    // holds anywhere is found rather than asked for.
+    expect(res.body.missing).toEqual(['experience_level', 'training_days']);
+    expect(res.body.message).toContain('Record experience_level, training_days');
     expect(routedStream).not.toHaveBeenCalled();
+  });
+
+  // The browser cannot buy its way past the gate with a claim about the
+  // person — but a trainer stating a value for a client the studio has no
+  // record of is legitimate, and is carried as THEIR statement rather than as
+  // the client's data, all the way into the prompt.
+  test('a trainer-stated value unblocks generation and is labelled as stated', async () => {
+    mockQueries({
+      'FROM pt_clients WHERE id=$1': [{
+        id: 'client-1', name: 'Bare', gender: null, dob: null, weight: null,
+        height: null, goal: null, workout_experience_level: null, frequency: null,
+        sessions_per_week: null, preferred_training_days: null,
+        health_conditions: null, previous_trainer_experience: false,
+      }],
+      'FROM workout_assignments wa': [],
+    });
+    const res = await request(app).post('/api/ai/workout/generate').send({
+      client_id: 'client-1',
+      goal: 'strength', experience_level: 'intermediate', training_days: 3,
+    });
+
+    expect(res.status).toBe(200);
+    const prompt = routedStream.mock.calls[0][0].messages[1].content;
+    expect(prompt).toContain('Experience level: intermediate (stated by the trainer for this session, not on file)');
+    expect(prompt).toContain('Training days per week: 3 (stated by the trainer for this session, not on file)');
+    // A recorded value still wins over a stated one. The trainer said
+    // 'strength'; the client's own goal row says otherwise, and the record is
+    // the authority — that precedence is what stops a request body quietly
+    // rewriting a client.
+    expect(prompt).not.toContain('Goal: strength');
+    // And what nobody holds is still said out loud rather than substituted.
+    expect(prompt).toContain('Height (cm): NOT RECORDED');
+    expect(prompt).toContain('Do not infer it, do not substitute a typical value');
   });
 });
 
@@ -510,14 +560,14 @@ describe('RAG: authorized knowledge in workout/generate', () => {
     const prompt = promptOf(routedStream.mock.calls[0][0]);
 
     // The four-section structure: facts, knowledge, library, instructions.
-    expect(prompt).toContain('CLIENT AUTHORITATIVE DATA:');
+    expect(prompt).toContain("CLIENT FACTS (from the studio's records):");
     expect(prompt).toContain('AUTHORIZED KNOWLEDGE BASE:');
     expect(prompt).toContain('[1] (Workout SOP) Every session starts with a 10-minute dynamic warm-up');
     expect(prompt).toContain('INSTRUCTIONS:');
     // Knowledge guides but can never override the client facts.
     expect(prompt).toContain('can never override the client facts');
     // And the client data is still fully present.
-    expect(prompt).toContain('Weight: 71.3 kg');
+    expect(prompt).toContain('Weight (kg): 71.3');
     expect(res.text).toContain('"type":"done"');
   });
 
@@ -687,7 +737,7 @@ describe('RAG: authorized knowledge in workout/generate', () => {
     expect(prompt).not.toContain('[1] (');
     expect(prompt).not.toContain('EXERCISE LIBRARY');
     // The facts and instructions survive without the RAG sections.
-    expect(prompt).toContain('CLIENT AUTHORITATIVE DATA:');
+    expect(prompt).toContain("CLIENT FACTS (from the studio's records):");
     expect(prompt).toContain('INSTRUCTIONS:');
     expect(res.text).toContain('"type":"done"');
     // Empty retrieval is reported honestly in the metadata event.

@@ -356,7 +356,7 @@ describe('programming memory', () => {
     // but it is the cheapest.
     const screen = prompt.indexOf('SAFETY SCREEN');
     const mem = prompt.indexOf('WHAT THIS TRAINER DID WITH YOUR LAST SUGGESTIONS');
-    const goals = prompt.indexOf('CLIENT AUTHORITATIVE DATA:');
+    const goals = prompt.indexOf("CLIENT FACTS (from the studio's records):");
     expect(screen).toBeLessThan(mem);
     // And specifically BETWEEN the screen and the goals, which is what the
     // route claims. Pinned because a preference pushed to the end of a long
