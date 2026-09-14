@@ -27,6 +27,7 @@ const svc = require('./pt-os.service');
 const { clientInOrg } = require('../../lib/orgGuard');
 const { today: studioToday } = require('../../lib/appTime');
 const { weekOf, resolveWeek } = require('./progression');
+const { ACTIVE_ASSIGNMENT_ORDER } = require('./assignments');
 const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./training-analytics');
 const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
 
@@ -866,7 +867,7 @@ router.get('/workout-log/analytics', auth, wrap(async (req, res) => {
          JOIN workout_plans wp ON wp.id = wa.workout_plan_id
         WHERE wa.client_id = $1 AND wa.status = 'active'
           ${orgId ? 'AND wa.organization_id = $2' : ''}
-        ORDER BY wa.start_date DESC
+        ORDER BY ${ACTIVE_ASSIGNMENT_ORDER}
         LIMIT 1`,
       orgId ? [client_id, orgId] : [client_id],
     ),
@@ -1089,7 +1090,7 @@ router.post('/workout-log/weekly-report',
            JOIN workout_plans wp ON wp.id = wa.workout_plan_id
           WHERE wa.client_id = $1 AND wa.status = 'active'
             ${orgId ? 'AND wa.organization_id = $2' : ''}
-          ORDER BY wa.start_date DESC LIMIT 1`,
+          ORDER BY ${ACTIVE_ASSIGNMENT_ORDER} LIMIT 1`,
         orgId ? [client_id, orgId] : [client_id],
       ),
       pool.query(

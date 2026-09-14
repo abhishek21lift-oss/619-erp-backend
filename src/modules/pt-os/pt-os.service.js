@@ -1,5 +1,6 @@
 const pool = require('../../db/pool');
 const { today: studioToday, todayShortDay: studioShortDay } = require('../../lib/appTime');
+const { activeAssignmentOrder } = require('./assignments');
 
 async function calculateMonthlyCommissions(month, scope = {}) {
   const monthStart = `${month}-01`;
@@ -652,7 +653,7 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
                       WHERE we.workout_plan_id = a.workout_plan_id
                         AND we.day_of_week = $2
                         AND we.week_number = 1)) DESC,
-                   a.start_date DESC
+                   ${activeAssignmentOrder('a')}
           LIMIT 1
        ) wa ON TRUE
        LEFT JOIN workout_plans wp ON wp.id = wa.workout_plan_id
@@ -746,7 +747,7 @@ async function getOpsSummary(scope = {}, trainerId = null) {
                    WHERE we.workout_plan_id = a.workout_plan_id
                      AND we.day_of_week = EXTRACT(ISODOW FROM s.session_date)::int
                      AND we.week_number = 1)) DESC,
-                a.start_date DESC
+                ${activeAssignmentOrder('a')}
        LIMIT 1
     ) wa ON TRUE
     WHERE s.session_date = $1 AND s.deleted_at IS NULL${orgS}

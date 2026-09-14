@@ -24,7 +24,7 @@
 // has asked".
 
 /** Sections a brief can carry, in the order a trainer would want to read them. */
-const SECTIONS = ['readiness', 'body', 'capacity', 'limitations', 'lifestyle', 'goal', 'history'];
+const SECTIONS = ['readiness', 'body', 'capacity', 'limitations', 'lifestyle', 'nutrition', 'goal', 'history'];
 
 /**
  * How old a section may be before it is reported as stale, in days.
@@ -54,6 +54,8 @@ const SECTIONS = ['readiness', 'body', 'capacity', 'limitations', 'lifestyle', '
  *                     describes current capacity
  *   body          90  weight and composition move fastest of all
  *   lifestyle    180  sleep, stress and occupation change with life
+ *   nutrition    180  what somebody eats, what they cannot eat, and what
+ *                     their gut does with it, on the same clock as lifestyle
  *   goal         180  a goal nobody has revisited in half a year may not be
  *                     the goal any more
  *
@@ -66,6 +68,7 @@ const STALE_AFTER_DAYS = Object.freeze({
   capacity: 180,
   body: 90,
   lifestyle: 180,
+  nutrition: 180,
   goal: 180,
 });
 
@@ -267,7 +270,8 @@ function textFrom(value) {
  * testable directly.
  */
 function buildBrief({
-  client, parq, assessment, posture, mobility, lifestyle, goal, assignment, recentSessions = [],
+  client, parq, assessment, posture, mobility, lifestyle, nutrition, goal, assignment,
+  recentSessions = [],
 }) {
   const sections = {};
 
@@ -362,6 +366,50 @@ function buildBrief({
     recovery_risk: lifestyle.recovery_risk ?? null,
     lifestyle_score: num(lifestyle.lifestyle_score),
     notes: textFrom(lifestyle.coach_notes),
+  } : { present: false };
+
+  // ── Nutrition: what the training is being fuelled by, and what it must be
+  // written around.
+  //
+  // ── Why a WORKOUT brief carries this ─────────────────────────────────────
+  //
+  // The studio has asked these questions and stored the answers since
+  // migration 057, and until now only the diet generator ever read them. The
+  // workout generator — the feature whose whole job is deciding how much work
+  // a person can recover from — could not see that a client eats one meal a
+  // day, drinks under a litre of water, or carries a medical condition their
+  // nutrition assessment records and no other form does.
+  //
+  // Four of these fields change a PROGRAMME rather than a meal plan:
+  //
+  //   · medical_conditions / medical_notes — recorded here and nowhere else
+  //     for clients whose PAR-Q predates this form. A constraint is a
+  //     constraint whichever screen it was typed into.
+  //   · meals_per_day and late_night_eating — energy availability and sleep
+  //     quality, which is recovery, which is how much volume is affordable.
+  //   · water_intake_liters — the one input that changes what a hard session
+  //     is safe to prescribe in an Indian summer.
+  //   · digestive_issues — decides whether a session can be programmed close
+  //     to a meal at all.
+  //
+  // Everything else the assessment holds stays out of this brief. A workout
+  // prompt does not need somebody's favourite foods, and a section that
+  // carries everything gets skimmed.
+  sections.nutrition = nutrition ? {
+    present: true,
+    as_of: dateOf(nutrition.assessment_date),
+    diet_preferences: labelsFrom(nutrition.diet_preferences),
+    allergies: labelsFrom(nutrition.food_allergies),
+    meals_per_day: num(nutrition.meals_per_day),
+    late_night_eating: nutrition.late_night_eating ?? null,
+    water_intake_liters: num(nutrition.water_intake_liters ?? nutrition.daily_fluid_intake_liters),
+    digestive_issues: labelsFrom(nutrition.digestive_issues),
+    takes_supplements: nutrition.takes_supplements ?? null,
+    // The two fields that are a SAFETY input rather than a dietary one. Kept
+    // verbatim through textFrom for the same reason the PAR-Q notes are: they
+    // are words a trainer wrote about a person.
+    medical_conditions: labelsFrom(nutrition.medical_conditions),
+    medical_notes: textFrom(nutrition.medical_notes),
   } : { present: false };
 
   sections.goal = goal ? {

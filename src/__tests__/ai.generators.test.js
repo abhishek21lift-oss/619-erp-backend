@@ -147,9 +147,25 @@ function mockQueries(overrides = {}) {
     'FROM workout_sets s': [],
     ...overrides,
   };
+  // ── Matched on SHAPE, not on formatting ────────────────────────────────
+  //
+  // The needles below are substrings of real SQL, and real SQL gets reindented.
+  // When the two loaders were collapsed into one (modules/pt-os/
+  // programming-context.js) the canonical query wrote `WHERE client_id = $1`
+  // where the retired one wrote `WHERE client_id=$1`, and every specific needle
+  // silently stopped matching — falling through to the general entry below it,
+  // which answers with no rows. The tests still passed the assertions that
+  // expected nothing and failed only the one that expected a disagreement.
+  //
+  // So whitespace is collapsed and the spaces around `=` are dropped on BOTH
+  // sides before matching. A needle then pins which table and which predicate,
+  // which is what it was ever meant to pin, and a reformat cannot quietly turn
+  // a fixture into an empty result again.
+  const shape = (sql) => String(sql).replace(/\s+/g, ' ').replace(/\s*=\s*/g, '=');
   pool.query.mockImplementation((sql) => {
+    const needleShape = shape(sql);
     for (const [needle, rows] of Object.entries(rowsBySql)) {
-      if (sql.includes(needle)) return Promise.resolve({ rows });
+      if (needleShape.includes(shape(needle))) return Promise.resolve({ rows });
     }
     return Promise.resolve({ rows: [] });
   });
@@ -305,7 +321,7 @@ describe('workout/generate', () => {
     expect(res.status).toBe(404);
     expect(res.body.error).toBe('Client not found');
     // The tenant boundary is in the SQL itself…
-    expect(pool.query.mock.calls[0][0]).toContain('organization_id=$2');
+    expect(pool.query.mock.calls[0][0].replace(/\s*=\s*/g, '=')).toContain('organization_id=$2');
     expect(pool.query.mock.calls[0][1][1]).toBe('org-1');
     // …and the child queries never ran at all, so nothing keyed by that
     // client_id was even read into memory.
@@ -321,7 +337,7 @@ describe('workout/generate', () => {
 
     expect(res.status).toBe(200);
     const [sql, params] = pool.query.mock.calls[0];
-    expect(sql).toContain('($2::uuid IS NULL OR organization_id=$2)');
+    expect(sql.replace(/\s*=\s*/g, '=')).toContain('($2::uuid IS NULL OR organization_id=$2)');
     expect(params[1]).toBeNull();
     // With no org context, retrieval fails closed: neither RAG nor the
     // exercise library is consulted — the prompt runs on client facts alone.

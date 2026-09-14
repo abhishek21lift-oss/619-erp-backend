@@ -10,6 +10,7 @@ const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
 const { markAccepted, acceptGeneration } = require('../modules/pt-os/programming-memory');
 const logger = require('../lib/logger');
+const { activeAssignmentOrder } = require('../modules/pt-os/assignments');
 
 // '/api/workouts/exercises' and '/exercises/meta' were here: read-only
 // duplicates of /api/exercises kept for older clients. There are none — the
@@ -196,7 +197,9 @@ router.get('/plans', auth, async (req, res, next) => {
     const { rows } = await pool.query(`
       SELECT wp.*,
         COALESCE((SELECT COUNT(*) FROM workout_exercises we WHERE we.workout_plan_id = wp.id), 0)::int AS exercise_count,
-        ${client_id ? `(SELECT wa2.progress_pct FROM workout_assignments wa2 WHERE wa2.workout_plan_id = wp.id AND wa2.client_id = $1 AND wa2.status = 'active' LIMIT 1)::int AS progress,` : '0 AS progress,'}
+        ${client_id ? `(SELECT wa2.progress_pct FROM workout_assignments wa2
+           WHERE wa2.workout_plan_id = wp.id AND wa2.client_id = $1 AND wa2.status = 'active'
+           ORDER BY ${activeAssignmentOrder('wa2')} LIMIT 1)::int AS progress,` : '0 AS progress,'}
         COALESCE((SELECT json_agg(json_build_object(
           'id', we.id, 'exercise_id', we.exercise_id, 'name', e.name,
           'muscle_group', e.muscle_group, 'sets', we.sets, 'reps', we.reps,

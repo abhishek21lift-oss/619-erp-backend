@@ -45,10 +45,8 @@
 // model's; the approval is the trainer's.
 
 const pool = require('../../db/pool');
-const { buildBrief } = require('./training-brief');
-const { buildRecovery } = require('./recovery');
 const { buildTrainingHistory, isoWeek } = require('./training-history');
-const { evaluate, equipmentFrom, weeklyMuscleSets, screenExercise } = require('./programming-rules');
+const { screenExercise, weeklyMuscleSets } = require('./programming-rules');
 const { normaliseName } = require('./plan-critic');
 const { volumeLandmarks, deloadTriggers } = require('./programming-rules');
 const { detectSignals, summariseRoster } = require('./training-signals');
@@ -68,21 +66,6 @@ const DEFAULT_WINDOW_WEEKS = 12;
  */
 const MAX_SETS = 2000;
 
-/**
- * Every row we hold about one client, and what it adds up to.
- *
- * @param {string} clientId
- * @param {string|null} orgId  From the authenticated session. Null only for a
- *        platform super admin, where the client lookup is unscoped by design
- *        and matches what both existing loaders already do.
- * @param {object=} opts
- * @param {number=} opts.windowWeeks
- * @param {string=} opts.equipmentText Free text from the request body; the
- *        database holds no equipment column, so this is the only source.
- * @param {object[]=} opts.exercises   Library rows to screen, already
- *        retrieved through the library's own tenancy predicate.
- * @returns {Promise<object|null>} null when the client is not this org's.
- */
 /**
  * A date column as 'YYYY-MM-DD', whatever the driver handed us.
  *
@@ -156,105 +139,6 @@ function programState(assignment, sessions = [], today = studioToday()) {
     sessions_completed_in_window: sessions.filter((x) => x?.status === 'completed').length,
     progress_pct: assignment.progress_pct ?? null,
     expired,
-  };
-}
-
-async function loadDigitalTwin(clientId, orgId, {
-  windowWeeks = DEFAULT_WINDOW_WEEKS, equipmentText = null, exercises = [],
-} = {}) {
-  const { rows: clientRows } = await pool.query(
-    `SELECT id, name, gender, dob, goal, injuries, notes, workout_experience_level,
-            health_conditions, organization_id
-       FROM pt_clients
-      WHERE id = $1 AND deleted_at IS NULL
-        AND ($2::uuid IS NULL OR organization_id = $2)`,
-    [clientId, orgId],
-  );
-  const client = clientRows[0];
-  if (!client) return null;
-
-  const weeks = Math.max(1, Math.min(104, Number(windowWeeks) || DEFAULT_WINDOW_WEEKS));
-  const one = (sql, params = [clientId]) => pool.query(sql, params).then((r) => r.rows[0] ?? null);
-  const many = (sql, params = [clientId]) => pool.query(sql, params).then((r) => r.rows);
-
-  const [parq, assessment, posture, mobility, lifestyle, goal, assignment, sessions, sets, checkins, landmarks] =
-    await Promise.all([
-      one(`SELECT * FROM pt_parq_forms WHERE client_id = $1 AND deleted_at IS NULL
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_posture_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_mobility_performance_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_goals WHERE client_id = $1 AND is_active = true
-            ORDER BY created_at DESC LIMIT 1`),
-      one(`SELECT wa.start_date, wa.progress_pct, wp.id AS plan_id, wp.name AS plan_name,
-                  wp.duration_weeks,
-                  (SELECT COUNT(DISTINCT we.day_of_week) FROM workout_exercises we
-                    WHERE we.workout_plan_id = wp.id AND we.week_number = 1)::int AS planned_days_count
-             FROM workout_assignments wa
-             JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-            WHERE wa.client_id = $1 AND wa.status = 'active'
-            ORDER BY wa.start_date DESC LIMIT 1`),
-      many(
-        `SELECT status, session_date FROM workout_sessions
-          WHERE client_id = $1 AND session_date >= CURRENT_DATE - ($2 * INTERVAL '1 week')`,
-        [clientId, weeks],
-      ),
-      // The half of the loop nothing outside the workout log has ever read.
-      // target_muscle rides along so weekly volume needs no second query — the
-      // same key muscle_volume_landmarks and the analytics screen use. Null for
-      // a set whose exercise was typed free-hand, which is 29 of production's
-      // 408 completed sets, and reported rather than dropped.
-      many(
-        `SELECT wse.exercise_name, s.weight_kg, s.reps, s.rpe, s.rir, s.completed,
-                ws.session_date, e.target_muscle
-           FROM workout_sets s
-           JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
-           JOIN workout_sessions ws ON ws.id = wse.session_id
-           LEFT JOIN exercises e ON e.id = wse.exercise_id
-          WHERE ws.client_id = $1
-            AND ws.session_date >= CURRENT_DATE - ($2 * INTERVAL '1 week')
-          ORDER BY ws.session_date DESC
-          LIMIT ${MAX_SETS}`,
-        [clientId, weeks],
-      ),
-      many(`SELECT week_start_date, mood, sleep_hours, water_glasses,
-                   stress_level, energy_level, soreness_level
-              FROM weekly_checkins WHERE client_id = $1
-             ORDER BY week_start_date DESC LIMIT 12`),
-      resolveLandmarks(orgId),
-    ]);
-
-  const brief = buildBrief({
-    client, parq, assessment, posture, mobility, lifestyle, goal, assignment,
-    recentSessions: sessions,
-  });
-  const recovery = buildRecovery(checkins);
-  const history = buildTrainingHistory({
-    sets,
-    assignment: adherenceInputs(assignment, sessions, weeks),
-    windowWeeks: weeks,
-  });
-  const rules = evaluate({
-    parq, mobility, posture, lifestyle, client,
-    equipment: equipmentFrom(equipmentText),
-    exercises,
-    history,
-    recovery,
-    weeklySets: weeklyMuscleSets(sets, isoWeek),
-    landmarks,
-  });
-
-  return {
-    client, brief, recovery, history, rules,
-    // Where they are in the programme they are already on — the half the
-    // generator was missing.
-    program: programState(assignment, sessions),
-    window_weeks: weeks,
   };
 }
 
@@ -418,6 +302,30 @@ function describeTwin(twin) {
   if (recovery.present && recovery.score !== null) {
     L.push(`- Self-reported readiness ${recovery.score}/100 (${recovery.band}), ${recovery.inputs}`
       + ` of ${recovery.max_inputs} questions answered, trend ${recovery.trend ?? 'unknown'}.`);
+  }
+
+  // ── Fuelling and recovery inputs the nutrition assessment holds ─────────
+  //
+  // These are in a WORKOUT prompt because they change what a person can be
+  // asked to do, not because the model should write a meal plan — and the
+  // last line says so, because a model handed food data will otherwise
+  // helpfully prescribe some.
+  const nut = brief.sections.nutrition;
+  if (nut?.present) {
+    const N = [];
+    if (nut.medical_conditions.length) N.push(`- Medical conditions recorded on the nutrition assessment: ${nut.medical_conditions.join(', ')}.`);
+    if (nut.medical_notes) N.push(`- Nutrition assessment medical notes: ${nut.medical_notes}`);
+    if (nut.meals_per_day !== null) N.push(`- Eats ${nut.meals_per_day} meals a day.`);
+    if (nut.water_intake_liters !== null) N.push(`- Drinks about ${nut.water_intake_liters} litres of fluid a day.`);
+    if (nut.late_night_eating === true) N.push('- Eats late at night, which is a sleep-quality and therefore a recovery input.');
+    if (nut.digestive_issues.length) N.push(`- Digestive issues reported: ${nut.digestive_issues.join(', ')}.`);
+    if (nut.allergies.length) N.push(`- Food allergies: ${nut.allergies.join(', ')}.`);
+    if (N.length) {
+      L.push('', 'FUELLING AND RECOVERY (from the nutrition assessment):', ...N);
+      L.push('Weigh these as recovery capacity and as constraints on session demand. Do NOT write a diet, a calorie target, a macro split or a meal plan — that is a separate assessment and a separate plan.');
+    }
+  } else {
+    L.push('', 'No nutrition assessment is on file, so nothing is known about this client\'s fuelling, hydration or food-related medical history. Do not assume it is adequate.');
   }
 
   if (brief.missing.length) {
@@ -735,7 +643,6 @@ const MAX_SWEEP_SETS = 20000;
 
 module.exports = {
   programState,
-  loadDigitalTwin,
   TRAINING_HAPPENED,
   resolveLandmarks,
   screenPlanExercises,

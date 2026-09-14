@@ -234,3 +234,137 @@ describe('what the model is shown', () => {
     }
   });
 });
+
+// ── The two states that were being collapsed into "we have it" ─────────────
+//
+// A weight the client mentioned at the door, a weight measured eighteen months
+// ago and a weight measured on Tuesday all printed as the same bare number, and
+// the model programmed from all three with equal confidence.
+
+describe('unverified: held, but never measured', () => {
+  const fromCheckin = (over = {}) => ({
+    ...bare(),
+    latestCheckin: { weight: 82 },
+    ...over,
+  });
+
+  test('a weight the client reported is unverified, not recorded', () => {
+    const { facts, data_quality: dq } = resolveClientFacts(fromCheckin());
+    expect(facts.weight_kg.value).toBe(82);
+    expect(facts.weight_kg.origin).toBe('unverified');
+    expect(dq.unverified).toEqual([{ field: 'weight_kg', source: 'weekly_checkins.weight' }]);
+    expect(dq.recorded.map((r) => r.field)).not.toContain('weight_kg');
+  });
+
+  test('a weight the studio measured is recorded', () => {
+    const { facts, data_quality: dq } = resolveClientFacts({
+      ...bare(), latestAssessment: { weight: 80 }, latestCheckin: { weight: 82 },
+    });
+    expect(facts.weight_kg.origin).toBe('recorded');
+    expect(facts.weight_kg.source).toBe('pt_assessments.weight');
+    expect(dq.unverified).toEqual([]);
+  });
+
+  // It is still a value the studio holds, so it counts towards how filled-in
+  // the record is. What it is not is something the studio MEASURED, and
+  // `unverified` is where that question is answered.
+  test('it counts towards completeness', () => {
+    expect(resolveClientFacts(fromCheckin()).data_quality.completeness_pct)
+      .toBe(Math.round((1 / FIELDS.length) * 100));
+  });
+
+  test('the model is told what unverified means, and only when it applies', () => {
+    const shown = describeFacts(resolveClientFacts(fromCheckin()).facts);
+    expect(shown).toContain('Weight (kg): 82 (from weekly_checkins.weight — UNVERIFIED');
+    expect(shown).toMatch(/what the client said, not what anybody measured/);
+
+    const measured = describeFacts(resolveClientFacts({
+      ...bare(), latestAssessment: { weight: 80 },
+    }).facts);
+    expect(measured).toContain('Weight (kg): 80 (from pt_assessments.weight)');
+    expect(measured).not.toMatch(/UNVERIFIED/);
+  });
+});
+
+describe('stale: measured, but a long time ago', () => {
+  const STALE_BODY = [{ section: 'body', as_of: '2024-01-03', age_days: 620, stale_after_days: 90 }];
+
+  test('a fact from a stale section carries the age of its assessment', () => {
+    const { facts, data_quality: dq } = resolveClientFacts(
+      { ...bare(), latestAssessment: { weight: 80 } }, {}, { stale: STALE_BODY },
+    );
+    expect(facts.weight_kg.origin).toBe('recorded');
+    expect(facts.weight_kg.stale).toEqual({ as_of: '2024-01-03', age_days: 620, stale_after_days: 90 });
+    expect(dq.stale).toEqual([expect.objectContaining({ field: 'weight_kg', section: 'body' })]);
+  });
+
+  test('a fact from a section nobody called stale carries nothing', () => {
+    const { facts, data_quality: dq } = resolveClientFacts(
+      { ...bare(), latestAssessment: { weight: 80 } }, {}, { stale: [] },
+    );
+    expect(facts.weight_kg.stale).toBeUndefined();
+    expect(dq.stale).toEqual([]);
+  });
+
+  // pt_clients has no assessment date, so there is no evidence about its age.
+  // Saying nothing is the honest answer; inventing a date would be worse.
+  test('a fact from a source with no assessment date is never called stale', () => {
+    const { facts } = resolveClientFacts(
+      { ...bare({ weight: 80 }) }, {}, { stale: STALE_BODY },
+    );
+    expect(facts.weight_kg.source).toBe('pt_clients.weight');
+    expect(facts.weight_kg.stale).toBeUndefined();
+  });
+
+  test('the model is told to program to it, not to extrapolate from it', () => {
+    const shown = describeFacts(resolveClientFacts(
+      { ...bare(), latestAssessment: { weight: 80 } }, {}, { stale: STALE_BODY },
+    ).facts);
+    expect(shown).toContain('STALE — measured 2024-01-03, 620 days ago');
+    expect(shown).toMatch(/Do NOT extrapolate it forward/);
+  });
+});
+
+describe('a fact can be several things at once', () => {
+  // ── Why this tests the formatter directly ──────────────────────────────
+  //
+  // It cannot be reached through resolveClientFacts today, and that is worth
+  // saying rather than working around. The only unverified source,
+  // weekly_checkins.weight, is LAST in its precedence chain, so it wins only
+  // when nothing else holds a weight — which means it can never carry a
+  // conflict. It also has no entry in SOURCE_SECTION, so it can never be
+  // stale. The three states are mutually exclusive by the shape of today's
+  // precedence, not by the shape of the code.
+  //
+  // The composition still has to be right, because the day a second unverified
+  // source joins that list — one in the middle of a chain, or one with an
+  // assessment date — a formatter that branched on the first match would
+  // silently drop two of the three. So the branch-free composition is pinned
+  // here, on a fact built by hand, and the comment says why the fixture is
+  // synthetic.
+  test('provenance, disagreement and age are all said, not the first that matched', () => {
+    const line = describeFacts({
+      weight_kg: {
+        value: 82,
+        source: 'weekly_checkins.weight',
+        origin: 'unverified',
+        conflicts: [{ source: 'pt_clients.weight', value: 91 }],
+        stale: { as_of: '2024-01-03', age_days: 620, stale_after_days: 90 },
+      },
+    }).split('\n').find((l) => l.startsWith('- Weight'));
+
+    expect(line).toMatch(/UNVERIFIED/);
+    expect(line).toMatch(/DISPUTED — 91 in pt_clients\.weight/);
+    expect(line).toMatch(/STALE — measured 2024-01-03/);
+  });
+
+  test('and the value itself is still the one precedence chose', () => {
+    const line = describeFacts({
+      weight_kg: {
+        value: 82, source: 'weekly_checkins.weight', origin: 'unverified',
+        conflicts: [{ source: 'pt_clients.weight', value: 91 }],
+      },
+    }).split('\n').find((l) => l.startsWith('- Weight'));
+    expect(line.startsWith('- Weight (kg): 82 ')).toBe(true);
+  });
+});

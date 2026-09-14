@@ -12,6 +12,7 @@ const { today: studioToday } = require('../../lib/appTime');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
 const { sweepRoster } = require('./client-context');
+const { ACTIVE_ASSIGNMENT_ORDER } = require('./assignments');
 const { buildEnrollmentPdf } = require('../../lib/ptEnrollmentPdf');
 const { buildSnapshot } = require('./client-snapshot');
 const { generateCoach } = require('./coach-ai');
@@ -2046,7 +2047,7 @@ router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
            FROM workout_assignments wa
            JOIN workout_plans wp ON wp.id = wa.workout_plan_id
           WHERE wa.client_id = $1 AND wa.status = 'active'
-          ORDER BY wa.start_date DESC LIMIT 1`),
+          ORDER BY ${ACTIVE_ASSIGNMENT_ORDER} LIMIT 1`),
     // Four weeks of the log, so "do they turn up" is answered from what was
     // performed rather than from the plan's own progress field.
     pool.query(

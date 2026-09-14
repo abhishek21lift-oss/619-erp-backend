@@ -255,3 +255,82 @@ describe('textFrom — free text out of columns that do not hold text', () => {
     }
   });
 });
+
+// ── The assessment only the diet generator could see ───────────────────────
+//
+// pt_nutrition_assessments has been collected since migration 057 and the
+// feature whose whole job is deciding how much work a person can recover from
+// could not read a word of it — not that they eat once a day, not that they
+// drink under a litre, and not the medical conditions recorded on that form
+// and on no other.
+
+describe('the nutrition section', () => {
+  const { buildBrief, SECTIONS, STALE_AFTER_DAYS } = require('../modules/pt-os/training-brief');
+
+  const NUTRITION = {
+    assessment_date: '2026-08-01',
+    diet_preferences: ['vegetarian'],
+    food_allergies: ['peanuts'],
+    meals_per_day: 2,
+    late_night_eating: true,
+    water_intake_liters: '1.5',
+    digestive_issues: { bloating: true, reflux: false },
+    takes_supplements: false,
+    medical_conditions: ['hypothyroidism'],
+    medical_notes: 'on levothyroxine',
+  };
+
+  const brief = (nutrition) => buildBrief({ client: { id: 'c1' }, nutrition });
+
+  it('is one of the sections a brief is counted complete against', () => {
+    expect(SECTIONS).toContain('nutrition');
+  });
+
+  it('is absent, not empty, when nobody has filled the form in', () => {
+    const b = brief(null);
+    expect(b.sections.nutrition).toEqual({ present: false });
+    expect(b.missing).toContain('nutrition');
+  });
+
+  it('carries the four fields that change a programme rather than a meal plan', () => {
+    const n = brief(NUTRITION).sections.nutrition;
+    expect(n.present).toBe(true);
+    expect(n.medical_conditions).toEqual(['hypothyroidism']);
+    expect(n.medical_notes).toBe('on levothyroxine');
+    expect(n.meals_per_day).toBe(2);
+    expect(n.water_intake_liters).toBe(1.5);
+    expect(n.late_night_eating).toBe(true);
+    expect(n.digestive_issues).toEqual(['bloating']);
+  });
+
+  it('leaves out what a workout prompt has no business reading', () => {
+    const n = brief({ ...NUTRITION, favourite_foods: ['biryani'], cravings: ['sugar'] });
+    expect(Object.keys(n)).not.toContain('favourite_foods');
+    expect(Object.keys(n)).not.toContain('cravings');
+  });
+
+  it('falls back to the daily fluid total when no water figure was given', () => {
+    const n = brief({ ...NUTRITION, water_intake_liters: null, daily_fluid_intake_liters: '2.5' })
+      .sections.nutrition;
+    expect(n.water_intake_liters).toBe(2.5);
+  });
+
+  it('reports nothing rather than zero when neither was recorded', () => {
+    const n = brief({ ...NUTRITION, water_intake_liters: null, daily_fluid_intake_liters: null })
+      .sections.nutrition;
+    expect(n.water_intake_liters).toBeNull();
+  });
+
+  it('goes stale on the same clock as lifestyle', () => {
+    expect(STALE_AFTER_DAYS.nutrition).toBe(STALE_AFTER_DAYS.lifestyle);
+    const old = new Date();
+    old.setUTCDate(old.getUTCDate() - (STALE_AFTER_DAYS.nutrition + 1));
+    const b = brief({ ...NUTRITION, assessment_date: old.toISOString().slice(0, 10) });
+    expect(b.stale.map((s) => s.section)).toContain('nutrition');
+  });
+
+  it('is not stale on the day it was taken', () => {
+    const b = brief({ ...NUTRITION, assessment_date: new Date().toISOString().slice(0, 10) });
+    expect(b.stale.map((s) => s.section)).not.toContain('nutrition');
+  });
+});

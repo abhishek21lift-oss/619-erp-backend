@@ -335,3 +335,92 @@ describe('flattening', () => {
     }
   });
 });
+
+// ── Enforcing an adaptation, not just asking for one ───────────────────────
+//
+// `mode=adapt` changed what the model was told. Nothing checked whether the
+// block that came back bore any resemblance to the one the client was actually
+// training, so a model that quietly rewrote the whole programme produced
+// exactly the second plan the adapt path exists to prevent — and it read like
+// a thoughtful continuation.
+
+describe('adaptation retention', () => {
+  const { MIN_RETENTION_PCT, MIN_EXERCISES_FOR_RETENTION } = require('../modules/pt-os/plan-critic');
+
+  const planOf = (names) => ({
+    weeks: 4,
+    warm_up: 'five minutes on the bike',
+    cool_down: 'stretching',
+    progression_notes: 'add 2.5kg a week',
+    weekly_schedule: {
+      Monday: {
+        exercises: names.map((name) => ({
+          name, sets: 3, reps: '8-10', rir_or_rpe: 'RIR 2', rest_seconds: 120,
+        })),
+      },
+    },
+  });
+
+  const BLOCK = ['Barbell Squat', 'Bench Press', 'Barbell Row', 'Overhead Press'];
+  const auditAdapting = (names, continuing = BLOCK) =>
+    auditPlan(planOf(names), { requested: { continuing: { exercise_names: continuing } } });
+
+  const retention = (audit) => audit.violations.find((v) => v.rule === 'adaptation_discarded_block');
+
+  it('passes an adaptation that keeps the programme and changes the prescription', () => {
+    expect(retention(auditAdapting(BLOCK))).toBeUndefined();
+  });
+
+  it('passes an adaptation that swaps one movement out', () => {
+    expect(retention(auditAdapting(['Barbell Squat', 'Bench Press', 'Barbell Row', 'Lat Pulldown'])))
+      .toBeUndefined();
+  });
+
+  it('fails one that replaced the programme', () => {
+    const v = retention(auditAdapting(['Leg Press', 'Cable Fly', 'Lat Pulldown', 'Lateral Raise']));
+    expect(v).toBeDefined();
+    expect(v.severity).toBe('critical');
+    expect(v.detail).toMatch(/keeps only 0 of the 4 exercises/);
+    // Names the movements it dropped, so a trainer can see what went.
+    expect(v.where).toEqual(expect.arrayContaining([expect.stringContaining('squat')]));
+  });
+
+  it('fails at exactly below the stated threshold, and passes at it', () => {
+    // Two of four kept is 50%, which is the floor and therefore allowed.
+    expect(retention(auditAdapting(['Barbell Squat', 'Bench Press', 'Leg Press', 'Cable Fly'])))
+      .toBeUndefined();
+    // One of four is 25%.
+    const v = retention(auditAdapting(['Barbell Squat', 'Leg Press', 'Cable Fly', 'Lateral Raise']));
+    expect(v.detail).toContain(`${MIN_RETENTION_PCT}%`);
+  });
+
+  it('matches on normalised name, so spelling does not fail an honest plan', () => {
+    expect(retention(auditAdapting(['barbell  squat', 'BENCH PRESS', 'Barbell Row', 'Overhead Press'])))
+      .toBeUndefined();
+  });
+
+  // A NEW programme has nothing to retain. Firing the rule there would fail a
+  // trainer who deliberately started their client on something different.
+  it('never fires on a new programme', () => {
+    expect(retention(auditPlan(planOf(['Leg Press']), { requested: {} }))).toBeUndefined();
+    expect(retention(auditPlan(planOf(['Leg Press']), { requested: { continuing: null } }))).toBeUndefined();
+  });
+
+  it('never fires on a block too small for a ratio to mean anything', () => {
+    const tiny = BLOCK.slice(0, MIN_EXERCISES_FOR_RETENTION - 1);
+    expect(retention(auditAdapting(['Leg Press'], tiny))).toBeUndefined();
+  });
+
+  it('spends the one revision on it, and tells the model to put them back', () => {
+    const audit = auditAdapting(['Leg Press', 'Cable Fly', 'Lat Pulldown', 'Lateral Raise']);
+    expect(audit.needs_revision).toBe(true);
+    const instruction = buildRevisionInstruction(audit);
+    expect(instruction).toMatch(/Put the client's current exercises back/);
+    expect(instruction).toMatch(/PROGRESS this block, not to replace it/);
+  });
+
+  it('leaves the replace-an-excluded-exercise instruction alone otherwise', () => {
+    const audit = auditAdapting(BLOCK.concat(['Leg Press']));
+    expect(buildRevisionInstruction(audit) ?? '').not.toMatch(/Put the client's current exercises back/);
+  });
+});

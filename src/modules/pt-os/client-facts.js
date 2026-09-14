@@ -22,9 +22,24 @@
  * So: one resolver, three categories, and no fourth.
  *
  *   RECORDED           the database holds it — the column is named
+ *   UNVERIFIED         the database holds it, but the only source is the
+ *                      client's own report rather than a studio measurement
  *   STATED             the trainer typed it for THIS generation, knowing it
  *                      is not on file, and it is labelled as their statement
  *   MISSING            nobody knows, and the prompt says NOT RECORDED
+ *
+ * and two flags a RECORDED or UNVERIFIED fact may additionally carry:
+ *
+ *   CONFLICTING        two of the studio's own records disagree; precedence
+ *                      decided, and the loser is carried rather than dropped
+ *   STALE              the assessment it came from is older than the studio
+ *                      treats as current — see training-brief's STALE_AFTER_DAYS
+ *
+ * Six states, because four of them were being collapsed into "we have it".
+ * A weight the client mentioned at the door, a weight measured eighteen months
+ * ago and a weight measured on Tuesday all printed as the same bare number,
+ * and the model — and the trainer reading the plan — had no way to tell which
+ * one it was programming from.
  *
  * There is deliberately no "assumed". A fact this module cannot source is
  * missing, and missing travels all the way to the trainer's screen and into
@@ -72,6 +87,54 @@ const BLOCKING = ['goal', 'experience_level', 'training_days'];
  * nothing downstream mistakes it for the studio's standing inventory.
  */
 const STATED_SUPERSEDES = ['equipment'];
+
+/**
+ * Sources that hold a real value the studio never measured.
+ *
+ * ── Why this list is one entry long ────────────────────────────────────────
+ *
+ * The temptation is to fill it: an enrolment form's height is "what they said",
+ * a fitness profile's weight is "probably what they said". Neither is something
+ * this codebase can demonstrate. `client_fitness_profiles` is written by an
+ * authenticated PUT from staff (routes/diet.js), and pt_clients' own columns
+ * come off the enrolment screen, also staff-entered. Marking those unverified
+ * would be a guess about how a studio works, which is the same class of
+ * mistake as the defaults this module exists to remove — it would just be a
+ * pessimistic one.
+ *
+ * `weekly_checkins` is different and the code says so out loud. Its writer's
+ * own comment describes it as "a thirty-second check-in at the door" that
+ * should "record what the client said", and the row carries a `client_notes`
+ * column beside the number. A weight from there is a person's report of their
+ * weight. A weight from `pt_assessments` is a measurement taken during an
+ * assessment. Programming a cut from the first as though it were the second is
+ * exactly the error worth naming.
+ *
+ * An entry joins this list when the code that writes it shows the value came
+ * from the client rather than from the studio. Not before.
+ */
+const UNVERIFIED_SOURCES = Object.freeze(new Set([
+  'weekly_checkins.weight',
+]));
+
+/**
+ * Which brief section a fact's source belongs to.
+ *
+ * Staleness is assessed per SECTION in training-brief.js — one date per
+ * assessment, one threshold per kind. This is the join back to the individual
+ * facts, so "the body section was measured 620 days ago" becomes "this weight
+ * is 620 days old" on the one line where somebody is about to program from it.
+ *
+ * Sources with no entry have no section and are never reported stale. That is
+ * not the same as fresh, and the absence is deliberate: pt_clients has no
+ * assessment date, so there is no evidence about its age to report and
+ * inventing one would be worse than saying nothing.
+ */
+const SOURCE_SECTION = Object.freeze({
+  'pt_assessments.weight': 'body',
+  'pt_lifestyle_assessments.workout_experience_level': 'lifestyle',
+  'pt_goals.goal_type': 'goal',
+});
 
 /**
  * How many training days `preferred_training_days` names.
@@ -140,7 +203,17 @@ function fromSources(candidates, coerce) {
   for (const [source, raw] of candidates) {
     const value = coerce(raw);
     if (value === null) continue;
-    if (!winner) { winner = { value, source, origin: 'recorded' }; continue; }
+    if (!winner) {
+      winner = {
+        value,
+        source,
+        // A value the studio holds but never measured is not the same fact as
+        // one it did. Decided here, at the moment the source is known, so no
+        // caller can lose it.
+        origin: UNVERIFIED_SOURCES.has(source) ? 'unverified' : 'recorded',
+      };
+      continue;
+    }
     if (!sameValue(winner.value, value)) conflicts.push({ source, value });
   }
   if (!winner) return null;
@@ -174,7 +247,11 @@ function sameValue(a, b) {
  * and what it supplies is marked `stated` for the rest of its life — in the
  * prompt, in the response, and in the ledger row.
  */
-function resolveClientFacts(ctx, stated = {}) {
+function resolveClientFacts(ctx, stated = {}, { stale = [] } = {}) {
+  // Sections the brief reported as older than this studio treats as current.
+  // Passed in rather than recomputed: one staleness rule, in training-brief.js,
+  // and this reads its answer.
+  const staleBySection = new Map((stale || []).map((st) => [st.section, st]));
   const {
     client = {}, profile = null, goals = [], latestAssessment = null,
     latestCheckin = null, lifestyle = null, workoutAssignments = [],
@@ -248,6 +325,11 @@ function resolveClientFacts(ctx, stated = {}) {
   const recorded = [];
   const statedFields = [];
   const missing = [];
+  // Held, but only on the client's own word. Listed separately from `recorded`
+  // so a screen can say which is which without re-deriving it.
+  const unverified = [];
+  // Held, but from an assessment old enough that its age is itself a fact.
+  const staleFields = [];
   // Facts two authoritative sources disagree about. Precedence decided, and
   // said so — this is the record of what it decided against.
   const conflicting = [];
@@ -257,8 +339,13 @@ function resolveClientFacts(ctx, stated = {}) {
       && text(stated[field]) !== null;
     const hit = supersedable ? null : resolved[field];
     if (hit) {
-      facts[field] = hit;
-      recorded.push({ field, source: hit.source });
+      const st = staleBySection.get(SOURCE_SECTION[hit.source]);
+      facts[field] = st
+        ? { ...hit, stale: { as_of: st.as_of, age_days: st.age_days, stale_after_days: st.stale_after_days } }
+        : hit;
+      if (hit.origin === 'unverified') unverified.push({ field, source: hit.source });
+      else recorded.push({ field, source: hit.source });
+      if (st) staleFields.push({ field, source: hit.source, ...st });
       if (hit.conflicts) {
         conflicting.push({
           field,
@@ -288,15 +375,20 @@ function resolveClientFacts(ctx, stated = {}) {
     active_assignment: active,
     data_quality: {
       recorded,
+      unverified,
       stated: statedFields,
       missing,
       conflicting,
+      stale: staleFields,
       blocking: missing.filter((m) => m.blocking).map((m) => m.field),
-      // Of the facts the prompt may state, how many came from the database.
-      // Trainer statements deliberately do not count towards it: the number
-      // is meant to answer "how much of this does the studio actually know",
-      // and a value typed into a box thirty seconds ago is not that.
-      completeness_pct: Math.round((recorded.length / FIELDS.length) * 100),
+      // Of the facts the prompt may state, how many the database holds at all.
+      // An unverified value counts — the studio does hold it, and the question
+      // this number answers is how much of the record is filled in, not how
+      // much of it was measured; `unverified` above answers that one.
+      //
+      // Trainer statements deliberately do not count. A value typed into a box
+      // thirty seconds ago is not something the studio knows about a client.
+      completeness_pct: Math.round(((recorded.length + unverified.length) / FIELDS.length) * 100),
     },
   };
 }
@@ -320,19 +412,46 @@ function describeFacts(facts) {
     const f = facts[field];
     if (!f || f.origin === 'missing') {
       lines.push(`- ${LABEL[field]}: NOT RECORDED`);
-    } else if (f.origin === 'stated') {
-      lines.push(`- ${LABEL[field]}: ${f.value} (stated by the trainer for this session, not on file)`);
-    } else if (f.conflicts) {
-      const others = f.conflicts.map((c) => `${c.value} in ${c.source}`).join(', ');
-      lines.push(`- ${LABEL[field]}: ${f.value} (from ${f.source}; DISPUTED — ${others})`);
-    } else {
-      lines.push(`- ${LABEL[field]}: ${f.value}`);
+      continue;
     }
+    if (f.origin === 'stated') {
+      lines.push(`- ${LABEL[field]}: ${f.value} (stated by the trainer for this session, not on file)`);
+      continue;
+    }
+    // Provenance, disagreement and age are three separate things and a fact
+    // can carry all three at once. Composed rather than branched, so a stale
+    // disputed self-reported weight says all of it instead of whichever the
+    // first matching branch happened to be.
+    const notes = [];
+    if (f.origin === 'unverified') {
+      notes.push(`from ${f.source} — UNVERIFIED, this is the client's own report and the studio has never measured it`);
+    } else {
+      notes.push(`from ${f.source}`);
+    }
+    if (f.conflicts) {
+      notes.push(`DISPUTED — ${f.conflicts.map((c) => `${c.value} in ${c.source}`).join(', ')}`);
+    }
+    if (f.stale) {
+      notes.push(`STALE — measured ${f.stale.as_of}, ${f.stale.age_days} days ago, and this studio treats it as current for ${f.stale.stale_after_days}`);
+    }
+    lines.push(`- ${LABEL[field]}: ${f.value} (${notes.join('; ')})`);
   }
   lines.push(
     '',
     'NOT RECORDED means the studio does not hold this value. Do not infer it, do not substitute a typical value, and do not write programming that depends on it. Where a decision would need it, program conservatively and say which value would change your choice.',
   );
+  if (FIELDS.some((f) => facts[f]?.origin === 'unverified')) {
+    lines.push(
+      '',
+      'UNVERIFIED means the number is what the client said, not what anybody measured. Use it, because it is the only figure there is — but do not build a prescription whose safety depends on it being exact, and say in the plan that it is worth measuring.',
+    );
+  }
+  if (FIELDS.some((f) => facts[f]?.stale)) {
+    lines.push(
+      '',
+      'STALE means the measurement is real but old. Program to it, and say in the plan that it needs repeating. Do NOT extrapolate it forward, and do not describe the client as having changed since — nobody has looked.',
+    );
+  }
   if (FIELDS.some((f) => facts[f]?.conflicts)) {
     lines.push(
       '',
@@ -343,7 +462,8 @@ function describeFacts(facts) {
 }
 
 module.exports = {
-  FIELDS, BLOCKING, STATED_SUPERSEDES, resolveClientFacts, describeFacts,
+  FIELDS, BLOCKING, STATED_SUPERSEDES, UNVERIFIED_SOURCES, SOURCE_SECTION,
+  resolveClientFacts, describeFacts,
   // Exported for the tests that pin the parsing rather than the resolution.
   countDays, ageFromDob,
 };

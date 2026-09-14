@@ -99,6 +99,14 @@ const text = (v) => (typeof v === 'string' ? v.trim() : '');
  * exercise 3" rather than naming a movement the trainer then has to hunt for
  * in a twelve-week block.
  */
+/**
+ * How much of the current block an adaptation must keep, and the smallest
+ * block the ratio means anything on. Named here rather than inline because
+ * they are judgement, not arithmetic — see the retention rule in auditPlan.
+ */
+const MIN_RETENTION_PCT = 50;
+const MIN_EXERCISES_FOR_RETENTION = 3;
+
 function planExercises(plan) {
   const schedule = plan?.weekly_schedule;
   if (!schedule || typeof schedule !== 'object') return [];
@@ -129,7 +137,10 @@ function owesSetsReps(ex) {
  *        looking the plan's own names up in the library, NOT by reusing the
  *        dozen rows retrieved for the prompt — those cover a fraction of what
  *        a model may name.
- * @param {object=} input.requested  { training_days, duration_weeks }
+ * @param {object=} input.requested  { training_days, duration_weeks, continuing }
+ *        `continuing`, when present, is the block this generation is an
+ *        ADAPTATION of: { exercise_names: string[] }. See the retention rule
+ *        below for what it buys.
  */
 function auditPlan(plan, { screened = new Map(), requested = {} } = {}) {
   const violations = [];
@@ -240,6 +251,47 @@ function auditPlan(plan, { screened = new Map(), requested = {} } = {}) {
   completenessRule('effort', 'no_effort_target', 'RIR or RPE target', SEVERITY.MINOR);
   completenessRule('rest', 'no_rest', 'rest period', SEVERITY.MINOR);
 
+  // ── Adaptation: is this the same programme, or a new one wearing its name? ─
+  //
+  // `mode=adapt` changed what the model was TOLD — "continue that programme",
+  // "do not reset to week 1", "do not swap exercises for variety alone". An
+  // instruction is not enforcement, and nothing checked whether the returned
+  // block bore any resemblance to the one the client was training. A model
+  // that quietly rewrote the whole thing produced a plan that read like a
+  // thoughtful continuation and was, in fact, exactly the second programme
+  // the adapt path exists to prevent.
+  //
+  // So: an adaptation must RETAIN most of what it is adapting. Retention is
+  // measured by normalised exercise name — the same matching the safety
+  // screen uses, nothing fuzzy — against the exercises the current block
+  // actually prescribes.
+  //
+  // Half, and not more. An adaptation is allowed to change things; that is
+  // what makes it an adaptation. Demanding near-total overlap would fail an
+  // honest response that dropped two movements a new constraint rules out.
+  // Below half, the model has replaced the programme rather than progressed
+  // it, whatever the prose above the exercises says.
+  //
+  // Three exercises minimum before the rule fires at all. A two-exercise
+  // block where one movement legitimately changes is 50% retention, and a
+  // ratio computed from two data points is not evidence of anything.
+  const continuing = Array.isArray(requested.continuing?.exercise_names)
+    ? [...new Set(requested.continuing.exercise_names.map(normaliseName).filter(Boolean))]
+    : [];
+  if (continuing.length >= MIN_EXERCISES_FOR_RETENTION) {
+    const written = new Set(exercises.map((ex) => normaliseName(ex.name || '')).filter(Boolean));
+    const kept = continuing.filter((n) => written.has(n));
+    const pct = Math.round((kept.length / continuing.length) * 100);
+    if (pct < MIN_RETENTION_PCT) {
+      violations.push({
+        severity: SEVERITY.CRITICAL,
+        rule: 'adaptation_discarded_block',
+        detail: `this was asked for as an adaptation, but it keeps only ${kept.length} of the ${continuing.length} exercises the client's current block prescribes (${pct}%, below the ${MIN_RETENTION_PCT}% an adaptation must retain)`,
+        where: continuing.filter((n) => !written.has(n)).slice(0, 8),
+      });
+    }
+  }
+
   if (!text(plan?.progression_notes)) {
     violations.push({
       severity: SEVERITY.MAJOR,
@@ -335,13 +387,23 @@ function buildRevisionInstruction(audit) {
   );
   if (!worth.length) return null;
 
+  const discarded = worth.find((v) => v.rule === 'adaptation_discarded_block');
+
   return [
     'Your previous plan broke rules that were given to you. Fix exactly these and change nothing else:',
     ...worth.map((v) => `- ${v.where && !Array.isArray(v.where) ? `${v.where}: ` : ''}${v.detail}`),
     '',
     'An excluded exercise must be REPLACED with one that trains a different movement, not reworded,',
-    'not given a lighter load, and not annotated with a caution. Reply with the corrected plan as the',
-    'same JSON object and nothing else.',
+    'not given a lighter load, and not annotated with a caution.',
+    // Said separately because the sentence above is the opposite instruction:
+    // one violation asks for an exercise to go, this one asks for exercises to
+    // come back, and a model given both in one breath tends to do neither.
+    ...(discarded
+      ? ['Put the client\'s current exercises back. You were asked to PROGRESS this block, not to replace it:'
+        + ' keep the movements they are already training and change the prescription, not the exercise list.'
+        + ' Only drop a movement the safety screen above rules out, and say which rule ruled it out.']
+      : []),
+    'Reply with the corrected plan as the same JSON object and nothing else.',
   ].join('\n');
 }
 
@@ -420,4 +482,6 @@ module.exports = {
   CRITIC_SYSTEM_PROMPT,
   SEVERITY,
   SCORE_WEIGHTS,
+  MIN_RETENTION_PCT,
+  MIN_EXERCISES_FOR_RETENTION,
 };

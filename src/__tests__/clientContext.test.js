@@ -24,10 +24,30 @@ jest.mock('../db/pool', () => ({ query: jest.fn() }));
 
 const pool = require('../db/pool');
 const {
-  loadDigitalTwin, describeTwin, limitationsLine, adherenceInputs, screenPlanExercises,
-  resolveLandmarks,
+  describeTwin, limitationsLine, adherenceInputs, screenPlanExercises, resolveLandmarks,
 } = require('../modules/pt-os/client-context');
+const { loadProgrammingContext } = require('../modules/pt-os/programming-context');
 const { buildConstraints } = require('../modules/pt-os/programming-rules');
+
+/**
+ * The twin, from the canonical loader.
+ *
+ * `loadDigitalTwin` was the second of the two context builders and is gone;
+ * what it returned is `ctx.twin` on the one loader that replaced it (see
+ * modules/pt-os/programming-context.js). These tests are unchanged in what
+ * they assert, because the twin's own shape did not change — only who
+ * assembles it.
+ *
+ * `exercises` used to be an argument to the loader and is now the result of
+ * the `retrieve` hook, which is where the library rows enter the context.
+ */
+async function twinOf(clientId, orgId, { exercises = [], ...opts } = {}) {
+  const ctx = await loadProgrammingContext(clientId, orgId, {
+    retrieve: async () => ({ ragChunks: [], exercises }),
+    ...opts,
+  });
+  return ctx ? ctx.twin : null;
+}
 
 const CLIENT = {
   id: 'cl-1', name: 'Test Client', gender: 'male', dob: '1995-01-01',
@@ -71,7 +91,7 @@ const LIB = [
 describe('tenant isolation', () => {
   it('reads nothing about a client belonging to another studio', async () => {
     const seen = mockPool({ client: null });
-    const twin = await loadDigitalTwin('cl-other', 'org-1');
+    const twin = await twinOf('cl-other', 'org-1');
 
     expect(twin).toBeNull();
     // The property that matters. One query ran, it was the org-scoped parent
@@ -86,7 +106,7 @@ describe('tenant isolation', () => {
 
   it('scopes the parent lookup by organization', async () => {
     mockPool();
-    await loadDigitalTwin('cl-1', 'org-1');
+    await twinOf('cl-1', 'org-1');
     const [sql, params] = pool.query.mock.calls[0];
     expect(sql).toMatch(/organization_id = \$2/);
     expect(params).toEqual(['cl-1', 'org-1']);
@@ -109,7 +129,7 @@ describe('the twin the generator is handed', () => {
       },
     });
 
-    const twin = await loadDigitalTwin('cl-1', 'org-1', { exercises: LIB });
+    const twin = await twinOf('cl-1', 'org-1', { exercises: LIB });
 
     // All three tables are now in the generator's read set. Before this module
     // none of them were.
@@ -131,7 +151,7 @@ describe('the twin the generator is handed', () => {
         ],
       },
     });
-    const twin = await loadDigitalTwin('cl-1', 'org-1');
+    const twin = await twinOf('cl-1', 'org-1');
     expect(twin.history.has_history).toBe(true);
     expect(twin.history.totals.sets).toBe(1);
     expect(twin.history.totals.sets_not_completed).toBe(1);
@@ -147,7 +167,7 @@ describe('the twin the generator is handed', () => {
         ],
       },
     });
-    const twin = await loadDigitalTwin('cl-1', 'org-1');
+    const twin = await twinOf('cl-1', 'org-1');
     // Real production shape: 29 of 408 completed sets do not join the library.
     expect(twin.rules.volume.unattributable_sets).toBe(1);
     expect(twin.history.totals.sets).toBe(1);
@@ -193,7 +213,7 @@ describe('adherence inputs', () => {
 describe('what the model is actually told', () => {
   const twinWith = async (tables, opts = {}) => {
     mockPool({ tables });
-    return loadDigitalTwin('cl-1', 'org-1', { exercises: LIB, ...opts });
+    return twinOf('cl-1', 'org-1', { exercises: LIB, ...opts });
   };
 
   it('warns, in words, that nobody has screened an unassessed client', async () => {
@@ -260,7 +280,7 @@ describe('what the model is actually told', () => {
 describe('the limitations line that replaces the empty column', () => {
   const twinWith = async (tables, client = CLIENT) => {
     mockPool({ client, tables });
-    return loadDigitalTwin('cl-1', 'org-1');
+    return twinOf('cl-1', 'org-1');
   };
 
   it('says UNKNOWN rather than none for an unscreened client', async () => {
@@ -439,7 +459,7 @@ describe('the studio\'s own volume ranges', () => {
       },
       landmarks: [{ target_muscle: 'lats', mev_sets: 10, mrv_sets: 25 }],
     });
-    const twin = await loadDigitalTwin('cl-1', 'org-1');
+    const twin = await twinOf('cl-1', 'org-1');
     // One set against a minimum of ten. The verdict exists only because the
     // studio's range reached the engine.
     expect(twin.rules.volume.below).toEqual(['Lats']);

@@ -27,8 +27,12 @@ const { runTools }                     = require('../lib/ai/tools');
 const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // The client's digital twin: the assessments, the screen and the logged sets
 // that this file could not see. See modules/pt-os/client-context.js.
-const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
-const { resolveClientFacts, describeFacts } = require('../modules/pt-os/client-facts');
+const { describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
+const { loadProgrammingContext } = require('../modules/pt-os/programming-context');
+const { describeFacts } = require('../modules/pt-os/client-facts');
+const { describeNextSession } = require('../modules/pt-os/next-session');
+const { describeAdaptation } = require('../modules/pt-os/adaptation');
+const { ACTIVE_ASSIGNMENT_ORDER } = require('../modules/pt-os/assignments');
 
 /**
  * The workout prompt's version, frozen with every generation.
@@ -341,7 +345,8 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerci
     pool.query(
       `SELECT wp.name AS plan_name, wa.status, wa.start_date, wa.end_date
        FROM workout_assignments wa LEFT JOIN workout_plans wp ON wp.id=wa.workout_plan_id
-       WHERE wa.client_id=$1 AND wa.status='active' ORDER BY wa.created_at DESC LIMIT 3`, [client_id]),
+       WHERE wa.client_id=$1 AND wa.status='active'
+       ORDER BY ${ACTIVE_ASSIGNMENT_ORDER} LIMIT 3`, [client_id]),
     pool.query(
       `SELECT dt.name AS template_name, da.status, da.start_date, da.end_date
        FROM diet_assignments da LEFT JOIN diet_templates dt ON dt.id=da.diet_template_id
@@ -710,58 +715,57 @@ router.get('/workout/context/:client_id', auth, async (req, res) => {
   const clientId = req.params.client_id;
   const org = orgParam(req);
 
+  // The canonical loader, with no `retrieve`: this is a summary of the
+  // client, not a generation, and retrieval is the expensive half.
+  //
+  // One loader means this endpoint and the generator cannot disagree. It used
+  // to run loadAuthoritativeClient for the facts and loadDigitalTwin for the
+  // screen, best-effort, so a twin that failed here reported a gate of unknown
+  // beside facts that had loaded fine — and the generator, loading both again
+  // a second later, could answer differently. Now either the whole context
+  // loads or the trainer is told it did not.
   let ctx;
   try {
-    // No ragQuery and no exerciseQuery: this is a summary of the client, not
-    // a generation, and retrieval is the expensive half.
-    ctx = await loadAuthoritativeClient(clientId, org);
+    ctx = await loadProgrammingContext(clientId, org);
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_context_load_failed');
     return res.status(503).json({ error: 'Client context unavailable' });
   }
   if (!ctx) return res.status(404).json({ error: 'Client not found' });
 
-  const { facts, data_quality: dataQuality, active_assignment: active } = resolveClientFacts(ctx, {});
-
-  // Best-effort: the safety gate and the training history are the two things
-  // a trainer most wants to see before generating, and neither is worth
-  // failing this summary over. An unreachable twin reports as unknown rather
-  // than as cleared.
-  let twin = null;
-  try {
-    twin = await loadDigitalTwin(clientId, org, { equipmentText: facts.equipment?.value ?? null });
-  } catch (err) {
-    logger.warn({ err: err.message }, 'ai_workout_context_twin_failed');
-  }
+  const twin = ctx.twin;
 
   res.json({
     client: { id: ctx.client.id, name: ctx.client.name },
-    facts,
-    data_quality: dataQuality,
-    safety: twin
-      ? {
-        gate: twin.rules.gate,
-        may_program: twin.rules.may_program,
-        screened: twin.rules.coverage.screened,
-        sources_present: twin.rules.coverage.sources_present,
-        constraints: twin.rules.constraints.length,
-        not_assessed: twin.brief.missing,
-        // On file, but old enough that its age is itself a fact.
-        stale: twin.brief.stale ?? [],
-      }
-      : null,
-    // From the canonical twin, not re-derived here: the week the generator
-    // will read is the week the screen shows, and the week progression.js
-    // resolves a session against. Three answers to "what week is this client
-    // on" is exactly the second truth this endpoint exists to avoid.
-    current_program: twin ? twin.program : (active ? { active: true, plan_name: active.plan_name ?? null } : { active: false }),
+    facts: ctx.facts,
+    data_quality: ctx.data_quality,
+    safety: {
+      gate: twin.rules.gate,
+      may_program: twin.rules.may_program,
+      screened: twin.rules.coverage.screened,
+      sources_present: twin.rules.coverage.sources_present,
+      constraints: twin.rules.constraints.length,
+      not_assessed: twin.brief.missing,
+      // On file, but old enough that its age is itself a fact.
+      stale: twin.brief.stale ?? [],
+    },
+    // From the canonical context, not re-derived here: the week the generator
+    // reads is the week this screen shows, and the week progression.js
+    // resolves a session against.
+    current_program: ctx.program,
+    // Null unless more than one assignment claims to be active. A trainer
+    // seeing this knows the engine had to choose, and which it chose.
+    assignment_ambiguity: ctx.assignment_ambiguity,
+    // The exact workout this client does next, resolved through the same
+    // resolveWeek the session log uses — or the named reason it could not be.
+    next_session: ctx.next_session,
+    // What the logged sets say to do with each lift in it, decided by rule.
+    adaptation: ctx.adaptation,
     // Whether there is anything to progress FROM. `has_history` false is the
     // common case on a new client and is not a fault — but a trainer reading
     // "progression" in a generated plan should know whether it was derived
     // from logged sets or chosen from first principles.
-    training_history: twin
-      ? { has_history: twin.history.has_history, window_weeks: twin.window_weeks }
-      : null,
+    training_history: { has_history: twin.history.has_history, window_weeks: twin.window_weeks },
   });
 });
 
@@ -781,11 +785,27 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   const retrievalStats = {};
   let ctx;
   try {
-    ctx = await loadAuthoritativeClient(client_id, org, {
-      ragQuery: 'MY PT STUDIO workout programming methodology, exercise selection, progressive overload, training technique, and injury modification',
-      exerciseQuery: 'strength training, mobility, and conditioning exercises',
-      exerciseUserId: req.user?.id,
-      retrievalStats,
+    // ONE loader, one org-scoped pt_clients authorization, one read of every
+    // table this needs. It used to be two — loadAuthoritativeClient for the
+    // facts and loadDigitalTwin for the screen — which read pt_assessments,
+    // weekly_checkins, pt_lifestyle_assessments, pt_goals and
+    // workout_assignments twice each, with DIFFERENT orderings, so the facts
+    // block and the body section of the same prompt could state different
+    // weights for the same client.
+    //
+    // `retrieve` runs inside the loader's own Promise.all, i.e. strictly after
+    // the parent client check has passed, so a cross-tenant or missing client
+    // never triggers a retrieval — the ordering property the retired loader
+    // had, kept rather than re-derived.
+    ctx = await loadProgrammingContext(client_id, org, {
+      stated: req.body || {},
+      retrieve: async () => {
+        const [ragChunks, exercises] = await Promise.all([
+          retrieveRagChunks(org, 'MY PT STUDIO workout programming methodology, exercise selection, progressive overload, training technique, and injury modification', 'ai_client_context_rag_failed', retrievalStats),
+          retrieveExerciseLibrary({ organizationId: org, userId: req.user?.id, query: 'strength training, mobility, and conditioning exercises' }, retrievalStats),
+        ]);
+        return { ragChunks, exercises };
+      },
     });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_generate_load_failed');
@@ -822,8 +842,11 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   // weight 75, gender male, experience beginner and four training days for
   // every client whose record was thin, all of which the prompt then printed
   // under the heading "CLIENT AUTHORITATIVE DATA".
-  const { facts, data_quality: dataQuality } = resolveClientFacts(ctx, req.body || {});
-  const p = resolveWorkoutExtras(ctx, req.body || {});
+  const { facts, data_quality: dataQuality } = ctx;
+  const p = resolveWorkoutExtras(
+    { client: ctx.client, ...ctx.record, workoutAssignments: ctx.active_assignment ? [ctx.active_assignment] : [] },
+    req.body || {},
+  );
   const val = (f) => facts[f]?.value ?? null;
 
   // Three facts decide exercise selection, volume and the shape of the week.
@@ -846,30 +869,15 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
 
   // ── The digital twin ─────────────────────────────────────────────────────
   //
-  // Everything this route could not previously see: the PAR-Q gate, the
-  // mobility and posture findings, and every set the client has logged. It
-  // re-runs the org-scoped pt_clients check rather than trusting this one,
-  // which costs an indexed lookup and keeps the module's isolation property
-  // true of the module rather than of its callers.
+  // The PAR-Q gate, the mobility and posture findings, and every set the
+  // client has logged — assembled by the same loader that resolved the facts
+  // above, from the same rows, under the same authorization.
   //
-  // Fail-closed by omission, never by error: if this throws, generation stops,
-  // because the alternative is writing a programme with the safety screen
-  // silently absent — which is exactly the state this whole change exists to
-  // end.
-  let twin;
-  try {
-    twin = await loadDigitalTwin(client_id, org, {
-      // Null when no equipment is recorded or stated. The screen then applies
-      // no equipment gate, which is what it already did for the old 'full gym'
-      // default — the difference is that the prompt no longer CLAIMS a full gym.
-      equipmentText: val('equipment'),
-      exercises: ctx.exercises,
-    });
-  } catch (err) {
-    logger.error({ err: err.message }, 'ai_workout_twin_load_failed');
-    return res.status(503).json({ error: 'AI workout generation failed', message: 'client context unavailable' });
-  }
-  if (!twin) return res.status(404).json({ error: 'Client not found' });
+  // Fail-closed by construction: the loader throws as a whole or it returns a
+  // whole context. There is no longer a path where the facts load and the
+  // safety screen quietly does not, which is what a best-effort second loader
+  // made possible.
+  const twin = ctx.twin;
 
   // ── The gate ─────────────────────────────────────────────────────────────
   //
@@ -921,6 +929,12 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       error: 'This client is already on a programme',
       code: 'ACTIVE_PROGRAM',
       program,
+      // What choosing "progress it" would actually continue from, so the
+      // screen can put the real next session in front of the trainer rather
+      // than asking them to pick between two abstractions.
+      next_session: ctx.next_session,
+      adaptation: ctx.adaptation,
+      assignment_ambiguity: ctx.assignment_ambiguity,
       message: `${program.plan_name || 'A programme'} is active`
         + (program.current_week ? ` and this is week ${program.current_week}`
           + (program.duration_weeks ? ` of ${program.duration_weeks}` : '') : '')
@@ -928,6 +942,9 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     });
   }
   const adapting = program.active && !program.expired && mode === 'adapt';
+  // The movements the client's current block actually prescribes. Read off the
+  // context rather than re-queried, and empty for a client with no live plan.
+  const planRowNames = (ctx.plan_exercise_names || []).filter(Boolean);
 
   const gateStatus = twin.rules.gate.status;
   if (!twin.rules.may_program && gateStatus !== 'unknown') {
@@ -1015,6 +1032,12 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   if (p.previous_trainer_experience) userPrompt.push('- Previously worked with a trainer: yes');
   if (p.target) userPrompt.push(`- Goal target: ${p.target}`);
   if (p.assigned_plan) userPrompt.push(`- Currently assigned plan: ${p.assigned_plan}`);
+  if (ctx.assignment_ambiguity) {
+    const amb = ctx.assignment_ambiguity;
+    userPrompt.push(
+      `- WARNING: ${amb.active_count} programmes are marked active for this client at once. The studio's rule (${amb.rule}) selected "${amb.chosen?.plan_name || 'the most recent'}", and everything above describes THAT programme. Do not program against the others, do not merge them, and say in the plan that the client's assignments need tidying.`,
+    );
+  }
 
   // AUTHORIZED KNOWLEDGE BASE (RAG): this caller's own org's documents
   // plus explicitly-global ones — see retrieveContext's document-level tenant
@@ -1071,6 +1094,15 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   // the same fresh block the create path does, and the only difference would
   // be the word in the request body.
   if (adapting) {
+    // The exact next workout, and what the logged sets say to do with each
+    // lift in it. Both are resolved before a token is spent and BEFORE the
+    // instruction below, so the model reads the prescription it is continuing
+    // and the verdicts it must write, rather than inventing a continuation
+    // from a plan name and a week number.
+    const nextText = describeNextSession(ctx.next_session);
+    if (nextText) userPrompt.push('', nextText);
+    const adaptText = describeAdaptation(ctx.adaptation);
+    if (adaptText) userPrompt.push('', adaptText);
     userPrompt.push(
       '',
       'THIS IS AN ADAPTATION, NOT A NEW PROGRAMME:',
@@ -1185,7 +1217,21 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     // The lookup is its own: the prompt was given a dozen library rows and a
     // model may name anything, so screening only those would answer "no
     // blocked exercise" for every blocked movement that was not retrieved.
-    const requested = { training_days: val('training_days'), duration_weeks: p.duration_weeks };
+    const requested = {
+      training_days: val('training_days'),
+      duration_weeks: p.duration_weeks,
+      // Only when adapting. The audit's retention rule needs the block being
+      // continued; on a NEW programme there is nothing to retain and passing
+      // the old block's exercises would fail a trainer who deliberately
+      // started something different.
+      //
+      // Every exercise the plan prescribes, across every day and week — not
+      // just the next session's. An adaptation that keeps Monday and throws
+      // Thursday away has still thrown half the programme away.
+      continuing: adapting
+        ? { exercise_names: [...new Set(planRowNames)] }
+        : null,
+    };
     const auditWith = async (candidate) => {
       const screened = await screenPlanExercises(
         planExercises(candidate).map((e) => e.name),
@@ -1338,6 +1384,21 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
           injuries_text: p.injuries || null,
           mode: adapting ? 'adapt' : 'new',
           program,
+          // The trainer's own words for THIS generation, frozen beside the
+          // facts. `injuries_text` above is the composed line the model read;
+          // this is what they typed, so a ledger row can answer whether a
+          // constraint came from an assessment or from a trainer saying it.
+          stated: {
+            constraints: firstDefined(req.body?.injuries) ?? null,
+            equipment: firstDefined(req.body?.equipment) ?? null,
+            fields: dataQuality.stated.map((f) => f.field),
+          },
+          // Exactly which session this was written to continue, and what the
+          // rules decided about each lift in it. Without these a ledger row
+          // says "adapt" and cannot say adapt FROM WHAT.
+          next_session: adapting ? ctx.next_session : null,
+          adaptation: adapting ? ctx.adaptation : null,
+          assignment_ambiguity: ctx.assignment_ambiguity,
         },
         dataQuality,
         // Advisory, and frozen beside the audit that is not. A ledger row that
@@ -1387,6 +1448,13 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       // week-1 programme.
       mode: adapting ? 'adapt' : 'new',
       program,
+      // What the plan was written to continue, and the rule-decided verdicts
+      // it was told to write. On screen beside the plan, because "progress
+      // the bench" is a claim a trainer should be able to check against the
+      // sets that produced it.
+      next_session: adapting ? ctx.next_session : null,
+      adaptation: adapting ? ctx.adaptation : null,
+      assignment_ambiguity: ctx.assignment_ambiguity,
       audit: {
         violations: audit.violations,
         unverified: audit.unverified,
