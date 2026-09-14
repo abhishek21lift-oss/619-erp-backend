@@ -54,14 +54,14 @@ const MEMORY_WINDOW = 10;
 async function recordGeneration({
   id, orgId, clientId, createdBy, requestId, model,
   revised = false, qualityScore = null, plan, screen = null, audit = null,
-  inputs = null, dataQuality = null,
+  inputs = null, dataQuality = null, critique = null, promptVersion = null,
 }) {
   const { rows } = await pool.query(
     `INSERT INTO ai_workout_generations
        (id, organization_id, client_id, created_by, request_id, model,
         revised, quality_score, proposed_plan, screen, audit,
-        inputs, data_quality)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        inputs, data_quality, critique, prompt_version)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      RETURNING id`,
     [id, orgId || null, clientId, createdBy || null, requestId || null, model || null,
       Boolean(revised), Number.isFinite(qualityScore) ? qualityScore : null,
@@ -69,7 +69,9 @@ async function recordGeneration({
       screen ? JSON.stringify(screen) : null,
       audit ? JSON.stringify(audit) : null,
       inputs ? JSON.stringify(inputs) : null,
-      dataQuality ? JSON.stringify(dataQuality) : null],
+      dataQuality ? JSON.stringify(dataQuality) : null,
+      critique ? JSON.stringify(critique) : null,
+      promptVersion || null],
   );
   return rows[0]?.id ?? null;
 }

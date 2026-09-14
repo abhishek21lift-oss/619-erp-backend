@@ -111,20 +111,54 @@ function text(v) {
 }
 
 /**
- * Walk candidate sources in precedence order and return the first that has a
- * value, along with the NAME of the column it came from.
+ * Walk candidate sources in precedence order, take the first that has a value,
+ * and report every OTHER source that disagrees with it.
  *
- * The name is the point. "Height: 172" tells a trainer nothing about whether
- * the engine read their measurement or someone's guess; "height_cm from
- * client_fitness_profiles.height_cm" tells them exactly where to go and
- * correct it.
+ * ── Two things at once, deliberately ───────────────────────────────────────
+ *
+ * The winner carries the NAME of the column it came from. That name is the
+ * point: "Height: 172" tells a trainer nothing about whether the engine read
+ * their measurement or someone's guess; "from client_fitness_profiles.height_cm"
+ * tells them exactly where to go and correct it.
+ *
+ * The disagreements matter more. This used to `return` on the first hit, so a
+ * client whose record says fat loss and whose goal assessment says muscle gain
+ * was silently programmed for fat loss — precedence quietly deciding a clinical
+ * question, with nothing on any screen saying a decision had been made.
+ *
+ * Precedence still decides, because SOMETHING has to and a deterministic rule
+ * beats a model guessing. What changes is that the choice stops being invisible:
+ * the loser is carried on the fact, surfaced to the trainer, told to the model
+ * as a disagreement it must not resolve, and frozen in the ledger.
+ *
+ * Only genuinely different values count. Two sources agreeing is not a
+ * conflict, and neither is one of them being empty.
  */
 function fromSources(candidates, coerce) {
+  let winner = null;
+  const conflicts = [];
   for (const [source, raw] of candidates) {
     const value = coerce(raw);
-    if (value !== null) return { value, source, origin: 'recorded' };
+    if (value === null) continue;
+    if (!winner) { winner = { value, source, origin: 'recorded' }; continue; }
+    if (!sameValue(winner.value, value)) conflicts.push({ source, value });
   }
-  return null;
+  if (!winner) return null;
+  return conflicts.length ? { ...winner, conflicts } : winner;
+}
+
+/**
+ * Whether two source values say the same thing.
+ *
+ * Numbers compare numerically so 3 and "3" agree. Strings compare folded, so
+ * "Fat Loss" and "fat_loss" agree — a studio that typed the same goal into two
+ * forms with different capitalisation has not contradicted itself, and
+ * reporting that as a conflict would train a trainer to ignore the word.
+ */
+function sameValue(a, b) {
+  if (typeof a === 'number' || typeof b === 'number') return Number(a) === Number(b);
+  const fold = (v) => String(v).trim().toLowerCase().replace(/[\s_-]+/g, '');
+  return fold(a) === fold(b);
 }
 
 /**
@@ -214,6 +248,9 @@ function resolveClientFacts(ctx, stated = {}) {
   const recorded = [];
   const statedFields = [];
   const missing = [];
+  // Facts two authoritative sources disagree about. Precedence decided, and
+  // said so — this is the record of what it decided against.
+  const conflicting = [];
 
   for (const field of FIELDS) {
     const supersedable = STATED_SUPERSEDES.includes(field)
@@ -222,6 +259,13 @@ function resolveClientFacts(ctx, stated = {}) {
     if (hit) {
       facts[field] = hit;
       recorded.push({ field, source: hit.source });
+      if (hit.conflicts) {
+        conflicting.push({
+          field,
+          chosen: { source: hit.source, value: hit.value },
+          rejected: hit.conflicts,
+        });
+      }
       continue;
     }
     const given = field === 'training_days' || field === 'age'
@@ -246,6 +290,7 @@ function resolveClientFacts(ctx, stated = {}) {
       recorded,
       stated: statedFields,
       missing,
+      conflicting,
       blocking: missing.filter((m) => m.blocking).map((m) => m.field),
       // Of the facts the prompt may state, how many came from the database.
       // Trainer statements deliberately do not count towards it: the number
@@ -277,6 +322,9 @@ function describeFacts(facts) {
       lines.push(`- ${LABEL[field]}: NOT RECORDED`);
     } else if (f.origin === 'stated') {
       lines.push(`- ${LABEL[field]}: ${f.value} (stated by the trainer for this session, not on file)`);
+    } else if (f.conflicts) {
+      const others = f.conflicts.map((c) => `${c.value} in ${c.source}`).join(', ');
+      lines.push(`- ${LABEL[field]}: ${f.value} (from ${f.source}; DISPUTED — ${others})`);
     } else {
       lines.push(`- ${LABEL[field]}: ${f.value}`);
     }
@@ -285,6 +333,12 @@ function describeFacts(facts) {
     '',
     'NOT RECORDED means the studio does not hold this value. Do not infer it, do not substitute a typical value, and do not write programming that depends on it. Where a decision would need it, program conservatively and say which value would change your choice.',
   );
+  if (FIELDS.some((f) => facts[f]?.conflicts)) {
+    lines.push(
+      '',
+      'DISPUTED means two of the studio\'s own records disagree. The value shown first is the one the studio\'s precedence rule selected, and it is the one to program to. Do NOT pick a different one, do not average them, and do not decide which record is right — that is the trainer\'s call, not yours. Say in the plan that the disagreement exists and which value you programmed to.',
+    );
+  }
   return lines.join('\n');
 }
 

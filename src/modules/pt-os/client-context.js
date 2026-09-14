@@ -52,6 +52,8 @@ const { evaluate, equipmentFrom, weeklyMuscleSets, screenExercise } = require('.
 const { normaliseName } = require('./plan-critic');
 const { volumeLandmarks, deloadTriggers } = require('./programming-rules');
 const { detectSignals, summariseRoster } = require('./training-signals');
+const { weekOf } = require('./progression');
+const { today: studioToday } = require('../../lib/appTime');
 
 /** How far back the training history looks, in weeks. */
 const DEFAULT_WINDOW_WEEKS = 12;
@@ -81,6 +83,82 @@ const MAX_SETS = 2000;
  *        retrieved through the library's own tenancy predicate.
  * @returns {Promise<object|null>} null when the client is not this org's.
  */
+/**
+ * A date column as 'YYYY-MM-DD', whatever the driver handed us.
+ *
+ * node-postgres parses DATE into a JS Date and leaves TEXT as a string, and
+ * this table has been both over its life. Mirrors dateOf() in
+ * training-brief.js rather than inventing a second convention.
+ */
+function isoDay(v) {
+  if (!v) return null;
+  const s = typeof v === 'string' ? v : v.toISOString?.();
+  return s ? String(s).slice(0, 10) : null;
+}
+
+/**
+ * Where this client currently IS inside their programme.
+ *
+ * ── Why the generator needs this ───────────────────────────────────────────
+ *
+ * Without it, a trainer pressing Generate for someone three weeks into a
+ * twelve-week block got a brand new twelve-week block. Not an adaptation, not
+ * a progression — a second programme, written as though the first did not
+ * exist, and saved alongside it as a second active assignment. The engine knew
+ * an assignment existed (it named it in the prompt as "currently assigned
+ * plan") and knew nothing about where inside it the client had got to.
+ *
+ * Everything here is derived from rows already loaded for other reasons, and
+ * the week comes from progression.js's own weekOf() — the same function that
+ * decides which week's prescription a session shows — so the number the
+ * generator reads is the number the session engine uses. Two answers to "what
+ * week is this client on" is exactly the kind of second truth this module
+ * exists to prevent.
+ *
+ * `expired` is its own state rather than folded into "no programme": a block
+ * that ran out last week is a client who needs the NEXT one, which is a
+ * different conversation from a client who never had one.
+ */
+function programState(assignment, sessions = [], today = studioToday()) {
+  if (!assignment) return { active: false };
+
+  // ── A pg DATE is a Date, not a string ────────────────────────────────────
+  //
+  // This was `String(assignment.start_date).slice(0, 10)`, which is right for
+  // the 'YYYY-MM-DD' a test fixture supplies and wrong for what the driver
+  // actually returns: node-postgres parses a DATE column into a JS Date, and
+  // String() on that gives "Mon Aug 24 2026 00:00:00 GMT+0530 ...". Sliced to
+  // ten characters that is "Mon Aug 24" — which weekOf cannot parse, so it
+  // returned its no-answer fallback of week 1.
+  //
+  // A client three weeks into a block was therefore reported as being in week
+  // 1 of it, and the adapt prompt would have told the model to continue from a
+  // week the client finished a fortnight ago. Every unit test passed, because
+  // every unit test handed it a string.
+  const started = isoDay(assignment.start_date);
+  const durationWeeks = Number(assignment.duration_weeks) || null;
+  const currentWeek = started ? weekOf(started, today) : null;
+  const expired = Boolean(durationWeeks && currentWeek && currentWeek > durationWeeks);
+
+  return {
+    active: true,
+    plan_id: assignment.plan_id ?? null,
+    plan_name: assignment.plan_name ?? null,
+    started_on: started,
+    duration_weeks: durationWeeks,
+    current_week: currentWeek,
+    // Null rather than a negative number when the block has no stated length:
+    // "unknown" and "none left" are different answers.
+    weeks_remaining: durationWeeks && currentWeek ? Math.max(0, durationWeeks - currentWeek) : null,
+    planned_days_per_week: Number(assignment.planned_days_count) || null,
+    // Completed sessions inside the history window, not since the plan began —
+    // named as such so nobody reads it as a lifetime total.
+    sessions_completed_in_window: sessions.filter((x) => x?.status === 'completed').length,
+    progress_pct: assignment.progress_pct ?? null,
+    expired,
+  };
+}
+
 async function loadDigitalTwin(clientId, orgId, {
   windowWeeks = DEFAULT_WINDOW_WEEKS, equipmentText = null, exercises = [],
 } = {}) {
@@ -171,7 +249,13 @@ async function loadDigitalTwin(clientId, orgId, {
     landmarks,
   });
 
-  return { client, brief, recovery, history, rules, window_weeks: weeks };
+  return {
+    client, brief, recovery, history, rules,
+    // Where they are in the programme they are already on — the half the
+    // generator was missing.
+    program: programState(assignment, sessions),
+    window_weeks: weeks,
+  };
 }
 
 /**
@@ -650,6 +734,7 @@ const TRAINING_HAPPENED = `(
 const MAX_SWEEP_SETS = 20000;
 
 module.exports = {
+  programState,
   loadDigitalTwin,
   TRAINING_HAPPENED,
   resolveLandmarks,
