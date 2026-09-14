@@ -29,6 +29,20 @@ const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // that this file could not see. See modules/pt-os/client-context.js.
 const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
 const { resolveClientFacts, describeFacts } = require('../modules/pt-os/client-facts');
+
+/**
+ * The workout prompt's version, frozen with every generation.
+ *
+ * Bump it whenever the prompt's INSTRUCTIONS, its ordering, or the contract it
+ * states to the model changes. Without it a ledger row can say what came back
+ * and not what was asked, so a programme that reads oddly six months from now
+ * cannot be traced to the wording that produced it.
+ *
+ * A hand-maintained string rather than a hash of the prompt text: the prompt
+ * interpolates this client's own facts, so a hash would differ per client and
+ * answer a question nobody asked.
+ */
+const WORKOUT_PROMPT_VERSION = '2026-09-14.adapt';
 // Checking the plan the model returned against the rules that shaped it.
 const {
   auditPlan, scorePlan, buildRevisionInstruction, parseCritique, describeAudit,
@@ -736,14 +750,11 @@ router.get('/workout/context/:client_id', auth, async (req, res) => {
         stale: twin.brief.stale ?? [],
       }
       : null,
-    current_program: active
-      ? {
-        name: active.plan_name || null,
-        status: active.status || null,
-        start_date: active.start_date || null,
-        end_date: active.end_date || null,
-      }
-      : null,
+    // From the canonical twin, not re-derived here: the week the generator
+    // will read is the week the screen shows, and the week progression.js
+    // resolves a session against. Three answers to "what week is this client
+    // on" is exactly the second truth this endpoint exists to avoid.
+    current_program: twin ? twin.program : (active ? { active: true, plan_name: active.plan_name ?? null } : { active: false }),
     // Whether there is anything to progress FROM. `has_history` false is the
     // common case on a new client and is not a fault — but a trainer reading
     // "progression" in a generated plan should know whether it was derived
@@ -884,6 +895,40 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   //
   // If a studio wants unscreened clients refused outright, this is the one
   // place to change it: drop the status check and refuse on `may_program`.
+  // ── Create, or progress what they are already on? ────────────────────────
+  //
+  // A trainer pressing Generate for someone three weeks into a twelve-week
+  // block used to get a brand new twelve-week block. Not an adaptation — a
+  // SECOND programme, written as though the first did not exist, and saved
+  // beside it as a second active assignment. The route knew an assignment
+  // existed (it named it in the prompt as "currently assigned plan") and knew
+  // nothing about where inside it the client had got to.
+  //
+  // So an active programme now forces the caller to say which they meant. 409
+  // rather than a default, because both defaults are wrong: silently creating
+  // duplicates programmes, and silently adapting would stop a trainer ever
+  // starting a new block. The response carries the programme state, so the
+  // screen can put the choice in front of them with the week they are on.
+  //
+  // An EXPIRED block does not gate. A twelve-week plan that ran out last month
+  // is a client who needs the next programme, and making the trainer answer a
+  // question about a finished block would be ceremony.
+  const mode = String(req.body?.mode || '').toLowerCase();
+  const program = twin.program;
+  if (program.active && !program.expired && mode !== 'new' && mode !== 'adapt') {
+    logger.info({ req_id: req.id, plan_id: program.plan_id, week: program.current_week }, 'ai_workout_generate_active_program');
+    return res.status(409).json({
+      error: 'This client is already on a programme',
+      code: 'ACTIVE_PROGRAM',
+      program,
+      message: `${program.plan_name || 'A programme'} is active`
+        + (program.current_week ? ` and this is week ${program.current_week}`
+          + (program.duration_weeks ? ` of ${program.duration_weeks}` : '') : '')
+        + '. Choose whether to progress it or start a new one.',
+    });
+  }
+  const adapting = program.active && !program.expired && mode === 'adapt';
+
   const gateStatus = twin.rules.gate.status;
   if (!twin.rules.may_program && gateStatus !== 'unknown') {
     logger.warn({ req_id: req.id, gate: gateStatus }, 'ai_workout_generate_gate_blocked');
@@ -1019,10 +1064,34 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     );
   }
 
+  // ── Progressing, not restarting ──────────────────────────────────────────
+  //
+  // Placed before the instructions so the model reads WHERE the client is
+  // before it reads what to write. Without this the adapt path would produce
+  // the same fresh block the create path does, and the only difference would
+  // be the word in the request body.
+  if (adapting) {
+    userPrompt.push(
+      '',
+      'THIS IS AN ADAPTATION, NOT A NEW PROGRAMME:',
+      `The client is already training "${program.plan_name || 'their current plan'}"`
+        + (program.started_on ? `, started ${program.started_on}` : '')
+        + (program.current_week ? `. They are in WEEK ${program.current_week}`
+          + (program.duration_weeks ? ` of ${program.duration_weeks}` : '') : '')
+        + (program.planned_days_per_week ? `, at ${program.planned_days_per_week} sessions a week` : '')
+        + '.',
+      'Continue that programme rather than replacing it. Keep the exercises that are working, keep the structure the client has adapted to, and change only what the evidence above justifies changing — a lift that has plateaued, a movement a constraint now rules out, a volume the recovery signals will not support.',
+      'Do NOT reset to week 1, do not re-introduce a beginner progression for a client mid-block, and do not swap exercises for variety alone — an exercise the client has been progressing is evidence, and replacing it throws that evidence away.',
+      'State plainly, for each change you make, what it replaces and why the evidence supports it. Where the evidence does not support a change, say so and keep the prescription as it is.',
+    );
+  }
+
   userPrompt.push(
     '',
     'INSTRUCTIONS:',
-    `Generate a ${p.duration_weeks}-week workout plan for this client using the client facts above and the authorized MY PT STUDIO methodology.`,
+    adapting
+      ? `Produce the next ${p.duration_weeks} weeks of this client's existing programme, continuing from week ${program.current_week ?? 1}, using the client facts above and the authorized MY PT STUDIO methodology.`
+      : `Generate a ${p.duration_weeks}-week workout plan for this client using the client facts above and the authorized MY PT STUDIO methodology.`,
     '',
     'TRAINING FREQUENCY:',
     `The client trains ${val('training_days')} days per week. Generate exactly ${val('training_days')} sessions per week — one per training day, never fewer and never more, and never silently change the frequency.`,
@@ -1267,8 +1336,15 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
           facts,
           duration_weeks: p.duration_weeks,
           injuries_text: p.injuries || null,
+          mode: adapting ? 'adapt' : 'new',
+          program,
         },
         dataQuality,
+        // Advisory, and frozen beside the audit that is not. A ledger row that
+        // holds the rule findings but not the second model's reading cannot
+        // reconstruct what the trainer was actually shown.
+        critique,
+        promptVersion: WORKOUT_PROMPT_VERSION,
       });
     } catch (err) {
       logger.warn({ err: err.message }, 'ai_workout_generation_record_failed');
@@ -1305,6 +1381,12 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       // this beside the plan, because "NOT RECORDED" changes how much of the
       // programme they should trust without checking.
       data_quality: dataQuality,
+      // What this generation was: a new block, or the next weeks of one the
+      // client is already training. Without it a saved plan cannot say which
+      // it was, and the ledger cannot answer why a week-4 client received a
+      // week-1 programme.
+      mode: adapting ? 'adapt' : 'new',
+      program,
       audit: {
         violations: audit.violations,
         unverified: audit.unverified,

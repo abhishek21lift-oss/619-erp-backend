@@ -86,8 +86,32 @@ describe('precedence', () => {
     const ctx = bare({ weight: 80 });
     ctx.latestAssessment = { weight: 78 };
     ctx.latestCheckin = { weight: 82 };
-    expect(resolveClientFacts(ctx).facts.weight_kg)
-      .toEqual({ value: 78, source: 'pt_assessments.weight', origin: 'recorded' });
+    const { facts, data_quality: dq } = resolveClientFacts(ctx);
+
+    expect(facts.weight_kg.value).toBe(78);
+    expect(facts.weight_kg.source).toBe('pt_assessments.weight');
+    expect(facts.weight_kg.origin).toBe('recorded');
+
+    // Three sources, three different numbers, is a genuine disagreement and is
+    // now reported as one — this assertion was a bare toEqual on the winner,
+    // which passed while the other two readings vanished without trace. A
+    // trainer looking at a plan built on 78kg should be able to see that the
+    // enrolment record says 80 and the last check-in said 82.
+    expect(facts.weight_kg.conflicts).toEqual([
+      { source: 'pt_clients.weight', value: 80 },
+      { source: 'weekly_checkins.weight', value: 82 },
+    ]);
+    expect(dq.conflicting.find((c) => c.field === 'weight_kg')).toBeDefined();
+  });
+
+  test('sources that agree are not reported as a disagreement', () => {
+    const ctx = bare({ weight: 78 });
+    ctx.latestAssessment = { weight: 78 };
+    ctx.latestCheckin = { weight: '78' };
+    const { facts, data_quality: dq } = resolveClientFacts(ctx);
+    expect(facts.weight_kg.value).toBe(78);
+    expect(facts.weight_kg.conflicts).toBeUndefined();
+    expect(dq.conflicting).toEqual([]);
   });
 });
 

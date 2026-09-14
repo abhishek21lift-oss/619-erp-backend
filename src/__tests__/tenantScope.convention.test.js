@@ -87,6 +87,14 @@ const PLATFORM_GLOBAL = new Set([
  * genuinely cannot leak across tenants.
  */
 const REVIEWED_EXCEPTIONS = {
+  'modules/pt-os/client-facts.js':
+    'Executes no SQL at all — the scanner is matching PROVENANCE LABELS, not '
+    + 'queries. This module receives rows another module already read under the '
+    + 'caller\'s tenant and reports which column each value came from, so its '
+    + 'output carries strings like "client_fitness_profiles.height_cm" for the '
+    + 'trainer to read. It requires no database client, imports none, and has '
+    + 'no read path to scope. Verified by the assertion below that it contains '
+    + 'no query call.',
   'routes/public.js':
     'GET /api/public/stats — unauthenticated marketing endpoint returning ' +
     'platform-wide COUNTs only (studios, trainers, active clients, sessions). ' +
@@ -391,6 +399,16 @@ describe('tenant-scope convention — no route reads a tenant table unscoped', (
     // route, name-resolution join on an already-scoped row), add it to
     // REVIEWED_EXCEPTIONS above WITH the reason it cannot leak.
     expect(offenders).toEqual([]);
+  });
+
+  // The claim above is that this file cannot read anything. Assert it rather
+  // than trusting the sentence: an exception that stops being true silently is
+  // worse than no exception, and this one rests entirely on the module never
+  // gaining a database client.
+  it('client-facts.js really does execute no SQL', () => {
+    const src = fs.readFileSync(path.join(SRC, 'modules/pt-os/client-facts.js'), 'utf8');
+    expect(src).not.toMatch(/require\(['"].*db\/pool/);
+    expect(src).not.toMatch(/\b(pool|client|db)\.query\(/);
   });
 
   it('keeps the exception list honest — every entry still exists and still needs to be there', () => {
