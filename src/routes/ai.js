@@ -301,7 +301,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerci
 
   const [
     profileRes, goalsRes, assessRes, checkinsRes,
-    lifestyleRes, nutritionRes, workoutAssignRes, dietAssignRes,
+    lifestyleRes, nutritionRes, workoutAssignRes, dietAssignRes, equipmentRes,
     ragChunks = [], exercises = [],
   ] = await Promise.all([
     pool.query(
@@ -332,6 +332,20 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerci
       `SELECT dt.name AS template_name, da.status, da.start_date, da.end_date
        FROM diet_assignments da LEFT JOIN diet_templates dt ON dt.id=da.diet_template_id
        WHERE da.client_id=$1 AND da.status='active' ORDER BY da.created_at DESC LIMIT 3`, [client_id]),
+    // ── The studio's equipment ───────────────────────────────────────────
+    //
+    // No column on pt_clients records what a client can train with, and
+    // training_mode is Offline/Online/Hybrid — WHERE they train, not what they
+    // can lift with. So the authoritative answer, where there is one, is what
+    // the studio itself has, held in the org-scoped settings store the rest of
+    // the product already writes through.
+    //
+    // Org-scoped in the statement. A platform-wide caller (org null) matches
+    // no row and gets nothing, which is the correct answer: there is no one
+    // studio whose equipment to report.
+    pool.query(
+      `SELECT value FROM system_settings
+        WHERE organization_id = $1 AND key = 'studio_equipment' LIMIT 1`, [org]),
     ...(ragQuery
       ? [retrieveRagChunks(org, ragQuery, 'ai_client_context_rag_failed', retrievalStats)]
       : []),
@@ -350,6 +364,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerci
     nutrition:        nutritionRes.rows[0] || null,
     workoutAssignments: workoutAssignRes.rows,
     dietAssignments:  dietAssignRes.rows,
+    studioEquipment:  equipmentRes.rows[0]?.value || null,
     ragChunks,
     exercises,
   };
@@ -717,6 +732,8 @@ router.get('/workout/context/:client_id', auth, async (req, res) => {
         sources_present: twin.rules.coverage.sources_present,
         constraints: twin.rules.constraints.length,
         not_assessed: twin.brief.missing,
+        // On file, but old enough that its age is itself a fact.
+        stale: twin.brief.stale ?? [],
       }
       : null,
     current_program: active
@@ -1235,6 +1252,11 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
           screened: twin.rules.coverage.screened,
           sources: twin.rules.coverage.sources_present,
           constraints: twin.rules.constraints,
+          // Frozen with the proposal: which sections were never assessed, and
+          // which were assessed so long ago that the model was told to weigh
+          // them as weaker evidence.
+          not_assessed: twin.brief.missing,
+          stale: twin.brief.stale ?? [],
         },
         audit: { violations: audit.violations, unverified: audit.unverified, counts: audit.counts },
         // What the engine knew, and what it did not. Frozen with the
@@ -1306,6 +1328,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
         })),
         deload: twin.rules.deload,
         not_assessed: twin.brief.missing,
+        stale: twin.brief.stale ?? [],
       },
     });
   } catch (err) {
