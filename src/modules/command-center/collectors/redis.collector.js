@@ -48,7 +48,10 @@ async function collect() {
   // inline sends by design (see docker-compose.yml's header), so this card
   // should say "off", not "broken".
   if (!redis.isConfigured()) {
-    return unavailable(NAME, 'REDIS_URL is not set — queues run inline');
+    // EXPECTED: a deployment with no REDIS_URL has not failed to observe
+    // Redis, it has no Redis. It does not degrade the platform rollup — the
+    // `queues` card carries what that choice costs.
+    return unavailable(NAME, 'REDIS_URL is not set — queues run inline', true);
   }
 
   const t0 = Date.now();

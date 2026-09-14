@@ -31,6 +31,19 @@
 // that is a denial-of-service control rather than an authorization boundary,
 // availability wins — and it is strictly better than the status quo, where the
 // counters were per-process anyway.
+//
+// ── Why this uses the FAIL-FAST client ─────────────────────────────────────
+//
+// (2) did not work, for a reason that is invisible from here: the shared
+// client is configured for BullMQ, with ioredis's offline queue on and
+// `maxRetriesPerRequest: null`. A command issued while Redis is unreachable is
+// therefore QUEUED, not rejected, and never abandoned — so `increment()` never
+// settled, `passOnStoreError` never had an error to pass on, and every
+// rate-limited route hung for the process lifetime rather than degrading.
+//
+// Measured with Redis stopped: /api/health answered (not rate limited) while
+// every other route was gone. lib/redis.js getFailFastClient() refuses to
+// queue, so the fallback this file was written around can actually happen.
 
 const { RedisStore } = require('rate-limit-redis');
 const redis = require('./redis');
@@ -64,7 +77,10 @@ function makeStore(prefix) {
     return undefined;
   }
 
-  const client = redis.getConnection();
+  // The FAIL-FAST client, not the shared BullMQ one. See the header: the
+  // shared client queues commands during an outage instead of rejecting them,
+  // so `passOnStoreError` could never fire and every limited route hung.
+  const client = redis.getFailFastClient();
 
   return new RedisStore({
     prefix: `rl:${prefix}:`,

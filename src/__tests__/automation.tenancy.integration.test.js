@@ -23,6 +23,7 @@
 // lose. Stand one up with scripts/rls-proof-setup.sh.
 
 const { Pool } = require('pg');
+const { appTimeZone } = require('../lib/appTime');
 
 const DB_URL = process.env.RLS_TEST_DATABASE_URL;
 const describeIf = DB_URL ? describe : describe.skip;
@@ -49,7 +50,30 @@ describeIf('automation tenancy, against a real database', () => {
   let repo;
 
   beforeAll(async () => {
-    owner = new Pool({ connectionString: DB_URL, max: 4 });
+    // The fixture pool must keep the SAME calendar as the code under test.
+    //
+    // src/db/pool.js sets the session time zone on every connection, so the
+    // repository's `CURRENT_DATE` is today in Asia/Kolkata. A raw pg.Pool
+    // inherits the server's zone instead — Etc/UTC on CI. Seed a birthday
+    // against UTC's today, ask for IST's today, and the two disagree for the
+    // five and a half hours between 18:30 and 00:00 UTC: the sweep queries
+    // below returned [] and this suite failed by time of day, green in the
+    // morning and red the same evening on the very same commit.
+    //
+    // As a startup parameter rather than pool.js's `SET TIME ZONE` on connect:
+    // that file explains it cannot use this one because production reaches
+    // Postgres through a pooler that would reject an unrecognised startup
+    // parameter outright. This reaches a throwaway local server directly, so
+    // the tidier form is available — part of the handshake, no window before
+    // it applies, and no querying a client the pool is mid-handover on.
+    //
+    // Sourced from appTimeZone() rather than hardcoded so a configured
+    // APP_TIMEZONE moves both sides together.
+    owner = new Pool({
+      connectionString: DB_URL,
+      max: 4,
+      options: `-c timezone=${appTimeZone()}`,
+    });
 
     // The repository reads its pool from src/db/pool, so it is pointed at this
     // database for the duration. Requiring it after the env var is set is what

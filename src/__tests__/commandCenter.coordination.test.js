@@ -78,6 +78,10 @@ jest.mock('../lib/redis', () => ({
   isConfigured: () => mockRedisState.configured,
   isReady: () => mockRedisState.ready,
   getClient: () => mockShared,
+  // The primitives use the FAIL-FAST client: the shared one queues commands
+  // during an outage instead of rejecting them, so every fallback below would
+  // hang instead of running. See lib/redis.js getFailFastClient().
+  getFailFastClient: () => mockShared,
 }));
 
 /** Two module instances, as two API containers would be. */
@@ -203,7 +207,7 @@ describe('tickets are single-use across instances', () => {
   });
 });
 
-describe('damping streaks are mockShared', () => {
+describe('damping streaks are shared', () => {
   it('two instances contribute to one count', async () => {
     const [a, b] = twoInstances();
     expect(await a.bumpStreak('redis', 'bad', 60_000)).toBe(1);

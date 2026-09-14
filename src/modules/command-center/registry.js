@@ -19,15 +19,29 @@
 
 const logger = require('../../lib/logger');
 
-/** Card states, worst last — ordering matters for rollups. */
+/**
+ * The card states. One vocabulary, used by the collectors, the rollup, the
+ * alert engine and the UI — there is no second scale anywhere.
+ *
+ * ── Why DEGRADED exists ────────────────────────────────────────────────────
+ *
+ * Without it, a dependency that is WORKING BUT REDUCED has nowhere honest to
+ * sit. Redis down means the queues do not stop — jobs run inline, in the
+ * request, synchronously. That is not healthy (latency and failure modes both
+ * change), it is not a warning about a threshold, and it is certainly not
+ * "unavailable", because work is still being done. Collapsing it into any of
+ * those three either overstates the problem or hides it.
+ */
 const STATUS = {
   HEALTHY: 'healthy',
+  /** Working, in a reduced mode that an operator needs to know about. */
+  DEGRADED: 'degraded',
   WARNING: 'warning',
+  /** The probe ran and did not answer in time. */
+  TIMEOUT: 'timeout',
   CRITICAL: 'critical',
   /** The probe could not run at all: no socket mounted, no key configured. */
   UNAVAILABLE: 'unavailable',
-  /** The probe ran and did not answer in time. */
-  TIMEOUT: 'timeout',
 };
 
 /**
@@ -55,9 +69,28 @@ const SCOPE = {
   PROCESS: 'process',
 };
 
+/**
+ * Severity, worst last.
+ *
+ * UNAVAILABLE sits between HEALTHY and DEGRADED rather than at the top, and
+ * that placement is the one judgement call in this file.
+ *
+ * A Docker socket that was never mounted is a gap in OBSERVABILITY, not an
+ * outage. Ranking it above WARNING would paint the console red every second on
+ * a box where a capability is simply not wired up, and an operator who sees
+ * red when nothing is wrong stops seeing red at all. But ranking it below
+ * HEALTHY — which is what "leave it out of the rollup" amounts to — is the
+ * opposite failure: a snapshot where six of eight probes could not run would
+ * report the two that did and call the platform healthy.
+ *
+ * So it degrades rather than alarms. The top line reads DEGRADED, the
+ * `observability` block says exactly how much of the platform was actually
+ * measured, and nothing claims health it did not verify.
+ */
 const SEVERITY_ORDER = [
   STATUS.HEALTHY,
   STATUS.UNAVAILABLE,
+  STATUS.DEGRADED,
   STATUS.WARNING,
   STATUS.TIMEOUT,
   STATUS.CRITICAL,
@@ -66,18 +99,32 @@ const SEVERITY_ORDER = [
 /**
  * Roll many card statuses into one.
  *
- * UNAVAILABLE deliberately ranks BELOW warning: a Docker socket that was never
- * mounted is a gap in observability, not an outage, and must not paint the
- * whole console red every second on a box where it is simply not wired up.
- * TIMEOUT ranks above warning because a probe that hangs usually means the
- * thing behind it is genuinely sick.
+ * An UNAVAILABLE card lifts the rollup to DEGRADED rather than reporting
+ * UNAVAILABLE outright: "the platform is unavailable" is a much stronger claim
+ * than "one probe could not run", and it is not the one the evidence supports.
+ *
+ * @param {Array<string|{status: string, expected?: boolean}>} cards
+ *   Statuses, or whole cards. Whole cards let an EXPECTED unavailability — a
+ *   capability this deployment has deliberately not wired up — be told from an
+ *   unexpected one. See `unavailable()`.
  */
-function rollup(statuses) {
+function rollup(cards) {
   let worst = STATUS.HEALTHY;
-  for (const s of statuses) {
-    if (SEVERITY_ORDER.indexOf(s) > SEVERITY_ORDER.indexOf(worst)) worst = s;
+  for (const c of cards) {
+    const status = typeof c === 'string' ? c : c?.status;
+    // An expected absence is not a gap in observability: nobody is waiting for
+    // a Redis card on a box with no REDIS_URL. It is still SHOWN, and still
+    // counted in `observability`, but it does not degrade the rollup — or a
+    // deployment that has deliberately not wired something up would read amber
+    // forever, which is how a status light stops meaning anything.
+    if (status === STATUS.UNAVAILABLE && typeof c === 'object' && c?.expected) continue;
+    const rank = SEVERITY_ORDER.indexOf(status);
+    if (rank > SEVERITY_ORDER.indexOf(worst)) worst = status;
   }
-  return worst;
+  // UNAVAILABLE never survives as a rollup: it describes one probe, not the
+  // platform. Whatever made it unavailable leaves us partially blind, which is
+  // exactly what DEGRADED means.
+  return worst === STATUS.UNAVAILABLE ? STATUS.DEGRADED : worst;
 }
 
 /**
@@ -96,9 +143,22 @@ function result(name, { status, data = null, latency_ms = null, reason = null })
   };
 }
 
-/** Marks a source that cannot be probed here — not an outage. */
-function unavailable(name, reason) {
-  return result(name, { status: STATUS.UNAVAILABLE, reason });
+/**
+ * Marks a source that cannot be probed here — not an outage.
+ *
+ * @param {boolean} [expected=false] TRUE when this deployment has deliberately
+ *   not wired the capability up (no REDIS_URL, no Docker socket). An expected
+ *   absence is reported and counted but does not degrade the platform rollup;
+ *   an unexpected one does, because then we are blind to something we should
+ *   have been able to see.
+ */
+function unavailable(name, reason, expected = false) {
+  return { ...result(name, { status: STATUS.UNAVAILABLE, reason }), expected: Boolean(expected) };
+}
+
+/** Working, in a reduced mode. `detail` names the mode, for the UI to render. */
+function degraded(name, reason, data = null) {
+  return result(name, { status: STATUS.DEGRADED, reason, data });
 }
 
 // ── In-flight probes ────────────────────────────────────────────────────────
@@ -268,7 +328,7 @@ function clear() { registry.clear(); inflight.clear(); }
 
 module.exports = {
   STATUS, SCOPE, SEVERITY_ORDER, rollup,
-  result, unavailable, runCollector,
+  result, unavailable, degraded, runCollector,
   register, get, names, clear,
   inflightCount,
 };

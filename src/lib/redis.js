@@ -132,6 +132,64 @@ function getWorkerConnection() {
   return createRedisClient();
 }
 
+// ── The fail-fast client, and the outage it exists to survive ───────────────
+//
+// The shared client above is configured for BullMQ, and correctly so:
+// `maxRetriesPerRequest: null` because a blocking command must never be capped,
+// and ioredis's `enableOfflineQueue` left at its default `true` so a command
+// issued during a blip is held and sent on reconnect rather than lost.
+//
+// For a QUEUE that is right. For anything on a request path it is a trap, and
+// the two together make it worse: a command issued while Redis is unreachable
+// is queued rather than rejected, and with retries uncapped it is never
+// abandoned. It does not fail. It waits — for the process lifetime.
+//
+// Measured, with Redis stopped and REDIS_URL still set: every rate-limited
+// route hung indefinitely. Not slow, not 500 — no response at all. The rate
+// limiter's store is deliberately paired with `passOnStoreError: true` so a
+// Redis fault lets the request through, and that fallback could never fire,
+// because there was no error to pass on. The API's own /api/health answered
+// (it is not rate limited) while every other route was gone, which is the
+// worst possible shape: a health check that says the process is alive while
+// the API is unreachable.
+//
+// So callers on a request path get their own connection that refuses to queue:
+// a command issued while disconnected rejects immediately, and a connection
+// that is up but unresponsive is bounded by commandTimeout. Now the degraded
+// paths that were written to handle an error actually receive one.
+const FAIL_FAST_COMMAND_TIMEOUT_MS =
+  Number(process.env.REDIS_COMMAND_TIMEOUT_MS) || 1000;
+
+let failFastClient;
+
+/**
+ * A client for request-path consumers: rate limiting, the Command Center's
+ * coordination primitives, anything where a hung request is worse than a
+ * missing answer.
+ *
+ * NOT for BullMQ. Queues need the offline queue and uncapped retries.
+ */
+function getFailFastClient() {
+  if (!failFastClient) {
+    failFastClient = new Redis({
+      ...redisOptions,
+      // The whole point. Reject instead of queueing when disconnected.
+      enableOfflineQueue: false,
+      // Bounded rather than null: nothing on this client blocks.
+      maxRetriesPerRequest: 1,
+      // Guards the other shape — connected, but not answering.
+      commandTimeout: FAIL_FAST_COMMAND_TIMEOUT_MS,
+    });
+    // Errors here are expected during an outage and are handled by each
+    // caller's own fallback. Without a listener, ioredis emits them as
+    // unhandled 'error' events and takes the process down.
+    failFastClient.on('error', (err) => {
+      logger.debug({ err: err.message }, 'fail-fast redis client error (handled by caller fallback)');
+    });
+  }
+  return failFastClient;
+}
+
 /**
  * True when the shared client is actually connected (status === 'ready').
  * Producers use this to decide queue-vs-inline: never enqueue into a dead
@@ -194,6 +252,11 @@ async function ping(timeoutMs = 5000) {
 
 /** Close the shared client (used by graceful shutdown). */
 async function close() {
+  if (failFastClient) {
+    const f = failFastClient;
+    failFastClient = undefined;
+    try { await f.quit(); } catch { f.disconnect(); }
+  }
   if (!redisClient) return;
   const c = redisClient;
   redisClient = undefined;
@@ -213,6 +276,8 @@ module.exports = {
   isConfigured,
   getConnection,
   getWorkerConnection,
+  getFailFastClient,
+  FAIL_FAST_COMMAND_TIMEOUT_MS,
   close,
   redisOptions,
 };

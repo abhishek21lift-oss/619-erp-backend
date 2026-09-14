@@ -111,8 +111,41 @@ describe('status rollup', () => {
     // A Docker socket that was never mounted is a gap in observability, not an
     // outage. If it outranked warning, every console on a box without the mount
     // would sit permanently amber and operators would stop reading the colour.
-    expect(registry.rollup([STATUS.HEALTHY, STATUS.UNAVAILABLE])).toBe(STATUS.UNAVAILABLE);
     expect(registry.rollup([STATUS.WARNING, STATUS.UNAVAILABLE])).toBe(STATUS.WARNING);
+  });
+
+  test('an unexpected unavailable DEGRADES rather than reading healthy', () => {
+    // The other half of the same judgement, and the half that was missing. A
+    // probe that should have run and did not leaves us blind, and a rollup of
+    // "healthy" over a blind spot is the single most misleading thing this
+    // console could say. It degrades; it does not alarm.
+    expect(registry.rollup([STATUS.HEALTHY, STATUS.UNAVAILABLE])).toBe(STATUS.DEGRADED);
+  });
+
+  test('UNAVAILABLE never survives as a platform rollup', () => {
+    // "The platform is unavailable" is a far stronger claim than "one probe
+    // could not run", and it is not the one the evidence supports.
+    expect(registry.rollup([STATUS.UNAVAILABLE, STATUS.UNAVAILABLE])).toBe(STATUS.DEGRADED);
+  });
+
+  test('an EXPECTED unavailable leaves the rollup healthy', () => {
+    // A deployment with no REDIS_URL has not failed to observe Redis; it has
+    // no Redis. Degrading on that would make the status light permanently
+    // amber, which is how a status light stops meaning anything.
+    const notConfigured = { status: STATUS.UNAVAILABLE, expected: true };
+    expect(registry.rollup([{ status: STATUS.HEALTHY }, notConfigured])).toBe(STATUS.HEALTHY);
+  });
+
+  test('an unexpected unavailable degrades even when passed as a card', () => {
+    // Cannot pass by treating every card-shaped input as expected.
+    const blind = { status: STATUS.UNAVAILABLE, expected: false };
+    expect(registry.rollup([{ status: STATUS.HEALTHY }, blind])).toBe(STATUS.DEGRADED);
+  });
+
+  test('degraded sits between unavailable and warning', () => {
+    expect(registry.rollup([STATUS.HEALTHY, STATUS.DEGRADED])).toBe(STATUS.DEGRADED);
+    expect(registry.rollup([STATUS.DEGRADED, STATUS.WARNING])).toBe(STATUS.WARNING);
+    expect(registry.rollup([STATUS.DEGRADED, STATUS.CRITICAL])).toBe(STATUS.CRITICAL);
   });
 
   test('a timeout outranks a warning', () => {
@@ -170,5 +203,103 @@ describe('registry guards', () => {
 
   test('a non-function collector is refused at registration, not at probe time', () => {
     expect(() => registry.register('bad', 'not a function')).toThrow(/must be a function/);
+  });
+});
+
+// ── Observability: how much of the platform did we actually measure? ────────
+//
+// A status line on its own cannot distinguish "I checked eight things and they
+// are fine" from "I checked two things and they are fine", and those are very
+// different claims to put a green dot on. This block is what stops the second
+// one being presented as the first.
+
+describe('observability', () => {
+  const { STATUS: ST } = registry;
+  const card = (name, status, extra = {}) => ({ name, status, ...extra });
+
+  it('counts a fully probed snapshot as complete coverage', () => {
+    const o = snapshot.observabilityOf([
+      card('a', ST.HEALTHY), card('b', ST.WARNING), card('c', ST.CRITICAL),
+    ]);
+    expect(o.total).toBe(3);
+    expect(o.probed).toBe(3);
+    expect(o.coverage).toBe(1);
+  });
+
+  it('drops coverage when a probe that SHOULD have run did not', () => {
+    const o = snapshot.observabilityOf([
+      card('a', ST.HEALTHY), card('b', ST.HEALTHY),
+      card('blind', ST.UNAVAILABLE, { expected: false }),
+      card('gone', ST.UNAVAILABLE, { expected: false }),
+    ]);
+    expect(o.unavailable).toBe(2);
+    expect(o.probed).toBe(2);
+    expect(o.coverage).toBe(0.5);
+  });
+
+  it('does NOT count a not-configured capability against coverage', () => {
+    // A deployment with no REDIS_URL has not failed to observe Redis; it has
+    // no Redis. Counting that as a blind spot would peg coverage below 1
+    // forever and make the number meaningless.
+    const o = snapshot.observabilityOf([
+      card('a', ST.HEALTHY), card('b', ST.HEALTHY),
+      card('redis', ST.UNAVAILABLE, { expected: true }),
+    ]);
+    expect(o.not_configured).toBe(1);
+    expect(o.unavailable).toBe(0);
+    expect(o.coverage).toBe(1);
+  });
+
+  it('counts a timed-out probe as unmeasured', () => {
+    const o = snapshot.observabilityOf([
+      card('a', ST.HEALTHY), card('slow', ST.TIMEOUT),
+    ]);
+    expect(o.timed_out).toBe(1);
+    expect(o.coverage).toBe(0.5);
+  });
+
+  it('reports staleness separately from coverage', () => {
+    // A cached reading IS a reading — it was measured, just not this second.
+    // Conflating the two would make a healthy console look blind.
+    const o = snapshot.observabilityOf([
+      card('a', ST.HEALTHY, { cached: true }), card('b', ST.HEALTHY),
+    ]);
+    expect(o.stale).toBe(1);
+    expect(o.coverage).toBe(1);
+  });
+
+  it('survives a snapshot where nothing could be measured at all', () => {
+    const o = snapshot.observabilityOf([
+      card('a', ST.UNAVAILABLE, { expected: false }),
+    ]);
+    expect(o.coverage).toBe(0);
+  });
+});
+
+describe('degraded_reasons', () => {
+  const { STATUS: ST } = registry;
+
+  it('names every card that is not green, with its reason', () => {
+    const reasons = snapshot.degradedReasons([
+      { name: 'a', status: ST.HEALTHY },
+      { name: 'db', status: ST.CRITICAL, reason: 'latency 900ms', scope: 'platform' },
+      { name: 'q', status: ST.DEGRADED, reason: 'inline fallback', scope: 'platform' },
+    ]);
+    expect(reasons.map((r) => r.card)).toEqual(['db', 'q']);
+    expect(reasons[0].reason).toBe('latency 900ms');
+  });
+
+  it('stays quiet about a capability this deployment does not have', () => {
+    const reasons = snapshot.degradedReasons([
+      { name: 'redis', status: ST.UNAVAILABLE, expected: true, reason: 'no REDIS_URL' },
+    ]);
+    expect(reasons).toEqual([]);
+  });
+
+  it('does NOT stay quiet about an unexpected blind spot', () => {
+    const reasons = snapshot.degradedReasons([
+      { name: 'security', status: ST.UNAVAILABLE, expected: false, reason: 'probe failed' },
+    ]);
+    expect(reasons).toHaveLength(1);
   });
 });

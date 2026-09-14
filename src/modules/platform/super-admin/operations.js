@@ -394,40 +394,53 @@ router.get('/audit/export', async (req, res, next) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SYSTEM HEALTH
+//  SYSTEM HEALTH — a PROJECTION of the Command Center snapshot
 //
-//  Live introspection, deliberately with no table of its own: anything
-//  persisted here would be a second copy of the truth that can go stale.
-//  Everything below is measured at request time.
+//  ── What this used to be, and why that was a problem ──────────────────────
+//
+//  A second, independent health calculation. It opened its own `SELECT 1`,
+//  read `_migrations` itself, called `process.memoryUsage()` itself and
+//  summarised the queues itself — duplicating four collectors — with no
+//  timeout, no cache, no coalescing and no cancellation, none of which the
+//  Command Center's registry lacks.
+//
+//  Worse than the duplicated work was the duplicated VOCABULARY. This endpoint
+//  graded the database `up` / `down`; the snapshot grades it healthy / warning
+//  / critical / timeout / unavailable against latency, pool pressure,
+//  connection ratio and idle-in-transaction. So a database at 900ms with the
+//  pool exhausted was `up` here and `critical` there, and the console rendered
+//  both, on the same screen, without saying which to believe.
+//
+//  ── What it is now ────────────────────────────────────────────────────────
+//
+//  The same response shape, derived entirely from the canonical snapshot. One
+//  probe, one grading, one answer. Every field below comes from a card; this
+//  handler measures nothing itself.
+//
+//  It keeps its shape because it is not only this repo's console that calls
+//  it, and gains the two fields it was always missing: `status` — which the
+//  frontend was already reading, and always getting `undefined` for, so the
+//  Infrastructure tile rendered the literal word "live" forever — and
+//  `observability`, so a caller can tell "everything is fine" from "the two
+//  things I could see are fine".
 // ═══════════════════════════════════════════════════════════════════════════
 
 router.get('/system-health', async (req, res, next) => {
   try {
-    const started = Date.now();
-    let db = { status: 'down', latency_ms: null, error: null };
-    let migrations = { applied: null, latest: null, applied_at: null };
-    let dbSize = null;
+    const { snapshot, registerCollectors } = require('../../command-center');
+    registerCollectors();
+    const snap = await snapshot.collect();
 
-    try {
-      const t0 = Date.now();
-      await pool.query('SELECT 1');
-      db = { status: 'up', latency_ms: Date.now() - t0, error: null };
-
-      const [mig, size] = await Promise.all([
-        pool.query(`SELECT COUNT(*)::int AS applied,
-                           (SELECT filename   FROM _migrations ORDER BY id DESC LIMIT 1) AS latest,
-                           (SELECT applied_at FROM _migrations ORDER BY id DESC LIMIT 1) AS applied_at
-                      FROM _migrations`),
-        pool.query(`SELECT pg_database_size(current_database())::bigint AS bytes`),
-      ]);
-      migrations = mig.rows[0];
-      dbSize = Number(size.rows[0].bytes);
-    } catch (err) {
-      db = { status: 'down', latency_ms: null, error: err.message };
-    }
+    const db = snap.cards.database ?? null;
+    const runtime = snap.cards.runtime ?? null;
+    const queues = snap.cards.queues ?? null;
+    const dbData = db?.data ?? {};
+    const rtData = runtime?.data ?? {};
 
     // Error volume over the last 24h, read from the audit trail rather than
-    // log files — log files are not queryable from here and rotate away.
+    // log files — log files are not queryable from here and rotate away. This
+    // is the one thing here that is NOT in a collector, because it describes
+    // the application's own history rather than a live dependency.
     let errors24h = null;
     try {
       const { rows } = await pool.query(
@@ -436,40 +449,41 @@ router.get('/system-health', async (req, res, next) => {
       errors24h = rows[0].n;
     } catch { /* non-fatal: health must still render if this query fails */ }
 
-    const mem = process.memoryUsage();
-
-    // BullMQ queue snapshot (Redis-backed workers). Measured at request time
-    // like everything else here; never fatal — an unreachable queue shows up
-    // as status 'unknown' rather than failing the whole health endpoint.
-    let queues = null;
-    try {
-      const { collectQueueStats, summarize } = require('../../../lib/queueHealth');
-      queues = summarize(await collectQueueStats());
-    } catch {
-      queues = { status: 'unknown', detail: 'unavailable' };
-    }
-
     res.json({
-      checked_at: new Date().toISOString(),
-      check_duration_ms: Date.now() - started,
+      // The canonical rollup. Same vocabulary as every other Command Center
+      // surface, because it IS the same reading.
+      status: snap.status,
+      observability: snap.observability,
+      degraded_reasons: snap.degraded_reasons,
+      checked_at: snap.collected_at,
+      check_duration_ms: snap.duration_ms,
+
       database: {
-        ...db,
-        size_bytes: dbSize,
-        pool: { total: pool.totalCount ?? null, idle: pool.idleCount ?? null, waiting: pool.waitingCount ?? null },
+        // Preserved for callers that branch on it, derived rather than
+        // re-measured: anything the collector did not grade healthy is not up.
+        status: db?.status === 'healthy' || db?.status === 'warning' ? 'up' : 'down',
+        // The collector's own five-state grade, which is the one to trust.
+        card_status: db?.status ?? 'unavailable',
+        latency_ms: dbData.latency_ms ?? null,
+        error: db?.reason ?? null,
+        size_bytes: dbData.size_bytes ?? null,
+        pool: dbData.pool ?? { total: null, idle: null, waiting: null },
       },
-      migrations,
+      migrations: dbData.migrations ?? { applied: null, latest: null, applied_at: null },
       process: {
-        uptime_seconds: Math.round(process.uptime()),
-        node_version: process.version,
+        uptime_seconds: rtData.uptime_seconds ?? Math.round(process.uptime()),
+        node_version: rtData.node_version ?? process.version,
         app_version: process.env.npm_package_version || null,
         environment: process.env.NODE_ENV || 'development',
         memory: {
-          rss_bytes: mem.rss,
-          heap_used_bytes: mem.heapUsed,
-          heap_total_bytes: mem.heapTotal,
+          rss_bytes: rtData.memory?.rss_bytes ?? null,
+          heap_used_bytes: rtData.memory?.heap_used_bytes ?? null,
+          heap_total_bytes: rtData.memory?.heap_total_bytes ?? null,
         },
+        // Said explicitly: this half describes ONE container, not the platform.
+        scope: runtime?.scope ?? 'process',
       },
-      queues,
+      queues: queues?.data?.summary ?? { status: queues?.status ?? 'unknown' },
       errors_24h: errors24h,
     });
   } catch (err) { next(err); }

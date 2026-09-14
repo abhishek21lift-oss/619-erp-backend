@@ -22,12 +22,17 @@ const path = require('path');
 const mockRedisState = { configured: true };
 jest.mock('../lib/redis', () => ({
   isConfigured: () => mockRedisState.configured,
-  getConnection: () => ({
+  // The store takes the FAIL-FAST client, not the shared BullMQ one. The
+  // shared client queues commands during an outage instead of rejecting them,
+  // so `passOnStoreError` never fired and every limited route hung — see
+  // __tests__/redis.failFast.test.js.
+  getFailFastClient: () => ({
     // rate-limit-redis loads its Lua script on init and expects a SHA string
     // back; everything else in its protocol is numeric. Returning 1 for both
     // makes the store throw "unexpected reply from redis client" at construction.
     call: jest.fn(async (cmd) => (String(cmd).toUpperCase() === 'SCRIPT' ? 'a'.repeat(40) : 1)),
   }),
+  getConnection: () => { throw new Error('the rate limiter must not use the shared BullMQ connection'); },
 }));
 
 const mockLog = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
