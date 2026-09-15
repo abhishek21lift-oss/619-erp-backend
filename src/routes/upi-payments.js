@@ -28,6 +28,7 @@ const multer = require('multer');
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { detectFileType, DOCUMENTS } = require('../lib/fileSignatures');
+const { strictNumber } = require('../lib/zodNumbers');
 const { auth, adminOnly } = require('../middleware/auth');
 const { requireStaff } = require('../middleware/rbac');
 const { validate } = require('../middleware/validate');
@@ -110,7 +111,12 @@ const schemas = {
       // Present so a studio can sell an ad-hoc package, but see the handler:
       // when plan_id resolves to a real plan the STORED price wins and this is
       // ignored, so a tampered payload cannot buy a plan at its own price.
-      base_amount: z.coerce.number().min(0).max(10_000_000),
+      // strictNumber, not z.coerce.number(): the latter turns '', '   ', null
+      // and [] into 0, so a malformed body created a ₹0 order rather than
+      // failing. Only the ad-hoc path uses this — a resolved plan_id makes the
+      // STORED price authoritative, per the handler — but ad-hoc is still a
+      // real sale.
+      base_amount: strictNumber({ label: 'base_amount', min: 0, max: 10_000_000 }),
       notes: safeText(500),
     }),
   },
@@ -142,7 +148,11 @@ const schemas = {
         'UPI ID must look like name@bank'
       ),
       merchant_name: z.string().trim().min(1, 'Merchant name is required').max(120),
-      gst_percent: z.coerce.number().min(0).max(100).default(0),
+      // The one that mattered most: with z.coerce.number(), a blank gst_percent
+      // coerced to 0 and passed .min(0), silently putting 0% GST on every
+      // invoice the studio issued afterwards. See lib/zodNumbers.js on why the
+      // statutory slabs are enforced in the UI and not here.
+      gst_percent: strictNumber({ label: 'gst_percent', min: 0, max: 100 }).default(0),
       gst_number: safeText(32),
       is_enabled: boolish.default(false),
       instructions: safeText(500),

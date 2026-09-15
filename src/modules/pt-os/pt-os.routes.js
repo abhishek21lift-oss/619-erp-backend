@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
+const { optionalNumber } = require('../../lib/zodNumbers');
 const { auth, adminOnly, adminOrManager } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
 const { validate } = require('../../middleware/validate');
@@ -48,24 +49,28 @@ const ptClientCreateSchema = {
     trainer_id: z.string().uuid().optional().nullable(),
     trainer_name: z.string().max(255).optional().nullable(),
     goal: z.string().max(100).optional().nullable(),
-    height: z.coerce.number().optional().nullable(),
-    weight: z.coerce.number().optional().nullable(),
-    body_fat: z.coerce.number().optional().nullable(),
+    // optionalNumber, not z.coerce.number(): the latter turns '' into 0, and a
+    // height of 0 cm or a weight of 0 kg is handed straight to the scoring
+    // libraries, which compute a BMI from it and store the result as a reading.
+    // Blank must stay blank.
+    height: optionalNumber({ label: 'height', min: 50, max: 250 }),
+    weight: optionalNumber({ label: 'weight', min: 20, max: 350 }),
+    body_fat: optionalNumber({ label: 'body_fat', min: 3, max: 70 }),
     health_conditions: z.string().max(500).optional().nullable(),
     injuries: z.string().max(500).optional().nullable(),
     frequency: z.string().max(50).optional().nullable(),
     notes: z.string().max(2000).optional().nullable(),
-    monthly_pt_amount: z.coerce.number().optional().nullable(),
-    base_amount: z.coerce.number().optional().nullable(),
-    discount: z.coerce.number().optional().nullable(),
+    monthly_pt_amount: optionalNumber({ label: 'monthly_pt_amount', min: 0, max: 10_000_000 }),
+    base_amount: optionalNumber({ label: 'base_amount', min: 0, max: 10_000_000 }),
+    discount: optionalNumber({ label: 'discount', min: 0, max: 10_000_000 }),
     pt_start_date: z.string().optional().nullable(),
     pt_end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(d => !isNaN(Date.parse(d)), 'Invalid date').optional().nullable(),
     pt_package_id: z.string().optional().nullable(),
     client_id: z.string().optional().nullable(),
     package_type: z.string().optional().nullable(),
-    duration_months: z.coerce.number().optional().nullable(),
-    base_price: z.coerce.number().optional().nullable(),
-    selling_price: z.coerce.number().optional().nullable(),
+    duration_months: optionalNumber({ label: 'duration_months', min: 1, max: 120, int: true }),
+    base_price: optionalNumber({ label: 'base_price', min: 0, max: 10_000_000 }),
+    selling_price: optionalNumber({ label: 'selling_price', min: 0, max: 10_000_000 }),
     whatsapp: z.string().regex(/^[6-9]\d{9}$/, 'Invalid Indian mobile number').optional().nullable(),
     occupation: z.string().max(100).optional().nullable(),
     emergency_contact: z.string().max(255).optional().nullable(),
