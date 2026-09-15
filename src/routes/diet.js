@@ -3,6 +3,7 @@ const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOrManager } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
 
@@ -358,7 +359,17 @@ router.get('/fitness-profile/:clientId', auth, async (req, res, next) => {
 });
 
 // PUT /api/diet/fitness-profile/:clientId
-router.put('/fitness-profile/:clientId', auth, async (req, res, next) => {
+// requireStaff, not a self-check. The GET beside this one grew a `role ===
+// member` branch when a member was found able to READ another client's
+// profile; the PUT did not, so a member could still WRITE one — health
+// conditions, injuries, emergency contact and phone, over the top of somebody
+// else's record. clientInOrg() below bounds the STUDIO and says nothing about
+// which client inside it, which is the same gap in the same shape.
+//
+// Gated rather than self-checked because no member surface calls this: the
+// client portal is /api/me, and the member app calls only api.me.*, bookings,
+// classes and UPI payments. This is the trainer's intake form.
+router.put('/fitness-profile/:clientId', auth, requireStaff, async (req, res, next) => {
   try {
     const d = req.body;
     const clientId = req.params.clientId;

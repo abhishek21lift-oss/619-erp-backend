@@ -85,7 +85,7 @@ router.get('/checkout/settings', auth, requireStaff, async (req, res, next) => {
 });
 
 // POST /api/subscription/checkout — open (or resume) a payment for a plan.
-router.post('/checkout', auth, validate(checkoutSchemas.open), async (req, res, next) => {
+router.post('/checkout', auth, requireStaff, validate(checkoutSchemas.open), async (req, res, next) => {
   try {
     if (!requireStudioAdmin(req, res)) return;
     const orgId = req.user?.organization_id;
@@ -103,7 +103,7 @@ router.post('/checkout', auth, validate(checkoutSchemas.open), async (req, res, 
 });
 
 // GET /api/subscription/checkout/:id — the checkout page's polling target.
-router.get('/checkout/:id', auth, validate(checkoutSchemas.idParam), async (req, res, next) => {
+router.get('/checkout/:id', auth, requireStaff, validate(checkoutSchemas.idParam), async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
     const { rows } = await pool.query(
@@ -125,7 +125,7 @@ router.get('/checkout/:id', auth, validate(checkoutSchemas.idParam), async (req,
 });
 
 // POST /api/subscription/checkout/:id/submit-utr
-router.post('/checkout/:id/submit-utr', auth, validate(checkoutSchemas.submitUtr), async (req, res, next) => {
+router.post('/checkout/:id/submit-utr', auth, requireStaff, validate(checkoutSchemas.submitUtr), async (req, res, next) => {
   try {
     if (!requireStudioAdmin(req, res)) return;
     const orgId = req.user?.organization_id;
@@ -158,7 +158,7 @@ router.post('/checkout/:id/submit-utr', auth, validate(checkoutSchemas.submitUtr
 });
 
 // POST /api/subscription/checkout/:id/cancel
-router.post('/checkout/:id/cancel', auth, validate(checkoutSchemas.idParam), async (req, res, next) => {
+router.post('/checkout/:id/cancel', auth, requireStaff, validate(checkoutSchemas.idParam), async (req, res, next) => {
   try {
     if (!requireStudioAdmin(req, res)) return;
     const cancelled = await checkout.cancel({
@@ -302,11 +302,32 @@ router.get('/payments', auth, requireStaff, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── Why every mutation below carries requireStaff ──────────────────────────
+//
+// The READS in this file were gated (/checkout/settings, /checkout, /invoices,
+// /payments) and the WRITES were not, which is the same asymmetry that left
+// PUT /api/diet/fitness-profile ungated beside a fixed GET. Each of these acts
+// on req.user.organization_id, so a `member` — the account client activation
+// creates for a gym client — could operate the STUDIO's billing:
+//
+//   request-activation      raise a billing request in the studio's name and
+//                           notify every super admin, with the member recorded
+//                           as actor_id/actor_name on the subscription_event.
+//   cancel-scheduled-change drop the owner's pending downgrade.
+//   checkout / submit-utr   open and pay against a studio checkout.
+//
+// Found by memberAuthzMatrix.authz.test.js, which probes non-GET methods; the
+// mount-level guard only ever probed GET, so none of this was ever asked.
+//
+// requireStaff rather than adminOnly deliberately: it closes the member hole
+// without deciding for a studio whether its manager may handle billing. If
+// billing should be owner-only, that is a narrower gate and a product call.
+
 // POST /api/subscription/request-activation — a studio asks the platform to
 // activate/renew its subscription (admin-activated billing). Notifies the super
 // admins in-app and logs the request so it surfaces in the command centre.
 // Reachable while frozen (on the auth allowlist). De-duplicated to once / 6h.
-router.post('/request-activation', auth, async (req, res, next) => {
+router.post('/request-activation', auth, requireStaff, async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
     if (!orgId) return res.status(400).json({ error: { code: 'NO_ORG', message: 'No studio context' } });
@@ -357,7 +378,7 @@ router.post('/request-activation', auth, async (req, res, next) => {
 // Returns the direction (upgrade/downgrade/renewal/activation), the proration
 // credit, the amount due, when it takes effect, and an over-limit warning when
 // a downgrade would leave the studio above the target plan's seat limit.
-router.get('/change-quote', auth, async (req, res, next) => {
+router.get('/change-quote', auth, requireStaff, async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
     if (!orgId) return res.status(400).json({ error: { code: 'NO_ORG', message: 'No studio context' } });
@@ -378,7 +399,7 @@ router.get('/change-quote', auth, async (req, res, next) => {
 // the super admin to execute against a real payment. A DOWNGRADE costs nothing,
 // so it is scheduled immediately for the end of the current period and needs no
 // operator involvement.
-router.post('/request-change', auth, async (req, res, next) => {
+router.post('/request-change', auth, requireStaff, async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
     if (!orgId) return res.status(400).json({ error: { code: 'NO_ORG', message: 'No studio context' } });
@@ -447,7 +468,7 @@ router.post('/request-change', auth, async (req, res, next) => {
 // before requesting activation. Read-only: nothing is reserved or redeemed, so
 // a code that passes here can still be taken by someone else first. The real
 // check happens under a row lock at redemption time.
-router.get('/validate-coupon', auth, async (req, res, next) => {
+router.get('/validate-coupon', auth, requireStaff, async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
     if (!orgId) return res.status(400).json({ error: { code: 'NO_ORG', message: 'No studio context' } });
@@ -475,7 +496,7 @@ router.get('/validate-coupon', auth, async (req, res, next) => {
 
 // POST /api/subscription/cancel-scheduled-change — drop a pending downgrade so
 // the studio stays on its current plan.
-router.post('/cancel-scheduled-change', auth, async (req, res, next) => {
+router.post('/cancel-scheduled-change', auth, requireStaff, async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
     if (!orgId) return res.status(400).json({ error: { code: 'NO_ORG', message: 'No studio context' } });

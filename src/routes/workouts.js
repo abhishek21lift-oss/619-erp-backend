@@ -5,6 +5,7 @@ const pool = require('../db/pool');
 // adminOrManager is gone from this file with the exercise write endpoints —
 // exercise authoring is now trainer-accessible and lives in routes/exercises.js.
 const { auth, adminManagerOrTrainer } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
@@ -374,7 +375,11 @@ async function lockPlan(client, planId) {
   await client.query('SELECT id FROM workout_plans WHERE id = $1 FOR UPDATE', [planId]);
 }
 
-router.get('/plans/:id', auth, async (req, res, next) => {
+// requireStaff. planReadFilter() is org-scoped (plus the shared NULL-org
+// library), so `auth` alone exposed every plan the studio has authored to any
+// member who guessed an id. A member reaches their own programme through
+// /api/me and the assignment routes, never here.
+router.get('/plans/:id', auth, requireStaff, async (req, res, next) => {
   try {
     const tenant = planReadFilter(req, 2);
     const { rows: planRows } = await pool.query(
@@ -1149,7 +1154,10 @@ router.get('/assignments', auth, async (req, res, next) => {
 
 // GET /api/workouts/assignments/:id — single assignment + its plan's full
 // prescribed exercises (feeds "today's prescribed exercises" in the log).
-router.get('/assignments/:id', auth, async (req, res, next) => {
+// requireStaff. tenantScope() below bounds the studio and says nothing about
+// which client inside it, so `auth` alone let any member read any assignment
+// in their studio by id — the plan, its goal and every exercise on it.
+router.get('/assignments/:id', auth, requireStaff, async (req, res, next) => {
   try {
     const scope = tenantScope(req);
     const guard = scope.applyFilter ? ' AND wa.organization_id = $2' : '';
@@ -1251,7 +1259,10 @@ router.post('/assign', auth, adminManagerOrTrainer, async (req, res, next) => {
 });
 
 // PUT /api/workouts/assignments/:id/progress
-router.put('/assignments/:id/progress', auth, async (req, res, next) => {
+// requireStaff. Same org-not-role gap as the read above, but a WRITE: a member
+// could set any other client's progress_pct, which is what the roster and the
+// client's own portal display back as their completion.
+router.put('/assignments/:id/progress', auth, requireStaff, async (req, res, next) => {
   try {
     const pct = parseInt(req.body.progress_pct);
     if (isNaN(pct) || pct < 0 || pct > 100)

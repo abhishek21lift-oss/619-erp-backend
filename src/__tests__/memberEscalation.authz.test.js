@@ -87,7 +87,17 @@ const MEMBER_REACHABLE = {
   '/api/invitations': 'Invitation acceptance, reached before the account has any role.',
   '/api/registrations': 'Self-serve studio signup. Reached before any account exists, so there is no role to check against yet.',
   '/api/me': 'The client portal. This IS the member surface; every handler scopes to the session\'s own client id.',
-  '/api/client-login': 'Client portal sign-in. A member authenticating is the one thing that must work before any role check can apply.',
+  // NOT member-reachable, and the reason that used to sit here said it was.
+  // routes/client-login.js is the STAFF tool that activates a client's login
+  // (POST /:clientId/activate, /deactivate, /resend) — not a member sign-in
+  // surface — and server.js mounts it `auth, requireStaff`. The entry was
+  // therefore describing a different router entirely, and because this table
+  // makes the loop `continue`, it turned a correctly-gated mount into one that
+  // is never probed: if requireStaff were dropped tomorrow, nothing here would
+  // notice. Kept as a comment rather than deleted silently, because the
+  // mistake is the interesting part — a wrong exemption is indistinguishable
+  // from a right one until somebody checks the mount.
+  //   '/api/client-login': '…'
   '/api/webhooks/razorpay': 'Payment provider callback, authenticated by signature rather than session.',
   '/api/bookings': 'A member listing their OWN bookings: the handler overrides member_id with the session\'s own for role === member, so the query string cannot widen it.',
   '/api/v1/bookings': 'Versioned alias of the same bookings router.',
