@@ -109,10 +109,14 @@ describe('staleness', () => {
 // A live client with a 2023 mobility screen is what found that. So these run
 // against buildBrief's own output rather than against a hand-written object.
 describe('against the brief this actually receives', () => {
+  // TODAY is passed in, not left to the wall clock. Every fixture below dates
+  // itself relative to TODAY, so grading the result against the real current
+  // date made the whole block true only on the day it was written.
   const brief = (over = {}) => buildBrief({
     client: { id: 'c1', name: 'A' },
     parq: null, assessment: null, posture: null, mobility: null,
     lifestyle: null, goal: null, assignment: null, recentSessions: [],
+    today: TODAY,
     ...over,
   });
 

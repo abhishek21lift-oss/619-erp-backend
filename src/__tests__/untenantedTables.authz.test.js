@@ -236,17 +236,14 @@ describe('campaigns, offers, feedback and plans', () => {
 describe('integrations', () => {
   const integrations = () => app('/api/integrations', '../routes/integrations');
 
-  test('connect upserts on (organization_id, id), not on id alone', async () => {
-    // The old ON CONFLICT (id) made the row a platform singleton: the second
-    // studio to connect Razorpay overwrote the first studio's API key.
-    await request(integrations())
-      .post('/api/integrations/razorpay/connect')
-      .send({ api_key: 'rzp_test_key' });
-    expect(allSql()).toMatch(/ON CONFLICT \(organization_id, id\)/);
-    expect(allParams()).toContain(ORG_B);
-  });
+  // `connect` used to be tested here, for the ON CONFLICT (id) bug that made
+  // the row a platform singleton — the second studio to connect Razorpay
+  // overwrote the first studio's key. That endpoint is gone: it stored a
+  // credential nothing ever read (see integrations.noCredentialStore.test.js).
+  // The isolation property it guarded still matters for the write that
+  // remains, so it is asserted on `disconnect` below rather than dropped.
 
-  test('disconnect is scoped the same way', async () => {
+  test('disconnect upserts on (organization_id, id), not on id alone', async () => {
     await request(integrations()).post('/api/integrations/razorpay/disconnect').send({});
     expect(allSql()).toMatch(/ON CONFLICT \(organization_id, id\)/);
     expect(allParams()).toContain(ORG_B);
@@ -257,14 +254,14 @@ describe('integrations', () => {
     expectScopedToCaller();
   });
 
-  test('a platform-wide operator with no studio selected cannot write a credential', async () => {
+  test('a platform-wide operator with no studio selected cannot write at all', async () => {
     // orgIdOf() is null for a super admin who has not named a studio, and NULLs
     // are distinct in the unique index — so an unguarded upsert would insert a
     // fresh unowned row on every call instead of updating anything.
     mockUser = { id: 'u-super', role: 'super_admin', organization_id: null };
     const res = await request(integrations())
-      .post('/api/integrations/razorpay/connect')
-      .send({ api_key: 'rzp_test_key' });
+      .post('/api/integrations/razorpay/disconnect')
+      .send({});
     expect(res.status).toBe(400);
     expect(allSql()).not.toMatch(/INSERT INTO integrations/);
   });

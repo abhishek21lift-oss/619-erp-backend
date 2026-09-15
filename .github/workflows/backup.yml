@@ -1,0 +1,84 @@
+name: Nightly database backup
+
+# ── Why this workflow exists ────────────────────────────────────────────────
+#
+# docs/DISASTER-RECOVERY.md establishes the finding: the Supabase organisation
+# is on the FREE plan, which gets no automated backups and no PITR, so six live
+# studios' data had exactly one copy. scripts/backup-database.js was written as
+# the stopgap — and then nothing scheduled it. A backup script that no clock
+# ever invokes is documentation, not a restore point.
+#
+# ── Why it runs over SSH rather than on the runner ──────────────────────────
+#
+# The doc offers three homes: a VPS cron entry, a systemd timer, or a scheduled
+# Action. This is the third, shaped like the first — it SSHes to the same box
+# deploy.yml already deploys to and runs the script there.
+#
+# That choice is deliberate. A GitHub-hosted runner would need DATABASE_URL as
+# a brand-new repository secret, putting a second copy of the production
+# credential somewhere it is not needed; the VPS already has it, in the env the
+# API container reads. It also keeps the dump on a host that can reach the
+# database directly and that already holds the R2 credentials for the off-site
+# upload. No new secret is introduced: HOST, USERNAME and SSH_KEY are the same
+# three deploy.yml uses.
+#
+# ── What this does NOT fix ──────────────────────────────────────────────────
+#
+# A nightly logical dump is an RPO of up to 24 hours. PITR measured in minutes
+# needs the Pro plan, and that decision is still open — see the disaster
+# recovery doc. This narrows the exposure; it does not close it. And a backup
+# nobody has restored is not yet a proven restore path: the doc's restore
+# rehearsal is still owed.
+
+on:
+  schedule:
+    # 02:30 UTC daily. Off the hour because every scheduled workflow on GitHub
+    # fires at :00 and the queue there is long enough to skip runs.
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: database-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run pg_dump on the VPS and upload off-site
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 30m
+          # Fail the step on the first failing command. A backup job that
+          # reports green while pg_dump errored is the exact failure mode the
+          # script's own verification exists to prevent.
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /opt/myptstudio/619-erp-backend
+
+            # The environment comes from the box, never from this file. The
+            # API container already reads these; the backup reuses them rather
+            # than introducing a second copy of the credential.
+            set -a
+            . /opt/myptstudio/.env
+            set +a
+
+            # BACKUP_DIR must sit outside the repository — the script refuses
+            # otherwise, because a dump inside a working tree is one `git add`
+            # away from being published.
+            BACKUP_DIR="${BACKUP_DIR:-/var/backups/619}" \
+            BACKUP_UPLOAD="${BACKUP_UPLOAD:-1}" \
+            BACKUP_RETAIN_DAYS="${BACKUP_RETAIN_DAYS:-30}" \
+              node scripts/backup-database.js
+
+      - name: Say so loudly if the backup did not run
+        if: failure()
+        run: |
+          echo "::error::Nightly database backup FAILED."
+          echo "::error::This project has no other restore point — see docs/DISASTER-RECOVERY.md."
+          exit 1
