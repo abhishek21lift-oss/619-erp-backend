@@ -277,7 +277,9 @@ describe('6. the TTL is bounded, because nothing else bounds the session', () =>
       })) {
         process.env.IMPERSONATION_TTL = env;
         jest.resetModules();
-        // eslint-disable-next-line global-require
+        // Re-required inside the loop on purpose: IMPERSONATION_TTL is resolved
+        // once at module load, so reading the clamp for a new env value means
+        // loading the module again.
         const fresh = require('../modules/platform/super-admin/shared');
         expect(`${env} -> ${fresh.IMPERSONATION_TTL}`).toBe(`${env} -> ${want}`);
       }
