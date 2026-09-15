@@ -31,9 +31,41 @@ const { TRIAL_DAYS } = subscription;
 // Roles a tenant login may hold (never 'super_admin' — that is platform-only and
 // cannot be created, edited, or impersonated through this tenant-facing portal).
 const TENANT_ROLES = ['admin', 'manager', 'trainer', 'member'];
-// How long a read-only impersonation session stays valid before the operator
-// must re-enter the studio. Short by design — impersonation is a spot check.
-const IMPERSONATION_TTL = process.env.IMPERSONATION_TTL || '30m';
+// How long an impersonation session stays valid before the operator must
+// re-enter the studio. Short by design — impersonation is a spot check.
+//
+// ── Why this is clamped rather than read straight from the environment ──────
+//
+// There is no revocation path for an impersonation token short of bumping the
+// TARGET's token_version (which force-logs-out the real admin too), so the TTL
+// is the only thing bounding a minted session. Read raw, `IMPERSONATION_TTL=30d`
+// — a plausible typo for 30m — would mint month-long tokens that carry a studio
+// admin's identity, and in `mode: 'full'` a month-long write capability. Nothing
+// would look wrong: the mint succeeds, the audit row says 30 days, and no test
+// asserts an upper bound.
+//
+// So the env var may shorten the window and may not lengthen it past the cap.
+// An unparseable or over-long value falls back to the default rather than
+// failing the boot: refusing to start the API because one operator convenience
+// knob is malformed trades a small risk for a large one.
+const IMPERSONATION_TTL_MAX_MINUTES = 120;
+const IMPERSONATION_TTL_DEFAULT_MINUTES = 30;
+
+/** Minutes in a `30m` / `2h` / `90` style duration, or null if unreadable. */
+function ttlMinutes(raw) {
+  const m = String(raw || '').trim().match(/^(\d+)\s*(m|min|mins|h|hr|hrs)?$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = (m[2] || 'm').toLowerCase();
+  return unit.startsWith('h') ? n * 60 : n;
+}
+
+const IMPERSONATION_TTL = (() => {
+  const wanted = ttlMinutes(process.env.IMPERSONATION_TTL);
+  if (wanted === null) return `${IMPERSONATION_TTL_DEFAULT_MINUTES}m`;
+  return `${Math.min(wanted, IMPERSONATION_TTL_MAX_MINUTES)}m`;
+})();
 
 // ── Logo upload (per-studio branding) ───────────────────────────────────────
 // memoryStorage + magic-byte sniff (MIME header alone can be spoofed), same
@@ -143,6 +175,8 @@ async function deliverInvitation(invitation, rawToken) {
 module.exports = {
   EMAIL_RE,
   IMPERSONATION_TTL,
+  IMPERSONATION_TTL_MAX_MINUTES,
+  ttlMinutes,
   TENANT_ROLES,
   TRIAL_DAYS,
   audit,
