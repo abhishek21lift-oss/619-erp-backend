@@ -6,6 +6,7 @@ const { randomUUID } = require('crypto');
 const express    = require('express');
 const pool       = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { requireStaff } = require('../middleware/rbac');
 const { tenantScope } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
 const logger     = require('../lib/logger');
@@ -706,7 +707,15 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
    client is currently training, and how much history there is to program
    from. Cheap enough to run on page load — no retrieval, no model.
 */
-router.get('/workout/context/:client_id', auth, async (req, res) => {
+// requireStaff: the whole point of this route is to summarise a CLIENT for the
+// person training them. `auth` alone let any member of the studio read any
+// other client's context by id — facts, data quality, the digital twin's
+// safety gate and their training history. orgParam() below bounds the studio,
+// which is the same org-not-role gap staffGate() exists to close.
+//
+// No member surface calls this; the member app calls only api.me.*, bookings,
+// classes and UPI payments.
+router.get('/workout/context/:client_id', auth, requireStaff, async (req, res) => {
   const clientId = req.params.client_id;
   const org = orgParam(req);
 
