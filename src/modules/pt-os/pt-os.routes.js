@@ -2213,6 +2213,16 @@ router.post('/clients/:id/coach', auth, wrap(async (req, res) => {
   res.json({ data: out });
 }));
 
+// ─── Transformations ───────────────────────────────────────
+//
+// Each active client's first and latest recorded weight, from
+// pt_os_measurements. Read-only and tenant-scoped through the client join —
+// see getTransformations for why the predicate cannot live on the measurement
+// row itself.
+router.get('/transformations', auth, wrap(async (req, res) => {
+  res.json({ data: await svc.getTransformations(tenantScope(req)) });
+}));
+
 // ─── Weekly check-in insight ───────────────────────────────
 //
 // What moved across this client's recent check-ins. POST and on demand for the

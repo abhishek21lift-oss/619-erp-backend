@@ -1163,6 +1163,107 @@ async function getCheckinInsightInputs(clientId, scope = {}, limit = 12) {
   return rows;
 }
 
+/**
+ * Every active client's weight journey, from their own recorded measurements.
+ *
+ * ── Why this reads pt_os_measurements and not pt_clients ───────────────────
+ *
+ * The Transformations screen used to derive all of this from the client list
+ * alone, comparing `weight` against `initial_weight`/`start_weight`. Neither
+ * of those columns exists — not on pt_clients, not in any migration — so the
+ * comparison was always 0 against 0. "Goal Completion Rate" read 0%
+ * permanently, the Start Weight column was permanently "—", and "Top
+ * Performer" reduced over a difference that was always zero, which means it
+ * returned the FIRST client in the array and printed an arbitrary member's
+ * name under a trophy.
+ *
+ * The real series is pt_os_measurements: one row per measuring session,
+ * carrying weight_kg and measured_at. First and latest of those is a
+ * transformation; a single current weight never was.
+ *
+ * ── Tenancy ────────────────────────────────────────────────────────────────
+ *
+ * pt_os_measurements deliberately has no organization_id — migration 177
+ * records it as a child row reached only through its parent. So the tenant
+ * predicate lives on the JOIN to pt_clients, and a measurement can only be
+ * read through a client this caller already owns. There is no path here that
+ * touches a measurement row without passing that filter first.
+ */
+async function getTransformations(scope = {}) {
+  const params = [];
+  let orgClause = '';
+  if (scope.applyFilter) {
+    params.push(scope.orgId);
+    orgClause = ` AND c.organization_id = $${params.length}`;
+  }
+
+  const { rows } = await pool.query(
+    `WITH ranked AS (
+       SELECT m.client_id,
+              m.weight_kg,
+              m.measured_at,
+              ROW_NUMBER() OVER (PARTITION BY m.client_id ORDER BY m.measured_at ASC)  AS first_rn,
+              ROW_NUMBER() OVER (PARTITION BY m.client_id ORDER BY m.measured_at DESC) AS last_rn,
+              COUNT(*)    OVER (PARTITION BY m.client_id)                              AS n
+         FROM pt_os_measurements m
+         JOIN pt_clients c ON c.id = m.client_id
+        WHERE c.deleted_at IS NULL
+          AND c.status = 'active'
+          AND m.weight_kg IS NOT NULL${orgClause}
+     )
+     SELECT c.id,
+            c.client_id,
+            c.name,
+            c.photo_url,
+            c.trainer_name,
+            c.created_at,
+            f.weight_kg   AS start_weight,
+            f.measured_at AS start_measured_at,
+            l.weight_kg   AS current_weight,
+            l.measured_at AS current_measured_at,
+            COALESCE(l.n, 0)::int AS measurement_count
+       FROM pt_clients c
+       LEFT JOIN ranked f ON f.client_id = c.id AND f.first_rn = 1
+       LEFT JOIN ranked l ON l.client_id = c.id AND l.last_rn  = 1
+      WHERE c.deleted_at IS NULL AND c.status = 'active'${orgClause}
+      ORDER BY c.name ASC`,
+    params
+  );
+
+  return rows.map((r) => {
+    // Two measurements at the same instant are one reading, not a change. A
+    // client with a single session has a start and a current that are the same
+    // row, and reporting that as "0 kg lost" would put them in the same bucket
+    // as somebody who genuinely held their weight for six months.
+    const hasSeries = r.measurement_count >= 2
+      && r.start_measured_at && r.current_measured_at
+      && String(r.start_measured_at) !== String(r.current_measured_at);
+
+    const start = r.start_weight === null ? null : Number(r.start_weight);
+    const current = r.current_weight === null ? null : Number(r.current_weight);
+
+    return {
+      id: r.id,
+      client_id: r.client_id,
+      name: r.name,
+      photo_url: r.photo_url,
+      trainer_name: r.trainer_name,
+      created_at: r.created_at,
+      measurement_count: r.measurement_count,
+      start_weight: hasSeries ? start : null,
+      current_weight: current,
+      start_measured_at: hasSeries ? r.start_measured_at : null,
+      current_measured_at: r.current_measured_at,
+      // null, not 0, when there is no series to compare. The screen must be
+      // able to tell "no data yet" from "no change", because they mean
+      // opposite things to a coach.
+      weight_change: hasSeries && start !== null && current !== null
+        ? Number((current - start).toFixed(2))
+        : null,
+    };
+  });
+}
+
 module.exports = {
   syncClientAssignments,
   getTodayRoster,
@@ -1180,4 +1281,5 @@ module.exports = {
   markPayoutPaid,
   getOpsSummary,
   getCheckinInsightInputs,
+  getTransformations,
 };
