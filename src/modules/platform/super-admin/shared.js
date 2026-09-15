@@ -18,6 +18,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const pool = require('../../../db/pool');
+const { detectFileType, LOGO_IMAGES } = require('../../../lib/fileSignatures');
 const logger = require('../../../lib/logger');
 const { saveFile } = require('../../../lib/fileStorage');
 const { invalidateUserCache } = require('../../../middleware/auth');
@@ -81,16 +82,18 @@ const logoUpload = multer({
     cb(null, true);
   },
 });
-const LOGO_SIGNATURES = [
-  { mime: 'image/jpeg', ext: 'jpg',  magic: [0xFF, 0xD8, 0xFF] },
-  { mime: 'image/png',  ext: 'png',  magic: [0x89, 0x50, 0x4E, 0x47] },
-  { mime: 'image/webp', ext: 'webp', magic: [0x52, 0x49, 0x46, 0x46] }, // "RIFF" (WEBP container)
-];
+/**
+ * Identify a logo by its bytes.
+ *
+ * Delegates to the shared signature table. Its own copy checked only WebP's
+ * outer `RIFF` magic and not the `WEBP` format word at byte 8 — and RIFF is
+ * also the container for WAV and AVI, so any of those passed as an image and
+ * was stored and served as `image/webp`. profile.js's copy of the same table
+ * had the format-word check; this one did not, which is what five copies of a
+ * security check produce.
+ */
 function detectLogoType(buf) {
-  for (const sig of LOGO_SIGNATURES) {
-    if (sig.magic.every((b, i) => buf[i] === b)) return sig;
-  }
-  return null;
+  return detectFileType(buf, LOGO_IMAGES);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

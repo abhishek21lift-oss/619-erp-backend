@@ -12,6 +12,7 @@ const { makeStore } = require('../lib/rateLimitStore');
 // what v12's `{ window: 1 }` meant.
 const { generateSecret, verifySync } = require('otplib');
 const pool = require('../db/pool');
+const { detectFileType, PROFILE_IMAGES } = require('../lib/fileSignatures');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const { logActivity } = require('../lib/activityLog');
 const recovery = require('../lib/mfaRecoveryCodes');
@@ -319,23 +320,6 @@ router.put('/me', async (req, res, next) => {
   }
 });
 
-// M-06: magic byte signatures to verify actual file type, not just MIME header
-const IMAGE_SIGNATURES = [
-  { mime: 'image/jpeg', ext: 'jpg',  magic: [0xFF, 0xD8, 0xFF] },
-  { mime: 'image/png',  ext: 'png',  magic: [0x89, 0x50, 0x4E, 0x47] },
-  { mime: 'image/gif',  ext: 'gif',  magic: [0x47, 0x49, 0x46, 0x38] },
-  { mime: 'image/webp', ext: 'webp', magic: [0x52, 0x49, 0x46, 0x46], offset4: [0x57, 0x45, 0x42, 0x50] },
-];
-
-function detectImageType(buf) {
-  for (const sig of IMAGE_SIGNATURES) {
-    const header = sig.magic.every((b, i) => buf[i] === b);
-    if (!header) continue;
-    if (sig.offset4 && !sig.offset4.every((b, i) => buf[8 + i] === b)) continue;
-    return sig;
-  }
-  return null;
-}
 
 /**
  * Remove an object a profile column no longer points at.
@@ -367,7 +351,7 @@ function forgetObject(url, what) {
  */
 async function swapProfileImage(req, { column, buffer, prefix = '' }) {
   // M-06: verify magic bytes — MIME header alone can be spoofed
-  const detected = detectImageType(buffer);
+  const detected = detectFileType(buffer, PROFILE_IMAGES);
   if (!detected) {
     return { error: 'File content does not match an allowed image type (PNG, JPG, WEBP, GIF)', status: 400 };
   }
@@ -507,7 +491,7 @@ async function portfolioRows(userId) {
 
 /** Save one image buffer, returning what the row needs. */
 async function saveImage(req, buffer, limitBytes) {
-  const detected = detectImageType(buffer);
+  const detected = detectFileType(buffer, PROFILE_IMAGES);
   if (!detected) return { error: 'File content does not match an allowed image type (PNG, JPG, WEBP, GIF)', status: 400 };
   const quota = portfolio.checkQuota({ currentCount: 0, bytes: buffer.length, limitBytes });
   if (quota.error) return quota;
