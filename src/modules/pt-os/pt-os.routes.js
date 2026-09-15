@@ -1,7 +1,7 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
-const { optionalNumber } = require('../../lib/zodNumbers');
+const { optionalNumber, parseStrict } = require('../../lib/zodNumbers');
 const { auth, adminOnly, adminOrManager } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
 const { validate } = require('../../middleware/validate');
@@ -1696,9 +1696,43 @@ router.get('/payments', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
+const PT_PAYMENT_METHODS = new Set(['CASH', 'UPI', 'CARD', 'BANK_TRANSFER']);
+
 router.post('/payments', auth, wrap(async (req, res) => {
   const { client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes } = req.body;
-  const numAmount = Number(amount) || 0;
+
+  // `Number(amount) || 0` recorded a ₹0 payment for a blank, a whitespace
+  // string, or anything unparseable — a ledger row that moves no balance,
+  // counts toward every report that counts rows, and says a member paid when
+  // they did not. Nothing after this point would have noticed: the INSERT and
+  // the balance update are both happy with zero.
+  //
+  // A waiver is not a ₹0 payment. It belongs in the discount path, where it can
+  // be reported as a waiver.
+  const parsedAmount = parseStrict(amount);
+  if (!parsedAmount.ok) {
+    return res.status(400).json({
+      error: {
+        code: 'VALIDATION',
+        message: parsedAmount.reason === 'absent' ? 'amount is required' : 'amount must be a number',
+      },
+    });
+  }
+  if (parsedAmount.value <= 0) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'amount must be greater than 0' } });
+  }
+  const numAmount = parsedAmount.value;
+
+  // The column is free text, so an unrecognised method was storable and then
+  // rendered as a blank chip on every screen that maps it to an icon.
+  if (payment_method != null && !PT_PAYMENT_METHODS.has(String(payment_method))) {
+    return res.status(400).json({
+      error: {
+        code: 'VALIDATION',
+        message: `payment_method must be one of ${[...PT_PAYMENT_METHODS].join(', ')}`,
+      },
+    });
+  }
 
   // A payment can only be recorded against a client in the caller's own org.
   if (client_id && !await clientInOrg(req, client_id))

@@ -1273,7 +1273,22 @@ runMigrationsWithRetry()
   });
 
 process.on('unhandledRejection', (reason) => {
-  logger.error({ reason }, 'unhandledRejection');
+  // `{ err }`, not `{ reason }`.
+  //
+  // pino serializes by KEY, and lib/logger.js registers a serializer for `err`
+  // and none for `reason`. An Error's `message` and `stack` are non-enumerable,
+  // so JSON.stringify of one is `{}` — which is exactly what every unhandled
+  // rejection this process has ever had was recorded as:
+  //
+  //     {"level":50,"reason":{},"msg":"unhandledRejection"}
+  //
+  // No message, no stack, no idea. The sibling handler below already gets this
+  // right, which is why one of the two has usable output and the other does
+  // not. Measured against this repo's own pino, not assumed.
+  //
+  // A non-Error rejection (`Promise.reject('nope')`) still logs fine: the
+  // stdSerializers err serializer passes a non-Error through unchanged.
+  logger.error({ err: reason }, 'unhandledRejection');
 });
 process.on('uncaughtException', (err) => {
   logger.fatal({ err }, 'uncaughtException — exiting');
