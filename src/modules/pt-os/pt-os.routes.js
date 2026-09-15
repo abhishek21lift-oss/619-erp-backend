@@ -15,6 +15,7 @@ const { sweepRoster } = require('./client-context');
 const { buildEnrollmentPdf } = require('../../lib/ptEnrollmentPdf');
 const { buildSnapshot } = require('./client-snapshot');
 const { generateCoach } = require('./coach-ai');
+const { generateCheckinInsight, MAX_WEEKS } = require('./checkin-ai');
 const { buildRecovery } = require('./recovery');
 const { routedChat } = require('../../lib/ai/router');
 const { logActivity } = require('../../lib/activityLog');
@@ -2210,6 +2211,26 @@ router.post('/clients/:id/coach', auth, wrap(async (req, res) => {
   });
 
   res.json({ data: out });
+}));
+
+// ─── Weekly check-in insight ───────────────────────────────
+//
+// What moved across this client's recent check-ins. POST and on demand for the
+// same reason /coach is: the answer changes when the client logs a check-in,
+// not when the page is opened, and an LLM call per page open is somebody's
+// money for an answer that has not changed since this morning.
+//
+// The reads live in pt-os.service — including the tenant predicate and the
+// "not yours" miss that becomes the 404 below — because SQL in an HTTP adapter
+// is the debt architecture.layering.convention.test.js is ratcheting down, and
+// a route written today has no business adding to it.
+router.post('/clients/:id/checkin-insight', auth, wrap(async (req, res) => {
+  const checkins = await svc.getCheckinInsightInputs(req.params.id, tenantScope(req), MAX_WEEKS);
+  if (checkins === null) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
+  const data = await generateCheckinInsight({ checkins, chat: routedChat });
+  return res.json({ data });
 }));
 
 // ─── Activity log ──────────────────────────────────────────

@@ -1118,6 +1118,51 @@ function clampOffset(value) {
   return Math.max(parseInt(value, 10) || 0, 0);
 }
 
+/**
+ * The check-ins the weekly-insight prompt is built from, for one client.
+ *
+ * Returns null when the client is not this caller's to read — the route turns
+ * that into a 404 before any check-in is fetched, so a trainer cannot probe
+ * another studio's client ids and cannot learn that one exists.
+ *
+ * The check-in read is scoped AGAIN on its own organization_id rather than
+ * trusting the client lookup to have covered it. weekly_checkins carries its
+ * own column, and a row whose owner disagrees with its client's is exactly the
+ * drift a second predicate costs nothing to refuse.
+ */
+async function getCheckinInsightInputs(clientId, scope = {}, limit = 12) {
+  const cParams = [clientId];
+  let cOrg = '';
+  if (scope.applyFilter) {
+    cParams.push(scope.orgId);
+    cOrg = ` AND organization_id = $${cParams.length}`;
+  }
+  const { rows: clientRows } = await pool.query(
+    `SELECT id FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${cOrg}`,
+    cParams
+  );
+  if (!clientRows[0]) return null;
+
+  const wParams = [clientId];
+  let wOrg = '';
+  if (scope.applyFilter) {
+    wParams.push(scope.orgId);
+    wOrg = ` AND organization_id = $${wParams.length}`;
+  }
+  wParams.push(limit);
+  const { rows } = await pool.query(
+    `SELECT week_start_date, weight, mood, sleep_hours, water_glasses, workout_count,
+            calories_avg, adherence_pct, stress_level, energy_level, soreness_level,
+            trainer_notes, client_notes
+       FROM weekly_checkins
+      WHERE client_id = $1${wOrg}
+      ORDER BY week_start_date DESC
+      LIMIT $${wParams.length}`,
+    wParams
+  );
+  return rows;
+}
+
 module.exports = {
   syncClientAssignments,
   getTodayRoster,
@@ -1134,4 +1179,5 @@ module.exports = {
   createPayout,
   markPayoutPaid,
   getOpsSummary,
+  getCheckinInsightInputs,
 };
