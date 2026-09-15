@@ -10,6 +10,7 @@
 const router = require('express').Router();
 const multer = require('multer');
 const pool = require('../../db/pool');
+const { detectFileType, DOCUMENTS } = require('../../lib/fileSignatures');
 const logger = require('../../lib/logger');
 const { auth } = require('../../middleware/auth');
 const { requireRole } = require('../../middleware/rbac');
@@ -392,18 +393,6 @@ const clearanceUpload = multer({
   },
 });
 
-const FILE_SIGNATURES = [
-  { mime: 'image/jpeg', ext: 'jpg', magic: [0xFF, 0xD8, 0xFF] },
-  { mime: 'image/png', ext: 'png', magic: [0x89, 0x50, 0x4E, 0x47] },
-  { mime: 'application/pdf', ext: 'pdf', magic: [0x25, 0x50, 0x44, 0x46] },
-];
-
-function detectFileType(buf) {
-  for (const sig of FILE_SIGNATURES) {
-    if (sig.magic.every((b, i) => buf[i] === b)) return sig;
-  }
-  return null;
-}
 
 // POST /informed-consent/:id/medical-clearance
 router.post('/informed-consent/:id/medical-clearance', auth, requireRole('admin', 'manager', 'trainer'), clearanceUpload.single('file'), wrap(async (req, res) => {
@@ -418,7 +407,7 @@ router.post('/informed-consent/:id/medical-clearance', auth, requireRole('admin'
   );
   if (!existingRows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
-  const detected = detectFileType(req.file.buffer);
+  const detected = detectFileType(req.file.buffer, DOCUMENTS);
   if (!detected) {
     return res.status(400).json({ error: { code: 'INVALID_FILE_TYPE' } });
   }

@@ -11,10 +11,31 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
-const { orgWhere, orgIdOf } = require('../lib/tenant-db');
+const { orgWhere, orgIdOf, tenantScope } = require('../lib/tenant-db');
+const { validateOffer } = require('../lib/offerRules');
+const { updateOffer } = require('../modules/offers/offers.service');
 
 const router = express.Router();
 router.use(auth, adminOnly);
+
+/**
+ * Shape a rule failure as a validation error.
+ *
+ * Carries `field` alongside the message, which the rest of the API does not yet
+ * do — all 82 of its other VALIDATION responses are message-only, so a client
+ * has nothing to key on and must show every server error at form level. The
+ * frontend's error mapper already reads this key; this is the first endpoint to
+ * send it, and the shape other endpoints should adopt.
+ */
+function validationError(check) {
+  return {
+    error: {
+      code: 'VALIDATION',
+      message: check.message,
+      ...(check.field ? { field: check.field } : {}),
+    },
+  };
+}
 
 // GET /api/offers
 router.get('/', async (req, res, next) => {
@@ -75,24 +96,26 @@ router.get('/:id', async (req, res, next) => {
 // POST /api/offers
 router.post('/', async (req, res, next) => {
   try {
-    const { title, description, discount_type, discount_value, code, audience, max_uses, valid_from, valid_until, status } = req.body;
-    if (!title) return res.status(400).json({ error: 'title is required' });
+    const check = validateOffer(req.body || {});
+    if (!check.ok) return res.status(400).json(validationError(check));
+    const v = check.value;
+
     const result = await pool.query(
       `INSERT INTO offers
          (title, description, discount_type, discount_value, code, audience, max_uses, valid_from, valid_until, status, created_by, organization_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
-        title,
-        description || null,
-        discount_type || 'percent',
-        discount_value || 0,
-        code || null,
-        audience || 'all',
-        max_uses || null,
-        valid_from || null,
-        valid_until || null,
-        status || 'active',
+        v.title,
+        v.description,
+        v.discount_type,
+        v.discount_value,
+        v.code,
+        v.audience,
+        v.max_uses,
+        v.valid_from,
+        v.valid_until,
+        v.status,
         req.user?.id,
         orgIdOf(req),
       ]
@@ -107,28 +130,15 @@ router.post('/', async (req, res, next) => {
 // PUT /api/offers/:id
 router.put('/:id', async (req, res, next) => {
   try {
-    const { title, description, discount_type, discount_value, code, audience, max_uses, valid_from, valid_until, status } = req.body;
-    const values = [title, description, discount_type, discount_value, code, audience, max_uses || null, valid_from || null, valid_until || null, status, req.params.id];
-    const org = orgWhere(req, values);
-    const result = await pool.query(
-      `UPDATE offers
-       SET title          = COALESCE($1, title),
-           description    = COALESCE($2, description),
-           discount_type  = COALESCE($3, discount_type),
-           discount_value = COALESCE($4, discount_value),
-           code           = COALESCE($5, code),
-           audience       = COALESCE($6, audience),
-           max_uses       = $7,
-           valid_from     = $8,
-           valid_until    = $9,
-           status         = COALESCE($10, status),
-           updated_at     = NOW()
-       WHERE id = $11${org}
-       RETURNING *`,
-      values
-    );
-    if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
-    res.json({ offer: result.rows[0] });
+    // The merge-and-validate lives in the service: discount_type and
+    // discount_value are only valid as a pair, so a request changing one must
+    // be checked against the stored value of the other, and that read-then-write
+    // does not belong in an adapter.
+    const result = await updateOffer(tenantScope(req), req.params.id, req.body || {});
+
+    if (result.status === 'notFound') return res.status(404).json({ error: 'Offer not found' });
+    if (result.status === 'invalid') return res.status(400).json(validationError(result));
+    res.json({ offer: result.offer });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'You already have an offer with this code' });
     next(err);

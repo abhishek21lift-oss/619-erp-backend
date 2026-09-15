@@ -27,6 +27,7 @@ const router = require('express').Router();
 const multer = require('multer');
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
+const { detectFileType, DOCUMENTS } = require('../lib/fileSignatures');
 const { auth, adminOnly } = require('../middleware/auth');
 const { requireStaff } = require('../middleware/rbac');
 const { validate } = require('../middleware/validate');
@@ -44,18 +45,6 @@ const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB, per spec
 // Magic-byte signatures. The multipart Content-Type header is attacker
 // controlled — the same pattern is used for PAR-Q documents and org logos —
 // so the header only gates the cheap rejection and the bytes decide.
-const FILE_SIGNATURES = [
-  { mime: 'image/jpeg', ext: 'jpg', magic: [0xFF, 0xD8, 0xFF] },
-  { mime: 'image/png', ext: 'png', magic: [0x89, 0x50, 0x4E, 0x47] },
-  { mime: 'application/pdf', ext: 'pdf', magic: [0x25, 0x50, 0x44, 0x46] },
-];
-
-function detectFileType(buf) {
-  for (const sig of FILE_SIGNATURES) {
-    if (sig.magic.every((b, i) => buf[i] === b)) return sig;
-  }
-  return null;
-}
 
 const screenshotUpload = multer({
   storage: multer.memoryStorage(),
@@ -504,7 +493,7 @@ router.post('/:id/upload', auth, validate(schemas.idParam), (req, res, next) => 
       });
     }
 
-    const detected = detectFileType(req.file.buffer);
+    const detected = detectFileType(req.file.buffer, DOCUMENTS);
     if (!detected) {
       return res.status(400).json({
         error: {
