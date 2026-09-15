@@ -265,9 +265,19 @@ function textFrom(value) {
  * Pure, so the shape of the thing a trainer reads can be tested without a
  * database — and so the "missing" logic, which is the part that matters, is
  * testable directly.
+ *
+ * `today` is injectable for the same reason every other date input here is an
+ * argument: staleness is a comparison against a clock, and a function that
+ * reads the wall clock internally cannot be tested for it. The brief's own
+ * `stale` list previously came from `staleness(sections)` with no date, so a
+ * test could pin every fixture to a fixed day and still be graded against
+ * whatever day it happened to run on — which is precisely the off-by-one that
+ * made this suite pass on the day it was written and fail the day after.
+ * Defaults to now, so no caller changes.
  */
 function buildBrief({
   client, parq, assessment, posture, mobility, lifestyle, goal, assignment, recentSessions = [],
+  today = new Date(),
 }) {
   const sections = {};
 
@@ -397,7 +407,7 @@ function buildBrief({
 
   const missing = SECTIONS.filter((k) => !sections[k].present);
   // Present, dated, and older than a trainer should silently trust.
-  const stale = staleness(sections);
+  const stale = staleness(sections, today);
 
   return {
     client: {

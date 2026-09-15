@@ -1,5 +1,29 @@
 'use strict';
-// Third-party integrations (Razorpay, SendGrid, Twilio…) and their API keys.
+// Third-party integrations: what this studio has, and who configured it.
+//
+// ── Why there is no longer a `connect` endpoint ─────────────────────────────
+//
+// There was one, and it was a credential-harvesting form for credentials
+// nothing consumed. `POST /:id/test` did not contact the provider: it checked
+// that the string started with 'rzp_' / 'sk_' / 'SG.' and answered
+// {success:true,"Connection test successful"}, so any typed nonsense of the
+// right shape turned the card green. `POST /:id/connect` then wrote that
+// string into integrations.api_key — TEXT, no encryption — and flipped the row
+// to 'connected'.
+//
+// Nothing in this codebase has ever read integrations.api_key. Razorpay, the
+// one payment provider that actually works, takes RAZORPAY_KEY_ID and
+// RAZORPAY_KEY_SECRET from the environment (lib/razorpay.js) and never looks
+// at this table. So a studio owner pasting their live secret here got a
+// green badge, a plaintext secret at rest in Postgres forever, and no
+// integration. The same reasoning already removed WhatsApp's entry from this
+// flow; the other providers were left behind.
+//
+// What remains is honest: GET reports status, deriving it from server
+// configuration for providers the server actually drives, and `disconnect`
+// stays so a studio can clear a row left by the old flow. Adding a provider
+// means wiring it for real and naming it in PROVIDERS below — not storing a
+// key and hoping.
 //
 // ── Why this file needed more than an organization_id filter ────────────────
 //
@@ -43,6 +67,28 @@ function writableOrg(req, res) {
   return orgId;
 }
 
+/**
+ * Integrations this server can actually drive, and how to ask.
+ *
+ * `managed: 'server'` means the credential lives in the environment and a
+ * studio cannot change it from the UI — which is the truth for Razorpay and
+ * the reason its card must not offer a key field. Anything absent from here
+ * has no working backend and must not be advertised as available.
+ */
+const PROVIDERS = Object.freeze({
+  razorpay: {
+    name: 'Razorpay',
+    managed: 'server',
+    // Delegated rather than reading process.env here, so there is one answer to
+    // "is Razorpay usable" and the checkout path and this screen cannot
+    // disagree. lib/razorpay resolves its keys once at module load, which is
+    // correct for env that does not change while the process runs — but it
+    // does mean a key added without a restart will not show up here either,
+    // matching exactly what the payment code would do with it.
+    isConfigured: () => require('../lib/razorpay').isConfigured(),
+  },
+});
+
 // GET /api/integrations — this studio's integration statuses
 //
 // api_key is deliberately absent from the column list, as it always was: the
@@ -56,67 +102,36 @@ router.get('/', async (req, res, next) => {
          FROM integrations WHERE 1=1${org} ORDER BY id`,
       values
     );
-    res.json(result.rows);
-  } catch (err) {
-    next(err);
-  }
-});
 
-// POST /api/integrations/:id/test — test connection with api_key
-router.post('/:id/test', async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const { api_key } = req.body;
-    if (!api_key || api_key.trim().length < 8) {
-      return res.json({ success: false, message: 'API key too short or missing' });
+    // A server-managed provider's status is whatever the server's own config
+    // says, not whatever a row happens to hold. A stale 'connected' row left
+    // by the removed connect flow must not outrank an unset RAZORPAY_KEY_ID.
+    const byId = new Map(result.rows.map((r) => [r.id, r]));
+    for (const [id, p] of Object.entries(PROVIDERS)) {
+      const configured = (() => {
+        try { return p.isConfigured(); } catch { return false; }
+      })();
+      const row = byId.get(id) ?? { id, name: p.name, connected_at: null, last_sync_at: null };
+      byId.set(id, {
+        ...row,
+        name: row.name || p.name,
+        status: configured ? 'connected' : 'unavailable',
+        managed: p.managed,
+      });
     }
-    // Basic format validation per integration type
-    const validations = {
-      razorpay:  (k) => k.startsWith('rzp_'),
-      stripe:    (k) => k.startsWith('sk_'),
-      sendgrid:  (k) => k.startsWith('SG.'),
-      twilio:    (k) => k.length >= 20,
-    };
-    const validate = validations[id];
-    if (validate && !validate(api_key)) {
-      return res.json({ success: false, message: `Invalid API key format for ${id}` });
-    }
-    // For integrations without strict format, accept any key >= 8 chars
-    res.json({ success: true, message: 'Connection test successful' });
+
+    res.json([...byId.values()].sort((a, b) => a.id.localeCompare(b.id)));
   } catch (err) {
     next(err);
   }
 });
 
-// POST /api/integrations/:id/connect — save API key and mark connected
-router.post('/:id/connect', async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const { api_key, name } = req.body;
-    if (!api_key) return res.status(400).json({ success: false, message: 'api_key is required' });
-    const orgId = writableOrg(req, res);
-    if (!orgId) return undefined;
-
-    await pool.query(
-      `INSERT INTO integrations (id, name, status, api_key, connected_at, updated_at, organization_id)
-       VALUES ($1, $2, 'connected', $3, NOW(), NOW(), $4)
-       ON CONFLICT (organization_id, id) DO UPDATE
-         SET status       = 'connected',
-             api_key      = EXCLUDED.api_key,
-             name         = COALESCE(EXCLUDED.name, integrations.name),
-             connected_at = COALESCE(integrations.connected_at, NOW()),
-             updated_at   = NOW()`,
-      [id, name || id, api_key, orgId]
-    );
-    res.json({ success: true, message: 'Integration connected' });
-    return undefined;
-  } catch (err) {
-    next(err);
-    return undefined;
-  }
-});
-
-// POST /api/integrations/:id/disconnect — mark as disconnected
+// POST /api/integrations/:id/disconnect — clear a row the old connect flow left
+//
+// Kept although nothing can connect any more: studios that used the removed
+// flow still have rows here, and this is how they clear one. It also nulls
+// api_key, so a studio can scrub its own stored secret without waiting for
+// the migration to be deployed.
 router.post('/:id/disconnect', async (req, res, next) => {
   try {
     const { id } = req.params;
