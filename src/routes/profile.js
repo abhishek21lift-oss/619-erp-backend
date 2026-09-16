@@ -240,11 +240,13 @@ const ok = (value) => ({ value });
 const PROFILE_FIELDS = [
   { body: 'phone',            col: 'phone',            parse: (v) => ok(credentials.cleanText(v, 40)) },
   { body: 'location',         col: 'location',         parse: (v) => ok(credentials.cleanText(v, 160)) },
-  { body: 'bio',              col: 'bio',              parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.freeText)) },
+  // bio, philosophy and training_style are collected in textareas, so they
+  // keep their line breaks. See cleanMultilineText in lib/credentials.js.
+  { body: 'bio',              col: 'bio',              parse: (v) => ok(credentials.cleanMultilineText(v, profileFields.LIMITS.freeText)) },
   { body: 'job_title',        col: 'job_title',        parse: (v) => ok(credentials.cleanText(v, credentials.LIMITS.job_title)) },
   { body: 'designation',      col: 'designation',      parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.designation)) },
-  { body: 'philosophy',       col: 'philosophy',       parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.philosophy)) },
-  { body: 'training_style',   col: 'training_style',   parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.trainingStyle)) },
+  { body: 'philosophy',       col: 'philosophy',       parse: (v) => ok(credentials.cleanMultilineText(v, profileFields.LIMITS.philosophy)) },
+  { body: 'training_style',   col: 'training_style',   parse: (v) => ok(credentials.cleanMultilineText(v, profileFields.LIMITS.trainingStyle)) },
   { body: 'current_gym',      col: 'current_gym',      parse: (v) => ok(credentials.cleanText(v, profileFields.LIMITS.gymName)) },
   {
     body: 'experience_since',

@@ -5,6 +5,7 @@ const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
+const { parseStrict } = require('../lib/zodNumbers');
 const automation = require('../modules/automation/automation.triggers');
 
 // GET /api/invoices — List invoices
@@ -150,7 +151,23 @@ router.post('/', auth, async (req, res, next) => {
     let subtotal = 0;
 
     if (isSimplified) {
-      subtotal = parseFloat(d.amount) || 0;
+      // `parseFloat(d.amount) || 0` created a ₹0 invoice for a blank, a
+      // whitespace string or anything unparseable — and parseFloat is looser
+      // still, because it parses a PREFIX: '1,500' is 1 and '12abc' is 12. An
+      // invoice for the wrong amount is worse than a rejected request, because
+      // it is sent to a member and entered in their accounts.
+      const parsed = parseStrict(d.amount);
+      if (!parsed.ok) {
+        await tx.query('ROLLBACK');
+        return res.status(400).json({
+          error: parsed.reason === 'absent' ? 'amount is required' : 'amount must be a number',
+        });
+      }
+      if (parsed.value <= 0) {
+        await tx.query('ROLLBACK');
+        return res.status(400).json({ error: 'amount must be greater than 0' });
+      }
+      subtotal = parsed.value;
     } else {
       for (const item of d.items) {
         const amt = (parseFloat(item.unit_price) || 0) * (parseInt(item.quantity) || 1);

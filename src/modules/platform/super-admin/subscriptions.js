@@ -9,6 +9,7 @@ const router = require('express').Router();
 const {
   audit, invalidateUserCache, pool, subscription,
 } = require('./shared');
+const { parseStrict } = require('../../../lib/zodNumbers');
 // GET /subscriptions — every studio's billing state + platform KPIs.
 router.get('/subscriptions', async (req, res, next) => {
   try {
@@ -117,6 +118,45 @@ router.post('/coupons', async (req, res, next) => {
       return res.status(400).json({ error: { code: 'VALIDATION', message: 'A percentage discount cannot exceed 100' } });
     }
 
+    // ── The four caps ────────────────────────────────────────────────────────
+    //
+    // These were `x != null ? Number(x) : null`, and that guard catches
+    // `undefined` and `null` and nothing else. Everything a form can actually
+    // send went straight into `Number()`:
+    //
+    //     ''      →  0     a coupon the list badges "Fully redeemed" the
+    //                      instant it is created, because times_redeemed >=
+    //                      max_redemptions. Same for max_per_org. On
+    //                      max_discount_inr, a percentage coupon capped at ₹0 —
+    //                      it applies, the studio is told it applied, and the
+    //                      discount is nothing.
+    //     '  '    →  0     identical, and not even caught by a truthiness test.
+    //     '2o'    →  NaN   which pg rejects, so a typo is a 500 rather than a
+    //                      400 that says which field.
+    //
+    // `COALESCE($9,1)` does not rescue max_per_org: COALESCE replaces NULL, and
+    // 0 is not NULL.
+    //
+    // `cap()` treats blank and whitespace as ABSENT — which is what every
+    // caller already means by them — and reports a non-numeric or non-positive
+    // value as the 400 it is. Omitting a cap still means "no limit", exactly as
+    // before; this only removes the paths that meant "no limit" to the caller
+    // and "zero" to the database.
+    const caps = {};
+    for (const [field, raw] of Object.entries({
+      max_discount_inr, min_amount_inr, max_redemptions, max_per_org,
+    })) {
+      const parsed = parseStrict(raw);
+      if (!parsed.ok) {
+        if (parsed.reason === 'absent') { caps[field] = null; continue; }
+        return res.status(400).json({ error: { code: 'VALIDATION', message: `${field} must be a number` } });
+      }
+      if (parsed.value <= 0) {
+        return res.status(400).json({ error: { code: 'VALIDATION', message: `${field} must be greater than 0, or left out for no limit` } });
+      }
+      caps[field] = parsed.value;
+    }
+
     const { rows } = await pool.query(`
       INSERT INTO subscription_coupons
         (code, description, discount_type, discount_value, max_discount_inr, min_amount_inr,
@@ -125,11 +165,11 @@ router.post('/coupons', async (req, res, next) => {
       VALUES (upper(trim($1)),$2,$3,$4,$5,$6,$7,$8,COALESCE($9,1),$10,$11,$12,$13)
       RETURNING *`,
       [code, description || null, discount_type, value,
-       max_discount_inr != null ? Number(max_discount_inr) : null,
-       min_amount_inr != null ? Number(min_amount_inr) : null,
+       caps.max_discount_inr,
+       caps.min_amount_inr,
        Array.isArray(applies_to_plans) && applies_to_plans.length ? applies_to_plans : null,
-       max_redemptions != null ? Number(max_redemptions) : null,
-       max_per_org != null ? Number(max_per_org) : null,
+       caps.max_redemptions,
+       caps.max_per_org,
        valid_from || null, valid_until || null,
        req.user.id, req.user.name || null]
     );

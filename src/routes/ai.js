@@ -29,7 +29,9 @@ const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // The client's digital twin: the assessments, the screen and the logged sets
 // that this file could not see. See modules/pt-os/client-context.js.
 const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
-const { resolveClientFacts, describeFacts } = require('../modules/pt-os/client-facts');
+const {
+  resolveClientFacts, describeFacts, numInRange,
+} = require('../modules/pt-os/client-facts');
 
 /**
  * The workout prompt's version, frozen with every generation.
@@ -433,17 +435,28 @@ function resolveDietInputs({ client, profile, goals, latestAssessment, latestChe
   const mealsPerDay  = firstDefined(nutrition?.meals_per_day, lifestyle?.meal_frequency);
   const active       = dietAssignments[0] || null;
 
+  // A figure the trainer typed is bounded before it can become a calorie
+  // target. `numInRange` is the same table the workout generator uses — see
+  // modules/pt-os/client-facts.js — so both prompts refuse the same
+  // impossible values, and out of range falls back to the record exactly as an
+  // empty box already did.
+  const statedWeight = numInRange(body.weight_kg, 'weight_kg');
+  const statedHeight = numInRange(body.height_cm, 'height_cm');
+  const statedAge    = numInRange(body.age, 'age');
+
   return {
-    age:      ageFromDob(client.dob) ?? (Number(body.age) || null),
+    age:      ageFromDob(client.dob) ?? statedAge,
     gender:   firstDefined(client.gender, body.gender),
-    weight_kg: firstDefined(latestWeight, body.weight_kg),
-    height_cm: firstDefined(height, body.height_cm),
+    weight_kg: firstDefined(latestWeight, statedWeight),
+    height_cm: firstDefined(height, statedHeight),
     activity_level: firstDefined(lifestyle?.activity_level, body.activity_level),
     goal:     firstDefined(goal, body.goal),
     dietary_preferences: firstDefined(dietPrefs, body.dietary_preferences) || 'none',
     allergies: firstDefined(allergies, body.allergies) || 'none',
     budget:   firstDefined(nutrition?.nutrition_budget, body.budget) || 'medium',
-    meal_frequency: Number(mealsPerDay) || Number(body.meal_frequency) || 4,
+    // Bounded for the same reason: "40" meals a day is a prompt the model will
+    // try to satisfy. Falls back to four, as it always did.
+    meal_frequency: Number(mealsPerDay) || numInRange(body.meal_frequency, 'meal_frequency') || 4,
     health_conditions: firstDefined(client.health_conditions, arrayToText(profile?.health_conditions)),
     medical_conditions: arrayToText(nutrition?.medical_conditions),
     foods_to_avoid: arrayToText(nutrition?.foods_to_avoid),

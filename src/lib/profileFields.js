@@ -13,7 +13,9 @@
 // a bug worth reporting.
 'use strict';
 
-const { cleanText, cleanDate, LIMITS: CRED_LIMITS } = require('./credentials');
+const {
+  cleanText, cleanMultilineText, cleanDate, LIMITS: CRED_LIMITS,
+} = require('./credentials');
 
 const MAX = {
   languages: 15,
@@ -203,7 +205,8 @@ function validateAchievements(raw, now = new Date()) {
       kind: ACHIEVEMENT_KINDS.includes(rawKind) ? rawKind : 'other',
       issuer: cleanText(r.issuer, LIMITS.issuer),
       year,
-      detail: cleanText(r.detail, LIMITS.detail),
+      // A textarea in the UI, so the line breaks a coach typed survive the save.
+      detail: cleanMultilineText(r.detail, LIMITS.detail),
     });
   }
   // Newest first, undated last: a timeline reads from the most recent thing,
@@ -279,5 +282,5 @@ module.exports = {
   validateEducation, validateAchievements, validateWorkingHours,
   weeklyMinutes,
   // Re-exported so the route has one import for field cleaning.
-  cleanText, cleanDate,
+  cleanText, cleanMultilineText, cleanDate,
 };

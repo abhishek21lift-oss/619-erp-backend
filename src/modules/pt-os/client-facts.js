@@ -104,6 +104,49 @@ function num(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * Plausible ranges for the numeric facts a trainer may STATE for a generation.
+ *
+ * The database paths were already bounded — `ageFromDob` refuses anything
+ * outside [0, 130) and `countDays` refuses a week with more than seven days in
+ * it — but the body path was not. So a typo in the generator form ("750" for a
+ * weight, "19" for an age) reached the prompt as
+ *
+ *     - Weight: 750 (stated by the trainer for this session, not on file)
+ *
+ * and the model wrote a training programme around it. That is the AI-input
+ * hardening rule stated plainly: a value the system would not accept from its
+ * own records must not enter the prompt merely because it arrived in a
+ * request body.
+ *
+ * Out of range resolves to `null`, which is the state the engine already has
+ * a well-defined answer for — the fact is reported as `missing`, it appears in
+ * `data_quality.missing`, and it is flagged blocking where the field is
+ * blocking. A gap the trainer can see and fill beats a number nobody checked.
+ *
+ * The bounds are deliberately wide. They exclude the impossible, not the
+ * unusual: a 95-year-old client and a 180kg client are both real, and neither
+ * should be turned away by a range check.
+ */
+const STATED_RANGE = {
+  age: [10, 120],
+  weight_kg: [20, 400],
+  height_cm: [90, 260],
+  training_days: [1, 7],
+  // Not one of this module's own FIELDS — the diet generator's, which shares
+  // the table so both prompts refuse the same impossible values. "40 meals a
+  // day" is a prompt the model will try to satisfy.
+  meal_frequency: [1, 12],
+};
+
+function numInRange(v, field) {
+  const n = num(v);
+  if (n === null) return null;
+  const range = STATED_RANGE[field];
+  if (!range) return n;
+  return n >= range[0] && n <= range[1] ? n : null;
+}
+
 function text(v) {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
@@ -268,9 +311,8 @@ function resolveClientFacts(ctx, stated = {}) {
       }
       continue;
     }
-    const given = field === 'training_days' || field === 'age'
-      || field === 'weight_kg' || field === 'height_cm'
-      ? num(stated[field])
+    const given = Object.prototype.hasOwnProperty.call(STATED_RANGE, field)
+      ? numInRange(stated[field], field)
       : text(stated[field]);
     if (given !== null) {
       facts[field] = { value: given, source: 'trainer', origin: 'stated' };
@@ -345,5 +387,5 @@ function describeFacts(facts) {
 module.exports = {
   FIELDS, BLOCKING, STATED_SUPERSEDES, resolveClientFacts, describeFacts,
   // Exported for the tests that pin the parsing rather than the resolution.
-  countDays, ageFromDob,
+  countDays, ageFromDob, numInRange, STATED_RANGE,
 };
