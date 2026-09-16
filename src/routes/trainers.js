@@ -185,7 +185,11 @@ router.post('/', auth, adminOnly, validate(trainerSchemas.create), async (req, r
       [id, d.name.trim(), d.mobile||null, d.email?.toLowerCase()||null,
        d.dob||null, d.gender||null, d.address||null,
        d.role||'Personal Trainer', d.joining_date||null,
-       parseFloat(d.salary)||0, rate,
+       // Zero is the right default for a trainer created without a salary,
+       // but the parse was never doing anything: zod validates `salary` as a
+       // number, so `parseFloat` only obscured that a string could never
+       // arrive here.
+       d.salary ?? 0, rate,
        d.specialization||null, d.certifications||null,
        d.status||'active', d.notes||null,
        d.bio||null, d.schedule||null,
@@ -228,7 +232,18 @@ router.put('/:id', auth, adminOnly, validate(trainerSchemas.update), async (req,
       [d.name?.trim()||ex[0].name, d.mobile||null, d.email?.toLowerCase()||null,
        d.dob||null, d.gender||null, d.address||null,
        d.role||ex[0].role, d.joining_date||null,
-       parseFloat(d.salary)||0, rate??ex[0].incentive_rate,
+       // `salary` is optional in trainerSchemas.update, so an update that did
+       // not resend it arrived as undefined — and `parseFloat(undefined)||0`
+       // is 0. Changing a phone number, a status or a note silently set the
+       // trainer's salary to zero, which feeds payroll and every salary-cost
+       // report with nothing on screen to say it had happened.
+       //
+       // Every other preserved field in this list already falls back to the
+       // existing row; `incentive_rate` on the very next line shows the shape.
+       // No parse is needed either: zod has already guaranteed a number.
+       // An explicit 0 is still honoured — an unpaid or commission-only
+       // trainer is real, and must stay distinguishable from "not sent".
+       d.salary ?? ex[0].salary, rate??ex[0].incentive_rate,
        d.specialization||null, d.certifications||null,
        d.status||ex[0].status, d.notes||null,
        d.bio||null, d.schedule||null,
