@@ -29,6 +29,9 @@ const FIXTURE = {
     clientId: 'ptc-e2e-alpha',
     clientName: 'ALPHA-ONLY-CLIENT',
     clientMobile: '9000000001',
+    secondClientId: 'ptc-e2e-alpha-2',
+    secondClientName: 'ALPHA-ONLY-CLIENT-TWO',
+    secondClientMobile: '9000000011',
     amount: 11111,
     payoutId: 'pyt-e2e-alpha',
     commissionId: 'cmm-e2e-alpha',
@@ -44,6 +47,9 @@ const FIXTURE = {
     clientId: 'ptc-e2e-bravo',
     clientName: 'BRAVO-ONLY-CLIENT',
     clientMobile: '9000000002',
+    secondClientId: 'ptc-e2e-bravo-2',
+    secondClientName: 'BRAVO-ONLY-CLIENT-TWO',
+    secondClientMobile: '9000000012',
     amount: 22222,
     payoutId: 'pyt-e2e-bravo',
     commissionId: 'cmm-e2e-bravo',
@@ -104,6 +110,25 @@ async function seedStudio(s, hash) {
      VALUES ($1, $2, $3, $4, $5, 0, $5, 0, $5, 0, 0, 'active', $6, NOW(), NOW())
      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, organization_id = EXCLUDED.organization_id`,
     [s.clientId, s.clientName, s.clientMobile, s.trainerId, s.amount, s.orgId]
+  );
+
+  // A SECOND client in the same studio.
+  //
+  // The isolation suite only ever needed one per tenant — it asks whether
+  // Bravo can see Alpha's row. The UI journeys need two inside ONE tenant,
+  // because the failure they exist to catch is the opposite shape: a form that
+  // carries entity A's state into entity B. Proving "open client A, cancel,
+  // open client B, the field is empty" is impossible against a studio with a
+  // single client, and the same-tenant pair is the only fixture that can do
+  // it. Named ALPHA-ONLY / BRAVO-ONLY like its sibling so a cross-tenant leak
+  // of THIS row fails the isolation suite too.
+  await pool.query(
+    `INSERT INTO pt_clients (id, name, mobile, trainer_id, base_amount, discount, final_amount,
+                             paid_amount, balance_amount, monthly_pt_amount, trainer_commission,
+                             status, organization_id, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, 0, $5, 0, $5, 0, 0, 'active', $6, NOW(), NOW())
+     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, organization_id = EXCLUDED.organization_id`,
+    [s.secondClientId, s.secondClientName, s.secondClientMobile, s.trainerId, s.amount, s.orgId]
   );
 
   await pool.query(
