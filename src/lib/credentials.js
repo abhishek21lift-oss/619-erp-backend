@@ -39,6 +39,39 @@ function cleanText(v, max) {
   return String(v).replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
+/**
+ * The same cleaning, for a field the UI collects in a textarea.
+ *
+ * `cleanText` collapses every run of whitespace — newlines included — into a
+ * single space. That is right for a name or a job title, which have no line
+ * structure to lose. It is wrong for a bio: the profile page offers a
+ * four-row textarea and a 2000-character budget, a coach writes three
+ * paragraphs, and the save flattens them into one run-on block. They watched
+ * it happen and there was nothing they could have typed to avoid it, because
+ * the destruction was on this side of the wire.
+ *
+ * So: spaces and tabs collapse WITHIN a line exactly as before, each line is
+ * trimmed, and a run of blank lines becomes at most one — a paragraph break,
+ * not an arbitrary gap. For any value that contains no newline the output is
+ * character-for-character what `cleanText` returned, which is what makes this
+ * safe to adopt on columns already full of single-line text.
+ */
+function cleanMultilineText(v, max) {
+  if (v === null || v === undefined) return '';
+  return String(v)
+    // Normalise CRLF/CR first so the line split below sees one separator.
+    .replace(/\r\n?/g, '\n')
+    // Horizontal whitespace only — \s would take the newlines with it.
+    .replace(/[^\S\n]+/g, ' ')
+    .split('\n')
+    .map((line) => line.trim())
+    .join('\n')
+    // Three or more newlines is someone leaning on Enter, not a wider gap.
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, max);
+}
+
 /** Whole days from `from` to `to`, both 'YYYY-MM-DD', in UTC. */
 function daysBetween(from, to) {
   return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000);
@@ -185,5 +218,5 @@ module.exports = {
   EXPIRING_SOON_DAYS, MAX_CERTIFICATIONS, MAX_SPECIALISATIONS,
   certificateStatus, validateCertificate, validateCertifications,
   validateSpecialisations, yearsOfExperience, presentCertifications,
-  credentialSummary, cleanText, cleanDate, LIMITS,
+  credentialSummary, cleanText, cleanMultilineText, cleanDate, LIMITS,
 };
