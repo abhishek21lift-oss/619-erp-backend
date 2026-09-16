@@ -6,6 +6,7 @@ const { auth, adminOrManager } = require('../middleware/auth');
 const { requireStaff } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
+const { parseStrict } = require('../lib/zodNumbers');
 
 // ─── MEALS ───────────────────────────────────────────────────
 
@@ -56,13 +57,51 @@ router.post('/meals', auth, adminOrManager, async (req, res, next) => {
     if (!d.name?.trim())
       return res.status(400).json({ error: 'Meal name required' });
 
+    // ── Macros: absent and zero are different facts ─────────────────────────
+    //
+    // This was `parseFloat(d.protein_g) || 0` for each of the three, and a
+    // meal added with the macros left blank — the common case, because a coach
+    // often knows the calories and fills the rest in later — was stored as 0 g
+    // protein, 0 g carbs, 0 g fats. Not "unknown": zero. Every plan that
+    // includes the meal then totals its protein as though it contributes none,
+    // and the number a client is coached against is wrong in the direction
+    // that matters.
+    //
+    // The columns are nullable (`NUMERIC(6,1) DEFAULT 0`, no NOT NULL — see
+    // migration 006), so "not measured yet" is storable and now is stored. A
+    // deliberate 0 still means 0; only the substitution is gone.
+    const macros = {};
+    for (const field of ['protein_g', 'carbs_g', 'fats_g']) {
+      const parsed = parseStrict(d[field]);
+      if (!parsed.ok) {
+        if (parsed.reason === 'absent') { macros[field] = null; continue; }
+        return res.status(400).json({ error: `${field} must be a number` });
+      }
+      if (parsed.value < 0) {
+        return res.status(400).json({ error: `${field} cannot be negative` });
+      }
+      macros[field] = parsed.value;
+    }
+
+    // Calories is the one that cannot be null: `calories INT NOT NULL DEFAULT
+    // 0`. There is no way to store "unknown calories", so a blank is rejected
+    // rather than turned into a 0 that reads as a fact.
+    const cal = parseStrict(d.calories);
+    if (!cal.ok) {
+      return res.status(400).json({
+        error: cal.reason === 'absent' ? 'calories is required' : 'calories must be a number',
+      });
+    }
+    if (!Number.isInteger(cal.value) || cal.value < 0) {
+      return res.status(400).json({ error: 'calories must be a whole number of 0 or more' });
+    }
+
     const { rows } = await pool.query(`
       INSERT INTO meals (id, name, description, meal_type, calories,
         protein_g, carbs_g, fats_g, serving_size, created_by, organization_id)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [randomUUID(), d.name.trim(), d.description || null, d.meal_type || 'breakfast',
-       parseInt(d.calories) || 0, parseFloat(d.protein_g) || 0,
-       parseFloat(d.carbs_g) || 0, parseFloat(d.fats_g) || 0,
+       cal.value, macros.protein_g, macros.carbs_g, macros.fats_g,
        d.serving_size || null, req.user.id, orgIdOf(req)]
     );
     res.status(201).json({ message: 'Meal created', meal: rows[0] });

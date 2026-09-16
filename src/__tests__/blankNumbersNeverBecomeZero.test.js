@@ -52,6 +52,7 @@ const app = express();
 app.use(express.json());
 app.use('/api/pt-os', require('../modules/pt-os/pt-os.routes'));
 app.use('/api/invoices', require('../routes/invoices'));
+app.use('/api/diet', require('../routes/diet'));
 
 beforeEach(() => {
   pool.query.mockReset();
@@ -260,5 +261,79 @@ describe('POST /api/platform/coupons — a blank cap is no limit, not zero', () 
     expect(params[4]).toBe(2000);
     expect(params[7]).toBe(20);
     expect(params[8]).toBe(2);
+  });
+});
+
+describe('POST /api/diet/meals — a blank macro is unknown, not zero', () => {
+  const post = (body) => request(app).post('/api/diet/meals').send({
+    name: 'Grilled chicken', meal_type: 'lunch', calories: 320, ...body,
+  });
+
+  const insertParams = () => {
+    const call = pool.query.mock.calls.find(([sql]) => /INSERT INTO meals/i.test(String(sql)));
+    return call ? call[1] : null;
+  };
+
+  beforeEach(() => {
+    pool.query.mockReset();
+    pool.query.mockResolvedValue({ rows: [{ id: 'meal-1' }], rowCount: 1 });
+  });
+
+  it.each(['protein_g', 'carbs_g', 'fats_g'])(
+    'stores null for a blank %s rather than 0',
+    async (field) => {
+      // `parseFloat(d[field]) || 0` stored zero. Every plan that includes the
+      // meal then totals its protein as though it contributes none.
+      await post({ [field]: '' }).expect(201);
+      const at = { protein_g: 5, carbs_g: 6, fats_g: 7 }[field];
+      expect(insertParams()[at]).toBeNull();
+    },
+  );
+
+  it('stores null when a macro is omitted entirely', async () => {
+    await post({}).expect(201);
+    const p = insertParams();
+    expect(p[5]).toBeNull();
+    expect(p[6]).toBeNull();
+    expect(p[7]).toBeNull();
+  });
+
+  it('keeps a DELIBERATE zero — black coffee really is 0 g of fat', async () => {
+    await post({ fats_g: 0 }).expect(201);
+    expect(insertParams()[7]).toBe(0);
+  });
+
+  it('stores the macros a coach actually measured', async () => {
+    await post({ protein_g: '31.5', carbs_g: 0, fats_g: '3.2' }).expect(201);
+    const p = insertParams();
+    expect(p[5]).toBe(31.5);
+    expect(p[6]).toBe(0);
+    expect(p[7]).toBe(3.2);
+  });
+
+  it('refuses an unparseable macro rather than silently zeroing it', async () => {
+    const res = await post({ protein_g: '31g' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/protein_g must be a number/);
+  });
+
+  it('refuses a negative macro', async () => {
+    expect((await post({ carbs_g: -5 })).status).toBe(400);
+  });
+
+  it('requires calories, because the column cannot hold "unknown"', async () => {
+    // `calories INT NOT NULL DEFAULT 0` — migration 006. A blank used to become
+    // a 0 that then reads as a fact on every plan total.
+    for (const calories of ['', '   ', null, undefined]) {
+      pool.query.mockClear();
+      const res = await post({ calories });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/calories/);
+    }
+  });
+
+  it('refuses fractional or negative calories', async () => {
+    expect((await post({ calories: '320.5' })).status).toBe(400);
+    expect((await post({ calories: -1 })).status).toBe(400);
   });
 });
