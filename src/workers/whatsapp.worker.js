@@ -6,12 +6,13 @@
 // In-process:   see src/workers/index.js
 
 const { Worker } = require('bullmq');
+const { withJobContext } = require('./jobContext');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 const { processWhatsappJob } = require('../services/whatsapp.service');
 
 function createWhatsappWorker() {
-  const worker = new Worker('whatsapp', processWhatsappJob, {
+  const worker = new Worker('whatsapp', withJobContext('whatsapp', processWhatsappJob), {
     connection: redis.getWorkerConnection(),
     prefix: process.env.BULL_PREFIX || 'bull',
     concurrency: parseInt(process.env.WHATSAPP_WORKER_CONCURRENCY, 10) || 5,

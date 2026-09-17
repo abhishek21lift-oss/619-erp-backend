@@ -112,6 +112,10 @@ async function getHealthPayload() {
       redis: 'connected',
       queues,
       rls: rlsHealthField(),
+      // Which build is answering. Before this, `version` was the string 'v3'
+      // and nothing anywhere recorded the deployed commit, so "is the fix
+      // live?" could only be answered by triggering the bug again.
+      release: require('./release').releaseInfo(),
     };
   }
 
@@ -121,6 +125,9 @@ async function getHealthPayload() {
     redis: redisState,
     queues,
     rls: rlsHealthField(),
+    // On the failure branch too, and especially there: the first question
+    // about a broken container is which build it is running.
+    release: require('./release').releaseInfo(),
     error: errorMessage,
   };
 }

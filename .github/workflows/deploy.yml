@@ -20,6 +20,12 @@ env:
     git checkout main
     git pull --ff-only origin main
     git rev-parse HEAD > /opt/myptstudio/.backend-deployed-sha.new
+    # Exported so docker-compose's build args pick them up. The sha was
+    # already being written to a file here and then not used for anything the
+    # running container could see — this is what makes /api/health and every
+    # log line able to name the build they came from.
+    export GIT_SHA="$(git rev-parse HEAD)"
+    export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     cd /opt/myptstudio
     docker compose build backend
     docker compose run --rm --no-deps backend npm run migrate

@@ -544,6 +544,17 @@ app.use(sanitizeQuery);
 const requestId = require('./middleware/requestId');
 app.use(requestId);
 
+// The build, on every response. A browser tab, a curl, or a bug report
+// screenshot then carries the commit it was served by — which is the evidence
+// that is always missing when someone says "it still happens on my machine".
+// Set once at module load; it cannot change while the process runs.
+const RELEASE_HEADER = require('./lib/release').releaseInfo();
+app.use(function appVersionHeader(req, res, next) {
+  res.setHeader('x-app-version', `${RELEASE_HEADER.version}+${RELEASE_HEADER.sha}`);
+  res.setHeader('x-api-contract', String(RELEASE_HEADER.contract));
+  next();
+});
+
 // ────────────────────────
 // STRUCTURED REQUEST LOGGER
 // ────────────────────────
@@ -587,7 +598,10 @@ app.use(function(req, res, next) {
 // HEALTH CHECK
 // ────────────────────────
 app.get('/', function(req, res) {
-  res.json({ status: 'ok', app: 'MY PT STUDIO API', version: '3.0.0' });
+  // Was a hardcoded '3.0.0' that no deploy had ever changed and nothing could
+  // change, because nothing wrote it.
+  const release = require('./lib/release').releaseInfo();
+  res.json({ status: 'ok', app: 'MY PT STUDIO API', version: release.version, sha: release.sha });
 });
 
 app.get('/api/health', async function(req, res) {
@@ -1014,6 +1028,12 @@ app.use(errorHandler);
 // START — run migrations first, then listen
 // ────────────────────────
 const { runMigrationsWithRetry } = require('./db/migrate');
+
+// What is running, in one line, before anything else happens. `docker logs`
+// then answers "which build is this" without a deploy-time note kept anywhere
+// else — and the sha appears on every subsequent line through the logger's
+// base fields.
+logger.info(require('./lib/release').releaseLogLine(), 'release');
 
 logger.info('Running database migrations…');
 runMigrationsWithRetry()
