@@ -68,12 +68,28 @@ async function runAutoRenew() {
   `);
 
   for (const m of rows) {
+    // Charge marker (migration 206): if the process died after a previous
+    // run's Razorpay charge succeeded but before that run's rollover
+    // transaction committed, ROLLBACK put this membership row right back
+    // into the WHERE clause above — same status='active', same end_date.
+    // The charge itself cannot be rolled back by Postgres. Skip rather than
+    // charge the member a second time; this needs a human to reconcile.
+    const today = new Date().toISOString().slice(0, 10);
+    if (m.last_renewal_charge_at && new Date(m.last_renewal_charge_at).toISOString().slice(0, 10) === today) {
+      logger.error(
+        { member_id: m.member_id, membership_id: m.id, order_id: m.last_renewal_order_id, charged_at: m.last_renewal_charge_at },
+        'auto_renew_skipped_already_charged_today — needs manual reconciliation, not re-charged'
+      );
+      continue;
+    }
+
     const client = await pool.connect();
     try {
-      await client.query('BEGIN');
-
-      // 1. Charge via Razorpay
-      const order = await razorpay.createOrder(m.price * 100, 'INR', `renew_${m.id}_${Date.now()}`);
+      // 1. Charge via Razorpay. Receipt is deterministic (membership id +
+      // today's date, not Date.now()) so a retried/duplicate attempt for the
+      // same membership on the same day is identifiable on the Razorpay
+      // statement instead of looking like an unrelated charge.
+      const order = await razorpay.createOrder(m.price * 100, 'INR', `renew_${m.id}_${today}`);
       const payment = order.status === 'created'
         ? await razorpay.capturePayment(order.id, m.price * 100)
         : null;
@@ -93,6 +109,16 @@ async function runAutoRenew() {
         },
         'auto_renew_charged_without_ledger_entry'
       );
+
+      // Written via `pool`, NOT `client` — committed immediately, independent
+      // of the rollover transaction below, so it survives even if that
+      // transaction rolls back. This is what the pre-charge check above reads.
+      await pool.query(
+        `UPDATE member_memberships SET last_renewal_charge_at = NOW(), last_renewal_order_id = $2 WHERE id = $1`,
+        [m.id, order.id]
+      );
+
+      await client.query('BEGIN');
 
       // 2. Create new membership
       const newEnd = new Date();

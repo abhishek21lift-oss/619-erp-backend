@@ -32,8 +32,14 @@ jest.mock('../db/pool', () => ({
 
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
+// The feature-flags routes are platform-only (see requireSuperAdmin, left
+// UNMOCKED below so its real role check runs) — every other test in this
+// file authenticates as the platform operator. `currentRole` lets the
+// dedicated tenancy test at the bottom flip to an ordinary studio admin
+// without a second app() wiring.
+const mockAuthState = { role: 'super_admin' };
 jest.mock('../middleware/auth', () => ({
-  auth: (req, _res, next) => { req.user = { id: 'admin-1', role: 'admin', organization_id: 'org-1' }; next(); },
+  auth: (req, _res, next) => { req.user = { id: 'admin-1', role: mockAuthState.role, organization_id: 'org-1' }; next(); },
   adminOnly: (_req, _res, next) => next(),
   adminOrManager: (_req, _res, next) => next(),
   adminManagerOrTrainer: (_req, _res, next) => next(),
@@ -54,7 +60,33 @@ function app() {
 
 const updates = () => mockQueries.filter((q) => /UPDATE feature_flags/i.test(q.sql));
 
-beforeEach(() => { mockQueries.length = 0; });
+beforeEach(() => { mockQueries.length = 0; mockAuthState.role = 'super_admin'; });
+
+describe('feature-flags is a platform-operator endpoint, not a studio-admin one', () => {
+  // Deep-audit finding: feature_flags has no organization_id column — it is
+  // one row per flag for the WHOLE platform. This handler used to be mounted
+  // with the same `adminOnly` guard as the per-studio settings above it in
+  // this file, so any studio's own admin (a role every self-serve trial
+  // signup is granted) could read and overwrite every other studio's
+  // platform-wide flags in one authenticated request.
+  test('an ordinary studio admin is refused on both GET and PUT', async () => {
+    mockAuthState.role = 'admin';
+    const getRes = await request(app()).get('/api/settings/feature-flags');
+    const putRes = await request(app()).put('/api/settings/feature-flags').send({ ai_suite: true });
+
+    expect(getRes.status).toBe(403);
+    expect(putRes.status).toBe(403);
+    expect(updates()).toHaveLength(0);
+  });
+
+  test('the platform operator (super_admin) can read and write', async () => {
+    const getRes = await request(app()).get('/api/settings/feature-flags');
+    const putRes = await request(app()).put('/api/settings/feature-flags').send({ ai_suite: true });
+
+    expect(getRes.status).toBe(200);
+    expect(putRes.status).toBe(200);
+  });
+});
 
 describe('PUT /settings/feature-flags', () => {
   test('writes every flag in ONE statement, not one per key', async () => {
@@ -126,6 +158,9 @@ describe('the sibling handler it was made consistent with', () => {
     // reason this test file exists has been undone from the other side.
     // Real keys — the handler filters the body against PERM_KEYS, so invented
     // ones are dropped and no statement runs at all.
+    // This is a per-studio route (unlike feature-flags above), so it needs an
+    // org-scoped admin, not the platform operator the rest of this file uses.
+    mockAuthState.role = 'admin';
     await request(app())
       .put('/api/settings/permissions')
       .send({ perm_trainer_finance: true, perm_trainer_reports: false });

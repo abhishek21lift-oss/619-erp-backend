@@ -302,10 +302,10 @@ describe('POST /api/platform/tenancy/run-isolation-tests — 5-minute per-user c
   // is exercised by the e2e suite.
 
   function mockRunnerHappyPath() {
-    // 1) probe two orgs
-    pool.query.mockResolvedValueOnce({
-      rows: [{ org_a: 'org-1', org_b: 'org-2' }],
-    });
+    // 1) create the two synthetic probe orgs
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ id: 'org-1' }] })
+      .mockResolvedValueOnce({ rows: [{ id: 'org-2' }] });
     // 2) probe client connect — the runner fires several queries in
     // sequence: INSERT, SELECT, UPDATE+SELECT, DELETE+SELECT, DELETE.
     // We model the contract for each: the probe row exists in org_A
@@ -341,7 +341,11 @@ describe('POST /api/platform/tenancy/run-isolation-tests — 5-minute per-user c
       release: jest.fn(),
     };
     pool.connect.mockResolvedValueOnce(client);
-    // 3) write tenancy_isolation_runs row
+    // 3) teardown: delete probe trainers, then delete the two probe orgs
+    pool.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+    // 4) write tenancy_isolation_runs row
     pool.query.mockResolvedValueOnce({
       rows: [{ id: 1, ran_at: new Date() }],
     });
@@ -393,12 +397,19 @@ describe('POST /api/platform/tenancy/run-isolation-tests — 5-minute per-user c
     expect(rB1.status).toBe(200);
   });
 
-  it('returns 503 NO_TENANTS when there are fewer than 2 organizations', async () => {
-    pool.query.mockResolvedValueOnce({ rows: [] }); // probeOrgs is empty
+  it('creates two synthetic probe orgs rather than reusing real ones, and tears them down', async () => {
+    const client = mockRunnerHappyPath();
     const res = await request(app())
       .post('/api/platform/tenancy/run-isolation-tests')
-      .set('Authorization', `Bearer ${token({ id: 'user-no-tenants' })}`);
-    expect(res.status).toBe(503);
-    expect(res.body.error.code).toBe('NO_TENANTS');
+      .set('Authorization', `Bearer ${token({ id: 'user-synthetic' })}`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.cleanup_failed).toBe(false);
+    // The two org-creation INSERTs and the two teardown DELETEs all ran
+    // against the shared pool (never against a real customer's org id).
+    const orgInserts = pool.query.mock.calls.filter(([sql]) => /INSERT INTO organizations/i.test(sql));
+    expect(orgInserts).toHaveLength(2);
+    const teardownDeletes = pool.query.mock.calls.filter(([sql]) => /DELETE FROM (trainers|organizations) WHERE/i.test(sql) && /IN \(\$1, \$2\)/.test(sql));
+    expect(teardownDeletes.length).toBeGreaterThanOrEqual(2);
+    expect(client.query).toHaveBeenCalled();
   });
 });

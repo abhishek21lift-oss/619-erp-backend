@@ -12,8 +12,24 @@
 // STUDIO, and sending from the wrong one is not a degraded delivery — it is a
 // message the recipient reads as coming from somebody else.
 
+const crypto = require('crypto');
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
+
+/**
+ * A stable idempotency key for one WhatsApp send, derived from the actual
+ * event payload rather than just (org, phone, template). Two notifications
+ * of the same type to the same person — a 7-day and a 1-day membership
+ * reminder, two different class reminders, two different booking
+ * confirmations — carry different `data`, so they hash to different keys and
+ * are never treated as retries of one another by the gateway's send-once
+ * ledger. A genuine retry of the *same* job calls this with the same
+ * `type`/`data`, so it still reuses the same key and dedupes correctly.
+ */
+function whatsappIdempotencyKey(orgId, to, type, data) {
+  const hash = crypto.createHash('sha1').update(JSON.stringify({ type, data })).digest('hex').slice(0, 16);
+  return `notif:${orgId}:${to}:${type}:${hash}`;
+}
 
 // ─── Channel adapters (stubs — wire to your providers) ──────────────────────
 const channels = {
@@ -239,6 +255,7 @@ async function deliverChannel(ch, type, recipient, data) {
       to: recipient.phone,
       organization_id: recipient.organization_id,
       body: tpl.body,
+      notification_id: whatsappIdempotencyKey(recipient.organization_id, recipient.phone, type, data),
       ...tpl.whatsapp,
     }; break;
     case 'sms':      adapterArgs = { to: recipient.phone, body: tpl.body }; break;
