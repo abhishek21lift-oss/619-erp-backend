@@ -1,5 +1,6 @@
 'use strict';
 const logger = require('../logger');
+const aiConfig = require('./config');
 
 const BASE_URL     = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
 const SITE_URL     = process.env.FRONTEND_URL || 'https://619fitness.app';
@@ -24,7 +25,7 @@ function defaultTimeoutMs() {
 }
 
 function getApiKey() {
-  const key = process.env.AI_API_KEY || process.env.OPENROUTER_API_KEY;
+  const key = aiConfig.apiKey();
   if (!key) {
     const err = new Error('AI_API_KEY / OPENROUTER_API_KEY is not configured');
     err.code = 'NOT_CONFIGURED';
@@ -132,6 +133,23 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
   const decoder = new TextDecoder();
   let buffer    = '';
   let usage     = null;
+  // ── Which model actually answered ────────────────────────────────────────
+  //
+  // OpenRouter stamps `model` on every streamed chunk, and this loop read the
+  // usage off those chunks while throwing the model away. The non-streaming
+  // path above has always kept it (`data.model || model`), so the two
+  // disagreed — and the streaming path is the one the workout and diet
+  // generators use.
+  //
+  // It matters because the configured model is an AUTO-ROUTER. Production
+  // sends "auto", which picks a different underlying model per request by
+  // design, so the requested name is never the answer to "what wrote this
+  // plan". Measured on the live database: 137 calls in 45 days logged as
+  // "auto", and every row of ai_workout_generations recording "auto" in the
+  // column that exists to answer exactly that question. A quality score of 82
+  // and one of 88 could have come from different models and nothing recorded
+  // which.
+  let servedModel = null;
 
   try {
     while (true) {
@@ -150,6 +168,7 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
         try {
           const parsed = JSON.parse(data);
           if (parsed.usage) usage = parsed.usage;
+          if (!servedModel && parsed.model) servedModel = parsed.model;
           const delta = parsed.choices?.[0]?.delta?.content;
           if (delta) yield delta;
         } catch { /* skip malformed chunk */ }
@@ -167,10 +186,17 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
   } finally {
     clearTimeout(timer);
     reader.releaseLock();
-    logger.info({ model, latency_ms: Date.now() - start }, 'ai_stream_done');
+    logger.info(
+      { model, served_model: servedModel, latency_ms: Date.now() - start },
+      'ai_stream_done'
+    );
   }
 
-  return usage;
+  // Both, and the shape is deliberate. Callers that only wanted the usage got
+  // an object before too; `served_model` is additive and `model` names what
+  // was REQUESTED, so a caller can report "asked for auto, got X" rather than
+  // having to choose between the two facts.
+  return { usage, model: servedModel || model, requested_model: model };
 }
 
 /**
