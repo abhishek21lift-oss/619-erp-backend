@@ -250,7 +250,18 @@ describe('the build plumbing that makes sha real in production', () => {
     // running container could read. This is what connects the two.
     const deploy = read('.github/workflows/deploy.yml');
     expect(deploy).toMatch(/export GIT_SHA=/);
-    expect(deploy).toMatch(/export GIT_SHA=[\s\S]{0,200}docker compose build/);
+    // The export has to come BEFORE the build, which is the whole point —
+    // ordering, not mere presence. Matched without a character budget, because
+    // a fixed window fails the moment a comment is added between the two and
+    // that failure says nothing about the ordering it is testing.
+    const exportAt = deploy.indexOf('export GIT_SHA=');
+    const buildAt = deploy.indexOf('docker compose build');
+    expect(exportAt).toBeGreaterThan(-1);
+    expect(buildAt).toBeGreaterThan(exportAt);
+    // And it has to actually reach the build. The compose file that runs in
+    // production is not in this repository, so an `args:` block here would not
+    // be enough on its own.
+    expect(deploy).toMatch(/--build-arg GIT_SHA=/);
   });
 });
 

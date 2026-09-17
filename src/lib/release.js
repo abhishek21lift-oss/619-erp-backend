@@ -85,6 +85,35 @@ const release = Object.freeze({
 const API_CONTRACT_VERSION = 1;
 
 /**
+ * The lowest WhatsApp-gateway contract this backend can talk to.
+ *
+ * Stated, not assumed. Without a declared floor, an incompatible gateway
+ * presents as a 404 on a route or a missing field on a response — symptoms
+ * that look like a bug in whichever service you happened to open first. With
+ * it, the seam check in scripts/assert-gateway-seam.js fails before deployment
+ * with both numbers in the message.
+ *
+ * Raise this in the same change that starts depending on a newer gateway.
+ */
+const MIN_GATEWAY_CONTRACT = 1;
+
+/**
+ * Is a peer's contract one this service can work with?
+ *
+ * Deliberately a plain floor comparison rather than semver range matching. The
+ * rule the three repositories actually follow is "bump on a breaking change",
+ * and a floor expresses exactly that with nothing left to interpret. A peer
+ * that reports no contract at all is INCOMPATIBLE rather than assumed-fine:
+ * before this existed every service reported no contract, so treating absence
+ * as "probably current" would make the check pass on precisely the builds it
+ * exists to catch.
+ */
+function isContractCompatible(peerContract, minimumRequired) {
+  if (typeof peerContract !== 'number' || !Number.isFinite(peerContract)) return false;
+  return peerContract >= minimumRequired;
+}
+
+/**
  * Everything a health payload or a deployment check needs, as plain data.
  *
  * Deliberately contains no environment variable values, no connection details
@@ -95,6 +124,9 @@ function releaseInfo() {
   return {
     ...release,
     contract: API_CONTRACT_VERSION,
+    // What this build needs from the gateway, so a deployment check can
+    // compare both directions without knowing either service's internals.
+    minGatewayContract: MIN_GATEWAY_CONTRACT,
     // Useful when several containers serve one service and only one is wrong.
     instance: os.hostname(),
   };
@@ -114,4 +146,7 @@ function releaseLogLine() {
   };
 }
 
-module.exports = { releaseInfo, releaseLogLine, normalizeSha, API_CONTRACT_VERSION };
+module.exports = {
+  releaseInfo, releaseLogLine, normalizeSha,
+  API_CONTRACT_VERSION, MIN_GATEWAY_CONTRACT, isContractCompatible,
+};
