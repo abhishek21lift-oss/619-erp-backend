@@ -51,6 +51,7 @@
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
 const gateway = require('../../lib/whatsappGateway');
+const phone   = require('./phone');
 
 /** The providers this build knows how to send through. */
 const PROVIDERS = Object.freeze({
@@ -183,6 +184,21 @@ async function sendViaBaileys(orgId, { to, text, clientMessageId, requestId }) {
     };
   }
 
+  if (res.code === 'RECIPIENT_NOT_ON_WHATSAPP') {
+    // The gateway asked WhatsApp and WhatsApp said nobody has that number.
+    // Permanent by definition — it will not be registered on the second
+    // attempt either — so the attempt budget must not be spent on it, and the
+    // row records the one reason a studio can actually act on: the number in
+    // their client list is wrong.
+    return {
+      status: SendStatus.FAILED,
+      provider: PROVIDERS.BAILEYS,
+      provider_id: null,
+      error: 'recipient_not_on_whatsapp',
+      retryable: false,
+    };
+  }
+
   return {
     status: SendStatus.FAILED,
     provider: PROVIDERS.BAILEYS,
@@ -220,7 +236,8 @@ async function sendViaTwilio({ to, text }) {
  *
  * @param {object} msg
  * @param {string} msg.orgId            Resolved from an authenticated session or server context.
- * @param {string} msg.to               E.164.
+ * @param {string} msg.to               Any stored phone number. Resolved to E.164
+ *                                  here — see phone.js — and refused if it cannot be.
  * @param {string} msg.text
  * @param {string} msg.clientMessageId  Stable across the caller's retries. communication_logs.id.
  * @param {string} [msg.requestId]      Propagated so one send is traceable across both services.
@@ -251,6 +268,41 @@ async function send({
     };
   }
   if (!to) return { status: SendStatus.FAILED, provider: null, provider_id: null, error: 'no_recipient', retryable: false };
+
+  // ── The recipient is resolved to E.164 HERE, once, for every provider ─────
+  //
+  // Not in the automation engine, and not in the gateway. This is the single
+  // point every send in the product passes through — the automation worker,
+  // the notifications channel and the AI action registry are the three callers
+  // — so a number fixed here is fixed for all of them, and a number that
+  // cannot be fixed fails for all of them.
+  //
+  // It fails NON-RETRYABLY and before any provider is touched. See phone.js:
+  // an unresolvable number used to be handed straight to the gateway, which
+  // dutifully turned it into a JID for nobody and returned a message id, so
+  // the row said 'sent' and nothing was ever delivered. A message that cannot
+  // be addressed has not been sent, and the log now says so.
+  const recipient = phone.toE164(to);
+  if (!recipient.ok) {
+    logger.warn(
+      { org_id: orgId, reason: recipient.reason },
+      'whatsapp_send_unaddressable_recipient'
+    );
+    return {
+      status: SendStatus.FAILED,
+      provider: null,
+      provider_id: null,
+      error: `invalid_recipient_${recipient.reason}`,
+      retryable: false,
+    };
+  }
+  if (recipient.normalized) {
+    // Worth a line: a deployment where every send needs a country code added
+    // has a client list that was captured without one, and the studio should
+    // eventually be shown that rather than have it silently patched forever.
+    logger.info({ org_id: orgId }, 'whatsapp_recipient_country_code_applied');
+  }
+  const e164 = recipient.e164;
   if (!text) return { status: SendStatus.FAILED, provider: null, provider_id: null, error: 'empty_message', retryable: false };
   if (!clientMessageId) {
     // Without it the gateway cannot dedupe, so a retry would send twice. That
@@ -258,7 +310,7 @@ async function send({
     return { status: SendStatus.FAILED, provider: null, provider_id: null, error: 'no_client_message_id', retryable: false };
   }
 
-  const result = await sendViaBaileys(orgId, { to, text, clientMessageId, requestId });
+  const result = await sendViaBaileys(orgId, { to: e164, text, clientMessageId, requestId });
 
   if (result.status === SendStatus.SENT) return result;
 
@@ -267,7 +319,7 @@ async function send({
       { org_id: orgId, reason: result.error },
       'whatsapp_falling_back_to_shared_provider'
     );
-    return sendViaTwilio({ to, text });
+    return sendViaTwilio({ to: e164, text });
   }
 
   // No fallback. The row records exactly why, and the studio sees "your
