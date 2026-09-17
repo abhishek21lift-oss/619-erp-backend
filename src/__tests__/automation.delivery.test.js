@@ -369,10 +369,14 @@ describe('the transport itself', () => {
     expect(mockGatewaySend).not.toHaveBeenCalled();
   });
 
+  // `to` is a real number in these two, and has to be: the transport resolves
+  // the recipient to E.164 before it looks at the instance at all, so a
+  // placeholder like '+91' now fails as unaddressable and never reaches the
+  // connection check these tests are about. See whatsapp.recipientE164.test.js.
   test('only falls back to a shared provider when explicitly permitted', async () => {
     db({ instance: null });
     const refused = await transport.send({
-      orgId: ORG_A, to: '+91', text: 'hi', clientMessageId: 'x', allowSharedProvider: false,
+      orgId: ORG_A, to: '+919876543210', text: 'hi', clientMessageId: 'x', allowSharedProvider: false,
     });
     expect(refused.status).toBe('not_connected');
     expect(refused.provider).toBe('baileys');
@@ -381,7 +385,7 @@ describe('the transport itself', () => {
   test('a connected instance is required, not merely an existing one', async () => {
     for (const state of ['connecting', 'reconnecting', 'logged_out', 'qr_timeout', 'failed', 'never_connected']) {
       db({ instance: { instance_id: 'inst-1', status: state, phone_e164: null } });
-      const res = await transport.send({ orgId: ORG_A, to: '+91', text: 'hi', clientMessageId: 'x' });
+      const res = await transport.send({ orgId: ORG_A, to: '+919876543210', text: 'hi', clientMessageId: 'x' });
       expect({ state, status: res.status }).toEqual({ state, status: 'not_connected' });
     }
     expect(mockGatewaySend).not.toHaveBeenCalled();
