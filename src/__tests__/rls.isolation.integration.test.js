@@ -466,4 +466,69 @@ describeIf('cross-tenant isolation, against a real database', () => {
       expect(rows[0].n).toBe(0);
     });
   });
+
+  // ── The preflight, against these two real connections ────────────────────
+  //
+  // db/rlsPreflight.js decides whether this process is allowed to serve
+  // traffic. Everywhere else it is exercised against a fake pool, which proves
+  // its logic and nothing about Postgres. Here it runs against the two real
+  // roles this file already has open — the owner, which bypasses RLS, and
+  // app_tenant, which does not — and has to reach opposite verdicts about
+  // them. If it cannot tell these two apart, it cannot tell production apart
+  // from a cut-over box either, and its verdict is worthless.
+  describe('db/rlsPreflight against the real roles', () => {
+    const { verifyRlsPosture } = require('../db/rlsPreflight');
+
+    beforeEach(async () => {
+      // The probe counts pt_clients per organization, so both studios need a
+      // row that only they can see. beforeEach above already inserts exactly
+      // one each, which is what makes the expected counts below 1 and 1.
+      await owner.query(`DELETE FROM pt_clients WHERE organization_id IN ($1,$2) AND id NOT IN ('client-a','client-b')`, [ORG_A, ORG_B]);
+    });
+
+    it('reports the owner connection as bypassing, with the probe to prove it', async () => {
+      const result = await verifyRlsPosture({
+        tenantPool: owner, ownerPool: owner, env: { TENANT_RLS_ENFORCE: 'on' },
+      });
+
+      const codes = result.findings.map((f) => f.code);
+      expect(result.tenant.bypasses_rls).toBe(true);
+      expect(codes).toContain('tenant_connection_bypasses_rls');
+      // Not merely the role flag: scoping to either studio still returned
+      // every row, which is the same shape production shows today.
+      expect(result.probe.isolated).toBe(false);
+      expect(result.probe.a).toBe(result.probe.total);
+      expect(result.enforced).toBe(false);
+    });
+
+    it('reports the app_tenant connection as isolated, and would let strict boot', async () => {
+      const result = await verifyRlsPosture({
+        tenantPool: tenant, ownerPool: owner, env: { TENANT_RLS_ENFORCE: 'strict' },
+      });
+
+      expect(result.tenant.role).toBe('app_tenant');
+      expect(result.tenant.bypasses_rls).toBe(false);
+      expect(result.findings.filter((f) => f.severity === 'fatal')).toEqual([]);
+      expect(result.enforced).toBe(true);
+      expect(result.ok).toBe(true);
+      // One client each, and the total is larger than either — the three
+      // numbers that distinguish real filtering from a policy that denies
+      // everything and from one that is bypassed.
+      expect(result.probe.a).toBe(1);
+      expect(result.probe.b).toBe(1);
+      expect(result.probe.total).toBeGreaterThan(1);
+    });
+
+    it('the probe leaves no transaction and no GUC behind', async () => {
+      await verifyRlsPosture({ tenantPool: tenant, ownerPool: owner, env: { TENANT_RLS_ENFORCE: 'on' } });
+
+      // A client returned to the pool mid-transaction poisons the next
+      // borrower, and a session-level app.org_id would silently scope every
+      // later query on that connection. Both are read back rather than assumed.
+      const { rows } = await tenant.query(
+        `SELECT current_setting('app.org_id', true) AS org, txid_current_if_assigned() IS NOT NULL AS in_txn`);
+      expect(rows[0].org === null || rows[0].org === '').toBe(true);
+      expect(rows[0].in_txn).toBe(false);
+    });
+  });
 });

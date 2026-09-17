@@ -1005,7 +1005,10 @@ const { runMigrationsWithRetry } = require('./db/migrate');
 
 logger.info('Running database migrations…');
 runMigrationsWithRetry()
-  .then(function() {
+  // async because the RLS posture check below is awaited before listen(): in
+  // `strict` the process must not reach the point of accepting a request it
+  // cannot prove it can isolate.
+  .then(async function() {
     // Start polling the operator's AI model overrides. After migrations, so
     // the table is guaranteed to exist; before listen, so the first request
     // has a warm cache. It cannot fail the boot — an unreachable table just
@@ -1027,6 +1030,42 @@ runMigrationsWithRetry()
       startWorkers()
         .then((ws) => { workers = ws; })
         .catch((err) => logger.warn({ err: err.message }, 'in-process workers failed to start — falling back to inline sends'));
+    }
+
+    // ── RLS posture, asked of the database rather than of the environment ──
+    //
+    // The boot guard higher up this file compares two connection STRINGS. That
+    // cannot answer the only question that decides whether tenant isolation is
+    // real: which role did this process actually authenticate as, and does it
+    // bypass row-level security. Two different URLs can reach the same
+    // privileged role, and on this platform they did — production serves
+    // traffic as `postgres`, which owns every table and carries rolbypassrls,
+    // so all 141 policies granted to app_tenant are inert while the per-query
+    // BEGIN/set_config/COMMIT wrapper still runs on every tenant read.
+    //
+    // Awaited before listen() on purpose. In `strict` the process must not
+    // reach the point of accepting a request it cannot isolate; in `on` the
+    // result is cached so /api/health can report it without re-probing.
+    {
+      const { enforceRlsPostureAtBoot } = require('./db/rlsPreflight');
+      const { setRlsPosture } = require('./lib/health');
+      const dbPool = require('./db/pool');
+      try {
+        const posture = await enforceRlsPostureAtBoot({
+          tenantPool: dbPool,
+          ownerPool: dbPool.ownerPoolForDiagnostics ? dbPool.ownerPoolForDiagnostics() : null,
+          logger,
+        });
+        setRlsPosture(posture);
+      } catch (err) {
+        // Never a boot failure on its own. A probe that throws is a finding
+        // about the probe, and `strict` has already exited by this point if the
+        // posture itself was wrong — see enforceRlsPostureAtBoot.
+        logger.error({ err: err.message }, 'rls_preflight_threw');
+        setRlsPosture({ posture: 'unknown', ok: true, enforced: false, findings: [
+          { code: 'rls_preflight_threw', severity: 'error', detail: err.message },
+        ] });
+      }
     }
 
     const server = app.listen(PORT, '0.0.0.0', function() {
@@ -1268,7 +1307,10 @@ runMigrationsWithRetry()
     process.on('SIGINT',  shutdown('SIGINT'));
   })
   .catch(function(err) {
-    logger.fatal({ err: err.message }, 'Startup migration failed');
+    // Covers migrations AND the rest of boot, since the handler above is async.
+    // Both are fatal for the same reason: a process that got partway through
+    // boot and kept listening is the state nobody can diagnose later.
+    logger.fatal({ err: err.message }, 'Startup failed');
     process.exit(1);
   });
 

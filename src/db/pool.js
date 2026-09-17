@@ -411,6 +411,25 @@ pool.connect = function tenantScopedConnect(...args) {
 pool.withOrgScope = withOrgScope;
 pool.scopeClient = scopeClient;
 
+/**
+ * The owner pool, for the RLS preflight to inspect — or null when there is
+ * only one connection.
+ *
+ * Named "forDiagnostics" because nothing else may route queries through it.
+ * `useOwnerConnection()` above is the one place that decides what runs on the
+ * owner connection, and it decides on the request's platform-wide context, not
+ * on a caller reaching for a second pool. The preflight needs the pool itself
+ * so it can ask `current_user` of it — which is the whole point: a role, not a
+ * connection string.
+ *
+ * Returns null rather than falling back to the tenant pool when the URLs match,
+ * so `no_separate_owner_connection` is reported instead of the preflight
+ * silently comparing a role against itself and finding them equal.
+ */
+pool.ownerPoolForDiagnostics = function ownerPoolForDiagnostics() {
+  return SEPARATE_ADMIN_CONNECTION ? ownerPool() : null;
+};
+
 // Test connection on startup. Don't crash here — Render's healthcheck will
 // surface a 5xx and you can read the log. Crashing prevents redeploys from
 // recovering when Supabase has a brief connectivity blip.

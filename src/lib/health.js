@@ -35,6 +35,40 @@
 const pool = require('../db/pool');
 const redis = require('./redis');
 
+// ── RLS posture, captured once at boot ─────────────────────────────────────
+//
+// Cached rather than probed per request, and the reason is this file's own
+// rule: the liveness probe must answer in single-digit milliseconds during an
+// incident. The posture check runs a cross-tenant count probe inside a
+// transaction — correct at boot, far too expensive every few seconds — and it
+// cannot change while the process runs, because the thing it measures is which
+// role this process connected as.
+//
+// Starts as `unknown` so a payload read before boot finished says so rather
+// than claiming a posture nobody has verified.
+let rlsPosture = { posture: 'unknown', enforced: false, findings: [] };
+
+/** Called once by server.js after db/rlsPreflight.js has run. */
+function setRlsPosture(result) {
+  rlsPosture = result || rlsPosture;
+}
+
+/**
+ * The posture, flattened for a payload that is served unauthenticated.
+ *
+ * Finding CODES only — never their detail strings, which name roles and
+ * connection topology. A liveness endpoint is reachable by anyone who can
+ * reach the container, and "which privileged role does this app connect as"
+ * is not something to hand out on it.
+ */
+function rlsHealthField() {
+  return {
+    posture: rlsPosture.posture,
+    enforced: Boolean(rlsPosture.enforced),
+    findings: (rlsPosture.findings || []).map((f) => f.code),
+  };
+}
+
 async function getHealthPayload() {
   let dbState = 'disconnected';
   let redisState = 'disconnected';
@@ -77,6 +111,7 @@ async function getHealthPayload() {
       db: 'connected',
       redis: 'connected',
       queues,
+      rls: rlsHealthField(),
     };
   }
 
@@ -85,6 +120,7 @@ async function getHealthPayload() {
     db: dbState,
     redis: redisState,
     queues,
+    rls: rlsHealthField(),
     error: errorMessage,
   };
 }
@@ -102,4 +138,6 @@ async function sendHealthResponse(req, res) {
 module.exports = {
   getHealthPayload,
   sendHealthResponse,
+  setRlsPosture,
+  rlsHealthField,
 };
