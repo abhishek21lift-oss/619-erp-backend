@@ -56,8 +56,9 @@ describeIf('notification inbox, against a real database', () => {
   beforeAll(async () => {
     db = new Pool({ connectionString: DB_URL, max: 4 });
     process.env.DATABASE_URL = DB_URL;
-    // Required before the pool module is loaded.
-    // eslint-disable-next-line global-require
+    // Required HERE, not at the top of the file: db/pool.js reads
+    // DATABASE_URL when it is first loaded, so the require has to come after
+    // the line above sets it.
     service = require('../modules/notifications/notifications.service');
 
     await db.query(
