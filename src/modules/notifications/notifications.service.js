@@ -355,10 +355,33 @@ async function inbox(userId, { unreadOnly = false, limit = 50 } = {}) {
   // whoever asked, and `notifications` is one of the tables that grows per
   // user forever.
   const capped = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  // ── `is_read`, projected as `read_at` ────────────────────────────────
+  //
+  // These three queries used to name a `read_at` column directly. No
+  // migration creates one: the table has carried `is_read BOOLEAN` since
+  // schema.sql, and the index behind this very query is on
+  // (user_id, is_read, created_at DESC). So every call errored with
+  // `column "read_at" does not exist` — the bell polls on every page, which
+  // means the notification centre has been returning 500 continuously, and
+  // markRead and markAllRead failed the same way. Exactly the shape of the
+  // `link` bug migration 124 repaired, and missed.
+  //
+  // Projected rather than renamed, because the API's consumers read
+  // `read_at` (AppShell derives the unread count from it) and a field that
+  // answers WHEN is strictly more useful than one that answers WHETHER.
+  // `updated_at` is honest as that timestamp: migration 108 exists precisely
+  // because trg_notifications_updated_at writes it, and marking read is the
+  // only thing that updates one of these rows.
+  //
+  // Deliberately not a schema change. Adding a real `read_at` alongside
+  // `is_read` would leave two columns that can disagree, orphan the index,
+  // and require every insert path to keep both in step.
   const { rows } = await pool.query(
-    `SELECT id, type, title, body, link, read_at, created_at
+    `SELECT id, type, title, body, link,
+            CASE WHEN is_read THEN updated_at ELSE NULL END AS read_at,
+            created_at
      FROM notifications
-     WHERE user_id = $1 ${unreadOnly ? 'AND read_at IS NULL' : ''}
+     WHERE user_id = $1 ${unreadOnly ? 'AND is_read = FALSE' : ''}
      ORDER BY created_at DESC LIMIT $2`,
     [userId, capped]
   );
@@ -367,14 +390,14 @@ async function inbox(userId, { unreadOnly = false, limit = 50 } = {}) {
 
 async function markRead(notifId, userId) {
   await pool.query(
-    `UPDATE notifications SET read_at = NOW() WHERE id = $1 AND user_id = $2`,
+    `UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2`,
     [notifId, userId]
   );
 }
 
 async function markAllRead(userId) {
   await pool.query(
-    `UPDATE notifications SET read_at = NOW() WHERE user_id = $1 AND read_at IS NULL`,
+    `UPDATE notifications SET is_read = TRUE WHERE user_id = $1 AND is_read = FALSE`,
     [userId]
   );
 }

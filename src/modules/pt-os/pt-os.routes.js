@@ -1286,7 +1286,29 @@ router.put('/commissions/:trainerId', auth, adminOnly, wrap(async (req, res) => 
   const { commission_pct } = req.body;
   if (commission_pct === undefined) return res.json({ data: { success: true } });
 
+  // Bounded here, not left to the column's CHECK.
+  //
+  // `incentive_rate` is NUMERIC(5,4) CHECK (BETWEEN 0 AND 1) — a fraction. An
+  // out-of-range value used to reach Postgres and come back as a constraint
+  // violation, which this route turns into a 500 carrying the constraint's
+  // name. A rate outside the range is a data-entry problem and belongs in a
+  // 400 that says so; a 500 tells the studio owner the server broke and tells
+  // whoever reads the log the name of a table.
+  //
+  // NaN is rejected explicitly: `Number(undefined)` is NaN, `NaN >= 0` is
+  // false, and a bare range comparison would have let it fall through to a
+  // different error than the one the caller needs to see.
   const rate = Number(commission_pct);
+  if (!Number.isFinite(rate) || rate < 0 || rate > 1) {
+    return res.status(400).json({
+      error: {
+        code: 'VALIDATION',
+        field: 'commission_pct',
+        message: 'Commission must be between 0% and 100%.',
+      },
+    });
+  }
+
   const beforeParams = [req.params.trainerId];
   const beforeOrg = orgWhere(req, beforeParams);
   const { rows: before } = await pool.query(
