@@ -623,15 +623,16 @@ const userApiLimiter = rateLimit({
   message: { error: 'Too many requests. Please slow down.' },
 });
 
-const loginLimiter = rateLimit({
-  store: makeStore('login'),
-  passOnStoreError: true,
-  windowMs: 15 * 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many login attempts. Please wait 15 minutes.' },
-});
+// ── Credential endpoints ──────────────────────────────────────────────────
+//
+// Three limiters in middleware/authRateLimit.js, keyed on identity, address
+// and device, replacing one instance that was keyed on the IP and shared
+// between login and refresh. A gym has one public IP; thirty attempts per
+// quarter-hour was thirty for the whole building, and automatic token renewals
+// spent that budget without anyone touching a keyboard. See that file's header.
+const {
+  loginIdentityLimiter, loginIpLimiter, refreshLimiter,
+} = require('./middleware/authRateLimit');
 
 const registerLimiter = rateLimit({
   store: makeStore('register'),
@@ -644,18 +645,29 @@ const registerLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-app.use('/api/auth/login',          loginLimiter);
-app.use('/api/v1/auth/login',       loginLimiter);
-app.use('/api/auth/google-login',   loginLimiter);
-app.use('/api/v1/auth/google-login',loginLimiter);
+
+// Both login limiters on every credential path, in this order: the per-account
+// budget is the brute-force control and should be the one that answers, and
+// the per-address ceiling behind it catches one host working through a list.
+const LOGIN_PATHS = [
+  '/api/auth/login', '/api/v1/auth/login',
+  '/api/auth/google-login', '/api/v1/auth/google-login',
+];
+for (const p of LOGIN_PATHS) {
+  app.use(p, loginIdentityLimiter);
+  app.use(p, loginIpLimiter);
+}
 app.use('/api/v1/auth/forgot-password', registerLimiter);
 app.use('/api/v1/auth/reset-password',  registerLimiter);
 app.use('/api/auth/create-user', registerLimiter);
 app.use('/api/auth/users',      registerLimiter);
 app.use('/api/auth/forgot-password', registerLimiter);
 app.use('/api/auth/reset-password',  registerLimiter);
-app.use('/api/v1/auth/refresh',      loginLimiter);
-app.use('/api/auth/refresh',         loginLimiter);
+// Its OWN budget and its own store prefix. Sharing `login`'s prefix meant a
+// counter shared with sign-in, so a browser renewing its access token every
+// fifteen minutes consumed the studio's ability to sign in at all.
+app.use('/api/v1/auth/refresh',      refreshLimiter);
+app.use('/api/auth/refresh',         refreshLimiter);
 
 // ────────────────────────
 // BRANCH SCOPE (ISSUE-004)
