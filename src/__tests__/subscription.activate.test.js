@@ -67,7 +67,7 @@ function scriptHappyPathUpToPayment({ paymentThrows } = {}) {
   } else {
     on(/^INSERT INTO subscription_payments/s, { rows: [{ id: 'pay-1' }] });
     on(/^SELECT \* FROM platform_billing_settings WHERE id = TRUE/, { rows: [] });
-    on(/^SELECT count\(\*\)\+1 AS n FROM subscription_invoices/, { rows: [{ n: 3 }] });
+    on(/^SELECT nextval\('subscription_invoice_seq'\) AS n/, { rows: [{ n: 3 }] });
     on(/^INSERT INTO subscription_invoices/s, { rows: [], rowCount: 1 });
   }
 }
@@ -126,6 +126,22 @@ describe('duplicate payment reference protection', () => {
     expect(ranSql(/^COMMIT$/)).toBe(true);
   });
 
+  test('invoice numbers come from an atomic sequence, not a racy count(*)+1', async () => {
+    // Deep-audit finding: count(*)+1 read inside the transaction let two
+    // DIFFERENT organizations activating at nearly the same instant compute
+    // the same invoice_number (the per-org advisory lock does not serialize
+    // across orgs) and collide on the column's UNIQUE constraint, aborting
+    // an otherwise-legitimate payment. nextval() cannot return the same
+    // value to two concurrent callers, no lock required.
+    on(/^SELECT invoice_number FROM subscription_invoices si/s, { rows: [] });
+    scriptHappyPathUpToPayment();
+
+    await subscription.activate(ORG, 'pro', { amount_inr: 7999, method: 'upi', reference: 'UTR123' });
+
+    expect(ranSql(/^SELECT nextval\('subscription_invoice_seq'\) AS n/)).toBe(true);
+    expect(ranSql(/^SELECT count\(\*\)\+1 AS n FROM subscription_invoices/)).toBe(false);
+  });
+
   test('a payment recorded with no reference (cash, comp) is unaffected — nothing to dedupe against', async () => {
     scriptHappyPathUpToPayment();
 
@@ -160,7 +176,7 @@ describe('duplicate activation does not stack a second period', () => {
     on(/^UPDATE organizations SET subscription_status/, { rows: [], rowCount: 1 });
     on(/^INSERT INTO subscription_payments/s, { rows: [{ id: 'pay-2' }] });
     on(/^SELECT \* FROM platform_billing_settings WHERE id = TRUE/, { rows: [] });
-    on(/^SELECT count\(\*\)\+1 AS n FROM subscription_invoices/, { rows: [{ n: 3 }] });
+    on(/^SELECT nextval\('subscription_invoice_seq'\) AS n/, { rows: [{ n: 3 }] });
     on(/^INSERT INTO subscription_invoices/s, { rows: [], rowCount: 1 });
   }
 

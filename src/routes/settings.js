@@ -21,6 +21,7 @@ const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { requireSuperAdmin } = require('../middleware/tenant');
 const { orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 
@@ -416,8 +417,20 @@ router.put('/permissions', auth, adminOnly, async (req, res, next) => {
   }
 });
 
-// GET /api/settings/feature-flags
-router.get('/feature-flags', auth, async (req, res, next) => {
+// GET/PUT /api/settings/feature-flags
+//
+// `feature_flags` is a single, PLATFORM-WIDE table — no organization_id
+// column, one row per flag for the whole product (face_checkin,
+// voice_feedback, birthday_reminders, auto_expire). It used to be mounted
+// with the same `adminOnly` guard as the per-studio settings above, which
+// meant any studio's own admin — a role every self-serve trial signup gets —
+// could read and overwrite these flags for every other studio on the
+// platform in one request. That is a cross-tenant authorization defect
+// regardless of how small the toggle surface is: a hostile or careless
+// trial account could disable auto_expire or face_checkin platform-wide.
+// This is a platform-operator control, so it is gated the same way the
+// platform user-management endpoints in routes/auth.js are.
+router.get('/feature-flags', auth, requireSuperAdmin, async (req, res, next) => {
   try {
     const { rows } = await pool.query('SELECT key, value, description FROM feature_flags ORDER BY key');
     const flags = {};
@@ -428,8 +441,7 @@ router.get('/feature-flags', auth, async (req, res, next) => {
   }
 });
 
-// PUT /api/settings/feature-flags
-router.put('/feature-flags', auth, adminOnly, async (req, res, next) => {
+router.put('/feature-flags', auth, requireSuperAdmin, async (req, res, next) => {
   try {
     const updates = req.body;
     if (!updates || typeof updates !== 'object')

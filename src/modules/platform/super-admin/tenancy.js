@@ -311,22 +311,23 @@ router.post('/tenancy/run-isolation-tests', async (req, res, next) => {
 
     const started = Date.now();
 
-    // Probe orgs used by the runner. Pick any two real orgs that have
-    // trainers (the join target) so the test exercises the cardinal
-    // directions. The runner is wrapped in a savepoint so a failure
-    // leaves no data behind.
-    const { rows: probeOrgs } = await pool.query(`
-      SELECT a.id AS org_a, b.id AS org_b
-        FROM organizations a
-        JOIN organizations b ON b.id <> a.id
-       LIMIT 1
-    `);
-    if (probeOrgs.length === 0) {
-      return res.status(503).json({
-        error: { code: 'NO_TENANTS', message: 'Cannot run isolation tests: fewer than two organizations on the platform.' },
-      });
-    }
-    const { org_a, org_b } = probeOrgs[0];
+    // Probe orgs used by the runner: two organizations created here,
+    // for this run only, and deleted at the end. Earlier versions of
+    // this endpoint picked two *real* organizations off the platform
+    // and wrote/renamed/deleted a live row in one of them — a genuine
+    // customer's data was momentarily mutated by a "read-only" console
+    // action. Never reuse a real org id here.
+    const probeSuffix = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    const { rows: [orgARow] } = await pool.query(
+      `INSERT INTO organizations (name, slug, status) VALUES ($1, $2, 'active') RETURNING id`,
+      [`__iso_probe_org_a_${probeSuffix}`, `iso-probe-org-a-${probeSuffix}`]
+    );
+    const { rows: [orgBRow] } = await pool.query(
+      `INSERT INTO organizations (name, slug, status) VALUES ($1, $2, 'active') RETURNING id`,
+      [`__iso_probe_org_b_${probeSuffix}`, `iso-probe-org-b-${probeSuffix}`]
+    );
+    const org_a = orgARow.id;
+    const org_b = orgBRow.id;
 
     // The runner: 4 tests, each in its own savepoint so a single failure
     // does not poison the rest. The result is a small array of
@@ -425,7 +426,7 @@ router.post('/tenancy/run-isolation-tests', async (req, res, next) => {
           await probeClient.query('COMMIT');
         } catch (err) {
           await probeClient.query('ROLLBACK');
-          logger.warn({ err: err.message, insertedId }, 'isolation probe cleanup failed');
+          logger.warn({ err: err.message, insertedId }, 'isolation probe row cleanup failed');
         }
       } catch (err) {
         await probeClient.query('ROLLBACK');
@@ -433,6 +434,29 @@ router.post('/tenancy/run-isolation-tests', async (req, res, next) => {
       }
     } finally {
       probeClient.release();
+    }
+
+    // Tear down the two synthetic orgs no matter what happened above.
+    // `trainers.organization_id` is ON DELETE SET NULL, not CASCADE, so
+    // deleting the orgs alone would not remove a leftover probe row —
+    // delete any trainer rows under either probe org explicitly first.
+    // Retry a few times before giving up, and if it still fails, that
+    // failure is recorded on the run (not just logged) so an operator
+    // sees it rather than a silent orphaned `__iso_probe_*` org.
+    let cleanupError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await pool.query(`DELETE FROM trainers WHERE organization_id IN ($1, $2)`, [org_a, org_b]);
+        await pool.query(`DELETE FROM organizations WHERE id IN ($1, $2)`, [org_a, org_b]);
+        cleanupError = null;
+        break;
+      } catch (err) {
+        cleanupError = err.message;
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 200 * attempt));
+      }
+    }
+    if (cleanupError) {
+      logger.error({ err: cleanupError, org_a, org_b }, 'isolation probe org cleanup failed after retries — orgs left behind');
     }
 
     const total = results.length;
@@ -452,11 +476,11 @@ router.post('/tenancy/run-isolation-tests', async (req, res, next) => {
       VALUES ($1, $2, $3, $4, $5, $6, $7)
       RETURNING id, ran_at
     `, [userId, req.user?.name || null, durationMs, passed, total, failed, JSON.stringify({
-      org_a, org_b, tests: results,
+      org_a, org_b, tests: results, cleanup_failed: !!cleanupError, cleanup_error: cleanupError,
     })]);
 
     await audit(req, 'tenancy_isolation_run', 'tenancy_isolation_runs', String(run.id), {
-      passed, total, failed, duration_ms: durationMs,
+      passed, total, failed, duration_ms: durationMs, cleanup_failed: !!cleanupError,
     });
 
     res.json({
@@ -468,6 +492,7 @@ router.post('/tenancy/run-isolation-tests', async (req, res, next) => {
         failed_tests: failed,
         duration_ms: durationMs,
         tests: results,
+        cleanup_failed: !!cleanupError,
       },
     });
   } catch (err) { next(err); }

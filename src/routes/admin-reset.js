@@ -251,7 +251,11 @@ router.post('/reset-outstanding-dues', async (req, res) => {
   }
   try {
     await dropIfExists(pool, 'outstanding_dues');
-    await deleteIfExists(pool, 'payments');
+    // `payments` is not in ALLOWED_TABLES — that table was dropped and
+    // pt_payments (below) is the canonical ledger (see the allow-list's own
+    // comment). A call here to delete it always threw `Invalid table name`,
+    // which the catch below turned into a silent 500 on every single
+    // invocation of this OTP-gated endpoint — it could never succeed.
     await deleteIfExists(pool, 'pt_payments');
     await deleteIfExists(pool, 'pt_client_renewals');
     // pt_clients is the only client table; the guarded `clients` reset that

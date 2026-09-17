@@ -60,8 +60,24 @@ const qrLimiter = rateLimit({
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// Deep-audit finding: with KIOSK_HMAC_SECRET unset (the default — it was
+// never documented in .env.example, so no deployment has ever set it), QR
+// check-in signatures silently reuse JWT_SECRET, sharing one secret across
+// two independent trust boundaries: a leak of either would compromise both.
+// `'fallback-dev-only'` was also dead code — server.js refuses to boot
+// without a real JWT_SECRET (>=32 chars), so that branch is unreachable in
+// any environment that starts. Warn once at boot so an operator can set a
+// dedicated KIOSK_HMAC_SECRET (see .env.example) and rotate it, without
+// silently invalidating already-issued static QR codes by changing what
+// they're signed with out from under them.
+let warnedNoKioskSecret = false;
 function hmacSecret() {
-  return process.env.KIOSK_HMAC_SECRET || process.env.JWT_SECRET || 'fallback-dev-only';
+  if (process.env.KIOSK_HMAC_SECRET) return process.env.KIOSK_HMAC_SECRET;
+  if (!warnedNoKioskSecret) {
+    warnedNoKioskSecret = true;
+    logger.warn('KIOSK_HMAC_SECRET is not set — QR check-in signatures are reusing JWT_SECRET. Set a dedicated KIOSK_HMAC_SECRET (see .env.example) to separate these trust boundaries.');
+  }
+  return process.env.JWT_SECRET;
 }
 
 // Build a signed QR payload: base64(userId|userType|ts|sig)

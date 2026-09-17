@@ -511,7 +511,11 @@ async function activate(orgId, planCode, opts = {}) {
     const billing = await platformBilling.loadSettings(client);
     const tax = platformBilling.buildInvoiceTax({ settings: billing, org, amountInr: chargedAmount });
 
-    const seq = (await client.query('SELECT count(*)+1 AS n FROM subscription_invoices')).rows[0].n;
+    // A real sequence, not `count(*)+1`: nextval() is atomic under Postgres
+    // MVCC, so two different orgs activating at nearly the same instant can
+    // never be handed the same number (migration 205 — see its header for
+    // the concurrent-activation bug this replaces).
+    const seq = (await client.query(`SELECT nextval('subscription_invoice_seq') AS n`)).rows[0].n;
     const invoiceNumber = `${billing.invoice_prefix || 'MPT'}-${now.getFullYear()}-${String(seq).padStart(5, '0')}`;
     await client.query(
       `INSERT INTO subscription_invoices

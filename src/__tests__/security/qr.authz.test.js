@@ -31,6 +31,14 @@
 
 'use strict';
 
+// The QR HMAC helper (qr-checkin.js hmacSecret()) falls back to JWT_SECRET
+// when KIOSK_HMAC_SECRET is unset — it no longer falls back further to a
+// hardcoded dev string (that branch was dead in every environment that
+// actually boots; see the deep-audit fix). This unit test mounts the router
+// directly rather than booting the real server, so it needs its own
+// JWT_SECRET the way the other route test files already set one.
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret-at-least-32-characters-long!!';
+
 const ORG_A = '11111111-1111-1111-1111-111111111111';
 const ORG_B = '22222222-2222-2222-2222-222222222222';
 
