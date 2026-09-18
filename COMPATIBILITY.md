@@ -78,6 +78,34 @@ authoritative next to ones that are.
 - **In the repository** — `src/__tests__/release.contract.test.js` keeps this
   file honest: the numbers in the table above must match the source.
 
+## Which order to merge in
+
+The seam check builds the gateway from its **default branch**
+(`feature/whatsapp-gateway-mvp`, pinned in `ci.yml`), not from whatever branch
+a paired change happens to live on. CI therefore asks: does this backend agree
+with the gateway as it is *today*?
+
+That has one consequence worth knowing before it costs an afternoon:
+
+> **A backend change that raises what it requires of the gateway cannot go
+> green until the gateway side has merged.** Merge the gateway PR first, then
+> re-run the backend's seam job.
+
+This is the check working, not a CI problem. A backend that requires something
+the deployed gateway does not serve is exactly what the seam exists to catch,
+and the branch a fix is sitting on is not what production runs.
+
+It cost an afternoon once already: the backend PR introducing contract
+checking failed 8/11 against a gateway built from a commit predating
+`619-erp-whatsapp/src/release.ts`, which was correct and read at first like a
+bug in the new checks. Each contract check now names that situation
+explicitly — "the gateway reports no release block at all… deploy the gateway
+first" — rather than dereferencing a block that is not there.
+
+In the other direction there is no ordering constraint: the gateway may merge
+whenever it likes, because raising the gateway's own contract cannot break a
+backend that is already above its floor.
+
 ## Rolling back to a known-compatible set
 
 Each deploy writes the commit it verified to a marker file on the box
