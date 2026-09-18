@@ -75,25 +75,38 @@ record('the client considers itself configured', async () => {
 // presented as a 404 on a route or a missing field on a response, symptoms
 // that look like a bug in whichever service you opened first, and a rollback
 // could restore a guess per service rather than a known-good SET.
-record('the gateway reports a release identity at all', async () => {
+// A gateway that predates release.ts answers /healthz with no release block at
+// all. Reaching into it then throws a TypeError naming a property, which says
+// nothing about which of the two services has to move. Every contract check
+// goes through here so the failure names the actual situation.
+async function gatewayRelease() {
   const res = await fetch(`${GATEWAY_URL}/healthz`);
   assert.strictEqual(res.status, 200, `gateway /healthz answered ${res.status}`);
   const body = await res.json();
+  assert.ok(
+    body.release,
+    'the gateway reports no release block at all, so there is no contract to '
+    + 'compare. It is running a build from before 619-erp-whatsapp/src/release.ts '
+    + 'existed — deploy the gateway first; see COMPATIBILITY.md.'
+  );
+  return body.release;
+}
 
-  assert.ok(body.release, '/healthz must carry a release block — see 619-erp-whatsapp/src/release.ts');
-  assert.strictEqual(body.release.service, 'whatsapp-gateway');
-  assert.ok(typeof body.release.sha === 'string', 'release.sha must be present, even as "unknown"');
-  assert.ok(Number.isFinite(body.release.contract), 'release.contract must be a number');
+record('the gateway reports a release identity at all', async () => {
+  const release = await gatewayRelease();
+  assert.strictEqual(release.service, 'whatsapp-gateway');
+  assert.ok(typeof release.sha === 'string', 'release.sha must be present, even as "unknown"');
+  assert.ok(Number.isFinite(release.contract), 'release.contract must be a number');
 });
 
 record('the gateway speaks a contract this backend can talk to', async () => {
-  const body = await (await fetch(`${GATEWAY_URL}/healthz`)).json();
+  const release = await gatewayRelease();
   const { MIN_GATEWAY_CONTRACT, isContractCompatible } = require('../src/lib/release');
 
   assert.ok(
-    isContractCompatible(body.release.contract, MIN_GATEWAY_CONTRACT),
+    isContractCompatible(release.contract, MIN_GATEWAY_CONTRACT),
     `this backend requires gateway contract >= ${MIN_GATEWAY_CONTRACT}, `
-    + `the gateway reports ${body.release.contract}. One of the two has to move `
+    + `the gateway reports ${release.contract}. One of the two has to move `
     + 'before either is deployed.'
   );
 });
@@ -102,9 +115,9 @@ record('this backend speaks a contract the gateway can serve', async () => {
   // The other direction, and it matters as much. The gateway declares the
   // oldest backend it can serve; a backend below that floor would be refused
   // at runtime in ways that look like intermittent failures.
-  const body = await (await fetch(`${GATEWAY_URL}/healthz`)).json();
+  const release = await gatewayRelease();
   const { API_CONTRACT_VERSION, isContractCompatible } = require('../src/lib/release');
-  const floor = body.release.minBackendContract;
+  const floor = release.minBackendContract;
 
   assert.ok(Number.isFinite(floor), 'gateway must declare minBackendContract');
   assert.ok(
