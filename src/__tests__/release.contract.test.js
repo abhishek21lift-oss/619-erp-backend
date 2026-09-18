@@ -90,14 +90,43 @@ describe('the seam check actually checks the contract', () => {
 
 describe('deployment verification exists in both workflows', () => {
   const backendDeploy = fs.readFileSync(path.join(root, '.github', 'workflows', 'deploy.yml'), 'utf8');
+  const verifyScript = path.join(root, 'scripts', 'deploy', 'verify-serving.sh');
 
-  it('the backend refuses to record a deploy it cannot confirm is serving', () => {
+  it('the deploy calls a verification step it cannot skip', () => {
     // `docker compose up -d` returning 0 means a container STARTED. It does not
     // mean it is serving, and it does not mean it is serving the new code.
-    expect(backendDeploy).toMatch(/deploy verification failed/);
-    expect(backendDeploy).toMatch(/SERVING/);
-    // The marker file must not advance past a failed verification — it is what
+    //
+    // This used to assert the polling loop's text inside deploy.yml. That was
+    // the wrong thing to pin: the loop WAS in deploy.yml, this assertion passed
+    // on every run, and the loop never executed on the box — the deploy log
+    // showed the container start and the script exit 41ms later with none of
+    // its output. Matching a workflow's source text proves the text is there,
+    // not that anything runs it.
+    expect(backendDeploy).toMatch(/verify-serving\.sh/);
+    expect(fs.existsSync(verifyScript)).toBe(true);
+  });
+
+  it('keeps every deploy line to a single command', () => {
+    // The reason the loop never ran. Multi-line shell constructs were the
+    // first this script had ever contained; everything before them, across
+    // hundreds of successful deploys, was one command per line.
+    const script = backendDeploy.split('DEPLOY_SCRIPT: |')[1].split('\njobs:')[0];
+    const offenders = script
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.endsWith('\\') || ['do', 'done', 'fi', 'then', 'else'].includes(l));
+    expect(offenders).toEqual([]);
+  });
+
+  it('the script refuses to record a deploy it cannot confirm is serving', () => {
+    const sh = fs.readFileSync(verifyScript, 'utf8');
+    expect(sh).toMatch(/deploy verification failed/);
+    // The marker must not advance past a failed verification — it is what
     // names the last commit known to have actually served traffic.
-    expect(backendDeploy).toMatch(/rm -f [^\n]*\.backend-deployed-sha\.new/);
+    expect(sh).toMatch(/rm -f "\$\{MARKER\}\.new"/);
+    // And it must only be advanced after the success path.
+    const failIdx = sh.indexOf('deploy verification failed');
+    const mvIdx = sh.indexOf('mv "${MARKER}.new"');
+    expect(mvIdx).toBeGreaterThan(failIdx);
   });
 });

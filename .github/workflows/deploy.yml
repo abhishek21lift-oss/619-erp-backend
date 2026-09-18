@@ -13,6 +13,21 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # ── One command per line, deliberately ─────────────────────────────────
+  #
+  # Everything this script does must be expressible as a single line. The
+  # verification step used to be a multi-line `for` loop here, and it never
+  # ran: the deploy log showed the container start and the script exit 1
+  # 41ms later, with none of the loop's output — not its error branch, not
+  # the 150 seconds of polling it should have taken. The identical block run
+  # as an ordinary script polls correctly, so the block was fine and the way
+  # these lines get assembled and shipped over SSH is what could not carry
+  # it. Every line that preceded it, through 200-odd successful deploys, had
+  # been exactly one command.
+  #
+  # So multi-line logic lives in scripts/deploy/, which is one line to call,
+  # has ordinary shell semantics, and has tests. The echoed markers below are
+  # here so that the next time this stops early, the log says where.
   DEPLOY_SCRIPT: |
     set -e
     cd /opt/myptstudio/619-erp-backend
@@ -20,60 +35,18 @@ env:
     git checkout main
     git pull --ff-only origin main
     git rev-parse HEAD > /opt/myptstudio/.backend-deployed-sha.new
-    # Exported so docker-compose's build args pick them up. The sha was
-    # already being written to a file here and then not used for anything the
-    # running container could see — this is what makes /api/health and every
-    # log line able to name the build they came from.
     export GIT_SHA="$(git rev-parse HEAD)"
     export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "deploy: building $GIT_SHA"
     cd /opt/myptstudio
-    # --build-arg explicitly, rather than relying on the compose file's `args`.
-    # The compose file at /opt/myptstudio/docker-compose.yml is NOT this
-    # repository's — that one defines `api` and `worker`, this script builds a
-    # service called `backend` — so it lives outside version control and
-    # nothing here can add build args to it. Passing them on the command line
-    # works whichever compose file is really there, and the repo's own compose
-    # declares the same args so a local build behaves identically.
-    docker compose build \
-      --build-arg GIT_SHA="$GIT_SHA" \
-      --build-arg BUILD_TIME="$BUILD_TIME" \
-      backend
+    docker compose build --build-arg GIT_SHA="$GIT_SHA" --build-arg BUILD_TIME="$BUILD_TIME" backend
+    echo "deploy: built; running migrations"
     docker compose run --rm --no-deps backend npm run migrate
+    echo "deploy: migrated; replacing container"
     docker compose rm -sf backend
     docker compose up -d backend
-
-    # ── Deployment verification ────────────────────────────────────────────
-    #
-    # `docker compose up -d` returning 0 means a container was STARTED, not
-    # that it is serving, and certainly not that it is serving the commit we
-    # just built. A build that silently reused a cached layer, an image that
-    # crash-loops after the healthcheck's start period, a compose file pointing
-    # somewhere else — all of them leave this script "successful" with the old
-    # build still answering, which is exactly the state that makes "is the fix
-    # deployed?" unanswerable.
-    #
-    # So the box asks the running container which commit it is, and refuses to
-    # record a successful deploy unless the answer matches. The API is bound to
-    # 127.0.0.1, which is why this runs here and not from the runner.
-    SERVING=""
-    for _ in $(seq 1 30); do
-      SERVING="$(curl -sf --max-time 5 http://127.0.0.1:5000/api/health 2>/dev/null         | grep -o '"sha":"[0-9a-f]*"' | head -1 | cut -d'"' -f4 || true)"
-      [ "$SERVING" = "$GIT_SHA" ] && break
-      sleep 5
-    done
-
-    if [ "$SERVING" != "$GIT_SHA" ]; then
-      echo "::error::deploy verification failed — expected $GIT_SHA, container reports '${SERVING:-no answer}'"
-      docker compose logs --tail 60 backend || true
-      # The marker file is NOT advanced. It keeps naming the last commit known
-      # to have actually served traffic, which is what a rollback needs.
-      rm -f /opt/myptstudio/.backend-deployed-sha.new
-      exit 1
-    fi
-    echo "deploy verified: backend is serving $SERVING"
-
-    mv /opt/myptstudio/.backend-deployed-sha.new /opt/myptstudio/.backend-deployed-sha
-    docker image prune -f
+    echo "deploy: container started; verifying it serves $GIT_SHA"
+    bash /opt/myptstudio/619-erp-backend/scripts/deploy/verify-serving.sh "$GIT_SHA" /opt/myptstudio backend http://127.0.0.1:5000/api/health /opt/myptstudio/.backend-deployed-sha
 
 jobs:
   deploy:
