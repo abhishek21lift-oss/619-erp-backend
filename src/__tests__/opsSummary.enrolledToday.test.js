@@ -186,6 +186,17 @@ describe('the programme panel is derived, not a second query', () => {
     expect(SRC).toContain('getTodayRoster({ date: today, scope, trainerId })');
   });
 
+  it('carries the mobile, so the coach card can message rather than only link', () => {
+    // The AI Coach card told the trainer "No mobile number on file for these
+    // clients". Nobody had looked: this panel simply never selected the
+    // column, and the card reported that absence as a fact about the client
+    // record. The roster already joins pt_clients, so the number is one
+    // column away, and the claim is now checkable rather than assumed.
+    expect(SRC).toMatch(/c\.mobile\s+AS client_mobile/);
+    const block = SRC.slice(SRC.indexOf('const today_unscheduled = roster.rows'));
+    expect(block.slice(0, 800)).toContain('client_mobile: r.client_mobile');
+  });
+
   it('still sorts by name and caps the list', () => {
     // The roster is in clock order; this panel reads in name order and shows
     // at most 25, as it always did.
