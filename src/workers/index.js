@@ -12,6 +12,12 @@ const logger = require('../lib/logger');
 let activeWorkers = [];
 
 async function startWorkers() {
+  // Which build these workers are. The worker container's log lines are the
+  // ones nobody can attribute after a partial deploy — the api can be on one
+  // commit and the worker on another, and until this line existed there was
+  // nothing in its output that said which.
+  logger.info(require('../lib/release').releaseLogLine(), 'release');
+
   const redis = require('../lib/redis');
   if (!redis.isConfigured()) {
     logger.warn('Redis not configured — in-process workers skipped');

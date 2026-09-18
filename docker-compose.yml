@@ -60,7 +60,15 @@ services:
       start_period: 5s
 
   api:
-    build: .
+    build:
+      context: .
+      # Baked into the image, not read at runtime: a production image has no
+      # .git directory. The deploy script resolves these and exports them; a
+      # plain `docker compose build` leaves them empty and the release reports
+      # sha "unknown", which is the honest answer for a local image.
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-}
     restart: unless-stopped
     ports:
       - '127.0.0.1:5000:5000'
@@ -116,7 +124,14 @@ services:
   # studio at once. RUN_WORKERS=1 on the api service is the single-container
   # alternative if this box cannot spare a second one.
   worker:
-    build: .
+    build:
+      context: .
+      # The worker needs its own identity for the same reason the api does: it
+      # is a separate container that can be running a different build after a
+      # partial deploy, and its log lines are the ones nobody can attribute.
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-}
     restart: unless-stopped
     command: ['node', 'src/workers/index.js']
     # The image's HEALTHCHECK curls /api/health, and this container runs no

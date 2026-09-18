@@ -27,6 +27,7 @@
 // mean one of those two facts had to be wrong.
 
 const { Worker } = require('bullmq');
+const { withJobContext } = require('./jobContext');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 const { runSweep } = require('../modules/automation/automation.sweep');
@@ -65,7 +66,7 @@ async function processSweepJob(job) {
 }
 
 function createAutomationWorker() {
-  const worker = new Worker('automation-sweep', processSweepJob, {
+  const worker = new Worker('automation-sweep', withJobContext('automation-sweep', processSweepJob), {
     connection: redis.getWorkerConnection(),
     prefix: process.env.BULL_PREFIX || 'bull',
     // One at a time. A second concurrent pass would race the first on the same

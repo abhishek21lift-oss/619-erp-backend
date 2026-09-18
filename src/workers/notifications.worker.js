@@ -6,12 +6,13 @@
 // In-process:   see src/workers/index.js
 
 const { Worker } = require('bullmq');
+const { withJobContext } = require('./jobContext');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 const { processNotificationJob } = require('../modules/notifications/notifications.service');
 
 function createNotificationsWorker() {
-  const worker = new Worker('notifications', processNotificationJob, {
+  const worker = new Worker('notifications', withJobContext('notifications', processNotificationJob), {
     connection: redis.getWorkerConnection(),
     prefix: process.env.BULL_PREFIX || 'bull',
     concurrency: parseInt(process.env.NOTIFICATIONS_WORKER_CONCURRENCY, 10) || 5,

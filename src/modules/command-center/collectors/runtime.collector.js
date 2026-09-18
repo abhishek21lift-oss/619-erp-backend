@@ -121,6 +121,19 @@ async function collect() {
     uptime_seconds: Math.round(process.uptime()),
     node_version: process.version,
     pid: process.pid,
+    // ── Which build this process is ──────────────────────────────────────
+    //
+    // The console could say a process was healthy, name its heap ratio to
+    // three decimal places and report its event-loop lag at p99 — and could
+    // not say which commit it was running. "Healthy" and "running the build
+    // with the fix in it" are different claims, and an operator looking at a
+    // recovered incident needs the second one.
+    //
+    // It also makes a PARTIAL deploy visible for the first time: the api and
+    // the worker are separate containers built from the same repository, and
+    // after a failed rollout they can sit on different commits indefinitely
+    // with nothing anywhere reporting the disagreement.
+    release: require('../../../lib/release').releaseInfo(),
     memory: {
       rss_bytes: bytes(mem.rss),
       heap_used_bytes: bytes(mem.heapUsed),

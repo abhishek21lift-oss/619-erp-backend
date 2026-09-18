@@ -1,6 +1,7 @@
 // src/workers/email.worker.js
 
 const { Worker } = require('bullmq');
+const { withJobContext } = require('./jobContext');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 const { processEmailJob } = require('../services/email.service');
@@ -12,7 +13,7 @@ function createEmailWorker() {
     return worker;
   }
 
-  worker = new Worker('email', processEmailJob, {
+  worker = new Worker('email', withJobContext('email', processEmailJob), {
     connection: redis.getWorkerConnection(),
     prefix: process.env.BULL_PREFIX || 'bull',
     concurrency: parseInt(process.env.EMAIL_WORKER_CONCURRENCY, 10) || 5,

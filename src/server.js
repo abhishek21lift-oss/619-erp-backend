@@ -544,6 +544,17 @@ app.use(sanitizeQuery);
 const requestId = require('./middleware/requestId');
 app.use(requestId);
 
+// The build, on every response. A browser tab, a curl, or a bug report
+// screenshot then carries the commit it was served by — which is the evidence
+// that is always missing when someone says "it still happens on my machine".
+// Set once at module load; it cannot change while the process runs.
+const RELEASE_HEADER = require('./lib/release').releaseInfo();
+app.use(function appVersionHeader(req, res, next) {
+  res.setHeader('x-app-version', `${RELEASE_HEADER.version}+${RELEASE_HEADER.sha}`);
+  res.setHeader('x-api-contract', String(RELEASE_HEADER.contract));
+  next();
+});
+
 // ────────────────────────
 // STRUCTURED REQUEST LOGGER
 // ────────────────────────
@@ -587,7 +598,10 @@ app.use(function(req, res, next) {
 // HEALTH CHECK
 // ────────────────────────
 app.get('/', function(req, res) {
-  res.json({ status: 'ok', app: 'MY PT STUDIO API', version: '3.0.0' });
+  // Was a hardcoded '3.0.0' that no deploy had ever changed and nothing could
+  // change, because nothing wrote it.
+  const release = require('./lib/release').releaseInfo();
+  res.json({ status: 'ok', app: 'MY PT STUDIO API', version: release.version, sha: release.sha });
 });
 
 app.get('/api/health', async function(req, res) {
@@ -623,15 +637,16 @@ const userApiLimiter = rateLimit({
   message: { error: 'Too many requests. Please slow down.' },
 });
 
-const loginLimiter = rateLimit({
-  store: makeStore('login'),
-  passOnStoreError: true,
-  windowMs: 15 * 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many login attempts. Please wait 15 minutes.' },
-});
+// ── Credential endpoints ──────────────────────────────────────────────────
+//
+// Three limiters in middleware/authRateLimit.js, keyed on identity, address
+// and device, replacing one instance that was keyed on the IP and shared
+// between login and refresh. A gym has one public IP; thirty attempts per
+// quarter-hour was thirty for the whole building, and automatic token renewals
+// spent that budget without anyone touching a keyboard. See that file's header.
+const {
+  loginIdentityLimiter, loginIpLimiter, refreshLimiter,
+} = require('./middleware/authRateLimit');
 
 const registerLimiter = rateLimit({
   store: makeStore('register'),
@@ -644,18 +659,29 @@ const registerLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-app.use('/api/auth/login',          loginLimiter);
-app.use('/api/v1/auth/login',       loginLimiter);
-app.use('/api/auth/google-login',   loginLimiter);
-app.use('/api/v1/auth/google-login',loginLimiter);
+
+// Both login limiters on every credential path, in this order: the per-account
+// budget is the brute-force control and should be the one that answers, and
+// the per-address ceiling behind it catches one host working through a list.
+const LOGIN_PATHS = [
+  '/api/auth/login', '/api/v1/auth/login',
+  '/api/auth/google-login', '/api/v1/auth/google-login',
+];
+for (const p of LOGIN_PATHS) {
+  app.use(p, loginIdentityLimiter);
+  app.use(p, loginIpLimiter);
+}
 app.use('/api/v1/auth/forgot-password', registerLimiter);
 app.use('/api/v1/auth/reset-password',  registerLimiter);
 app.use('/api/auth/create-user', registerLimiter);
 app.use('/api/auth/users',      registerLimiter);
 app.use('/api/auth/forgot-password', registerLimiter);
 app.use('/api/auth/reset-password',  registerLimiter);
-app.use('/api/v1/auth/refresh',      loginLimiter);
-app.use('/api/auth/refresh',         loginLimiter);
+// Its OWN budget and its own store prefix. Sharing `login`'s prefix meant a
+// counter shared with sign-in, so a browser renewing its access token every
+// fifteen minutes consumed the studio's ability to sign in at all.
+app.use('/api/v1/auth/refresh',      refreshLimiter);
+app.use('/api/auth/refresh',         refreshLimiter);
 
 // ────────────────────────
 // BRANCH SCOPE (ISSUE-004)
@@ -1003,9 +1029,18 @@ app.use(errorHandler);
 // ────────────────────────
 const { runMigrationsWithRetry } = require('./db/migrate');
 
+// What is running, in one line, before anything else happens. `docker logs`
+// then answers "which build is this" without a deploy-time note kept anywhere
+// else — and the sha appears on every subsequent line through the logger's
+// base fields.
+logger.info(require('./lib/release').releaseLogLine(), 'release');
+
 logger.info('Running database migrations…');
 runMigrationsWithRetry()
-  .then(function() {
+  // async because the RLS posture check below is awaited before listen(): in
+  // `strict` the process must not reach the point of accepting a request it
+  // cannot prove it can isolate.
+  .then(async function() {
     // Start polling the operator's AI model overrides. After migrations, so
     // the table is guaranteed to exist; before listen, so the first request
     // has a warm cache. It cannot fail the boot — an unreachable table just
@@ -1027,6 +1062,42 @@ runMigrationsWithRetry()
       startWorkers()
         .then((ws) => { workers = ws; })
         .catch((err) => logger.warn({ err: err.message }, 'in-process workers failed to start — falling back to inline sends'));
+    }
+
+    // ── RLS posture, asked of the database rather than of the environment ──
+    //
+    // The boot guard higher up this file compares two connection STRINGS. That
+    // cannot answer the only question that decides whether tenant isolation is
+    // real: which role did this process actually authenticate as, and does it
+    // bypass row-level security. Two different URLs can reach the same
+    // privileged role, and on this platform they did — production serves
+    // traffic as `postgres`, which owns every table and carries rolbypassrls,
+    // so all 141 policies granted to app_tenant are inert while the per-query
+    // BEGIN/set_config/COMMIT wrapper still runs on every tenant read.
+    //
+    // Awaited before listen() on purpose. In `strict` the process must not
+    // reach the point of accepting a request it cannot isolate; in `on` the
+    // result is cached so /api/health can report it without re-probing.
+    {
+      const { enforceRlsPostureAtBoot } = require('./db/rlsPreflight');
+      const { setRlsPosture } = require('./lib/health');
+      const dbPool = require('./db/pool');
+      try {
+        const posture = await enforceRlsPostureAtBoot({
+          tenantPool: dbPool,
+          ownerPool: dbPool.ownerPoolForDiagnostics ? dbPool.ownerPoolForDiagnostics() : null,
+          logger,
+        });
+        setRlsPosture(posture);
+      } catch (err) {
+        // Never a boot failure on its own. A probe that throws is a finding
+        // about the probe, and `strict` has already exited by this point if the
+        // posture itself was wrong — see enforceRlsPostureAtBoot.
+        logger.error({ err: err.message }, 'rls_preflight_threw');
+        setRlsPosture({ posture: 'unknown', ok: true, enforced: false, findings: [
+          { code: 'rls_preflight_threw', severity: 'error', detail: err.message },
+        ] });
+      }
     }
 
     const server = app.listen(PORT, '0.0.0.0', function() {
@@ -1268,7 +1339,10 @@ runMigrationsWithRetry()
     process.on('SIGINT',  shutdown('SIGINT'));
   })
   .catch(function(err) {
-    logger.fatal({ err: err.message }, 'Startup migration failed');
+    // Covers migrations AND the rest of boot, since the handler above is async.
+    // Both are fatal for the same reason: a process that got partway through
+    // boot and kept listening is the state nobody can diagnose later.
+    logger.fatal({ err: err.message }, 'Startup failed');
     process.exit(1);
   });
 

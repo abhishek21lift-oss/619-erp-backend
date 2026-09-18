@@ -10,6 +10,7 @@ const { platformSessionBlocked, TENANT_SESSION_REQUIRED } = require('./platformA
 // (staged rollout only). See TENANT-RLS-PLAN.md and server.js startup validation.
 // Shared predicate — see lib/tenantRlsFlag.js for why it is not inlined here.
 const { rlsEnforcementEnabled } = require('../lib/tenantRlsFlag');
+const { setRequestContext } = require('../lib/request-context');
 const TENANT_RLS_ENFORCE = rlsEnforcementEnabled();
 
 // Path prefixes that stay reachable even when a studio's subscription has lapsed,
@@ -156,6 +157,18 @@ async function auth(req, res, next) {
     }
 
     req.user = user;
+
+    // Name the actor on the correlation context, so every line this request
+    // goes on to write says WHO as well as WHICH REQUEST. Set here rather than
+    // in requestId.js because the context is opened before authentication — a
+    // rejected login has to be traceable too, and at that point there is no
+    // actor to name.
+    //
+    // The user ID only. Never the name and never the email: logger.js redacts
+    // those wherever they appear precisely because they kept arriving through
+    // request bodies, and adding them back deliberately on every line would
+    // undo that.
+    setRequestContext({ actor: user.id, org: user.organization_id || null });
 
     // Which plane this session was opened for — see middleware/platformAuth.js.
     //

@@ -65,16 +65,44 @@ async function routedChat({ intent, messages, temperature, max_tokens, timeout }
  * Streaming chat completion with automatic fallback routing.
  * Yields SSE-ready string chunks. Returns metadata as generator return value.
  */
+
+/**
+ * Forward every chunk of `gen` to our caller and hand back its RETURN value.
+ *
+ * `for await (const chunk of gen) yield chunk` looks equivalent and is not: it
+ * throws the generator's return value away. That is precisely how the model
+ * that actually served a request was being lost — streamCompletion returns it,
+ * and both loops here discarded the return and reported the model that had
+ * been REQUESTED.
+ *
+ * It only mattered once the configured model became an auto-router. "auto"
+ * picks a different underlying model per request by design, so the requested
+ * name can never answer "what wrote this plan" — and every row of
+ * ai_workout_generations in production records "auto" in the column that
+ * exists to answer it.
+ *
+ * `yield*` delegates, which forwards the chunks AND evaluates to the delegate's
+ * return value. That is the whole fix, and it is why this is a two-line
+ * function rather than a loop.
+ */
+async function* relay(gen) {
+  return yield* gen;
+}
+
 async function* routedStream({ intent, messages, temperature, max_tokens, timeout }) {
   const { model, tier } = resolveModel(intent);
   const chain = chainFor(tier, model, intent);
 
   try {
     const gen = streamCompletion({ model, messages, temperature, max_tokens, timeout });
-    for await (const chunk of gen) {
-      yield chunk;
-    }
-    return { model, tier, intent, used_fallback: false };
+    const meta = yield* relay(gen);
+    return {
+      // The model that ANSWERED, falling back to the one requested when the
+      // provider did not say. See relay() for why this is not `for await`.
+      model: (meta && meta.model) || model,
+      requested_model: model,
+      tier, intent, used_fallback: false,
+    };
   } catch (primaryErr) {
     logger.warn({ model, tier, intent, err: primaryErr.message }, 'ai_stream_primary_failed');
 
@@ -85,10 +113,12 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
 
       try {
         const gen = streamCompletion({ model: step.model, messages, temperature, max_tokens, timeout });
-        for await (const chunk of gen) {
-          yield chunk;
-        }
-        return { model: step.model, tier: step.tier, intent, used_fallback: true };
+        const meta = yield* relay(gen);
+        return {
+          model: (meta && meta.model) || step.model,
+          requested_model: step.model,
+          tier: step.tier, intent, used_fallback: true,
+        };
       } catch (fbErr) {
         attempts.push({ model: step.model, tier: step.tier, err: fbErr });
         logger.error({ model: step.model, tier: step.tier, err: fbErr.message }, 'ai_stream_fallback_failed');

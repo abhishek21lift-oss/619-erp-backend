@@ -63,7 +63,19 @@ describe('the seam check cannot pass without a real gateway', () => {
   });
 
   it('refuses a suite that has shrunk', () => {
-    expect(script).toMatch(/checks\.length < 8/);
+    // Derived from the script rather than hardcoded. The literal was `8`, and
+    // adding three contract checks to the seam meant this test failed for a
+    // reason that had nothing to do with what it guards — while a floor left
+    // at 8 would silently have allowed three checks to be deleted.
+    //
+    // What matters is that the floor is not BELOW the number of checks that
+    // actually exist, which is what makes deleting one a failure.
+    const declared = script.match(/checks\.length < (\d+)/);
+    expect(declared).not.toBeNull();
+
+    const actual = (script.match(/^record\(/gm) || []).length;
+    expect(actual).toBeGreaterThan(0);
+    expect(Number(declared[1])).toBe(actual);
   });
 
   it('asserts the exact error code transport.js branches on', () => {

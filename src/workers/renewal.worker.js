@@ -20,6 +20,7 @@
 // In-process: see src/workers/index.js.
 
 const { Worker } = require('bullmq');
+const { withJobContext } = require('./jobContext');
 const pool = require('../db/pool');
 const notifier = require('../modules/notifications/notifications.service');
 const razorpay = require('../lib/razorpay');
@@ -212,7 +213,7 @@ async function processRenewalJob(job) {
 }
 
 function createRenewalWorker() {
-  const worker = new Worker('membership-renewals', processRenewalJob, {
+  const worker = new Worker('membership-renewals', withJobContext('membership-renewals', processRenewalJob), {
     connection: redis.getWorkerConnection(),
     prefix: process.env.BULL_PREFIX || 'bull',
     concurrency: 1,

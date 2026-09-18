@@ -10,6 +10,7 @@ const { requireStaff } = require('../middleware/rbac');
 const { tenantScope } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
 const logger     = require('../lib/logger');
+const aiConfig   = require('../lib/ai/config');
 
 // Null-safe tenant param: a tenant user gets their org id (queries then filter
 // `organization_id = $x`); a platform super admin operating platform-wide gets
@@ -71,13 +72,13 @@ const router = express.Router();
 
 /* ─── Guard ─────────────────────────────────────────────────────────────── */
 function requireConfigured(req, res, next) {
-  const apiKey = process.env.AI_API_KEY || process.env.OPENROUTER_API_KEY;
-  const baseUrl = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
+  const apiKey = aiConfig.apiKey();
+  const baseUrl = aiConfig.baseUrl();
 
   if (!apiKey) {
     return res.status(501).json({
       error: 'AI not configured',
-      message: 'AI_API_KEY / OPENROUTER_API_KEY is not set in environment variables.',
+      message: aiConfig.configurationProblem(),
     });
   }
 
@@ -2076,9 +2077,15 @@ router.get('/model-stats', auth, async (req, res) => {
    ═══════════════════════════════════════════════════════════════════════════ */
 router.get('/health', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  if (!process.env.OPENROUTER_API_KEY) {
+  // Read through lib/ai/config.js, not process.env directly. This line used to
+  // check OPENROUTER_API_KEY alone while the code that CALLS the provider
+  // checks AI_API_KEY first — so a box configured with AI_API_KEY had working
+  // AI and a health endpoint reporting `configured: false`, which sends
+  // somebody hunting for a key that is present.
+  if (!aiConfig.isConfigured()) {
     return res.json({
       configured: false,
+      reason: aiConfig.configurationProblem(),
       models: { primary: models.primary, secondary: models.secondary, fallback: models.fallback },
     });
   }
@@ -2131,7 +2138,11 @@ router.get('/provider-settings', auth, adminOnly, async (req, res) => {
   res.json({
     data: {
       provider:   'openrouter',
-      configured: !!process.env.OPENROUTER_API_KEY,
+      configured: aiConfig.isConfigured(),
+      // WHICH variable is live, never the key itself. The question during a
+      // rotation is "which name is in play", and answering it has never
+      // required revealing the value.
+      key_source: aiConfig.keySource(),
       models: {
         primary:   models.primary,
         secondary: models.secondary,

@@ -6,12 +6,13 @@
 // In-process:   see src/workers/index.js
 
 const { Worker } = require('bullmq');
+const { withJobContext } = require('./jobContext');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 const { processAiJob } = require('../services/ai.service');
 
 function createAiWorker() {
-  const worker = new Worker('ai', processAiJob, {
+  const worker = new Worker('ai', withJobContext('ai', processAiJob), {
     connection: redis.getWorkerConnection(),
     prefix: process.env.BULL_PREFIX || 'bull',
     // Embedding is CPU-bound (local transformers) — keep concurrency low so

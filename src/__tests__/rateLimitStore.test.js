@@ -102,22 +102,62 @@ describe('makeStore', () => {
 // Source-level, because the risk is a limiter being ADDED later without a
 // store — which no unit test of the existing ones would notice.
 
-const FILES = [
-  'src/server.js',
-  'src/routes/auth-webauthn.js',
-  'src/routes/client-activation.js',
-  'src/routes/invitations.js',
-  'src/routes/profile.js',
-  'src/routes/qr-checkin.js',
-  'src/routes/search.js',
-];
+// ── Discovered, not listed ─────────────────────────────────────────────────
+//
+// This was a hand-maintained array of seven paths, and the blind spot is the
+// same one the tenant-table scanner had: a limiter in a file nobody added to
+// the list is not merely unchecked, it is invisible — the suite stays green
+// and the count assertion below is the only thing that notices, by going DOWN.
+// That is exactly what happened when the credential limiters moved into
+// middleware/authRateLimit.js: three new limiters appeared, the total fell,
+// and the failure pointed at the vacuity guard rather than at the new file.
+//
+// So the list is derived by walking src/ for files that actually construct a
+// limiter. A new one is covered the moment it is written, wherever it lives.
+const ROOT = path.join(__dirname, '..', '..');
 
-const read = (f) => fs.readFileSync(path.join(__dirname, '..', '..', f), 'utf8');
+/**
+ * Source with comments removed.
+ *
+ * Every scan below has to read CODE. middleware/authRateLimit.js opens by
+ * quoting the limiter it replaces — `store: makeStore('login')` and all — to
+ * explain the lockout, and a raw scan counted that quotation as a live limiter
+ * missing its passOnStoreError. The failure was in the comment, not the code.
+ *
+ * It cuts the other way too, which is the dangerous direction: a file whose
+ * only mention of `makeStore` is inside a comment would satisfy a raw scan
+ * while wiring nothing at all.
+ */
+const read = (f) => fs.readFileSync(path.join(ROOT, f), 'utf8')
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/^[ \t]*\/\/.*$/gm, '');
+
+const FILES = (() => {
+  const found = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(path.join(ROOT, dir), { withFileTypes: true })) {
+      const rel = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === '__tests__' || entry.name === 'node_modules') continue;
+        walk(rel);
+        continue;
+      }
+      if (!entry.name.endsWith('.js')) continue;
+      if (/rateLimit\(\{/.test(read(rel))) found.push(rel);
+    }
+  };
+  walk('src');
+  return found.sort();
+})();
 
 describe('every limiter in the codebase uses the shared store', () => {
   it('finds the limiters, so this cannot pass vacuously', () => {
     const total = FILES.reduce((n, f) => n + (read(f).match(/rateLimit\(\{/g) || []).length, 0);
-    expect(total).toBeGreaterThanOrEqual(11);
+    // Twelve today: nine route/server limiters plus the three credential ones
+    // in middleware/authRateLimit.js. A floor, not an equality — adding a
+    // limiter should not fail this, removing every one of them should.
+    expect(FILES.length).toBeGreaterThanOrEqual(7);
+    expect(total).toBeGreaterThanOrEqual(12);
   });
 
   it.each(FILES)('%s wires store + passOnStoreError on each limiter', (file) => {
@@ -133,9 +173,15 @@ describe('every limiter in the codebase uses the shared store', () => {
   });
 
   it('gives every limiter a DISTINCT prefix', () => {
-    const prefixes = FILES.flatMap((f) => [...read(f).matchAll(/makeStore\('([a-z]+)'\)/g)].map((m) => m[1]));
+    // Hyphens included: the credential limiters are `login-id`, `login-ip` and
+    // `refresh-device`, and a letters-only pattern silently matched none of
+    // them — a prefix-collision test that cannot see a prefix proves nothing
+    // about it. The three are also the ones where a collision did real damage:
+    // login and refresh sharing the `login` prefix shared a counter, which is
+    // how automatic token renewals locked a studio out of signing in.
+    const prefixes = FILES.flatMap((f) => [...read(f).matchAll(/makeStore\('([a-z0-9-]+)'\)/g)].map((m) => m[1]));
 
-    expect(prefixes.length).toBeGreaterThanOrEqual(11);
+    expect(prefixes.length).toBeGreaterThanOrEqual(12);
     expect(new Set(prefixes).size).toBe(prefixes.length);
   });
 
