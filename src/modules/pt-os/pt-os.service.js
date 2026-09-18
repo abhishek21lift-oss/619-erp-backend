@@ -602,6 +602,10 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
             r.start_time,
             r.source_rank,
             c.name               AS client_name,
+            -- Carried so the AI Coach card can MESSAGE an unbooked client
+            -- rather than only link to a list. The roster already joins the
+            -- client row, so this costs a column, not a query.
+            c.mobile             AS client_mobile,
             c.photo_url          AS client_photo,
             wa.id                AS assignment_id,
             wp.id                AS plan_id,
@@ -777,6 +781,7 @@ async function getOpsSummary(scope = {}, trainerId = null) {
       assignment_id: r.assignment_id,
       client_id: r.client_id,
       client_name: r.client_name,
+      client_mobile: r.client_mobile,
       client_photo: r.client_photo,
       plan_id: r.plan_id,
       plan_name: r.plan_name,
