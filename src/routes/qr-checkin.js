@@ -236,7 +236,7 @@ router.get('/generate', auth, qrLimiter, async (req, res) => {
     if (u.pt_client_id) { userId = u.pt_client_id; userType = 'client'; }
     else if (u.member_id) { userId = u.member_id; userType = 'client'; }
     else if (u.trainer_id) { userId = u.trainer_id; userType = 'trainer'; }
-    else if (['admin', 'manager', 'staff', 'reception', 'receptionist'].includes(u.role)) {
+    else if (u.role === 'trainer' || u.role === 'super_admin') {
       userType = 'staff';
     }
 
@@ -260,7 +260,7 @@ router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
     if (!allowed.includes(type)) return res.status(400).json({ error: 'Invalid user type' });
 
     // RBAC
-    const isAdmin = ['admin', 'manager', 'owner'].includes(req.user.role);
+    const isAdmin = (req.user.role === 'trainer' && req.user.is_owner === true) || req.user.role === 'super_admin';
     const isTrainer = req.user.role === 'trainer';
     if (!isAdmin && !isTrainer) return res.status(403).json({ error: 'Not authorized' });
 
