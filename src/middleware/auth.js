@@ -270,7 +270,7 @@ async function auth(req, res, next) {
 }
 
 function adminOnly(req, res, next) {
-  if (req.user?.role !== 'trainer') {
+  if (!['trainer', 'admin', 'manager', 'staff', 'reception', 'receptionist'].includes(req.user?.role)) {
     return res.status(403).json({ error: 'Trainer owner access required' });
   }
   next();
@@ -283,7 +283,7 @@ function adminOnly(req, res, next) {
  */
 function adminOrManager(req, res, next) {
   const role = req.user?.role;
-  if (role !== 'trainer') {
+  if (!['trainer', 'admin', 'manager', 'staff', 'reception', 'receptionist'].includes(role)) {
     return res.status(403).json({ error: 'Trainer owner access required' });
   }
   next();
@@ -305,7 +305,7 @@ function adminOrManager(req, res, next) {
  */
 function adminManagerOrTrainer(req, res, next) {
   const role = req.user?.role;
-  if (role !== 'trainer') {
+  if (!['trainer', 'admin', 'manager', 'staff', 'reception', 'receptionist'].includes(role)) {
     return res.status(403).json({ error: 'Trainer owner access required' });
   }
   next();
