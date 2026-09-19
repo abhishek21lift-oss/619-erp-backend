@@ -110,4 +110,13 @@ function toVectorLiteral(vec) {
   return `[${vec.join(',')}]`;
 }
 
-module.exports = { embedText, embedBatch, toVectorLiteral, EMBEDDING_DIM, EMBEDDING_PROVIDER };
+/**
+ * The model that actually produced a vector, for stamping onto stored rows.
+ *
+ * 384 dimensions is a shape, not a meaning: two different 384-dim models emit
+ * into unrelated coordinate spaces, and pgvector will compare them without
+ * complaint. Migration 207 stores this per chunk so retrieval can refuse.
+ */
+const EMBEDDING_MODEL = EMBEDDING_PROVIDER === 'local' ? LOCAL_MODEL : EMBEDDING_PROVIDER;
+
+module.exports = { embedText, embedBatch, toVectorLiteral, EMBEDDING_DIM, EMBEDDING_PROVIDER, EMBEDDING_MODEL };

@@ -19,7 +19,20 @@ When a client has medical conditions, always recommend consulting a qualified ph
 // lib/ai/tools.js) — member counts, attendance, revenue, etc. — for
 // questions about what's actually happening in the studio right now, as
 // opposed to knowledgeContext's static documents.
-function buildCoachSystemPrompt(clientContext, knowledgeContext, toolContext) {
+/**
+ * `grounding` describes what actually happened when we went looking, because
+ * three outcomes need three different instructions and only two existed:
+ *
+ *   'ok'          — chunks were retrieved (knowledgeContext is non-empty)
+ *   'no_match'    — the base was consulted and holds nothing relevant
+ *   'unavailable' — the base could NOT be consulted (embedding/DB outage)
+ *
+ * 'unavailable' used to be indistinguishable from 'no_match' all the way down
+ * in retrieveContext(), so during an outage the model was told the studio had
+ * no such document — a statement nothing had checked. It then answered from
+ * general knowledge with no sign to the reader that it was ungrounded.
+ */
+function buildCoachSystemPrompt(clientContext, knowledgeContext, toolContext, grounding = 'no_match') {
   return [
     GYM_CTX,
     '',
@@ -35,6 +48,8 @@ function buildCoachSystemPrompt(clientContext, knowledgeContext, toolContext) {
       // though client records never live in the document store at all.
       // The knowledge base holds POLICY documents; people, money and
       // attendance come from the live data section below.
+      : grounding === 'unavailable'
+      ? `\nThis studio's document store could NOT be searched for this question — the retrieval service is temporarily unavailable. You have not checked it. Do not say the studio has no document on the subject, and do not present general knowledge as this studio's written policy. If the question is about a written policy or SOP, say that you could not reach the studio's documents right now and offer to answer from general knowledge instead. Questions about clients, members, staff, bookings or finances are unaffected — those come from live records below, not from documents.`
       : `\nNo uploaded policy/SOP document matched this question. That only limits questions about this studio's written procedures and policies — it says nothing about clients, members, staff, bookings or finances, which come from the studio's live records, not from uploaded documents. If the user asks about a written policy or SOP you have no document for, say so plainly rather than inventing one.`,
     toolContext
       ? `\nLive data just pulled from this studio's own records:\n${toolContext}\n\nUse these figures directly when answering — do not recompute or second-guess them, and do not invent additional numbers beyond what's given. If a line says the user isn't permitted to view something, tell them that plainly instead of answering anyway.`

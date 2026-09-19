@@ -101,12 +101,76 @@ async function statusFor(orgId, client) {
 }
 
 /**
+ * How many checks in a row have failed, and when the streak started.
+ *
+ * ── Why a counter and not just a log line ─────────────────────────────────
+ *
+ * The guard fails OPEN on error, deliberately: a quota check that cannot run
+ * must not take the AI Suite down with it. That bias is right and is kept.
+ *
+ * What was wrong is that it failed open *silently*. One `logger.warn` per
+ * request, at the same level as routine noise, is indistinguishable from a
+ * healthy system when the database is degraded — and while it is degraded
+ * every studio's spending cap is simply not applied. An hour of that is an
+ * hour of uncapped AI spend whose only trace is warn-level lines nobody is
+ * paged on.
+ *
+ * So the streak is counted. The first failure warns; a sustained streak
+ * escalates to error with an explicit statement of what is not being
+ * enforced, which is the thing an alert rule can actually match on.
+ * Failing open stays the behaviour; being quiet about it does not.
+ */
+let consecutiveFailures = 0;
+let streakStartedAt = null;
+
+/** Escalate once a streak is long enough to mean "degraded", not "blip". */
+const FAILURE_STREAK_ALERT = Number(process.env.AI_QUOTA_FAILURE_ALERT_AFTER || 3);
+
+/** Test seam + operational read: how blind is the cost control right now. */
+function quotaEnforcementHealth() {
+  return {
+    consecutive_failures: consecutiveFailures,
+    degraded: consecutiveFailures >= FAILURE_STREAK_ALERT,
+    since: streakStartedAt,
+  };
+}
+
+function recordQuotaCheckOutcome(ok, err) {
+  if (ok) {
+    if (consecutiveFailures > 0) {
+      logger.info(
+        { recovered_after: consecutiveFailures, degraded_since: streakStartedAt },
+        'ai_quota_check_recovered'
+      );
+    }
+    consecutiveFailures = 0;
+    streakStartedAt = null;
+    return;
+  }
+  consecutiveFailures += 1;
+  if (!streakStartedAt) streakStartedAt = new Date().toISOString();
+  const payload = {
+    err: err.message,
+    consecutive_failures: consecutiveFailures,
+    degraded_since: streakStartedAt,
+    // Stated plainly so an alert rule and a human read the same thing.
+    effect: 'AI spending limits are NOT being enforced while this persists',
+  };
+  if (consecutiveFailures >= FAILURE_STREAK_ALERT) {
+    logger.error(payload, 'ai_quota_enforcement_degraded');
+  } else {
+    logger.warn(payload, 'ai_quota_check_failed');
+  }
+}
+
+/**
  * Express guard for AI routes.
  *
  * Refuses only when enforcement is ON, a limit exists, and it is exceeded.
  * Every other path — enforcement off, no limit, under the limit, or the check
  * itself failing — calls next(). A quota check that errors must not take the
  * AI Suite down with it; failing open is the correct bias for a cost control.
+ * It is no longer a SILENT fail-open — see recordQuotaCheckOutcome above.
  */
 function requireAiQuota() {
   return async function aiQuotaGuard(req, res, next) {
@@ -115,6 +179,7 @@ function requireAiQuota() {
       if (!orgId || req.user.role === 'super_admin') return next();
 
       const s = await statusFor(orgId);
+      recordQuotaCheckOutcome(true);
       if (!s.enforcement_enabled || !s.over) return next();
 
       return res.status(429).json({
@@ -126,10 +191,10 @@ function requireAiQuota() {
         },
       });
     } catch (err) {
-      logger.warn({ err: err.message }, 'ai quota check failed — allowing the request');
+      recordQuotaCheckOutcome(false, err);
       return next();
     }
   };
 }
 
-module.exports = { PERIOD_SQL, loadSettings, usedThisMonth, limitFor, statusFor, requireAiQuota };
+module.exports = { PERIOD_SQL, loadSettings, usedThisMonth, limitFor, statusFor, requireAiQuota, quotaEnforcementHealth };
