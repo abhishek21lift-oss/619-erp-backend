@@ -134,7 +134,7 @@ describe('POST /api/ai/knowledge/:id/reindex', () => {
   });
 
   test('an unauthorized role is rejected before any query runs', async () => {
-    mockUser = { id: 't1', role: 'trainer', organization_id: 'org-1' };
+    mockUser = { id: 'm1', role: 'member', organization_id: 'org-1' };
 
     const res = await request(app).post('/api/ai/knowledge/doc-1/reindex');
 
