@@ -7,7 +7,7 @@
 //   router.get('/own-or-admin/:id', auth, requireSelfOrRole('trainer'), handler);
 
 function canonicalRole(role) {
-  return ['admin', 'manager', 'staff', 'reception', 'receptionist'].includes(role) ? 'trainer' : role;
+  return role === 'admin' ? 'trainer' : role;
 }
 
 function requireRole(...roles) {
