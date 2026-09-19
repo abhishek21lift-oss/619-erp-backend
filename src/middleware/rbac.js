@@ -2,9 +2,9 @@
 // Role-Based Access Control. Use after auth() middleware.
 //
 // Usage:
-//   router.get('/admin-only', auth, requireRole('admin'), handler);
+//   router.get('/admin-only', auth, requireRole('trainer'), handler);
 //   router.get('/staff',      auth, requireRole('admin','trainer'), handler);
-//   router.get('/own-or-admin/:id', auth, requireSelfOrRole('admin'), handler);
+//   router.get('/own-or-admin/:id', auth, requireSelfOrRole('trainer'), handler);
 
 function requireRole(...roles) {
   return (req, res, next) => {
@@ -48,8 +48,8 @@ function requireSelfOrRole(...roles) {
  function requireTrainerOwnership(pool, paramName = 'id') {
    return async (req, res, next) => {
      if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH' } });
-     if (req.user.role === 'admin') return next();
-     if (req.user.role !== 'trainer') return res.status(403).json({ error: { code: 'FORBIDDEN' } });
+     if (req.user.role === 'trainer') return next();
+     if (req.user.role !== 'super_admin') return res.status(403).json({ error: { code: 'FORBIDDEN' } });
 
      const memberId = req.params[paramName];
      try {
@@ -73,7 +73,7 @@ function requireSelfOrRole(...roles) {
  * `member` is deliberately absent, and that absence is the point — see
  * requireStaff.
  */
-const STAFF_ROLES = ['super_admin', 'admin', 'manager', 'staff', 'trainer', 'reception', 'receptionist'];
+const STAFF_ROLES = ['super_admin', 'trainer'];
 
 /**
  * Everything behind a studio's back office.
