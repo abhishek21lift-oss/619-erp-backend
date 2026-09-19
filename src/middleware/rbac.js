@@ -6,12 +6,18 @@
 //   router.get('/staff',      auth, requireRole('admin','trainer'), handler);
 //   router.get('/own-or-admin/:id', auth, requireSelfOrRole('trainer'), handler);
 
+function canonicalRole(role) {
+  return ['admin', 'manager', 'staff', 'reception', 'receptionist'].includes(role) ? 'trainer' : role;
+}
+
 function requireRole(...roles) {
   return (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH', message: 'Not authenticated' } });
-    if (!roles.includes(req.user.role)) {
+    const actualRole = canonicalRole(req.user.role);
+    const requiredRoles = roles.map(canonicalRole);
+    if (!requiredRoles.includes(actualRole)) {
       return res.status(403).json({
-        error: { code: 'FORBIDDEN', message: `Requires one of: ${roles.join(', ')}` },
+        error: { code: 'FORBIDDEN', message: `Requires one of: ${requiredRoles.join(', ')}` },
       });
     }
     next();
@@ -23,7 +29,7 @@ function requireRole(...roles) {
 function requireSelfOrRole(...roles) {
   return (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH', message: 'Not authenticated' } });
-    if (roles.includes(req.user.role)) return next();
+    if (roles.map(canonicalRole).includes(canonicalRole(req.user.role))) return next();
 
     // For members: the id in the URL must be their own pt_client_id.
     // The legacy `member_id` column referenced the dropped `clients` table
@@ -101,7 +107,7 @@ function requireStaff(req, res, next) {
   if (!req.user) {
     return res.status(401).json({ error: { code: 'UNAUTH', message: 'Not authenticated' } });
   }
-  if (!STAFF_ROLES.includes(req.user.role)) {
+  if (!STAFF_ROLES.includes(canonicalRole(req.user.role))) {
     return res.status(403).json({
       error: { code: 'FORBIDDEN', message: 'This area is for studio staff.' },
     });
