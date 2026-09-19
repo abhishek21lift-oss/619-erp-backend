@@ -16,7 +16,7 @@ const multer = require('multer');
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
-const { requireRole, requireStaff } = require('../middleware/rbac');
+const { requireRole, requireStaff, requireStudioOwner } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { saveFile } = require('../lib/fileStorage');
 const { SUPPORTED_MIME_TYPES } = require('../lib/ai/textExtract');
@@ -43,7 +43,7 @@ const EXT_BY_MIME = { 'application/pdf': 'pdf', 'text/plain': 'txt' };
 /* ═══════════════════════════════════════════════════════════════════════════
    POST /api/ai/knowledge  — upload + queue a document for indexing
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/', auth, requireRole('admin', 'manager'), (req, res, next) => {
+router.post('/', auth, requireStudioOwner, (req, res, next) => {
   upload.single('file')(req, res, (err) => {
     if (err) return res.status(400).json({ error: { code: 'UPLOAD_ERROR', message: err.message } });
     next();
