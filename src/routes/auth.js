@@ -661,7 +661,7 @@ router.post('/change-password', auth, validate(authSchemas.changePassword), chan
 
 // POST /api/auth/create-user  (admin only)
 // Also accepts /users for compatibility with older frontend builds
-const ALLOWED_ROLES = ['admin', 'manager', 'trainer', 'reception', 'member'];
+const ALLOWED_ROLES = ['trainer', 'member'];
 
 async function createUserHandler(req, res) {
   try {
