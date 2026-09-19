@@ -6,6 +6,7 @@ const { randomUUID } = require('crypto');
 const express    = require('express');
 const pool       = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { isStudioOwner } = require('../middleware/rbac');
 const { requireStaff } = require('../middleware/rbac');
 const { tenantScope } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
@@ -1895,7 +1896,7 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
    POST /api/ai/business/insights
    ═══════════════════════════════════════════════════════════════════════════ */
 router.post('/business/insights', auth, requireConfigured, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (!isStudioOwner(req.user)) return res.status(403).json({ error: 'Studio owner access required' });
 
   const { from, to } = req.body || {};
   const fromDate = from ? new Date(from) : new Date(Date.now() - 30 * 86400000);
@@ -2082,7 +2083,7 @@ router.get('/usage', auth, async (req, res) => {
 });
 
 router.get('/model-stats', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (!isStudioOwner(req.user)) return res.status(403).json({ error: 'Studio owner access required' });
   const stats = await getModelStats();
   res.json({ data: stats });
 });
@@ -2092,7 +2093,7 @@ router.get('/model-stats', auth, async (req, res) => {
    GET /api/ai/health
    ═══════════════════════════════════════════════════════════════════════════ */
 router.get('/health', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (!isStudioOwner(req.user)) return res.status(403).json({ error: 'Studio owner access required' });
   // Read through lib/ai/config.js, not process.env directly. This line used to
   // check OPENROUTER_API_KEY alone while the code that CALLS the provider
   // checks AI_API_KEY first — so a box configured with AI_API_KEY had working
@@ -2124,7 +2125,7 @@ router.get('/health', auth, async (req, res) => {
    POST /api/ai/test
    ═══════════════════════════════════════════════════════════════════════════ */
 router.post('/test', auth, requireConfigured, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (!isStudioOwner(req.user)) return res.status(403).json({ error: 'Studio owner access required' });
 
   const { intent = 'chat', prompt = 'Say "MY PT STUDIO AI is ready" and nothing else.' } = req.body || {};
   try {
