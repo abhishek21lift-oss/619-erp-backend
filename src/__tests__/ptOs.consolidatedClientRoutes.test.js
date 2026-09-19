@@ -48,10 +48,10 @@ jest.mock('../db/pool', () => ({
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
 const ORG_A = '11111111-1111-1111-1111-111111111111';
-let mockUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+let mockUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (req, res, next) => (req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Forbidden' })),
+  adminOnly: (req, res, next) => (req.user.role === 'trainer' ? next() : res.status(403).json({ error: 'Forbidden' })),
   adminOrManager: (_req, _res, next) => next(),
   adminManagerOrTrainer: (_req, _res, next) => next(),
   requireRole: () => (_req, _res, next) => next(),
@@ -82,7 +82,7 @@ const paramsOf = (re) => (queries.find((q) => re.test(q.sql)) || {}).params;
 beforeEach(() => {
   queries.length = 0;
   mockClient = { id: 'ptc-1', trainer_id: 'tr-1' };
-  mockUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+  mockUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
 });
 
 describe('GET /clients/search', () => {
@@ -248,7 +248,7 @@ describe('the endpoints the retired mount duplicated', () => {
   });
 
   test('DELETE /clients/:id refuses a non-admin', async () => {
-    mockUser = { id: 'u5', role: 'trainer', organization_id: ORG_A, trainer_id: 'tr-1' };
+    mockUser = { id: 'u5', role: 'member', organization_id: ORG_A, trainer_id: null };
     const res = await request(app()).delete('/api/pt-os/clients/ptc-1');
     expect(res.status).toBe(403);
   });
