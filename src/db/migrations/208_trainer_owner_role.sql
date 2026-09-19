@@ -17,8 +17,10 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF NEW.role IN ('admin', 'manager', 'reception', 'receptionist', 'staff') THEN
+  IF NEW.role = 'admin' THEN
     NEW.role := 'trainer';
+  ELSIF NEW.role IN ('manager', 'reception', 'receptionist', 'staff') THEN
+    NEW.role := 'member';
   END IF;
   RETURN NEW;
 END;
@@ -29,7 +31,3 @@ CREATE TRIGGER users_canonicalize_role
 BEFORE INSERT OR UPDATE OF role ON users
 FOR EACH ROW
 EXECUTE FUNCTION canonicalize_user_role();
-
-CREATE UNIQUE INDEX IF NOT EXISTS users_one_owner_trainer_per_org
-  ON users (organization_id)
-  WHERE role = 'trainer' AND deleted_at IS NULL AND organization_id IS NOT NULL;
