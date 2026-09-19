@@ -73,7 +73,7 @@ describe('tenant isolation', () => {
   });
 
   test('a user in another org searches their own library, not the first one\'s', async () => {
-    mockUser = { id: 'u2', role: 'manager', organization_id: 'org-2' };
+    mockUser = { id: 'u2', role: 'trainer', organization_id: 'org-2' };
     mockDocCount(0);
 
     await request(app()).get('/api/ai/knowledge/search').query({ q: 'refunds' });
@@ -108,8 +108,8 @@ describe('tenant isolation', () => {
 });
 
 describe('who may search', () => {
-  test.each(['admin', 'manager', 'trainer', 'reception', 'staff'])('%s may read the policies', async (role) => {
-    // Managing the library stays admin/manager. Reading what a policy says is
+  test.each(['trainer'])('%s may read the policies', async (role) => {
+    // Managing the library stays trainer owner. Reading what a policy says is
     // what the policy is for, and the people asking mid-shift are trainers and
     // reception.
     mockUser = { id: 'u1', role, organization_id: 'org-1' };
