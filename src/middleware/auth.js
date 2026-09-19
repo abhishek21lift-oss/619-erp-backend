@@ -156,6 +156,13 @@ async function auth(req, res, next) {
       _cacheSet(user.id, user);
     }
 
+    // Canonicalise legacy studio role identifiers at the authentication boundary.
+    // This keeps older tokens/fixtures safe during rollout while ensuring every
+    // downstream authorization check sees only trainer/member/super_admin.
+    if (['admin', 'manager', 'staff', 'reception', 'receptionist'].includes(user.role)) {
+      user = { ...user, role: 'trainer' };
+    }
+
     req.user = user;
 
     // Name the actor on the correlation context, so every line this request
