@@ -111,7 +111,7 @@ async function auth(req, res, next) {
           // has to load here with role and organization_id: taking a client id
           // from the request instead is the exact mistake the isolation layer
           // exists to prevent.
-          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.pt_client_id, u.branch_id,
+          `SELECT u.id, u.name, u.email, u.role, u.is_owner, u.trainer_id, u.member_id, u.pt_client_id, u.branch_id,
                   u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
                   o.is_founder, o.founder_number,
                   o.status AS organization_status, o.subscription_status,
