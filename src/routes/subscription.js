@@ -51,7 +51,7 @@ function sendCheckoutError(res, err) {
 
 /** Only a studio ADMIN may commit the studio to a payment. */
 function requireStudioAdmin(req, res) {
-  if (req.user?.role !== 'admin') {
+  if (!(req.user?.role === 'trainer' && req.user?.is_owner === true)) {
     res.status(403).json({
       error: { code: 'FORBIDDEN', message: 'Only the studio admin can pay for the subscription.' },
     });
