@@ -132,7 +132,7 @@ describe('GET /clients/search', () => {
   });
 
   test('a non-trainer is not roster-filtered at all', async () => {
-    // The other half — an admin must not be silently restricted to nothing.
+    mockUser = { id: 'member-1', role: 'member', organization_id: ORG_A, trainer_id: null };
     await request(app()).get('/api/pt-os/clients/search?q=asha');
     expect(sqls().find((s) => /ILIKE \$1/.test(s))).not.toMatch(/c\.trainer_id = \$\d/);
   });
