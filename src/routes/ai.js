@@ -599,10 +599,15 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     // Retrieval failures (e.g. embedding model not yet warmed up) are
     // non-fatal — the coach still answers, just without citations.
     let knowledgeChunks = [];
+    // 'no_match' until retrieval says otherwise. See buildCoachSystemPrompt:
+    // an outage must not be described to the model as an empty knowledge base.
+    let grounding = 'no_match';
     try {
       knowledgeChunks = await retrieveContext({ organizationId: orgParam(req), query: message });
+      if (knowledgeChunks.length) grounding = 'ok';
     } catch (ragErr) {
-      logger.warn({ err: ragErr.message }, 'ai_chat_rag_retrieval_failed');
+      grounding = 'unavailable';
+      logger.warn({ err: ragErr.message, grounding }, 'ai_chat_rag_retrieval_failed');
     }
     const knowledgeCtx = knowledgeChunks
       .map((c, i) => `[${i + 1}] (${c.title}) ${c.content}`)
@@ -619,10 +624,14 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       toolNames = toolResult.toolNames;
       toolCtx = toolResult.contextText;
     } catch (toolErr) {
+      // The whole dispatcher failing is rarer than one tool failing (which
+      // runTools reports inline), but it has the same hazard: the model must
+      // not answer with figures it never received as though it had them.
       logger.warn({ err: toolErr.message }, 'ai_chat_tools_failed');
+      toolCtx = "[Live data] This studio's live records could not be read just now. Say so plainly if the question needs them — do not estimate or recall figures.";
     }
 
-    const systemPrompt = buildCoachSystemPrompt(clientCtx, knowledgeCtx, toolCtx);
+    const systemPrompt = buildCoachSystemPrompt(clientCtx, knowledgeCtx, toolCtx, grounding);
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -630,6 +639,13 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     ];
 
     send({ type: 'start', conversation_id: convId });
+    if (grounding === 'unavailable') {
+      // The reader is told too, not just the model. An answer given while the
+      // document store was unreachable looks identical to a well-grounded one
+      // on screen, and "no sources shown" is the same display as "this studio
+      // has nothing on file" — the ambiguity this whole change exists to end.
+      send({ type: 'grounding', grounding });
+    }
     if (knowledgeChunks.length) {
       // De-duplicated document titles, in relevance order — lets the UI show
       // "Answered using: <titles>" without exposing raw chunk text or ids.

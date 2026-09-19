@@ -473,7 +473,20 @@ async function runTools(req, message) {
       contextParts.push(`[${tool.label}] ${text}`);
       toolNames.push(tool.label);
     } catch (err) {
+      // Reported to the model, not just to the log.
+      //
+      // This used to log and move on, so a tool that threw looked exactly
+      // like a tool that was never triggered: the model got no line, no
+      // denial, nothing — and answered the question anyway, from whatever it
+      // could infer. For "how many active clients do I have?" that is a
+      // fabricated number presented as this studio's data.
+      //
+      // The honest-denial shape directly above already exists for the
+      // authorization case; a failure is the same situation with a different
+      // cause, so it takes the same shape rather than a new one.
       logger.warn({ tool: tool.name, err: err.message }, 'ai_tool_run_failed');
+      contextParts.push(`[${tool.label}] This lookup failed just now, so no figures were retrieved. Tell the user the data could not be read rather than answering from memory or estimating.`);
+      toolNames.push(tool.label);
     }
   }
 

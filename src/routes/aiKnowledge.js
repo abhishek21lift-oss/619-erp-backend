@@ -193,14 +193,21 @@ router.get('/search', auth, requireStaff, async (req, res) => {
   );
   const documentsAvailable = countRows[0]?.n ?? 0;
 
+  // Three outcomes, three answers. `documents_available` above already
+  // separated "nothing uploaded" from "nothing matched"; `retrieval` adds the
+  // third, which had been indistinguishable from the second: the search did
+  // not run at all. Reporting an outage as an empty result is how a studio
+  // gets told it has no refund policy when it has one — the same mistake the
+  // count above exists to prevent, one layer further down.
   let chunks = [];
+  let retrieval = 'ok';
   try {
     chunks = await retrieveContext({ organizationId: scope.orgId, query: q, topK });
   } catch (err) {
-    // Same posture as the AI Coach's own call site: a cold embedding model is
-    // not a reason to 500 a search box. Empty results with the document count
-    // attached still let the caller say something true.
-    logger.warn({ err: err.message }, 'ai_knowledge_search_failed');
+    // Still not a 500: a cold embedding model is not a reason to break a
+    // search box. But the caller is told, rather than shown a clean zero.
+    retrieval = 'unavailable';
+    logger.warn({ err: err.message, retrieval }, 'ai_knowledge_search_failed');
   }
 
   res.json({
@@ -214,6 +221,9 @@ router.get('/search', auth, requireStaff, async (req, res) => {
         similarity: Number(c.similarity),
       })),
       documents_available: documentsAvailable,
+      // 'ok' — the search ran. 'unavailable' — it did not, so an empty
+      // `chunks` says nothing about what this studio has on file.
+      retrieval,
       scope: 'organization',
     },
   });
