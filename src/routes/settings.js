@@ -21,6 +21,7 @@ const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { isStudioOwner } = require('../middleware/rbac');
 const { requireSuperAdmin } = require('../middleware/tenant');
 const { orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
@@ -64,7 +65,7 @@ router.get('/', auth, async (req, res, next) => {
       [settingsOrg(req)]
     );
 
-    const isAdminLevel = ['admin', 'super_admin'].includes(req.user.role);
+    const isAdminLevel = isStudioOwner(req.user) || req.user.role === 'super_admin';
     const RESTRICTED_PREFIXES = ['internal_', 'geo_', 'biometric_', 'feature_'];
     const visibleRows = isAdminLevel
       ? rows
