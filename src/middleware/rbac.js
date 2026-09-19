@@ -10,6 +10,18 @@ function canonicalRole(role) {
   return role === 'admin' ? 'trainer' : role;
 }
 
+function isStudioOwner(user) {
+  return user?.role === 'trainer' && user?.is_owner === true;
+}
+
+function requireStudioOwner(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH', message: 'Not authenticated' } });
+  if (!isStudioOwner(req.user)) {
+    return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Studio owner access required' } });
+  }
+  next();
+}
+
 function requireRole(...roles) {
   return (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH', message: 'Not authenticated' } });
@@ -54,8 +66,8 @@ function requireSelfOrRole(...roles) {
  function requireTrainerOwnership(pool, paramName = 'id') {
    return async (req, res, next) => {
      if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH' } });
-     if (req.user.role === 'trainer') return next();
-     if (req.user.role !== 'super_admin') return res.status(403).json({ error: { code: 'FORBIDDEN' } });
+     if (isStudioOwner(req.user)) return next();
+     if (req.user.role !== 'trainer') return res.status(403).json({ error: { code: 'FORBIDDEN' } });
 
      const memberId = req.params[paramName];
      try {
@@ -136,5 +148,5 @@ function requireClient(req, res, next) {
 
 module.exports = {
   requireRole, requireSelfOrRole, requireTrainerOwnership,
-  requireStaff, requireClient, STAFF_ROLES,
+  requireStudioOwner, isStudioOwner, requireStaff, requireClient, STAFF_ROLES,
 };
