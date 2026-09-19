@@ -159,7 +159,7 @@ async function auth(req, res, next) {
     // Canonicalise legacy studio role identifiers at the authentication boundary.
     // This keeps older tokens/fixtures safe during rollout while ensuring every
     // downstream authorization check sees only trainer/member/super_admin.
-    if (['admin', 'manager', 'staff', 'reception', 'receptionist'].includes(user.role)) {
+    if (user.role === 'admin') {
       user = { ...user, role: 'trainer' };
     }
 
@@ -270,7 +270,7 @@ async function auth(req, res, next) {
 }
 
 function adminOnly(req, res, next) {
-  if (!['trainer', 'admin', 'manager', 'staff', 'reception', 'receptionist'].includes(req.user?.role)) {
+  if (!['trainer', 'admin'].includes(req.user?.role)) {
     return res.status(403).json({ error: 'Trainer owner access required' });
   }
   next();
@@ -283,7 +283,7 @@ function adminOnly(req, res, next) {
  */
 function adminOrManager(req, res, next) {
   const role = req.user?.role;
-  if (!['trainer', 'admin', 'manager', 'staff', 'reception', 'receptionist'].includes(role)) {
+  if (!['trainer', 'admin'].includes(role)) {
     return res.status(403).json({ error: 'Trainer owner access required' });
   }
   next();
