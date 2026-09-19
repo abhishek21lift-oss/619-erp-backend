@@ -115,7 +115,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     let rows;
     try {
       const result = await pool.query(
-        `SELECT u.id, u.name, u.email, u.role, u.password, u.token_version,
+        `SELECT u.id, u.name, u.email, u.role, u.is_owner, u.password, u.token_version,
                 u.trainer_id, u.member_id, u.is_active,
                 u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
                 -- Founder status rides along on the session rather than being
@@ -365,6 +365,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         name:              user.name,
         email:             user.email,
         role:              user.role,
+        is_owner:          user.is_owner === true,
         trainer_id:        user.trainer_id,
         pt_client_id:      user.pt_client_id,
         organization_id:       user.organization_id,
@@ -714,7 +715,7 @@ router.get('/users', auth, requireSuperAdmin, async (req, res) => {
     const scope = tenantScope(req);
     const orgParam = scope.applyFilter ? scope.orgId : null;
     const { rows } = await pool.query(
-      `SELECT id, name, email, role, trainer_id, is_active, last_login, created_at
+      `SELECT id, name, email, role, is_owner, trainer_id, is_active, last_login, created_at
          FROM users
         WHERE deleted_at IS NULL
           AND ($3::uuid IS NULL OR organization_id = $3)
