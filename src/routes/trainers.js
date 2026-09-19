@@ -22,8 +22,8 @@ function scrubForNonAdmin(t) {
 // GET /api/trainers
 router.get('/', auth, async (req, res, next) => {
   try {
-    const isAdmin = req.user.role === 'admin';
-    const isManager = req.user.role === 'manager';
+    const isAdmin = req.user.role === 'trainer';
+    const isManager = false;
     const ownTid = req.user.trainer_id || null;
     const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
