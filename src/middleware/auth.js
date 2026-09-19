@@ -163,6 +163,12 @@ async function auth(req, res, next) {
       user = { ...user, role: 'trainer' };
     }
 
+    // During rolling deployment, older databases may not have is_owner yet.
+    // Treat only legacy admin accounts as owners; normal trainers remain staff.
+    if (user.is_owner === undefined || user.is_owner === null) {
+      user = { ...user, is_owner: user.role === 'admin' };
+    }
+
     req.user = user;
 
     // Name the actor on the correlation context, so every line this request
