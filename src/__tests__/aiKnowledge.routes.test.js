@@ -3,7 +3,7 @@
 // ingestion for a document stuck in `processing` (or failed).
 //
 // The route must:
-//   * accept only admin/manager (requireRole — the real middleware is used)
+//   * accept only trainer owner (requireRole — the real middleware is used)
 //   * verify the document exists AND belongs to the caller's org
 //   * enqueue BullMQ job name=reindex_document data={ documentId }
 //   * NOT ingest inline while Redis is available (asynchronous via the queue)
@@ -54,7 +54,7 @@ beforeEach(() => {
 });
 
 describe('POST /api/ai/knowledge/:id/reindex', () => {
-  test('an authorized admin can reindex a document in their own org', async () => {
+  test('an authorized trainer owner can reindex a document in their own org', async () => {
     pool.query.mockImplementation((sql) => {
       if (sql.includes('ai_documents WHERE id')) return Promise.resolve({ rows: [{ id: 'doc-1' }] });
       if (sql.includes('UPDATE ai_documents')) return Promise.resolve({ rows: [], rowCount: 1 });
@@ -84,8 +84,8 @@ describe('POST /api/ai/knowledge/:id/reindex', () => {
     expect(ingestDocument).not.toHaveBeenCalled();
   });
 
-  test('an authorized manager can reindex a document in their own org', async () => {
-    mockUser = { id: 'm1', role: 'manager', organization_id: 'org-2' };
+  test('an authorized trainer owner can reindex a document in their own org', async () => {
+    mockUser = { id: 'm1', role: 'trainer', organization_id: 'org-2' };
     pool.query.mockImplementation((sql) => {
       if (sql.includes('ai_documents WHERE id')) return Promise.resolve({ rows: [{ id: 'doc-2' }] });
       if (sql.includes('UPDATE ai_documents')) return Promise.resolve({ rows: [], rowCount: 1 });
@@ -144,7 +144,7 @@ describe('POST /api/ai/knowledge/:id/reindex', () => {
     expect(aiQueue.add).not.toHaveBeenCalled();
   });
 
-  test('a super admin without a target org gets no bypass — the route is admin/manager only', async () => {
+  test('a super admin without a target org gets no bypass — the route is trainer owner only', async () => {
     mockUser = { id: 'sa-1', role: 'super_admin', organization_id: null };
 
     const res = await request(app).post('/api/ai/knowledge/doc-1/reindex');
