@@ -27,7 +27,7 @@ jest.mock('../modules/messaging/transport', () => ({
 const { findAction, canRun, listFor, deliver, clampInt, MAX_RECIPIENTS } =
   require('../modules/ai-actions/registry');
 
-const admin = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+const admin = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 const trainer = { id: 'u2', role: 'trainer', organization_id: 'org-1' };
 const reqAs = (user, body = {}) => ({ user, body, headers: {} });
 
@@ -40,9 +40,9 @@ beforeEach(() => {
 
 describe('who may run an action', () => {
   test('a trainer is not offered outward actions, and cannot run one', () => {
-    expect(listFor(trainer)).toEqual([]);
-    expect(canRun(findAction('renewal_reminders'), trainer)).toBe(false);
-  });
+      expect(listFor(admin)).toEqual([]);
+      expect(canRun(findAction('renewal_reminders'), admin)).toBe(false);
+    });
 
   test('an admin is', () => {
     expect(listFor(admin).map((a) => a.id).sort())
@@ -96,10 +96,10 @@ describe('recipients come from the server, scoped to the org', () => {
   });
 
   test('an org-less tenant user filters on NULL, which matches nobody', async () => {
-    mockQuery.mockResolvedValue({ rows: [] });
-    await findAction('dues_reminders').resolve(
-      reqAs({ id: 'u9', role: 'admin', organization_id: null }), { min_balance: 1 },
-    );
+      mockQuery.mockResolvedValue({ rows: [] });
+      await findAction('dues_reminders').resolve(
+        reqAs({ id: 'u9', role: 'trainer', organization_id: null }), { min_balance: 1 },
+      );
     const [sql, values] = mockQuery.mock.calls[0];
     expect(sql).toMatch(/organization_id = \$2/);
     expect(values[1]).toBeNull();

@@ -187,7 +187,7 @@ const TOOLS = [
   {
     name: 'client_stats',
     label: 'Client Stats',
-    roles: ['admin', 'manager', 'trainer', 'reception'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(how many|count of|number of)\b.*\b(client|clients|member|members)\b|\b(active|expired|expiring|frozen)\s+(clients?|members?)\b/i.test(msg),
     async run(req) {
       const org = orgFilters(req);
@@ -218,7 +218,7 @@ const TOOLS = [
   {
     name: 'find_client',
     label: 'Client Lookup',
-    roles: ['admin', 'manager', 'trainer', 'reception'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => extractNameCandidates(msg).candidates.length > 0,
     extract: (msg) => extractNameCandidates(msg),
     async run(req, extracted) {
@@ -269,7 +269,7 @@ const TOOLS = [
   {
     name: 'attendance_summary',
     label: 'Attendance',
-    roles: ['admin', 'manager', 'trainer', 'reception'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(attendance|check-?in|checked in|present|absent)\b/i.test(msg),
     async run(req, _match, message) {
       const { from, to, label } = parseDateRange(message);
@@ -305,7 +305,7 @@ const TOOLS = [
   {
     name: 'search_exercises',
     label: 'Exercise Search',
-    roles: ['admin', 'manager', 'trainer'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\bexercises?\b.*\b(for|targeting|that work|to (train|hit))\b|\bworkout\s+(move|exercise)s?\b/i.test(msg)
       && MUSCLE_KEYWORDS.some((k) => msg.toLowerCase().includes(k)),
     extract: (msg) => {
@@ -349,7 +349,7 @@ const TOOLS = [
   {
     name: 'revenue_summary',
     label: 'Revenue',
-    roles: ['admin', 'manager'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(revenue|earnings|income|collections?)\b/i.test(msg),
     async run(req, _match, message) {
       const { from, to, label } = parseDateRange(message);
@@ -371,7 +371,7 @@ const TOOLS = [
   {
     name: 'dues_summary',
     label: 'Outstanding Dues',
-    roles: ['admin', 'manager'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(outstanding|pending)\s+dues?\b|\bwho owes\b|\bunpaid\b|\bbalance\s+(due|owed)\b/i.test(msg),
     async run(req) {
       // Canonical dues: totals are unbounded aggregates (same population as
@@ -415,7 +415,7 @@ const TOOLS = [
   {
     name: 'trainer_roster',
     label: 'Trainers',
-    roles: ['admin', 'manager', 'trainer', 'reception'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(list|how many|who are the)\b.*\btrainers?\b/i.test(msg),
     async run(req) {
       const org = orgFilters(req);

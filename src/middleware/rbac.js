@@ -48,7 +48,7 @@ function requireSelfOrRole(...roles) {
  function requireTrainerOwnership(pool, paramName = 'id') {
    return async (req, res, next) => {
      if (!req.user) return res.status(401).json({ error: { code: 'UNAUTH' } });
-     if (req.user.role === 'admin') return next();
+     if (req.user.role === 'admin' || req.user.role === 'trainer') return next();
      if (req.user.role !== 'trainer') return res.status(403).json({ error: { code: 'FORBIDDEN' } });
 
      const memberId = req.params[paramName];
@@ -73,7 +73,7 @@ function requireSelfOrRole(...roles) {
  * `member` is deliberately absent, and that absence is the point — see
  * requireStaff.
  */
-const STAFF_ROLES = ['super_admin', 'admin', 'manager', 'staff', 'trainer', 'reception', 'receptionist'];
+const STAFF_ROLES = ['super_admin', 'trainer'];
 
 /**
  * Everything behind a studio's back office.

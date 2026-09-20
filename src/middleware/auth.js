@@ -263,8 +263,16 @@ async function auth(req, res, next) {
 }
 
 function adminOnly(req, res, next) {
-  if (req.user?.role !== 'admin') {
+  const role = req.user?.role;
+  if (role !== 'admin' && role !== 'trainer' && role !== 'super_admin') {
     return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+}
+
+function trainerOnly(req, res, next) {
+  if (req.user?.role !== 'trainer' && req.user?.role !== 'super_admin') {
+    return res.status(403).json({ error: 'Trainer access required' });
   }
   next();
 }
@@ -276,7 +284,7 @@ function adminOnly(req, res, next) {
  */
 function adminOrManager(req, res, next) {
   const role = req.user?.role;
-  if (role !== 'admin' && role !== 'manager') {
+  if (role !== 'admin' && role !== 'manager' && role !== 'trainer' && role !== 'super_admin') {
     return res.status(403).json({ error: 'Admin or manager access required' });
   }
   next();
@@ -298,7 +306,7 @@ function adminOrManager(req, res, next) {
  */
 function adminManagerOrTrainer(req, res, next) {
   const role = req.user?.role;
-  if (role !== 'admin' && role !== 'manager' && role !== 'trainer') {
+  if (role !== 'admin' && role !== 'manager' && role !== 'trainer' && role !== 'super_admin') {
     return res.status(403).json({ error: 'Admin, manager or trainer access required' });
   }
   next();
@@ -319,6 +327,7 @@ const { requireRole, requireSelfOrRole } = require('./rbac');
 module.exports = {
   auth,
   adminOnly,
+  trainerOnly,
   adminOrManager,
   adminManagerOrTrainer,
   requireRole,

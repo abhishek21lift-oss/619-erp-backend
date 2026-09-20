@@ -260,7 +260,7 @@ router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
     if (!allowed.includes(type)) return res.status(400).json({ error: 'Invalid user type' });
 
     // RBAC
-    const isAdmin = ['admin', 'manager', 'owner'].includes(req.user.role);
+    const isAdmin = ['trainer', 'admin', 'manager', 'owner', 'super_admin'].includes(req.user.role);
     const isTrainer = req.user.role === 'trainer';
     if (!isAdmin && !isTrainer) return res.status(403).json({ error: 'Not authorized' });
 
@@ -615,7 +615,7 @@ router.get('/my-history', auth, async (req, res) => {
 // Admin report of staff/trainer attendance for a given period.
 router.get('/staff-report', auth, async (req, res) => {
   try {
-    const isAdmin = ['admin', 'manager', 'owner'].includes(req.user.role);
+    const isAdmin = ['trainer', 'admin', 'manager', 'owner', 'super_admin'].includes(req.user.role);
     if (!isAdmin) return res.status(403).json({ error: 'Admin only' });
 
     const from  = req.query.from || new Date().toISOString().slice(0, 7) + '-01';

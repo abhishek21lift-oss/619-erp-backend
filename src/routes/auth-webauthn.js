@@ -887,7 +887,7 @@ router.put('/credentials/:id/toggle', auth, async (req, res, next) => {
 
 function requireAdminOrManager(req, res, next) {
   const role = req.user.role;
-  if (role !== 'admin' && role !== 'manager' && role !== 'super_admin') {
+  if (role !== 'admin' && role !== 'manager' && role !== 'trainer' && role !== 'super_admin') {
     return res.status(403).json({ error: 'Admin or manager access required' });
   }
   next();

@@ -323,14 +323,14 @@ router.delete('/users/:id', async (req, res, next) => {
     if (target.role === 'super_admin') {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Platform accounts cannot be deleted here' } });
     }
-    if (target.role === 'admin' && target.organization_id) {
+    if ((target.role === 'admin' || target.role === 'trainer') && target.organization_id) {
       const { rows: [{ count }] } = await pool.query(
         `SELECT count(*)::int AS count FROM users
-          WHERE organization_id = $1 AND role = 'admin' AND is_active = true AND deleted_at IS NULL AND id <> $2`,
+          WHERE organization_id = $1 AND role IN ('admin', 'trainer') AND is_active = true AND deleted_at IS NULL AND id <> $2`,
         [target.organization_id, req.params.id]
       );
       if (count === 0) {
-        return res.status(409).json({ error: { code: 'LAST_ADMIN', message: "Cannot delete a studio's last active admin. Add another admin first." } });
+        return res.status(409).json({ error: { code: 'LAST_ADMIN', message: "Cannot delete a studio's last active trainer. Add another trainer first." } });
       }
     }
     await pool.query(

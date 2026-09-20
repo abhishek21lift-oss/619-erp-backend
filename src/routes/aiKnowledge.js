@@ -43,7 +43,7 @@ const EXT_BY_MIME = { 'application/pdf': 'pdf', 'text/plain': 'txt' };
 /* ═══════════════════════════════════════════════════════════════════════════
    POST /api/ai/knowledge  — upload + queue a document for indexing
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/', auth, requireRole('admin', 'manager'), (req, res, next) => {
+router.post('/', auth, requireRole('trainer', 'super_admin'), (req, res, next) => {
   upload.single('file')(req, res, (err) => {
     if (err) return res.status(400).json({ error: { code: 'UPLOAD_ERROR', message: err.message } });
     next();
@@ -100,7 +100,7 @@ router.post('/', auth, requireRole('admin', 'manager'), (req, res, next) => {
 /* ═══════════════════════════════════════════════════════════════════════════
    GET /api/ai/knowledge — list this org's documents
    ═══════════════════════════════════════════════════════════════════════════ */
-router.get('/', auth, requireRole('admin', 'manager'), async (req, res) => {
+router.get('/', auth, requireRole('trainer', 'super_admin'), async (req, res) => {
   const scope = tenantScope(req);
   if (!scope.applyFilter) return res.json({ data: [] }); // platform-wide super admin: no single org to list
 
@@ -232,7 +232,7 @@ router.get('/search', auth, requireStaff, async (req, res) => {
 /* ═══════════════════════════════════════════════════════════════════════════
    DELETE /api/ai/knowledge/:id
    ═══════════════════════════════════════════════════════════════════════════ */
-router.delete('/:id', auth, requireRole('admin', 'manager'), async (req, res) => {
+router.delete('/:id', auth, requireRole('trainer', 'super_admin'), async (req, res) => {
   const scope = tenantScope(req);
   const params = [req.params.id];
   let orgClause = '';
@@ -248,7 +248,7 @@ router.delete('/:id', auth, requireRole('admin', 'manager'), async (req, res) =>
 /* ═══════════════════════════════════════════════════════════════════════════
    POST /api/ai/knowledge/:id/reindex — re-run extraction+chunking+embedding
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/:id/reindex', auth, requireRole('admin', 'manager'), async (req, res) => {
+router.post('/:id/reindex', auth, requireRole('trainer', 'super_admin'), async (req, res) => {
   const scope = tenantScope(req);
   const params = [req.params.id];
   let orgClause = '';

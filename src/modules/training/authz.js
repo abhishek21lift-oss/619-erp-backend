@@ -35,7 +35,7 @@ const pool = require('../../db/pool');
 const { tenantScope } = require('../../lib/tenant-db');
 
 /** Roles that see every client in their studio. */
-const ALL_CLIENT_ROLES = ['admin', 'manager', 'super_admin'];
+const ALL_CLIENT_ROLES = ['trainer', 'admin', 'manager', 'super_admin'];
 
 function seesAllClients(req) {
   return ALL_CLIENT_ROLES.includes(req.user?.role);

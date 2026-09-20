@@ -9,7 +9,7 @@
 
 jest.mock('../db/pool', () => ({ query: jest.fn() }));
 
-let mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+let mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
   adminOnly: (_req, _res, next) => next(),
@@ -59,7 +59,7 @@ beforeEach(() => {
   pool.query.mockReset();
   mockSend.mockReset();
   mockSend.mockResolvedValue({ status: 'sent' });
-  mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+  mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 });
 
 describe('planning', () => {
@@ -77,11 +77,11 @@ describe('planning', () => {
   });
 
   test('a trainer is refused', async () => {
-    mockUser = { id: 'u2', role: 'trainer', organization_id: 'org-1' };
-    const res = await request(app()).post('/api/ai/actions/dues_reminders/plan').send({});
-    expect(res.status).toBe(403);
-    expect(pool.query).not.toHaveBeenCalled();
-  });
+      mockUser = { id: 'u2', role: 'member', organization_id: 'org-1' };
+      const res = await request(app()).post('/api/ai/actions/dues_reminders/plan').send({});
+      expect(res.status).toBe(403);
+      expect(pool.query).not.toHaveBeenCalled();
+    });
 
   test('an unknown action is a 404, not a crash', async () => {
     const res = await request(app()).post('/api/ai/actions/drop_everything/plan').send({});
@@ -216,13 +216,13 @@ describe('executing', () => {
   });
 
   test('a trainer cannot execute even with a valid plan id', async () => {
-    mockUser = { id: 'u2', role: 'trainer', organization_id: 'org-1' };
-    const res = await request(app())
-      .post('/api/ai/actions/dues_reminders/execute')
-      .send({ plan_id: 'plan-1' });
-    expect(res.status).toBe(403);
-    expect(pool.query).not.toHaveBeenCalled();
-  });
+      mockUser = { id: 'u2', role: 'member', organization_id: 'org-1' };
+      const res = await request(app())
+        .post('/api/ai/actions/dues_reminders/execute')
+        .send({ plan_id: 'plan-1' });
+      expect(res.status).toBe(403);
+      expect(pool.query).not.toHaveBeenCalled();
+    });
 
   test('execute requires a plan — there is no unconfirmed path', async () => {
     const res = await request(app()).post('/api/ai/actions/dues_reminders/execute').send({});

@@ -2,17 +2,17 @@ jest.mock('../db/pool', () => {
   const store = [
     {
       id: 'usr-1',
-      name: 'Admin',
-      email: 'admin@619fitness.com',
-      password: '$2a$10$abcdefghijklmnopqrstuv', // not a real hash; bcrypt.compare mocked below
-      role: 'admin',
-      trainer_id: null,
-      member_id: null,
-      is_active: true,
-      token_version: 0,
-      organization_id: 'org-1',
-      organization_name: 'Test Studio',
-      organization_logo_url: null,
+            name: 'Trainer',
+            email: 'trainer@619fitness.com',
+            password: '$2a$10$abcdefghijklmnopqrstuv', // not a real hash; bcrypt.compare mocked below
+            role: 'trainer',
+            trainer_id: null,
+            member_id: null,
+            is_active: true,
+            token_version: 0,
+            organization_id: 'org-1',
+            organization_name: 'Test Studio',
+            organization_logo_url: null,
     },
   ];
   return {
@@ -67,19 +67,19 @@ app.use('/api/auth', authRouter);
 describe('POST /api/auth/login', () => {
   it('returns 200 and sets a token cookie for valid credentials', async () => {
     const res = await request(app)
-      .post('/api/auth/login')
-      .send({ email: 'admin@619fitness.com', password: 'correct-password' });
-    expect(res.status).toBe(200);
-    expect(res.body.user).toBeDefined();
-    expect(res.body.user.email).toBe('admin@619fitness.com');
-    expect(res.headers['set-cookie']).toBeDefined();
-    expect(res.headers['set-cookie'].join(';')).toMatch(/token=/);
-  });
+          .post('/api/auth/login')
+          .send({ email: 'trainer@619fitness.com', password: 'correct-password' });
+        expect(res.status).toBe(200);
+        expect(res.body.user).toBeDefined();
+        expect(res.body.user.email).toBe('trainer@619fitness.com');
+        expect(res.headers['set-cookie']).toBeDefined();
+        expect(res.headers['set-cookie'].join(';')).toMatch(/token=/);
+      });
 
-  it('returns 401 for invalid credentials', async () => {
-    const res = await request(app)
-      .post('/api/auth/login')
-      .send({ email: 'admin@619fitness.com', password: 'wrong-password' });
+      it('returns 401 for invalid credentials', async () => {
+        const res = await request(app)
+          .post('/api/auth/login')
+          .send({ email: 'trainer@619fitness.com', password: 'wrong-password' });
     expect(res.status).toBe(401);
   });
 

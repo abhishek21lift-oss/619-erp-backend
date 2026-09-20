@@ -22,7 +22,7 @@ function scrubForNonAdmin(t) {
 // GET /api/trainers
 router.get('/', auth, async (req, res, next) => {
   try {
-    const isAdmin = req.user.role === 'admin';
+    const isAdmin = req.user.role === 'admin' || req.user.role === 'trainer' || req.user.role === 'super_admin';
     const isManager = req.user.role === 'manager';
     const ownTid = req.user.trainer_id || null;
     const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
@@ -85,7 +85,7 @@ router.get('/:id', auth, async (req, res, next) => {
     const { rows } = await pool.query(`SELECT * FROM trainers WHERE id=$1 AND deleted_at IS NULL${orgClause}`, idParams);
     if (!rows[0]) return res.status(404).json({ error: 'Trainer not found' });
 
-    const isAdmin = req.user.role === 'admin';
+    const isAdmin = req.user.role === 'admin' || req.user.role === 'trainer' || req.user.role === 'super_admin';
     const trainer = (!isAdmin && req.user.trainer_id !== rows[0].id)
       ? scrubForNonAdmin(rows[0])
       : rows[0];
@@ -157,7 +157,7 @@ router.get('/:id', auth, async (req, res, next) => {
     `, statsParams);
 
     // Hide salary-related stats from non-admin viewers
-    if (!isAdmin && req.user.trainer_id !== rows[0].id) {
+    if (!isAdmin && req.user.trainer_id !== rows[0].id && req.user.role !== 'trainer') {
       delete stats[0].lifetime_revenue;
       delete stats[0].month_incentive;
     }

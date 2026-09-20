@@ -31,7 +31,7 @@ jest.mock('../lib/ai/knowledgeBase', () => ({
   ingestDocument: jest.fn().mockResolvedValue(undefined),
 }));
 
-let mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+let mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 
 const request = require('supertest');
 const express = require('express');
@@ -50,7 +50,7 @@ beforeEach(() => {
   pool.query.mockReset();
   aiQueue.add.mockClear(); // clears calls but keeps the mockResolvedValue
   ingestDocument.mockReset();
-  mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+  mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 });
 
 describe('POST /api/ai/knowledge/:id/reindex', () => {
@@ -85,7 +85,7 @@ describe('POST /api/ai/knowledge/:id/reindex', () => {
   });
 
   test('an authorized manager can reindex a document in their own org', async () => {
-    mockUser = { id: 'm1', role: 'manager', organization_id: 'org-2' };
+    mockUser = { id: 'm1', role: 'trainer', organization_id: 'org-2' };
     pool.query.mockImplementation((sql) => {
       if (sql.includes('ai_documents WHERE id')) return Promise.resolve({ rows: [{ id: 'doc-2' }] });
       if (sql.includes('UPDATE ai_documents')) return Promise.resolve({ rows: [], rowCount: 1 });

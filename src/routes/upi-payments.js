@@ -325,7 +325,7 @@ async function userIdForClient(clientId) {
 async function adminUserIds(orgId) {
   const { rows } = await pool.query(
     `SELECT id FROM users
-      WHERE organization_id = $1 AND is_active = TRUE AND role IN ('admin','manager')`,
+      WHERE organization_id = $1 AND is_active = TRUE AND role IN ('admin','manager','trainer')`,
     [orgId]
   );
   return rows.map((r) => r.id);

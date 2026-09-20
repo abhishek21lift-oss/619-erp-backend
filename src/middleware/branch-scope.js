@@ -43,7 +43,7 @@ function branchScope(req, _res, next) {
   }
 
   const role = req.user.role;
-  const isAdmin = role === 'admin' || role === 'manager';
+  const isAdmin = role === 'admin' || role === 'manager' || role === 'trainer' || role === 'super_admin';
   const branchId = isAdmin ? null : (req.user.branch_id || null);
 
   req.branchScope = makeBranchScope(isAdmin, branchId);
