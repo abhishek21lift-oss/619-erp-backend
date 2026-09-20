@@ -183,11 +183,11 @@ function extractNameCandidates(msg) {
 }
 
 const TOOLS = [
-  /* ── Client stats (any staff role; trainers see only their own roster) ── */
+  /* ── Client stats (trainer or super_admin) ── */
   {
     name: 'client_stats',
     label: 'Client Stats',
-    roles: ['admin', 'manager', 'trainer', 'reception'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(how many|count of|number of)\b.*\b(client|clients|member|members)\b|\b(active|expired|expiring|frozen)\s+(clients?|members?)\b/i.test(msg),
     async run(req) {
       const org = orgFilters(req);
@@ -218,7 +218,7 @@ const TOOLS = [
   {
     name: 'find_client',
     label: 'Client Lookup',
-    roles: ['admin', 'manager', 'trainer', 'reception'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => extractNameCandidates(msg).candidates.length > 0,
     extract: (msg) => extractNameCandidates(msg),
     async run(req, extracted) {
@@ -265,11 +265,11 @@ const TOOLS = [
     },
   },
 
-  /* ── Attendance summary ──────────────────────────────────────────────── */
+  /* ── Attendance summary ─────────────────────────────────────────────── */
   {
     name: 'attendance_summary',
     label: 'Attendance',
-    roles: ['admin', 'manager', 'trainer', 'reception'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(attendance|check-?in|checked in|present|absent)\b/i.test(msg),
     async run(req, _match, message) {
       const { from, to, label } = parseDateRange(message);
@@ -305,7 +305,7 @@ const TOOLS = [
   {
     name: 'search_exercises',
     label: 'Exercise Search',
-    roles: ['admin', 'manager', 'trainer'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\bexercises?\b.*\b(for|targeting|that work|to (train|hit))\b|\bworkout\s+(move|exercise)s?\b/i.test(msg)
       && MUSCLE_KEYWORDS.some((k) => msg.toLowerCase().includes(k)),
     extract: (msg) => {
@@ -313,18 +313,6 @@ const TOOLS = [
       return MUSCLE_KEYWORDS.find((k) => lower.includes(k)) || null;
     },
     async run(req, muscle) {
-      // Same visibility rule as the exercise library's own reads
-      // (visibilityClause in routes/exercises.js, and retrieveExerciseLibrary
-      // in routes/ai.js): built-in exercises (organization_id IS NULL) are
-      // shared by every studio; a studio's custom exercises are visible only
-      // to the trainer who wrote them, inside their own org. Deleted and
-      // archived rows never surface. The legacy `visibility` column is dead —
-      // nothing reads it, and this query does not either.
-      //
-      // Org and user come from the authenticated request (tenantScope +
-      // req.user), never from the model or the message. Fail closed: without
-      // a trusted org or user (platform-wide super admin, org-less user) we
-      // return nothing rather than broadening the query.
       const org = orgParam(req);
       const userId = req.user?.id;
       if (!org || !userId) return [];
@@ -345,11 +333,11 @@ const TOOLS = [
     },
   },
 
-  /* ── Revenue summary (financial data — admin/manager only) ───────────── */
+  /* ── Revenue summary (financial data — trainer / owner / super_admin) ───────────── */
   {
     name: 'revenue_summary',
     label: 'Revenue',
-    roles: ['admin', 'manager'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(revenue|earnings|income|collections?)\b/i.test(msg),
     async run(req, _match, message) {
       const { from, to, label } = parseDateRange(message);
@@ -371,13 +359,9 @@ const TOOLS = [
   {
     name: 'dues_summary',
     label: 'Outstanding Dues',
-    roles: ['admin', 'manager'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(outstanding|pending)\s+dues?\b|\bwho owes\b|\bunpaid\b|\bbalance\s+(due|owed)\b/i.test(msg),
     async run(req) {
-      // Canonical dues: totals are unbounded aggregates (same population as
-      // /api/reports/dues/summary); the top-10 rows are for naming names only.
-      // Summing the top-10 and presenting it as the studio total understated
-      // dues for any studio with more than ten debtors.
       const org = orgFilters(req);
       const params = [];
       let orgFilter = '';
@@ -415,7 +399,7 @@ const TOOLS = [
   {
     name: 'trainer_roster',
     label: 'Trainers',
-    roles: ['admin', 'manager', 'trainer', 'reception'],
+    roles: ['trainer', 'admin', 'manager', 'super_admin'],
     test: (msg) => /\b(list|how many|who are the)\b.*\btrainers?\b/i.test(msg),
     async run(req) {
       const org = orgFilters(req);

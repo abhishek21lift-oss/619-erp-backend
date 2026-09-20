@@ -275,10 +275,6 @@ router.get('/clients/search', auth, wrap(async (req, res) => {
 async function clientHistory(req, res, load) {
   const client = await svc.findClientForAccess(req.params.id, tenantScope(req));
   if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-  if (req.user.role === 'trainer'
-      && (!req.user.trainer_id || client.trainer_id !== req.user.trainer_id)) {
-    return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied' } });
-  }
   const rows = await load(req.params.id, { limit: req.query.limit, offset: req.query.offset });
   return res.json(rows);
 }
@@ -2050,7 +2046,7 @@ router.get('/dashboard/ops', auth, wrap(async (req, res) => {
   // merge this endpoint had no trainer scoping at all, so a trainer's
   // dashboard listed every client in the studio while /pt-os/today — the same
   // question, the other screen — showed them only their own.
-  const isStaff = ['admin', 'manager', 'super_admin'].includes(req.user.role);
+  const isStaff = ['trainer', 'admin', 'manager', 'super_admin'].includes(req.user.role);
   const data = await svc.getOpsSummary(
     tenantScope(req),
     isStaff ? null : (req.user.trainer_id || null),

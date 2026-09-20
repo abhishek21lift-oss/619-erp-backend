@@ -64,7 +64,7 @@ router.get('/', auth, async (req, res, next) => {
       [settingsOrg(req)]
     );
 
-    const isAdminLevel = ['admin', 'super_admin'].includes(req.user.role);
+    const isAdminLevel = ['trainer', 'admin', 'super_admin'].includes(req.user.role);
     const RESTRICTED_PREFIXES = ['internal_', 'geo_', 'biometric_', 'feature_'];
     const visibleRows = isAdminLevel
       ? rows

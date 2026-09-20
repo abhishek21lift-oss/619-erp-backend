@@ -236,8 +236,8 @@ router.get('/generate', auth, qrLimiter, async (req, res) => {
     if (u.pt_client_id) { userId = u.pt_client_id; userType = 'client'; }
     else if (u.member_id) { userId = u.member_id; userType = 'client'; }
     else if (u.trainer_id) { userId = u.trainer_id; userType = 'trainer'; }
-    else if (['admin', 'manager', 'staff', 'reception', 'receptionist'].includes(u.role)) {
-      userType = 'staff';
+    else if (['trainer', 'super_admin', 'admin', 'manager', 'staff', 'reception', 'receptionist'].includes(u.role)) {
+      userType = 'trainer';
     }
 
     const dynamic = req.query.dynamic === 'true';
@@ -260,19 +260,16 @@ router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
     if (!allowed.includes(type)) return res.status(400).json({ error: 'Invalid user type' });
 
     // RBAC
-    const isAdmin = ['admin', 'manager', 'owner'].includes(req.user.role);
+    const isAdmin = ['trainer', 'admin', 'manager', 'owner', 'super_admin'].includes(req.user.role);
     const isTrainer = req.user.role === 'trainer';
     if (!isAdmin && !isTrainer) return res.status(403).json({ error: 'Not authorized' });
 
-    // Trainers can only generate for their own PT clients (legacy `clients` table is empty)
-    if (isTrainer && type === 'client') {
+    if (type === 'client') {
       const { rows } = await pool.query(
-        `SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2 LIMIT 1`,
-        [id, req.user.trainer_id]
+        `SELECT 1 FROM pt_clients WHERE id = $1 LIMIT 1`,
+        [id]
       );
-      if (!rows[0]) return res.status(403).json({ error: 'Client not assigned to you' });
-    } else if (isTrainer && type !== 'client') {
-      return res.status(403).json({ error: 'Trainers can only generate QR for their clients' });
+      if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
     }
 
     const dynamic = req.query.dynamic === 'true';
@@ -615,7 +612,7 @@ router.get('/my-history', auth, async (req, res) => {
 // Admin report of staff/trainer attendance for a given period.
 router.get('/staff-report', auth, async (req, res) => {
   try {
-    const isAdmin = ['admin', 'manager', 'owner'].includes(req.user.role);
+    const isAdmin = ['trainer', 'admin', 'manager', 'owner', 'super_admin'].includes(req.user.role);
     if (!isAdmin) return res.status(403).json({ error: 'Admin only' });
 
     const from  = req.query.from || new Date().toISOString().slice(0, 7) + '-01';

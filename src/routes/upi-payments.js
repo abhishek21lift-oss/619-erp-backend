@@ -321,11 +321,11 @@ async function userIdForClient(clientId) {
   return rows[0]?.id || null;
 }
 
-/** Studio admins and managers — the people who verify payments. */
+/** Studio trainers / admins — the people who verify payments. */
 async function adminUserIds(orgId) {
   const { rows } = await pool.query(
     `SELECT id FROM users
-      WHERE organization_id = $1 AND is_active = TRUE AND role IN ('admin','manager')`,
+      WHERE organization_id = $1 AND is_active = TRUE AND role IN ('trainer','admin','manager')`,
     [orgId]
   );
   return rows.map((r) => r.id);

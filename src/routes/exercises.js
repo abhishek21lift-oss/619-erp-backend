@@ -21,7 +21,7 @@ const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 
 // ─── PERMISSIONS ──────────────────────────────────────────────
 
-const FULL_ACCESS = new Set(['super_admin', 'admin', 'manager']);
+const FULL_ACCESS = new Set(['super_admin', 'trainer', 'admin', 'manager']);
 
 /** May create a custom exercise at all. */
 function canCreate(user) {

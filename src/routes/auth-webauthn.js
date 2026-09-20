@@ -887,8 +887,8 @@ router.put('/credentials/:id/toggle', auth, async (req, res, next) => {
 
 function requireAdminOrManager(req, res, next) {
   const role = req.user.role;
-  if (role !== 'admin' && role !== 'manager' && role !== 'super_admin') {
-    return res.status(403).json({ error: 'Admin or manager access required' });
+  if (role !== 'trainer' && role !== 'admin' && role !== 'manager' && role !== 'super_admin') {
+    return res.status(403).json({ error: 'Trainer access required' });
   }
   next();
 }
@@ -984,7 +984,7 @@ router.get('/admin/credentials', auth, requireAdminOrManager, async (req, res, n
 // DELETE /admin/credentials/:id — admin revoke, tenant-scoped so an org admin
 // can only revoke passkeys belonging to a user in their own organization.
 router.delete('/admin/credentials/:id', auth, async (req, res, next) => {
-  if (req.user.role !== 'admin' && req.user.role !== 'super_admin') {
+  if (req.user.role !== 'trainer' && req.user.role !== 'admin' && req.user.role !== 'super_admin') {
     return res.status(403).json({ error: 'Admin only' });
   }
   try {

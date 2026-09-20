@@ -219,7 +219,7 @@ router.get('/revenue-target', auth, async (req, res, next) => {
         set_at: row?.created_at ?? null,
         // Only an admin may set it; surfaced so the UI shows the right message
         // to a trainer rather than a form that will 403.
-        can_set: req.user.role === 'admin' || req.user.role === 'super_admin',
+        can_set: req.user.role === 'trainer' || req.user.role === 'admin' || req.user.role === 'super_admin',
       },
     });
   } catch (err) {

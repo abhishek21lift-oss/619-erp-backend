@@ -60,7 +60,7 @@ const authSchemas = {
       name: z.string().min(1, 'Name is required').max(255).transform(function(v) { return v.trim(); }),
       email: emailSchema,
       password: passwordSchema,
-      role: z.enum(['admin', 'manager', 'trainer', 'reception', 'member']).default('trainer'),
+      role: z.enum(['super_admin', 'trainer', 'member', 'admin', 'manager', 'reception', 'staff']).transform(r => (['admin', 'manager', 'reception', 'staff'].includes(r) ? 'trainer' : r)).default('trainer'),
       trainer_id: z.string().optional().nullable(),
       member_id: z.string().optional().nullable(),
     }),
