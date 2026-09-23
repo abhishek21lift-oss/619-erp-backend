@@ -29,6 +29,10 @@
 --   and communication_logs hold only 'client' rows. So the data change is
 --   admin → trainer, 1:1 per studio, and nothing else moves.
 --
+--   One admin has no linked trainer profile, but a live, unlinked profile
+--   with the same email exists in their studio (measured 2026-09-23, after
+--   the first deployment failed on it — see step 3). It is linked, not copied.
+--
 -- ── Refuses rather than guesses ────────────────────────────────────────────
 --
 -- A database whose data does not fit the model — two live staff accounts in
@@ -91,6 +95,23 @@ BEGIN
     RAISE EXCEPTION '208: % staff account(s) are linked to a trainer profile in a different organization', n;
   END IF;
 
+  -- Step 3 links an unlinked account to the trainer profile that already
+  -- carries its email, since trainers_email_uniq (global, soft-deleted rows
+  -- included) leaves room for only one. That profile has to be one the
+  -- account can own: in its studio, live, and nobody else's.
+  SELECT COUNT(*) INTO n
+    FROM users u
+    JOIN trainers t ON LOWER(t.email) = LOWER(u.email)
+   WHERE u.role IN ('admin', 'manager', 'trainer', 'reception', 'receptionist', 'staff')
+     AND u.deleted_at IS NULL AND u.trainer_id IS NULL
+     AND COALESCE(u.email, '') <> ''
+     AND (t.organization_id IS DISTINCT FROM u.organization_id
+          OR t.deleted_at IS NOT NULL
+          OR EXISTS (SELECT 1 FROM users o WHERE o.trainer_id = t.id));
+  IF n > 0 THEN
+    RAISE EXCEPTION '208: % unlinked staff account(s) share an email with a trainer profile they cannot own (another studio''s, deleted, or already linked)', n;
+  END IF;
+
   SELECT COUNT(*) INTO n FROM attendance_logs WHERE ref_type NOT IN ('client', 'trainer');
   IF n > 0 THEN
     RAISE EXCEPTION '208: % attendance row(s) are about a staff/user subject that no longer exists as a type', n;
@@ -151,22 +172,40 @@ UPDATE users
 --
 -- pt_clients, pt_sessions, pt_payments and QR check-in link to `trainers`,
 -- and the studio's trainer checks in as their profile. An owner created
--- before profiles were linked (one production account) gets one now, in
+-- before profiles were linked (one production account) is linked now, in
 -- their own organization.
+--
+-- That production owner already HAS a profile — live, in their studio, with
+-- their email, just never linked to the account. The first deployment of this
+-- file inserted a second one regardless and failed on trainers_email_uniq
+-- (rolled back; nothing changed). So an existing profile with the account's
+-- email is linked, and a new one is created only when there is none. The
+-- preflight has already refused any such profile the account could not own.
 DO $$
 DECLARE
   r RECORD;
-  new_id TEXT;
+  profile_id TEXT;
 BEGIN
   FOR r IN
     SELECT id, name, email, organization_id
       FROM users
      WHERE role = 'trainer' AND deleted_at IS NULL AND trainer_id IS NULL
   LOOP
-    INSERT INTO trainers (name, email, organization_id)
-    VALUES (r.name, r.email, r.organization_id)
-    RETURNING id INTO new_id;
-    UPDATE users SET trainer_id = new_id, updated_at = NOW() WHERE id = r.id;
+    profile_id := NULL;
+    SELECT t.id INTO profile_id
+      FROM trainers t
+     WHERE COALESCE(r.email, '') <> ''
+       AND LOWER(t.email) = LOWER(r.email)
+       AND t.organization_id = r.organization_id
+       AND t.deleted_at IS NULL;
+
+    IF profile_id IS NULL THEN
+      INSERT INTO trainers (name, email, organization_id)
+      VALUES (r.name, r.email, r.organization_id)
+      RETURNING id INTO profile_id;
+    END IF;
+
+    UPDATE users SET trainer_id = profile_id, updated_at = NOW() WHERE id = r.id;
   END LOOP;
 END $$;
 
