@@ -66,6 +66,15 @@ describe('the preflight refuses rather than guesses', () => {
     expect(body).toMatch(/RAISE EXCEPTION '208: % attendance row\(s\)/);
     expect(body).toMatch(/RAISE EXCEPTION '208: % communication row\(s\)/);
   });
+
+  it('raises on an email collision with a profile the account cannot own', () => {
+    // trainers_email_uniq is global, so an unlinked account whose email is on
+    // ANOTHER studio's profile, a deleted one, or one already linked to someone
+    // else can neither get a new profile nor take that one.
+    expect(body).toMatch(/RAISE EXCEPTION '208: % unlinked staff account\(s\) share an email with a trainer profile they cannot own/);
+    const check = body.slice(body.indexOf('JOIN trainers t ON LOWER(t.email) = LOWER(u.email)'));
+    expect(check).toMatch(/t\.organization_id IS DISTINCT FROM u\.organization_id\s*OR t\.deleted_at IS NOT NULL\s*OR EXISTS \(SELECT 1 FROM users o WHERE o\.trainer_id = t\.id\)/);
+  });
 });
 
 describe('every destructive step is recoverable', () => {
@@ -139,6 +148,22 @@ describe('the data it moves', () => {
   it('gives a live trainer without a profile one in their OWN organization', () => {
     expect(body).toMatch(/INSERT INTO trainers \(name, email, organization_id\)/);
     expect(body).toMatch(/VALUES \(r\.name, r\.email, r\.organization_id\)/);
+  });
+
+  it('links the profile that already carries the owner\'s email instead of inserting a duplicate', () => {
+    // The first production deployment failed here: the unlinked owner already
+    // had a profile with their email, and a second INSERT broke
+    // trainers_email_uniq. The lookup must come first, stay inside the owner's
+    // studio, skip deleted rows, and the INSERT must only run when it found
+    // nothing.
+    const step = body.slice(body.indexOf('profile_id := NULL'), body.indexOf('ALTER TABLE users ALTER COLUMN role DROP DEFAULT'));
+    const lookup = step.indexOf('SELECT t.id INTO profile_id');
+    const insert = step.indexOf('INSERT INTO trainers');
+    expect(lookup).toBeGreaterThan(-1);
+    expect(insert).toBeGreaterThan(lookup);
+    expect(step).toMatch(/LOWER\(t\.email\) = LOWER\(r\.email\)\s*AND t\.organization_id = r\.organization_id\s*AND t\.deleted_at IS NULL/);
+    expect(step).toMatch(/IF profile_id IS NULL THEN\s*INSERT INTO trainers/);
+    expect(step).toMatch(/UPDATE users SET trainer_id = profile_id/);
   });
 
   it('remaps announcement audiences instead of leaving them addressed to nobody', () => {
