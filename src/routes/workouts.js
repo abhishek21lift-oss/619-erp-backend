@@ -2,10 +2,7 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
-// adminOrManager is gone from this file with the exercise write endpoints —
-// exercise authoring is now trainer-accessible and lives in routes/exercises.js.
-const { auth, adminManagerOrTrainer } = require('../middleware/auth');
-const { requireStaff } = require('../middleware/rbac');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
@@ -43,11 +40,10 @@ const logger = require('../lib/logger');
  *
  * @param {object} req
  * @param {number} nextParam  1-based index of the next free $n placeholder
- * @returns {{ sql: string, params: any[] }} — sql is '' for a super admin
+ * @returns {{ sql: string, params: any[] }}
  */
 function planReadFilter(req, nextParam) {
   const scope = tenantScope(req);
-  if (!scope.applyFilter) return { sql: '', params: [] };
   // Shared platform templates (organization_id IS NULL) stay visible.
   return {
     sql: `(wp.organization_id = $${nextParam} OR wp.organization_id IS NULL)`,
@@ -58,16 +54,12 @@ function planReadFilter(req, nextParam) {
 /**
  * Load a plan the caller is allowed to MODIFY, or explain why not.
  *
- * Two independent checks, in the order that leaks least:
+ * The plan must belong to the caller's studio outright. A NULL
+ * organization_id (the shared platform library) is readable by every studio
+ * and writable by none. Within the studio there is no further check: the
+ * trainer owns every plan in it.
  *
- *   1. Tenant. The plan must belong to the caller's studio outright. A NULL
- *      organization_id is readable by everyone but writable by nobody except a
- *      super admin, so a studio cannot edit the shared library.
- *   2. Trainer ownership. A trainer may modify a plan they created, or one
- *      assigned to a client they train. Admin and manager skip this — they own
- *      the whole studio.
- *
- * Both failures return 404 rather than 403. A 403 on a plan in another studio
+ * Failure returns 404 rather than 403. A 403 on a plan in another studio
  * confirms that the id exists, which is exactly the fact the tenant boundary is
  * meant to hide.
  *
@@ -78,25 +70,8 @@ async function loadEditablePlan(req, planId, client = pool) {
   const conds = ['wp.id = $1', 'wp.deleted_at IS NULL'];
   const params = [planId];
 
-  if (scope.applyFilter) {
-    conds.push(`wp.organization_id = $${params.length + 1}`);
-    params.push(scope.orgId);
-  }
-
-  if (req.user?.role === 'trainer') {
-    // Created it, or it is assigned to one of their clients. EXISTS rather
-    // than a join so a plan assigned to several clients yields one row.
-    conds.push(`(
-      wp.created_by = $${params.length + 1}
-      OR EXISTS (
-        SELECT 1 FROM workout_assignments wa
-          JOIN pt_clients pc ON pc.id = wa.client_id
-         WHERE wa.workout_plan_id = wp.id
-           AND pc.trainer_id = $${params.length + 2}
-      )
-    )`);
-    params.push(req.user.id, req.user.trainer_id || '');
-  }
+  conds.push(`wp.organization_id = $${params.length + 1}`);
+  params.push(scope.orgId);
 
   const { rows } = await client.query(
     `SELECT wp.* FROM workout_plans wp WHERE ${conds.join(' AND ')}`,
@@ -150,7 +125,7 @@ router.get('/plans', auth, async (req, res, next) => {
     if (client_id) {
       conds.push(`wa.client_id = $${p++}`); params.push(client_id);
       const wscope = tenantScope(req);
-      if (wscope.applyFilter) { conds.push(`wa.organization_id = $${p++}`); params.push(wscope.orgId); }
+      conds.push(`wa.organization_id = $${p++}`); params.push(wscope.orgId);
     }
 
     const joinClause = client_id
@@ -168,28 +143,17 @@ router.get('/plans', auth, async (req, res, next) => {
     // therefore read "0% complete" — not because nobody had trained, but
     // because the query never asked.
     //
-    // Two restrictions, both load-bearing:
-    //
-    //   · organization. workout_assignments is tenant data (086). Without
-    //     this, one studio's plan card would name another studio's clients.
-    //   · trainer. GET /api/pt/clients already narrows to req.user.trainer_id
-    //     for a trainer, so a trainer sees only their own clients everywhere
-    //     else on this page. Returning every client on the plan here would
-    //     hand them names the rest of the app deliberately withholds.
+    // Restricted to the organization: workout_assignments is tenant data
+    // (086), and without this one studio's plan card would name another
+    // studio's clients.
     //
     // Shared platform templates (organization_id IS NULL) stay readable by
     // everyone, but their assignments are still filtered to the caller's own
     // studio — the template is shared, the roster on it is not.
     const scope = tenantScope(req);
     const assignConds = ["wa.status = 'active'", 'pc.deleted_at IS NULL'];
-    if (scope.applyFilter) {
-      assignConds.push(`wa.organization_id = $${p++}`);
-      params.push(scope.orgId);
-    }
-    if (req.user?.role === 'trainer') {
-      assignConds.push(`pc.trainer_id = $${p++}`);
-      params.push(req.user.trainer_id || '');
-    }
+    assignConds.push(`wa.organization_id = $${p++}`);
+    params.push(scope.orgId);
 
     const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
@@ -216,7 +180,7 @@ router.get('/plans', auth, async (req, res, next) => {
           'start_date',   wa_r.start_date
         ) ORDER BY pc.name)
         FROM workout_assignments wa_r
-        JOIN pt_clients pc ON pc.id = wa_r.client_id
+        JOIN pt_clients pc ON pc.id = wa_r.client_id AND pc.organization_id = wa_r.organization_id
         WHERE wa_r.workout_plan_id = wp.id
           AND ${assignConds.join(' AND ').replace(/\bwa\./g, 'wa_r.')}), '[]'::json) AS assignments
       FROM workout_plans wp
@@ -375,11 +339,11 @@ async function lockPlan(client, planId) {
   await client.query('SELECT id FROM workout_plans WHERE id = $1 FOR UPDATE', [planId]);
 }
 
-// requireStaff. planReadFilter() is org-scoped (plus the shared NULL-org
+// requireTrainer. planReadFilter() is org-scoped (plus the shared NULL-org
 // library), so `auth` alone exposed every plan the studio has authored to any
 // member who guessed an id. A member reaches their own programme through
 // /api/me and the assignment routes, never here.
-router.get('/plans/:id', auth, requireStaff, async (req, res, next) => {
+router.get('/plans/:id', auth, requireTrainer, async (req, res, next) => {
   try {
     const tenant = planReadFilter(req, 2);
     const { rows: planRows } = await pool.query(
@@ -495,7 +459,7 @@ router.get('/plans/:id', auth, requireStaff, async (req, res, next) => {
 // A body-shaped API would let any caller post any plan and have it filed as an
 // accepted AI proposal — including exercises the safety screen excluded, with
 // that screen's own record attached saying they were not. See acceptGeneration.
-router.post('/plans/from-generation', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.post('/plans/from-generation', auth, requireTrainer, async (req, res, next) => {
   const { generation_id: generationId, name } = req.body || {};
   if (!generationId) return res.status(400).json({ error: 'generation_id is required' });
 
@@ -561,7 +525,7 @@ router.post('/plans/from-generation', auth, adminManagerOrTrainer, async (req, r
   }
 });
 
-router.post('/plans', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.post('/plans', auth, requireTrainer, async (req, res, next) => {
   const d = req.body;
   if (!d.name?.trim())
     return res.status(400).json({ error: 'Plan name required' });
@@ -635,7 +599,7 @@ router.post('/plans', auth, adminManagerOrTrainer, async (req, res, next) => {
 // autosave through here — a save of one day would delete the other six, and
 // every save would invalidate the ids the UI is dragging. Use the granular
 // endpoints below for incremental edits.
-router.put('/plans/:id', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.put('/plans/:id', auth, requireTrainer, async (req, res, next) => {
   const client = await pool.connect();
   try {
     const d = req.body;
@@ -711,7 +675,7 @@ router.put('/plans/:id', auth, adminManagerOrTrainer, async (req, res, next) => 
 // write would mint a snapshot per keystroke. This is the deliberate action.
 
 // POST /api/workouts/plans/:id/versions — freeze the current state as history.
-router.post('/plans/:id/versions', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.post('/plans/:id/versions', auth, requireTrainer, async (req, res, next) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -816,7 +780,7 @@ router.get('/plans/:id/versions', auth, async (req, res, next) => {
 // possible at all.
 
 // POST /api/workouts/plans/:id/exercises — append one exercise to a day
-router.post('/plans/:id/exercises', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.post('/plans/:id/exercises', auth, requireTrainer, async (req, res, next) => {
   const client = await pool.connect();
   try {
     const plan = await loadEditablePlan(req, req.params.id, client);
@@ -870,7 +834,7 @@ router.post('/plans/:id/exercises', auth, adminManagerOrTrainer, async (req, res
 });
 
 // PATCH /api/workouts/plans/:id/exercises/:rowId — edit fields in place
-router.patch('/plans/:id/exercises/:rowId', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.patch('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, res, next) => {
   const client = await pool.connect();
   try {
     const plan = await loadEditablePlan(req, req.params.id, client);
@@ -960,7 +924,7 @@ router.patch('/plans/:id/exercises/:rowId', auth, adminManagerOrTrainer, async (
 });
 
 // DELETE /api/workouts/plans/:id/exercises/:rowId
-router.delete('/plans/:id/exercises/:rowId', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.delete('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, res, next) => {
   const client = await pool.connect();
   try {
     const plan = await loadEditablePlan(req, req.params.id, client);
@@ -1019,7 +983,7 @@ router.delete('/plans/:id/exercises/:rowId', auth, adminManagerOrTrainer, async 
 // The way out of an edit. Deleting a week's own rows makes it computed again,
 // so it goes back to following the nearest earlier anchor — and so do the
 // weeks after it, unless they have edits of their own.
-router.delete('/plans/:id/weeks/:week', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.delete('/plans/:id/weeks/:week', auth, requireTrainer, async (req, res, next) => {
   try {
     const plan = await loadEditablePlan(req, req.params.id);
     if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
@@ -1040,7 +1004,7 @@ router.delete('/plans/:id/weeks/:week', auth, adminManagerOrTrainer, async (req,
 });
 
 // PUT /api/workouts/plans/:id/days/:day/order — reorder one day, ids preserved
-router.put('/plans/:id/days/:day/order', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.put('/plans/:id/days/:day/order', auth, requireTrainer, async (req, res, next) => {
   const client = await pool.connect();
   try {
     const plan = await loadEditablePlan(req, req.params.id, client);
@@ -1107,7 +1071,7 @@ router.put('/plans/:id/days/:day/order', auth, adminManagerOrTrainer, async (req
 });
 
 // DELETE /api/workouts/plans/:id
-router.delete('/plans/:id', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.delete('/plans/:id', auth, requireTrainer, async (req, res, next) => {
   try {
     const plan = await loadEditablePlan(req, req.params.id);
     if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
@@ -1134,7 +1098,7 @@ router.get('/assignments', auth, async (req, res, next) => {
     let p = 2;
     if (status) { conds.push(`wa.status = $${p++}`); params.push(status); }
     const scope = tenantScope(req);
-    if (scope.applyFilter) { conds.push(`wa.organization_id = $${p++}`); params.push(scope.orgId); }
+    conds.push(`wa.organization_id = $${p++}`); params.push(scope.orgId);
 
     const { rows } = await pool.query(`
       SELECT wa.*, wp.name AS plan_name, wp.goal AS plan_goal,
@@ -1154,20 +1118,20 @@ router.get('/assignments', auth, async (req, res, next) => {
 
 // GET /api/workouts/assignments/:id — single assignment + its plan's full
 // prescribed exercises (feeds "today's prescribed exercises" in the log).
-// requireStaff. tenantScope() below bounds the studio and says nothing about
+// requireTrainer. tenantScope() below bounds the studio and says nothing about
 // which client inside it, so `auth` alone let any member read any assignment
 // in their studio by id — the plan, its goal and every exercise on it.
-router.get('/assignments/:id', auth, requireStaff, async (req, res, next) => {
+router.get('/assignments/:id', auth, requireTrainer, async (req, res, next) => {
   try {
     const scope = tenantScope(req);
-    const guard = scope.applyFilter ? ' AND wa.organization_id = $2' : '';
+    const guard = ' AND wa.organization_id = $2';
     const { rows: assignRows } = await pool.query(`
       SELECT wa.*, wp.name AS plan_name, wp.goal AS plan_goal,
              wp.duration_weeks, wp.sessions_per_week
         FROM workout_assignments wa
         JOIN workout_plans wp ON wp.id = wa.workout_plan_id
        WHERE wa.id = $1${guard}`,
-      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+      [req.params.id, scope.orgId]
     );
     const assignment = assignRows[0];
     if (!assignment) return res.status(404).json({ error: 'Assignment not found' });
@@ -1188,7 +1152,7 @@ router.get('/assignments/:id', auth, requireStaff, async (req, res, next) => {
 });
 
 // POST /api/workouts/assign
-router.post('/assign', auth, adminManagerOrTrainer, async (req, res, next) => {
+router.post('/assign', auth, requireTrainer, async (req, res, next) => {
   try {
     const d = req.body;
     if (!d.workout_plan_id || !d.client_id)
@@ -1201,8 +1165,10 @@ router.post('/assign', auth, adminManagerOrTrainer, async (req, res, next) => {
     //      platform template, which is legitimate to assign even though it
     //      cannot be edited. planReadFilter, not loadEditablePlan, for exactly
     //      that reason.
-    //   2. A trainer may only assign to their own client. Without this a
-    //      trainer could attach a programme to any client in the studio.
+    //   2. The client must be a live client of THIS studio. The upsert below
+    //      is keyed on (plan, client) with no organization, and a shared
+    //      platform template is assignable by every studio — so without this
+    //      a studio could revive or rewrite another studio's assignment.
     const tenant = planReadFilter(req, 2);
     const { rows: planRows } = await pool.query(
       `SELECT wp.id FROM workout_plans wp
@@ -1212,14 +1178,12 @@ router.post('/assign', auth, adminManagerOrTrainer, async (req, res, next) => {
     );
     if (!planRows[0]) return res.status(404).json({ error: 'Workout plan not found' });
 
-    if (req.user.role === 'trainer') {
-      const { rows: mine } = await pool.query(
-        'SELECT 1 FROM pt_clients WHERE id = $1 AND trainer_id = $2',
-        [d.client_id, req.user.trainer_id || '']
-      );
-      // 404, not 403: a 403 would confirm the client exists.
-      if (!mine[0]) return res.status(404).json({ error: 'Client not found' });
-    }
+    const { rows: mine } = await pool.query(
+      'SELECT 1 FROM pt_clients WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL',
+      [d.client_id, orgIdOf(req)]
+    );
+    // 404, not 403: a 403 would confirm the client exists.
+    if (!mine[0]) return res.status(404).json({ error: 'Client not found' });
 
     // PAR-Q + Informed Consent gate — shared with Workout Log session
     // creation (src/lib/screeningGate.js) so both entry points enforce the
@@ -1246,6 +1210,8 @@ router.post('/assign', auth, adminManagerOrTrainer, async (req, res, next) => {
       DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date,
         end_date = EXCLUDED.end_date,
         organization_id = COALESCE(workout_assignments.organization_id, EXCLUDED.organization_id), updated_at = NOW()
+      WHERE workout_assignments.organization_id IS NULL
+         OR workout_assignments.organization_id = EXCLUDED.organization_id
       RETURNING *`,
       [randomUUID(), d.workout_plan_id, d.client_id, req.user.trainer_id || null,
        d.start_date || new Date().toISOString().split('T')[0],
@@ -1259,21 +1225,21 @@ router.post('/assign', auth, adminManagerOrTrainer, async (req, res, next) => {
 });
 
 // PUT /api/workouts/assignments/:id/progress
-// requireStaff. Same org-not-role gap as the read above, but a WRITE: a member
+// requireTrainer. Same org-not-role gap as the read above, but a WRITE: a member
 // could set any other client's progress_pct, which is what the roster and the
 // client's own portal display back as their completion.
-router.put('/assignments/:id/progress', auth, requireStaff, async (req, res, next) => {
+router.put('/assignments/:id/progress', auth, requireTrainer, async (req, res, next) => {
   try {
     const pct = parseInt(req.body.progress_pct);
     if (isNaN(pct) || pct < 0 || pct > 100)
       return res.status(400).json({ error: 'progress_pct must be 0-100' });
 
     const scope = tenantScope(req);
-    const guard = scope.applyFilter ? ' AND organization_id = $3' : '';
+    const guard = ' AND organization_id = $3';
     const { rows } = await pool.query(`
       UPDATE workout_assignments SET progress_pct=$1, updated_at=NOW()
       WHERE id=$2${guard} RETURNING *`,
-      scope.applyFilter ? [pct, req.params.id, scope.orgId] : [pct, req.params.id]
+      [pct, req.params.id, scope.orgId]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Assignment not found' });
     res.json({ message: 'Progress updated', assignment: rows[0] });

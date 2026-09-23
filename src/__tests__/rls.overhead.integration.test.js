@@ -176,5 +176,8 @@ describeIf('what the org-scoping wrapper costs', () => {
     // asserted above. This only catches a pathological regression — the
     // wrapper growing an N+1 or a retry loop.
     expect(s).toBeLessThan(b * 25);
-  });
+    // 200 interleaved runs of 1 + 4 round trips. The test deliberately asserts
+    // no wall-clock threshold, so jest's 5s default must not become one by
+    // accident on a slow link (Docker Desktop's host bridge is ~1-2 ms/RTT).
+  }, 60000);
 });

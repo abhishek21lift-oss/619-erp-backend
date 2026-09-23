@@ -65,7 +65,7 @@ const ACTIONS = [
     title: 'Send renewal reminders',
     /** Leaves the building. The confirmation step is not decoration. */
     outward: true,
-    roles: ['admin', 'manager', 'super_admin'],
+    roles: ['trainer'],
     describe: (p) => `WhatsApp every active client whose package ends within ${p.days} days`,
     normalize: (body = {}) => ({ days: clampInt(body.days, { min: 1, max: 90, fallback: 7 }) }),
 
@@ -76,10 +76,8 @@ const ACTIONS = [
                    AND status = 'active'
                    AND pt_end_date IS NOT NULL
                    AND pt_end_date::DATE BETWEEN CURRENT_DATE AND CURRENT_DATE + ($1 || ' days')::INTERVAL`;
-      if (scope.applyFilter) {
-        values.push(scope.orgId);
-        where += ` AND organization_id = $${values.length}`;
-      }
+      values.push(scope.orgId);
+      where += ` AND organization_id = $${values.length}`;
       const { rows } = await pool.query(
         `SELECT id, name, mobile, pt_end_date::TEXT,
                 (pt_end_date::DATE - CURRENT_DATE)::INT AS days_left
@@ -122,7 +120,7 @@ const ACTIONS = [
     id: 'dues_reminders',
     title: 'Send payment reminders',
     outward: true,
-    roles: ['admin', 'manager', 'super_admin'],
+    roles: ['trainer'],
     describe: (p) => `WhatsApp every client with a balance over ${moneyINR(p.min_balance)}`,
     normalize: (body = {}) => ({
       min_balance: clampInt(body.min_balance, { min: 1, max: 1_000_000, fallback: 1 }),
@@ -132,10 +130,8 @@ const ACTIONS = [
       const scope = tenantScope(req);
       const values = [params.min_balance];
       let where = `deleted_at IS NULL AND balance_amount >= $1`;
-      if (scope.applyFilter) {
-        values.push(scope.orgId);
-        where += ` AND organization_id = $${values.length}`;
-      }
+      values.push(scope.orgId);
+      where += ` AND organization_id = $${values.length}`;
       const { rows } = await pool.query(
         `SELECT id, name, mobile, balance_amount
            FROM pt_clients
@@ -219,7 +215,7 @@ function findAction(id) {
 }
 
 function canRun(action, user) {
-  return Boolean(action && user && action.roles.includes(user.role));
+  return Boolean(action && user && Array.isArray(action.roles) && action.roles.includes(user.role));
 }
 
 /** What this user is allowed to see offered. */

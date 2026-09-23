@@ -11,35 +11,30 @@
  *   GET /api/insights/attendance/today             — today summary
  *   GET /api/insights/renewals?from&to             — TRUE renewal conversion + pipeline counts
  *   GET /api/insights/renewals/rows?days&limit     — renewal pipeline rows (top-N)
- *   GET /api/insights/trainers                     — canonical trainer summary
  *   GET /api/insights/utilisation                  — session completion
  *   GET /api/insights/business                     — deterministic business insights (no LLM)
  *
- * Guards: mount adds [auth, requireStaff, requireFeature('insights')] in
- * server.js. Trainers are clamped to their own rows; members never reach here
- * (requireStaff). orgId comes from tenantScope — null only for platform-wide
- * super_admin.
+ * Guards: mount adds [auth, requireTrainer, requireFeature('insights')] in
+ * server.js. Members never reach here (requireTrainer). orgId comes from
+ * tenantScope — always the trainer's own studio, and every metric covers that
+ * whole studio.
  *
  * Compatibility: /api/reports stays mounted and delegates to the same
  * metric-engine (see routes/reports.js). New clients use /api/insights/*.
  */
 const router = require('express').Router();
-const { auth, adminOnly } = require('../../middleware/auth');
+const { auth } = require('../../middleware/auth');
 const { tenantScope } = require('../../lib/tenant-db');
 const engine = require('./metric-engine');
 const { buildBusinessInsights } = require('./insights-engine');
 
 function orgParam(req) {
   const scope = tenantScope(req);
-  return scope.applyFilter ? scope.orgId : null;
-}
-
-function trainerParam(req) {
-  return req.user && req.user.role === 'trainer' ? req.user.trainer_id || null : null;
+  return scope.orgId;
 }
 
 function ctx(req) {
-  return { orgId: orgParam(req), trainerId: trainerParam(req) };
+  return { orgId: orgParam(req) };
 }
 
 // GET /api/insights/overview — the page-level call. Prefer this.
@@ -103,14 +98,6 @@ router.get('/renewals/rows', auth, async (req, res, next) => {
   try {
     res.set('X-Insights-Note', 'pipeline rows only; conversion must use /renewals');
     res.json(await engine.getRenewalRows({ days: req.query.days, limit: req.query.limit, ...ctx(req) }));
-  } catch (err) { next(err); }
-});
-
-// Admin/manager only — mirrors legacy /reports/trainer-summary (per-trainer
-// revenue is not peer-visible data).
-router.get('/trainers', auth, adminOnly, async (req, res, next) => {
-  try {
-    res.json(await engine.getTrainerSummary({ orgId: orgParam(req) }));
   } catch (err) { next(err); }
 });
 

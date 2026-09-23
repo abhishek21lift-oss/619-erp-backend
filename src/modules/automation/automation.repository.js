@@ -45,26 +45,6 @@ async function settingsFor(orgId) {
   return rows[0] || { automation_enabled: false, daily_send_limit: 0 };
 }
 
-/**
- * May automated messages go out on this trainer's behalf?
- *
- * Both ids are bound. Matching on trainer_id alone would be enough to find the
- * row — trainer ids are unique platform-wide — and that is exactly why the org
- * is in the WHERE too: a grant is an authorisation record, so a query that
- * could match another studio's grant by id is an authorisation bypass rather
- * than a data leak. Migration 190 puts the org in the unique constraint for
- * the same reason.
- */
-async function trainerIsGranted(orgId, trainerId) {
-  if (!orgId || !trainerId) return false;
-  const { rowCount } = await pool.query(
-    `SELECT 1 FROM whatsapp_automation_trainer_grants
-      WHERE organization_id = $1 AND trainer_id = $2`,
-    [orgId, trainerId]
-  );
-  return rowCount > 0;
-}
-
 /** Automated messages this studio has queued or sent today. */
 async function sendsToday(orgId) {
   const { rows } = await pool.query(
@@ -99,64 +79,6 @@ async function upsertSettings(orgId, { automationEnabled, dailySendLimit, update
     [orgId, automationEnabled, dailySendLimit, updatedBy]
   );
   return rows[0];
-}
-
-/**
- * This studio's trainers and whether each may have messages sent on their
- * behalf.
- *
- * A LEFT JOIN rather than two queries the caller zips, so "every trainer, with
- * their grant state" is one answer that cannot disagree with itself. The join
- * predicate carries the org on BOTH sides: `trainers` is filtered to the
- * studio, and the grant is matched within the same studio, so a grant row can
- * never be attributed to a trainer it does not belong to.
- */
-async function trainersWithGrants(orgId) {
-  const { rows } = await pool.query(
-    `SELECT t.id, t.name, t.status,
-            (g.trainer_id IS NOT NULL) AS whatsapp_automation_granted,
-            g.granted_at
-       FROM trainers t
-       LEFT JOIN whatsapp_automation_trainer_grants g
-              ON g.trainer_id = t.id AND g.organization_id = t.organization_id
-      WHERE t.organization_id = $1 AND t.deleted_at IS NULL
-      ORDER BY t.name`,
-    [orgId]
-  );
-  return rows;
-}
-
-/**
- * Grant a trainer permission, if that trainer is this studio's.
- *
- * The org is checked in the INSERT itself — the SELECT supplies the row only
- * when `trainers` agrees the trainer belongs to this studio — rather than in a
- * separate lookup the caller performs first. A check that lives in a different
- * statement from the write is a check with a race in it, and this particular
- * write is an authorisation record.
- */
-async function grantTrainer(orgId, trainerId, grantedBy) {
-  const { rows } = await pool.query(
-    `INSERT INTO whatsapp_automation_trainer_grants (organization_id, trainer_id, granted_by)
-     SELECT $1, t.id, $3 FROM trainers t
-      WHERE t.id = $2 AND t.organization_id = $1 AND t.deleted_at IS NULL
-     ON CONFLICT (organization_id, trainer_id) DO NOTHING
-     RETURNING trainer_id`,
-    [orgId, trainerId, grantedBy]
-  );
-  // No row means either "not this studio's trainer" or "already granted". The
-  // caller distinguishes them by asking whether the grant now exists, which is
-  // the state that actually matters.
-  return rows.length > 0;
-}
-
-async function revokeTrainer(orgId, trainerId) {
-  const { rowCount } = await pool.query(
-    `DELETE FROM whatsapp_automation_trainer_grants
-      WHERE organization_id = $1 AND trainer_id = $2`,
-    [orgId, trainerId]
-  );
-  return rowCount > 0;
 }
 
 // ── Rules ───────────────────────────────────────────────────────────────────
@@ -228,12 +150,8 @@ async function clientRecipient(orgId, clientId) {
  * A lead has no `whatsapp` column — only `mobile` — so there is nothing to
  * prefer between; the one number is the number.
  *
- * `trainer_id` is returned for the same reason it is on the client: the
- * permission that governs an automated message is the permission of the
- * trainer the person is assigned to. On pt_leads it is a bare TEXT column with
- * no foreign key, so a lead can carry a trainer id this studio does not own —
- * which changes nothing, because trainerIsGranted binds the org too and a
- * foreign trainer simply has no grant here.
+ * `trainer_id` is returned for parity with the client recipient; nothing in
+ * the send path decides on it.
  */
 async function leadRecipient(orgId, leadId) {
   const { rows } = await pool.query(
@@ -1062,10 +980,6 @@ async function followupsDue(orgId) {
 module.exports = {
   settingsFor,
   upsertSettings,
-  trainersWithGrants,
-  grantTrainer,
-  revokeTrainer,
-  trainerIsGranted,
   sendsToday,
   activeRulesFor,
   touchRule,

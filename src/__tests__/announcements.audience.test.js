@@ -61,9 +61,9 @@ describe('audience targeting', () => {
 
 describe('recipient resolution', () => {
   const rows = [
-    { id: 'u1', organization_id: 'o1', organization_name: 'Iron House', role: 'admin' },
+    { id: 'u1', organization_id: 'o1', organization_name: 'Iron House', role: 'trainer' },
     { id: 'u2', organization_id: 'o1', organization_name: 'Iron House', role: 'manager' },
-    { id: 'u3', organization_id: 'o2', organization_name: 'Flex Lab', role: 'admin' },
+    { id: 'u3', organization_id: 'o2', organization_name: 'Flex Lab', role: 'trainer' },
   ];
 
   it('counts distinct studios, not recipients', async () => {
@@ -86,12 +86,12 @@ describe('recipient resolution', () => {
     expect(db.log[0].sql).toMatch(/u\.deleted_at IS NULL/);
   });
 
-  it('defaults to admins and managers when no roles are set', async () => {
+  it("defaults to the studios' trainers when no roles are set", async () => {
     // A maintenance window is not something a studio's members need pushed
-    // at them; the default audience is the people who can act on it.
+    // at them; the default audience is the person who can act on it.
     const db = makeClient([{ match: /FROM users u/, result: { rows: [] } }]);
     await resolveRecipients({ audience: 'all' }, db);
-    expect(db.log[0].params.at(-1)).toEqual(['admin', 'manager']);
+    expect(db.log[0].params.at(-1)).toEqual(['trainer']);
   });
 
   it('honours an explicit role list', async () => {

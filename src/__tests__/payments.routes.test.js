@@ -2,7 +2,7 @@
 //
 // Audit finding C-4: payments.js had no route-level test. lib/ helpers around
 // it did, but nothing exercised the HTTP layer — so the auth gate, the tenant
-// check, the trainer-ownership check and the transaction boundaries were all
+// check and the transaction boundaries were all
 // unverified on the route that records money changing hands.
 //
 // The transaction structure is what makes this worth testing carefully. Every
@@ -33,10 +33,14 @@ const mockTxClient = {
     mockTxLog.push({ sql: text, params });
 
     if (/^BEGIN|^COMMIT|^ROLLBACK/i.test(text)) return { rows: [], rowCount: 0 };
-    if (/FROM pt_clients WHERE id=\$1 AND deleted_at IS NULL FOR UPDATE/i.test(text)) {
-      return { rows: mockClientRow ? [mockClientRow] : [], rowCount: mockClientRow ? 1 : 0 };
+    // The client lookup carries the caller's organization; the mock applies it
+    // the way the table would, so a client of another studio is simply absent.
+    if (/FROM pt_clients WHERE id=\$1 AND deleted_at IS NULL AND organization_id=\$2 FOR UPDATE/i.test(text)) {
+      const hit = mockClientRow && mockClientRow.organization_id === params[1];
+      return { rows: hit ? [mockClientRow] : [], rowCount: hit ? 1 : 0 };
     }
-    if (/SELECT id, incentive_rate FROM trainers/i.test(text)) {
+    // lib/studioTrainer.trainerForOrg — the trainer profile, inside one studio.
+    if (/FROM trainers WHERE id = \$1 AND organization_id = \$2/i.test(text)) {
       return { rows: mockTrainerRow ? [mockTrainerRow] : [], rowCount: mockTrainerRow ? 1 : 0 };
     }
     if (/UPDATE pt_payments SET deleted_at/i.test(text)) {
@@ -58,11 +62,8 @@ jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jes
 let mockUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (req, res, next) => (
-    req.user.role === 'admin' || req.user.role === 'super_admin'
-      ? next()
-      : res.status(403).json({ error: 'Admin access required' })
-  ),
+  // The real guard, so the tests below exercise what production runs.
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const express = require('express');
@@ -89,7 +90,7 @@ beforeEach(() => {
   mockClientRow = { id: CLIENT_A, organization_id: ORG_A, trainer_id: 'trn-1', name: 'A Client' };
   mockTrainerRow = { id: 'trn-1', incentive_rate: 0.4 };
   mockDeletedPtPayment = null;
-  mockUser = { id: 'usr-admin', role: 'admin', organization_id: ORG_A, trainer_id: null };
+  mockUser = { id: 'usr-admin', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 });
 
 describe('POST /api/payments — validation', () => {
@@ -132,15 +133,16 @@ describe('POST /api/payments — access control', () => {
     expect(sqlAt(/INSERT INTO pt_payments/i)).toHaveLength(0);
   });
 
-  test('403s a trainer recording against a client who is not theirs, and rolls back', async () => {
+  test('the trainer records against any client of their studio — there is no roster narrowing', async () => {
+    // The owner is the trainer; a client assigned to another coach profile in
+    // the same studio is still the owner's client.
     mockUser = { id: 'usr-t', role: 'trainer', organization_id: ORG_A, trainer_id: 'trn-OTHER' };
     mockClientRow = { id: CLIENT_A, organization_id: ORG_A, trainer_id: 'trn-1' };
 
     const res = await request(app()).post('/api/payments').send(validBody());
 
-    expect(res.status).toBe(403);
-    expect(verbs()).toEqual(['BEGIN', 'ROLLBACK']);
-    expect(sqlAt(/INSERT INTO pt_payments/i)).toHaveLength(0);
+    expect(res.status).toBe(201);
+    expect(verbs()).toEqual(['BEGIN', 'COMMIT']);
   });
 
   test('lets a trainer record against their own client', async () => {
@@ -161,14 +163,23 @@ describe('POST /api/payments — access control', () => {
     expect(verbs()).toEqual(['BEGIN', 'ROLLBACK']);
   });
 
-  test('a super admin with no org is not blocked by the tenant filter', async () => {
+  test('the platform operator cannot record a payment in any studio', async () => {
+    // It used to be "not blocked by the tenant filter" and write into any
+    // studio's ledger. super_admin is refused before a transaction opens.
     mockUser = { id: 'usr-sa', role: 'super_admin', organization_id: null, trainer_id: null };
     mockClientRow = { id: CLIENT_A, organization_id: ORG_B, trainer_id: null };
 
     const res = await request(app()).post('/api/payments').send(validBody());
 
-    expect(res.status).toBe(201);
-    expect(verbs()).toEqual(['BEGIN', 'COMMIT']);
+    expect(res.status).toBe(403);
+    expect(verbs()).toEqual([]);
+  });
+
+  test('a member cannot record a payment', async () => {
+    mockUser = { id: 'usr-m', role: 'member', organization_id: ORG_A, pt_client_id: CLIENT_A };
+    const res = await request(app()).post('/api/payments').send(validBody());
+    expect(res.status).toBe(403);
+    expect(verbs()).toEqual([]);
   });
 });
 
@@ -258,8 +269,8 @@ describe('POST /api/payments — the write itself', () => {
 });
 
 describe('DELETE /api/payments/:id', () => {
-  test('refuses a non-admin', async () => {
-    mockUser = { id: 'usr-t', role: 'trainer', organization_id: ORG_A, trainer_id: 'trn-1' };
+  test('refuses a member', async () => {
+    mockUser = { id: 'usr-m', role: 'member', organization_id: ORG_A, pt_client_id: CLIENT_A };
 
     const res = await request(app()).delete('/api/payments/pay-1');
 
@@ -284,7 +295,9 @@ describe('DELETE /api/payments/:id', () => {
     await request(app()).delete('/api/payments/pay-1');
 
     const [upd] = sqlAt(/UPDATE pt_clients SET paid_amount = GREATEST/i);
-    expect(upd.params).toEqual([1234, CLIENT_A]);
+    // The reversal is scoped to the caller's studio in the UPDATE itself.
+    expect(upd.params).toEqual([1234, CLIENT_A, ORG_A]);
+    expect(upd.sql).toMatch(/AND organization_id = \$3/);
     // Reversal must not push paid_amount negative if it was already adjusted.
     expect(upd.sql).toMatch(/GREATEST\(0, paid_amount - \$1\)/i);
   });

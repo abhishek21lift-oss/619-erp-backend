@@ -54,7 +54,7 @@ app.use(express.json());
 app.use('/api/admin', (req, res, next) => require('../middleware/auth').auth(req, res, next),
   requireSuperAdmin, requireSuperAdminMfa, require('../routes/admin-reset'));
 
-const TENANT_ADMIN = { id: 'usr-owner', role: 'admin', organization_id: 'org-a' };
+const TENANT_ADMIN = { id: 'usr-owner', role: 'trainer', organization_id: 'org-a' };
 const SUPER_ADMIN = { id: 'usr-platform', role: 'super_admin', organization_id: null };
 const TRAINER = { id: 'usr-trainer', role: 'trainer', organization_id: 'org-a' };
 

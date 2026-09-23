@@ -3,35 +3,26 @@
 //
 // ── The shape ──────────────────────────────────────────────────────────────
 //
-// A handler narrows its query for a trainer, so that a trainer sees only their
-// own roster:
+// Handlers used to narrow their query for a trainer (an assistant coach) and
+// leave it wide for everyone else:
 //
 //     const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
 //     const where = tid ? 'AND p.trainer_id = $2' : '';
 //
-// For an admin or a manager the empty string is correct — they are supposed to
-// see the whole studio. For everyone ELSE it is a silent grant. The code reads
-// as "narrow for trainers", and what it does is "narrow for trainers, and
-// widen for every role nobody thought about".
+// That produced four real holes — GET /api/reports/monthly, GET /api/search,
+// GET /api/expenses/stats and the shared authz.trainerWhere/canAccessClient —
+// because every role nobody thought about got the wide branch.
 //
-// It has now produced four instances:
+// In the Trainer → Members model there is nothing to narrow TO: the trainer
+// owns the studio. So the whole shape is gone rather than patched, and this
+// file pins what replaced it in the one shared helper:
 //
-//   GET /api/reports/monthly        studio revenue          (fixed in #84)
-//   GET /api/search                 the studio's clients    (fixed in #85)
-//   GET /api/expenses/stats         studio expense totals   (fixed here)
-//   authz.trainerWhere / canAccessClient                    (fixed here)
-//
-// The last is the one worth the comment. It is a SHARED helper, so the hole
-// was inherited by every caller rather than written four times; it was latent
-// only because every current caller happens to sit behind
-// requireRole('admin','manager','trainer'). "Safe because of something in
-// another file" is exactly how the twelve untenanted tables happened.
-//
-// ── What this file pins ────────────────────────────────────────────────────
-//
-// Not the wording of any one query. The property: a member must not be handed
-// the unconstrained branch of a trainer test.
-
+//   · trainer — the studio's clients, and only the studio's: one query, bound
+//     to the caller's organization, with no trainer_id narrowing.
+//   · member — their own client record and nothing else, decided from the
+//     session without asking the database.
+//   · anything else — false, without a query. No role falls through to an
+//     org-only check the way a member once did.
 const fs = require('fs');
 const path = require('path');
 
@@ -62,10 +53,6 @@ const TRAINER = {
   organization_id: '11111111-1111-4111-8111-111111111111',
   trainer_id: 'tr-1',
 };
-const ADMIN = {
-  id: 'u-admin', role: 'admin',
-  organization_id: '11111111-1111-4111-8111-111111111111',
-};
 
 beforeEach(() => { mockQueries.length = 0; });
 
@@ -90,49 +77,34 @@ describe('canAccessClient constrains a member to their own client', () => {
     await expect(authz.canAccessClient({ user: orphan }, 'client-own')).resolves.toBe(false);
   });
 
-  it('still queries for a trainer, rather than short-circuiting everyone', async () => {
-    // A fix that refused every non-admin would also pass the tests above.
+  it('queries for a trainer, bound to their organization and not to a roster', async () => {
+    // A fix that refused everyone would also pass the member tests above.
     await authz.canAccessClient({ user: TRAINER }, 'client-x');
     expect(mockQueries).toHaveLength(1);
     expect(mockQueries[0].sql).toMatch(/FROM pt_clients/i);
-    expect(mockQueries[0].params).toContain('tr-1');
-  });
-
-  it('still queries for an admin, unnarrowed by trainer', async () => {
-    await authz.canAccessClient({ user: ADMIN }, 'client-x');
-    expect(mockQueries).toHaveLength(1);
-    expect(mockQueries[0].params).not.toContain('tr-1');
+    expect(mockQueries[0].sql).toMatch(/organization_id = \$2/);
+    expect(mockQueries[0].params).toEqual(['client-x', TRAINER.organization_id]);
+    // The trainer owns the studio: no assistant-coach narrowing.
+    expect(mockQueries[0].sql).not.toMatch(/trainer_id/);
   });
 });
 
-describe('trainerWhere does not hand a member the unconstrained branch', () => {
-  it('matches nothing for a member', () => {
-    const params = [];
-    const clause = authz.trainerWhere({ user: MEMBER }, params);
-    // The bug returned '' here — no clause at all — which widened the query.
-    expect(clause).not.toBe('');
-    expect(clause).toMatch(/FALSE/i);
+describe('canAccessClient refuses every other caller without asking the database', () => {
+  it.each([
+    ['the platform operator', { id: 'op', role: 'super_admin', organization_id: null }],
+    ['a trainer with no studio', { id: 't', role: 'trainer', organization_id: null }],
+    ['a removed staff role', { id: 'a', role: 'admin', organization_id: '11111111-1111-4111-8111-111111111111' }],
+    ['a role nobody defined', { id: 'x', role: 'partner_api', organization_id: '11111111-1111-4111-8111-111111111111' }],
+    ['no user at all', undefined],
+  ])('%s', async (_label, user) => {
+    await expect(authz.canAccessClient({ user }, 'client-x')).resolves.toBe(false);
+    expect(mockQueries).toHaveLength(0);
   });
 
-  it('narrows to the trainer for a trainer', () => {
-    const params = [];
-    const clause = authz.trainerWhere({ user: TRAINER }, params);
-    expect(clause).toMatch(/c\.trainer_id = \$1/);
-    expect(params).toEqual(['tr-1']);
-  });
-
-  it('stays empty for an admin, who is meant to see the studio', () => {
-    const params = [];
-    expect(authz.trainerWhere({ user: ADMIN }, params)).toBe('');
-    expect(params).toEqual([]);
-  });
-
-  it('stays empty for a staff role with no trainer record', () => {
-    // reception/staff legitimately see the whole studio and have no
-    // trainer_id. Refusing them would be a different bug.
-    const params = [];
-    const reception = { ...ADMIN, role: 'reception' };
-    expect(authz.trainerWhere({ user: reception }, params)).toBe('');
+  it('exports no roster-narrowing helper for a caller to reach for', () => {
+    expect(authz.trainerWhere).toBeUndefined();
+    expect(authz.seesAllClients).toBeUndefined();
+    expect(authz.ALL_CLIENT_ROLES).toBeUndefined();
   });
 });
 
@@ -144,9 +116,9 @@ describe('the routes that carried this pattern are gated', () => {
   // specific mounts stay gated, so a future edit that drops one is caught by
   // name rather than by a count changing somewhere.
   it.each([
-    ['/api/expenses', 'staffGate'],
-    ['/api/search', 'requireStaff'],
-    ['/api/reports', 'staffGate'],
+    ['/api/expenses', 'studioGate'],
+    ['/api/search', 'requireTrainer'],
+    ['/api/reports', 'studioGate'],
   ])('%s is mounted behind %s', (mount, guard) => {
     const line = server.split('\n').find((l) => l.includes(`app.use('${mount}'`));
     expect(line).toBeDefined();

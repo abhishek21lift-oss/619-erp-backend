@@ -176,7 +176,9 @@ function requireAiQuota() {
   return async function aiQuotaGuard(req, res, next) {
     try {
       const orgId = req.user?.organization_id;
-      if (!orgId || req.user.role === 'super_admin') return next();
+      // No studio, no studio quota to spend. Only tenant routes mount this,
+      // behind guards that already refuse an account without one.
+      if (!orgId) return next();
 
       const s = await statusFor(orgId);
       recordQuotaCheckOutcome(true);

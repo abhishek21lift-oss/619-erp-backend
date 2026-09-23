@@ -13,8 +13,7 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
-const { auth } = require('../../middleware/auth');
-const { requireRole } = require('../../middleware/rbac');
+const { auth, requireTrainer } = require('../../middleware/auth');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
@@ -29,6 +28,11 @@ const { today: studioToday } = require('../../lib/appTime');
 const { weekOf, resolveWeek } = require('./progression');
 const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./training-analytics');
 const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -182,7 +186,7 @@ router.get('/workout-log/sessions', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
   const params = [client_id];
   let orgClause = '';
-  if (scope.applyFilter) { params.push(scope.orgId); orgClause = ` AND ws.organization_id = $${params.length}`; }
+  params.push(scope.orgId); orgClause = ` AND ws.organization_id = $${params.length}`;
   params.push(lim, off);
   const { rows } = await pool.query(
     `SELECT ws.*,
@@ -203,8 +207,8 @@ router.get('/workout-log/sessions', auth, wrap(async (req, res) => {
 router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   const { id } = req.params;
   const scope = tenantScope(req);
-  const sessGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
-  const sessParams = scope.applyFilter ? [id, scope.orgId] : [id];
+  const sessGuard = ' AND organization_id = $2';
+  const sessParams = [id, scope.orgId];
   const [sessionRes, exercisesRes] = await Promise.all([
     pool.query(`SELECT * FROM workout_sessions WHERE id = $1${sessGuard}`, sessParams),
     pool.query(
@@ -324,7 +328,7 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
 }));
 
 // POST /workout-log/sessions
-router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trainer'), validate(sessionCreateSchema), wrap(async (req, res) => {
+router.post('/workout-log/sessions', auth, requireTrainer, validate(sessionCreateSchema), wrap(async (req, res) => {
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
@@ -365,10 +369,10 @@ router.post('/workout-log/sessions', auth, requireRole('admin', 'manager', 'trai
 // the frontend can render a constrained day picker instead of free text.
 router.get('/workout-log/sessions/:sessionId/planned-day-options', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const guard = ' AND organization_id = $2';
   const { rows: sessionRows } = await pool.query(
     `SELECT workout_assignment_id FROM workout_sessions WHERE id = $1${guard}`,
-    scope.applyFilter ? [req.params.sessionId, scope.orgId] : [req.params.sessionId]
+    [req.params.sessionId, scope.orgId]
   );
   const session = sessionRows[0];
   if (!session) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -388,7 +392,7 @@ router.get('/workout-log/sessions/:sessionId/planned-day-options', auth, wrap(as
 }));
 
 // PATCH /workout-log/sessions/:id
-router.patch('/workout-log/sessions/:id', auth, requireRole('admin', 'manager', 'trainer'), validate(sessionUpdateSchema), wrap(async (req, res) => {
+router.patch('/workout-log/sessions/:id', auth, requireTrainer, validate(sessionUpdateSchema), wrap(async (req, res) => {
   const { id } = req.params;
   const b = req.body;
   const allowed = ['session_date', 'program_name', 'workout_day', 'notes', 'duration_minutes', 'status'];
@@ -401,7 +405,7 @@ router.patch('/workout-log/sessions/:id', auth, requireRole('admin', 'manager', 
   sets.push('updated_at = NOW()');
   const scope = tenantScope(req);
   let whereGuard = '';
-  if (scope.applyFilter) { params.push(scope.orgId); whereGuard = ` AND organization_id = $${params.length}`; }
+  params.push(scope.orgId); whereGuard = ` AND organization_id = $${params.length}`;
   const { rows } = await pool.query(`UPDATE workout_sessions SET ${sets.join(', ')} WHERE id = $1${whereGuard} RETURNING *`, params);
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   if (b.status !== undefined && rows[0].workout_assignment_id) {
@@ -411,12 +415,12 @@ router.patch('/workout-log/sessions/:id', auth, requireRole('admin', 'manager', 
 }));
 
 // DELETE /workout-log/sessions/:id
-router.delete('/workout-log/sessions/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+router.delete('/workout-log/sessions/:id', auth, requireTrainer, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const guard = ' AND organization_id = $2';
   const { rows } = await pool.query(
     `DELETE FROM workout_sessions WHERE id = $1${guard} RETURNING id, client_id, workout_assignment_id`,
-    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+    [req.params.id, scope.orgId]
   );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   if (rows[0].workout_assignment_id) await recomputeAssignmentProgress(rows[0].workout_assignment_id);
@@ -427,14 +431,14 @@ router.delete('/workout-log/sessions/:id', auth, requireRole('admin', 'manager',
 // ─── Exercises within a session ─────────────────────────────
 
 // POST /workout-log/sessions/:sessionId/exercises
-router.post('/workout-log/sessions/:sessionId/exercises', auth, requireRole('admin', 'manager', 'trainer'), validate(exerciseAddSchema), wrap(async (req, res) => {
+router.post('/workout-log/sessions/:sessionId/exercises', auth, requireTrainer, validate(exerciseAddSchema), wrap(async (req, res) => {
   const { sessionId } = req.params;
   const b = req.body;
   const scope = tenantScope(req);
-  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const guard = ' AND organization_id = $2';
   const { rows: sessionRows } = await pool.query(
     `SELECT id FROM workout_sessions WHERE id = $1${guard}`,
-    scope.applyFilter ? [sessionId, scope.orgId] : [sessionId]
+    [sessionId, scope.orgId]
   );
   if (!sessionRows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -452,18 +456,16 @@ router.post('/workout-log/sessions/:sessionId/exercises', auth, requireRole('adm
 }));
 
 // DELETE /workout-log/exercises/:id
-router.delete('/workout-log/exercises/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+router.delete('/workout-log/exercises/:id', auth, requireTrainer, wrap(async (req, res) => {
   const scope = tenantScope(req);
   let query = 'DELETE FROM workout_session_exercises WHERE id = $1 RETURNING id';
   let params = [req.params.id];
-  if (scope.applyFilter) {
-    // Gate on the parent session's org — the leaf table has no org column.
-    query = `DELETE FROM workout_session_exercises wse
-               USING workout_sessions ws
-              WHERE wse.id = $1 AND ws.id = wse.session_id AND ws.organization_id = $2
-              RETURNING wse.id`;
-    params = [req.params.id, scope.orgId];
-  }
+  // Gate on the parent session's org — the leaf table has no org column.
+  query = `DELETE FROM workout_session_exercises wse
+             USING workout_sessions ws
+            WHERE wse.id = $1 AND ws.id = wse.session_id AND ws.organization_id = $2
+            RETURNING wse.id`;
+  params = [req.params.id, scope.orgId];
   const { rows } = await pool.query(query, params);
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ message: 'Exercise removed' });
@@ -472,18 +474,18 @@ router.delete('/workout-log/exercises/:id', auth, requireRole('admin', 'manager'
 // ─── Sets ───────────────────────────────────────────────────
 
 // POST /workout-log/exercises/:sessionExerciseId/sets
-router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireRole('admin', 'manager', 'trainer'), validate(setCreateSchema), wrap(async (req, res) => {
+router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireTrainer, validate(setCreateSchema), wrap(async (req, res) => {
   const { sessionExerciseId } = req.params;
   const b = req.body;
 
   const scope = tenantScope(req);
-  const exGuard = scope.applyFilter ? ' AND ws.organization_id = $2' : '';
+  const exGuard = ' AND ws.organization_id = $2';
   const { rows: exRows } = await pool.query(
     `SELECT wse.exercise_id, wse.exercise_name, ws.client_id
        FROM workout_session_exercises wse
        JOIN workout_sessions ws ON ws.id = wse.session_id
       WHERE wse.id = $1${exGuard}`,
-    scope.applyFilter ? [sessionExerciseId, scope.orgId] : [sessionExerciseId]
+    [sessionExerciseId, scope.orgId]
   );
   const ex = exRows[0];
   if (!ex) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -512,19 +514,19 @@ router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireRole(
 }));
 
 // PATCH /workout-log/sets/:id
-router.patch('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'trainer'), validate(setUpdateSchema), wrap(async (req, res) => {
+router.patch('/workout-log/sets/:id', auth, requireTrainer, validate(setUpdateSchema), wrap(async (req, res) => {
   const { id } = req.params;
   const b = req.body;
 
   const scope = tenantScope(req);
-  const setGuard = scope.applyFilter ? ' AND ws.organization_id = $2' : '';
+  const setGuard = ' AND ws.organization_id = $2';
   const { rows: existingRows } = await pool.query(
     `SELECT s.*, wse.exercise_id, wse.exercise_name, ws.client_id
        FROM workout_sets s
        JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
        JOIN workout_sessions ws ON ws.id = wse.session_id
       WHERE s.id = $1${setGuard}`,
-    scope.applyFilter ? [id, scope.orgId] : [id]
+    [id, scope.orgId]
   );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -556,19 +558,17 @@ router.patch('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'tra
 }));
 
 // DELETE /workout-log/sets/:id
-router.delete('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+router.delete('/workout-log/sets/:id', auth, requireTrainer, wrap(async (req, res) => {
   const scope = tenantScope(req);
   let query = 'DELETE FROM workout_sets WHERE id = $1 RETURNING id';
   let params = [req.params.id];
-  if (scope.applyFilter) {
-    // Gate on the parent session's org — the leaf table has no org column.
-    query = `DELETE FROM workout_sets s
-               USING workout_session_exercises wse, workout_sessions ws
-              WHERE s.id = $1 AND wse.id = s.session_exercise_id AND ws.id = wse.session_id
-                AND ws.organization_id = $2
-              RETURNING s.id`;
-    params = [req.params.id, scope.orgId];
-  }
+  // Gate on the parent session's org — the leaf table has no org column.
+  query = `DELETE FROM workout_sets s
+             USING workout_session_exercises wse, workout_sessions ws
+            WHERE s.id = $1 AND wse.id = s.session_exercise_id AND ws.id = wse.session_id
+              AND ws.organization_id = $2
+            RETURNING s.id`;
+  params = [req.params.id, scope.orgId];
   const { rows } = await pool.query(query, params);
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ message: 'Set deleted' });
@@ -614,16 +614,13 @@ router.delete('/workout-log/sets/:id', auth, requireRole('admin', 'manager', 'tr
 // `session` is the log if one already exists, so a client can be resumed
 // rather than double-started.
 //
-// Scoped like every other read here: tenant first, then — for a trainer who
-// is not an admin — their own clients only.
+// Scoped like every other read here: to the trainer's studio, all of it.
 router.get('/workout-log/today', auth, wrap(async (req, res) => {
   // The rule lives in the service — see svc.getTodayRoster. This adapter
-  // decides who is asking and how the answer is shaped, nothing more.
-  const isStaff = ['admin', 'manager', 'super_admin'].includes(req.user.role);
+  // shapes the answer, nothing more.
   const { date, dow, rows } = await svc.getTodayRoster({
     date: req.query.date,
     scope: tenantScope(req),
-    trainerId: isStaff ? null : (req.user.trainer_id || null),
   });
 
   res.json({
@@ -682,7 +679,7 @@ router.get('/workout-log/previous', auth, wrap(async (req, res) => {
   if (exclude_session_id) { params.push(exclude_session_id); excludeClause = `AND ws.id != $${params.length}`; }
   const scope = tenantScope(req);
   let orgClause = '';
-  if (scope.applyFilter) { params.push(scope.orgId); orgClause = `AND ws.organization_id = $${params.length}`; }
+  params.push(scope.orgId); orgClause = `AND ws.organization_id = $${params.length}`;
 
   const { rows: exRows } = await pool.query(
     `SELECT wse.id AS session_exercise_id, ws.session_date
@@ -715,7 +712,7 @@ router.get('/workout-log/progress', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
   const params = [client_id, matchParam];
   let orgClause = '';
-  if (scope.applyFilter) { params.push(scope.orgId); orgClause = `AND ws.organization_id = $${params.length}`; }
+  params.push(scope.orgId); orgClause = `AND ws.organization_id = $${params.length}`;
 
   const { rows } = await pool.query(
     `SELECT ws.session_date, s.weight_kg, s.reps
@@ -757,7 +754,7 @@ router.get('/workout-log/volume-summary', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
   const params = [client_id, trunc];
   let orgClause = '';
-  if (scope.applyFilter) { params.push(scope.orgId); orgClause = `AND ws.organization_id = $${params.length}`; }
+  params.push(scope.orgId); orgClause = `AND ws.organization_id = $${params.length}`;
 
   const { rows } = await pool.query(
     `SELECT date_trunc($2, ws.session_date)::date AS period,
@@ -803,7 +800,7 @@ router.get('/workout-log/analytics', auth, wrap(async (req, res) => {
     : studioToday();
 
   const scope = tenantScope(req);
-  const orgId = scope.applyFilter ? scope.orgId : null;
+  const orgId = scope.orgId;
 
   // The window. Sets and sessions older than this are not read at all rather
   // than read and filtered — a client two years in should not pay for it.
@@ -914,7 +911,7 @@ router.get('/workout-log/analytics', auth, wrap(async (req, res) => {
 // GET /workout-log/landmarks — the studio's weekly set ranges, resolved.
 router.get('/workout-log/landmarks', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  const orgId = scope.applyFilter ? scope.orgId : null;
+  const orgId = scope.orgId;
   const { rows } = await pool.query(
     `SELECT DISTINCT ON (target_muscle)
             target_muscle, mev_sets, mrv_sets,
@@ -934,7 +931,7 @@ router.get('/workout-log/landmarks', auth, wrap(async (req, res) => {
 // and means "no range" — a blank is an honest answer, and better than a pair
 // of numbers nobody chose.
 router.put('/workout-log/landmarks/:muscle',
-  auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+  auth, requireTrainer, wrap(async (req, res) => {
     const orgId = orgIdOf(req);
     if (!orgId) {
       // A platform operator editing the shared defaults is a different action
@@ -980,7 +977,7 @@ router.put('/workout-log/landmarks/:muscle',
 // by mistake, and there is otherwise no route back to a number they have
 // overwritten.
 router.delete('/workout-log/landmarks/:muscle',
-  auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+  auth, requireTrainer, wrap(async (req, res) => {
     const orgId = orgIdOf(req);
     if (!orgId) {
       return res.status(403).json({ error: { code: 'ORG_REQUIRED', message: 'A studio context is required' } });
@@ -1015,7 +1012,7 @@ router.delete('/workout-log/landmarks/:muscle',
 // months of extrapolation from four points is not a forecast. Inside a PDF it
 // would read as a record rather than as a guess.
 router.post('/workout-log/weekly-report',
-  auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+  auth, requireTrainer, wrap(async (req, res) => {
     const { client_id, week_start, coach_note } = req.body;
     if (!client_id) return res.status(400).json({ error: { code: 'MISSING_CLIENT_ID' } });
     if (!await clientInOrg(req, client_id)) {
@@ -1029,7 +1026,7 @@ router.post('/workout-log/weekly-report',
     const end = endDate.toISOString().slice(0, 10);
 
     const scope = tenantScope(req);
-    const orgId = scope.applyFilter ? scope.orgId : null;
+    const orgId = scope.orgId;
 
     const [clientRows, sessionRows, prRows, setRows, planRows, landmarkRows] = await Promise.all([
       pool.query(

@@ -29,16 +29,9 @@ jest.mock('../db/pool', () => {
 let mockUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOrManager: (req, res, next) =>
-    (['admin', 'manager'].includes(req.user?.role)
-      ? next()
-      : res.status(403).json({ error: 'Admin or manager access required' })),
-  // The real implementation, inlined — this suite exists partly to prove
-  // trainers get through it.
-  adminManagerOrTrainer: (req, res, next) =>
-    (['admin', 'manager', 'trainer'].includes(req.user?.role)
-      ? next()
-      : res.status(403).json({ error: 'Admin, manager or trainer access required' })),
+  // The real guard — this suite exists partly to prove the trainer gets
+  // through it and a member does not.
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 jest.mock('../lib/screeningGate', () => ({
@@ -56,7 +49,9 @@ app.use('/api/workouts', require('../routes/workouts'));
 const ORG_A = '11111111-1111-1111-1111-111111111111';
 const PLAN = 'plan-1';
 
-const ADMIN_A   = { id: 'u-admin', role: 'admin',   organization_id: ORG_A, trainer_id: null };
+// The studio trainer without a coach profile row, and with one. Both are the
+// studio's owner; the profile only matters for session/client assignment.
+const OWNER_A   = { id: 'u-owner', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 const TRAINER_A = { id: 'u-tr',    role: 'trainer', organization_id: ORG_A, trainer_id: 'tr-1' };
 const MEMBER_A  = { id: 'u-mem',   role: 'member',  organization_id: ORG_A, trainer_id: null };
 
@@ -69,7 +64,7 @@ const paramsOf = (re) => {
 };
 
 beforeEach(() => {
-  mockUser = ADMIN_A;
+  mockUser = OWNER_A;
   pool.query.mockReset();
   // Default: every query resolves to one innocuous row. Individual tests
   // override with mockResolvedValueOnce where the shape matters.
@@ -142,21 +137,18 @@ describe('trainer access — the module is usable by the people it is for', () =
     expect(res.status).toBe(200);
   });
 
-  it('restricts a trainer to plans they created or that are assigned to their clients', async () => {
-    mockUser = TRAINER_A;
-    await request(app).put(`/api/workouts/plans/${PLAN}`).send({ name: 'x' });
-    const load = sqls().find((s) => /SELECT wp\.\* FROM workout_plans wp WHERE wp\.id/.test(s));
-    expect(load).toMatch(/wp\.created_by = \$/);
-    expect(load).toMatch(/pc\.trainer_id = \$/);
-    // Scoped by the trainer's own id, not a value from the request.
-    expect(paramsOf(/SELECT wp\.\* FROM workout_plans wp WHERE wp\.id/)).toContain('tr-1');
-  });
-
-  it('does NOT apply the ownership clause for an admin', async () => {
-    mockUser = ADMIN_A;
-    await request(app).put(`/api/workouts/plans/${PLAN}`).send({ name: 'x' });
-    const load = sqls().find((s) => /SELECT wp\.\* FROM workout_plans wp WHERE wp\.id/.test(s));
-    expect(load).not.toMatch(/pc\.trainer_id/);
+  it('edits any plan in the studio — the organization is the only boundary', async () => {
+    // The creator/assignee narrowing existed for assistant coaches. The
+    // trainer owns the studio, so it went with them; the org clause stays.
+    for (const user of [TRAINER_A, OWNER_A]) {
+      pool.query.mockClear();
+      mockUser = user;
+      await request(app).put(`/api/workouts/plans/${PLAN}`).send({ name: 'x' });
+      const load = sqls().find((s) => /SELECT wp\.\* FROM workout_plans wp WHERE wp\.id/.test(s));
+      expect(load).not.toMatch(/pc\.trainer_id|wp\.created_by = /);
+      expect(load).toMatch(/wp\.organization_id = \$2/);
+      expect(paramsOf(/SELECT wp\.\* FROM workout_plans wp WHERE wp\.id/)).toEqual([PLAN, ORG_A]);
+    }
   });
 
   it('still refuses a member', async () => {
@@ -165,11 +157,11 @@ describe('trainer access — the module is usable by the people it is for', () =
     expect(res.status).toBe(403);
   });
 
-  it('lets a trainer assign a plan only to their own client', async () => {
+  it('will not assign a plan to a client outside the studio', async () => {
     mockUser = TRAINER_A;
     pool.query
       .mockResolvedValueOnce({ rows: [{ id: PLAN }] })  // plan is visible
-      .mockResolvedValueOnce({ rows: [] });             // client is NOT theirs
+      .mockResolvedValueOnce({ rows: [] });             // client is not in this studio
     const res = await request(app)
       .post('/api/workouts/assign')
       .send({ workout_plan_id: PLAN, client_id: 'someone-elses-client' });
@@ -360,44 +352,42 @@ describe('plan rosters — real progress, and only the clients you may see', () 
     sqls().find((s) => /FROM workout_assignments wa_r/.test(s));
 
   it('scopes the roster to the caller\'s studio', async () => {
-    mockUser = ADMIN_A;
+    mockUser = OWNER_A;
     await request(app).get('/api/workouts/plans');
     expect(rosterSql()).toMatch(/wa_r\.organization_id = \$\d/);
   });
 
-  it('shows a trainer only the clients they train', async () => {
-    // The leak this prevents: two trainers in one studio, both able to read
-    // the same plan, each seeing the other's clients named on its card.
+  it('names only clients of the same studio on the card', async () => {
+    // The joined client is bound to the assignment's organization, so a
+    // mis-linked row can never put another studio's client name on a card.
     mockUser = TRAINER_A;
     await request(app).get('/api/workouts/plans');
-    const sql = rosterSql();
-    expect(sql).toMatch(/pc\.trainer_id = \$\d/);
-
-    const call = pool.query.mock.calls.find(([s]) => /FROM workout_assignments wa_r/.test(String(s).replace(/\s+/g, ' ')));
-    expect(call[1]).toContain(TRAINER_A.trainer_id);
+    expect(rosterSql()).toMatch(/JOIN pt_clients pc ON pc\.id = wa_r\.client_id AND pc\.organization_id = wa_r\.organization_id/);
   });
 
-  it('does not narrow an admin to one trainer\'s clients', async () => {
-    mockUser = ADMIN_A;
+  it('does not narrow the trainer to one coach profile\'s clients', async () => {
+    mockUser = TRAINER_A;
     await request(app).get('/api/workouts/plans');
     expect(rosterSql()).not.toMatch(/pc\.trainer_id/);
+    const call = pool.query.mock.calls.find(([s]) => /FROM workout_assignments wa_r/.test(String(s).replace(/\s+/g, ' ')));
+    expect(call[1]).not.toContain(TRAINER_A.trainer_id);
   });
 
   it('leaves out clients whose record was deleted', async () => {
-    mockUser = ADMIN_A;
+    mockUser = OWNER_A;
     await request(app).get('/api/workouts/plans');
     expect(rosterSql()).toMatch(/pc\.deleted_at IS NULL/);
   });
 
   it('counts only assignments that are still running', async () => {
-    mockUser = ADMIN_A;
+    mockUser = OWNER_A;
     await request(app).get('/api/workouts/plans');
     expect(rosterSql()).toMatch(/wa_r\.status = 'active'/);
   });
 
   it('reports progress as the mean across the clients running the plan', async () => {
     // The defect in one assertion: this used to be 0 regardless.
-    mockUser = ADMIN_A;
+    mockUser = OWNER_A;
     pool.query.mockResolvedValueOnce({
       rows: [{
         id: PLAN, organization_id: ORG_A, progress: 0,
@@ -414,7 +404,7 @@ describe('plan rosters — real progress, and only the clients you may see', () 
   });
 
   it('rounds rather than emitting a fraction of a percent', async () => {
-    mockUser = ADMIN_A;
+    mockUser = OWNER_A;
     pool.query.mockResolvedValueOnce({
       rows: [{
         id: PLAN, progress: 0,
@@ -431,7 +421,7 @@ describe('plan rosters — real progress, and only the clients you may see', () 
   it('reports 0 for a plan nobody is running, and says the roster is empty', async () => {
     // Still 0 — but now because there is nothing to average, which is a fact
     // about the plan rather than about the query.
-    mockUser = ADMIN_A;
+    mockUser = OWNER_A;
     pool.query.mockResolvedValueOnce({
       rows: [{ id: PLAN, progress: 0, assignments: [] }],
     });
@@ -443,7 +433,7 @@ describe('plan rosters — real progress, and only the clients you may see', () 
   it('keeps one client\'s own figure when the list is scoped to them', async () => {
     // Asking for a single client's plans must not average them with anybody
     // else's — that view is about that person.
-    mockUser = ADMIN_A;
+    mockUser = OWNER_A;
     pool.query.mockResolvedValueOnce({
       rows: [{
         id: PLAN, progress: 73,

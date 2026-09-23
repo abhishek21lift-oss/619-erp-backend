@@ -200,7 +200,7 @@ async function cancel(bookingId, { reason } = {}, ctx) {
     await client.query('BEGIN');
 
     // Scoped by organization. The role check below only ever constrained
-    // `member`, so before this an admin, manager or trainer of ANY studio
+    // `member`, so before this any studio account
     // could cancel ANY booking on the platform by id — the booking's own
     // studio was never consulted. 404 rather than 403: a caller outside the
     // studio must not be able to tell the booking exists.
@@ -301,7 +301,7 @@ async function cancel(bookingId, { reason } = {}, ctx) {
  * Check in (member arrives at the gym).
  */
 async function checkIn(bookingId, { method = 'manual' }, ctx = {}) {
-  // The route gates this on requireRole('admin','manager','trainer') — but a
+  // The route gates this on requireTrainer — but a
   // role is not an ownership check. Any admin or trainer of any studio could
   // mark any booking on the platform as attended, and the mirrored attendance
   // row landed in whatever studio the row belonged to. The organization filter
@@ -365,7 +365,12 @@ async function checkIn(bookingId, { method = 'manual' }, ctx = {}) {
        SET check_in_time = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
            status        = 'present',
            method        = CASE WHEN attendance_logs.method = 'manual' THEN EXCLUDED.method
-                                ELSE attendance_logs.method END`,
+                                ELSE attendance_logs.method END
+       -- The conflict key carries no organization; this does. Same guard as
+       -- routes/attendance.js: a row belonging to another studio is left
+       -- untouched rather than overwritten through the DO UPDATE branch.
+       WHERE attendance_logs.organization_id IS NULL
+          OR attendance_logs.organization_id = EXCLUDED.organization_id`,
     [b.member_id, attendanceMethod(method), `Class booking ${b.id}`,
      process.env.BRANCH_ID || null, b.organization_id]
   );
@@ -379,10 +384,8 @@ async function checkIn(bookingId, { method = 'manual' }, ctx = {}) {
 async function listForMember(memberId, { from, to, status } = {}, scope = {}) {
   const params = [memberId];
   const where = [`b.member_id = $1`];
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    where.push(`b.organization_id = $${params.length}`);
-  }
+  params.push(scope.orgId);
+  where.push(`b.organization_id = $${params.length}`);
   if (from)   { params.push(from);   where.push(`cs.starts_at >= $${params.length}`); }
   if (to)     { params.push(to);     where.push(`cs.starts_at <= $${params.length}`); }
   if (status) { params.push(status); where.push(`b.status = $${params.length}`); }
@@ -394,7 +397,7 @@ async function listForMember(memberId, { from, to, status } = {}, scope = {}) {
      FROM bookings b
      JOIN class_sessions cs ON cs.id = b.session_id
      JOIN class_templates ct ON ct.id = cs.template_id
-     LEFT JOIN trainers t ON t.id = cs.trainer_id
+     LEFT JOIN trainers t ON t.id = cs.trainer_id AND t.organization_id = cs.organization_id
      WHERE ${where.join(' AND ')}
      ORDER BY cs.starts_at DESC LIMIT 200`,
     params

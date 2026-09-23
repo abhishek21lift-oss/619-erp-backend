@@ -47,18 +47,15 @@ jest.mock('../db/pool', () => ({
   connect: (...args) => mockRealPool.connect(...args),
 }));
 
-let mockUser = { id: 'u-a', role: 'admin', organization_id: ORG_A };
+let mockUser = { id: 'u-a', role: 'trainer', organization_id: ORG_A };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 jest.mock('../middleware/rbac', () => ({
-  requireRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../lib/logger', () => ({
   info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn(),
@@ -161,7 +158,7 @@ describeIf('PT current-term financials, against a real database', () => {
     await mockRealPool.end();
   });
 
-  beforeEach(() => { mockUser = { id: 'u-a', role: 'admin', organization_id: ORG_A }; });
+  beforeEach(() => { mockUser = { id: 'u-a', role: 'trainer', organization_id: ORG_A }; });
 
   // ── The reported bug ──────────────────────────────────────────────────────
 
@@ -249,19 +246,19 @@ describeIf('PT current-term financials, against a real database', () => {
   // ── Tenant isolation ──────────────────────────────────────────────────────
 
   it('will not serve another studio\'s client profile', async () => {
-    mockUser = { id: 'u-b', role: 'admin', organization_id: ORG_B };
+    mockUser = { id: 'u-b', role: 'trainer', organization_id: ORG_B };
     const res = await request(app).get(`/api/pt-os/clients/${ids['zero-snapshot']}`);
     expect(res.status).toBe(404);
   });
 
   it('will not serve another studio\'s subscription history', async () => {
-    mockUser = { id: 'u-b', role: 'admin', organization_id: ORG_B };
+    mockUser = { id: 'u-b', role: 'trainer', organization_id: ORG_B };
     const res = await request(app).get(`/api/pt-os/clients/${ids['renewed']}/subscriptions`);
     expect(res.status).toBe(404);
   });
 
   it('does not let one studio\'s terms leak into another studio\'s totals', async () => {
-    mockUser = { id: 'u-b', role: 'admin', organization_id: ORG_B };
+    mockUser = { id: 'u-b', role: 'trainer', organization_id: ORG_B };
     const res = await request(app).get(`/api/pt-os/clients/${ids['other-org']}`);
     expect(res.status).toBe(200);
     expect(Number(res.body.data.current_term_fee)).toBe(40000);

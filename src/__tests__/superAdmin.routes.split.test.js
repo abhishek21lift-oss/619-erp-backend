@@ -215,7 +215,6 @@ describe('super-admin API — the H-03 split', () => {
     'POST /organizations/:id/subscription/freeze',
     'POST /organizations/:id/subscription/reactivate',
     'POST /organizations/:id/subscription/schedule-downgrade',
-    'POST /organizations/:id/users',
     'POST /registrations/:id/approve',
     'POST /registrations/:id/reject',
     'POST /subscription-payments/:id/refund',

@@ -33,24 +33,12 @@ describe('client writes are audited', () => {
 });
 
 describe('the trainer commission endpoint', () => {
-  const fn = ptOs.slice(ptOs.indexOf("router.put('/commissions/:trainerId'"));
-  const body = fn.slice(0, fn.indexOf('\n}));')) + '\n}));';
-
-  it('is now tenant-scoped — it had no organization filter at all before this', () => {
-    // Same helper every sibling write in this file already uses.
-    expect(body).toMatch(/orgWhere\(req, beforeParams\)/);
-    expect(body).toMatch(/orgWhere\(req, updParams\)/);
-  });
-
-  it('404s a cross-tenant trainer id rather than updating it', () => {
-    expect(body).toContain("if (before.length === 0) return res.status(404)");
-  });
-
-  it('logs the before and after commission rate, not just that something changed', () => {
-    expect(body).toContain("logActivity(");
-    expect(body).toContain("'trainer.commission_update'");
-    expect(body).toContain('{ incentive_rate: rate }');
-    expect(body).toContain('{ incentive_rate: before[0].incentive_rate }');
+  it('is gone with the staff roles, and so is its payout sibling', () => {
+    // Commissions and payouts paid a studio's staff. The studio has one
+    // trainer — its owner — so the endpoints were removed rather than kept
+    // with nobody to pay.
+    expect(ptOs).not.toContain("router.put('/commissions/:trainerId'");
+    expect(ptOs).not.toContain("router.post('/payouts'");
   });
 });
 
@@ -92,17 +80,14 @@ describe('GET /activity-log — the studio-facing read of the trail', () => {
   const route = ptOs.slice(ptOs.indexOf("router.get('/activity-log'"));
   const body = route.slice(0, route.indexOf('module.exports'));
 
-  it('is admin/manager only, not open to every signed-in role', () => {
-    expect(route.slice(0, route.indexOf('wrap('))).toContain('adminOrManager');
+  it('is the studio trainer\'s only, not open to every signed-in role', () => {
+    expect(route.slice(0, route.indexOf('wrap('))).toContain('requireTrainer');
   });
 
   it('filters to the caller\'s own organization unconditionally — never an optional clause a query param could skip', () => {
-    // Every sibling read in this file guards the org filter behind
-    // scope.applyFilter (true for a studio user, false only for a platform
-    // super admin operating platform-wide) — but adminOrManager already
-    // rejects super_admin outright, so this endpoint has no "see everything"
-    // path to accidentally leave open. The filter is unconditional, not
-    // behind an if.
+    // tenantScope() has no unfiltered case any more, and requireTrainer
+    // refuses super_admin outright, so there is no "see everything" path to
+    // leave open. The filter is unconditional, not behind an if.
     expect(body).toContain("const where = ['a.organization_id = $1']");
     expect(body).toContain('const params = [scope.orgId]');
     expect(body).not.toMatch(/if \(scope\.applyFilter\)/);

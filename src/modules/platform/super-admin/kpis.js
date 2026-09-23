@@ -24,7 +24,7 @@ router.get('/overview/kpis', async (req, res, next) => {
         ),
         owner_kpis AS (
           SELECT COUNT(DISTINCT u.id)::int AS total_owners FROM users u
-          WHERE u.role = 'admin' AND u.deleted_at IS NULL AND EXISTS (SELECT 1 FROM organizations o WHERE o.id = u.organization_id)
+          WHERE u.role = 'trainer' AND u.deleted_at IS NULL AND EXISTS (SELECT 1 FROM organizations o WHERE o.id = u.organization_id)
         ),
         trainer_kpis AS (SELECT COUNT(*)::int AS total_trainers FROM trainers WHERE deleted_at IS NULL),
         client_kpis AS (

@@ -22,7 +22,7 @@ jest.mock('../db/pool', () => ({ query: jest.fn() }));
 let mockUser = { id: 'usr-1', role: 'trainer', organization_id: 'org-1' };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../lib/ai/router', () => ({
   routedChat: jest.fn(),
@@ -59,7 +59,7 @@ const ASSESS_ROWS = [{ weight: 73.2, body_fat_pct: 22, chest_cm: null, waist_cm:
 const CHECKIN_ROWS = [{ weight: 73, mood: 'good', sleep_hours: 7, client_notes: 'ok', created_at: '2026-08-10' }];
 
 // The parent pt_clients gate buildClientContext must run FIRST.
-const PARENT_SQL = /SELECT name, dob, gender, mobile FROM pt_clients WHERE id=\$1 AND deleted_at IS NULL AND \(\$2::uuid IS NULL OR organization_id=\$2\)/;
+const PARENT_SQL = /SELECT name, dob, gender, mobile FROM pt_clients WHERE id=\$1 AND deleted_at IS NULL AND organization_id = \$2/;
 const CHILD_TABLES = /pt_goals|pt_assessments|weekly_checkins/;
 
 function clientDispatch({ client = CLIENT_ROWS, goals = GOAL_ROWS, assess = ASSESS_ROWS, checkins = CHECKIN_ROWS } = {}) {
@@ -210,32 +210,22 @@ describe('POST /api/ai/chat — clients that fail the parent gate', () => {
     expect(sqls.some((s) => CHILD_TABLES.test(s))).toBe(false);
   });
 
-  it('missing organization: null org param, gate still authoritative', async () => {
-    // Org-less tenant user — orgParam() resolves to null, and the shared
-    // predicate's `$2::uuid IS NULL` branch authorizes platform-wide, exactly
-    // as loadAuthoritativeClient does. The gate still decides everything:
-    // an existing client is authorized (children run, parity with canonical),
-    // and a client that fails the gate gets zero child queries.
+  it('missing organization: null org is bound under strict equality, which matches nothing', async () => {
+    // An org-less account. orgParam() resolves to null and the parent gate
+    // binds it as `organization_id = $2` — strict equality, never true for
+    // NULL. There used to be a `$2::uuid IS NULL OR …` branch here that
+    // turned a missing organization into platform-wide access; the mock below
+    // returns what a real database now returns for that predicate: nothing.
     mockUser = { id: 'usr-1', role: 'trainer', organization_id: null };
 
-    // Existing client under a null org → authorized platform-wide (canonical parity).
-    pool.query.mockImplementation(clientDispatch());
+    pool.query.mockImplementation(clientDispatch({ client: [] }));
     routedStream.mockImplementation(streamChunks(['ok']));
     await request(app)
       .post('/api/ai/chat')
       .send({ message: 'hi', client_id: 'cli-1', conversation_id: 'conv-1' });
     const parentCall = pool.query.mock.calls.find(([s]) => PARENT_SQL.test(s));
     expect(parentCall[1]).toEqual(['cli-1', null]); // null org bound, not interpolated
-    expect(systemPromptOf()).toContain('Current client context:');
-
-    // Same org-less user, client that fails the gate → zero child queries.
-    pool.query.mockReset();
-    pool.query.mockImplementation(clientDispatch({ client: [] }));
-    routedStream.mockReset();
-    routedStream.mockImplementation(streamChunks(['ok']));
-    await request(app)
-      .post('/api/ai/chat')
-      .send({ message: 'hi', client_id: 'nope', conversation_id: 'conv-1' });
+    expect(parentCall[0]).not.toMatch(/IS NULL OR/);
     const sqls = pool.query.mock.calls.map(([s]) => s);
     expect(sqls.some((s) => CHILD_TABLES.test(s))).toBe(false);
     expect(systemPromptOf()).not.toContain('Current client context:');

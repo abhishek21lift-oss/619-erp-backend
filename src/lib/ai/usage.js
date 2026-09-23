@@ -58,23 +58,33 @@ async function getUserUsage(user_id) {
 /**
  * Per-model breakdown for the last 30 days (admin view).
  */
-async function getModelStats() {
+/**
+ * One studio's AI usage by model over the last 30 days.
+ *
+ * ai_usage_log carries no organization_id, so the studio is reached through
+ * the user who made each call. orgId is required and bound with strict
+ * equality: a missing org matches nothing rather than every studio.
+ */
+async function getModelStats(orgId) {
   const { rows } = await pool.query(
     `SELECT
-       model,
-       provider,
-       intent_type,
+       l.model,
+       l.provider,
+       l.intent_type,
        COUNT(*)                                                   AS requests,
-       COALESCE(SUM(tokens_total),0)                             AS tokens_total,
-       COALESCE(SUM(tokens_prompt),0)                            AS tokens_prompt,
-       COALESCE(SUM(tokens_completion),0)                        AS tokens_completion,
-       COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE)        AS requests_today,
-       AVG(latency_ms)::INTEGER                                  AS avg_latency_ms,
-       COUNT(*) FILTER (WHERE used_fallback)                     AS fallback_count
-     FROM ai_usage_log
-     WHERE created_at >= NOW() - INTERVAL '30 days'
-     GROUP BY model, provider, intent_type
-     ORDER BY requests DESC`
+       COALESCE(SUM(l.tokens_total),0)                           AS tokens_total,
+       COALESCE(SUM(l.tokens_prompt),0)                          AS tokens_prompt,
+       COALESCE(SUM(l.tokens_completion),0)                      AS tokens_completion,
+       COUNT(*) FILTER (WHERE l.created_at >= CURRENT_DATE)      AS requests_today,
+       AVG(l.latency_ms)::INTEGER                                AS avg_latency_ms,
+       COUNT(*) FILTER (WHERE l.used_fallback)                   AS fallback_count
+     FROM ai_usage_log l
+     JOIN users u ON u.id = l.user_id
+     WHERE l.created_at >= NOW() - INTERVAL '30 days'
+       AND u.organization_id = $1
+     GROUP BY l.model, l.provider, l.intent_type
+     ORDER BY requests DESC`,
+    [orgId]
   );
   return rows;
 }

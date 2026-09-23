@@ -250,7 +250,7 @@ describe('the two aggregates this was written for stay bounded', () => {
     // stripComments, not the raw file. The comment above these queries QUOTES
     // the one-query form in order to explain why it is wrong, and a raw-text
     // check would read that explanation as the defect returning. The same slip
-    // has now happened twice in this repo — once with a `requireStaff` check
+    // has now happened twice in this repo — once with a `requireTrainer` check
     // that matched the word inside an inserted comment.
     const src = stripComments(fs.readFileSync(
       path.join(SRC, 'modules', 'command-center', 'alerts.service.js'), 'utf8'));

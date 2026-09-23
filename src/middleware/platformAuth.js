@@ -312,7 +312,7 @@ function pathOf(req) {
  * Anything that is neither a platform path nor plane-neutral. Written as
  * "everything else" on purpose: a route added tomorrow is tenant surface by
  * default, so forgetting to classify it fails toward the restrictive answer
- * rather than leaving a hole. The same reasoning as requireStaff's allow-list
+ * rather than leaving a hole. The same reasoning as requireTrainer's allow-list
  * in rbac.js.
  */
 function isTenantPlanePath(path) {

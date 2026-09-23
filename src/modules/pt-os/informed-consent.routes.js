@@ -3,7 +3,7 @@
 // Mounted at /api/pt-os, so final paths are /api/pt-os/informed-consent/...
 //
 // Follows the same conventions as parq.routes.js: a shared wrap() for
-// async error handling, auth + requireRole('admin','manager','trainer')
+// async error handling, auth + requireTrainer
 // on every write (this app is staff-operated — consent is signed in
 // person on a staff device during onboarding, there is no separate
 // PT-client login), and logActivity() for the audit trail.
@@ -12,14 +12,18 @@ const multer = require('multer');
 const pool = require('../../db/pool');
 const { detectFileType, DOCUMENTS } = require('../../lib/fileSignatures');
 const logger = require('../../lib/logger');
-const { auth } = require('../../middleware/auth');
-const { requireRole } = require('../../middleware/rbac');
+const { auth, requireTrainer } = require('../../middleware/auth');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
 const { generateInformedConsentPdf } = require('../../lib/informedConsentPdf');
 const { saveFile } = require('../../lib/fileStorage');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -98,7 +102,7 @@ async function fetchClientSnapshot(clientId, req) {
   const scope = tenantScope(req);
   const params = [clientId];
   let orgClause = '';
-  if (scope.applyFilter) { params.push(scope.orgId); orgClause = ' AND organization_id = $2'; }
+  params.push(scope.orgId); orgClause = ' AND organization_id = $2';
   const { rows } = await pool.query(
     `SELECT name AS full_name, gender, dob, mobile, email, address, occupation,
             emergency_contact, emergency_phone, trainer_id
@@ -116,7 +120,7 @@ router.get('/informed-consent', auth, wrap(async (req, res) => {
   const where = [];
   const params = [];
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  params.push(scope.orgId); where.push(`organization_id = $${params.length}`);
   if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
@@ -128,10 +132,10 @@ router.get('/informed-consent', auth, wrap(async (req, res) => {
 // GET /informed-consent/:id
 router.get('/informed-consent/:id', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const guard = ' AND organization_id = $2';
   const { rows } = await pool.query(
     `SELECT * FROM pt_informed_consents WHERE id = $1${guard}`,
-    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+    [req.params.id, scope.orgId]
   );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ data: rows[0] });
@@ -143,10 +147,10 @@ router.get('/informed-consent/:id', auth, wrap(async (req, res) => {
 router.get('/informed-consent/:id/activity', auth, wrap(async (req, res) => {
   // Gate on the parent consent's org — activity_log has no org column.
   const scope = tenantScope(req);
-  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const guard = ' AND organization_id = $2';
   const { rows: owner } = await pool.query(
     `SELECT id FROM pt_informed_consents WHERE id = $1${guard}`,
-    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+    [req.params.id, scope.orgId]
   );
   if (!owner[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -162,7 +166,7 @@ router.get('/informed-consent/:id/activity', auth, wrap(async (req, res) => {
 
 // POST /informed-consent — creates a new draft, auto-filling the client
 // snapshot from pt_clients for any field not explicitly provided.
-router.post('/informed-consent', auth, requireRole('admin', 'manager', 'trainer'), validate(createSchema), wrap(async (req, res) => {
+router.post('/informed-consent', auth, requireTrainer, validate(createSchema), wrap(async (req, res) => {
   const b = req.body;
   const snapshot = await fetchClientSnapshot(b.client_id, req);
   if (!snapshot) return res.status(404).json({ error: { code: 'CLIENT_NOT_FOUND' } });
@@ -198,7 +202,7 @@ router.post('/informed-consent', auth, requireRole('admin', 'manager', 'trainer'
 // A draft is edited in place. A completed record is never overwritten —
 // editing it archives the current row and creates a new draft version
 // carrying the patched fields forward, per the module's versioning rule.
-router.patch('/informed-consent/:id', auth, requireRole('admin', 'manager', 'trainer'), validate(updateSchema), wrap(async (req, res) => {
+router.patch('/informed-consent/:id', auth, requireTrainer, validate(updateSchema), wrap(async (req, res) => {
   const { id } = req.params;
   const b = req.body;
 
@@ -214,10 +218,10 @@ router.patch('/informed-consent/:id', auth, requireRole('admin', 'manager', 'tra
   try {
     await tx.query('BEGIN');
     const scope = tenantScope(req);
-    const upGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+    const upGuard = ' AND organization_id = $2';
     const { rows: existingRows } = await tx.query(
       `SELECT * FROM pt_informed_consents WHERE id = $1${upGuard} FOR UPDATE`,
-      scope.applyFilter ? [id, scope.orgId] : [id]
+      [id, scope.orgId]
     );
     const existing = existingRows[0];
     if (!existing) { await tx.query('ROLLBACK'); return res.status(404).json({ error: { code: 'NOT_FOUND' } }); }
@@ -293,13 +297,13 @@ router.patch('/informed-consent/:id', auth, requireRole('admin', 'manager', 'tra
 // and trainer have signed and every acknowledgement is true, the record
 // is finalized: status -> completed, capture metadata recorded, PDF
 // generated.
-router.post('/informed-consent/:id/sign', auth, requireRole('admin', 'manager', 'trainer'), validate(signSchema), wrap(async (req, res) => {
+router.post('/informed-consent/:id/sign', auth, requireTrainer, validate(signSchema), wrap(async (req, res) => {
   const { id } = req.params;
   const scope = tenantScope(req);
-  const signGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const signGuard = ' AND organization_id = $2';
   const { rows: existingRows } = await pool.query(
     `SELECT * FROM pt_informed_consents WHERE id = $1${signGuard}`,
-    scope.applyFilter ? [id, scope.orgId] : [id]
+    [id, scope.orgId]
   );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -365,12 +369,12 @@ router.post('/informed-consent/:id/sign', auth, requireRole('admin', 'manager', 
 }));
 
 // POST /informed-consent/:id/revoke
-router.post('/informed-consent/:id/revoke', auth, requireRole('admin', 'manager'), wrap(async (req, res) => {
+router.post('/informed-consent/:id/revoke', auth, requireTrainer, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  const rvGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const rvGuard = ' AND organization_id = $2';
   const { rows } = await pool.query(
     `UPDATE pt_informed_consents SET status = 'revoked', updated_at = NOW() WHERE id = $1${rvGuard} RETURNING *`,
-    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+    [req.params.id, scope.orgId]
   );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   await logActivity(req, 'informed_consent.revoke', 'pt_informed_consents', req.params.id, {});
@@ -395,15 +399,15 @@ const clearanceUpload = multer({
 
 
 // POST /informed-consent/:id/medical-clearance
-router.post('/informed-consent/:id/medical-clearance', auth, requireRole('admin', 'manager', 'trainer'), clearanceUpload.single('file'), wrap(async (req, res) => {
+router.post('/informed-consent/:id/medical-clearance', auth, requireTrainer, clearanceUpload.single('file'), wrap(async (req, res) => {
   if (!req.file) return res.status(400).json({ error: { code: 'FILE_REQUIRED' } });
 
   const { id } = req.params;
   const scope = tenantScope(req);
-  const mcGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const mcGuard = ' AND organization_id = $2';
   const { rows: existingRows } = await pool.query(
     `SELECT id FROM pt_informed_consents WHERE id = $1${mcGuard}`,
-    scope.applyFilter ? [id, scope.orgId] : [id]
+    [id, scope.orgId]
   );
   if (!existingRows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 

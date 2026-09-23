@@ -19,7 +19,7 @@
 //   • The screenshot URL is a server-generated storage key. A caller can only
 //     upload bytes; it cannot name where they land or claim a URL it did not
 //     produce.
-//   • Approval is admin-only, tenant-scoped, and conditional on the row still
+//   • Approval is the trainer's, tenant-scoped, and conditional on the row still
 //     being pending — see lib/upiPayments.js.
 'use strict';
 
@@ -29,8 +29,7 @@ const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { detectFileType, DOCUMENTS } = require('../lib/fileSignatures');
 const { strictNumber } = require('../lib/zodNumbers');
-const { auth, adminOnly } = require('../middleware/auth');
-const { requireStaff } = require('../middleware/rbac');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { z } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
@@ -316,16 +315,16 @@ async function notify(userId, type, title, body, link) {
  */
 async function userIdForClient(clientId) {
   const { rows } = await pool.query(
-    `SELECT id FROM users WHERE pt_client_id = $1 AND is_active = TRUE LIMIT 1`, [clientId]
+    `SELECT id FROM users WHERE pt_client_id = $1 AND role = 'member' AND is_active = TRUE AND deleted_at IS NULL LIMIT 1`, [clientId]
   );
   return rows[0]?.id || null;
 }
 
-/** Studio trainers / admins — the people who verify payments. */
-async function adminUserIds(orgId) {
+/** The studio's trainer — the person who verifies payments. */
+async function trainerUserIds(orgId) {
   const { rows } = await pool.query(
     `SELECT id FROM users
-      WHERE organization_id = $1 AND is_active = TRUE AND role IN ('trainer','admin','manager')`,
+      WHERE organization_id = $1 AND is_active = TRUE AND deleted_at IS NULL AND role = 'trainer'`,
     [orgId]
   );
   return rows.map((r) => r.id);
@@ -338,19 +337,19 @@ async function adminUserIds(orgId) {
 // GET /api/payments/upi/settings — what the payment page and the settings
 // screen both read. Safe for any authenticated user in the studio: it exposes
 // the studio's own public payee details and nothing else.
-// requireStaff on this route only. The rest of this mount is the member-facing
+// requireTrainer on this route only. The rest of this mount is the member-facing
 // payment flow (create, upload proof, submit UTR), which must stay open — but
 // this returns the studio's UPI configuration object, and the sibling endpoint
 // /api/subscription/checkout/settings deliberately withholds its VPA from its
 // own response for exactly that reason. Gating the mount would break paying.
-router.get('/settings', auth, requireStaff, wrap(async (req, res) => {
+router.get('/settings', auth, requireTrainer, wrap(async (req, res) => {
   const orgId = requireOrg(req);
   const settings = await upi.getSettings(orgId);
   res.json({ data: settings, configured: Boolean(settings), enabled: Boolean(settings?.is_enabled) });
 }));
 
-// PUT /api/payments/upi/settings — admin only.
-router.put('/settings', auth, adminOnly, validate(schemas.settings), wrap(async (req, res) => {
+// PUT /api/payments/upi/settings — the studio trainer.
+router.put('/settings', auth, requireTrainer, validate(schemas.settings), wrap(async (req, res) => {
   try {
     const orgId = requireOrg(req);
     const saved = await upi.upsertSettings(orgId, req.body);
@@ -585,7 +584,7 @@ router.post('/:id/submit-utr', auth, validate(schemas.submitUtr), wrap(async (re
     });
 
     // Tell the studio there is something to verify.
-    const admins = await adminUserIds(order.organization_id);
+    const admins = await trainerUserIds(order.organization_id);
     await Promise.all(admins.map((id) => notify(
       id, 'payment',
       'New payment waiting for verification',
@@ -687,7 +686,7 @@ router.get('/history', auth, validate(schemas.history), wrap(async (req, res) =>
 //
 // The counters are computed in SQL rather than by paginating the list, so
 // "Total Collection" is the real total and not the total of the first page.
-router.get('/pending', auth, adminOnly, validate(schemas.pending), wrap(async (req, res) => {
+router.get('/pending', auth, requireTrainer, validate(schemas.pending), wrap(async (req, res) => {
   const orgId = requireOrg(req);
 
   const conditions = ['o.organization_id = $1'];
@@ -778,8 +777,8 @@ router.get('/pending', auth, adminOnly, validate(schemas.pending), wrap(async (r
   });
 }));
 
-// GET /api/payments/upi/:id/audit — the trail for one payment (admin only).
-router.get('/:id/audit', auth, adminOnly, validate(schemas.idParam), wrap(async (req, res) => {
+// GET /api/payments/upi/:id/audit — the trail for one payment (trainer).
+router.get('/:id/audit', auth, requireTrainer, validate(schemas.idParam), wrap(async (req, res) => {
   const orgId = requireOrg(req);
   const { rows } = await pool.query(
     `SELECT action, from_status, to_status, detail, actor_name, actor_role, created_at
@@ -791,8 +790,8 @@ router.get('/:id/audit', auth, adminOnly, validate(schemas.idParam), wrap(async 
   res.json({ data: rows });
 }));
 
-// POST /api/payments/upi/:id/approve — admin only.
-router.post('/:id/approve', auth, adminOnly, validate(schemas.idParam), wrap(async (req, res) => {
+// POST /api/payments/upi/:id/approve — the studio trainer.
+router.post('/:id/approve', auth, requireTrainer, validate(schemas.idParam), wrap(async (req, res) => {
   try {
     const orgId = requireOrg(req);
     const result = await upi.approve({ orderId: req.params.id, orgId, actor: actorOf(req) });
@@ -818,8 +817,8 @@ router.post('/:id/approve', auth, adminOnly, validate(schemas.idParam), wrap(asy
   }
 }));
 
-// POST /api/payments/upi/:id/reject — admin only.
-router.post('/:id/reject', auth, adminOnly, validate(schemas.reject), wrap(async (req, res) => {
+// POST /api/payments/upi/:id/reject — the studio trainer.
+router.post('/:id/reject', auth, requireTrainer, validate(schemas.reject), wrap(async (req, res) => {
   try {
     const orgId = requireOrg(req);
     const result = await upi.reject({
@@ -850,7 +849,7 @@ router.post('/:id/reject', auth, adminOnly, validate(schemas.reject), wrap(async
 // POST /api/payments/upi/:id/request-correction — a rejection with a softer
 // framing. Same transition, so the member can resubmit either way; the audit
 // action differs so the trail records what the admin actually meant.
-router.post('/:id/request-correction', auth, adminOnly, validate(schemas.reject),
+router.post('/:id/request-correction', auth, requireTrainer, validate(schemas.reject),
   wrap(async (req, res) => {
     try {
       const orgId = requireOrg(req);

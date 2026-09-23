@@ -60,7 +60,8 @@ function audienceClause(a) {
  */
 async function resolveRecipients(a, db) {
   const { clause, params } = audienceClause(a);
-  const roles = a.audience_roles?.length ? a.audience_roles : ['trainer', 'admin', 'manager'];
+  // Default audience: the studios' trainers (a studio-facing announcement).
+  const roles = a.audience_roles?.length ? a.audience_roles : ['trainer'];
   params.push(roles);
 
   const { rows } = await db.query(

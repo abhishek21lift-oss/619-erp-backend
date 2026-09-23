@@ -10,10 +10,9 @@ const request = require('supertest');
 jest.mock('../db/pool', () => ({ query: jest.fn(), connect: jest.fn() }));
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = global.__mockUser; next(); },
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
-jest.mock('../middleware/rbac', () => ({ requireRole: () => (_req, _res, next) => next() }));
+jest.mock('../middleware/rbac', () => ({ requireTrainer: (_req, _res, next) => next(),}));
 jest.mock('../lib/activityLog', () => ({ logActivity: jest.fn() }));
 
 const mockClientInOrg = jest.fn(async () => true);
@@ -36,7 +35,7 @@ const find = (re) => sqls().find((s) => re.test(s));
 beforeEach(() => {
   jest.clearAllMocks();
   mockClientInOrg.mockResolvedValue(true);
-  global.__mockUser = { id: 'u-1', role: 'admin', organization_id: ORG };
+  global.__mockUser = { id: 'u-1', role: 'trainer', organization_id: ORG };
   pool.query.mockResolvedValue({ rows: [] });
 });
 

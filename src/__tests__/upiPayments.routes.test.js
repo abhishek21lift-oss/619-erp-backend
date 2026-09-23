@@ -57,11 +57,8 @@ jest.mock('../db/pool', () => ({
 let mockUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (req, res, next) => (
-    req.user?.role === 'admin' || req.user?.role === 'super_admin'
-      ? next()
-      : res.status(403).json({ error: 'Admin access required' })
-  ),
+  // The real guard, so the test proves what production enforces.
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const express = require('express');
@@ -80,18 +77,28 @@ const ORDER = '3f8b1c2d-4e5a-4b7c-9d0e-1a2b3c4d5e6f';
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockUser = { id: 'usr-admin', role: 'admin', organization_id: ORG_A, trainer_id: null };
+  mockUser = { id: 'usr-trainer', role: 'trainer', organization_id: ORG_A, trainer_id: 'trn-1' };
 });
 
-describe('admin-only endpoints reject non-admins', () => {
-  const adminRoutes = [
+describe('the review endpoints are the studio trainer\'s alone', () => {
+  const trainerRoutes = [
     ['post', `/api/payments/upi/${ORDER}/approve`, {}],
     ['post', `/api/payments/upi/${ORDER}/reject`, { reason: 'AMOUNT_MISMATCH' }],
     ['get', '/api/payments/upi/pending', null],
   ];
 
-  test.each(adminRoutes)('%s %s is closed to a trainer', async (method, url, body) => {
-    mockUser = { id: 'usr-t', role: 'trainer', organization_id: ORG_A, trainer_id: 'trn-1' };
+  test.each(trainerRoutes)('%s %s is open to the studio trainer', async (method, url, body) => {
+    // The trainer owns the studio and reviews its payments — there is no
+    // separate admin above them any more.
+    const r = request(app())[method](url);
+    const res = await (body ? r.send(body) : r);
+    expect(res.status).toBeLessThan(400);
+  });
+
+  test.each(trainerRoutes)('%s %s is closed to the platform operator', async (method, url, body) => {
+    // Platform-only: approving a studio's payment is a tenant action, reached
+    // through audited impersonation or not at all.
+    mockUser = { id: 'usr-sa', role: 'super_admin', organization_id: null, trainer_id: null };
 
     const r = request(app())[method](url);
     const res = await (body ? r.send(body) : r);
@@ -101,7 +108,7 @@ describe('admin-only endpoints reject non-admins', () => {
     expect(mockUpi.reject).not.toHaveBeenCalled();
   });
 
-  test.each(adminRoutes)('%s %s is closed to a member', async (method, url, body) => {
+  test.each(trainerRoutes)('%s %s is closed to a member', async (method, url, body) => {
     mockUser = { id: 'usr-m', role: 'member', organization_id: ORG_A, member_id: 'ptc-1' };
 
     const r = request(app())[method](url);
@@ -135,9 +142,9 @@ describe('the organization an approval executes against', () => {
     );
   });
 
-  test('ignores an x-org-id header from an ordinary tenant admin', async () => {
-    // tenantScope only honours x-org-id for super_admin. A studio owner
-    // sending it must stay pinned to their own organization.
+  test('ignores an x-org-id header from the trainer', async () => {
+    // Nothing on the tenant plane reads x-org-id. A trainer sending it stays
+    // pinned to their own organization.
     await request(app())
       .post(`/api/payments/upi/${ORDER}/approve`)
       .set('x-org-id', ORG_B)
@@ -148,33 +155,24 @@ describe('the organization an approval executes against', () => {
     );
   });
 
-  test('honours x-org-id for a super admin, who is deliberately cross-tenant', async () => {
+  test('an x-org-id header does not retarget a super admin into a studio', async () => {
+    // It used to: the header made a super admin's approval execute against
+    // any studio they named. Now the platform operator has no tenant at all.
     mockUser = { id: 'usr-sa', role: 'super_admin', organization_id: null, trainer_id: null };
 
-    await request(app())
+    const res = await request(app())
       .post(`/api/payments/upi/${ORDER}/approve`)
       .set('x-org-id', ORG_B)
       .send({});
 
-    expect(mockUpi.approve).toHaveBeenCalledWith(
-      expect.objectContaining({ orgId: ORG_B })
-    );
-  });
-
-  test('403s an account with no studio context instead of running unscoped', async () => {
-    // Fail closed. A null org must not reach upi.approve(), where a missing
-    // predicate could match another tenant's order.
-    mockUser = { id: 'usr-orphan', role: 'admin', organization_id: null, trainer_id: null };
-
-    const res = await request(app()).post(`/api/payments/upi/${ORDER}/approve`).send({});
-
     expect(res.status).toBe(403);
-    expect(res.body.error.code).toBe('NO_TENANT');
     expect(mockUpi.approve).not.toHaveBeenCalled();
   });
 
-  test('a super admin with no x-org-id is also refused — approval needs a target', async () => {
-    mockUser = { id: 'usr-sa', role: 'super_admin', organization_id: null, trainer_id: null };
+  test('403s a trainer account with no studio instead of running unscoped', async () => {
+    // Fail closed. A null org must not reach upi.approve(), where a missing
+    // predicate could match another tenant's order.
+    mockUser = { id: 'usr-orphan', role: 'trainer', organization_id: null, trainer_id: null };
 
     const res = await request(app()).post(`/api/payments/upi/${ORDER}/approve`).send({});
 

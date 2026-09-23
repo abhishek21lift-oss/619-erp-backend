@@ -13,8 +13,7 @@ jest.mock('../db/pool', () => ({ query: jest.fn() }));
 let mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const mockRetrieve = jest.fn();
@@ -73,7 +72,7 @@ describe('tenant isolation', () => {
   });
 
   test('a user in another org searches their own library, not the first one\'s', async () => {
-    mockUser = { id: 'u2', role: 'manager', organization_id: 'org-2' };
+    mockUser = { id: 'u2', role: 'trainer', organization_id: 'org-2' };
     mockDocCount(0);
 
     await request(app()).get('/api/ai/knowledge/search').query({ q: 'refunds' });
@@ -81,21 +80,23 @@ describe('tenant isolation', () => {
     expect(mockRetrieve).toHaveBeenCalledWith(expect.objectContaining({ organizationId: 'org-2' }));
   });
 
-  test('a platform-wide super admin gets nothing rather than everything', async () => {
+  test('the platform operator is refused — a studio search is not a platform tool', async () => {
     // A similarity search across every tenant on the platform is not a query
-    // anyone should be able to run, and there is no single org to scope it to.
+    // anyone should be able to run. super_admin is refused by requireTrainer
+    // here, and by auth.js on every tenant route before that.
     mockUser = { id: 'sa', role: 'super_admin', organization_id: null };
 
     const res = await request(app()).get('/api/ai/knowledge/search').query({ q: 'refunds' });
 
-    expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({ chunks: [], documents_available: 0, scope: 'platform' });
+    expect(res.status).toBe(403);
     expect(mockRetrieve).not.toHaveBeenCalled();
     expect(pool.query).not.toHaveBeenCalled();
   });
 
-  test('a super admin targeting one org via x-org-id searches that org', async () => {
-    mockUser = { id: 'sa', role: 'super_admin', organization_id: null };
+  test('an x-org-id header names nothing: the search stays in the caller\'s own studio', async () => {
+    // The header used to retarget a super admin's search at any studio. It is
+    // no longer read anywhere — the organization comes from the session only.
+    mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
     mockDocCount(2);
 
     await request(app())
@@ -103,21 +104,28 @@ describe('tenant isolation', () => {
       .set('x-org-id', 'org-7')
       .query({ q: 'refunds' });
 
-    expect(mockRetrieve).toHaveBeenCalledWith(expect.objectContaining({ organizationId: 'org-7' }));
+    expect(mockRetrieve).toHaveBeenCalledWith(expect.objectContaining({ organizationId: 'org-1' }));
+    expect(mockRetrieve).not.toHaveBeenCalledWith(expect.objectContaining({ organizationId: 'org-7' }));
   });
 });
 
 describe('who may search', () => {
-  test.each(['admin', 'manager', 'trainer', 'reception', 'staff'])('%s may read the policies', async (role) => {
-    // Managing the library stays admin/manager. Reading what a policy says is
-    // what the policy is for, and the people asking mid-shift are trainers and
-    // reception.
-    mockUser = { id: 'u1', role, organization_id: 'org-1' };
+  test('the studio trainer may read the policies', async () => {
+    mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
     mockDocCount(1);
 
     const res = await request(app()).get('/api/ai/knowledge/search').query({ q: 'notice period' });
 
     expect(res.status).toBe(200);
+  });
+
+  test.each(['admin', 'manager', 'reception', 'staff'])('a removed staff role (%s) may not', async (role) => {
+    mockUser = { id: 'u1', role, organization_id: 'org-1' };
+
+    const res = await request(app()).get('/api/ai/knowledge/search').query({ q: 'notice period' });
+
+    expect(res.status).toBe(403);
+    expect(mockRetrieve).not.toHaveBeenCalled();
   });
 
   test('a client account may not', async () => {

@@ -176,8 +176,9 @@ describe('the summary', () => {
     pool.query.mockResolvedValue({ rows: [{}] });
     await request(app).get('/api/platform/users/summary');
     const sql = sqlOf();
-    expect(sql).toMatch(/AS owners/);
-    expect(sql).toMatch(/AS trainers/);
+    // The studio owners ARE the trainers: one count, keyed on role 'trainer'.
+    expect(sql).toMatch(/role = 'trainer'\)::int\s+AS owners/);
+    expect(sql).not.toMatch(/role = 'admin'/);
     expect(sql).toMatch(/AS members/);
     expect(sql).toMatch(/AS platform/);
   });

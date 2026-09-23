@@ -51,11 +51,8 @@ const CLIENT_USER = {
 let mockUser = CLIENT_USER;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 
@@ -85,36 +82,23 @@ beforeEach(() => {
   };
 });
 
-describe('GET /api/payments — a client sees their own payments', () => {
-  test('clamps on the pt_clients link, not the legacy one', async () => {
-    await request(app('/api/payments', '../routes/payments')).get('/api/payments');
-
-    const q = queries.find((x) => /FROM pt_payments p/i.test(x.sql));
-    expect(q).toBeTruthy();
-    // The clamp covers both ledgers in the UNION, and the live one is first.
-    expect(q.sql).toMatch(/p\.client_id = ANY\(\$\d\)/);
-    const arr = q.params.find((p) => Array.isArray(p));
-    expect(arr).toContain(MY_CLIENT);
+describe('GET /api/payments — the studio ledger is not a client surface', () => {
+  // The payments router used to clamp a member to their own rows. It is now
+  // the trainer's ledger outright (router-level requireTrainer, as well as the
+  // mount), and a client reads their own payments at GET /api/me/payments,
+  // keyed from the session's pt_client_id. So the member clamp here would be
+  // dead code; what must hold is that a client is refused before any query.
+  test('a client account is refused and nothing is read', async () => {
+    const res = await request(app('/api/payments', '../routes/payments')).get('/api/payments');
+    expect(res.status).toBe(403);
+    expect(queries.find((x) => /FROM pt_payments/i.test(x.sql))).toBeUndefined();
   });
 
-  test('an account linked to neither id matches nothing rather than everything', async () => {
-    mockUser = { ...CLIENT_USER, pt_client_id: null, member_id: null };
-    await request(app('/api/payments', '../routes/payments')).get('/api/payments');
-
-    const q = queries.find((x) => /FROM pt_payments p/i.test(x.sql));
-    const arr = q.params.find((p) => Array.isArray(p));
-    // An empty array in `= ANY(...)` matches no row. Fail closed.
-    expect(arr).toEqual([]);
-  });
-
-  test('a client cannot widen the clamp by passing client_id', async () => {
-    await request(app('/api/payments', '../routes/payments'))
-      .get(`/api/payments?client_id=${OTHER_CLIENT}`);
-
-    const q = queries.find((x) => /FROM pt_payments p/i.test(x.sql));
-    const arr = q.params.find((p) => Array.isArray(p));
-    expect(arr).toEqual([MY_CLIENT]);
-    expect(q.params).not.toContain(OTHER_CLIENT);
+  test('a client cannot get in by naming a client_id either', async () => {
+    const res = await request(app('/api/payments', '../routes/payments'))
+      .get(`/api/payments?client_id=${MY_CLIENT}`);
+    expect(res.status).toBe(403);
+    expect(queries).toHaveLength(0);
   });
 });
 
@@ -123,10 +107,10 @@ describe('GET /api/payments — a client sees their own payments', () => {
 // /api/clients was retired: it was a second HTTP surface over pt_clients, and
 // its handlers moved to /api/pt-os/clients. Those two tests pinned a
 // member-role clamp INSIDE that handler — defence in depth, since the mount
-// itself carried requireStaff and a client account (role 'member') could never
+// itself carried requireTrainer and a client account (role 'member') could never
 // reach it. With the handler deleted there is nothing left to clamp, and
 // re-pointing them at /api/pt-os/clients/:id would assert a member clamp that
-// handler has never had and does not need: /api/pt-os is requireStaff too.
+// handler has never had and does not need: /api/pt-os is requireTrainer too.
 //
 // What the deletion does NOT remove is the finding this whole file exists for
 // — that a member must be clamped on pt_client_id and never on the legacy
@@ -134,15 +118,15 @@ describe('GET /api/payments — a client sees their own payments', () => {
 // source scan at the end of this file is what keeps a new one from reaching
 // for member_id.
 
-describe('requireSelfOrRole admits a real client account', () => {
-  const { requireSelfOrRole } = require('../middleware/rbac');
+describe('requireTrainerOrSelf admits a real client account', () => {
+  const { requireTrainerOrSelf } = require('../middleware/rbac');
 
   function run(user, id) {
     const req = { user, params: { id } };
     let status = null;
     const res = { status: (c) => { status = c; return { json: () => {} }; } };
     let passed = false;
-    requireSelfOrRole('admin')(req, res, () => { passed = true; });
+    requireTrainerOrSelf('id')(req, res, () => { passed = true; });
     return { passed, status };
   }
 
@@ -161,8 +145,12 @@ describe('requireSelfOrRole admits a real client account', () => {
     expect(r.passed).toBe(false);
   });
 
-  test('an elevated role still passes without an id match', () => {
-    expect(run({ id: 'a', role: 'admin' }, OTHER_CLIENT).passed).toBe(true);
+  test('the studio trainer passes without an id match', () => {
+    expect(run({ id: 'a', role: 'trainer', organization_id: ORG }, OTHER_CLIENT).passed).toBe(true);
+  });
+
+  test('a removed staff role does not', () => {
+    expect(run({ id: 'a', role: 'admin', organization_id: ORG }, OTHER_CLIENT).passed).toBe(false);
   });
 });
 

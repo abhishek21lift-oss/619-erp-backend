@@ -27,11 +27,10 @@ jest.mock('../lib/ai/embeddings', () => ({
   EMBEDDING_DIM: 384,
 }));
 
-let mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+let mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 jest.mock('../lib/ai/router', () => ({ routedStream: jest.fn(), routedChat: jest.fn() }));
@@ -188,7 +187,7 @@ beforeEach(() => {
   mockLogInfo.mockClear();
   mockLogWarn.mockClear();
   mockLogError.mockClear();
-  mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+  mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 });
 
 describe('workout/generate', () => {
@@ -305,7 +304,7 @@ describe('workout/generate', () => {
     expect(res.status).toBe(404);
     expect(res.body.error).toBe('Client not found');
     // The tenant boundary is in the SQL itself…
-    expect(pool.query.mock.calls[0][0]).toContain('organization_id=$2');
+    expect(pool.query.mock.calls[0][0]).toContain('organization_id = $2');
     expect(pool.query.mock.calls[0][1][1]).toBe('org-1');
     // …and the child queries never ran at all, so nothing keyed by that
     // client_id was even read into memory.
@@ -313,30 +312,22 @@ describe('workout/generate', () => {
     expect(routedStream).not.toHaveBeenCalled();
   });
 
-  test('a platform super admin can generate for any org (org filter off)', async () => {
-    mockUser = { id: 'sa-1', role: 'super_admin' };
-    mockQueries({});
-    routedStream.mockReturnValue(streamChunks([JSON.stringify(WORKOUT_PLAN)]));
+  test('an account with no organization generates for no studio (strict org filter)', async () => {
+    // There used to be a "platform super admin, org filter off" case here: the
+    // parent lookup was `($2::uuid IS NULL OR organization_id=$2)`, so a null
+    // org read any studio's client. The operator no longer reaches tenant
+    // routes at all (auth.js), and the lookup is now strict equality, which a
+    // null org never satisfies — the mock returns what the database would.
+    mockUser = { id: 'u-no-org', role: 'trainer', organization_id: null };
+    mockQueries({ 'FROM pt_clients WHERE id=$1': [] });
     const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
 
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(404);
     const [sql, params] = pool.query.mock.calls[0];
-    expect(sql).toContain('($2::uuid IS NULL OR organization_id=$2)');
+    expect(sql).toContain('organization_id = $2');
+    expect(sql).not.toMatch(/IS NULL OR/);
     expect(params[1]).toBeNull();
-    // With no org context, retrieval fails closed: neither RAG nor the
-    // exercise library is consulted — the prompt runs on client facts alone.
-    expect(pool.query.mock.calls.every(([c]) => !c.includes('ai_document_chunks'))).toBe(true);
-    expect(pool.query.mock.calls.every(([c]) => !c.includes('FROM exercises e'))).toBe(true);
-    const prompt = promptOf(routedStream.mock.calls[0][0]);
-    expect(prompt).not.toContain('AUTHORIZED KNOWLEDGE BASE');
-    expect(prompt).not.toContain('EXERCISE LIBRARY');
-    // The observability event still fires — platform-wide, so it reports
-    // organization_scoped: false with zero retrieval.
-    const event = ragRetrievalEvent();
-    expect(event).toBeDefined();
-    expect(event[0].organization_scoped).toBe(false);
-    expect(event[0].rag_chunks_count).toBe(0);
-    expect(event[0].exercise_count).toBe(0);
+    expect(routedStream).not.toHaveBeenCalled();
   });
 
   // ── A bare record is refused by NAME, not filled in ──────────────────────
@@ -1068,7 +1059,9 @@ describe('an active programme', () => {
 
   const LIVE_PLAN = [{
     plan_id: 'plan-1', plan_name: 'Base Phase',
-    start_date: '2026-08-24', end_date: null, status: 'active',
+    // Three weeks ago, computed — not a calendar date. A literal start date
+    // made "week 4" true for exactly one week and a failure every week after.
+    start_date: new Date(Date.now() - 21 * 86400000).toISOString().slice(0, 10), end_date: null, status: 'active',
     duration_weeks: 12, planned_days_count: 3, progress_pct: 25,
   }];
 

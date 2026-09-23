@@ -2,8 +2,7 @@ jest.mock('../db/pool', () => ({ query: jest.fn() }));
 jest.mock('../lib/fileStorage', () => ({ saveFile: jest.fn() }));
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = { id: 'op-1', name: 'Owner', role: 'super_admin' }; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
   invalidateUserCache: jest.fn(),
 }));
 
@@ -21,7 +20,7 @@ function app() {
 }
 
 const call = (re) => pool.query.mock.calls.find(([sql]) => re.test(sql));
-const TENANT = { id: 'u9', name: 'Studio Admin', email: 'a@studio.com', role: 'admin', organization_id: 'org-1' };
+const TENANT = { id: 'u9', name: 'Studio Admin', email: 'a@studio.com', role: 'trainer', organization_id: 'org-1' };
 
 beforeEach(() => pool.query.mockReset());
 

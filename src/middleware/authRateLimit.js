@@ -13,16 +13,18 @@
 //     app.use('/api/auth/login',   loginLimiter);
 //     app.use('/api/auth/refresh', loginLimiter);   // ← same instance
 //
-// Default keyGenerator, so the key was the IP. A gym has one public IP, and
-// every trainer, receptionist and manager in the building shares it — thirty
-// attempts per quarter-hour for the whole studio, between all of them.
+// Default keyGenerator, so the key was the IP. A studio has one public IP,
+// and everyone in the building shares it — the trainer on their laptop and
+// their phone, and every member signing in from the studio's wifi — thirty
+// attempts per quarter-hour between all of them.
 //
 // Refresh is what makes it certain rather than merely likely. The access token
 // lives 15 minutes (ACCESS_TOKEN_TTL_MS in routes/auth.js) and the browser
-// renews it automatically, so every signed-in staff member spends at least one
+// renews it automatically, so every signed-in account spends at least one
 // request from that shared bucket per window without touching a keyboard —
-// more with a second tab, a phone, or a reload. Ten staff on shift can consume
-// the entire login budget through renewals alone, and then nobody can sign in,
+// more with a second tab, a phone, or a reload. A trainer and a handful of
+// members on the studio's wifi can consume the entire login budget through
+// renewals alone, and then nobody can sign in,
 // and nothing in the logs says why: the 429 says "too many login attempts" to
 // a person who has not attempted a login.
 //
@@ -30,8 +32,8 @@
 //
 // IDENTITY is the brute-force control. An attacker guessing passwords for one
 // account should be stopped on that account whether they come from one address
-// or a thousand, and a receptionist mistyping her own password must not spend
-// the manager's budget. Keyed on a hash of what was typed into the email box —
+// or a thousand, and a member mistyping their own password must not spend the
+// trainer's budget. Keyed on a hash of what was typed into the email box —
 // so it is per-account and costs a studio nothing.
 //
 // IP is the credential-stuffing control, and nothing else. One host trying
@@ -67,7 +69,7 @@ const WINDOW_MS = 15 * 60 * 1000;
  *
  * Ten, against the thirty a whole studio shared. Stricter where it matters and
  * looser where it hurt: this is the number an attacker has to beat, and it is
- * no longer the number a busy reception desk has to stay under.
+ * no longer the number a busy studio has to stay under.
  */
 const LOGIN_FAILURES_PER_IDENTITY = Number(process.env.LOGIN_MAX_FAILURES_PER_IDENTITY || 10);
 

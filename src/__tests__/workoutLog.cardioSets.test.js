@@ -21,10 +21,9 @@ const request = require('supertest');
 jest.mock('../db/pool', () => ({ query: jest.fn(), connect: jest.fn() }));
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = global.__mockUser; next(); },
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
-jest.mock('../middleware/rbac', () => ({ requireRole: () => (_req, _res, next) => next() }));
+jest.mock('../middleware/rbac', () => ({ requireTrainer: (_req, _res, next) => next(),}));
 jest.mock('../lib/activityLog', () => ({ logActivity: jest.fn() }));
 
 const pool = require('../db/pool');
@@ -43,7 +42,7 @@ const EX_ROW = {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  global.__mockUser = { id: 'u-1', role: 'admin', organization_id: 'org-1' };
+  global.__mockUser = { id: 'u-1', role: 'trainer', organization_id: 'org-1' };
 });
 
 const insertCall = () =>

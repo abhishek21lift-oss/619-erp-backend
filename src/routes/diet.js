@@ -2,8 +2,7 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
-const { auth, adminOrManager } = require('../middleware/auth');
-const { requireStaff } = require('../middleware/rbac');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
 const { parseStrict } = require('../lib/zodNumbers');
@@ -29,10 +28,8 @@ router.get('/meals', auth, async (req, res, next) => {
     const params = [];
 
     const scope = tenantScope(req);
-    if (scope.applyFilter) {
-      params.push(scope.orgId);
-      conds.push(`(organization_id IS NULL OR organization_id = $${params.length})`);
-    }
+    params.push(scope.orgId);
+    conds.push(`(organization_id IS NULL OR organization_id = $${params.length})`);
     if (meal_type) { params.push(meal_type);      conds.push(`meal_type = $${params.length}`); }
     if (search)    { params.push(`%${search}%`);  conds.push(`name ILIKE $${params.length}`); }
 
@@ -51,7 +48,7 @@ router.get('/meals', auth, async (req, res, next) => {
 });
 
 // POST /api/diet/meals
-router.post('/meals', auth, adminOrManager, async (req, res, next) => {
+router.post('/meals', auth, requireTrainer, async (req, res, next) => {
   try {
     const d = req.body;
     if (!d.name?.trim())
@@ -146,10 +143,8 @@ router.get('/templates', auth, async (req, res, next) => {
     let p = 1;
 
     const scope = tenantScope(req);
-    if (scope.applyFilter) {
-      params.push(scope.orgId);
-      conds.push(`(dt.organization_id IS NULL OR dt.organization_id = $${p++})`);
-    }
+    params.push(scope.orgId);
+    conds.push(`(dt.organization_id IS NULL OR dt.organization_id = $${p++})`);
     if (goal) { conds.push(`goal = $${p++}`); params.push(goal); }
 
     const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
@@ -181,7 +176,7 @@ router.get('/templates', auth, async (req, res, next) => {
 });
 
 // POST /api/diet/templates
-router.post('/templates', auth, adminOrManager, async (req, res, next) => {
+router.post('/templates', auth, requireTrainer, async (req, res, next) => {
   try {
     const d = req.body;
     if (!d.name?.trim())
@@ -229,7 +224,7 @@ router.get('/assignments', auth, async (req, res, next) => {
     let p = 2;
     if (status) { conds.push(`da.status = $${p++}`); params.push(status); }
     const scope = tenantScope(req);
-    if (scope.applyFilter) { conds.push(`da.organization_id = $${p++}`); params.push(scope.orgId); }
+    conds.push(`da.organization_id = $${p++}`); params.push(scope.orgId);
 
     const { rows } = await pool.query(`
       SELECT da.*, dt.name AS template_name, dt.goal AS template_goal,
@@ -248,7 +243,7 @@ router.get('/assignments', auth, async (req, res, next) => {
 });
 
 // POST /api/diet/assign
-router.post('/assign', auth, adminOrManager, async (req, res, next) => {
+router.post('/assign', auth, requireTrainer, async (req, res, next) => {
   try {
     const d = req.body;
     if (!d.diet_template_id || !d.client_id)
@@ -270,10 +265,7 @@ router.post('/assign', auth, adminOrManager, async (req, res, next) => {
     // layering ratchet only ever lets shrink. Zero rows back means the
     // template is not visible to this caller — same shared shape as the reads:
     // product-seeded (no org) or this studio's own.
-    const scope = tenantScope(req);
-    const templateGuard = scope.applyFilter
-      ? 'AND (dt.organization_id IS NULL OR dt.organization_id = $9)'
-      : '';
+    const templateGuard = 'AND (dt.organization_id IS NULL OR dt.organization_id = $9)';
 
     const { rows } = await pool.query(`
       INSERT INTO diet_assignments (id, diet_template_id, client_id, trainer_id,
@@ -307,11 +299,11 @@ router.get('/tracker', auth, async (req, res, next) => {
 
     const logDate = date || new Date().toISOString().split('T')[0];
     const scope = tenantScope(req);
-    const orgGuard = scope.applyFilter ? ' AND organization_id=$3' : '';
+    const orgGuard = ' AND organization_id=$3';
 
     const { rows } = await pool.query(
       `SELECT * FROM nutrition_logs WHERE client_id=$1 AND log_date=$2${orgGuard}`,
-      scope.applyFilter ? [client_id, logDate, scope.orgId] : [client_id, logDate]
+      [client_id, logDate, scope.orgId]
     );
 
     // Also return the past 7 days for the weekly view
@@ -319,7 +311,7 @@ router.get('/tracker', auth, async (req, res, next) => {
       SELECT * FROM nutrition_logs
       WHERE client_id=$1 AND log_date >= $2::date - 6${orgGuard}
       ORDER BY log_date DESC`,
-      scope.applyFilter ? [client_id, logDate, scope.orgId] : [client_id, logDate]
+      [client_id, logDate, scope.orgId]
     );
 
     res.json({
@@ -385,10 +377,10 @@ router.get('/fitness-profile/:clientId', auth, async (req, res, next) => {
       if (!own || own !== req.params.clientId) return res.json(null);
     }
     const scope = tenantScope(req);
-    const orgGuard = scope.applyFilter ? ' AND organization_id=$2' : '';
+    const orgGuard = ' AND organization_id=$2';
     const { rows } = await pool.query(
       `SELECT * FROM client_fitness_profiles WHERE client_id=$1${orgGuard}`,
-      scope.applyFilter ? [req.params.clientId, scope.orgId] : [req.params.clientId]
+      [req.params.clientId, scope.orgId]
     );
     res.json(rows[0] || null);
   } catch (err) {
@@ -398,7 +390,7 @@ router.get('/fitness-profile/:clientId', auth, async (req, res, next) => {
 });
 
 // PUT /api/diet/fitness-profile/:clientId
-// requireStaff, not a self-check. The GET beside this one grew a `role ===
+// requireTrainer, not a self-check. The GET beside this one grew a `role ===
 // member` branch when a member was found able to READ another client's
 // profile; the PUT did not, so a member could still WRITE one — health
 // conditions, injuries, emergency contact and phone, over the top of somebody
@@ -408,7 +400,7 @@ router.get('/fitness-profile/:clientId', auth, async (req, res, next) => {
 // Gated rather than self-checked because no member surface calls this: the
 // client portal is /api/me, and the member app calls only api.me.*, bookings,
 // classes and UPI payments. This is the trainer's intake form.
-router.put('/fitness-profile/:clientId', auth, requireStaff, async (req, res, next) => {
+router.put('/fitness-profile/:clientId', auth, requireTrainer, async (req, res, next) => {
   try {
     const d = req.body;
     const clientId = req.params.clientId;

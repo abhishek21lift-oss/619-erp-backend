@@ -44,11 +44,8 @@ const ORG_A = '11111111-1111-1111-1111-111111111111';
 const mockUser = { id: 'trainer-a', role: 'trainer', organization_id: ORG_A };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 
@@ -68,7 +65,7 @@ const reads = () => queries.filter((q) => /FROM exercises e/i.test(q.sql));
 beforeEach(() => { queries.length = 0; });
 
 describe('reading exercises', () => {
-  it('scopes custom exercises to the trainer who wrote them', async () => {
+  it('scopes custom exercises to the studio that wrote them', async () => {
     await request(app()).get('/api/exercises').expect(200);
 
     const r = reads();
@@ -76,8 +73,10 @@ describe('reading exercises', () => {
     for (const q of r) {
       // Built-ins stay shared…
       expect(q.sql).toMatch(/e\.organization_id IS NULL/);
-      // …and anything owned by a studio must match BOTH the org and the author.
-      expect(q.sql).toMatch(/e\.organization_id = \$\d+::uuid AND e\.created_by = \$\d+/);
+      // …and anything owned by a studio must match the caller's studio. The
+      // studio has one trainer, so there is no per-author narrowing to apply.
+      expect(q.sql).toMatch(/e\.organization_id = \$\d+::uuid/);
+      expect(q.sql).not.toMatch(/e\.created_by = \$\d+/);
     }
   });
 
@@ -91,11 +90,10 @@ describe('reading exercises', () => {
     }
   });
 
-  it('passes the callerid and org into every scoped read', async () => {
+  it('passes the caller org into every scoped read', async () => {
     await request(app()).get('/api/exercises').expect(200);
     for (const q of reads()) {
       expect(q.params).toContain(ORG_A);
-      expect(q.params).toContain('trainer-a');
     }
   });
 
@@ -105,8 +103,72 @@ describe('reading exercises', () => {
     // leak of names and a confusing dead end.
     await request(app()).get('/api/exercises/meta').expect(200);
     for (const q of reads()) {
-      expect(q.sql).toMatch(/e\.created_by = \$\d+/);
+      expect(q.sql).toMatch(/e\.organization_id IS NULL OR e\.organization_id = \$\d+::uuid/);
     }
+  });
+});
+
+// ── Cross-studio writes ────────────────────────────────────────────────────
+//
+// The by-id routes used to look an exercise up with `WHERE id = $1` alone,
+// and canEdit() admitted any "full access" role — which, once every studio
+// owner was a trainer, meant any trainer could edit, archive or delete
+// ANOTHER studio's custom exercise, and edit the shared built-in library for
+// every studio at once. The pool below behaves like the table: it applies the
+// visibility predicate from the query's own bound parameters.
+describe('writes by id stay inside the caller\'s studio', () => {
+  const pool = require('../db/pool');
+  const ORG_B = '22222222-2222-2222-2222-222222222222';
+  const ROWS = {
+    'ex-builtin': { id: 'ex-builtin', created_by: null, is_custom: false, organization_id: null },
+    'ex-own': { id: 'ex-own', created_by: 'trainer-a', is_custom: true, organization_id: ORG_A },
+    'ex-foreign': { id: 'ex-foreign', created_by: 'trainer-b', is_custom: true, organization_id: ORG_B },
+  };
+
+  beforeEach(() => {
+    pool.query.mockImplementation(async (sql, params) => {
+      const flat = String(sql).replace(/\s+/g, ' ').trim();
+      queries.push({ sql: flat, params });
+      if (/FROM exercises e WHERE e\.id = \$1/i.test(flat)) {
+        const row = ROWS[params[0]];
+        const visible = row && (row.organization_id === null || row.organization_id === params[1]);
+        return visible ? { rows: [row], rowCount: 1 } : { rows: [], rowCount: 0 };
+      }
+      if (/UPDATE exercises/i.test(flat)) return { rows: [{ id: params[1] }], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    });
+  });
+
+  const writes = () => queries.filter((q) => /UPDATE exercises/i.test(q.sql));
+
+  it.each([
+    ['put', '/api/exercises/ex-foreign', { name: 'Taken over' }],
+    ['post', '/api/exercises/ex-foreign/archive', {}],
+    ['delete', '/api/exercises/ex-foreign', undefined],
+    ['post', '/api/exercises/ex-foreign/duplicate', {}],
+    ['post', '/api/exercises/ex-foreign/favorite', {}],
+    ['get', '/api/exercises/ex-foreign/versions', undefined],
+  ])('%s %s on another studio\'s custom exercise is a 404, and writes nothing', async (verb, url, body) => {
+    const res = await request(app())[verb](url).send(body);
+    expect(res.status).toBe(404);
+    expect(writes()).toHaveLength(0);
+  });
+
+  it.each([
+    ['put', '/api/exercises/ex-builtin', { name: 'Renamed for everyone' }],
+    ['post', '/api/exercises/ex-builtin/archive', {}],
+    ['delete', '/api/exercises/ex-builtin', undefined],
+  ])('%s %s on the shared built-in library is refused', async (verb, url, body) => {
+    const res = await request(app())[verb](url).send(body);
+    expect(res.status).toBe(403);
+    expect(writes()).toHaveLength(0);
+  });
+
+  it('archiving the studio\'s own custom exercise is scoped to its organization in the UPDATE itself', async () => {
+    await request(app()).post('/api/exercises/ex-own/archive').send({}).expect(200);
+    const [upd] = writes();
+    expect(upd.sql).toMatch(/WHERE id = \$2 AND organization_id = \$3/);
+    expect(upd.params).toEqual(['trainer-a', 'ex-own', ORG_A]);
   });
 });
 

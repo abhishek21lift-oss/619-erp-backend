@@ -125,5 +125,8 @@ describe('no live credential is committed', () => {
     for (const attempt of ['', '.', 'password', 'admin', LOCKED, 'a'.repeat(53)]) {
       await expect(bcrypt.compare(attempt, LOCKED)).resolves.toBe(false);
     }
-  });
+    // Six cost-12 compares are ~0.8s each in pure-JS bcryptjs on a modest
+    // CPU — right at jest's 5s default. The budget is explicit so the test
+    // measures the property, not the machine.
+  }, 30000);
 });

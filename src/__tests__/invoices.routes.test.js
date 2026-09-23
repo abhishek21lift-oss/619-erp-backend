@@ -54,7 +54,7 @@ jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jes
 let mockUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const express = require('express');
@@ -79,7 +79,7 @@ beforeEach(() => {
   mockTxClient.release.mockClear();
   mockClientRow = { id: 'ptc-1', name: 'A Client' };
   mockInvoiceRow = null;
-  mockUser = { id: 'usr-admin', role: 'admin', organization_id: ORG_A, trainer_id: null };
+  mockUser = { id: 'usr-admin', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 });
 
 describe('POST /api/invoices — tenant boundary on the client lookup', () => {
@@ -105,26 +105,28 @@ describe('POST /api/invoices — tenant boundary on the client lookup', () => {
     expect(sqlAt(/INSERT INTO invoices/i)).toHaveLength(0);
   });
 
-  test('a super admin operating platform-wide is not filtered', async () => {
-    mockUser = { id: 'usr-sa', role: 'super_admin', organization_id: null, trainer_id: null };
+  test('an account with no organization is still filtered — it binds NULL and finds no client', async () => {
+    // There used to be an unfiltered "super admin, platform-wide" case here.
+    // tenantScope() has no unfiltered case now, and the operator never
+    // reaches a tenant route; an org-less caller binds NULL, which matches
+    // nothing.
+    mockUser = { id: 'usr-x', role: 'trainer', organization_id: null, trainer_id: null };
 
     await request(app()).post('/api/invoices')
       .send({ client_id: 'ptc-1', items: [{ description: 'x', unit_price: 1, quantity: 1 }] });
 
     const q = clientLookup();
-    expect(q.sql).not.toMatch(/organization_id/);
-    expect(q.params).toEqual(['ptc-1']);
+    expect(q.sql).toMatch(/organization_id = \$2/);
+    expect(q.params).toEqual(['ptc-1', null]);
   });
 
-  test('a super admin targeting one org via x-org-id IS filtered to it', async () => {
-    mockUser = { id: 'usr-sa', role: 'super_admin', organization_id: null, trainer_id: null };
-
+  test('an x-org-id header cannot retarget the lookup at another studio', async () => {
     await request(app()).post('/api/invoices')
       .set('x-org-id', ORG_B)
       .send({ client_id: 'ptc-1', items: [{ description: 'x', unit_price: 1, quantity: 1 }] });
 
     const q = clientLookup();
-    expect(q.params).toEqual(['ptc-1', ORG_B]);
+    expect(q.params).not.toContain(ORG_B);
   });
 });
 

@@ -48,14 +48,11 @@ jest.mock('../db/pool', () => ({
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
 const ORG_A = '11111111-1111-1111-1111-111111111111';
-let mockUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+let mockUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (req, res, next) => (req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Forbidden' })),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 
@@ -65,12 +62,6 @@ const request = require('supertest');
 function app() {
   const a = express();
   a.use(express.json());
-  // branchScope is applied globally at /api/ in server.js, so a pt-os handler
-  // can rely on it. A user with no branch gets the permissive 'TRUE'.
-  a.use((req, _res, next) => {
-    req.branchScope = { appendTo: (p) => ({ sql: 'TRUE', params: p || [] }) };
-    next();
-  });
   a.use('/api/pt-os', require('../modules/pt-os/pt-os.routes'));
   a.use((_req, res) => res.status(404).json({ error: 'Not found' }));
   return a;
@@ -82,7 +73,7 @@ const paramsOf = (re) => (queries.find((q) => re.test(q.sql)) || {}).params;
 beforeEach(() => {
   queries.length = 0;
   mockClient = { id: 'ptc-1', trainer_id: 'tr-1' };
-  mockUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+  mockUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
 });
 
 describe('GET /clients/search', () => {
@@ -109,52 +100,33 @@ describe('GET /clients/search', () => {
     expect(sqls().find((s) => /ILIKE \$1/.test(s))).toMatch(/c\.organization_id = \$\d/);
   });
 
-  test('a trainer is restricted to their own roster', async () => {
-    mockUser = { id: 'u2', role: 'trainer', organization_id: ORG_A, trainer_id: 'tr-9' };
-    await request(app()).get('/api/pt-os/clients/search?q=asha');
+  test('the trainer searches the whole studio: no roster narrowing, whatever their profile', async () => {
+    // The studio's owner is its trainer. The assistant-coach rule that pinned
+    // a trainer to their own roster (and a trainer with no profile to nothing)
+    // went with the staff roles; the organization is the whole boundary.
+    for (const trainer_id of ['tr-9', null]) {
+      queries.length = 0;
+      mockUser = { id: 'u2', role: 'trainer', organization_id: ORG_A, trainer_id };
+      await request(app()).get('/api/pt-os/clients/search?q=asha');
 
-    const sql = sqls().find((s) => /ILIKE \$1/.test(s));
-    expect(sql).toMatch(/c\.trainer_id = \$\d/);
-    expect(paramsOf(/ILIKE \$1/)).toContain('tr-9');
+      const sql = sqls().find((s) => /ILIKE \$1/.test(s));
+      expect(sql).not.toMatch(/c\.trainer_id = \$\d/);
+      expect(sql).toMatch(/c\.organization_id = \$\d/);
+      expect(paramsOf(/ILIKE \$1/)).toContain(ORG_A);
+    }
   });
 
-  test('a trainer with NO linked record matches nothing, not everything', async () => {
-    // The fail-closed rule, and the one this move could most easily have lost:
-    // treating a null trainer_id as "no filter" hands that account the whole
-    // studio's roster. The filter must still be applied, bound to NULL, so
-    // `trainer_id = NULL` is never true.
-    mockUser = { id: 'u3', role: 'trainer', organization_id: ORG_A, trainer_id: null };
+  test('the joined trainer name comes from the same studio only', async () => {
     await request(app()).get('/api/pt-os/clients/search?q=asha');
-
     const sql = sqls().find((s) => /ILIKE \$1/.test(s));
-    expect(sql).toMatch(/c\.trainer_id = \$\d/);
-    expect(paramsOf(/ILIKE \$1/)).toContain(null);
+    expect(sql).toMatch(/LEFT JOIN trainers t ON t\.id = c\.trainer_id AND t\.organization_id = c\.organization_id/);
   });
 
-  test('a non-trainer is not roster-filtered at all', async () => {
-    // The other half — an admin must not be silently restricted to nothing.
-    await request(app()).get('/api/pt-os/clients/search?q=asha');
-    expect(sqls().find((s) => /ILIKE \$1/.test(s))).not.toMatch(/c\.trainer_id = \$\d/);
-  });
-
-  test('the branch predicate is still applied against the synthesised column', async () => {
-    // pt_clients has no branch_id, so the subselect synthesises a NULL one.
-    // For a user WITH a branch that predicate matches nothing, which is what
-    // branch-scope means by "legacy rows with a NULL branch are not visible".
-    // Dropping the shim would turn "sees nothing" into "sees everything".
-    const a = express();
-    a.use(express.json());
-    a.use((req, _res, next) => {
-      req.branchScope = { appendTo: (p) => ({ sql: 'branch_id = $' + (p.length + 1), params: [...p, 'br-1'] }) };
-      next();
-    });
-    a.use('/api/pt-os', require('../modules/pt-os/pt-os.routes'));
-
-    await request(a).get('/api/pt-os/clients/search?q=asha');
-    const sql = sqls().find((s) => /ILIKE \$1/.test(s));
-    expect(sql).toMatch(/NULL::text AS branch_id/);
-    expect(sql).toMatch(/c\.branch_id = \$\d/);
-    expect(paramsOf(/ILIKE \$1/)).toContain('br-1');
+  test('a member cannot search the studio', async () => {
+    mockUser = { id: 'm1', role: 'member', organization_id: ORG_A, pt_client_id: 'ptc-1' };
+    const res = await request(app()).get('/api/pt-os/clients/search?q=asha');
+    expect([403, 401]).toContain(res.status);
+    expect(sqls().some((s) => /ILIKE \$1/.test(s))).toBe(false);
   });
 
   test('the page size is capped', async () => {
@@ -185,32 +157,16 @@ describe('GET /clients/:id/attendance and /payments', () => {
     expect(sqls().some((s) => /FROM attendance_logs/i.test(s))).toBe(false);
   });
 
-  test('a trainer cannot read another trainer\'s client', async () => {
+  test('the trainer reads any client of their studio, whichever coach profile it names', async () => {
     mockUser = { id: 'u2', role: 'trainer', organization_id: ORG_A, trainer_id: 'tr-OTHER' };
     const res = await request(app()).get('/api/pt-os/clients/ptc-1/payments');
-
-    expect(res.status).toBe(403);
-    expect(sqls().some((s) => /FROM pt_payments/i.test(s))).toBe(false);
+    expect(res.status).toBe(200);
   });
 
-  test('a trainer with no linked record is refused, not allowed through', async () => {
-    mockUser = { id: 'u3', role: 'trainer', organization_id: ORG_A, trainer_id: null };
+  test('a member is refused and reads no history', async () => {
+    mockUser = { id: 'm1', role: 'member', organization_id: ORG_A, pt_client_id: 'ptc-1' };
     const res = await request(app()).get('/api/pt-os/clients/ptc-1/payments');
-    expect(res.status).toBe(403);
-  });
-
-  test('...including for a client who has no trainer either', async () => {
-    // The case the `!req.user.trainer_id` half of the guard exists for, and the
-    // one a fixture with an assigned client cannot reach: drop that half and
-    // the check becomes `null !== null`, which is false, so an unassigned
-    // client becomes readable by any trainer account with no linked record.
-    // Found by mutation — the previous test passed with the guard removed.
-    mockClient = { id: 'ptc-2', trainer_id: null };
-    mockUser = { id: 'u3', role: 'trainer', organization_id: ORG_A, trainer_id: null };
-
-    const res = await request(app()).get('/api/pt-os/clients/ptc-2/payments');
-
-    expect(res.status).toBe(403);
+    expect([403, 401]).toContain(res.status);
     expect(sqls().some((s) => /FROM pt_payments/i.test(s))).toBe(false);
   });
 
@@ -247,8 +203,8 @@ describe('the endpoints the retired mount duplicated', () => {
     expect(del).toMatch(/organization_id/);
   });
 
-  test('DELETE /clients/:id refuses a non-admin', async () => {
-    mockUser = { id: 'u5', role: 'trainer', organization_id: ORG_A, trainer_id: 'tr-1' };
+  test('DELETE /clients/:id refuses a member', async () => {
+    mockUser = { id: 'u5', role: 'member', organization_id: ORG_A, pt_client_id: 'ptc-1' };
     const res = await request(app()).delete('/api/pt-os/clients/ptc-1');
     expect(res.status).toBe(403);
   });

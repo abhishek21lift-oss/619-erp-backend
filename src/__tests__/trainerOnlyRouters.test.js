@@ -1,13 +1,13 @@
-// The staff-only routers, asserted at the mount.
+// The trainer-only routers, asserted at the mount.
 //
-// requireStaff went in for /api/pt-os and stopped there. Its own comment in
+// requireTrainer went in for /api/pt-os and stopped there. Its own comment in
 // middleware/rbac.js gives the reason it exists — read routes gated on `auth`
 // alone were "survivable only because no account had ever held the `member`
 // role" — and client logins create those accounts by the hundred.
 //
 // This is not a cross-tenant issue: tenantScope() still confines everything to
 // one studio. It is a privilege one. A logged-in CLIENT could read their own
-// gym's staff data — the client roster with contact details and notes, the
+// studio's back-office data — the client roster with contact details and notes, the
 // studio's revenue and outstanding dues, and every progress record in the
 // organisation.
 //
@@ -20,16 +20,15 @@ const path = require('path');
 
 const server = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
 
-const STAFF_ONLY = [
+const TRAINER_ONLY = [
   // 'clients' was here until /api/clients was retired — a second HTTP surface
   // over pt_clients, whose handlers moved to /api/pt-os/clients. That mount
   // takes its place on this list rather than the entry simply disappearing:
-  // the client API still exists and still must be staff-only, and a list that
+  // the client API still exists and still must be trainer-only, and a list that
   // silently shrinks when a route moves is a guard that stops guarding.
   'pt-os',          // the client API: roster, profile, search, history, money
   'progress',       // nine GETs whose client_id is optional
   'reports',        // revenue, dues, trainer performance
-  'trainers',
   'payments',
   'attendance',
   'expenses',
@@ -38,53 +37,53 @@ const STAFF_ONLY = [
   'search',
 ];
 
-// A mount satisfies "behind requireStaff" one of two ways: the literal
-// middleware inline (`auth, requireStaff, ...gate(key)`), or the staffGate(key)
-// combinator — `const staffGate = (key) => [auth, requireStaff, requireFeature(key)]`
-// — which bakes requireStaff in without the word appearing at the call site.
-// Both are asserted below; staffGate's own definition is checked separately so
+// A mount satisfies "behind requireTrainer" one of two ways: the literal
+// middleware inline (`auth, requireTrainer, ...gate(key)`), or the studioGate(key)
+// combinator — `const studioGate = (key) => [auth, requireTrainer, requireFeature(key)]`
+// — which bakes requireTrainer in without the word appearing at the call site.
+// Both are asserted below; studioGate's own definition is checked separately so
 // swapping a mount to it doesn't silently stop proving the ordering property.
-const STAFF_GATED = /requireStaff|staffGate\(/;
+const TRAINER_GATED = /requireTrainer|studioGate\(/;
 
-describe('every staff-only router is mounted behind requireStaff', () => {
-  test.each(STAFF_ONLY)('/api/%s', (name) => {
-    const mount = new RegExp(`app\\.use\\('/api/${name}',[^;]*(?:requireStaff|staffGate\\()[^;]*require\\(`);
+describe('every trainer-only router is mounted behind requireTrainer', () => {
+  test.each(TRAINER_ONLY)('/api/%s', (name) => {
+    const mount = new RegExp(`app\\.use\\('/api/${name}',[^;]*(?:requireTrainer|studioGate\\()[^;]*require\\(`);
     expect(server).toMatch(mount);
   });
 
-  test.each(STAFF_ONLY)('/api/%s is not mounted without one', (name) => {
+  test.each(TRAINER_ONLY)('/api/%s is not mounted without one', (name) => {
     // The failing shape written out, so a reviewer can see exactly what
     // regressed if this goes red.
     const lines = server.split('\n').filter((l) => l.includes(`app.use('/api/${name}'`));
     expect(lines.length).toBeGreaterThan(0);
-    for (const line of lines) expect(line).toMatch(STAFF_GATED);
+    for (const line of lines) expect(line).toMatch(TRAINER_GATED);
   });
 });
 
 describe('the gate is ordered so a client learns nothing extra', () => {
   test.each(['attendance', 'communication'])(
-    'requireStaff precedes the feature gate on /api/%s', (name) => {
+    'requireTrainer precedes the feature gate on /api/%s', (name) => {
       const line = server.split('\n').find((l) => l.includes(`app.use('/api/${name}'`));
-      expect(line.indexOf('requireStaff')).toBeLessThan(line.indexOf('gate('));
+      expect(line.indexOf('requireTrainer')).toBeLessThan(line.indexOf('gate('));
     },
   );
 
   test.each(['reports', 'expenses', 'invoices'])(
-    'staffGate(key) carries the same ordering on /api/%s', (name) => {
+    'studioGate(key) carries the same ordering on /api/%s', (name) => {
       const line = server.split('\n').find((l) => l.includes(`app.use('/api/${name}'`));
-      expect(line).toMatch(/staffGate\(/);
+      expect(line).toMatch(/studioGate\(/);
     },
   );
 
-  test('staffGate itself puts requireStaff before requireFeature', () => {
-    const def = server.split('\n').find((l) => l.includes('const staffGate ='));
+  test('studioGate itself puts requireTrainer before requireFeature', () => {
+    const def = server.split('\n').find((l) => l.includes('const studioGate ='));
     expect(def).toBeTruthy();
-    expect(def.indexOf('requireStaff')).toBeLessThan(def.indexOf('requireFeature'));
+    expect(def.indexOf('requireTrainer')).toBeLessThan(def.indexOf('requireFeature'));
   });
 });
 
 describe('the client portal is unaffected', () => {
-  test('/api/me is still mounted for clients, not staff', () => {
+  test('/api/me is still mounted for clients, not the trainer', () => {
     // The portal calls exactly one endpoint. Gating the routers above breaks
     // nothing it uses — verified against 619-erp-frontend, where no screen
     // under app/(bare)/member, /client or /member-login references any of them.
@@ -92,14 +91,14 @@ describe('the client portal is unaffected', () => {
   });
 });
 
-describe('requireStaff still means what it says', () => {
-  const { requireStaff, STAFF_ROLES } = require('../middleware/rbac');
+describe('requireTrainer still means what it says', () => {
+  const { requireTrainer } = require('../middleware/rbac');
 
   const run = (user) => {
     let status = null;
     let passed = false;
     const res = { status: (s) => { status = s; return res; }, json: () => res };
-    requireStaff({ user }, res, () => { passed = true; });
+    requireTrainer({ user }, res, () => { passed = true; });
     return { passed, status };
   };
 
@@ -108,11 +107,17 @@ describe('requireStaff still means what it says', () => {
       .toMatchObject({ passed: false, status: 403 });
   });
 
-  test.each(STAFF_ROLES)('%s is admitted', (role) => {
-    expect(run({ role, organization_id: 'org-1' }).passed).toBe(true);
+  test('the trainer of a studio is admitted', () => {
+    expect(run({ role: 'trainer', organization_id: 'org-1' }).passed).toBe(true);
   });
 
-  test('member is absent from the allow-list', () => {
-    expect(STAFF_ROLES).not.toContain('member');
+  test.each(['super_admin', 'admin', 'manager', 'reception', 'staff'])('%s is refused', (role) => {
+    expect(run({ role, organization_id: role === 'super_admin' ? null : 'org-1' }))
+      .toMatchObject({ passed: false, status: 403 });
+  });
+
+  test('/api/trainers and /api/leave are not mounted at all', () => {
+    // The staff-management surface went with the staff roles.
+    expect(server).not.toMatch(/app\.use\('\/api\/(trainers|leave)'/);
   });
 });

@@ -54,8 +54,7 @@ jest.mock('../../lib/logger', () => ({
 let mockUser;
 jest.mock('../../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../../middleware/rbac').requireTrainer(...a),
 }));
 
 const express = require('express');
@@ -65,11 +64,6 @@ const { errorHandler } = require('../../middleware/errorHandler');
 function app() {
   const a = express();
   a.use(express.json());
-  // server.js applies branchScope globally at `app.use('/api/', branchScope)`,
-  // and the handlers read `req.branchScope.appendTo(...)`. Mounting the router
-  // without it would be a harness that does not resemble production — the real
-  // middleware is used, not a stub, so its behaviour is exercised too.
-  a.use(require('../../middleware/branch-scope').branchScope);
   a.use('/api/attendance', require('../../routes/attendance'));
   a.use(errorHandler);
   return a;
@@ -81,8 +75,8 @@ const CLIENT_A = {
   id: 'usr-client-a', role: 'member', organization_id: ORG_A,
   pt_client_id: 'ptc-a', member_id: 'mem-a', trainer_id: null,
 };
-const ADMIN_A   = { id: 'usr-admin-a', role: 'admin', organization_id: ORG_A, trainer_id: null };
-const ADMIN_B   = { id: 'usr-admin-b', role: 'admin', organization_id: ORG_B, trainer_id: null };
+const ADMIN_A   = { id: 'usr-admin-a', role: 'trainer', organization_id: ORG_A, trainer_id: null };
+const ADMIN_B   = { id: 'usr-admin-b', role: 'trainer', organization_id: ORG_B, trainer_id: null };
 const TRAINER_A = { id: 'usr-trainer-a', role: 'trainer', organization_id: ORG_A, trainer_id: 'trn-a' };
 
 beforeEach(() => {
@@ -259,7 +253,7 @@ describe('D. GET /gaps emits exactly one WHERE clause', () => {
     expect(q.params).toContain(ORG_A);
   });
 
-  test('trainer + organization: one WHERE, own-client filter appended, and 200', async () => {
+  test('a trainer with a coach profile sees the same studio-wide list — no roster filter', async () => {
     mockUser = TRAINER_A;
     const res = await request(app()).get('/api/attendance/gaps');
 
@@ -267,20 +261,23 @@ describe('D. GET /gaps emits exactly one WHERE clause', () => {
     const q = gapsSql();
     expect(mainBodyWhereCount(q.sql)).toBe(1);
     expect(q.sql).not.toMatch(/WHERE 1=1/);
-    expect(q.sql).toMatch(/c\.trainer_id = \$/);
+    expect(q.sql).not.toMatch(/c\.trainer_id = \$/);
     expect(q.sql).toMatch(/c\.organization_id = \$/);
     expect(q.params).toContain(ORG_A);
-    expect(q.params).toContain('trn-a');
+    expect(q.params).not.toContain('trn-a');
   });
 
-  test('admin, no organization scope: still exactly one WHERE', async () => {
-    mockUser = { id: 'usr-super', role: 'super_admin', trainer_id: null };
-    const res = await request(app()).get('/api/attendance/gaps');
+  test('the joined trainer name is constrained to the same studio', async () => {
+    mockUser = ADMIN_A;
+    await request(app()).get('/api/attendance/gaps');
+    expect(gapsSql().sql).toMatch(/LEFT JOIN trainers t ON t\.id = c\.trainer_id AND t\.organization_id = c\.organization_id/);
+  });
 
-    expect(res.status).toBe(200);
-    const q = gapsSql();
-    expect(mainBodyWhereCount(q.sql)).toBe(1);
-    expect(q.sql).not.toMatch(/WHERE 1=1/);
-    expect(q.sql).not.toMatch(/organization_id/);
+  test('the platform operator is refused, not given an unscoped list', async () => {
+    // It used to get the list with no organization filter at all.
+    mockUser = { id: 'usr-super', role: 'super_admin', organization_id: null, trainer_id: null };
+    const res = await request(app()).get('/api/attendance/gaps');
+    expect(res.status).toBe(403);
+    expect(dbTouched()).toBe(0);
   });
 });

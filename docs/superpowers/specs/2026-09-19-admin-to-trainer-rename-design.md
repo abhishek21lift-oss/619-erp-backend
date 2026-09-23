@@ -1,7 +1,10 @@
 # Admin → Trainer hard rename — design
 
 **Date:** 2026-09-19
-**Status:** approved (full 5-section design, chat 2026-09-19)
+**Status:** SUPERSEDED (2026-09-22) by the Trainer → Members role model —
+migration `208_trainer_members_role_model.sql`. Kept as the record of what was
+decided on the 19th and why; read the differences below before using any detail
+from it.
 **Scope:** `619-erp-backend` + `619-erp-frontend`
 **Approach:** A. Hard rename — `admin` identifier deleted everywhere, `trainer` becomes the single studio-owner role.
 
@@ -51,3 +54,24 @@
 - `manager`/`staff`/`reception` dead roles are NOT deleted (separate cleanup if ever wanted).
 - Git history still contains `admin` references; no history rewrite (same reasoning as the super-admin hash incident: rotation/migration forward, don't rewrite).
 - `/api/admin/*` platform naming confusion documented, not renamed.
+
+## Superseded — what actually shipped (2026-09-22)
+
+This design renamed `admin` to `trainer` and left the other staff roles in
+place. The change that shipped goes further: a studio is **one trainer and
+their members**, and everything else is gone. Where the two differ:
+
+| This design | What shipped |
+| --- | --- |
+| `manager` / `staff` / `reception` kept as dead roles | deleted — `users_role_check` allows exactly `super_admin`, `trainer`, `member` |
+| `trainer` gains owner powers; assistant-coach scoping merged in | same, plus every per-coach *feature* removed: commissions, payouts, staff leave, trainer CRUD, the per-role permission matrix |
+| `super_admin` untouched | platform-**only**: refused on every tenant path, no `x-org-id` targeting, enters a studio solely through audited impersonation |
+| `postSignInPath` trainer → `/trainer/dashboard` | `/pt-os` — the client list is the trainer's home |
+| frontend `hasRole` keeps a superuser branch | exact membership; no role satisfies another's gate and no alias maps a retired role onto `trainer` |
+| backup table `public._backup_admin_rename` | `archive.role_model_users_backup` / `archive.role_model_settings_backup`, out of `public`; the old table is moved into `archive` if it exists |
+| migration numbered after a dupe check | `208`, replacing the never-applied `208_admin_to_trainer_role_consolidation.sql` (its CI failed, production stopped at 207) |
+
+The residuals below still hold: git history is not rewritten, and the
+`/api/admin/*` platform mounts and the `/api/auth/webauthn/admin/*` paths keep
+their names for API compatibility — both are guarded, and both are documented
+where they are served.

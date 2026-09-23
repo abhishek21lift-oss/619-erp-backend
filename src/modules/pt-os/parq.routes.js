@@ -11,14 +11,18 @@ const multer = require('multer');
 const pool = require('../../db/pool');
 const { detectFileType, DOCUMENTS } = require('../../lib/fileSignatures');
 const logger = require('../../lib/logger');
-const { auth } = require('../../middleware/auth');
-const { requireRole } = require('../../middleware/rbac');
+const { auth, requireTrainer } = require('../../middleware/auth');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
 const { generateConsentPdf } = require('../../lib/parqPdf');
 const { saveFile } = require('../../lib/fileStorage');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -212,7 +216,7 @@ router.get('/parq/forms', auth, wrap(async (req, res) => {
   const where = ['deleted_at IS NULL'];
   const params = [];
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  params.push(scope.orgId); where.push(`organization_id = $${params.length}`);
   if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const { rows } = await pool.query(
     `SELECT * FROM pt_parq_forms WHERE ${where.join(' AND ')} ORDER BY assessment_date DESC`, params
@@ -237,8 +241,8 @@ router.get('/parq/forms', auth, wrap(async (req, res) => {
 router.get('/parq/forms/:id', auth, wrap(async (req, res) => {
   const { id } = req.params;
   const scope = tenantScope(req);
-  const formGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
-  const formParams = scope.applyFilter ? [id, scope.orgId] : [id];
+  const formGuard = ' AND organization_id = $2';
+  const formParams = [id, scope.orgId];
   const [formRes, familyRes, clearanceRes, consentRes, docsRes] = await Promise.all([
     pool.query(`SELECT * FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${formGuard}`, formParams),
     pool.query('SELECT * FROM pt_family_medical_history WHERE parq_form_id = $1 ORDER BY created_at', [id]),
@@ -264,17 +268,17 @@ router.get('/parq/forms/:id', auth, wrap(async (req, res) => {
 // before showing the workout Assign button.
 router.get('/parq/forms/:id/gate-status', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  const gsGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const gsGuard = ' AND organization_id = $2';
   const { rows } = await pool.query(
     `SELECT workout_gate_status, risk_level FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${gsGuard}`,
-    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+    [req.params.id, scope.orgId]
   );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ data: rows[0] });
 }));
 
 // POST /parq/forms
-router.post('/parq/forms', auth, requireRole('admin', 'manager', 'trainer'), validate(parqFormCreateSchema), wrap(async (req, res) => {
+router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema), wrap(async (req, res) => {
   const b = req.body;
   const analysis = computeParqAnalysis(b.parq_answers);
   const gateStatus = analysis.riskLevel === 'high' ? 'blocked' : 'cleared';
@@ -346,7 +350,7 @@ router.post('/parq/forms', auth, requireRole('admin', 'manager', 'trainer'), val
 }));
 
 // PATCH /parq/forms/:id
-router.patch('/parq/forms/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+router.patch('/parq/forms/:id', auth, requireTrainer, wrap(async (req, res) => {
   const { id } = req.params;
   const b = req.body;
 
@@ -363,10 +367,10 @@ router.patch('/parq/forms/:id', auth, requireRole('admin', 'manager', 'trainer')
   try {
     await tx.query('BEGIN');
     const scope = tenantScope(req);
-    const upGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+    const upGuard = ' AND organization_id = $2';
     const { rows: existingRows } = await tx.query(
       `SELECT * FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${upGuard} FOR UPDATE`,
-      scope.applyFilter ? [id, scope.orgId] : [id]
+      [id, scope.orgId]
     );
     const existing = existingRows[0];
     if (!existing) {
@@ -437,13 +441,13 @@ router.patch('/parq/forms/:id', auth, requireRole('admin', 'manager', 'trainer')
 // ─── Medical Clearance ──────────────────────────────────────
 
 // POST /parq/forms/:formId/clearance
-router.post('/parq/forms/:formId/clearance', auth, requireRole('admin', 'manager', 'trainer'), validate(clearanceCreateSchema), wrap(async (req, res) => {
+router.post('/parq/forms/:formId/clearance', auth, requireTrainer, validate(clearanceCreateSchema), wrap(async (req, res) => {
   const { formId } = req.params;
   const scope = tenantScope(req);
-  const clGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const clGuard = ' AND organization_id = $2';
   const { rows: formRows } = await pool.query(
     `SELECT client_id, organization_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${clGuard}`,
-    scope.applyFilter ? [formId, scope.orgId] : [formId]
+    [formId, scope.orgId]
   );
   const form = formRows[0];
   if (!form) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -466,14 +470,14 @@ router.post('/parq/forms/:formId/clearance', auth, requireRole('admin', 'manager
 }));
 
 // PATCH /parq/clearance/:id
-router.patch('/parq/clearance/:id', auth, requireRole('admin', 'manager', 'trainer'), wrap(async (req, res) => {
+router.patch('/parq/clearance/:id', auth, requireTrainer, wrap(async (req, res) => {
   const allowed = ['doctor_name', 'hospital', 'clearance_date', 'certificate_url', 'doctor_contact', 'expiry_date', 'approval_status'];
 
   const scope = tenantScope(req);
-  const mcGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const mcGuard = ' AND organization_id = $2';
   const { rows: existingRows } = await pool.query(
     `SELECT * FROM pt_medical_clearances WHERE id = $1${mcGuard}`,
-    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+    [req.params.id, scope.orgId]
   );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -513,21 +517,18 @@ router.patch('/parq/clearance/:id', auth, requireRole('admin', 'manager', 'train
 
 // POST /parq/forms/:formId/consent
 //
-// Role check: `auth` only, no requireRole. This app is staff-operated
-// (audited earlier — there is no separate PT-client login; `pt_clients`
-// rows have no linked `users` account, unlike gym `member`-role users).
-// Consent is signed in person on a staff device during onboarding, so
-// requiring admin/manager/trainer here is both accurate to how the form
-// is actually used AND safer than opening it to any authenticated user
-// (which would let an unrelated `member`-role account sign a consent
-// record for a PT client they have no association with).
-router.post('/parq/forms/:formId/consent', auth, requireRole('admin', 'manager', 'trainer'), validate(consentCreateSchema), wrap(async (req, res) => {
+// The trainer signs this, not the member. Consent is taken in person on the
+// studio's device during onboarding, so requiring the trainer is both
+// accurate to how the form is used AND safer than opening it to any
+// authenticated user — which would let an unrelated member account sign a
+// consent record for a client they have no association with.
+router.post('/parq/forms/:formId/consent', auth, requireTrainer, validate(consentCreateSchema), wrap(async (req, res) => {
   const { formId } = req.params;
   const scope = tenantScope(req);
-  const coGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const coGuard = ' AND organization_id = $2';
   const { rows: formRows } = await pool.query(
     `SELECT client_id, organization_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${coGuard}`,
-    scope.applyFilter ? [formId, scope.orgId] : [formId]
+    [formId, scope.orgId]
   );
   const form = formRows[0];
   if (!form) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -602,15 +603,15 @@ const docUpload = multer({
 const DOC_TYPES = ['medical_report', 'medical_certificate', 'other'];
 
 // POST /parq/forms/:formId/documents
-router.post('/parq/forms/:formId/documents', auth, requireRole('admin', 'manager', 'trainer'), docUpload.single('file'), wrap(async (req, res) => {
+router.post('/parq/forms/:formId/documents', auth, requireTrainer, docUpload.single('file'), wrap(async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'File is required' });
 
   const { formId } = req.params;
   const scope = tenantScope(req);
-  const dGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const dGuard = ' AND organization_id = $2';
   const { rows: formRows } = await pool.query(
     `SELECT client_id, organization_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${dGuard}`,
-    scope.applyFilter ? [formId, scope.orgId] : [formId]
+    [formId, scope.orgId]
   );
   const form = formRows[0];
   if (!form) return res.status(404).json({ error: { code: 'NOT_FOUND' } });

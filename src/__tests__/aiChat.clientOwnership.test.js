@@ -34,14 +34,29 @@ jest.mock('../db/pool', () => ({
   }),
 }));
 
+// The model, the knowledge base and the tool layer are stubbed: what this
+// file tests is whether a conversation is persisted with a client id the
+// caller's studio does not own, which is decided before any of them run.
+// Left real, every request went out to OpenRouter and loaded the embedding
+// model, so the suite's pass/fail depended on network latency.
+jest.mock('../lib/ai/router', () => ({
+  routedChat: jest.fn(),
+  routedStream: jest.fn(async function* stream() { yield 'ok'; }),
+}));
+jest.mock('../lib/ai/knowledgeBase', () => ({ retrieveContext: jest.fn(async () => []) }));
+jest.mock('../lib/ai/tools', () => ({ runTools: jest.fn(async () => ({ contextText: '', toolNames: [] })) }));
+jest.mock('../lib/ai/usage', () => ({
+  logUsage: jest.fn().mockResolvedValue(undefined),
+  getUserUsage: jest.fn(),
+  getModelStats: jest.fn(),
+}));
+
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => {
-    req.user = { id: 'usr-1', role: 'admin', organization_id: '11111111-1111-4111-8111-111111111111' };
+    req.user = { id: 'usr-1', role: 'trainer', organization_id: '11111111-1111-4111-8111-111111111111' };
     next();
   },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const express = require('express');

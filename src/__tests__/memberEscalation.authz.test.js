@@ -17,7 +17,7 @@
 // Writing this found one: GET /api/support/tickets returned every support
 // ticket the studio had raised — subject, category, priority, status,
 // created_by_name — to any member, and POST created them in the studio's
-// name. Fixed by adding requireStaff to that mount in server.js.
+// name. Fixed by adding requireTrainer to that mount in server.js.
 //
 // ── How ────────────────────────────────────────────────────────────────────
 //
@@ -61,13 +61,18 @@ jest.mock('../middleware/auth', () => {
     // A member who has already authenticated. The question this file asks is
     // what happens AFTER authentication succeeds, so the token check itself is
     // deliberately out of the way — it is covered by auth.login.test.js.
-    auth: (req, _res, next) => { req.user = { ...MEMBER }; next(); },
+    //
+    // A caller already placed on the request is kept: routers now carry their
+    // own `router.use(auth, requireTrainer)`, so auth runs a second time
+    // inside the router, and a test that sets up a trainer upstream must not
+    // have it silently replaced by the member here.
+    auth: (req, _res, next) => { req.user = req.user || { ...MEMBER }; next(); },
   };
 });
 
 const express = require('express');
 const request = require('supertest');
-const { requireStaff } = require('../middleware/rbac');
+const { requireTrainer } = require('../middleware/rbac');
 const { auth } = require('../middleware/auth');
 
 /**
@@ -90,10 +95,10 @@ const MEMBER_REACHABLE = {
   // NOT member-reachable, and the reason that used to sit here said it was.
   // routes/client-login.js is the STAFF tool that activates a client's login
   // (POST /:clientId/activate, /deactivate, /resend) — not a member sign-in
-  // surface — and server.js mounts it `auth, requireStaff`. The entry was
+  // surface — and server.js mounts it `auth, requireTrainer`. The entry was
   // therefore describing a different router entirely, and because this table
   // makes the loop `continue`, it turned a correctly-gated mount into one that
-  // is never probed: if requireStaff were dropped tomorrow, nothing here would
+  // is never probed: if requireTrainer were dropped tomorrow, nothing here would
   // notice. Kept as a comment rather than deleted silently, because the
   // mistake is the interesting part — a wrong exemption is indistinguishable
   // from a right one until somebody checks the mount.
@@ -153,10 +158,10 @@ function mountsFromServer() {
     out.push({
       mountPath: m[1].replace(/\/$/, ''),
       module: mod,
-      // staffGate() is the [auth, requireStaff, requireFeature] helper; it must
+      // studioGate() is the [auth, requireTrainer, requireFeature] helper; it must
       // be named here explicitly, since it does not contain the substring
-      // "requireStaff" and this check would otherwise miss every mount using it.
-      gated: /requireStaff|staffGate|requireRole|requireSuperAdmin|adminOnly|platformAuth|requireClient/.test(chain),
+      // "requireTrainer" and this check would otherwise miss every mount using it.
+      gated: /requireTrainer|studioGate|requireRole|requireSuperAdmin|adminOnly|platformAuth|requireClient/.test(chain),
     });
   }
   return out;
@@ -214,7 +219,7 @@ describe('a member cannot reach staff mounts', () => {
         app.use(express.json());
         // The real chain: server.js's own gates where it has them, then the
         // real router, which may gate internally instead.
-        const chain = mount.gated ? [auth, requireStaff, router] : [router];
+        const chain = mount.gated ? [auth, requireTrainer, router] : [router];
         app.use(mount.mountPath, ...chain);
 
         let res;
@@ -260,11 +265,11 @@ describe('a member cannot reach staff mounts', () => {
     const router = require('../routes/support');
     const app = express();
     app.use(express.json());
-    app.use('/api/support', auth, requireStaff, router);
+    app.use('/api/support', auth, requireTrainer, router);
 
     const res = await request(app).get('/api/support/tickets');
     expect(res.status).toBe(403);
-    expect(JSON.stringify(res.body)).toMatch(/staff/i);
+    expect(JSON.stringify(res.body)).toMatch(/trainer/i);
   });
 
   it('a staff role still reaches support', async () => {
@@ -274,8 +279,8 @@ describe('a member cannot reach staff mounts', () => {
     app.use(express.json());
     app.use(
       '/api/support',
-      (req, _res, next) => { req.user = { ...MEMBER, role: 'admin' }; next(); },
-      requireStaff,
+      (req, _res, next) => { req.user = { ...MEMBER, role: 'trainer' }; next(); },
+      requireTrainer,
       router
     );
 

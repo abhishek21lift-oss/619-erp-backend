@@ -1,5 +1,6 @@
 // src/routes/auth-webauthn.js
-// WebAuthn / Passkey authentication for staff (admin, manager, trainer, reception).
+// WebAuthn / Passkey authentication for signed-in accounts (the studio's
+// trainer, and the platform operator for their own sign-in).
 // Mounted at /api/auth/webauthn by server.js
 // Uses @simplewebauthn/server v13 API.
 //
@@ -10,7 +11,7 @@
 const express  = require('express');
 const jwt      = require('jsonwebtoken');
 const pool     = require('../db/pool');
-const { auth } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
 const logger   = require('../lib/logger');
 const loginEvents = require('../lib/loginEvents');
@@ -677,7 +678,7 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
       // organization_id is selected only so the login event carries studio
       // attribution; without it passkey sign-ins would be invisible to the
       // Security Centre's per-studio filter. Nothing else on this path reads it.
-      `SELECT id, name, email, role, trainer_id, member_id, token_version, organization_id
+      `SELECT id, name, email, role, trainer_id, pt_client_id, token_version, organization_id
        FROM users WHERE id = $1 AND is_active = true AND deleted_at IS NULL`,
       [cred.user_id]
     );
@@ -882,15 +883,20 @@ router.put('/credentials/:id/toggle', auth, async (req, res, next) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ADMIN endpoints — require admin or manager role
+// Studio passkey management — the trainer, over their own studio's accounts.
+// (The "/admin" path segment predates the Trainer → Members model and is kept
+// for API compatibility.)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function requireAdminOrManager(req, res, next) {
-  const role = req.user.role;
-  if (role !== 'trainer' && role !== 'admin' && role !== 'manager' && role !== 'super_admin') {
-    return res.status(403).json({ error: 'Trainer access required' });
-  }
-  next();
+/**
+ * GET /admin/config reads no tenant data — it reports the rpId/origin this
+ * instance would use for the CALLER's own browser — so the platform operator,
+ * who also signs in with passkeys, may run it too. Every other /admin route
+ * here reads a studio's credentials and is requireTrainer.
+ */
+function requireTrainerOrPlatform(req, res, next) {
+  if (req.user?.role === 'super_admin') return next();
+  return requireTrainer(req, res, next);
 }
 
 // GET /admin/config — what rpId and origin this instance will actually use for
@@ -905,7 +911,7 @@ function requireAdminOrManager(req, res, next) {
 // Returns hostnames the caller's own browser already knows and booleans about
 // whether two env vars are set — never their values beyond the host, and no
 // secrets.
-router.get('/admin/config', auth, requireAdminOrManager, (req, res) => {
+router.get('/admin/config', auth, requireTrainerOrPlatform, (req, res) => {
   const hostname = requestHostname(req);
   const rpId = getEffectiveRpId(req);
   const expectedOrigin = getExpectedOrigin(req);
@@ -932,13 +938,12 @@ router.get('/admin/config', auth, requireAdminOrManager, (req, res) => {
   });
 });
 
-// GET /admin/stats — tenant-scoped: platform super_admin sees all orgs;
-// a tenant admin/manager sees only their own organization's passkeys.
-router.get('/admin/stats', auth, requireAdminOrManager, async (req, res, next) => {
+// GET /admin/stats — the trainer's own studio's passkeys only.
+router.get('/admin/stats', auth, requireTrainer, async (req, res, next) => {
   try {
-    const { orgId, applyFilter } = tenantScope(req);
-    const where  = applyFilter ? 'WHERE u.organization_id = $1' : '';
-    const params = applyFilter ? [orgId] : [];
+    const { orgId } = tenantScope(req);
+    const where  = 'WHERE u.organization_id = $1';
+    const params = [orgId];
     const { rows } = await pool.query(`
       SELECT
         COUNT(*) FILTER (WHERE uc.deleted_at IS NULL)::int                        AS total_credentials,
@@ -954,15 +959,15 @@ router.get('/admin/stats', auth, requireAdminOrManager, async (req, res, next) =
 });
 
 // GET /admin/credentials — tenant-scoped list.
-router.get('/admin/credentials', auth, requireAdminOrManager, async (req, res, next) => {
+router.get('/admin/credentials', auth, requireTrainer, async (req, res, next) => {
   try {
     const limit  = Math.min(Math.max(parseInt(req.query.limit,  10) || 100, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0,   0);
-    const { orgId, applyFilter } = tenantScope(req);
+    const { orgId } = tenantScope(req);
 
     const conds  = ['uc.deleted_at IS NULL'];
     const params = [];
-    if (applyFilter) { params.push(orgId); conds.push(`u.organization_id = $${params.length}`); }
+    params.push(orgId); conds.push(`u.organization_id = $${params.length}`);
     params.push(limit);  const limIdx = params.length;
     params.push(offset); const offIdx = params.length;
 
@@ -981,17 +986,13 @@ router.get('/admin/credentials', auth, requireAdminOrManager, async (req, res, n
   } catch (err) { next(err); }
 });
 
-// DELETE /admin/credentials/:id — admin revoke, tenant-scoped so an org admin
-// can only revoke passkeys belonging to a user in their own organization.
-router.delete('/admin/credentials/:id', auth, async (req, res, next) => {
-  if (req.user.role !== 'trainer' && req.user.role !== 'admin' && req.user.role !== 'super_admin') {
-    return res.status(403).json({ error: 'Admin only' });
-  }
+// DELETE /admin/credentials/:id — the trainer revokes a passkey belonging to
+// an account in their own organization, and no other.
+router.delete('/admin/credentials/:id', auth, requireTrainer, async (req, res, next) => {
   try {
-    const { orgId, applyFilter } = tenantScope(req);
-    const params = [req.params.id];
-    let orgCond = '';
-    if (applyFilter) { params.push(orgId); orgCond = `AND u.organization_id = $${params.length}`; }
+    const { orgId } = tenantScope(req);
+    const params = [req.params.id, orgId];
+    const orgCond = 'AND u.organization_id = $2';
 
     const { rows } = await pool.query(
       `UPDATE user_webauthn_credentials uc
@@ -1008,22 +1009,18 @@ router.delete('/admin/credentials/:id', auth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// GET /admin/audit-logs — tenant-scoped. A tenant admin sees webauthn events
-// performed by users in their org (registration/management, actor-based) plus
-// login events targeting a user in their org (target-based, since login has no
-// authenticated actor). Platform super_admin sees everything.
-router.get('/admin/audit-logs', auth, requireAdminOrManager, async (req, res, next) => {
+// GET /admin/audit-logs — the trainer's own studio. WebAuthn events performed
+// by users in the org (registration/management, actor-based) plus login events
+// targeting a user in the org (target-based, since login has no authenticated
+// actor).
+router.get('/admin/audit-logs', auth, requireTrainer, async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
-    const { orgId, applyFilter } = tenantScope(req);
+    const { orgId } = tenantScope(req);
 
-    const params = [];
-    let orgCond = '';
-    if (applyFilter) {
-      params.push(orgId);
-      orgCond = `AND (u.organization_id = $${params.length}
-                   OR al.entity_id IN (SELECT id FROM users WHERE organization_id = $${params.length}))`;
-    }
+    const params = [orgId];
+    const orgCond = `AND (u.organization_id = $1
+                   OR al.entity_id IN (SELECT id FROM users WHERE organization_id = $1))`;
     params.push(limit);
     const limIdx = params.length;
 

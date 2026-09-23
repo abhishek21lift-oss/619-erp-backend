@@ -31,10 +31,8 @@ jest.mock('../middleware/auth', () => ({
     req.user = mockCurrentUser;
     next();
   },
-  adminOnly: (req, res, next) =>
-    req.user && req.user.role === 'admin'
-      ? next()
-      : res.status(403).json({ error: 'Admin access required' }),
+  // The real guard, so the test proves what production enforces.
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const request = require('supertest');
@@ -53,7 +51,7 @@ let fetchCalls;
 beforeEach(() => {
   pool.query.mockReset();
   fetchCalls = [];
-  mockCurrentUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+  mockCurrentUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
 
   global.fetch = jest.fn(async (url, init) => {
     fetchCalls.push({ url: String(url), headers: (init && init.headers) || {} });
@@ -131,7 +129,7 @@ describe('the organization comes from the session, never from the request', () =
   it('never lets studio B reach studio A’s instance', async () => {
     // B has no row of its own, so every instance-scoped route must 404 rather
     // than fall through to whatever row happens to exist.
-    mockCurrentUser = { id: 'u2', role: 'admin', organization_id: ORG_B };
+    mockCurrentUser = { id: 'u2', role: 'trainer', organization_id: ORG_B };
     pool.query.mockResolvedValue({ rowCount: 0, rows: [] });
 
     for (const [method, path] of [
@@ -149,27 +147,47 @@ describe('the organization comes from the session, never from the request', () =
 });
 
 describe('authorisation', () => {
-  it('refuses a non-admin', async () => {
+  it('refuses a member, and every retired staff role', async () => {
     // gate() in server.js is auth + feature flag and says nothing about role —
     // the comment there records a real escalation where a `member` account
     // satisfied every check and read staff data. Connecting a studio's WhatsApp
-    // number is an owner action.
-    for (const role of ['member', 'trainer', 'manager', 'reception']) {
+    // number is the studio trainer's action.
+    for (const role of ['member', 'admin', 'manager', 'reception', 'staff']) {
       mockCurrentUser = { id: 'u3', role, organization_id: ORG_A };
       const res = await request(app).get('/api/integrations/whatsapp/status');
       expect(res.status).toBe(403);
     }
+    expect(fetchCalls).toHaveLength(0);
   });
 
-  it('refuses a platform admin with no studio selected', async () => {
-    // Pairing a WhatsApp number has no platform-wide meaning. Same 400 and the
-    // same wording as writableOrg() in integrations.js.
-    mockCurrentUser = { id: 'sa', role: 'admin', organization_id: null };
-    const res = await request(app).post('/api/integrations/whatsapp/connect');
+  it('lets the studio trainer in', async () => {
+    instanceExists();
+    const res = await request(app).get('/api/integrations/whatsapp/status');
+    expect(res.status).toBeLessThan(400);
+  });
 
-    expect(res.status).toBe(400);
-    expect(res.body.message).toMatch(/Select a studio/i);
+  it('refuses a caller with no studio before the gateway is asked anything', async () => {
+    // Pairing a WhatsApp number has no platform-wide meaning. The platform
+    // operator — or a trainer row somehow missing its organization — is
+    // refused by the guard.
+    for (const user of [
+      { id: 'sa', role: 'super_admin', organization_id: null },
+      { id: 'orphan', role: 'trainer', organization_id: null },
+    ]) {
+      mockCurrentUser = user;
+      const res = await request(app).post('/api/integrations/whatsapp/connect');
+      expect(res.status).toBe(403);
+    }
     expect(fetchCalls).toHaveLength(0);
+  });
+
+  it('an x-org-id header cannot point the gateway at another studio', async () => {
+    instanceExists();
+    await request(app).get('/api/integrations/whatsapp/status').set('x-org-id', ORG_B);
+    const select = pool.query.mock.calls.find(([q]) => /FROM whatsapp_instances/i.test(q));
+    expect(select[1]).toContain(ORG_A);
+    expect(select[1]).not.toContain(ORG_B);
+    for (const c of fetchCalls) expect(JSON.stringify(c)).not.toContain(ORG_B);
   });
 });
 

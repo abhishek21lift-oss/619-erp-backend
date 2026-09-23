@@ -26,44 +26,17 @@ const { tenantScope } = require('../tenant-db');
 const { parseDateRange } = require('./dateRange');
 
 /**
- * The org id to filter a tool's query by, or null for no filter.
- *
- * ── Why callers must branch on orgFilters(), not on this value ──────────────
- *
- * This returns null for TWO opposite situations, and they must not be
- * conflated:
- *
- *   · a platform super admin operating platform-wide — no filter is correct,
- *     they are meant to read across studios; and
- *   · a tenant user whose organization_id is NULL — for whom "no filter" means
- *     revenue_summary, dues_summary, client_stats and trainer_roster answer
- *     with PLATFORM-WIDE figures.
- *
- * tenantScope() keeps them apart on purpose: the second case comes back as
- * applyFilter=true with orgId=null, which every hand-written route in this
- * codebase turns into `organization_id = NULL` — a predicate that is never
- * true, so the query returns nothing. That is the fail-closed answer.
- *
- * Six tools here used to branch on `if (org)`, which collapsed the two cases
- * into the dangerous one. `users.organization_id` is nullable (migration 172
- * tightened three tables, not that one), so it was reachable rather than
- * hypothetical. Use orgFilters() below instead.
+ * The organization every tool's query is filtered by: always the caller's own
+ * (tenantScope() has no unfiltered case). `apply` is kept in the returned
+ * shape and is always true — bind orgId even when it is null, so an account
+ * with no organization gets no rows instead of the platform.
  */
 function orgParam(req) {
-  const scope = tenantScope(req);
-  return scope.applyFilter ? scope.orgId : null;
+  return tenantScope(req).orgId;
 }
 
-/**
- * Whether to apply an organization filter at all, and what to bind for it.
- *
- * `apply` is false ONLY for a platform-wide super admin. For everyone else it
- * is true, and `orgId` may still be null — bind it anyway and let the SQL
- * return nothing, which is the point.
- */
 function orgFilters(req) {
-  const scope = tenantScope(req);
-  return { apply: scope.applyFilter, orgId: scope.orgId };
+  return { apply: true, orgId: tenantScope(req).orgId };
 }
 
 const fmtINR = (n) => '₹' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
@@ -183,22 +156,20 @@ function extractNameCandidates(msg) {
 }
 
 const TOOLS = [
-  /* ── Client stats (trainer or super_admin) ── */
+  /* ── Client stats ── */
   {
     name: 'client_stats',
     label: 'Client Stats',
-    roles: ['trainer', 'admin', 'manager', 'super_admin'],
+    roles: ['trainer'],
     test: (msg) => /\b(how many|count of|number of)\b.*\b(client|clients|member|members)\b|\b(active|expired|expiring|frozen)\s+(clients?|members?)\b/i.test(msg),
     async run(req) {
       const org = orgFilters(req);
-      const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : null;
       const params = [];
       let p = 1;
       const conds = ['deleted_at IS NULL'];
       // Bound even when orgId is null: `organization_id = NULL` is never true,
       // so an org-less tenant user gets no rows instead of the whole platform.
-      if (org.apply) { conds.push(`organization_id = $${p++}`); params.push(org.orgId); }
-      if (trainerId) { conds.push(`trainer_id = $${p++}`); params.push(trainerId); }
+      conds.push(`organization_id = $${p++}`); params.push(org.orgId);
       const { rows } = await pool.query(
         `SELECT
            COUNT(*) FILTER (WHERE status = 'active') AS active,
@@ -218,20 +189,18 @@ const TOOLS = [
   {
     name: 'find_client',
     label: 'Client Lookup',
-    roles: ['trainer', 'admin', 'manager', 'super_admin'],
+    roles: ['trainer'],
     test: (msg) => extractNameCandidates(msg).candidates.length > 0,
     extract: (msg) => extractNameCandidates(msg),
     async run(req, extracted) {
       const { candidates } = extracted;
       const org = orgFilters(req);
-      const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : null;
 
       const params = candidates.map((c) => `%${c}%`);
       const nameClause = candidates.map((_, i) => `name ILIKE $${i + 1}`).join(' OR ');
       let p = candidates.length + 1;
       const conds = ['deleted_at IS NULL', `(${nameClause})`];
-      if (org.apply) { conds.push(`organization_id = $${p++}`); params.push(org.orgId); }
-      if (trainerId) { conds.push(`trainer_id = $${p++}`); params.push(trainerId); }
+      conds.push(`organization_id = $${p++}`); params.push(org.orgId);
 
       const { rows } = await pool.query(
         `SELECT name, status, mobile, package_type, trainer_name, balance_amount,
@@ -269,21 +238,15 @@ const TOOLS = [
   {
     name: 'attendance_summary',
     label: 'Attendance',
-    roles: ['trainer', 'admin', 'manager', 'super_admin'],
+    roles: ['trainer'],
     test: (msg) => /\b(attendance|check-?in|checked in|present|absent)\b/i.test(msg),
     async run(req, _match, message) {
       const { from, to, label } = parseDateRange(message);
       const org = orgFilters(req);
-      const trainerId = req.user.role === 'trainer' ? req.user.trainer_id : null;
       const params = [from, to];
       let p = 3;
-      let trainerFilter = '';
-      if (trainerId) {
-        trainerFilter = `AND a.ref_id IN (SELECT id FROM pt_clients WHERE trainer_id = $${p++}) `;
-        params.push(trainerId);
-      }
       let orgFilter = '';
-      if (org.apply) { orgFilter = `AND a.organization_id = $${p++} `; params.push(org.orgId); }
+      orgFilter = `AND a.organization_id = $${p++} `; params.push(org.orgId);
 
       const { rows } = await pool.query(
         `SELECT
@@ -293,7 +256,7 @@ const TOOLS = [
            COUNT(DISTINCT ref_id) AS unique_clients,
            COUNT(*) AS total
          FROM attendance_logs a
-         WHERE a.ref_type = 'client' AND a.date BETWEEN $1::date AND $2::date ${trainerFilter}${orgFilter}`,
+         WHERE a.ref_type = 'client' AND a.date BETWEEN $1::date AND $2::date ${orgFilter}`,
         params
       );
       return { ...rows[0], label };
@@ -305,7 +268,7 @@ const TOOLS = [
   {
     name: 'search_exercises',
     label: 'Exercise Search',
-    roles: ['trainer', 'admin', 'manager', 'super_admin'],
+    roles: ['trainer'],
     test: (msg) => /\bexercises?\b.*\b(for|targeting|that work|to (train|hit))\b|\bworkout\s+(move|exercise)s?\b/i.test(msg)
       && MUSCLE_KEYWORDS.some((k) => msg.toLowerCase().includes(k)),
     extract: (msg) => {
@@ -313,17 +276,19 @@ const TOOLS = [
       return MUSCLE_KEYWORDS.find((k) => lower.includes(k)) || null;
     },
     async run(req, muscle) {
+      // The same visibility rule as routes/exercises.js: the built-in library
+      // plus this studio's own custom exercises, and nothing of any other
+      // studio's.
       const org = orgParam(req);
-      const userId = req.user?.id;
-      if (!org || !userId) return [];
+      if (!org) return [];
       const { rows } = await pool.query(
         `SELECT e.name, e.muscle_group, e.body_part, e.equipment, e.difficulty
          FROM exercises e
          WHERE e.deleted_at IS NULL AND e.archived_at IS NULL
-           AND (e.organization_id IS NULL OR (e.organization_id = $2::uuid AND e.created_by = $3))
+           AND (e.organization_id IS NULL OR e.organization_id = $2::uuid)
            AND (e.muscle_group ILIKE $1 OR e.body_part ILIKE $1 OR e.target_muscle ILIKE $1)
          ORDER BY e.name LIMIT 8`,
-        [`%${muscle}%`, org, userId]
+        [`%${muscle}%`, org]
       );
       return rows;
     },
@@ -333,18 +298,18 @@ const TOOLS = [
     },
   },
 
-  /* ── Revenue summary (financial data — trainer / owner / super_admin) ───────────── */
+  /* ── Revenue summary (financial data — the studio's trainer) ───────────── */
   {
     name: 'revenue_summary',
     label: 'Revenue',
-    roles: ['trainer', 'admin', 'manager', 'super_admin'],
+    roles: ['trainer'],
     test: (msg) => /\b(revenue|earnings|income|collections?)\b/i.test(msg),
     async run(req, _match, message) {
       const { from, to, label } = parseDateRange(message);
       const org = orgFilters(req);
       const params = [from, to];
       let orgFilter = '';
-      if (org.apply) { orgFilter = 'AND organization_id = $3'; params.push(org.orgId); }
+      orgFilter = 'AND organization_id = $3'; params.push(org.orgId);
       const { rows } = await pool.query(
         `SELECT COALESCE(SUM(amount), 0) AS total_revenue, COUNT(*) AS total_payments
          FROM pt_payments WHERE date BETWEEN $1 AND $2 AND deleted_at IS NULL ${orgFilter}`,
@@ -359,13 +324,13 @@ const TOOLS = [
   {
     name: 'dues_summary',
     label: 'Outstanding Dues',
-    roles: ['trainer', 'admin', 'manager', 'super_admin'],
+    roles: ['trainer'],
     test: (msg) => /\b(outstanding|pending)\s+dues?\b|\bwho owes\b|\bunpaid\b|\bbalance\s+(due|owed)\b/i.test(msg),
     async run(req) {
       const org = orgFilters(req);
       const params = [];
       let orgFilter = '';
-      if (org.apply) { orgFilter = 'AND organization_id = $1'; params.push(org.orgId); }
+      orgFilter = 'AND organization_id = $1'; params.push(org.orgId);
       const [{ rows: totals }, { rows }] = await Promise.all([
         pool.query(
           `SELECT COALESCE(SUM(balance_amount), 0) AS total,
@@ -395,29 +360,6 @@ const TOOLS = [
     },
   },
 
-  /* ── Trainer roster ───────────────────────────────────────────────────── */
-  {
-    name: 'trainer_roster',
-    label: 'Trainers',
-    roles: ['trainer', 'admin', 'manager', 'super_admin'],
-    test: (msg) => /\b(list|how many|who are the)\b.*\btrainers?\b/i.test(msg),
-    async run(req) {
-      const org = orgFilters(req);
-      const params = [];
-      let orgFilter = '';
-      if (org.apply) { orgFilter = 'AND organization_id = $1'; params.push(org.orgId); }
-      const { rows } = await pool.query(
-        `SELECT name, specialization, status FROM trainers
-         WHERE deleted_at IS NULL AND status = 'active' ${orgFilter} ORDER BY name`,
-        params
-      );
-      return rows;
-    },
-    format: (rows) => {
-      if (!rows.length) return 'No active trainers found.';
-      return `Active trainers (${rows.length}): ` + rows.map((t) => `${t.name}${t.specialization ? ` (${t.specialization})` : ''}`).join(', ');
-    },
-  },
 ];
 
 /**
@@ -438,7 +380,8 @@ async function runTools(req, message) {
   const contextParts = [];
 
   for (const tool of matched) {
-    const authorized = !tool.roles || tool.roles.includes(req.user.role);
+    // Fail closed: a tool that names no roles is authorised for nobody.
+    const authorized = Array.isArray(tool.roles) && tool.roles.includes(req.user.role);
     if (!authorized) {
       contextParts.push(`[${tool.label}] The current user's role ("${req.user.role}") is not permitted to view this data — say so plainly rather than answering.`);
       toolNames.push(tool.label);

@@ -176,13 +176,15 @@ describe('permission is re-checked at send time, not only at queue time', () => 
     expect(updates().some((u) => u.params.includes('automation_disabled'))).toBe(true);
   });
 
-  test('a trainer whose grant was revoked while the message waited does not send', async () => {
+  test('the studio switch is the only permission: there is no per-trainer grant to consult', async () => {
+    // The grant level went with the staff roles — the studio has one trainer,
+    // and it is the trainer who turned the switch on. A worker that still
+    // looked a grant up would be deciding on a table nothing writes any more.
     db({ grant: false });
     const out = await processAutomationJob(job());
 
-    expect(out).toMatchObject({ status: 'skipped', reason: 'trainer_not_permitted' });
-    expect(mockGatewaySend).not.toHaveBeenCalled();
-    expect(updates().some((u) => u.params.includes('trainer_not_permitted'))).toBe(true);
+    expect(out.reason).not.toBe('trainer_not_permitted');
+    expect(mockGatewaySend).toHaveBeenCalledTimes(1);
   });
 
   test('an already-sent row is not sent again', async () => {

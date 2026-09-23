@@ -1,36 +1,31 @@
 'use strict';
-// Multi-tenant isolation helpers (Phase 0 — foundation).
+// Multi-tenant isolation helpers.
 //
-// The tenant boundary is the `organizations` table. Every authenticated user
-// carries `req.user.organization_id` (populated by auth.js after migration
-// 078). These helpers are the single source of truth for resolving and
-// enforcing that boundary. In Phase 0 they are DORMANT — exported and unit-
-// testable but only active where explicitly mounted — so nothing changes yet.
-// Later phases wire `tenantContext` globally, add a tenant-scoped query guard,
-// and layer Postgres RLS underneath for defence in depth.
+// The tenant boundary is the `organizations` table. Every authenticated tenant
+// account (trainer or member) carries `req.user.organization_id`, loaded from
+// the database by auth.js on every request. That column is the ONLY source of
+// a request's tenant: no header, query parameter or body field can name or
+// change it.
+//
+// The platform operator (super_admin) is not a tenant account. auth.js refuses
+// it on every tenant-plane path, so on the paths where it is allowed (the
+// control plane and the plane-neutral auth/profile routes) it resolves to no
+// organization at all.
 
-const { targetOrgId } = require('../lib/tenant-db');
-
-// Platform operators have role 'super_admin' and no organization; they may act
-// across tenants (e.g. the hidden admin portal).
+// Platform operators have role 'super_admin' and no organization.
 function isSuperAdmin(req) {
   return req.user?.role === 'super_admin';
 }
 
 // Resolve the organization the current request operates within.
-//   - Normal users: their own organization_id — a hard, non-overridable boundary.
-//   - Super admins: may target a specific org via the `x-org-id` header,
-//     else operate platform-wide (null).
-// Throws a 403-worthy error only when a non-super-admin has no organization.
+//   - Tenant accounts: their own organization_id — a hard, non-overridable
+//     boundary.
+//   - Platform operators: null. They act across tenants only through the
+//     control-plane routes, which name the studio in the URL and are guarded
+//     by PLATFORM_GUARD; they never inherit a tenant from the request.
+// Throws a 403-worthy error only when a tenant account has no organization.
 function resolveOrgId(req) {
-  if (isSuperAdmin(req)) {
-    // Same rule as tenantScope(), from the same function, so the two cannot
-    // drift. This resolution feeds the RLS GUC (auth.js sets app.org_id from
-    // it) while handlers filter with tenantScope() — if they disagreed about
-    // the target org, the database and the application would be scoped to
-    // different tenants within one request. See targetOrgId's own comment.
-    return targetOrgId(req);
-  }
+  if (isSuperAdmin(req)) return null;
   const orgId = req.user?.organization_id;
   if (!orgId) {
     const err = new Error('No organization context for this account');
@@ -41,18 +36,23 @@ function resolveOrgId(req) {
   return orgId;
 }
 
-// Express guard: attaches req.orgId / req.isSuperAdmin for downstream handlers.
+// Express guard: attaches req.orgId for downstream handlers. Refuses any
+// request that has no tenant — including a platform operator, who has no
+// business on a route that mounts this.
 function tenantContext(req, res, next) {
   try {
-    req.isSuperAdmin = isSuperAdmin(req);
-    req.orgId = resolveOrgId(req);
+    const orgId = resolveOrgId(req);
+    if (!orgId) {
+      return res.status(403).json({ error: { code: 'NO_TENANT', message: 'No organization context for this account' } });
+    }
+    req.orgId = orgId;
     next();
   } catch (err) {
     res.status(err.status || 403).json({ error: { code: err.code || 'NO_TENANT', message: err.message } });
   }
 }
 
-// Express guard: platform super-admin only (the hidden admin portal).
+// Express guard: platform super-admin only (the Command Center).
 function requireSuperAdmin(req, res, next) {
   if (!isSuperAdmin(req)) {
     return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Super admin access required' } });

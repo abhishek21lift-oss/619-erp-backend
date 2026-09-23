@@ -66,7 +66,7 @@ describe('a failing tool is reported to the model, not only to the log', () => {
   it('tells the model the lookup failed instead of passing nothing', async () => {
     pool.query.mockRejectedValueOnce(new Error('connection reset'));
 
-    const result = await runTools(reqAs('manager'), 'How many active clients do we have?');
+    const result = await runTools(reqAs('trainer'), 'How many active clients do we have?');
 
     expect(result.contextText).toMatch(/lookup failed just now/i);
     expect(result.contextText).toMatch(/rather than answering from memory or estimating/i);
@@ -76,8 +76,8 @@ describe('a failing tool is reported to the model, not only to the log', () => {
 
   it('a failure and a no-trigger are no longer the same empty string', async () => {
     pool.query.mockRejectedValueOnce(new Error('connection reset'));
-    const failed = await runTools(reqAs('manager'), 'How many active clients do we have?');
-    const never = await runTools(reqAs('manager'), 'What is a good warm-up routine?');
+    const failed = await runTools(reqAs('trainer'), 'How many active clients do we have?');
+    const never = await runTools(reqAs('trainer'), 'What is a good warm-up routine?');
 
     expect(never.contextText).toBe('');
     expect(failed.contextText).not.toBe('');
@@ -95,7 +95,7 @@ describe('a failing tool is reported to the model, not only to the log', () => {
     pool.query.mockResolvedValueOnce({
       rows: [{ active: '12', inactive: '3', frozen: '1', expiring_soon: '2', total: '16' }],
     });
-    const result = await runTools(reqAs('manager'), 'How many active clients do we have?');
+    const result = await runTools(reqAs('trainer'), 'How many active clients do we have?');
     expect(result.contextText).toMatch(/16 total/);
     expect(result.contextText).not.toMatch(/failed/i);
   });

@@ -28,7 +28,8 @@
 // in any studio holding the key, and this bucket holds PAR-Q health
 // screenings, payment proofs and photographs of clients.
 
-const { tenantScope, targetOrgId } = require('../lib/tenant-db');
+const tenantDb = require('../lib/tenant-db');
+const { tenantScope } = tenantDb;
 const { resolveOrgId } = require('../middleware/tenant');
 
 const ORG_A = '11111111-1111-1111-1111-111111111111';
@@ -43,17 +44,23 @@ const reqOf = ({ role, orgId = null, headers = {}, query = {}, body = {} }) => (
 });
 
 describe('org resolution — one rule, not two', () => {
-  it('agrees with tenantScope for a super admin targeting an org by header', () => {
+  it('gives a super admin no tenant, even when the x-org-id header names one', () => {
+    // The platform operator is platform-only: the header that used to retarget
+    // them into a studio is not read anywhere any more. The one way into a
+    // studio is impersonation, which loads the studio's own account.
     const req = reqOf({ role: 'super_admin', headers: { 'x-org-id': ORG_B } });
-    expect(resolveOrgId(req)).toBe(ORG_B);
-    expect(tenantScope(req).orgId).toBe(ORG_B);
+    expect(resolveOrgId(req)).toBeNull();
+    expect(tenantScope(req).orgId).toBeNull();
   });
 
-  it('agrees for a super admin operating platform-wide', () => {
+  it('never hands a super admin an unfiltered scope', () => {
+    // applyFilter:false was the "platform-wide" mode every handler had to
+    // remember to special-case. It no longer exists: with no org the filter
+    // still applies, and matches nothing.
     const req = reqOf({ role: 'super_admin' });
     expect(resolveOrgId(req)).toBeNull();
     expect(tenantScope(req).orgId).toBeNull();
-    expect(tenantScope(req).applyFilter).toBe(false);
+    expect(tenantScope(req).applyFilter).toBe(true);
   });
 
   it('ignores a target org smuggled through the query string', () => {
@@ -79,7 +86,7 @@ describe('org resolution — one rule, not two', () => {
       { query: { organization_id: ORG_B } },
       { body: { organization_id: ORG_B } },
     ]) {
-      const req = reqOf({ role: 'admin', orgId: ORG_A, ...attempt });
+      const req = reqOf({ role: 'trainer', orgId: ORG_A, ...attempt });
       expect(resolveOrgId(req)).toBe(ORG_A);
       expect(tenantScope(req).orgId).toBe(ORG_A);
     }
@@ -89,16 +96,23 @@ describe('org resolution — one rule, not two', () => {
     // resolveOrgId and tenantScope keep DIFFERENT contracts here on purpose —
     // one throws, the other returns null so the filter matches no rows — and
     // sharing the target rule must not have collapsed that distinction.
-    const req = reqOf({ role: 'admin', orgId: null });
+    const req = reqOf({ role: 'trainer', orgId: null });
     expect(() => resolveOrgId(req)).toThrow(/No organization context/i);
     expect(tenantScope(req).orgId).toBeNull();
     expect(tenantScope(req).applyFilter).toBe(true);
   });
 
-  it('reads the target from the header and nowhere else', () => {
-    expect(targetOrgId({ headers: { 'x-org-id': ORG_B }, query: {}, body: {} })).toBe(ORG_B);
-    expect(targetOrgId({ headers: {}, query: { organization_id: ORG_B }, body: {} })).toBeNull();
-    expect(targetOrgId({ headers: {}, query: {}, body: { organization_id: ORG_B } })).toBeNull();
+  it('has no client-supplied target at all — the header helper is gone', () => {
+    // targetOrgId() read x-org-id for super admins. With no caller left that
+    // may name its tenant, keeping the helper would only invite one back.
+    expect(tenantDb.targetOrgId).toBeUndefined();
+    for (const attempt of [
+      { headers: { 'x-org-id': ORG_B } },
+      { query: { organization_id: ORG_B } },
+      { body: { organization_id: ORG_B } },
+    ]) {
+      expect(tenantScope(reqOf({ role: 'super_admin', ...attempt })).orgId).toBeNull();
+    }
   });
 });
 
@@ -150,15 +164,15 @@ describe('upload categories — unregistered means denied', () => {
     expect(unregistered).toEqual([]);
   });
 
-  it('states the super-admin bypass once, above the category checks', () => {
-    // Hoisting it was what let the denial be added safely: with the bypass
-    // still buried in each branch, `if (!table) return false` would have
-    // locked the platform console out of any category it is the sole reader
-    // for. If someone reintroduces a per-branch copy, the ordering guarantee
-    // is gone and this says so.
+  it('has no super-admin bypass: ownership is organization equality for everyone', () => {
+    // The platform console cannot reach /api/uploads at all (it is a tenant
+    // plane path, refused in auth.js), so the "platform-wide reads every
+    // category" shortcut was dead weight with a sharp edge. Every owned
+    // category now answers one question: is the record in the caller's studio?
     const fn = src.slice(src.indexOf('async function callerOwnsRecord'));
     const body = fn.slice(0, fn.indexOf('\n}\n'));
-    expect(body.match(/scope\.applyFilter/g)).toHaveLength(1);
-    expect(body.indexOf('scope.applyFilter')).toBeLessThan(body.indexOf('if (!table)'));
+    expect(body).not.toMatch(/applyFilter/);
+    expect(body).not.toMatch(/super_admin/);
+    expect(body.match(/organization_id === scope\.orgId/g).length).toBeGreaterThanOrEqual(2);
   });
 });

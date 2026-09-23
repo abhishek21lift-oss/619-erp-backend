@@ -38,13 +38,11 @@ const MUTABLE_COLUMNS = Object.freeze([
 /**
  * Append the tenant predicate, mirroring `orgWhere` but from a scope.
  *
- * Fail-closed in the same way: when the scope says to filter, the predicate is
- * always added, so a missing org id narrows to nothing rather than widening to
- * everything.
+ * Fail-closed in the same way: the predicate is always added, so a missing
+ * scope or org id narrows to nothing rather than widening to everything.
  */
 function orgPredicate(scope, params, col = 'organization_id') {
-  if (!scope || !scope.applyFilter) return '';
-  params.push(scope.orgId);
+  params.push(scope ? scope.orgId : null);
   return ` AND ${col} = $${params.length}`;
 }
 

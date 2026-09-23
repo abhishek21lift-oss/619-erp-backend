@@ -9,17 +9,16 @@
 // here, change the canonical endpoint and map here if needed.
 const router = require('express').Router();
 const pool = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
 const engine = require('../modules/insights/metric-engine');
 
-// Null-safe tenant param: a tenant user gets their org id (queries then filter
-// `organization_id = $x`); a platform super admin operating platform-wide gets
-// NULL, and `$x IS NULL OR organization_id = $x` matches every row. A super
-// admin targeting one org via x-org-id gets that org id and is filtered.
+// The caller's organization, bound into every query as `organization_id = $x`.
+// Always a real org for the trainer these routes admit; if it were ever null
+// the strict equality matches no rows, rather than every studio's.
 function orgParam(req) {
   const scope = tenantScope(req);
-  return scope.applyFilter ? scope.orgId : null;
+  return scope.orgId;
 }
 
 // GET /api/reports/monthly — canonical: metric-engine.getMonthlyRevenue
@@ -29,46 +28,12 @@ router.get('/monthly', auth, async (req, res, next) => {
     res.set('Deprecation', 'true');
     res.set('Link', '</api/insights/revenue/monthly>; rel="successor-version"');
     const { year = new Date().getFullYear() } = req.query;
-    const isTrainer = req.user.role === 'trainer';
-    const tid = isTrainer ? req.user.trainer_id : null;
     const scope = tenantScope(req);
     const rows = await engine.getMonthlyRevenue({
       year,
-      orgId: scope.applyFilter ? scope.orgId : null,
-      trainerId: tid,
+      orgId: scope.orgId,
     });
     res.json(rows);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET /api/reports/trainer-summary (admin only) — canonical:
-// metric-engine.getTrainerSummary. Shape frozen.
-router.get('/trainer-summary', auth, adminOnly, async (req, res, next) => {
-  try {
-    res.set('Deprecation', 'true');
-    res.set('Link', '</api/insights/trainers>; rel="successor-version"');
-    const scope = tenantScope(req);
-    res.json(await engine.getTrainerSummary({
-      orgId: scope.applyFilter ? scope.orgId : null,
-    }));
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET /api/reports/trainers — DEPRECATED alias for /trainer-summary.
-// Same canonical source (metric-engine.getTrainerSummary). Kept for
-// compatibility; new code must call /api/insights/trainers.
-router.get('/trainers', auth, adminOnly, async (req, res, next) => {
-  try {
-    res.set('Deprecation', 'true');
-    res.set('Link', '</api/insights/trainers>; rel="successor-version"');
-    const scope = tenantScope(req);
-    res.json(await engine.getTrainerSummary({
-      orgId: scope.applyFilter ? scope.orgId : null,
-    }));
   } catch (err) {
     next(err);
   }
@@ -90,8 +55,7 @@ router.get('/revenue', auth, async (req, res, next) => {
     }
     const r = await engine.getRevenue({
       from: f, to: tt,
-      orgId: scope.applyFilter ? scope.orgId : null,
-      trainerId: req.user.role === 'trainer' ? req.user.trainer_id || null : null,
+      orgId: scope.orgId,
     });
     res.json({ count: r.count, total: r.total, total_incentives: r.total_incentives });
   } catch (err) {
@@ -111,8 +75,7 @@ router.get('/revenue', auth, async (req, res, next) => {
 // counts beside it had the same fault.
 //
 // This runs the IDENTICAL population as /dues — same union, same
-// balance_amount > 0, same soft-delete filter, same trainer scope, same org
-// scope — differing only in having no LIMIT and returning aggregates instead
+// balance_amount > 0, same soft-delete filter, same org scope — differing only in having no LIMIT and returning aggregates instead
 // of rows. It is a separate route rather than a change to /dues so the array
 // response stays untouched: three pages consume that (finance/dues, reports,
 // insights/revenue) and none of them have to change.
@@ -124,14 +87,12 @@ router.get('/dues/summary', auth, async (req, res, next) => {
   try {
     res.set('Deprecation', 'true');
     res.set('Link', '</api/insights/dues/summary>; rel="successor-version"');
-    const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
     const scope = tenantScope(req);
     const high = Number.isFinite(Number(req.query.high)) ? Number(req.query.high) : 10000;
     const medium = Number.isFinite(Number(req.query.medium)) ? Number(req.query.medium) : 3000;
     res.json(await engine.getDuesSummary({
       high, medium,
-      orgId: scope.applyFilter ? scope.orgId : null,
-      trainerId: tid,
+      orgId: scope.orgId,
     }));
   } catch (err) {
     next(err);
@@ -144,11 +105,9 @@ router.get('/dues', auth, async (req, res, next) => {
   try {
     res.set('Deprecation', 'true');
     res.set('Link', '</api/insights/dues>; rel="successor-version"');
-    const tid = req.user.role === 'trainer' ? req.user.trainer_id : null;
     const scope = tenantScope(req);
     res.json(await engine.getDuesRows({
-      orgId: scope.applyFilter ? scope.orgId : null,
-      trainerId: tid,
+      orgId: scope.orgId,
       limit: 100,
     }));
   } catch (err) {
@@ -158,7 +117,7 @@ router.get('/dues', auth, async (req, res, next) => {
 
 // ── Monthly revenue target ──────────────────────────────────────────────────
 //
-// A studio admin commits to one revenue figure per calendar month. Once set it
+// The studio's trainer commits to one revenue figure per calendar month. Once set it
 // cannot be changed — that is enforced by a UNIQUE (organization_id, period)
 // constraint and by the deliberate absence of any update route, NOT by
 // disabling an input on the client.
@@ -177,7 +136,7 @@ async function currentMonthRevenue(req) {
   const last = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
   const r = await engine.getRevenue({
     from: f, to: last,
-    orgId: scope.applyFilter ? scope.orgId : null,
+    orgId: scope.orgId,
   });
   return Number(r.total ?? 0);
 }
@@ -192,7 +151,7 @@ router.get('/revenue-target', auth, async (req, res, next) => {
            FROM revenue_targets t
            LEFT JOIN users u ON u.id = t.set_by
           WHERE t.period = date_trunc('month', CURRENT_DATE)::date
-            AND ($1::uuid IS NULL OR t.organization_id = $1)
+            AND t.organization_id = $1
           LIMIT 1`,
         [orgId],
       ),
@@ -217,9 +176,9 @@ router.get('/revenue-target', auth, async (req, res, next) => {
         locked: Boolean(row),
         set_by_name: row?.set_by_name ?? null,
         set_at: row?.created_at ?? null,
-        // Only an admin may set it; surfaced so the UI shows the right message
-        // to a trainer rather than a form that will 403.
-        can_set: req.user.role === 'trainer' || req.user.role === 'admin' || req.user.role === 'super_admin',
+        // Kept in the response shape for the clients that read it. Everyone
+        // who can reach this route is the studio's trainer, who may set it.
+        can_set: true,
       },
     });
   } catch (err) {
@@ -228,7 +187,7 @@ router.get('/revenue-target', auth, async (req, res, next) => {
 });
 
 // POST /api/reports/revenue-target — set this month's target. Once only.
-router.post('/revenue-target', auth, adminOnly, async (req, res, next) => {
+router.post('/revenue-target', auth, requireTrainer, async (req, res, next) => {
   try {
     const orgId = orgParam(req);
     if (!orgId) {

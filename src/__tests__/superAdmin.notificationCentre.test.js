@@ -15,8 +15,7 @@ jest.mock('../lib/announcements', () => ({
 }));
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = { id: 'op-1', name: 'Owner', role: 'super_admin' }; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
   invalidateUserCache: jest.fn(),
 }));
 
@@ -175,7 +174,7 @@ describe('preview', () => {
     // nothing — the number the operator confirms must be the number that goes.
     pool.query.mockResolvedValueOnce({ rows: [DRAFT] });
     announcements.resolveRecipients.mockResolvedValueOnce({
-      users: Array.from({ length: 14 }, (_, i) => ({ name: `U${i}`, role: 'admin', organization_name: 'Iron House' })),
+      users: Array.from({ length: 14 }, (_, i) => ({ name: `U${i}`, role: 'trainer', organization_name: 'Iron House' })),
       studio_count: 3,
     });
 

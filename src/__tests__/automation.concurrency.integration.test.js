@@ -17,6 +17,14 @@
 
 const { Pool } = require('pg');
 
+// Every test here crosses a process boundary, and two of them open 25-40
+// transactions at once. Jest's 5s default then measures the machine rather
+// than the property under test — on a loaded runner (or Docker Desktop's host
+// bridge, ~1-2ms per round trip) the races are correct and still time out.
+// Set once for the file, because "it talks to a real database" is true of
+// every test in it, not of six hand-picked ones.
+jest.setTimeout(60000);
+
 const DB_URL = process.env.RLS_TEST_DATABASE_URL;
 const describeIf = DB_URL ? describe : describe.skip;
 

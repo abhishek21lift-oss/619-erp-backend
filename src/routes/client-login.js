@@ -2,7 +2,7 @@
 // The trainer's side of client logins: turn one on, resend the link, turn it
 // off, and see where it stands.
 //
-// Mounted at /api/client-login behind auth + requireStaff (see server.js), so
+// Mounted at /api/client-login behind auth + requireTrainer (see server.js), so
 // nothing here re-checks that the caller is staff. What every handler DOES
 // re-check is that the client belongs to the caller's studio — the mount
 // proves the caller is staff somewhere, not that they are staff HERE, and a
@@ -24,9 +24,15 @@ const invites = require('../lib/clientInvitations');
 const email = require('../lib/email');
 const { tenantScope } = require('../lib/tenant-db');
 const { frontendUrl } = require('../lib/frontendUrl');
-const { invalidateUserCache } = require('../middleware/auth');
+const { invalidateUserCache, auth, requireTrainer } = require('../middleware/auth');
+
 
 const router = express.Router();
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 /**
  * Load a client, scoped to the caller's studio.
@@ -39,10 +45,8 @@ async function loadClient(req, id, { client = pool } = {}) {
   const scope = tenantScope(req);
   const params = [id];
   let where = 'c.id = $1';
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    where += ' AND c.organization_id = $2';
-  }
+  params.push(scope.orgId);
+  where += ' AND c.organization_id = $2';
   const { rows } = await client.query(
     `SELECT c.id, c.name, c.email, c.photo_url, c.trainer_id, c.organization_id,
             c.paid_amount, c.balance_amount, c.deleted_at,

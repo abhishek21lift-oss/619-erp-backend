@@ -23,9 +23,8 @@ jest.mock('../lib/ai/embeddings', () => ({
   EMBEDDING_DIM: 384,
 }));
 jest.mock('../middleware/auth', () => ({
-  auth: (req, _res, next) => { req.user = { id: 'u1', role: 'admin', organization_id: 'org-1' }; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
+  auth: (req, _res, next) => { req.user = { id: 'u1', role: 'trainer', organization_id: 'org-1' }; next(); },
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../lib/ai/router', () => ({ routedStream: jest.fn(), routedChat: jest.fn() }));
 jest.mock('../lib/ai/models', () => ({ models: { primary: 'primary-model' } }));

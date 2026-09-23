@@ -137,9 +137,13 @@ async function isEnabled(orgId, planCode, key, client) {
 function requireFeature(key) {
   return async function featureGuard(req, res, next) {
     try {
-      // Platform operators are not subject to tenant feature flags — they are
-      // not inside a tenant.
-      if (!req.user?.organization_id || req.user.role === 'super_admin') return next();
+      // A feature flag is a property of a studio. An account with no studio
+      // has no flags to satisfy and no business on a feature-gated tenant
+      // route, so it is refused rather than waved through. (The platform
+      // operator never reaches here: auth.js refuses it on the tenant plane.)
+      if (!req.user?.organization_id) {
+        return res.status(403).json({ error: { code: 'NO_TENANT', message: 'No organization context for this account' } });
+      }
       const on = await isEnabled(req.user.organization_id, req.user.plan_code || null, key);
       if (on) return next();
       return res.status(403).json({

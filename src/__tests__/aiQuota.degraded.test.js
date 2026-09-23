@@ -22,7 +22,7 @@ const pool = require('../db/pool');
 const { requireAiQuota, quotaEnforcementHealth } = require('../lib/aiQuota');
 
 const guard = requireAiQuota();
-const reqFor = (orgId = 'org-1') => ({ user: { organization_id: orgId, role: 'admin' } });
+const reqFor = (orgId = 'org-1') => ({ user: { organization_id: orgId, role: 'trainer' } });
 const resStub = () => ({ status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() });
 
 async function runGuard() {

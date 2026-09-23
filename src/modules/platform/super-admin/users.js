@@ -144,8 +144,7 @@ router.get('/users/summary', async (req, res, next) => {
         count(*) FILTER (WHERE deleted_at IS NULL AND is_active)::int                  AS active,
         count(*) FILTER (WHERE deleted_at IS NULL AND NOT is_active)::int              AS inactive,
         count(*) FILTER (WHERE deleted_at IS NOT NULL)::int                            AS deleted,
-        count(*) FILTER (WHERE deleted_at IS NULL AND role = 'admin')::int             AS owners,
-        count(*) FILTER (WHERE deleted_at IS NULL AND role = 'trainer')::int           AS trainers,
+        count(*) FILTER (WHERE deleted_at IS NULL AND role = 'trainer')::int           AS owners,
         count(*) FILTER (WHERE deleted_at IS NULL AND role = 'member')::int            AS members,
         count(*) FILTER (WHERE deleted_at IS NULL AND role = 'super_admin')::int       AS platform,
         -- "Never signed in" is a real operational category: an invitation that

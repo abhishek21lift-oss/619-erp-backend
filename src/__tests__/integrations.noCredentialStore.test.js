@@ -74,7 +74,7 @@ describe('server-managed provider status comes from the server, not a row', () =
     pool.query.mockReset();
     pool.query.mockResolvedValue({ rows });
     const layer = router.stack.find((l) => l.route && l.route.path === '/' && l.route.methods.get);
-    const req = { user: { role: 'admin', organization_id: 'org-a' }, headers: {} };
+    const req = { user: { role: 'trainer', organization_id: 'org-a' }, headers: {} };
     let payload;
     const res = { json: (p) => { payload = p; } };
     await new Promise((resolve, reject) => {

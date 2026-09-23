@@ -7,7 +7,7 @@
 // POST /api/qr/checkout              — check out (end gym visit)
 // GET  /api/qr/dashboard             — live attendance dashboard stats
 // GET  /api/qr/my-history            — member's own attendance history + streaks
-// GET  /api/qr/staff-report          — staff/trainer attendance report (admin only)
+// GET  /api/qr/staff-report          — the studio's attendance report (trainer)
 'use strict';
 
 const router   = require('express').Router();
@@ -15,8 +15,7 @@ const crypto   = require('crypto');
 const QRCode   = require('qrcode');
 const pool     = require('../db/pool');
 const logger   = require('../lib/logger');
-const { auth } = require('../middleware/auth');
-const { requireStaff } = require('../middleware/rbac');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const metricEngine = require('../modules/insights/metric-engine');
 
@@ -30,22 +29,22 @@ const metricEngine = require('../modules/insights/metric-engine');
 //   POST /checkout      closes the caller's OWN open attendance row
 //   GET  /my-history    the caller's OWN attendance history
 //
-// Putting requireStaff on the mount (which is what the first pass at this
+// Putting requireTrainer on the mount (which is what the first pass at this
 // finding proposed) would 403 a member trying to display their own check-in
 // code — a client-facing outage introduced by a security fix.
 //
-// Two routes are studio-wide and get `requireStaff` individually, marked below:
+// Two routes are studio-wide and get `requireTrainer` individually, marked below:
 //   POST /scan          marks ANYONE present from a signed payload
 //   GET  /dashboard     live studio-wide attendance aggregates
 //
 // Two already carry their own RBAC and are left exactly as they are:
-//   GET /generate/:type/:id   admin/manager/owner, or trainer for own client
-//   GET /staff-report         inline admin check
+//   GET /generate/:type/:id   the trainer, for a subject in their own studio
+//   GET /staff-report         requireTrainer (the studio's own report)
 //
-// __tests__/security/qr.authz.test.js pins BOTH directions: the two staff
-// routes refuse a client, and the three client routes keep working and stay
-// self-scoped. The second half is what stops a future "just add requireStaff to
-// the mount" from shipping.
+// __tests__/security/qr.authz.test.js pins BOTH directions: the two trainer
+// routes refuse a member, and the three client routes keep working and stay
+// self-scoped. The second half is what stops a future "just add requireTrainer
+// to the mount" from shipping.
 const rateLimit = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
 
@@ -145,15 +144,15 @@ async function generateQrDataUrl(userId, userType, dynamic = false) {
  * principle — and pt_clients is where members actually live.
  */
 async function resolveUser(userId, userType, orgId) {
-  // $2 IS NULL disables the filter for a super admin and applies it otherwise;
-  // the same pattern the rest of the codebase uses for tenant scoping.
+  // Always filtered to the caller's organization: a code from another studio
+  // resolves to nobody.
   if (userType === 'client') {
     const { rows } = await pool.query(
       `SELECT id, name, status, photo_url, client_id AS member_code, client_id,
               pt_end_date, package_type
          FROM pt_clients
         WHERE id = $1 AND deleted_at IS NULL
-          AND ($2::uuid IS NULL OR organization_id = $2)
+          AND organization_id = $2
         LIMIT 1`,
       [userId, orgId]
     );
@@ -162,18 +161,26 @@ async function resolveUser(userId, userType, orgId) {
   if (userType === 'trainer') {
     const { rows } = await pool.query(
       `SELECT id, name, email, mobile FROM trainers
-        WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2) LIMIT 1`,
+        WHERE id = $1 AND organization_id = $2 LIMIT 1`,
       [userId, orgId]
     );
     return rows[0] ? { ...rows[0], status: 'active', _type: 'trainer' } : null;
   }
-  // staff / user
-  const { rows } = await pool.query(
-    `SELECT id, name, email, role FROM users
-      WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2) LIMIT 1`,
-    [userId, orgId]
-  );
-  return rows[0] ? { ...rows[0], status: 'active', _type: userType } : null;
+  // A QR names a client or the studio's trainer profile, nothing else. The
+  // 'staff' and 'user' identities went with the staff roles.
+  return null;
+}
+
+/**
+ * The QR identity of the signed-in account: a member is their client record,
+ * the trainer is their trainer profile. Anything else has no identity to
+ * check in as. (member_id pointed at the dropped legacy `clients` table and
+ * is no longer consulted.)
+ */
+function selfIdentity(u) {
+  if (u.role === 'member' && u.pt_client_id) return { userId: u.pt_client_id, userType: 'client' };
+  if (u.role === 'trainer' && u.trainer_id) return { userId: u.trainer_id, userType: 'trainer' };
+  return null;
 }
 
 function membershipStatus(user) {
@@ -202,7 +209,7 @@ function membershipStatus(user) {
  * than trusting the join.
  */
 async function markAttendance(userId, userType, userName, method, deviceInfo, location, orgId) {
-  const refType = userType === 'client' ? 'client' : userType === 'trainer' ? 'trainer' : 'staff';
+  const refType = userType === 'trainer' ? 'trainer' : 'client';
   const date = new Date().toISOString().slice(0, 10);
 
   const { rows } = await pool.query(
@@ -216,6 +223,10 @@ async function markAttendance(userId, userType, userName, method, deviceInfo, lo
                                 ELSE attendance_logs.method END,
            notes         = EXCLUDED.notes,
            organization_id = COALESCE(attendance_logs.organization_id, EXCLUDED.organization_id)
+     -- The conflict key has no organization in it; never touch another
+     -- studio's row.
+     WHERE attendance_logs.organization_id IS NULL
+        OR attendance_logs.organization_id = EXCLUDED.organization_id
      RETURNING id, check_in_time`,
     [userId, refType, userName, date, method,
      `${method.toUpperCase()} check-in`, userId, deviceInfo || null, location || null, orgId]
@@ -227,18 +238,9 @@ async function markAttendance(userId, userType, userName, method, deviceInfo, lo
 // Generate QR for the currently authenticated user.
 router.get('/generate', auth, qrLimiter, async (req, res) => {
   try {
-    const u = req.user;
-    let userId = u.id;
-    let userType = 'user';
-
-    // Map auth role to QR user type
-    // PT clients use pt_client_id; gym members use member_id
-    if (u.pt_client_id) { userId = u.pt_client_id; userType = 'client'; }
-    else if (u.member_id) { userId = u.member_id; userType = 'client'; }
-    else if (u.trainer_id) { userId = u.trainer_id; userType = 'trainer'; }
-    else if (['trainer', 'super_admin', 'admin', 'manager', 'staff', 'reception', 'receptionist'].includes(u.role)) {
-      userType = 'trainer';
-    }
+    const identity = selfIdentity(req.user);
+    if (!identity) return res.status(400).json({ error: 'This account has no check-in identity' });
+    const { userId, userType } = identity;
 
     const dynamic = req.query.dynamic === 'true';
     const dataUrl = await generateQrDataUrl(userId, userType, dynamic);
@@ -252,24 +254,16 @@ router.get('/generate', auth, qrLimiter, async (req, res) => {
 });
 
 // ── GET /api/qr/generate/:type/:id ───────────────────────────────────────────
-// Generate QR for any user (admin or trainer for their clients).
-router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
+// Generate the QR for one of the studio's clients (or its trainer profile).
+router.get('/generate/:type/:id', auth, requireTrainer, qrLimiter, async (req, res) => {
   try {
     const { type, id } = req.params;
-    const allowed = ['client', 'trainer', 'staff', 'user'];
-    if (!allowed.includes(type)) return res.status(400).json({ error: 'Invalid user type' });
+    if (type !== 'client' && type !== 'trainer') return res.status(400).json({ error: 'Invalid user type' });
 
-    // RBAC
-    const isAdmin = ['trainer', 'admin', 'manager', 'owner', 'super_admin'].includes(req.user.role);
-    const isTrainer = req.user.role === 'trainer';
-    if (!isAdmin && !isTrainer) return res.status(403).json({ error: 'Not authorized' });
-
-    if (type === 'client') {
-      const { rows } = await pool.query(
-        `SELECT 1 FROM pt_clients WHERE id = $1 LIMIT 1`,
-        [id]
-      );
-      if (!rows[0]) return res.status(404).json({ error: 'Client not found' });
+    // Only for someone in the caller's own studio: a signed code for another
+    // studio's client is not something this studio may mint.
+    if (!await resolveUser(id, type, orgIdOf(req))) {
+      return res.status(404).json({ error: type === 'client' ? 'Client not found' : 'Not found' });
     }
 
     const dynamic = req.query.dynamic === 'true';
@@ -285,7 +279,7 @@ router.get('/generate/:type/:id', auth, qrLimiter, async (req, res) => {
 
 // ── POST /api/qr/scan ─────────────────────────────────────────────────────────
 // Validate signed QR payload and mark attendance. Called by scanner.
-// Auth required (reception, kiosk, trainer, admin) OR kiosk token.
+// Auth required (the studio trainer) OR a kiosk token.
 const scanLimiter = rateLimit({
   store: makeStore('qrscan'),
   passOnStoreError: true,
@@ -295,10 +289,9 @@ const scanLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// AUD-004: staff only. A signed QR marks whoever it names present, so this is
-// the scanner's endpoint — reception, a kiosk, a trainer or an admin — never
-// the person being scanned.
-router.post('/scan', auth, requireStaff, scanLimiter, async (req, res) => {
+// AUD-004: the trainer only. A signed QR marks whoever it names present, so
+// this is the scanner's endpoint — never the person being scanned.
+router.post('/scan', auth, requireTrainer, scanLimiter, async (req, res) => {
   try {
     const { payload, device_info, location } = req.body;
     if (!payload) return res.status(400).json({ error: 'QR payload required' });
@@ -321,12 +314,12 @@ router.post('/scan', auth, requireStaff, scanLimiter, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found', success: false });
 
     // Duplicate scan prevention: check if already checked in today within 5 minutes
-    const refType = userType === 'client' ? 'client' : userType === 'trainer' ? 'trainer' : 'staff';
+    const refType = userType === 'trainer' ? 'trainer' : 'client';
     const { rows: recent } = await pool.query(
       `SELECT id, check_in_time FROM attendance_logs
        WHERE ref_id = $1 AND ref_type = $2 AND date = CURRENT_DATE
          AND check_in_time > NOW() - INTERVAL '5 minutes'
-         AND ($3::uuid IS NULL OR organization_id = $3)
+         AND organization_id = $3
        LIMIT 1`,
       [userId, refType, orgId]
     );
@@ -386,21 +379,18 @@ router.post('/scan', auth, requireStaff, scanLimiter, async (req, res) => {
 // Marks check-out time for the current user's today attendance record.
 router.post('/checkout', auth, async (req, res) => {
   try {
-    const u = req.user;
-    let userId = u.id;
-    let refType = 'staff';
-
-    if (u.pt_client_id) { userId = u.pt_client_id; refType = 'client'; }
-    else if (u.member_id) { userId = u.member_id; refType = 'client'; }
-    else if (u.trainer_id) { userId = u.trainer_id; refType = 'trainer'; }
+    const identity = selfIdentity(req.user);
+    if (!identity) return res.json({ success: false, message: 'No active check-in found for today' });
+    const { userId, userType: refType } = identity;
 
     const { rows } = await pool.query(
       `UPDATE attendance_logs
           SET check_out_time = NOW()
         WHERE ref_id = $1 AND ref_type = $2 AND date = CURRENT_DATE
           AND check_out_time IS NULL
+          AND organization_id = $3
         RETURNING id, check_in_time, check_out_time`,
-      [userId, refType]
+      [userId, refType, req.user.organization_id]
     );
 
     if (!rows[0]) return res.json({ success: false, message: 'No active check-in found for today' });
@@ -426,13 +416,13 @@ router.post('/checkout', auth, async (req, res) => {
 // Live attendance dashboard: currently inside, today's count, peak hours, breakdown.
 // AUD-004: staff only. Studio-wide aggregates — who is inside right now,
 // today's totals, peak hours — across every client the studio has.
-router.get('/dashboard', auth, requireStaff, async (req, res) => {
+router.get('/dashboard', auth, requireTrainer, async (req, res) => {
   try {
     // Tenant scope: every aggregate below is limited to the caller's org.
     const scope = tenantScope(req);
-    const oParams = scope.applyFilter ? [scope.orgId] : [];
-    const oc = scope.applyFilter ? ' AND organization_id = $1' : '';   // bare tables
-    const ocA = scope.applyFilter ? ' AND a.organization_id = $1' : ''; // aliased `a`
+    const oParams = [scope.orgId];
+    const oc = ' AND organization_id = $1';   // bare tables
+    const ocA = ' AND a.organization_id = $1'; // aliased `a`
 
     const [todayStats, currentlyInside, hourlyBreakdown, weeklyTrend, methodBreakdown] =
       await Promise.all([
@@ -534,13 +524,12 @@ router.get('/dashboard', auth, requireStaff, async (req, res) => {
 // Member's own attendance history with streak calculation.
 router.get('/my-history', auth, async (req, res) => {
   try {
-    const u = req.user;
-    let refId = u.id;
-    let refType = 'staff';
-
-    if (u.pt_client_id) { refId = u.pt_client_id; refType = 'client'; }
-    else if (u.member_id) { refId = u.member_id; refType = 'client'; }
-    else if (u.trainer_id) { refId = u.trainer_id; refType = 'trainer'; }
+    const identity = selfIdentity(req.user);
+    // An account with no check-in identity has no history. Answered through
+    // the same query shape with an id that cannot match, rather than a second
+    // response format.
+    const refId = identity ? identity.userId : '00000000-0000-0000-0000-000000000000';
+    const refType = identity ? identity.userType : 'client';
 
     const limit = Math.min(Math.max(parseInt(req.query.limit || '90', 10) || 90, 1), 365);
 
@@ -560,7 +549,7 @@ router.get('/my-history', auth, async (req, res) => {
     // while the attendance page counted 'present' alone, so one person had two
     // attendance rates depending on who was looking.
     const { history: rows, stats: agg, presentDates } =
-      await metricEngine.getSelfAttendanceHistory({ refId, refType, limit });
+      await metricEngine.getSelfAttendanceHistory({ refId, refType, orgId: req.user.organization_id, limit });
 
     let currentStreak = 0;
     let longestStreak = 0;
@@ -609,15 +598,14 @@ router.get('/my-history', auth, async (req, res) => {
 });
 
 // ── GET /api/qr/staff-report ──────────────────────────────────────────────────
-// Admin report of staff/trainer attendance for a given period.
-router.get('/staff-report', auth, async (req, res) => {
+// The studio's attendance report by person, for a given period. (The path name
+// predates the Trainer → Members model and is kept for API compatibility.)
+router.get('/staff-report', auth, requireTrainer, async (req, res) => {
   try {
-    const isAdmin = ['trainer', 'admin', 'manager', 'owner', 'super_admin'].includes(req.user.role);
-    if (!isAdmin) return res.status(403).json({ error: 'Admin only' });
 
     const from  = req.query.from || new Date().toISOString().slice(0, 7) + '-01';
     const to    = req.query.to   || new Date().toISOString().slice(0, 10);
-    const type  = req.query.type || 'all'; // client|trainer|staff|all
+    const type  = req.query.type || 'all'; // client|trainer|all
 
     const conds = ['date >= $1::date', 'date <= $2::date'];
     const params = [from, to];
@@ -626,7 +614,7 @@ router.get('/staff-report', auth, async (req, res) => {
       conds.push(`ref_type = $${params.length}`);
     }
     const scope = tenantScope(req);
-    if (scope.applyFilter) { params.push(scope.orgId); conds.push(`organization_id = $${params.length}`); }
+    params.push(scope.orgId); conds.push(`organization_id = $${params.length}`);
 
     const { rows } = await pool.query(
       `SELECT ref_id, ref_name, ref_type,

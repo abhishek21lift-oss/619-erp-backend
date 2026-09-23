@@ -30,10 +30,12 @@ const authSchemas = {
       // or the Command Center. Enforced in the login handler, AFTER the
       // password check — see routes/auth.js for why the order matters.
       //
-      // Optional and defaulting to 'staff' so existing callers (the mobile
-      // app on /api/v1/auth/login, any saved bookmark) keep working exactly
-      // as before. A member has never been able to sign in through those, so
-      // defaulting this way changes nothing for anyone who works today.
+      // Optional and defaulting to the trainer (studio) door so existing
+      // callers (the mobile app on /api/v1/auth/login, any saved bookmark)
+      // keep working exactly as before. 'staff' is the wire name that door
+      // had before the Trainer → Members model; installed Android builds
+      // still send it, so it is accepted here and normalised to 'trainer'.
+      // It names a door, not a role, and grants nothing.
       //
       // 'platform' was missing here when the Command Center's door shipped.
       // The handler understood it, the frontend sent it, the TypeScript type
@@ -46,23 +48,15 @@ const authSchemas = {
       // Anything added to this enum must be handled in routes/auth.js, and
       // anything handled there must appear here. auth.portal.test.js now posts
       // a real login for each value to keep the two in step.
-      portal: z.enum(['staff', 'member', 'platform']).optional(),
+      portal: z.enum(['trainer', 'staff', 'member', 'platform'])
+        .transform((p) => (p === 'staff' ? 'trainer' : p))
+        .optional(),
     }),
   },
   changePassword: {
     body: z.object({
       currentPassword: z.string().min(1, 'Current password is required'),
       newPassword: passwordSchema,
-    }),
-  },
-  createUser: {
-    body: z.object({
-      name: z.string().min(1, 'Name is required').max(255).transform(function(v) { return v.trim(); }),
-      email: emailSchema,
-      password: passwordSchema,
-      role: z.enum(['super_admin', 'trainer', 'member', 'admin', 'manager', 'reception', 'staff']).transform(r => (['admin', 'manager', 'reception', 'staff'].includes(r) ? 'trainer' : r)).default('trainer'),
-      trainer_id: z.string().optional().nullable(),
-      member_id: z.string().optional().nullable(),
     }),
   },
 };

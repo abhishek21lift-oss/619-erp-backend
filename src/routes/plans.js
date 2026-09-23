@@ -2,7 +2,7 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { planSchemas } = require('../lib/validation');
 const { orgWhere, orgIdOf } = require('../lib/tenant-db');
@@ -34,8 +34,8 @@ router.get('/', auth, async (req, res, next) => {
   }
 });
 
-// POST /api/plans  (admin only)
-router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res, next) => {
+// POST /api/plans  (the studio trainer)
+router.post('/', auth, requireTrainer, validate(planSchemas.create), async (req, res, next) => {
   try {
     const d = req.body;
 
@@ -92,8 +92,8 @@ router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res,
   }
 });
 
-// PUT /api/plans/:id  (admin only)
-router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, res, next) => {
+// PUT /api/plans/:id  (the studio trainer)
+router.put('/:id', auth, requireTrainer, validate(planSchemas.update), async (req, res, next) => {
   try {
     const d = req.body;
     const exParams = [req.params.id];
@@ -162,8 +162,8 @@ router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, re
   }
 });
 
-// DELETE /api/plans/:id  (admin only) — soft delete
-router.delete('/:id', auth, adminOnly, async (req, res, next) => {
+// DELETE /api/plans/:id  (the studio trainer) — soft delete
+router.delete('/:id', auth, requireTrainer, async (req, res, next) => {
   try {
     const params = [req.params.id];
     const org = orgWhere(req, params);

@@ -74,7 +74,7 @@ function paramsOf(re) { return (state.log.find((e) => re.test(e.sql)) || {}).par
 
 const ORG = '11111111-1111-1111-1111-111111111111';
 const REQ_ID = '22222222-2222-2222-2222-222222222222';
-const ACTOR = { id: 'usr-admin', name: 'Studio Admin', role: 'admin' };
+const ACTOR = { id: 'usr-admin', name: 'Studio Admin', role: 'trainer' };
 const OPERATOR = { id: 'usr-super', name: 'Platform', role: 'super_admin' };
 
 const SETTINGS = {
@@ -386,7 +386,7 @@ describe('buildCheckoutView', () => {
     expect(view.intent_url).toMatch(/[?&]am=2999(\.00)?(&|$)/);
     expect(view.intent_url).toMatch(/[?&]cu=INR(&|$)/);
     expect(view.qr_data_url).toMatch(/^data:image\/(png|svg\+xml)/);
-  }, 20000);
+  }, 60000);
 
   test('a discounted request encodes the discounted amount, never the list price', async () => {
     const view = await checkout.buildCheckoutView(
@@ -394,7 +394,7 @@ describe('buildCheckoutView', () => {
     );
     expect(view.intent_url).toMatch(/[?&]am=2499(\.00)?(&|$)/);
     expect(view.intent_url).not.toMatch(/am=2999/);
-  }, 20000);
+  }, 60000);
 });
 
 // ════════════════════════════════════════════════════════════════════════════

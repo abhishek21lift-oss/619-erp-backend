@@ -146,18 +146,6 @@ async function processAutomationJob(job) {
     return { status: 'skipped', reason: 'automation_disabled' };
   }
 
-  const recipient = await repo.clientRecipient(orgId, row.recipient_id);
-  if (recipient && recipient.trainer_id) {
-    const granted = await repo.trainerIsGranted(orgId, recipient.trainer_id);
-    if (!granted) {
-      // Revoked while the message waited. Recorded as failed with the reason
-      // rather than silently dropped, so the studio can see that their change
-      // took effect on messages already in flight.
-      await repo.markFailed(orgId, logId, { reason: 'trainer_not_permitted' });
-      return { status: 'skipped', reason: 'trainer_not_permitted' };
-    }
-  }
-
   const result = await transport.send({
     orgId,
     to: row.recipient_phone,

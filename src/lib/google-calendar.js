@@ -184,7 +184,7 @@ async function createBookingEvent(userId, bookingId, organizationName) {
        FROM bookings b
        JOIN class_sessions cs  ON cs.id = b.session_id
        JOIN class_templates ct ON ct.id = cs.template_id
-       LEFT JOIN trainers t    ON t.id  = cs.trainer_id
+       LEFT JOIN trainers t    ON t.id  = cs.trainer_id AND t.organization_id = cs.organization_id
        LEFT JOIN branches br   ON br.id = cs.branch_id
        WHERE b.id = $1`,
       [bookingId]

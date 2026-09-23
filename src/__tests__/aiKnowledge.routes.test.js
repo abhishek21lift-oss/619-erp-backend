@@ -3,7 +3,7 @@
 // ingestion for a document stuck in `processing` (or failed).
 //
 // The route must:
-//   * accept only admin/manager (requireRole — the real middleware is used)
+//   * accept only the studio trainer (requireTrainer — the real middleware is used)
 //   * verify the document exists AND belongs to the caller's org
 //   * enqueue BullMQ job name=reindex_document data={ documentId }
 //   * NOT ingest inline while Redis is available (asynchronous via the queue)
@@ -31,7 +31,7 @@ jest.mock('../lib/ai/knowledgeBase', () => ({
   ingestDocument: jest.fn().mockResolvedValue(undefined),
 }));
 
-let mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+let mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 
 const request = require('supertest');
 const express = require('express');
@@ -50,7 +50,7 @@ beforeEach(() => {
   pool.query.mockReset();
   aiQueue.add.mockClear(); // clears calls but keeps the mockResolvedValue
   ingestDocument.mockReset();
-  mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+  mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 });
 
 describe('POST /api/ai/knowledge/:id/reindex', () => {
@@ -84,8 +84,8 @@ describe('POST /api/ai/knowledge/:id/reindex', () => {
     expect(ingestDocument).not.toHaveBeenCalled();
   });
 
-  test('an authorized manager can reindex a document in their own org', async () => {
-    mockUser = { id: 'm1', role: 'manager', organization_id: 'org-2' };
+  test("another studio's trainer can reindex a document in THEIR own org", async () => {
+    mockUser = { id: 'm1', role: 'trainer', organization_id: 'org-2' };
     pool.query.mockImplementation((sql) => {
       if (sql.includes('ai_documents WHERE id')) return Promise.resolve({ rows: [{ id: 'doc-2' }] });
       if (sql.includes('UPDATE ai_documents')) return Promise.resolve({ rows: [], rowCount: 1 });
@@ -134,7 +134,7 @@ describe('POST /api/ai/knowledge/:id/reindex', () => {
   });
 
   test('an unauthorized role is rejected before any query runs', async () => {
-    mockUser = { id: 't1', role: 'trainer', organization_id: 'org-1' };
+    mockUser = { id: 't1', role: 'member', organization_id: 'org-1', pt_client_id: 'c-1' };
 
     const res = await request(app).post('/api/ai/knowledge/doc-1/reindex');
 
@@ -144,7 +144,7 @@ describe('POST /api/ai/knowledge/:id/reindex', () => {
     expect(aiQueue.add).not.toHaveBeenCalled();
   });
 
-  test('a super admin without a target org gets no bypass — the route is admin/manager only', async () => {
+  test('a super admin gets no bypass — the route is the studio trainer\'s only', async () => {
     mockUser = { id: 'sa-1', role: 'super_admin', organization_id: null };
 
     const res = await request(app).post('/api/ai/knowledge/doc-1/reindex');

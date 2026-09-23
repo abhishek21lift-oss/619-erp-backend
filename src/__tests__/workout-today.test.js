@@ -17,10 +17,9 @@ const request = require('supertest');
 jest.mock('../db/pool', () => ({ query: jest.fn(), connect: jest.fn() }));
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = global.__mockUser; next(); },
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
-jest.mock('../middleware/rbac', () => ({ requireRole: () => (_req, _res, next) => next() }));
+jest.mock('../middleware/rbac', () => ({ requireTrainer: (_req, _res, next) => next(),}));
 jest.mock('../lib/activityLog', () => ({ logActivity: jest.fn() }));
 
 const pool = require('../db/pool');
@@ -38,7 +37,7 @@ const DOW_ROW = { rows: [{ dow: 4 }] };
 
 beforeEach(() => {
   jest.clearAllMocks();
-  global.__mockUser = { id: 'u-1', role: 'admin', organization_id: 'org-1' };
+  global.__mockUser = { id: 'u-1', role: 'trainer', organization_id: 'org-1' };
 });
 
 describe('GET /workout-log/today', () => {
@@ -199,21 +198,25 @@ describe('GET /workout-log/today', () => {
     expect(params).toContain('org-1');
   });
 
-  it('limits a plain trainer to their own clients', async () => {
+  it('gives the trainer the whole studio, even with a coach profile attached', async () => {
+    // The per-coach narrowing went with the assistant-coach role: the trainer
+    // owns the studio. The organization stays the boundary.
     global.__mockUser = { id: 'u-2', role: 'trainer', organization_id: 'org-1', trainer_id: 't-9' };
     pool.query.mockResolvedValueOnce(DOW_ROW).mockResolvedValueOnce({ rows: [] });
 
     await request(app()).get('/api/pt-os/workout-log/today').expect(200);
 
     const [sql, params] = pool.query.mock.calls[1];
-    expect(sql).toMatch(/c\.trainer_id = \$5/);
-    expect(params).toContain('t-9');
+    expect(sql).not.toMatch(/c\.trainer_id =/);
+    expect(params).not.toContain('t-9');
+    expect(sql).toMatch(/c\.organization_id = \$4/);
+    expect(params).toContain('org-1');
   });
 
-  it('does NOT restrict by trainer for an admin', async () => {
-    pool.query.mockResolvedValueOnce(DOW_ROW).mockResolvedValueOnce({ rows: [] });
-    await request(app()).get('/api/pt-os/workout-log/today').expect(200);
-    expect(pool.query.mock.calls[1][0]).not.toMatch(/c\.trainer_id =/);
+  it('refuses a member', async () => {
+    global.__mockUser = { id: 'u-3', role: 'member', organization_id: 'org-1', pt_client_id: 'ptc-1' };
+    await request(app()).get('/api/pt-os/workout-log/today').expect(403);
+    expect(pool.query).not.toHaveBeenCalled();
   });
 
   it('rejects a malformed date instead of interpolating it', async () => {

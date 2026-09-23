@@ -29,7 +29,7 @@ jest.mock('../db/pool', () => ({ query: jest.fn() }));
 let mockCurrentUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockCurrentUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const request = require('supertest');
@@ -78,7 +78,7 @@ function rowInState(status) {
 beforeEach(() => {
   pool.query.mockReset();
   calls = [];
-  mockCurrentUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+  mockCurrentUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
   responses = {};
 
   global.fetch = jest.fn(async (url, init) => {

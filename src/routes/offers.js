@@ -10,13 +10,13 @@
 // below now mean "you already have that code" rather than "somebody does".
 const express = require('express');
 const pool = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { orgWhere, orgIdOf, tenantScope } = require('../lib/tenant-db');
 const { validateOffer } = require('../lib/offerRules');
 const { updateOffer } = require('../modules/offers/offers.service');
 
 const router = express.Router();
-router.use(auth, adminOnly);
+router.use(auth, requireTrainer);
 
 /**
  * Shape a rule failure as a validation error.

@@ -15,15 +15,19 @@
 const router = require('express').Router();
 const pool = require('../db/pool');
 const support = require('../lib/support');
-const { auth } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 // Declared by the router itself, so mounting it can never leave it open.
-router.use(auth);
 
-/** A platform operator has no tickets of their own; they use the Control Centre. */
+/** Support tickets belong to a studio; an account with none has no tickets. */
 function tenantOrg(req, res) {
   const orgId = req.user?.organization_id;
-  if (!orgId || req.user.role === 'super_admin') {
+  if (!orgId) {
     res.status(403).json({ error: { code: 'TENANT_ONLY', message: 'Support tickets belong to a studio.' } });
     return null;
   }
