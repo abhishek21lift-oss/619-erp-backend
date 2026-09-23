@@ -9,10 +9,10 @@ const { sendAdminResetOtp } = require('../lib/email');
 // SECURITY (audit finding C-1): this router performs platform-wide, unscoped
 // destructive operations (DELETE/DROP with no organization_id filter, across
 // every tenant). It must only ever be reachable by the platform super admin.
-// That is enforced at the mount point in server.js: `auth, requireSuperAdmin,
-// requireSuperAdminMfa`. Do NOT re-add a per-route `adminOnly` check here —
-// `adminOnly` matches role==='admin', the ordinary tenant Studio Owner role,
-// which is exactly the access this file must never grant.
+// That is enforced at the mount point in server.js by PLATFORM_GUARD (auth,
+// requireSuperAdmin, requireSuperAdminMfa, requirePlatformOwner). Do NOT add a
+// per-route tenant guard such as `requireTrainer` here — it admits the studio
+// owner, which is exactly the access this file must never grant.
 
 // SECURITY (audit finding P1-5): OTP brute-force protection.
 // After MAX_OTP_ATTEMPTS failed attempts, lock the intent for OTP_LOCK_MS.

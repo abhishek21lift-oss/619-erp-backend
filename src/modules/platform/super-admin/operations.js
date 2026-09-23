@@ -18,7 +18,7 @@ router.get('/overview', async (req, res, next) => {
     const { rows: studios } = await pool.query(`
       SELECT o.id, o.name, o.slug, o.status, o.logo_url, o.created_at,
         (SELECT count(*) FROM users u
-           WHERE u.organization_id = o.id AND u.deleted_at IS NULL AND u.role = 'admin')::int              AS admin_count,
+           WHERE u.organization_id = o.id AND u.deleted_at IS NULL AND u.role = 'trainer')::int            AS trainer_count,
         (SELECT max(u.last_login) FROM users u
            WHERE u.organization_id = o.id AND u.deleted_at IS NULL)                                        AS last_login,
         (SELECT count(*) FROM pt_clients c
@@ -125,7 +125,7 @@ router.post('/users/:id/force-logout', async (req, res, next) => {
 });
 
 // ── POST /users/:id/reset-mfa ────────────────────────────────────────────────
-// Clears the enrolled authenticator so a locked-out admin can re-enrol. This is
+// Clears the enrolled authenticator so a locked-out account can re-enrol. This is
 // a support action with real weight — it removes a security factor — so it is
 // audited with the previous state, and sessions are revoked alongside it: an
 // existing session would otherwise outlive the factor that authorised it.

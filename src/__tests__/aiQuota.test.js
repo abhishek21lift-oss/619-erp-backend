@@ -94,7 +94,7 @@ describe('the guard', () => {
   const run = async (opts) => {
     script(opts);
     let status = null; let body = null; let nexted = false;
-    const req = { user: { organization_id: 'org-1', role: opts.role || 'admin' } };
+    const req = { user: { organization_id: opts.orgId === undefined ? 'org-1' : opts.orgId, role: opts.role || 'trainer' } };
     const res = { status(c) { status = c; return this; }, json(b) { body = b; return this; } };
     await aiQuota.requireAiQuota()(req, res, () => { nexted = true; });
     return { status, body, nexted };
@@ -130,10 +130,12 @@ describe('the guard', () => {
     expect(r.nexted).toBe(true);
   });
 
-  it('never quota-limits a platform operator', async () => {
+  it('never quota-limits an account with no studio (there is no studio quota to spend)', async () => {
+    // The platform operator is such an account — and auth.js refuses it on
+    // every tenant route anyway, so this guard never sees one in practice.
     const r = await run({
       settings: { default_monthly_tokens: 1, enforcement_enabled: true, warn_at_pct: 80 },
-      usage: { tokens: 9999, requests: 1 }, role: 'super_admin',
+      usage: { tokens: 9999, requests: 1 }, role: 'super_admin', orgId: null,
     });
     expect(r.nexted).toBe(true);
   });
@@ -144,7 +146,7 @@ describe('the guard', () => {
     mockQuery.mockRejectedValue(new Error('relation "ai_platform_settings" does not exist'));
     let nexted = false;
     await aiQuota.requireAiQuota()(
-      { user: { organization_id: 'org-1', role: 'admin' } },
+      { user: { organization_id: 'org-1', role: 'trainer' } },
       { status() { return this; }, json() { return this; } },
       () => { nexted = true; },
     );

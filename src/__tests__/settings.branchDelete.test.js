@@ -36,16 +36,14 @@ jest.mock('../db/pool', () => ({
 
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
-let mockUser = { id: 'admin-1', role: 'admin', organization_id: 'org-1' };
+let mockUser = { id: 'admin-1', role: 'trainer', organization_id: 'org-1' };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
   adminOnly: (req, res, next) => (
     req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Forbidden' })
   ),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 
@@ -65,7 +63,7 @@ beforeEach(() => {
   mockQueries.length = 0;
   mockBranchRows = [{ key: BRANCH_KEY }];
   mockMemberCount = 0;
-  mockUser = { id: 'admin-1', role: 'admin', organization_id: 'org-1' };
+  mockUser = { id: 'admin-1', role: 'trainer', organization_id: 'org-1' };
 });
 
 describe('DELETE /settings/branches/:id', () => {

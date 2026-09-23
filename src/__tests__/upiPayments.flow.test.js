@@ -82,7 +82,7 @@ function anOrder(overrides = {}) {
   };
 }
 
-const ACTOR = { id: 'usr-admin', name: 'Admin', role: 'admin' };
+const ACTOR = { id: 'usr-admin', name: 'Admin', role: 'trainer' };
 
 beforeEach(() => {
   state.handlers = [];

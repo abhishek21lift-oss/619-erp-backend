@@ -2,7 +2,7 @@
 //
 // ── Why this router is not blanket-gated ────────────────────────────────────
 //
-// The Phase 1 write-up recommended putting `requireStaff` on the /api/qr mount.
+// The Phase 1 write-up recommended putting `requireTrainer` on the /api/qr mount.
 // Reading the handlers shows that would be wrong and would cause a client-facing
 // outage. Three of the seven routes derive their subject from `req.user` and are
 // self-scoped by construction:
@@ -27,7 +27,7 @@
 // So this file tests two things that pull in opposite directions: that the two
 // staff routes are closed, and that the three client routes stay open. The
 // second half is regression protection — it is what stops a future "just add
-// requireStaff to the mount" from shipping.
+// requireTrainer to the mount" from shipping.
 
 'use strict';
 
@@ -64,7 +64,7 @@ jest.mock('express-rate-limit', () => () => (_req, _res, next) => next());
 let mockUser;
 jest.mock('../../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../../middleware/rbac').requireTrainer(...a),
 }));
 
 const express = require('express');
@@ -89,14 +89,16 @@ const CLIENT_B = {
   id: 'usr-client-b', role: 'member', organization_id: ORG_B,
   pt_client_id: 'ptc-b', member_id: 'mem-b', trainer_id: null,
 };
-const ADMIN_A   = { id: 'usr-admin-a', role: 'admin', organization_id: ORG_A, trainer_id: null };
-const ADMIN_B   = { id: 'usr-admin-b', role: 'admin', organization_id: ORG_B, trainer_id: null };
+// The studio's trainer without a coach profile, and with one. Both own the
+// studio; the profile only matters where a row points at `trainers`.
+const OWNER_A   = { id: 'usr-owner-a', role: 'trainer', organization_id: ORG_A, trainer_id: null };
+const ADMIN_B   = { id: 'usr-admin-b', role: 'trainer', organization_id: ORG_B, trainer_id: null };
 const TRAINER_A = { id: 'usr-trainer-a', role: 'trainer', organization_id: ORG_A, trainer_id: 'trn-a' };
 
 beforeEach(() => {
   mockLog.length = 0;
   mockRows = [];
-  mockUser = ADMIN_A;
+  mockUser = OWNER_A;
 });
 
 // ── B. The two studio-wide routes must be staff-only ────────────────────────
@@ -127,8 +129,8 @@ describe('B. staff-only QR routes refuse a client', () => {
   });
 
   test.each([
-    ['admin',   () => ADMIN_A],
-    ['trainer', () => TRAINER_A],
+    ['a trainer with no coach profile', () => OWNER_A],
+    ['a trainer with one',              () => TRAINER_A],
   ])('%s is allowed through the role gate on /dashboard', async (_r, who) => {
     mockUser = who();
     const res = await request(app()).get('/api/qr/dashboard');
@@ -140,7 +142,7 @@ describe('B. staff-only QR routes refuse a client', () => {
   });
 
   test('the dashboard is scoped to the caller organization', async () => {
-    mockUser = ADMIN_A;
+    mockUser = OWNER_A;
     await request(app()).get('/api/qr/dashboard');
     const scoped = mockLog.filter((q) => /organization_id/i.test(q.sql));
     expect(scoped.length).toBeGreaterThan(0);
@@ -148,7 +150,7 @@ describe('B. staff-only QR routes refuse a client', () => {
   });
 
   test('x-org-id does not move a staff caller to another studio', async () => {
-    mockUser = ADMIN_A;
+    mockUser = OWNER_A;
     await request(app()).get('/api/qr/dashboard').set('x-org-id', ORG_B);
     const scoped = mockLog.filter((q) => /organization_id/i.test(q.sql));
     for (const q of scoped) {
@@ -169,7 +171,9 @@ describe('C. client-facing QR routes stay open and stay self-scoped', () => {
     // Subject comes from req.user (pt_client_id), never from the request.
     expect(res.body.userId).toBe('ptc-a');
     expect(res.body.userType).toBe('client');
-  });
+    // Encoding a real PNG takes ~3s in jest's VM, so the 5s default becomes a
+    // timing assertion nobody wrote. The budget is explicit instead.
+  }, 30000);
 
   test('GET /generate ignores any id the caller tries to supply', async () => {
     mockUser = CLIENT_A;
@@ -179,7 +183,7 @@ describe('C. client-facing QR routes stay open and stay self-scoped', () => {
     expect(res.status).toBe(200);
     // Still their own — the handler reads req.user and nothing else.
     expect(res.body.userId).toBe('ptc-a');
-  });
+  }, 30000);
 
   test('GET /my-history works for a client and queries only their own rows', async () => {
     mockUser = CLIENT_A;
@@ -231,10 +235,22 @@ describe('D. routes that already carry their own RBAC are unchanged', () => {
     expect(res.status).toBe(403);
   });
 
-  test('GET /generate/:type/:id refuses a trainer a client that is not theirs', async () => {
+  test('GET /generate/:type/:id will not mint a code for another studio\'s client', async () => {
+    // The lookup is scoped to the caller's organization; a client of another
+    // studio is simply not found. 404, not 403 — the id's existence elsewhere
+    // is not confirmed.
     mockUser = TRAINER_A;
-    mockRows = []; // the ownership lookup finds no assignment
+    mockRows = [];
     const res = await request(app()).get('/api/qr/generate/client/ptc-not-mine');
+    expect(res.status).toBe(404);
+    const lookup = mockLog.find((x) => /FROM pt_clients/i.test(x.sql));
+    expect(lookup.sql).toMatch(/organization_id = \$2/);
+    expect(lookup.params).toContain(ORG_A);
+  });
+
+  test('GET /generate/:type/:id refuses a client outright', async () => {
+    mockUser = CLIENT_A;
+    const res = await request(app()).get('/api/qr/generate/client/ptc-a');
     expect(res.status).toBe(403);
   });
 
@@ -244,13 +260,13 @@ describe('D. routes that already carry their own RBAC are unchanged', () => {
     expect(res.status).toBe(403);
   });
 
-  test('GET /staff-report refuses a trainer (admin only)', async () => {
+  test('GET /staff-report is the studio trainer\'s report', async () => {
     mockUser = TRAINER_A;
     const res = await request(app()).get('/api/qr/staff-report');
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
   });
 
-  test('GET /staff-report is scoped for an admin', async () => {
+  test('GET /staff-report is scoped to the caller studio', async () => {
     mockUser = ADMIN_B;
     await request(app()).get('/api/qr/staff-report');
     const q = mockLog.find((x) => /FROM attendance_logs/i.test(x.sql));

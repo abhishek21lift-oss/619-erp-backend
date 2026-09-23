@@ -32,12 +32,10 @@ jest.mock('../db/pool', () => ({
   }),
 }));
 
-let mockCurrentUser = { id: 'usr-1', role: 'admin', organization_id: ORG_A, trainer_id: null };
+let mockCurrentUser = { id: 'usr-1', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockCurrentUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const express = require('express');
@@ -55,7 +53,7 @@ const touching = (table) =>
 beforeEach(() => {
   mockQueries.length = 0;
   mockRows = [];
-  mockCurrentUser = { id: 'usr-1', role: 'admin', organization_id: ORG_A, trainer_id: null };
+  mockCurrentUser = { id: 'usr-1', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 });
 
 describe('GET /api/diet/templates is bounded by the caller studio', () => {
@@ -99,15 +97,17 @@ describe('GET /api/diet/templates is bounded by the caller studio', () => {
     expect(q.sql).toMatch(/LIMIT \$3 OFFSET \$4/i);
   });
 
-  it('a platform super admin with no target org reads unscoped', async () => {
-    // The one caller for whom no predicate is correct. If this starts being
-    // filtered, the operator console silently shows nothing.
-    mockCurrentUser = { id: 'usr-0', role: 'super_admin', organization_id: null, trainer_id: null };
+  it('an account with no organization gets shared templates only — never an unscoped read', async () => {
+    // There used to be an unfiltered branch for a platform super admin. The
+    // operator never reaches a tenant route now, and tenantScope() has no
+    // unfiltered case: an org-less caller binds NULL, which matches only the
+    // shared (organization_id IS NULL) library, never another studio's rows.
+    mockCurrentUser = { id: 'usr-0', role: 'trainer', organization_id: null, trainer_id: null };
     await request(app).get('/api/diet/templates').expect(200);
 
     const [q] = touching('diet_templates');
-    expect(q.sql).not.toMatch(/organization_id/i);
-    expect(q.params).toEqual([200, 0]);
+    expect(q.sql).toMatch(/dt\.organization_id IS NULL OR dt\.organization_id = \$1/i);
+    expect(q.params[0]).toBeNull();
   });
 });
 
@@ -141,14 +141,13 @@ describe('POST /api/diet/assign is bounded by the caller studio', () => {
     expect(res.status).not.toBe(403);
   });
 
-  it('a platform super admin with no target org assigns unguarded', async () => {
+  it('the platform operator cannot assign at all', async () => {
+    // It used to assign "unguarded". Assigning a diet is the studio trainer's
+    // act; requireTrainer refuses super_admin before any query runs.
     mockCurrentUser = { id: 'usr-0', role: 'super_admin', organization_id: null, trainer_id: null };
     mockRows = [{ id: 'as-1' }];
-    await request(app).post('/api/diet/assign').send(body).expect(201);
-
-    const ins = touching('diet_assignments')[0];
-    expect(ins.sql).toMatch(/WHERE EXISTS/i);
-    expect(ins.sql).not.toMatch(/dt\.organization_id/i);
+    await request(app).post('/api/diet/assign').send(body).expect(403);
+    expect(touching('diet_assignments')).toHaveLength(0);
   });
 });
 

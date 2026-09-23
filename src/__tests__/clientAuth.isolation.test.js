@@ -18,7 +18,7 @@ process.env.JWT_SECRET = 'test-secret-at-least-32-characters-long!!';
 jest.mock('../db/pool', () => ({ query: jest.fn(), connect: jest.fn() }));
 
 const pool = require('../db/pool');
-const { requireStaff, requireClient, STAFF_ROLES } = require('../middleware/rbac');
+const { requireTrainer, requireClient, ROLES, ALL_ROLES } = require('../middleware/rbac');
 
 /** An app that injects a given req.user, then applies the gate under test. */
 function appWith(user, gate, handler = (req, res) => res.json({ reached: true })) {
@@ -34,12 +34,12 @@ const CLIENT_USER = {
   organization_id: 'org-a', pt_client_id: 'ptc-1', trainer_id: 'trn-1',
 };
 
-describe('requireStaff — the back office', () => {
+describe('requireTrainer — the back office', () => {
   it('refuses a client account', async () => {
     // The whole point. Before this gate, GET /api/pt-os/clients answered any
     // authenticated caller — which was survivable only while no account held
     // the `member` role. Activation creates those accounts by the hundred.
-    const res = await request(appWith(CLIENT_USER, requireStaff)).get('/probe');
+    const res = await request(appWith(CLIENT_USER, requireTrainer)).get('/probe');
     expect(res.status).toBe(403);
     expect(res.body.reached).toBeUndefined();
   });
@@ -49,14 +49,37 @@ describe('requireStaff — the back office', () => {
     // logged in and this is not for you". Collapsing them sends a client with
     // a valid session to the login page, where they log in again and land back
     // here in a loop.
-    const res = await request(appWith(undefined, requireStaff)).get('/probe');
+    const res = await request(appWith(undefined, requireTrainer)).get('/probe');
     expect(res.status).toBe(401);
   });
 
-  it('admits every staff role', async () => {
-    for (const role of STAFF_ROLES) {
-      const res = await request(appWith({ id: 'u', role }, requireStaff)).get('/probe');
-      expect([role, res.status]).toEqual([role, 200]);
+  it('admits the trainer of a studio, and only the trainer', async () => {
+    const ok = await request(appWith({ id: 'u', role: ROLES.TRAINER, organization_id: 'org-a' }, requireTrainer)).get('/probe');
+    expect(ok.status).toBe(200);
+    // Exactly three roles exist; of them, only the trainer runs a studio.
+    expect([...ALL_ROLES].sort()).toEqual(['member', 'super_admin', 'trainer']);
+  });
+
+  it('refuses a trainer with no studio — there would be no tenant to scope by', async () => {
+    const res = await request(appWith({ id: 'u', role: 'trainer', organization_id: null }, requireTrainer)).get('/probe');
+    expect(res.status).toBe(403);
+  });
+
+  it('refuses the platform operator: super_admin is not a studio role', async () => {
+    // It used to pass every studio gate. The operator reaches a studio only by
+    // impersonation, which loads the studio's own trainer as req.user.
+    const res = await request(appWith({ id: 'u', role: 'super_admin', organization_id: null }, requireTrainer)).get('/probe');
+    expect(res.status).toBe(403);
+  });
+
+  it('refuses every removed staff role instead of mapping it onto trainer', async () => {
+    // normalizeRole() used to turn these into 'trainer'. A stale row carrying
+    // one is refused — the database constraint (migration 208) makes such a
+    // row impossible, and this makes sure it could not be promoted if it
+    // existed.
+    for (const role of ['admin', 'manager', 'reception', 'receptionist', 'staff', 'owner']) {
+      const res = await request(appWith({ id: 'u', role, organization_id: 'org-a' }, requireTrainer)).get('/probe');
+      expect([role, res.status]).toEqual([role, 403]);
     }
   });
 
@@ -64,13 +87,13 @@ describe('requireStaff — the back office', () => {
     // The asymmetry that decides how this is written. A new role forgotten
     // here gets a visible 403; a new role forgotten in a deny-list-shaped
     // check gets the studio's whole client list, and nobody finds out.
-    const res = await request(appWith({ id: 'u', role: 'partner_api' }, requireStaff)).get('/probe');
+    const res = await request(appWith({ id: 'u', role: 'partner_api' }, requireTrainer)).get('/probe');
     expect(res.status).toBe(403);
   });
 
   it('does not treat `member` as staff under any casing or alias', async () => {
     for (const role of ['member', 'Member', 'MEMBER', 'client']) {
-      const res = await request(appWith({ id: 'u', role }, requireStaff)).get('/probe');
+      const res = await request(appWith({ id: 'u', role }, requireTrainer)).get('/probe');
       expect([role, res.status]).toEqual([role, 403]);
     }
   });
@@ -89,20 +112,20 @@ describe('requireClient — the client portal', () => {
     expect(res.status).toBe(403);
   });
 
-  it('refuses staff — including an admin', async () => {
+  it('refuses the trainer and the platform operator', async () => {
     // Not a courtesy check. Every query behind this gate scopes to
-    // req.user.pt_client_id, which is null for staff; letting an admin through
+    // req.user.pt_client_id, which is null for them; letting one through
     // would run `WHERE client_id IS NULL` and return whatever that matches.
-    for (const role of ['admin', 'trainer', 'super_admin']) {
+    for (const role of ['trainer', 'super_admin']) {
       const res = await request(appWith({ id: 'u', role, pt_client_id: null }, requireClient)).get('/probe');
       expect([role, res.status]).toEqual([role, 403]);
     }
   });
 
-  it('refuses an admin even if a pt_client_id is somehow set on their row', async () => {
-    // Role is checked as well as the link, so a stray column value on a staff
-    // account cannot turn into portal access.
-    const res = await request(appWith({ id: 'u', role: 'admin', pt_client_id: 'ptc-1' }, requireClient)).get('/probe');
+  it('refuses a trainer even if a pt_client_id is somehow set on their row', async () => {
+    // Role is checked as well as the link, so a stray column value on the
+    // trainer's account cannot turn into portal access.
+    const res = await request(appWith({ id: 'u', role: 'trainer', pt_client_id: 'ptc-1' }, requireClient)).get('/probe');
     expect(res.status).toBe(403);
   });
 });

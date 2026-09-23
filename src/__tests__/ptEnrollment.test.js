@@ -46,35 +46,36 @@ describe('payment method is a closed set', () => {
 });
 
 describe('the role boundary', () => {
-  /** The two allowlists in PATCH /clients/:id, trainer first. */
-  function allowlists() {
-    const block = src().match(/const allowed = isTrainer\s*\?\s*\[([\s\S]*?)\]\s*:\s*\[([\s\S]*?)\];/);
-    if (!block) throw new Error('allowlists not found');
-    // Strip line comments FIRST. A comma inside one ("Money-adjacent, so
-    // admin only") splits the comment in two and glues the quoted entry that
-    // follows onto the tail of a fragment, which then fails the startsWith
-    // test — so the field looks absent when it is right there in the list.
-    const parse = (t) => (t.replace(/\/\/[^\n]*/g, '').match(/'[^']+'/g) || [])
-      .map((x) => x.replace(/'/g, ''));
-    return { trainer: parse(block[1]), admin: parse(block[2]) };
+  /** The one allowlist in PATCH /clients/:id. */
+  function allowlist() {
+    const block = src().match(/router\.patch\('\/clients\/:id'[\s\S]*?const allowed = \[([\s\S]*?)\];/);
+    if (!block) throw new Error('allowlist not found');
+    // Strip line comments first, so a comma inside one cannot split an entry.
+    return (block[1].replace(/\/\/[^\n]*/g, '').match(/'[^']+'/g) || []).map((x) => x.replace(/'/g, ''));
   }
 
-  test('a trainer cannot set the payment method', () => {
-    // It is money-adjacent, and PATCH drops out-of-allowlist fields silently.
-    const { trainer, admin } = allowlists();
-    expect(trainer).not.toContain('payment_method');
-    expect(admin).toContain('payment_method');
+  test('there is one allowlist, not a narrower one for a "trainer" role', () => {
+    // There used to be two: a reduced list for an assistant coach and a full
+    // one for admin/manager. The studio's owner IS the trainer now, and the
+    // reduced list would have taken the owner's own client edits away.
+    expect(src()).not.toMatch(/const allowed = isTrainer/);
   });
 
-  test('but a trainer CAN record the agreement', () => {
-    // A trainer runs the enrolment in front of the client. Locking the
-    // signature to admins would mean the person holding the phone cannot
-    // record the thing the client just signed.
-    const { trainer, admin } = allowlists();
+  test('the trainer can set the payment method', () => {
+    expect(allowlist()).toContain('payment_method');
+  });
+
+  test('and record the agreement', () => {
     for (const f of ['agreement_accepted_at', 'agreement_signature', 'agreement_text']) {
-      expect(trainer).toContain(f);
-      expect(admin).toContain(f);
+      expect(allowlist()).toContain(f);
     }
+  });
+
+  test('trainer_id is re-checked against the studio before it is stored', () => {
+    // A foreign key from the request: it must name this studio's trainer
+    // profile (lib/studioTrainer.js), or the edit is refused.
+    const body = src().slice(src().indexOf("router.patch('/clients/:id'"));
+    expect(body.slice(0, body.indexOf('\n}));'))).toMatch(/resolveTrainerId\(pool, orgIdOf\(req\), req\.body\.trainer_id\)/);
   });
 });
 

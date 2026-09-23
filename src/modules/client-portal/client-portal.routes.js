@@ -60,7 +60,7 @@ router.get('/profile', wrap(async (req, res) => {
             t.specialization AS trainer_specialization,
             o.name AS studio_name, o.logo_url AS studio_logo
        FROM pt_clients c
-       LEFT JOIN trainers t ON t.id = c.trainer_id
+       LEFT JOIN trainers t ON t.id = c.trainer_id AND t.organization_id = c.organization_id
        LEFT JOIN organizations o ON o.id = c.organization_id
       WHERE c.id = $1 AND c.deleted_at IS NULL${orgClause(orgId, params, 'c.organization_id')}`,
     params

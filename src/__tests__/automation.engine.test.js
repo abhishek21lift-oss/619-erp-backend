@@ -200,33 +200,22 @@ describe('tenant isolation', () => {
   });
 });
 
-describe('the trainer permission gate', () => {
-  test('a client whose trainer has no grant is not messaged', async () => {
+describe('the studio switch is the whole permission', () => {
+  test('a client with a trainer profile is messaged on the studio switch alone', async () => {
+    // There used to be a second, per-trainer grant. It went with the staff
+    // roles: the studio has one trainer, who is the one that turned the
+    // switch on. Nothing may consult the old grants table.
     db.grant = false;
     db({ settings: ENABLED, rules: [RULE], client: CLIENT });
     const res = await emit();
 
-    expect(res.outcome).toBe(Outcome.TRAINER_NOT_PERMITTED);
-    // The assertion that matters: not that it said no, but that no row and no
-    // job exist. A skip that still queued would deliver the message anyway.
-    expect(insertCalls()).toHaveLength(0);
-    expect(mockEnqueue).not.toHaveBeenCalled();
-  });
-
-  test('the grant is looked up for the CLIENT\'s trainer, in the caller\'s org', async () => {
-    // Not whoever triggered the event. A payment taken by the front desk still
-    // produces a message the client reads as coming from their trainer's
-    // studio relationship, so it is that trainer's grant that must exist.
-    db({ settings: ENABLED, rules: [RULE], client: CLIENT });
-    await emit();
-    const call = mockQuery.mock.calls.find(([sql]) => /whatsapp_automation_trainer_grants/.test(sql));
-    expect(call[1]).toEqual([ORG_A, 'trainer-a']);
+    expect(res.outcome).toBe(Outcome.QUEUED);
+    expect(mockEnqueue).toHaveBeenCalledTimes(1);
+    expect(mockQuery.mock.calls.some(([sql]) => /whatsapp_automation_trainer_grants/.test(sql))).toBe(false);
+    expect(Outcome.TRAINER_NOT_PERMITTED).toBeUndefined();
   });
 
   test('a client with no trainer is a studio-level message and still goes', async () => {
-    // There is no individual to attribute it to, the studio switch is the
-    // whole authorisation, and requiring a grant that cannot exist would make
-    // unassigned clients silently unmessageable.
     db.grant = false;
     db({ settings: ENABLED, rules: [RULE], client: { ...CLIENT, trainer_id: null } });
     const res = await emit();

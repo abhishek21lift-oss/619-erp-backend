@@ -10,17 +10,24 @@
 //    created, and the 503 branch below becomes unreachable rather than load-
 //    bearing.
 //
-// 2. The only filter was branch_id, and scopedClause() returned the literal
-//    'TRUE' for admins — so an admin's read, update and soft-delete addressed
-//    every studio's records on the platform. The branch clause is kept as a
-//    within-studio refinement; the org clause below is the boundary.
+// 2. The only filter was branch_id, and the branch clause returned the literal
+//    'TRUE' for the studio owner — so the owner's read, update and soft-delete
+//    addressed every studio's records on the platform. The org clause below is
+//    the boundary; there is no per-user branch clause any more.
 const express = require('express');
 const pool = require('../../db/pool');
-const { auth } = require('../../middleware/auth');
-const { branchScope } = require('../../middleware/branch-scope');
+const { auth, requireTrainer } = require('../../middleware/auth');
 const { orgWhere, orgIdOf } = require('../../lib/tenant-db');
+const { HttpError } = require('../../middleware/errorHandler');
+const { branchInOrg } = require('../../lib/studioBranch');
+
 
 const router = express.Router();
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 const MIGRATION_MESSAGE = 'operations table not migrated. Run npm run migrate.';
 
@@ -73,21 +80,18 @@ function cleanModuleKey(moduleKey) {
   return key;
 }
 
-function scopedClause(req, params) {
-  const branchId = req.branchScope && req.branchScope.branchId;
-  if (!branchId || (req.branchScope && req.branchScope.isAdmin)) return 'TRUE';
-  params.push(branchId);
-  return `(branch_id = $${params.length} OR branch_id IS NULL)`;
-}
-
-function branchForWrite(req) {
-  if (req.branchScope && req.branchScope.isAdmin) {
-    return req.body.branch_id || req.body.branchId || null;
+/**
+ * The branch a new record is tagged with, if the caller named one — and only
+ * if it is one of this studio's branches (lib/studioBranch.js).
+ */
+async function branchForWrite(req) {
+  const requested = req.body.branch_id || req.body.branchId || null;
+  if (!requested) return null;
+  if (!await branchInOrg(pool, orgIdOf(req), requested)) {
+    throw new HttpError(400, 'INVALID_BRANCH', 'branch_id does not belong to this studio');
   }
-  return (req.branchScope && req.branchScope.branchId) || null;
+  return requested;
 }
-
-router.use(auth, branchScope);
 
 router.get('/:moduleKey', async (req, res, next) => {
   let moduleKey;
@@ -99,14 +103,12 @@ router.get('/:moduleKey', async (req, res, next) => {
 
   const params = [moduleKey];
   const org = orgWhere(req, params);
-  const scope = scopedClause(req, params);
   try {
     const { rows } = await pool.query(
       `SELECT id, title, owner, status, priority, amount, due_date, channel, notes, created_at, updated_at
          FROM module_records
         WHERE module_key = $1${org}
           AND deleted_at IS NULL
-          AND ${scope}
         ORDER BY due_date ASC, created_at DESC
         LIMIT 500`,
       params
@@ -122,7 +124,7 @@ router.post('/:moduleKey', async (req, res, next) => {
   try {
     const moduleKey = cleanModuleKey(req.params.moduleKey);
     validate(req.body);
-    const branchId = branchForWrite(req);
+    const branchId = await branchForWrite(req);
     const createdBy = req.user && req.user.id;
     const { rows } = await pool.query(
       `INSERT INTO module_records
@@ -168,8 +170,7 @@ router.put('/:moduleKey/:id', async (req, res, next) => {
       req.params.id,
     ];
     const org = orgWhere(req, params);
-    const scope = scopedClause(req, params);
-    const { rows } = await pool.query(
+      const { rows } = await pool.query(
       `UPDATE module_records
           SET title = $1,
               owner = $2,
@@ -182,7 +183,6 @@ router.put('/:moduleKey/:id', async (req, res, next) => {
         WHERE module_key = $9
           AND id = $10${org}
           AND deleted_at IS NULL
-          AND ${scope}
         RETURNING id, title, owner, status, priority, amount, due_date, channel, notes, created_at, updated_at`,
       params
     );
@@ -199,14 +199,12 @@ router.delete('/:moduleKey/:id', async (req, res, next) => {
     const moduleKey = cleanModuleKey(req.params.moduleKey);
     const params = [moduleKey, req.params.id];
     const org = orgWhere(req, params);
-    const scope = scopedClause(req, params);
     const { rows } = await pool.query(
       `UPDATE module_records
           SET deleted_at = NOW()
         WHERE module_key = $1
           AND id = $2${org}
           AND deleted_at IS NULL
-          AND ${scope}
         RETURNING id`,
       params
     );

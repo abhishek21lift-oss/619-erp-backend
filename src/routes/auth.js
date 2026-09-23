@@ -13,8 +13,7 @@ const { verifySync } = require('otplib');
 const pool   = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, invalidateUserCache } = require('../middleware/auth');
-const { tenantScope, orgIdOf } = require('../lib/tenant-db');
-const { requireSuperAdmin } = require('../middleware/tenant');
+const { ALL_ROLES, TENANT_ROLES } = require('../middleware/rbac');
 const platformAuth = require('../middleware/platformAuth');
 const { validate } = require('../middleware/validate');
 const { authSchemas } = require('../lib/validation');
@@ -179,10 +178,10 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // already proved they know the password, at which point their own role is
     // not a secret from them.
     //
-    // Defaults to 'staff' when absent so every existing caller — the mobile
-    // app on /api/v1/auth/login, a saved bookmark, the operator portal —
-    // behaves exactly as it did. A member has never been able to sign in
-    // through any of those, so nothing that works today changes.
+    // Defaults to the trainer door when absent so every existing caller — the
+    // mobile app on /api/v1/auth/login, a saved bookmark — behaves exactly as
+    // it did. (validation.js has already normalised the legacy wire value
+    // 'staff' to 'trainer'.)
     //
     // ── The third door ──
     //
@@ -196,9 +195,20 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     const requestedPortal = req.body.portal;
     const portal = requestedPortal === 'member' ? 'member'
       : requestedPortal === 'platform' ? 'platform'
-        : 'staff';
+        : 'trainer';
     const isMemberAccount = user.role === 'member';
     const isPlatformAccount = user.role === 'super_admin';
+
+    // An account that holds none of the three roles — or a studio role with no
+    // studio — gets no session at all. The database constraints (migration
+    // 208) make such a row impossible; this keeps a session from ever being
+    // minted for one that slipped through, rather than relying on every guard
+    // downstream to notice.
+    if (!ALL_ROLES.includes(user.role)
+        || (TENANT_ROLES.includes(user.role) && !user.organization_id)) {
+      logger.error({ userId: user.id }, 'login refused: account role/tenant is misconfigured');
+      return res.status(403).json({ error: { code: 'ACCOUNT_MISCONFIGURED', message: 'This account cannot sign in. Contact support.' } });
+    }
 
     if (portal === 'platform' && !isPlatformAccount) {
       loginEvents.record(req, {
@@ -206,7 +216,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         userId: user.id, orgId: user.organization_id,
       });
       return res.status(403).json({
-        error: { code: 'WRONG_PORTAL', portal: isMemberAccount ? 'member' : 'staff',
+        error: { code: 'WRONG_PORTAL', portal: isMemberAccount ? 'member' : 'trainer',
           message: 'This is the Command Center sign-in. Use your studio login.' },
       });
     }
@@ -219,7 +229,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // console with an error they cannot clear. Until the flag flips they get a
     // tenant-audience session here, which already cannot reach the control
     // plane — so the boundary is real before the refusal is.
-    if (portal === 'staff' && isPlatformAccount && platformAuth.sessionEnforced()) {
+    if (portal === 'trainer' && isPlatformAccount && platformAuth.sessionEnforced()) {
       loginEvents.record(req, {
         outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
         userId: user.id, orgId: user.organization_id,
@@ -236,11 +246,11 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         userId: user.id, orgId: user.organization_id,
       });
       return res.status(403).json({
-        error: { code: 'WRONG_PORTAL', portal: 'staff',
-          message: 'This is the member sign-in. Use Admin Login for a studio account.' },
+        error: { code: 'WRONG_PORTAL', portal: 'trainer',
+          message: 'This is the member sign-in. Use Trainer Login for your studio account.' },
       });
     }
-    if (portal === 'staff' && isMemberAccount) {
+    if (portal === 'trainer' && isMemberAccount) {
       loginEvents.record(req, {
         outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
         userId: user.id, orgId: user.organization_id,
@@ -256,7 +266,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // second-factor protected. If they have TOTP enabled, a valid 6-digit code
     // is required here. If they have not enrolled yet, login is allowed (so
     // they can reach Settings to set it up) but flagged mfaSetupRequired — the
-    // super-admin API itself is blocked until 2FA is on (requireSuperAdmin).
+    // platform API itself is blocked until 2FA is on (requireSuperAdminMfa).
     let mfaSetupRequired = false;
     if (user.role === 'super_admin') {
       let mfaEnabled = false;
@@ -659,161 +669,12 @@ async function changePasswordHandler(req, res) {
 router.put('/change-password', auth, validate(authSchemas.changePassword), changePasswordHandler);
 router.post('/change-password', auth, validate(authSchemas.changePassword), changePasswordHandler);
 
-// POST /api/auth/create-user  (admin only)
-// Also accepts /users for compatibility with older frontend builds
-const ALLOWED_ROLES = ['super_admin', 'trainer', 'member'];
-
-async function createUserHandler(req, res) {
-  try {
-    const { name, email, password, role = 'trainer', trainer_id, member_id } = req.body;
-    if (!name || !email || !password)
-      return res.status(400).json({ error: 'Name, email and password required' });
-    if (password.length < 8)
-      return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    if (!ALLOWED_ROLES.includes(role))
-      return res.status(400).json({ error: `Role must be one of: ${ALLOWED_ROLES.join(', ')}` });
-
-    // If a trainer_id is supplied, make sure it actually exists. Otherwise
-    // we'd happily create an orphaned link that breaks the dashboard later.
-    if (trainer_id) {
-      const { rows: t } = await pool.query('SELECT 1 FROM trainers WHERE id = $1', [trainer_id]);
-      if (!t.length) return res.status(400).json({ error: 'trainer_id does not match an existing trainer' });
-    }
-
-    const { rows: exists } = await pool.query(
-      'SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [email.trim()]
-    );
-    if (exists.length) return res.status(409).json({ error: 'Email already registered' });
-
-    const hashed = await bcrypt.hash(password, 12);
-    const id = crypto.randomUUID();
-    // Stamp the new user with the creating admin's org so they belong to that
-    // studio (and only that studio's admins can see/manage them).
-    await pool.query(
-      'INSERT INTO users (id, name, email, password, role, trainer_id, member_id, organization_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-      [id, name.trim(), email.toLowerCase().trim(), hashed, role, trainer_id || null, member_id || null, orgIdOf(req)]
-    );
-    res.status(201).json({ message: 'User created', user: { id, name, email: email.toLowerCase(), role } });
-  } catch (err) {
-    logger.error({ err: err.message }, 'Create user error');
-    res.status(500).json({ error: 'Server error' });
-  }
-}
-router.post('/create-user', auth, requireSuperAdmin, validate(authSchemas.createUser), createUserHandler);
-// Compatibility alias — the frontend at one point posted here
-router.post('/users', auth, requireSuperAdmin, validate(authSchemas.createUser), createUserHandler);
-
-// GET /api/auth/users  (admin only)
-router.get('/users', auth, requireSuperAdmin, async (req, res) => {
-  try {
-    const limit  = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
-    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-    // Tenant isolation: a studio admin only ever sees users in their own org.
-    // The platform super admin (null org) is naturally excluded from a tenant
-    // admin's list; a super admin operating platform-wide sees everyone.
-    const scope = tenantScope(req);
-    const orgParam = scope.applyFilter ? scope.orgId : null;
-    const { rows } = await pool.query(
-      `SELECT id, name, email, role, trainer_id, is_active, last_login, created_at
-         FROM users
-        WHERE deleted_at IS NULL
-          AND ($3::uuid IS NULL OR organization_id = $3)
-        ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-      [limit, offset, orgParam]
-    );
-    res.json(rows);
-  } catch (err) {
-    logger.error({ err: err.message }, 'list users failed');
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// PUT /api/auth/users/:id (admin only) — update name, email, role, status
-router.put('/users/:id', auth, requireSuperAdmin, async (req, res) => {
-  if (req.params.id === req.user.id && req.body.role && req.body.role !== req.user.role)
-    return res.status(400).json({ error: 'Cannot change your own role' });
-  try {
-    const allowed = ['name', 'email', 'role'];
-    const updates = [];
-    const vals = [];
-    let idx = 1;
-    for (const key of allowed) {
-      if (req.body[key] !== undefined) {
-        updates.push(`${key} = $${idx++}`);
-        vals.push(req.body[key]);
-      }
-    }
-    if (!updates.length) return res.status(400).json({ error: 'No fields to update' });
-    vals.push(req.params.id);
-    const idPos = idx; // $idx is the target user id
-    // Tenant isolation: an admin can only modify users within their own org.
-    const scope = tenantScope(req);
-    let orgClause = '';
-    if (scope.applyFilter) { vals.push(scope.orgId); orgClause = ` AND organization_id = $${vals.length}`; }
-    const { rows } = await pool.query(
-      `UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${idPos} AND deleted_at IS NULL${orgClause} RETURNING id, name, email, role`,
-      vals
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-    invalidateUserCache(req.params.id);
-    res.json({ message: 'Updated', user: rows[0] });
-  } catch (err) {
-    logger.error({ err: err.message, userId: req.params.id }, 'update user failed');
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// PUT /api/auth/users/:id/toggle  (admin only)
-router.put('/users/:id/toggle', auth, requireSuperAdmin, async (req, res) => {
-  if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot disable yourself' });
-  try {
-    // Tenant isolation: only within the caller's own org.
-    const scope = tenantScope(req);
-    const params = [req.params.id];
-    let orgClause = '';
-    if (scope.applyFilter) { params.push(scope.orgId); orgClause = ` AND organization_id = $${params.length}`; }
-    const { rows } = await pool.query(
-      `UPDATE users SET is_active = NOT is_active, token_version = token_version + 1, updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL${orgClause} RETURNING id, is_active`,
-      params
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-    invalidateUserCache(req.params.id);
-    res.json({ message: 'Updated', is_active: rows[0].is_active });
-  } catch (err) {
-    logger.error({ err: err.message, userId: req.params.id }, 'toggle user active failed');
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// DELETE /api/auth/users/:id (admin only)
-// FIX: soft delete — sets deleted_at and bumps token_version so existing tokens are immediately revoked.
-// Hard delete left a dangling reference risk and bypassed the deleted_at guard in auth middleware.
-router.delete('/users/:id', auth, requireSuperAdmin, async (req, res) => {
-  if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
-  try {
-    // Tenant isolation: only within the caller's own org.
-    const scope = tenantScope(req);
-    const params = [req.params.id];
-    let orgClause = '';
-    if (scope.applyFilter) { params.push(scope.orgId); orgClause = ` AND organization_id = $${params.length}`; }
-    const { rows } = await pool.query(
-      `UPDATE users
-          SET deleted_at = NOW(),
-              is_active = false,
-              token_version = token_version + 1,
-              updated_at = NOW()
-        WHERE id = $1
-          AND deleted_at IS NULL${orgClause}
-        RETURNING id`,
-      params
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'User not found or already deleted' });
-    invalidateUserCache(req.params.id);
-    res.json({ message: 'User deleted' });
-  } catch (err) {
-    logger.error({ err: err.message, userId: req.params.id }, 'delete user failed');
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+// The legacy account-management endpoints (/create-user, /users, /users/:id,
+// /users/:id/toggle) are gone. They were super_admin-only duplicates of the
+// Command Center's user management (/api/platform/users, /organizations), and
+// with the tenant boundary strict they could only ever match nothing — while
+// still letting the operator create super_admin accounts outside the
+// platform-grant flow and change any login's role. A studio's trainer is
+// created with the studio, and its members by client activation.
 
 module.exports = router;

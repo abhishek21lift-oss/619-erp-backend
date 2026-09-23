@@ -5,7 +5,7 @@
 //      access is already enforced lazily by the auth layer).
 //   2. Expire studios whose paid period has ended.
 //   3. Send 7 / 3 / 1-day and expiry-day reminders, plus frozen notifications, to
-//      each studio's admin users (in-app).
+//      the studio's trainer (in-app).
 //
 // Every step is idempotent and reminders are de-duplicated via subscription_events,
 // so running this repeatedly (interval or cron) never double-freezes or double-
@@ -18,10 +18,10 @@ const subscription = require('../lib/subscription');
 
 const REMINDER_DAYS = [7, 3, 1, 0]; // 0 = expiry day
 
-// In-app notification to every active admin of a studio.
-async function notifyStudioAdmins(orgId, title, body, link) {
+// In-app notification to the studio's trainer.
+async function notifyStudioTrainer(orgId, title, body, link) {
   const { rows } = await pool.query(
-    `SELECT id FROM users WHERE organization_id = $1 AND role = 'admin' AND is_active = true AND deleted_at IS NULL`,
+    `SELECT id FROM users WHERE organization_id = $1 AND role = 'trainer' AND is_active = true AND deleted_at IS NULL`,
     [orgId]
   );
   for (const u of rows) {
@@ -64,7 +64,7 @@ async function sweepExpiries() {
   );
   for (const o of frozen) {
     await logEvent(o.id, 'frozen', { reason: 'trial_expired' });
-    await notifyStudioAdmins(o.id, 'Your trial has expired',
+    await notifyStudioTrainer(o.id, 'Your trial has expired',
       'Please subscribe to continue using MY PT STUDIO. Your data is safe.', '/subscription');
   }
 
@@ -75,7 +75,7 @@ async function sweepExpiries() {
   );
   for (const o of expired) {
     await logEvent(o.id, 'expired', { reason: 'period_ended' });
-    await notifyStudioAdmins(o.id, 'Your subscription has expired',
+    await notifyStudioTrainer(o.id, 'Your subscription has expired',
       'Please renew to continue using MY PT STUDIO. Your data is safe.', '/subscription');
   }
 
@@ -97,7 +97,7 @@ async function sendReminders() {
       if (await reminderAlreadySent(o.id, 'trial', days)) continue;
       const msg = days === 0 ? 'Your free trial ends today. Subscribe to keep access.'
         : `Your free trial ends in ${days} ${days === 1 ? 'day' : 'days'}. Subscribe to keep access.`;
-      await notifyStudioAdmins(o.id, 'Trial ending soon', msg, '/subscription');
+      await notifyStudioTrainer(o.id, 'Trial ending soon', msg, '/subscription');
       await logEvent(o.id, 'reminder_sent', { kind: 'trial', days });
       sent++;
     }
@@ -112,7 +112,7 @@ async function sendReminders() {
       if (await reminderAlreadySent(o.id, 'renewal', days)) continue;
       const msg = days === 0 ? 'Your subscription renews today.'
         : `Your subscription renews in ${days} ${days === 1 ? 'day' : 'days'}.`;
-      await notifyStudioAdmins(o.id, 'Renewal reminder', msg, '/subscription');
+      await notifyStudioTrainer(o.id, 'Renewal reminder', msg, '/subscription');
       await logEvent(o.id, 'reminder_sent', { kind: 'renewal', days });
       sent++;
     }
@@ -149,4 +149,4 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { runSubscriptionSweep, sweepExpiries, sendReminders, notifyStudioAdmins, applyScheduledDowngrades };
+module.exports = { runSubscriptionSweep, sweepExpiries, sendReminders, notifyStudioTrainer, applyScheduledDowngrades };

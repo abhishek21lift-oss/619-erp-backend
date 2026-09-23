@@ -29,16 +29,16 @@ const crypto  = require('crypto');
 const pool    = require('../db/pool');
 const logger  = require('../lib/logger');
 const gateway = require('../lib/whatsappGateway');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { orgIdOf } = require('../lib/tenant-db');
 
 const router = express.Router();
 
-// adminOnly, not just auth. server.js's gate() is auth + feature flag and says
+// requireTrainer, not just auth. server.js's gate() is auth + feature flag and says
 // nothing about role — the comment there records a real escalation where a
 // `member` account satisfied every check and read staff data. Connecting a
 // studio's WhatsApp number is an owner action.
-router.use(auth, adminOnly);
+router.use(auth, requireTrainer);
 
 // ── Why every response here is Cache-Control: no-store ──────────────────────
 //

@@ -39,8 +39,7 @@ jest.mock('../db/pool', () => {
 let mockUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../lib/screeningGate', () => ({ checkScreeningGate: jest.fn(async () => ({ blocked: null, warnings: [] })) }));
 
@@ -287,20 +286,27 @@ describe('the proposal has to actually reach the client', () => {
   });
 
   it('writes no assignment when the save fails', async () => {
-    // A caller with no organization never reaches the assignment at all: the
-    // exercise lookup refuses an org-less request outright (see
-    // lookupExercisesByName), so nothing resolves and the save is rejected
-    // before the transaction opens. acceptGeneration still guards on orgId —
-    // it is exported and other callers could reach it — but through this route
-    // that guard is unreachable, and the property worth pinning is this one:
-    // a failed save leaves no orphan assignment pointing at a plan that was
+    // Nothing in the proposal resolves against the library, so the save is
+    // rejected before the transaction opens. The property worth pinning: a
+    // failed save leaves no orphan assignment pointing at a plan that was
     // never written.
-    mockUser = { id: 'u-tr', role: 'trainer', organization_id: null, trainer_id: 'tr-1' };
+    mockDb({ library: [] });
     const res = await post();
 
     expect(res.status).toBe(422);
     expect(res.body.code).toBe('NOTHING_RESOLVED');
     expect(sqls().some((s) => /INSERT INTO workout_assignments/.test(s))).toBe(false);
     expect(sqls().some((s) => /INSERT INTO workout_plans/.test(s))).toBe(false);
+  });
+
+  it('refuses a trainer account with no studio before touching anything', async () => {
+    // acceptGeneration still guards on orgId — it is exported and other
+    // callers could reach it — but through this route the router guard
+    // refuses an org-less caller first.
+    mockUser = { id: 'u-tr', role: 'trainer', organization_id: null, trainer_id: 'tr-1' };
+    const res = await post();
+
+    expect(res.status).toBe(403);
+    expect(pool.query).not.toHaveBeenCalled();
   });
 });

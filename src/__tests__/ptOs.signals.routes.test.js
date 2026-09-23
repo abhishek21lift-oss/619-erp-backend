@@ -21,11 +21,9 @@ jest.mock('../db/pool', () => {
 let mockUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
-jest.mock('../middleware/rbac', () => ({ requireRole: () => (_req, _res, next) => next() }));
+jest.mock('../middleware/rbac', () => ({ requireTrainer: (_req, _res, next) => next(),}));
 
 const request = require('supertest');
 const express = require('express');
@@ -36,7 +34,7 @@ app.use(express.json());
 app.use('/api/pt-os', require('../modules/pt-os/pt-os.routes'));
 
 const ORG = '11111111-1111-1111-1111-111111111111';
-const ADMIN = { id: 'u-admin', role: 'admin', organization_id: ORG, trainer_id: null };
+const ADMIN = { id: 'u-admin', role: 'trainer', organization_id: ORG, trainer_id: null };
 const TRAINER = { id: 'u-tr', role: 'trainer', organization_id: ORG, trainer_id: 'tr-1' };
 
 const ago = (n) => {
@@ -108,28 +106,24 @@ describe('scoping', () => {
     for (const call of pool.query.mock.calls) expect(call[1][0]).toBe(ORG);
   });
 
-  it('pins a trainer to their own clients whatever they ask for', async () => {
+  it('sweeps the whole studio for the trainer — no roster narrowing, whatever is asked', async () => {
+    // The trainer owns the studio, so there is no narrower roster to pin to,
+    // and a trainer_id in the query string narrows nothing either: the sweep
+    // is the same as the client list, which is the whole studio.
     mockUser = TRAINER;
     await request(app).get('/api/pt-os/signals?trainer_id=tr-someone-else');
-
-    // The same rule GET /clients uses. A signals sweep that showed more than
-    // the client list would be a way around it. The landmark query carries no
-    // trainer — the ranges are the studio's, and every trainer sees the same
-    // ones.
     for (const [sql, params] of pool.query.mock.calls) {
       if (/muscle_volume_landmarks/.test(String(sql))) continue;
-      expect(params[1]).toBe('tr-1');
+      expect(params[0]).toBe(ORG);
+      expect(params[1]).toBeNull();
     }
   });
 
-  it('lets an admin see the studio, or narrow to one trainer', async () => {
-    mockUser = ADMIN;
-    await request(app).get('/api/pt-os/signals');
-    expect(pool.query.mock.calls[0][1][1]).toBeNull();
-
-    mockDb();
-    await request(app).get('/api/pt-os/signals?trainer_id=tr-2');
-    expect(pool.query.mock.calls[0][1][1]).toBe('tr-2');
+  it('a member is refused before the sweep runs', async () => {
+    mockUser = { id: 'm1', role: 'member', organization_id: ORG, pt_client_id: 'c-1' };
+    const res = await request(app).get('/api/pt-os/signals');
+    expect(res.status).toBe(403);
+    expect(pool.query).not.toHaveBeenCalled();
   });
 
   it('answers an empty roster without touching the sets table', async () => {

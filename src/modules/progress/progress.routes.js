@@ -1,7 +1,6 @@
 const router = require('express').Router();
 const pool = require('../../db/pool');
-const { auth } = require('../../middleware/auth');
-const { requireRole } = require('../../middleware/rbac');
+const { auth, requireTrainer } = require('../../middleware/auth');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { tenantScope, orgIdOf, orgWhere } = require('../../lib/tenant-db');
@@ -12,6 +11,11 @@ const lifestyleScoring = require('./lifestyle-scoring');
 const nutritionScoring = require('./nutrition-scoring');
 const mobilityScoring = require('./mobility-scoring');
 const postureScoring = require('./posture-scoring');
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -80,7 +84,7 @@ router.get('/assessments', auth, wrap(async (req, res) => {
   // Qualify with the pa alias — this query joins `trainers`, which also has an
   // organization_id column, so an unqualified reference is ambiguous.
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`pa.organization_id = $${params.length}`); }
+  params.push(scope.orgId); where.push(`pa.organization_id = $${params.length}`);
   const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 200);
   const off = Math.max(parseInt(offset, 10) || 0, 0);
   params.push(lim); const limIdx = params.length;
@@ -88,16 +92,19 @@ router.get('/assessments', auth, wrap(async (req, res) => {
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT pa.*, t.name AS trainer_name FROM pt_assessments pa
-     LEFT JOIN trainers t ON t.id = pa.trainer_id ${whereSql}
+     LEFT JOIN trainers t ON t.id = pa.trainer_id AND t.organization_id = pa.organization_id ${whereSql}
      ORDER BY assessment_date DESC LIMIT $${limIdx} OFFSET $${offIdx}`, params
   );
   res.json({ data: rows });
 }));
 
-router.post('/assessments', auth, requireRole('admin','manager','trainer'), validate(assessmentCreateSchema), wrap(async (req, res) => {
+router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-  const trainer_id = req.user.role === 'trainer' ? req.user.trainer_id : b.trainer_id;
+  // The assessor is the studio's trainer profile, from the session. A
+  // trainer_id in the body is ignored: it is a foreign key, and taking it
+  // from the request would let a row point at another studio's trainer.
+  const trainer_id = req.user.trainer_id || null;
 
   // Age/gender: prefer what the frontend sent (it already has the client
   // record loaded); fall back to a DB lookup so BMR/VO2max/norms still work
@@ -109,7 +116,7 @@ router.post('/assessments', auth, requireRole('admin','manager','trainer'), vali
     const dScope = tenantScope(req);
     const cParams = [b.client_id];
     let cOrg = '';
-    if (dScope.applyFilter) { cParams.push(dScope.orgId); cOrg = ' AND organization_id = $2'; }
+    cParams.push(dScope.orgId); cOrg = ' AND organization_id = $2';
     const { rows: cRows } = await pool.query(`SELECT dob, gender FROM pt_clients WHERE id = $1${cOrg}`, cParams);
     const c = cRows[0];
     if (c) {
@@ -315,7 +322,7 @@ router.get('/goals', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  params.push(scope.orgId); where.push(`organization_id = $${params.length}`);
   if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
@@ -390,10 +397,10 @@ router.patch('/goals/:id', auth, wrap(async (req, res) => {
   ];
 
   const scope = tenantScope(req);
-  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const guard = ' AND organization_id = $2';
   const { rows: existingRows } = await pool.query(
     `SELECT * FROM pt_goals WHERE id = $1${guard}`,
-    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+    [req.params.id, scope.orgId]
   );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -438,7 +445,7 @@ router.get('/weekly-checkins', auth, wrap(async (req, res) => {
   const { client_id, limit } = req.query;
   const where = []; const params = [];
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  params.push(scope.orgId); where.push(`organization_id = $${params.length}`);
   if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const lim = Math.min(Math.max(parseInt(limit, 10) || 12, 1), 52);
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -477,6 +484,11 @@ router.post('/weekly-checkins', auth, wrap(async (req, res) => {
        stress_level = EXCLUDED.stress_level, energy_level = EXCLUDED.energy_level,
        soreness_level = EXCLUDED.soreness_level,
        updated_at = NOW()
+     -- (client_id, week_start_date) says nothing about the studio. The client
+     -- was verified in the caller's organization above, so this can only ever
+     -- exclude a row that could not legitimately be the target.
+     WHERE weekly_checkins.organization_id IS NULL
+        OR weekly_checkins.organization_id = EXCLUDED.organization_id
      RETURNING *`,
     [client_id, week_start_date, num(weight, null), mood || null, num(sleep_hours, null),
      num(water_glasses, null), num(workout_count, 0), num(calories_avg, null),
@@ -490,7 +502,7 @@ router.get('/strength-logs', auth, wrap(async (req, res) => {
   const { client_id, exercise_name, limit } = req.query;
   const where = []; const params = [];
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  params.push(scope.orgId); where.push(`organization_id = $${params.length}`);
   if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   if (exercise_name) { params.push(exercise_name); where.push(`exercise_name = $${params.length}`); }
   const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
@@ -516,7 +528,7 @@ const strengthLogCreateSchema = {
   }),
 };
 
-router.post('/strength-logs', auth, requireRole('admin', 'manager', 'trainer'), validate(strengthLogCreateSchema), wrap(async (req, res) => {
+router.post('/strength-logs', auth, requireTrainer, validate(strengthLogCreateSchema), wrap(async (req, res) => {
   const { client_id, exercise_name, weight_kg, sets_done, reps_done, notes,
     assessment_id, one_rm_formula, is_direct_1rm, one_rm_estimate } = req.body;
   if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
@@ -537,7 +549,7 @@ router.get('/progress-photos', auth, wrap(async (req, res) => {
   const { client_id, limit } = req.query;
   const where = []; const params = [];
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  params.push(scope.orgId); where.push(`organization_id = $${params.length}`);
   if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -558,7 +570,7 @@ const progressPhotoCreateSchema = {
   }),
 };
 
-router.post('/progress-photos', auth, requireRole('admin', 'manager', 'trainer'), validate(progressPhotoCreateSchema), wrap(async (req, res) => {
+router.post('/progress-photos', auth, requireTrainer, validate(progressPhotoCreateSchema), wrap(async (req, res) => {
   const { client_id, photo_url, photo_type, taken_at, notes } = req.body;
   if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const { rows } = await pool.query(
@@ -572,11 +584,7 @@ router.post('/progress-photos', auth, requireRole('admin', 'manager', 'trainer')
 
 router.delete('/progress-photos/:id', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  if (scope.applyFilter) {
-    await pool.query('DELETE FROM progress_photos WHERE id = $1 AND organization_id = $2', [req.params.id, scope.orgId]);
-  } else {
-    await pool.query('DELETE FROM progress_photos WHERE id = $1', [req.params.id]);
-  }
+  await pool.query('DELETE FROM progress_photos WHERE id = $1 AND organization_id = $2', [req.params.id, scope.orgId]);
   res.status(204).end();
 }));
 
@@ -686,7 +694,7 @@ router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
   return res.json({ data: rows });
 }));
 
-router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(lifestyleAssessmentCreateSchema), wrap(async (req, res) => {
+router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAssessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computeLifestyleAnalysis(b);
@@ -931,7 +939,7 @@ router.get('/nutrition-assessments', auth, wrap(async (req, res) => {
   return res.json({ data: rows });
 }));
 
-router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(nutritionAssessmentCreateSchema), wrap(async (req, res) => {
+router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAssessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = await computeNutritionAnalysis(b.client_id, b);
@@ -1100,7 +1108,7 @@ router.get('/mobility-performance-assessments', auth, wrap(async (req, res) => {
   // strength_logs/progress_photos) — client_id alone let a caller who knows or
   // guesses another org's client_id list that org's mobility records.
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  params.push(scope.orgId); where.push(`organization_id = $${params.length}`);
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT * FROM pt_mobility_performance_assessments ${whereSql} ORDER BY assessment_date DESC`, params
@@ -1108,7 +1116,7 @@ router.get('/mobility-performance-assessments', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/mobility-performance-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(mobilityPerformanceAssessmentCreateSchema), wrap(async (req, res) => {
+router.post('/mobility-performance-assessments', auth, requireTrainer, validate(mobilityPerformanceAssessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computeMobilityAnalysis(b);
@@ -1142,10 +1150,10 @@ router.patch('/mobility-performance-assessments/:id', auth, wrap(async (req, res
   ];
 
   const scope = tenantScope(req);
-  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const guard = ' AND organization_id = $2';
   const { rows: existingRows } = await pool.query(
     `SELECT * FROM pt_mobility_performance_assessments WHERE id = $1${guard}`,
-    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+    [req.params.id, scope.orgId]
   );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
@@ -1198,7 +1206,7 @@ router.get('/posture-assessments', auth, wrap(async (req, res) => {
   // Multi-tenant isolation: this table missed the 084 sweep the same way
   // mobility-performance-assessments did — see that route for the finding.
   const scope = tenantScope(req);
-  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  params.push(scope.orgId); where.push(`organization_id = $${params.length}`);
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT * FROM pt_posture_assessments ${whereSql} ORDER BY assessment_date DESC`, params
@@ -1206,7 +1214,7 @@ router.get('/posture-assessments', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/posture-assessments', auth, requireRole('admin', 'manager', 'trainer'), validate(postureAssessmentCreateSchema), wrap(async (req, res) => {
+router.post('/posture-assessments', auth, requireTrainer, validate(postureAssessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computePostureAnalysis(b);
@@ -1240,10 +1248,10 @@ router.patch('/posture-assessments/:id', auth, wrap(async (req, res) => {
   const allowed = ['assessment_date', 'front_issues', 'side_issues', 'back_issues', 'other_issue_notes', 'coach_notes'];
 
   const scope = tenantScope(req);
-  const guard = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const guard = ' AND organization_id = $2';
   const { rows: existingRows } = await pool.query(
     `SELECT * FROM pt_posture_assessments WHERE id = $1${guard}`,
-    scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+    [req.params.id, scope.orgId]
   );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });

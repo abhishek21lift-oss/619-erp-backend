@@ -8,7 +8,7 @@
 // and returned every studio's client NAMES and MOBILE NUMBERS alongside how
 // many PT sessions each had left, to any authenticated account of any role —
 // including the `member` accounts the client-activation flow creates, because
-// the mount in server.js carried no requireStaff either.
+// the mount in server.js carried no requireTrainer either.
 //
 // The writes were worse in a different way. POST /session-balance/:id/use
 // decremented any balance row on the platform by id, which is a studio's sold
@@ -21,12 +21,16 @@
 // points at a foreign client would otherwise just move the problem.
 const router = require('express').Router();
 const pool = require('../../db/pool');
-const { auth } = require('../../middleware/auth');
-const { requireRole } = require('../../middleware/rbac');
+const { auth, requireTrainer } = require('../../middleware/auth');
 const { orgWhere, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
 const repo = require('./automation.repository');
 const automation = require('./automation.triggers');
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -51,7 +55,7 @@ router.get('/rules', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/rules', auth, requireRole('admin','manager'), wrap(async (req, res) => {
+router.post('/rules', auth, requireTrainer, wrap(async (req, res) => {
   const { name, trigger_event, channel, template, delay_minutes } = req.body;
   if (!name?.trim() || !trigger_event || !template?.trim()) {
     return res.status(400).json({ error: { code: 'VALIDATION', message: 'name, trigger_event, and template are required' } });
@@ -64,7 +68,7 @@ router.post('/rules', auth, requireRole('admin','manager'), wrap(async (req, res
   return res.status(201).json({ data: rows[0] });
 }));
 
-router.patch('/rules/:id', auth, requireRole('admin','manager'), wrap(async (req, res) => {
+router.patch('/rules/:id', auth, requireTrainer, wrap(async (req, res) => {
   const allowed = ['name','trigger_event','channel','template','delay_minutes','is_active'];
   const sets = []; const params = [req.params.id];
   for (const key of allowed) {
@@ -82,7 +86,7 @@ router.patch('/rules/:id', auth, requireRole('admin','manager'), wrap(async (req
   return res.json({ data: rows[0] });
 }));
 
-router.delete('/rules/:id', auth, requireRole('admin'), wrap(async (req, res) => {
+router.delete('/rules/:id', auth, requireTrainer, wrap(async (req, res) => {
   const params = [req.params.id];
   const org = orgWhere(req, params);
   const { rowCount } = await pool.query(
@@ -94,21 +98,15 @@ router.delete('/rules/:id', auth, requireRole('admin'), wrap(async (req, res) =>
 
 // ── WhatsApp automation permission ──────────────────────────────────────────
 //
-// Two levels, because the question has two halves: does this STUDIO allow
-// automated sending, and may a message go out on behalf of THIS TRAINER. Both
-// must say yes before the engine queues anything, and both are re-checked in
-// the worker — a rule's delay can be hours, and a switch that only stops
-// messages nobody had queued yet is not a switch.
+// One switch: does this STUDIO allow automated sending. The trainer owns the
+// studio, so there is no second, per-trainer grant to hold — that level went
+// with the staff roles. The switch is checked before the engine queues
+// anything and re-checked in the worker: a rule's delay can be hours, and a
+// switch that only stops messages nobody had queued yet is not a switch.
 //
-// ── Why these do not live in routes/settings.js with the other permissions ──
-//
-// Because that surface cannot hold them safely. `system_settings` has no
-// organization_id — verified in production, 35 rows shared by 6 studios — and
-// routes/settings.js writes it with ON CONFLICT (key), so one studio changing
-// a perm_* value changes it for the whole platform. That is tolerable for a
-// flag that hides a menu item. It is not tolerable for the flag that decides
-// whether a studio's clients get messaged, so migration 190 gives these their
-// own tenanted tables and they are served from here.
+// It lives in its own tenanted table (migration 190) rather than
+// system_settings because it decides whether a studio's clients get messaged
+// unattended, and that table was tenanted from its first row.
 //
 // No SQL in this file: it goes through automation.repository.js, which is
 // where the layering rule (architecture.layering.convention.test.js) puts it.
@@ -117,9 +115,8 @@ router.delete('/rules/:id', auth, requireRole('admin'), wrap(async (req, res) =>
 function requireOrg(req, res) {
   const orgId = orgIdOf(req);
   if (!orgId) {
-    // A platform super_admin operating platform-wide has no studio, and
-    // "enable automated messaging" has no platform-wide meaning — it would
-    // mean every studio at once. Same refusal as routes/whatsapp.js.
+    // Fail closed: "enable automated messaging" has no meaning without a
+    // studio. requireTrainer already guarantees one; this is the belt to it.
     res.status(400).json({
       error: { code: 'ORG_REQUIRED', message: 'Select a studio before changing its automation settings.' },
     });
@@ -128,20 +125,17 @@ function requireOrg(req, res) {
   return orgId;
 }
 
-router.get('/whatsapp-settings', auth, requireRole('admin', 'manager'), wrap(async (req, res) => {
+router.get('/whatsapp-settings', auth, requireTrainer, wrap(async (req, res) => {
   const orgId = requireOrg(req, res);
   if (!orgId) return undefined;
-  const [settings, trainers] = await Promise.all([
-    repo.settingsFor(orgId),
-    repo.trainersWithGrants(orgId),
-  ]);
-  return res.json({ data: { ...settings, trainers } });
+  const settings = await repo.settingsFor(orgId);
+  return res.json({ data: settings });
 }));
 
-// admin only, not admin+manager. Switching automated messaging on is the
-// decision that lets this system message a studio's clients unattended, and it
-// belongs to whoever owns the studio's relationship with them.
-router.put('/whatsapp-settings', auth, requireRole('admin'), wrap(async (req, res) => {
+// The trainer only. Switching automated messaging on is the decision that
+// lets this system message a studio's clients unattended, and it belongs to
+// whoever owns the studio's relationship with them.
+router.put('/whatsapp-settings', auth, requireTrainer, wrap(async (req, res) => {
   const orgId = requireOrg(req, res);
   if (!orgId) return undefined;
 
@@ -165,32 +159,6 @@ router.put('/whatsapp-settings', auth, requireRole('admin'), wrap(async (req, re
     updatedBy: req.user.id,
   });
   return res.json({ data: saved });
-}));
-
-router.put('/whatsapp-settings/trainers/:trainerId', auth, requireRole('admin'), wrap(async (req, res) => {
-  const orgId = requireOrg(req, res);
-  if (!orgId) return undefined;
-  const granted = await repo.grantTrainer(orgId, req.params.trainerId, req.user.id);
-  if (!granted) {
-    // Either not this studio's trainer, or already granted. Both are answered
-    // by reporting the state rather than by distinguishing them: a 404 that
-    // fires only for a foreign trainer id would confirm which ids exist
-    // elsewhere, and an "already granted" error is not a failure of anything.
-    const already = await repo.trainerIsGranted(orgId, req.params.trainerId);
-    if (!already) return notFound(res, 'Trainer');
-  }
-  return res.json({ data: { trainer_id: req.params.trainerId, whatsapp_automation_granted: true } });
-}));
-
-router.delete('/whatsapp-settings/trainers/:trainerId', auth, requireRole('admin'), wrap(async (req, res) => {
-  const orgId = requireOrg(req, res);
-  if (!orgId) return undefined;
-  // Revoking is idempotent and always succeeds: the state the caller asked for
-  // is the state that holds afterwards, whether or not a row was deleted. An
-  // error here would be a reason not to retry a revocation, which is the one
-  // operation that must always be easy.
-  await repo.revokeTrainer(orgId, req.params.trainerId);
-  return res.json({ data: { trainer_id: req.params.trainerId, whatsapp_automation_granted: false } });
 }));
 
 // ── Communication logs ──────────────────────────────────────────────────────
@@ -326,7 +294,7 @@ router.get('/pt-packages', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/pt-packages', auth, requireRole('admin'), wrap(async (req, res) => {
+router.post('/pt-packages', auth, requireTrainer, wrap(async (req, res) => {
   const { name, session_count, duration_days, price, goal_type, description } = req.body;
   try {
     const { rows } = await pool.query(
@@ -346,7 +314,7 @@ router.post('/pt-packages', auth, requireRole('admin'), wrap(async (req, res) =>
   }
 }));
 
-router.patch('/pt-packages/:id', auth, requireRole('admin'), wrap(async (req, res) => {
+router.patch('/pt-packages/:id', auth, requireTrainer, wrap(async (req, res) => {
   const allowed = ['name','session_count','duration_days','price','goal_type','description','is_active'];
   const sets = []; const params = [req.params.id];
   for (const key of allowed) {
@@ -362,7 +330,7 @@ router.patch('/pt-packages/:id', auth, requireRole('admin'), wrap(async (req, re
   return res.json({ data: rows[0] });
 }));
 
-router.delete('/pt-packages/:id', auth, requireRole('admin'), wrap(async (req, res) => {
+router.delete('/pt-packages/:id', auth, requireTrainer, wrap(async (req, res) => {
   const params = [req.params.id];
   const org = orgWhere(req, params);
   const { rows } = await pool.query(

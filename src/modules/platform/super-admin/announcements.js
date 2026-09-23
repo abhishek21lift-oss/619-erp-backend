@@ -15,7 +15,9 @@ const TITLE_MAX = 140;
 const BODY_MAX = 4000;
 const SEVERITIES = ['info', 'success', 'warning', 'critical'];
 const AUDIENCES = ['all', 'plan', 'status', 'studios'];
-const ANNOUNCEMENT_ROLES = ['admin', 'manager', 'trainer', 'member'];
+// Who an announcement can address: the studios' trainers, their members, or
+// both. One definition, owned by rbac.js.
+const { TENANT_ROLES: ANNOUNCEMENT_ROLES } = require('../../../middleware/rbac');
 
 /** Shared by create and update; returns { error } or { value }. */
 function validateAnnouncement(body, { partial = false } = {}) {
@@ -120,7 +122,7 @@ router.post('/announcements', async (req, res, next) => {
        RETURNING *`,
       [value.title, value.body, value.severity || 'info', value.link || null,
        value.audience || 'all', value.audience_plans || null, value.audience_statuses || null,
-       value.audience_org_ids || null, value.audience_roles || ['admin', 'manager'],
+       value.audience_org_ids || null, value.audience_roles || ['trainer'],
        req.user?.id || null, req.user?.name || null]
     );
 

@@ -14,7 +14,7 @@ jest.mock('../middleware/auth', () => ({
     req.user = { id: 'usr-1', role: 'trainer', organization_id: 'org-1' };
     next();
   },
-  adminOnly: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../lib/ai/router', () => ({
   routedChat: jest.fn(),
@@ -279,7 +279,7 @@ describe('POST /api/ai/chat — bounded conversation history (F-5)', () => {
     const clientGate = pool.query.mock.calls.find(
       ([sql]) => sql.includes('SELECT name, dob, gender, mobile FROM pt_clients'));
     expect(clientGate).toBeTruthy();
-    expect(clientGate[0]).toContain('organization_id=$2');
+    expect(clientGate[0]).toContain('organization_id = $2');
     expect(clientGate[1]).toEqual(['cli-1', 'org-1']);
 
     // …and the ownership check ran too, org-bound, before the conversation

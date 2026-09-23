@@ -323,10 +323,15 @@ const DOMAINS = {
       'whatsapp_instances', 'whatsapp_webhook_events',
       // The permission gate for automated sending. It lives here rather than
       // with automation_rules in `engagement` because it is about DELIVERY —
-      // whether this studio's WhatsApp may be used unattended, and on whose
-      // behalf — not about which events produce which messages. engagement
-      // already depends on messaging, so the direction holds: a rule cannot
-      // fire without permission, and permission knows nothing about rules.
+      // whether this studio's WhatsApp may be used unattended — not about
+      // which events produce which messages. engagement already depends on
+      // messaging, so the direction holds: a rule cannot fire without
+      // permission, and permission knows nothing about rules.
+      //
+      // The per-coach grants table is retained for its rows and is no longer
+      // read: with one trainer per studio, the studio switch IS the trainer's
+      // permission. It stays declared here because the table still exists and
+      // still references `trainers`.
       'whatsapp_automation_settings', 'whatsapp_automation_trainer_grants',
     ],
   },

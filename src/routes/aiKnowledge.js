@@ -3,20 +3,19 @@
 // Mounted at /api/ai/knowledge. Registered BEFORE /api/ai in server.js so it
 // is matched first regardless of what /api/ai's own router does internally.
 //
-// Tenant model: org admins/managers upload knowledge scoped to their own
-// organization (organization_id = caller's org). Platform super admins can
-// additionally upload GLOBAL platform knowledge by sending
-// is_global=true — such documents get organization_id NULL and become
-// readable by every organization via the retrieval layer
-// (lib/ai/knowledgeBase.js). Global uploads are the ONLY way a document
-// becomes global; there is no inference or fallback anywhere.
+// Tenant model: the studio's trainer uploads knowledge scoped to their own
+// organization (organization_id = caller's org). Documents that already carry
+// is_global (organization_id NULL) are platform knowledge, readable by every
+// studio through the retrieval layer (lib/ai/knowledgeBase.js) and writable by
+// none of them: nothing on this router creates, deletes or reindexes a global
+// document, and nothing infers one.
 
 const express = require('express');
 const multer = require('multer');
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
-const { requireRole, requireStaff } = require('../middleware/rbac');
+const { requireTrainer } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { saveFile } = require('../lib/fileStorage');
 const { SUPPORTED_MIME_TYPES } = require('../lib/ai/textExtract');
@@ -43,7 +42,7 @@ const EXT_BY_MIME = { 'application/pdf': 'pdf', 'text/plain': 'txt' };
 /* ═══════════════════════════════════════════════════════════════════════════
    POST /api/ai/knowledge  — upload + queue a document for indexing
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/', auth, requireRole('trainer', 'super_admin'), (req, res, next) => {
+router.post('/', auth, requireTrainer, (req, res, next) => {
   upload.single('file')(req, res, (err) => {
     if (err) return res.status(400).json({ error: { code: 'UPLOAD_ERROR', message: err.message } });
     next();
@@ -55,15 +54,13 @@ router.post('/', auth, requireRole('trainer', 'super_admin'), (req, res, next) =
     const title = (req.body?.title || req.file.originalname || 'Untitled document').trim().slice(0, 255);
     const category = CATEGORIES.includes(req.body?.category) ? req.body.category : 'guide';
 
-    // Global documents: platform super admin only, and only when explicitly
-    // requested (is_global=true) — a super admin without that flag goes down
-    // the normal org path and still needs an x-org-id. A non-super-admin can
-    // never create a global document.
-    const isGlobal = req.user?.role === 'super_admin' && req.body?.is_global === 'true';
-    const organizationId = isGlobal ? null : orgIdOf(req);
+    // Always the trainer's own studio. A studio cannot create a global
+    // (platform-wide) document: is_global is never taken from the request.
+    const isGlobal = false;
+    const organizationId = orgIdOf(req);
     if (!organizationId) {
       return res.status(400).json({
-        error: { code: 'NO_ORG', message: 'Select a target organization (x-org-id) before uploading a document.' },
+        error: { code: 'NO_ORG', message: 'This account has no studio to upload to.' },
       });
     }
 
@@ -100,9 +97,8 @@ router.post('/', auth, requireRole('trainer', 'super_admin'), (req, res, next) =
 /* ═══════════════════════════════════════════════════════════════════════════
    GET /api/ai/knowledge — list this org's documents
    ═══════════════════════════════════════════════════════════════════════════ */
-router.get('/', auth, requireRole('trainer', 'super_admin'), async (req, res) => {
+router.get('/', auth, requireTrainer, async (req, res) => {
   const scope = tenantScope(req);
-  if (!scope.applyFilter) return res.json({ data: [] }); // platform-wide super admin: no single org to list
 
   const { rows } = await pool.query(
     `SELECT d.id, d.title, d.category, d.filename, d.mime_type, d.file_size_bytes,
@@ -131,16 +127,10 @@ router.get('/', auth, requireRole('trainer', 'super_admin'), async (req, res) =>
    "search". Those are DELETE and POST today, so there is no collision yet;
    this is about the GET /:id somebody adds next year.
 
-   ── Why requireStaff, when managing the library is admin/manager ────────────
+   ── Why requireTrainer ──────────────────────────────────────────────────────
 
-   Uploading, deleting and reindexing are custodial acts over a shared
-   resource, and they stay restricted. READING what a policy says is what the
-   policy is for. The people who need "how long is the notice period?" mid-shift
-   are trainers and reception, and gating retrieval to admin/manager would leave
-   the knowledge base useful only to the two roles least likely to be asking.
-
-   `member` is still excluded — these are internal SOPs, guides and policies,
-   and requireStaff is the same allow-list guarding /api/pt-os.
+   These are the studio's internal SOPs, guides and policies: the trainer's.
+   `member` is excluded, with the same guard that protects /api/pt-os.
 
    ── What it deliberately does NOT do ────────────────────────────────────────
 
@@ -152,16 +142,14 @@ router.get('/', auth, requireRole('trainer', 'super_admin'), async (req, res) =>
 const MAX_QUERY_CHARS = 500;
 const MAX_TOP_K = 10;
 
-router.get('/search', auth, requireStaff, async (req, res) => {
+router.get('/search', auth, requireTrainer, async (req, res) => {
   const scope = tenantScope(req);
   // Retrieval is per-studio by definition — the chunks table is partitioned by
-  // organization_id and a similarity search across every tenant on the platform
-  // is not a thing anyone should be able to run. A platform-wide super admin
-  // has no single org to search, so this is empty rather than everything.
-  // Mirrors GET / above, and retrieveContext() itself fails closed the same way
-  // on a null organizationId.
-  if (!scope.applyFilter) {
-    return res.json({ data: { chunks: [], documents_available: 0, scope: 'platform' } });
+  // organization_id and a similarity search across every tenant on the
+  // platform is not a thing anyone should be able to run. retrieveContext()
+  // fails closed on a null organizationId as well.
+  if (!scope.orgId) {
+    return res.json({ data: { chunks: [], documents_available: 0 } });
   }
 
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
@@ -232,11 +220,11 @@ router.get('/search', auth, requireStaff, async (req, res) => {
 /* ═══════════════════════════════════════════════════════════════════════════
    DELETE /api/ai/knowledge/:id
    ═══════════════════════════════════════════════════════════════════════════ */
-router.delete('/:id', auth, requireRole('trainer', 'super_admin'), async (req, res) => {
+router.delete('/:id', auth, requireTrainer, async (req, res) => {
   const scope = tenantScope(req);
   const params = [req.params.id];
   let orgClause = '';
-  if (scope.applyFilter) { params.push(scope.orgId); orgClause = ' AND organization_id = $2'; }
+  params.push(scope.orgId); orgClause = ' AND organization_id = $2';
 
   const { rows } = await pool.query(`SELECT id FROM ai_documents WHERE id = $1${orgClause}`, params);
   if (!rows.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Document not found' } });
@@ -248,16 +236,16 @@ router.delete('/:id', auth, requireRole('trainer', 'super_admin'), async (req, r
 /* ═══════════════════════════════════════════════════════════════════════════
    POST /api/ai/knowledge/:id/reindex — re-run extraction+chunking+embedding
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/:id/reindex', auth, requireRole('trainer', 'super_admin'), async (req, res) => {
+router.post('/:id/reindex', auth, requireTrainer, async (req, res) => {
   const scope = tenantScope(req);
   const params = [req.params.id];
   let orgClause = '';
-  if (scope.applyFilter) { params.push(scope.orgId); orgClause = ' AND organization_id = $2'; }
+  params.push(scope.orgId); orgClause = ' AND organization_id = $2';
 
   const { rows } = await pool.query(`SELECT id FROM ai_documents WHERE id = $1${orgClause}`, params);
   if (!rows.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Document not found' } });
 
-  await pool.query(`UPDATE ai_documents SET status = 'processing', error_message = NULL, updated_at = NOW() WHERE id = $1`, [req.params.id]);
+  await pool.query(`UPDATE ai_documents SET status = 'processing', error_message = NULL, updated_at = NOW() WHERE id = $1 AND organization_id = $2`, [req.params.id, scope.orgId]);
   res.json({ message: 'Reindexing started' });
 
   const { dispatchAiJob } = require('../services/ai.service');

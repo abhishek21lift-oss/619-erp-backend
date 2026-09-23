@@ -1,7 +1,12 @@
 const router = require('express').Router();
 const pool = require('../db/pool');
-const { auth } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+
+// The studio's expenses belong to the studio, and the trainer owns it: every
+// row in the organization, not only the ones this account created. The guard
+// travels with the router (the mount in server.js carries studioGate too).
+router.use(auth, requireTrainer);
 
 // GET /api/expenses — list expenses with optional filters
 // ISSUE-030: excludes soft-deleted rows (deleted_at IS NULL).
@@ -12,18 +17,13 @@ router.get('/', auth, async (req, res, next) => {
     const params = [];
     let p = 1;
 
-    if (req.user.role === 'trainer') {
-      conditions.push(`created_by = $${p++}`);
-      params.push(req.user.id);
-    }
-
     if (from)     { conditions.push(`expense_date >= $${p++}`); params.push(from); }
     if (to)       { conditions.push(`expense_date <= $${p++}`); params.push(to); }
     if (category) { conditions.push(`category = $${p++}`);      params.push(category); }
     if (status)   { conditions.push(`status = $${p++}`);        params.push(status); }
 
     const scope = tenantScope(req);
-    if (scope.applyFilter) { conditions.push(`e.organization_id = $${p++}`); params.push(scope.orgId); }
+    conditions.push(`e.organization_id = $${p++}`); params.push(scope.orgId);
 
     params.push(Math.min(parseInt(qLimit) || 200, 1000));
     params.push(parseInt(offset) || 0);
@@ -58,19 +58,11 @@ router.get('/stats', auth, async (req, res, next) => {
     const params = [];
     let p = 1;
 
-    // Canonical with GET / list: trainers see only expenses they created.
-    // (The list endpoint has this clamp; stats was missing it and returned
-    // studio-wide totals to any trainer session.)
-    if (req.user.role === 'trainer') {
-      conditions.push(`e.created_by = $${p++}`);
-      params.push(req.user.id);
-    }
-
     if (from) { conditions.push(`expense_date >= $${p++}`); params.push(from); }
     if (to)   { conditions.push(`expense_date <= $${p++}`); params.push(to); }
 
     const scope = tenantScope(req);
-    if (scope.applyFilter) { conditions.push(`e.organization_id = $${p++}`); params.push(scope.orgId); }
+    conditions.push(`e.organization_id = $${p++}`); params.push(scope.orgId);
 
     const { rows: totals } = await pool.query(
       `SELECT
@@ -133,13 +125,13 @@ router.post('/', auth, async (req, res, next) => {
 router.get('/:id', auth, async (req, res, next) => {
   try {
     const scope = tenantScope(req);
-    const guard = scope.applyFilter ? ' AND e.organization_id = $2' : '';
+    const guard = ' AND e.organization_id = $2';
     const { rows } = await pool.query(
       `SELECT e.*, u.name AS created_by_name
        FROM expenses e
        LEFT JOIN users u ON u.id = e.created_by
        WHERE e.id = $1 AND e.deleted_at IS NULL${guard}`,
-      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+      [req.params.id, scope.orgId]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Expense not found' });
     res.json(rows[0]);
@@ -153,17 +145,12 @@ router.get('/:id', auth, async (req, res, next) => {
 router.put('/:id', auth, async (req, res, next) => {
   try {
     const scope = tenantScope(req);
-    const existGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+    const existGuard = ' AND organization_id = $2';
     const { rows: existing } = await pool.query(
       'SELECT * FROM expenses WHERE id = $1 AND deleted_at IS NULL' + existGuard,
-      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+      [req.params.id, scope.orgId]
     );
     if (!existing[0]) return res.status(404).json({ error: 'Expense not found' });
-
-    // Only the creator or admin/manager can edit
-    if (req.user.role === 'trainer' && existing[0].created_by !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
 
     const fields = [];
     const params = [req.params.id];
@@ -179,8 +166,9 @@ router.put('/:id', auth, async (req, res, next) => {
 
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
 
+    params.push(scope.orgId);
     const { rows } = await pool.query(
-      `UPDATE expenses SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $1 RETURNING *`,
+      `UPDATE expenses SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $1 AND organization_id = $${idx} RETURNING *`,
       params
     );
     res.json({ message: 'Expense updated', expense: rows[0] });
@@ -194,18 +182,14 @@ router.put('/:id', auth, async (req, res, next) => {
 router.delete('/:id', auth, async (req, res, next) => {
   try {
     const scope = tenantScope(req);
-    const existGuard = scope.applyFilter ? ' AND organization_id = $2' : '';
+    const existGuard = ' AND organization_id = $2';
     const { rows: existing } = await pool.query(
       'SELECT * FROM expenses WHERE id = $1 AND deleted_at IS NULL' + existGuard,
-      scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id]
+      [req.params.id, scope.orgId]
     );
     if (!existing[0]) return res.status(404).json({ error: 'Expense not found' });
 
-    if (req.user.role === 'trainer' && existing[0].created_by !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    await pool.query('UPDATE expenses SET deleted_at = NOW() WHERE id = $1', [req.params.id]);
+    await pool.query('UPDATE expenses SET deleted_at = NOW() WHERE id = $1 AND organization_id = $2', [req.params.id, scope.orgId]);
     res.json({ message: 'Expense deleted' });
   } catch (err) {
     next(err);

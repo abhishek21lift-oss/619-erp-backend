@@ -49,11 +49,8 @@ const USER = { id: 'usr-sa', email: 'sa@example.test', role: 'super_admin', orga
 let mockUser = USER;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
   computeAccess: () => ({ allowed: true, state: 'active' }),
   invalidateUserCache: jest.fn(),
 }));

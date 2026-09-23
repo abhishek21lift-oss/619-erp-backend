@@ -1,7 +1,7 @@
 // src/modules/notifications/notifications.routes.js
 const router = require('express').Router();
 const { auth } = require('../../middleware/auth');
-const { requireRole } = require('../../middleware/rbac');
+const { requireTrainer } = require('../../middleware/rbac');
 const svc = require('./notifications.service');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -24,8 +24,8 @@ router.patch('/:id/read', auth, wrap(async (req, res) => {
   res.status(204).end();
 }));
 
-// POST /api/v1/notifications/broadcast  — admin only
-router.post('/broadcast', auth, requireRole('admin','manager'), wrap(async (req, res) => {
+// POST /api/v1/notifications/broadcast  — the studio trainer
+router.post('/broadcast', auth, requireTrainer, wrap(async (req, res) => {
   const { type, member_ids, data, channels } = req.body;
   const sent = [];
   for (const mid of member_ids || []) {

@@ -34,14 +34,11 @@ jest.mock('../db/pool', () => ({ query: jest.fn(), connect: jest.fn() }));
 
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => {
-    req.user = { id: 'u1', name: 'Op', role: 'admin', organization_id: '11111111-1111-1111-1111-111111111111' };
+    req.user = { id: 'u1', name: 'Op', role: 'trainer', organization_id: '11111111-1111-1111-1111-111111111111' };
     next();
   },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
 }));
 
 const request = require('supertest');

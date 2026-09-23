@@ -8,8 +8,7 @@ jest.mock('../modules/command-center', () => ({
 }));
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = { id: 'op-1', name: 'Owner', role: 'super_admin' }; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
   invalidateUserCache: jest.fn(),
 }));
 

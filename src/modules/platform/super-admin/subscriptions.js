@@ -722,10 +722,10 @@ router.post('/subscription-requests/:id/approve', async (req, res, next) => {
         amount_inr: result.request.amount_inr, plan_code: result.request.plan_code,
       });
 
-    // Tell the studio's admins their subscription is live.
+    // Tell the studio's trainer their subscription is live.
     try {
       const { rows: admins } = await pool.query(
-        `SELECT id FROM users WHERE organization_id=$1 AND role='admin' AND is_active=true`,
+        `SELECT id FROM users WHERE organization_id=$1 AND role='trainer' AND is_active=true AND deleted_at IS NULL`,
         [result.request.organization_id]
       );
       for (const a of admins) {
@@ -755,7 +755,7 @@ router.post('/subscription-requests/:id/reject', async (req, res, next) => {
 
     try {
       const { rows: admins } = await pool.query(
-        `SELECT id FROM users WHERE organization_id=$1 AND role='admin' AND is_active=true`,
+        `SELECT id FROM users WHERE organization_id=$1 AND role='trainer' AND is_active=true AND deleted_at IS NULL`,
         [result.request.organization_id]
       );
       for (const a of admins) {

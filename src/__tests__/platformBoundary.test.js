@@ -35,7 +35,7 @@ const {
 } = platformAuth;
 
 const OPERATOR = { id: 'usr-operator', role: 'super_admin', organization_id: null };
-const TENANT_ADMIN = { id: 'usr-owner', role: 'admin', organization_id: 'org-a' };
+const TENANT_ADMIN = { id: 'usr-owner', role: 'trainer', organization_id: 'org-a' };
 const TRAINER = { id: 'usr-trainer', role: 'trainer', organization_id: 'org-a' };
 
 /**

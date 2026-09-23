@@ -99,18 +99,11 @@ function normaliseKey(req, res) {
  * caller's organization.
  *
  * Fails closed: an unparseable key, a missing row, or a row in another org all
- * deny. A platform super_admin operating without a target org (applyFilter
- * false) is allowed through, consistent with tenantScope() everywhere else.
+ * deny. There is no unrestricted caller: tenantScope() always scopes to the
+ * account's own organization.
  */
 async function callerOwnsRecord(req, category, key) {
   const scope = tenantScope(req);
-
-  // A platform super admin operating platform-wide is unrestricted, consistent
-  // with tenantScope() everywhere else. Hoisted here so it is stated once
-  // instead of repeated per branch, and so the unknown-category denial below
-  // cannot accidentally lock the platform console out of a category it is the
-  // only caller for.
-  if (!scope.applyFilter) return true;
 
   // Portfolio media is resolved by KEY, not by an id parsed out of the
   // filename. A before/after row owns two objects and each carries its own

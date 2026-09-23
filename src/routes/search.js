@@ -19,9 +19,14 @@
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
-const { auth } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
 const searchService = require('../modules/search/search.service');
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 // Search is called far more often than a normal endpoint — a 300ms debounce
 // still produces several requests per typed word — so it gets its own budget
@@ -46,17 +51,6 @@ router.get('/', auth, searchLimiter, async (req, res, next) => {
     // only way it gets a WHERE clause.
     const scope = tenantScope(req);
 
-    // A trainer sees only their own roster. This is narrower than the org
-    // filter and is applied in addition to it, never instead of it. Admins and
-    // managers get the whole studio, which is the existing rule everywhere else
-    // (see routes/clients.js).
-    const trainerId = req.user.role === 'trainer' ? (req.user.trainer_id || null) : null;
-    // A trainer whose account has no trainer record must not fall through to
-    // the whole studio. Fail closed.
-    if (req.user.role === 'trainer' && !trainerId) {
-      return res.json({ data: { query: String(req.query.q || ''), groups: [], took_ms: 0 } });
-    }
-
     // Optional filter, for callers that want one entity type (e.g. a picker
     // reusing this endpoint). Unknown names are simply ignored by the service.
     const types = typeof req.query.types === 'string'
@@ -66,12 +60,9 @@ router.get('/', auth, searchLimiter, async (req, res, next) => {
     const data = await searchService.search({
       query: req.query.q,
       scope,
-      trainerId,
       // AI conversations are personal, not organizational, so that provider
-      // scopes on the user rather than the org. Role gates the groups a
-      // trainer is not offered at all (see PROVIDERS).
+      // scopes on the user rather than the org.
       userId: req.user.id,
-      role: req.user.role,
       limit: req.query.limit,
       types,
     });

@@ -122,20 +122,12 @@ describeIf('automation tenancy, against a real database', () => {
   });
 
   describe('the permission lookup', () => {
-    test("Studio A cannot see Studio B's grant, even naming B's trainer directly", async () => {
-      // Trainer ids are unique platform-wide, so matching on the id alone
-      // WOULD find B's row. The org in the WHERE is the only thing stopping
-      // it, and a grant is an authorisation record — so this is a bypass, not
-      // a data leak.
-      expect(await repo.trainerIsGranted(ORG_A, 'auto-trainer-b')).toBe(false);
-      expect(await repo.trainerIsGranted(ORG_B, 'auto-trainer-a')).toBe(false);
-    });
-
-    test('each studio sees its own grant', async () => {
-      // The other half. A check that answers "no" to everything is not a
-      // permission system, and would pass the test above.
-      expect(await repo.trainerIsGranted(ORG_A, 'auto-trainer-a')).toBe(true);
-      expect(await repo.trainerIsGranted(ORG_B, 'auto-trainer-b')).toBe(true);
+    // The per-trainer grant is gone with the staff roles; the studio switch
+    // (whatsapp_automation_settings, tenanted from its first row) is the whole
+    // permission, and nothing in the repository reads the old grants table.
+    test('the repository no longer exposes a per-trainer grant', () => {
+      expect(repo.trainerIsGranted).toBeUndefined();
+      expect(repo.grantTrainer).toBeUndefined();
     });
 
     test('a studio with no settings row defaults to closed', async () => {
@@ -151,7 +143,7 @@ describeIf('automation tenancy, against a real database', () => {
       expect(await repo.clientRecipient(ORG_A, 'auto-client-b')).toBeNull();
     });
 
-    test('and can resolve its own, with the trainer whose permission governs it', async () => {
+    test('and can resolve its own, with its trainer profile', async () => {
       const own = await repo.clientRecipient(ORG_A, 'auto-client-a');
       expect(own).toMatchObject({ id: 'auto-client-a', trainer_id: 'auto-trainer-a' });
       expect(own.phone).toBe('+919000000001');

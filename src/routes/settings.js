@@ -5,9 +5,8 @@
 // It did not used to be. system_settings had no organization_id and none of
 // the queries below filtered, so all six studios in production shared one set
 // of 35 rows: studio name, business email, phone, address, the geofence that
-// gates check-in, and the perm_* role permissions. Any staff user read another
-// studio's; any admin overwrote it, because the upserts conflicted on `key`
-// alone.
+// gates check-in. Any studio could read another studio's, and overwrite it,
+// because the upserts conflicted on `key` alone.
 //
 // Migration 194 gave the table an organization_id, moved the primary key to
 // (organization_id, key) and swapped its RLS policy from shared-read to
@@ -20,22 +19,21 @@
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
-const { requireSuperAdmin } = require('../middleware/tenant');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
+
+// The studio trainer only. server.js mounts this router behind requireTrainer
+// too; declaring it here as well means the guard travels with the router and
+// cannot be lost if the mount is edited or the router is mounted again.
+router.use(auth, requireTrainer);
 
 /**
  * The org this request reads and writes settings for.
  *
- * Fails closed: a caller with no resolvable studio — including a platform
- * super admin who has not picked one — gets null, and every query below binds
- * that null so it matches no row and writes nothing. (orgIdOf() is
- * tenantScope().orgId; the scope's applyFilter flag is deliberately NOT
- * consulted, because "platform-wide" is the one mode this router must not
- * have — it would mean reading or writing every studio's settings at once.) Settings are per-studio
- * business configuration; there is no meaningful platform-wide view of them,
- * so "all studios at once" is not a mode this router offers.
+ * Fails closed: a caller with no resolvable studio gets null, and every query
+ * below binds that null so it matches no row and writes nothing. Settings are
+ * per-studio business configuration; there is no platform-wide view of them.
  */
 function settingsOrg(req) {
   return orgIdOf(req);
@@ -53,9 +51,9 @@ function requireOrg(req, res) {
   return orgId;
 }
 
-// GET /api/settings — List all settings
-// ISSUE-028: Non-admin users receive a filtered view that excludes
-// internal_, geo_, biometric_, and feature_ prefixed keys.
+// GET /api/settings — List all settings of the trainer's studio.
+// Members never reach this router (requireTrainer at the mount), so there is
+// no filtered "non-admin" view to serve.
 router.get('/', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
@@ -64,11 +62,7 @@ router.get('/', auth, async (req, res, next) => {
       [settingsOrg(req)]
     );
 
-    const isAdminLevel = ['trainer', 'admin', 'super_admin'].includes(req.user.role);
-    const RESTRICTED_PREFIXES = ['internal_', 'geo_', 'biometric_', 'feature_'];
-    const visibleRows = isAdminLevel
-      ? rows
-      : rows.filter(r => !RESTRICTED_PREFIXES.some(prefix => r.key.startsWith(prefix)));
+    const visibleRows = rows;
 
     const obj = {};
     for (const r of visibleRows) {
@@ -83,7 +77,7 @@ router.get('/', auth, async (req, res, next) => {
 });
 
 // PUT /api/settings — Bulk update settings
-router.put('/', auth, adminOnly, async (req, res, next) => {
+router.put('/', auth, requireTrainer, async (req, res, next) => {
   try {
     const orgId = requireOrg(req, res);
     if (!orgId) return;
@@ -155,7 +149,11 @@ router.get('/branches', auth, async (req, res, next) => {
               (value::jsonb)->>'name' AS name,
               (value::jsonb)->>'location' AS location,
               (value::jsonb)->>'status' AS status,
-              COALESCE((SELECT COUNT(*) FROM pt_clients WHERE branch_id = s.key AND deleted_at IS NULL), 0)::int AS member_count
+              -- pt_clients carries no branch_id, so no client is attributed to a
+              -- branch. The subquery that used to count them named a column that
+              -- does not exist (every call failed) and, had it existed, would have
+              -- counted clients of every studio sharing the same key.
+              0::int AS member_count
        FROM system_settings s
        WHERE s.organization_id = $1 AND s.key LIKE 'branch_%' AND s.type = 'json'
        ORDER BY s.key`,
@@ -168,7 +166,7 @@ router.get('/branches', auth, async (req, res, next) => {
 });
 
 // POST /api/settings/branches
-router.post('/branches', auth, adminOnly, async (req, res, next) => {
+router.post('/branches', auth, requireTrainer, async (req, res, next) => {
   try {
     const orgId = requireOrg(req, res);
     if (!orgId) return;
@@ -193,7 +191,7 @@ router.post('/branches', auth, adminOnly, async (req, res, next) => {
 });
 
 // PUT /api/settings/branches/:id
-router.put('/branches/:id', auth, adminOnly, async (req, res, next) => {
+router.put('/branches/:id', auth, requireTrainer, async (req, res, next) => {
   try {
     const orgId = requireOrg(req, res);
     if (!orgId) return;
@@ -237,7 +235,7 @@ router.put('/branches/:id', auth, adminOnly, async (req, res, next) => {
 // would leave those rows pointing at a key that no longer resolves, and they
 // would silently vanish from every per-branch view. A studio that wants the
 // branch out of the way without moving its members can PUT status:'inactive'.
-router.delete('/branches/:id', auth, adminOnly, async (req, res, next) => {
+router.delete('/branches/:id', auth, requireTrainer, async (req, res, next) => {
   try {
     const orgId = requireOrg(req, res);
     if (!orgId) return;
@@ -310,7 +308,7 @@ router.get('/gym', auth, async (req, res, next) => {
 });
 
 // PUT /api/settings/gym
-router.put('/gym', auth, adminOnly, async (req, res, next) => {
+router.put('/gym', auth, requireTrainer, async (req, res, next) => {
   try {
     const orgId = requireOrg(req, res);
     if (!orgId) return;
@@ -340,142 +338,13 @@ router.put('/gym', auth, adminOnly, async (req, res, next) => {
   }
 });
 
-// ── ROLE PERMISSIONS ─────────────────────────────────────────────────────────
-
-const PERM_KEYS = [
-  'perm_trainer_pt_module', 'perm_trainer_finance', 'perm_trainer_reports',
-  'perm_trainer_insights', 'perm_trainer_staff_view', 'perm_trainer_settings',
-  'perm_trainer_all_pt_clients', 'perm_trainer_commissions', 'perm_trainer_record_payment',
-  'perm_reception_pt_module', 'perm_reception_finance', 'perm_reception_reports',
-  'perm_reception_insights', 'perm_reception_settings', 'perm_reception_staff_view',
-  'perm_reception_record_payment',
-];
-
-const PERM_DEFAULTS = {
-  perm_trainer_pt_module: true,
-  perm_trainer_finance: false,
-  perm_trainer_reports: false,
-  perm_trainer_insights: false,
-  perm_trainer_staff_view: true,
-  perm_trainer_settings: false,
-  perm_trainer_all_pt_clients: false,
-  perm_trainer_commissions: true,
-  perm_trainer_record_payment: false,
-  perm_reception_pt_module: false,
-  perm_reception_finance: false,
-  perm_reception_reports: false,
-  perm_reception_insights: false,
-  perm_reception_settings: false,
-  perm_reception_staff_view: true,
-  perm_reception_record_payment: true,
-};
-
-// GET /api/settings/permissions
-router.get('/permissions', auth, async (req, res, next) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT key, value FROM system_settings
-        WHERE key = ANY($1::text[]) AND organization_id = $2`,
-      [PERM_KEYS, settingsOrg(req)]
-    );
-    const perms = { ...PERM_DEFAULTS };
-    for (const r of rows) {
-      perms[r.key] = r.value === 'true';
-    }
-    res.json({ permissions: perms, role: req.user.role });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// PUT /api/settings/permissions
-router.put('/permissions', auth, adminOnly, async (req, res, next) => {
-  try {
-    const orgId = requireOrg(req, res);
-    if (!orgId) return;
-    const updates = req.body;
-    if (!updates || typeof updates !== 'object')
-      return res.status(400).json({ error: 'Body must be a key-value object' });
-
-    const keys = PERM_KEYS.filter(k => updates[k] !== undefined);
-    if (keys.length) {
-      const strVals = keys.map(k => updates[k] ? 'true' : 'false');
-      // Role permissions are per-studio. Unscoped, an admin in one studio
-      // toggling perm_trainer_finance changed what trainers could reach in
-      // every other studio — a cross-tenant authorization change.
-      await pool.query(
-        `INSERT INTO system_settings (organization_id, key, value, updated_at)
-         SELECT $3, unnest($1::text[]), unnest($2::text[]), NOW()
-         ON CONFLICT (organization_id, key)
-         DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-        [keys, strVals, orgId]
-      );
-    }
-    res.json({ message: 'Permissions updated' });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET/PUT /api/settings/feature-flags
+// The per-role permission matrix (perm_trainer_* / perm_reception_*) is gone
+// with the staff roles: the trainer owns the studio and has every capability,
+// so there is nothing left to grant or withhold. Migration 208 deletes the
+// stored perm_* rows.
 //
-// `feature_flags` is a single, PLATFORM-WIDE table — no organization_id
-// column, one row per flag for the whole product (face_checkin,
-// voice_feedback, birthday_reminders, auto_expire). It used to be mounted
-// with the same `adminOnly` guard as the per-studio settings above, which
-// meant any studio's own admin — a role every self-serve trial signup gets —
-// could read and overwrite these flags for every other studio on the
-// platform in one request. That is a cross-tenant authorization defect
-// regardless of how small the toggle surface is: a hostile or careless
-// trial account could disable auto_expire or face_checkin platform-wide.
-// This is a platform-operator control, so it is gated the same way the
-// platform user-management endpoints in routes/auth.js are.
-router.get('/feature-flags', auth, requireSuperAdmin, async (req, res, next) => {
-  try {
-    const { rows } = await pool.query('SELECT key, value, description FROM feature_flags ORDER BY key');
-    const flags = {};
-    for (const r of rows) flags[r.key] = r.value;
-    res.json({ flags, raw: rows });
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.put('/feature-flags', auth, requireSuperAdmin, async (req, res, next) => {
-  try {
-    const updates = req.body;
-    if (!updates || typeof updates !== 'object')
-      return res.status(400).json({ error: 'Body must be a key-value object' });
-
-    const keys = Object.keys(updates);
-    if (!keys.length) return res.json({ message: 'Feature flags updated', updated: 0, requested: 0 });
-
-    // One statement, atomic by construction — the same shape PUT /permissions
-    // above uses for the same class of bulk key/value write.
-    //
-    // This was a `for` loop issuing one UPDATE per key with no transaction
-    // around it. A failure partway through (dropped connection, constraint
-    // error on flag 3 of 5) left flags 1-2 committed, 4-5 never attempted, and
-    // returned a single 500 that read as "nothing happened" — so the operator's
-    // next move was to retry a write that had already half-applied. Feature
-    // flags gate real functionality, so a half-applied set is a half-configured
-    // product, not a cosmetic problem.
-    const vals = keys.map((k) => Boolean(updates[k]));
-    const { rowCount } = await pool.query(
-      `UPDATE feature_flags AS f
-          SET value = v.value, updated_at = NOW()
-         FROM unnest($1::text[], $2::boolean[]) AS v(key, value)
-        WHERE f.key = v.key`,
-      [keys, vals]
-    );
-
-    // Report what actually changed. Unknown keys match no row and are skipped
-    // silently — true of the loop too — so returning the count lets a caller
-    // notice a typo instead of reading "updated" and believing it.
-    res.json({ message: 'Feature flags updated', updated: rowCount, requested: keys.length });
-  } catch (err) {
-    next(err);
-  }
-});
+// So are GET/PUT /feature-flags. They required super_admin behind a mount that
+// requires a trainer, so no request could ever reach them; the platform's
+// feature switches live in the Command Center (/api/platform/features).
 
 module.exports = router;

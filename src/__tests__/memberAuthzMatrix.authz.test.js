@@ -72,7 +72,7 @@ jest.mock('../middleware/auth', () => {
 
 const express = require('express');
 const request = require('supertest');
-const { requireStaff } = require('../middleware/rbac');
+const { requireTrainer } = require('../middleware/rbac');
 const { auth } = require('../middleware/auth');
 
 /**
@@ -130,7 +130,7 @@ const MEMBER_MAY = {
   'GET /api/ai/actions': 'Returns only the actions canRun() permits for the caller\'s role, so a member sees the member set.',
 
   // ── Deliberate non-answers that happen to use a 2xx status. ──────────────
-  'GET /api/diet/fitness-profile/1': "Answers null — not the row — when a member asks for an id that is not their own. A 200 carrying null is the refusal; the sibling PUT is now requireStaff outright.",
+  'GET /api/diet/fitness-profile/1': "Answers null — not the row — when a member asks for an id that is not their own. A 200 carrying null is the refusal; the sibling PUT is now requireTrainer outright.",
   'GET /api/invitations/track/1.gif': 'A tracking pixel. Always returns a 1x1 GIF regardless of the id, by design, and reads nothing back to the caller.',
   'GET /api/public/stats': 'The unauthenticated marketing surface. Public by definition and carries no studio or client rows.',
 };
@@ -148,7 +148,7 @@ function mountsFromServer() {
     out.push({
       mountPath: m[1].replace(/\/$/, ''),
       module: mod,
-      gated: /requireStaff|staffGate|requireRole|requireSuperAdmin|adminOnly|platformAuth|requireClient/.test(chain),
+      gated: /requireTrainer|studioGate|requireRole|requireSuperAdmin|adminOnly|platformAuth|requireClient/.test(chain),
     });
   }
   return out;
@@ -210,7 +210,7 @@ describe('the member authorization matrix', () => {
 
         const app = express();
         app.use(express.json());
-        app.use(mount.mountPath, ...(mount.gated ? [auth, requireStaff, router] : [router]));
+        app.use(mount.mountPath, ...(mount.gated ? [auth, requireTrainer, router] : [router]));
 
         const verb = route.method.toLowerCase();
         if (typeof request(app)[verb] !== 'function') continue;
@@ -254,13 +254,15 @@ describe('the member authorization matrix', () => {
 
   it('sees enough routes to be meaningful', () => {
     // A traversal that silently stops finding routes would pass vacuously.
+    // (391 when the staff-management surface — /api/trainers, /api/leave,
+    // commissions and payouts — was removed with the staff roles.)
     let total = 0;
     for (const mount of mounts) {
       let router;
       try { router = require(`../${mount.module.replace(/^\.\//, '')}`); } catch { continue; }
       total += routesOf(router).length;
     }
-    expect(total).toBeGreaterThan(400);
+    expect(total).toBeGreaterThan(350);
   });
 
   it('every exception is keyed by method and path, not by mount', () => {
@@ -291,7 +293,7 @@ describe('the four routes this file was written to catch', () => {
     app.use(mount, router);
     const res = await request(app)[verb](url).send({ progress_pct: 50 });
     expect(res.status).toBe(403);
-    expect(JSON.stringify(res.body)).toMatch(/staff/i);
+    expect(JSON.stringify(res.body)).toMatch(/trainer/i);
   });
 
   it.each(cases)('still admits a trainer: %s %s', async (verb, url, mod, mount) => {

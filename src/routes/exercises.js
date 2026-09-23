@@ -7,11 +7,17 @@
 // place to reason about permissions.
 //
 // PERMISSION MODEL
-//   admin / manager / super_admin  full access to every exercise
-//   trainer                        read all; create custom; edit only their own
-//   reception / member             read only
+//   built-in library (organization_id IS NULL)  read-only for every studio;
+//                                               nobody on the tenant plane may
+//                                               change it, because a change
+//                                               would reach every studio
+//   the studio's custom exercises               the trainer: create, edit,
+//                                               archive, delete
+//   member                                      read only
 //
-// Ownership is checked against the row, not the role alone — see canEdit().
+// Ownership is checked against the row's organization, not the role alone —
+// see canEdit() — and every by-id lookup goes through visibilityClause(), so
+// another studio's custom exercise is a 404, not a 403.
 
 const router = require('express').Router();
 const { randomUUID } = require('crypto');
@@ -21,25 +27,23 @@ const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 
 // ─── PERMISSIONS ──────────────────────────────────────────────
 
-const FULL_ACCESS = new Set(['super_admin', 'trainer', 'admin', 'manager']);
-
-/** May create a custom exercise at all. */
+/** May create a custom exercise at all: the studio's trainer. */
 function canCreate(user) {
-  return FULL_ACCESS.has(user?.role) || user?.role === 'trainer';
+  return user?.role === 'trainer' && Boolean(user.organization_id);
 }
 
 /**
  * May edit/archive/delete THIS row.
  *
- * A trainer owns what they authored and nothing else. Critically, nobody
- * except full-access roles may edit a built-in library exercise (one with a
- * source_id and no organization): a trainer editing "Barbell Squat" would
- * silently change it for every other studio on the platform.
+ * Only a custom exercise of the trainer's own studio. A built-in library row
+ * has no organization and is edited by nobody here: a trainer editing
+ * "Barbell Squat" would silently change it for every other studio on the
+ * platform.
  */
 function canEdit(user, row) {
-  if (FULL_ACCESS.has(user?.role)) return true;
-  if (user?.role !== 'trainer') return false;
-  return row.created_by === user.id && row.is_custom === true;
+  return user?.role === 'trainer'
+    && Boolean(row?.organization_id)
+    && String(row.organization_id) === String(user.organization_id);
 }
 
 function forbid(res, msg = 'You do not have permission to modify this exercise') {
@@ -83,32 +87,40 @@ const SORTS = {
  *   Built-in (organization_id IS NULL) — the 890-row seeded library, shared by
  *   every studio. Nobody owns these and everybody sees them.
  *
- *   Custom (organization_id set) — visible ONLY to the trainer who wrote it,
- *   and only inside their own organisation. A trainer's custom work is their
- *   own: their cues, their naming, their half-finished experiments. Another
- *   trainer in the same studio does not see them, and no other studio can
- *   reach them at all.
+ *   Custom (organization_id set) — visible only inside the studio that wrote
+ *   it. The studio has one trainer, who sees all of it; no other studio can
+ *   reach it at all.
  *
  * This replaced a three-way `visibility` column ('public' / 'organization' /
  * 'private') that let an author widen the audience. The column still exists —
  * dropping it is a migration for no gain — but nothing reads it any more, so
  * there is no value anyone could set that would share a custom exercise. The
- * ownership check is here rather than in the handlers precisely so list, count
- * and facet queries cannot drift apart about who may see what.
- *
- * created_by is NULL on the seeded rows, which is why the ownership test sits
- * inside the custom branch — a NULL author must never match a real user.
+ * check is here rather than in the handlers precisely so list, count, facet
+ * and by-id queries cannot drift apart about who may see what.
  */
 function visibilityClause(req, params) {
   const { orgId } = tenantScope(req);
   params.push(orgId);
   const orgP = `$${params.length}`;
-  params.push(req.user.id);
-  const userP = `$${params.length}`;
   return `(
             e.organization_id IS NULL
-            OR (e.organization_id = ${orgP}::uuid AND e.created_by = ${userP})
+            OR e.organization_id = ${orgP}::uuid
           )`;
+}
+
+/**
+ * The exercise with this id, if the caller may see it (built-in, or a custom
+ * exercise of their own studio); otherwise null. Every by-id route resolves
+ * through this before reading or writing anything keyed on the id.
+ */
+async function loadVisible(req, id, columns = 'e.id, e.created_by, e.is_custom, e.organization_id') {
+  const params = [id];
+  const vis = visibilityClause(req, params);
+  const { rows } = await pool.query(
+    `SELECT ${columns} FROM exercises e WHERE e.id = $1 AND e.deleted_at IS NULL AND ${vis}`,
+    params
+  );
+  return rows[0] || null;
 }
 
 /** Shared column list for list/detail responses. One list, one source. */
@@ -332,13 +344,15 @@ router.get('/meta', auth, async (req, res, next) => {
 
 router.get('/favorites', auth, async (req, res, next) => {
   try {
+    const params = [req.user.id];
+    const vis = visibilityClause(req, params);
     const { rows } = await pool.query(
       `SELECT ${EXERCISE_COLUMNS}, TRUE AS is_favorite
          ${EXERCISE_JOINS}
          JOIN exercise_favorites f ON f.exercise_id = e.id AND f.user_id = $1
-        WHERE e.deleted_at IS NULL
+        WHERE e.deleted_at IS NULL AND ${vis}
         ORDER BY f.created_at DESC LIMIT 200`,
-      [req.user.id]
+      params
     );
     res.json({ exercises: rows, total: rows.length });
   } catch (err) { next(err); }
@@ -350,16 +364,18 @@ router.get('/favorites', auth, async (req, res, next) => {
 router.get('/recent', auth, async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const params = [req.user.id, limit];
+    const vis = visibilityClause(req, params);
     const { rows } = await pool.query(
       `SELECT ${EXERCISE_COLUMNS}, r.use_count, r.used_at,
               EXISTS (SELECT 1 FROM exercise_favorites f
                        WHERE f.exercise_id = e.id AND f.user_id = $1) AS is_favorite
          ${EXERCISE_JOINS}
          JOIN exercise_recent_usage r ON r.exercise_id = e.id AND r.user_id = $1
-        WHERE e.deleted_at IS NULL AND e.archived_at IS NULL
+        WHERE e.deleted_at IS NULL AND e.archived_at IS NULL AND ${vis}
         ORDER BY r.used_at DESC, r.use_count DESC
         LIMIT $2`,
-      [req.user.id, limit]
+      params
     );
     res.json({ exercises: rows, total: rows.length });
   } catch (err) { next(err); }
@@ -441,6 +457,7 @@ router.get('/:id', auth, async (req, res, next) => {
 
 router.get('/:id/versions', auth, async (req, res, next) => {
   try {
+    if (!await loadVisible(req, req.params.id)) return res.status(404).json({ error: 'Exercise not found' });
     const { rows } = await pool.query(
       `SELECT v.id, v.version, v.snapshot, v.change_summary, v.created_at,
               u.name AS changed_by_name
@@ -568,10 +585,7 @@ router.put('/:id', auth, async (req, res, next) => {
     // correctly. It stays outside the write transaction deliberately — that is
     // where it already was, and moving BEGIN above it would leave an open
     // transaction on every early return below.
-    const { rows: existing } = await pool.query(
-      'SELECT id, created_by, is_custom, organization_id FROM exercises WHERE id = $1 AND deleted_at IS NULL',
-      [req.params.id]
-    );
+    const existing = [await loadVisible(req, req.params.id)].filter(Boolean);
     if (!existing[0]) return res.status(404).json({ error: 'Exercise not found' });
     if (!canEdit(req.user, existing[0])) return forbid(res);
 
@@ -630,8 +644,10 @@ router.put('/:id', auth, async (req, res, next) => {
 
     if (sets.length) {
       params.push(req.params.id);
+      const idP = params.length;
+      params.push(req.user.organization_id);
       await client.query(
-        `UPDATE exercises SET ${sets.join(', ')} WHERE id = $${params.length}`,
+        `UPDATE exercises SET ${sets.join(', ')} WHERE id = $${idP} AND organization_id = $${params.length}`,
         params
       );
     }
@@ -671,9 +687,10 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
     // the BEGIN, so on a borrowed client it would carry no app.org_id and
     // duplicating your own custom exercise would 404 while duplicating a
     // built-in still worked.
-    const { rows: src } = await pool.query(
-      'SELECT * FROM exercises WHERE id = $1 AND deleted_at IS NULL', [req.params.id]
-    );
+    // Only an exercise the caller can see may be copied: the built-in library
+    // or their own studio's. Another studio's custom exercise is its private
+    // work and must not be readable by duplicating it.
+    const src = [await loadVisible(req, req.params.id, 'e.*')].filter(Boolean);
     if (!src[0]) return res.status(404).json({ error: 'Exercise not found' });
 
     await client.query('BEGIN');
@@ -738,18 +755,15 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
 
 router.post('/:id/archive', auth, async (req, res, next) => {
   try {
-    const { rows: existing } = await pool.query(
-      'SELECT id, created_by, is_custom FROM exercises WHERE id = $1 AND deleted_at IS NULL',
-      [req.params.id]
-    );
-    if (!existing[0]) return res.status(404).json({ error: 'Exercise not found' });
-    if (!canEdit(req.user, existing[0])) return forbid(res);
+    const existing = await loadVisible(req, req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Exercise not found' });
+    if (!canEdit(req.user, existing)) return forbid(res);
 
     const archive = req.body?.archived !== false;
     const { rows } = await pool.query(
       `UPDATE exercises SET archived_at = ${archive ? 'NOW()' : 'NULL'}, updated_by = $1
-        WHERE id = $2 RETURNING id, archived_at`,
-      [req.user.id, req.params.id]
+        WHERE id = $2 AND organization_id = $3 RETURNING id, archived_at`,
+      [req.user.id, req.params.id, req.user.organization_id]
     );
     res.json({ message: archive ? 'Exercise archived' : 'Exercise restored', exercise: rows[0] });
   } catch (err) { next(err); }
@@ -765,12 +779,9 @@ router.post('/:id/archive', auth, async (req, res, next) => {
 
 router.delete('/:id', auth, async (req, res, next) => {
   try {
-    const { rows: existing } = await pool.query(
-      'SELECT id, created_by, is_custom FROM exercises WHERE id = $1 AND deleted_at IS NULL',
-      [req.params.id]
-    );
-    if (!existing[0]) return res.status(404).json({ error: 'Exercise not found' });
-    if (!canEdit(req.user, existing[0])) return forbid(res);
+    const existing = await loadVisible(req, req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Exercise not found' });
+    if (!canEdit(req.user, existing)) return forbid(res);
 
     const { rows: used } = await pool.query(
       `SELECT (SELECT COUNT(*)::int FROM workout_exercises WHERE exercise_id = $1) AS in_plans,
@@ -779,8 +790,8 @@ router.delete('/:id', auth, async (req, res, next) => {
     );
 
     await pool.query(
-      `UPDATE exercises SET deleted_at = NOW(), is_active = FALSE, updated_by = $1 WHERE id = $2`,
-      [req.user.id, req.params.id]
+      `UPDATE exercises SET deleted_at = NOW(), is_active = FALSE, updated_by = $1 WHERE id = $2 AND organization_id = $3`,
+      [req.user.id, req.params.id, req.user.organization_id]
     );
 
     res.json({
@@ -794,6 +805,7 @@ router.delete('/:id', auth, async (req, res, next) => {
 
 router.post('/:id/favorite', auth, async (req, res, next) => {
   try {
+    if (!await loadVisible(req, req.params.id)) return res.status(404).json({ error: 'Exercise not found' });
     const on = req.body?.favorite !== false;
     if (on) {
       await pool.query(
@@ -816,6 +828,7 @@ router.post('/:id/favorite', auth, async (req, res, next) => {
 
 router.post('/:id/use', auth, async (req, res, next) => {
   try {
+    if (!await loadVisible(req, req.params.id)) return res.status(404).json({ error: 'Exercise not found' });
     await pool.query(
       `INSERT INTO exercise_recent_usage (user_id, exercise_id, use_count, used_at)
        VALUES ($1, $2, 1, NOW())

@@ -25,10 +25,9 @@ router.use(auth);
 router.get('/', async (req, res, next) => {
   try {
     const orgId = req.user?.organization_id;
-    // A platform operator is not inside a tenant, so there is no per-studio
-    // answer to give. Returning an empty map rather than 403 keeps a shared
-    // client component from having to special-case the operator.
-    if (!orgId || req.user.role === 'super_admin') return res.json({ data: {} });
+    // No studio, no per-studio answer: an empty map rather than a 403 keeps a
+    // shared client component from having to special-case it.
+    if (!orgId) return res.json({ data: {} });
 
     const { rows } = await pool.query('SELECT plan_code FROM organizations WHERE id = $1', [orgId]);
     const map = await featuresLib.mapForOrg(orgId, rows[0]?.plan_code || null);

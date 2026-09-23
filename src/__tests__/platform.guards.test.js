@@ -20,7 +20,7 @@ const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 
 const ADMIN = {
-  id: 'usr-admin', name: 'Studio Admin', email: 'a@x.com', role: 'admin',
+  id: 'usr-admin', name: 'Studio Admin', email: 'a@x.com', role: 'trainer',
   organization_id: '11111111-1111-1111-1111-111111111111',
   token_version: 1, is_active: true, deleted_at: null,
 };

@@ -54,7 +54,10 @@ function queryWith(...needles) {
   return hits[0];
 }
 
-const enrolledQuery = () => queryWith('preferred_training_days', 'string_to_array');
+// 'c.preferred_training_days' — the ops summary's alias — rather than the bare
+// column: the Today roster's query (alias c2) carries the same day-token match
+// and is a different query.
+const enrolledQuery = () => queryWith('replace(c.preferred_training_days', 'string_to_array');
 
 describe('the enrolled-today query', () => {
   it('exists at all', () => {
@@ -126,10 +129,12 @@ describe('getOpsSummary contract', () => {
     expect(SRC).toContain('today_sessions, today_unscheduled, today_enrolled');
   });
 
-  it('passes the org id as the third parameter when filtering', () => {
+  it('passes the org id as the third parameter, always', () => {
     // $1 today, $2 the day token, $3 the org — off-by-one here would compare
-    // an org id against a weekday and silently return nothing.
-    expect(SRC).toContain('apply ? [today, todayDay, scope.orgId] : [today, todayDay]');
+    // an org id against a weekday and silently return nothing. There is no
+    // unfiltered variant any more.
+    expect(SRC).toContain('[today, todayDay, scope.orgId]');
+    expect(SRC).not.toContain('apply ? [today, todayDay, scope.orgId]');
   });
 });
 
@@ -178,12 +183,12 @@ describe('the programme panel is derived, not a second query', () => {
     expect(roster).toContain('MIN(source_rank)');
   });
 
-  it('passes the trainer through, so the panel cannot outrank the roster', () => {
-    // Before the merge getOpsSummary took only a tenant scope, so a trainer's
-    // dashboard listed every client in the studio while the same question on
-    // /pt-os/today showed them only their own.
-    expect(SRC).toMatch(/async function getOpsSummary\(scope = \{\}, trainerId = null\)/);
-    expect(SRC).toContain('getTodayRoster({ date: today, scope, trainerId })');
+  it('derives the programme panel from the same roster, over the same studio', () => {
+    // The trainer owns the studio, so the dashboard and /pt-os/today answer
+    // the same question over the same rows: the whole studio, and no roster
+    // narrowing on either side.
+    expect(SRC).toMatch(/async function getOpsSummary\(scope = \{\}\)/);
+    expect(SRC).toContain('getTodayRoster({ date: today, scope })');
   });
 
   it('carries the mobile, so the coach card can message rather than only link', () => {

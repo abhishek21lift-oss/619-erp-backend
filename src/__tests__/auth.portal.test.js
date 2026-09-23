@@ -1,6 +1,6 @@
 // Two sign-in doors, and the rule that keeps them apart.
 //
-// Admin Login (/login) is for the people who run a studio. Member Login
+// Trainer Login (/login) is for the studio's trainer. Member Login
 // (/member-login) is for clients. Each refuses the other's accounts.
 //
 // The whole point of these tests is that the separation is NOT the two pages.
@@ -58,7 +58,7 @@ beforeEach(() => {
 });
 
 describe('Member Login refuses studio accounts', () => {
-  it.each(['admin', 'trainer', 'manager', 'super_admin'])('refuses %s', async (role) => {
+  it.each(['trainer', 'super_admin'])('refuses %s', async (role) => {
     pool.query.mockResolvedValueOnce({ rows: [row(role)] });
 
     const res = await signIn({ portal: 'member' });
@@ -77,7 +77,7 @@ describe('Member Login refuses studio accounts', () => {
   });
 });
 
-describe('Admin Login refuses member accounts', () => {
+describe('Trainer Login refuses member accounts', () => {
   it('refuses a member', async () => {
     pool.query.mockResolvedValueOnce({ rows: [row('member')] });
 
@@ -88,10 +88,37 @@ describe('Admin Login refuses member accounts', () => {
     expect(res.headers['set-cookie']).toBeUndefined();
   });
 
-  it.each(['admin', 'trainer', 'manager'])('admits %s', async (role) => {
-    pool.query.mockResolvedValue({ rows: [row(role)] });
-    const res = await signIn({ portal: 'staff' });
+  it.each(['trainer', 'staff'])('admits the trainer through portal=%s', async (portal) => {
+    // 'staff' is the door's legacy wire name, still sent by installed Android
+    // builds; validation.js normalises it to 'trainer'. It names a door, not a
+    // role, and admits nobody the trainer door would not.
+    pool.query.mockResolvedValue({ rows: [row('trainer')] });
+    const res = await signIn({ portal });
     expect(res.status).toBe(200);
+  });
+});
+
+describe('the removed staff roles cannot sign in at all', () => {
+  // users_role_check (migration 208) makes such a row impossible. If one
+  // slipped through it gets no session at any door — rather than being
+  // promoted, which is what normalizeRole() used to do.
+  it.each([
+    ['admin', 'trainer'], ['manager', 'trainer'], ['reception', 'trainer'],
+    ['staff', 'trainer'], ['admin', 'member'], ['admin', 'platform'],
+  ])('%s at the %s door', async (role, portal) => {
+    pool.query.mockResolvedValueOnce({ rows: [row(role)] });
+    const res = await signIn({ portal });
+    expect(res.status).toBe(403);
+    expect(res.headers['set-cookie']).toBeUndefined();
+    expect(res.body.token).toBeUndefined();
+  });
+
+  it('a trainer row with no studio gets no session either', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [row('trainer', { organization_id: null })] });
+    const res = await signIn({ portal: 'trainer' });
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('ACCOUNT_MISCONFIGURED');
+    expect(res.headers['set-cookie']).toBeUndefined();
   });
 });
 
@@ -123,10 +150,10 @@ describe('the check is not something the client can skip', () => {
     expect(res.status).not.toBe(200);
   });
 
-  it('still lets staff in when portal is omitted, so existing callers keep working', async () => {
+  it('still lets the trainer in when portal is omitted, so existing callers keep working', async () => {
     // The mobile app on /api/v1/auth/login and every saved bookmark send no
     // portal. They must behave exactly as before this change.
-    pool.query.mockResolvedValue({ rows: [row('admin')] });
+    pool.query.mockResolvedValue({ rows: [row('trainer')] });
     const res = await signIn({});
     expect(res.status).toBe(200);
   });
@@ -138,7 +165,7 @@ describe('the wrong door does not become an account oracle', () => {
     // any address with a junk password would distinguish "no such account"
     // from "exists, and is staff" — handing an attacker a way to enumerate
     // both membership and role without ever knowing a password.
-    pool.query.mockResolvedValueOnce({ rows: [row('admin')] });
+    pool.query.mockResolvedValueOnce({ rows: [row('trainer')] });
     const wrongPw = await request(app).post('/api/auth/login')
       .send({ email: 'a@b.com', password: 'not-the-password', portal: 'member' });
 
@@ -154,10 +181,10 @@ describe('the wrong door does not become an account oracle', () => {
   it('only reveals the mismatch once the password is proven', async () => {
     // With the correct password the caller already owns the account, so
     // telling them which door to use leaks nothing they do not know.
-    pool.query.mockResolvedValueOnce({ rows: [row('admin')] });
+    pool.query.mockResolvedValueOnce({ rows: [row('trainer')] });
     const res = await signIn({ portal: 'member' });
     expect(res.status).toBe(403);
-    expect(res.body.error.message).toMatch(/Admin Login/);
+    expect(res.body.error.message).toMatch(/Trainer Login/);
   });
 });
 
@@ -180,13 +207,13 @@ describe('the audit trail', () => {
     );
   });
 
-  it('records staff on Member Login as wrong_portal too', async () => {
-    pool.query.mockResolvedValueOnce({ rows: [row('admin')] });
+  it('records the trainer on Member Login as wrong_portal too', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [row('trainer')] });
     await signIn({ portal: 'member' });
 
     expect(loginEvents.record).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ outcome: 'wrong_portal', userId: 'usr-admin' }),
+      expect.objectContaining({ outcome: 'wrong_portal', userId: 'usr-trainer' }),
     );
   });
 
@@ -194,7 +221,7 @@ describe('the audit trail', () => {
     // Stated as a negative as well, because both branches passing the
     // positive check above would still allow an extra bad_password record
     // alongside it — which is what would actually pollute the audit trail.
-    for (const [role, portal] of [['member', 'staff'], ['admin', 'member']]) {
+    for (const [role, portal] of [['member', 'trainer'], ['trainer', 'member']]) {
       loginEvents.record.mockClear();
       pool.query.mockResolvedValueOnce({ rows: [row(role)] });
       await signIn({ portal });
@@ -239,12 +266,12 @@ describe('the Command Center door', () => {
   });
 
   it('refuses a studio account at the Command Center door', async () => {
-    pool.query.mockResolvedValueOnce({ rows: [row('admin')] });
+    pool.query.mockResolvedValueOnce({ rows: [row('trainer')] });
     pool.query.mockResolvedValue({ rows: [] });
     const res = await signIn({ portal: 'platform' });
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('WRONG_PORTAL');
-    expect(res.body.error.portal).toBe('staff');
+    expect(res.body.error.portal).toBe('trainer');
   });
 
   it('refuses a client at the Command Center door, pointing at the member door', async () => {

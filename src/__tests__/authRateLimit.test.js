@@ -167,7 +167,10 @@ describe('brute-force protection is stronger, not weaker', () => {
     const blocked = await failLogin(app, 'one-more@gym.example', '198.51.100.9');
     expect(blocked.status).toBe(429);
     expect(blocked.body.scope).toBe('address');
-  });
+    // One sequential request per unit of the address ceiling — 500 under
+    // NODE_ENV=test — which a slow runner does not finish inside jest's 5s
+    // default.
+  }, 90000);
 
   it('capitalisation does not buy a fresh budget', async () => {
     const { app, limits } = buildApp();
@@ -287,5 +290,8 @@ describe('concurrency', () => {
     ]);
 
     expect(responses.every((r) => r.status === 200)).toBe(true);
-  });
+    // A burst of full-stack requests. The property is "every one is a 200",
+    // not "they finish inside jest's 5s default" — which on a loaded runner
+    // they do not, the same reason the stuffing test above carries a budget.
+  }, 60000);
 });

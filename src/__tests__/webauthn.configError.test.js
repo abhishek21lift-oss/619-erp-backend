@@ -26,9 +26,7 @@ jest.mock('../lib/logger', () => ({
 jest.mock('../lib/loginEvents', () => ({ record: jest.fn() }));
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = { id: 'u1', email: 'a@b.c', name: 'A', organization_id: 'org1' }; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const express = require('express');

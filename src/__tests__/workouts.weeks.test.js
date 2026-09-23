@@ -161,8 +161,7 @@ jest.mock('../db/pool', () => {
 let mockUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../lib/screeningGate', () => ({
   checkScreeningGate: jest.fn(async () => ({ blocked: null, warnings: [] })),
@@ -176,7 +175,7 @@ const app = express();
 app.use(express.json());
 app.use('/api/workouts', require('../routes/workouts'));
 
-const ADMIN = { id: 'u-admin', role: 'admin', organization_id: ORG_A, trainer_id: null };
+const ADMIN = { id: 'u-admin', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 
 /** Week 1 Monday: squat 60kg, bench 40kg. The whole programme, as stored. */
 const seed = () => {

@@ -8,7 +8,7 @@
 //   GET /trainer-performance  every trainer on the platform, with their
 //                             incentive_rate and commission earned
 //
-// Both sat behind `requireStaff` (and adminOrManager for the second), which
+// Both sat behind `requireTrainer` (and adminOrManager for the second), which
 // are ROLE gates — they answer "may this person see a report", never "whose
 // report". So any staff account in any studio could read every other studio's
 // revenue, and any admin could read a competitor's trainer roster and pay.
@@ -32,15 +32,12 @@ jest.mock('../db/pool', () => ({ query: jest.fn() }));
 const ORG_A = '11111111-1111-1111-1111-111111111111';
 
 // The caller is a plain studio admin in ORG_A — the account that held the leak.
-let mockUser = { id: 'usr-1', role: 'admin', organization_id: ORG_A, trainer_id: null };
+let mockUser = { id: 'usr-1', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
 }));
 
 const request = require('supertest');
@@ -62,7 +59,7 @@ function lastCall() {
 beforeEach(() => {
   pool.query.mockReset();
   pool.query.mockResolvedValue({ rows: [], rowCount: 0 });
-  mockUser = { id: 'usr-1', role: 'admin', organization_id: ORG_A, trainer_id: null };
+  mockUser = { id: 'usr-1', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 });
 
 describe('GET /api/pt-os/revenue — tenant isolation', () => {
@@ -94,74 +91,17 @@ describe('GET /api/pt-os/revenue — tenant isolation', () => {
     expect(params).not.toContain('22222222-2222-2222-2222-222222222222');
   });
 
-  it('applies no filter for a platform super admin operating platform-wide', async () => {
-    // The one caller who is allowed to see every studio, consistent with
-    // tenantScope() everywhere else.
+  it('refuses the platform operator instead of reporting every studio at once', async () => {
+    // There used to be an unfiltered "platform-wide" case here. super_admin is
+    // not a studio role; the router refuses it before any query runs.
     mockUser = { id: 'ops-1', role: 'super_admin', organization_id: null };
-    await request(app).get('/api/pt-os/revenue').expect(200);
-    const { sql, params } = lastCall();
-
-    expect(sql).not.toMatch(/organization_id/);
-    expect(params).toHaveLength(0);
+    await request(app).get('/api/pt-os/revenue').expect(403);
   });
 });
 
-describe('GET /api/pt-os/trainer-performance — tenant isolation', () => {
-  it('scopes the trainer, and both joined arms', async () => {
-    // All three matter independently. A correctly-scoped trainer LEFT JOINed
-    // to an unscoped pt_payments still sums another studio's money into this
-    // studio's row — which reads as a reconciliation bug, not a leak, and so
-    // would be believed for a long time.
-    await request(app).get('/api/pt-os/trainer-performance').expect(200);
-    const { sql, params } = lastCall();
-
-    expect(sql).toMatch(/t\.organization_id = \$\d/);
-    expect(sql).toMatch(/c\.organization_id = \$\d/);
-    expect(sql).toMatch(/p\.organization_id = \$\d/);
-    expect(params.filter((p) => p === ORG_A)).toHaveLength(3);
-  });
-
-  it('constrains the joined tables in ON, not WHERE', async () => {
-    // A LEFT JOIN whose right-hand table is constrained in WHERE silently
-    // becomes an INNER JOIN. Every trainer with no clients yet — a new hire,
-    // the reason a studio opens this screen — would vanish from the report.
-    await request(app).get('/api/pt-os/trainer-performance').expect(200);
-    const { sql } = lastCall();
-
-    const joins = sql.split(/\n/).filter((l) => /LEFT JOIN/i.test(l));
-    expect(joins).toHaveLength(2);
-    for (const line of joins) expect(line).toMatch(/organization_id = \$\d/);
-
-    // ...and the statement's own WHERE clause carries only the trainer filter.
-    //
-    // Matched as a line that STARTS with WHERE, not the first `WHERE` in the
-    // text: the SELECT list is full of `FILTER (WHERE c.status = 'active')`
-    // aggregates, and searching for the keyword alone lands inside the first
-    // of those — which made a first draft of this test fail against correct SQL.
-    const where = sql.split(/\n/).find((l) => /^\s*WHERE\b/i.test(l));
-    expect(where).toBeDefined();
-    expect(where).toMatch(/t\.organization_id/);
-    expect(where).not.toMatch(/[cp]\.organization_id/);
-  });
-
-  it('qualifies every org column, so the JOIN cannot throw "ambiguous"', async () => {
-    // pt_trainers, pt_clients and pt_payments all carry organization_id, so an
-    // unqualified predicate here is a guaranteed 500 on every call. See
-    // ptOs.orgWhereQualified.test.js for the outage that rule came from.
-    await request(app).get('/api/pt-os/trainer-performance').expect(200);
-    const { sql } = lastCall();
-
-    for (const m of sql.matchAll(/(^|[^.\w])organization_id\s*=/g)) {
-      throw new Error(`unqualified organization_id in a JOINed query: ...${m[0]}`);
-    }
-  });
-
-  it('applies no filter for a platform super admin operating platform-wide', async () => {
-    mockUser = { id: 'ops-1', role: 'super_admin', organization_id: null };
-    await request(app).get('/api/pt-os/trainer-performance').expect(200);
-    const { sql, params } = lastCall();
-
-    expect(sql).not.toMatch(/organization_id/);
-    expect(params).toHaveLength(0);
+describe('GET /api/pt-os/trainer-performance', () => {
+  it('is gone with the staff roles — there is one trainer, so nobody to rank', async () => {
+    const res = await request(app).get('/api/pt-os/trainer-performance');
+    expect(res.status).toBe(404);
   });
 });

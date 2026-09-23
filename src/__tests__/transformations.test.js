@@ -116,11 +116,14 @@ describe('tenancy', () => {
     expect(sql.match(/c\.organization_id = \$1/g)).toHaveLength(2);
   });
 
-  it('a platform operator with no studio selected gets no filter and no stray param', async () => {
+  it('a scope with no studio still filters — and matches nothing', async () => {
+    // There is no platform-wide mode any more: even a scope claiming
+    // applyFilter:false is bound to its (null) org, so it returns no rows
+    // rather than every studio's clients.
     answer([]);
     await getTransformations({ applyFilter: false, orgId: null });
     const [sql, params] = pool.query.mock.calls[0];
-    expect(sql).not.toMatch(/organization_id/);
-    expect(params).toEqual([]);
+    expect(sql).toMatch(/c\.organization_id = \$1/);
+    expect(params).toEqual([null]);
   });
 });

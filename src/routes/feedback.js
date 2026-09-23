@@ -11,11 +11,11 @@
 // for scoping here for exactly that reason; organization_id is.
 const express = require('express');
 const pool = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { orgWhere, orgIdOf } = require('../lib/tenant-db');
 
 const router = express.Router();
-router.use(auth, adminOnly);
+router.use(auth, requireTrainer);
 
 // GET /api/feedback
 router.get('/', async (req, res, next) => {

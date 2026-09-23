@@ -21,7 +21,7 @@ jest.mock('../db/pool', () => {
 let mockUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOrManager: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
   adminManagerOrTrainer: (req, res, next) =>
     (['admin', 'manager', 'trainer'].includes(req.user?.role)
       ? next()
@@ -41,7 +41,7 @@ app.use('/api/workouts', require('../routes/workouts'));
 
 const ORG_A = '11111111-1111-1111-1111-111111111111';
 const PLAN = 'plan-1';
-const ADMIN_A = { id: 'u-admin', role: 'admin', organization_id: ORG_A, trainer_id: null };
+const ADMIN_A = { id: 'u-admin', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 const MEMBER_A = { id: 'u-mem', role: 'member', organization_id: ORG_A, trainer_id: null };
 
 const sqls = () => pool.query.mock.calls.map(([s]) => String(s).replace(/\s+/g, ' '));

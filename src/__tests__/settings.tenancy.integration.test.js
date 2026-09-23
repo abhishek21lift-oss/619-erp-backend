@@ -4,7 +4,7 @@
 // ── What was wrong ─────────────────────────────────────────────────────────
 //
 // routes/settings.js calls itself "Studio Settings CRUD" and is mounted
-// `auth, requireStaff`. system_settings had no organization_id, and not one of
+// `auth, requireTrainer`. system_settings had no organization_id, and not one of
 // its fourteen statements filtered by anything, so all six studios in
 // production shared one set of 35 rows.
 //

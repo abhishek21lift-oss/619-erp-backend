@@ -27,8 +27,9 @@ jest.mock('../modules/messaging/transport', () => ({
 const { findAction, canRun, listFor, deliver, clampInt, MAX_RECIPIENTS } =
   require('../modules/ai-actions/registry');
 
-const admin = { id: 'u1', role: 'admin', organization_id: 'org-1' };
-const trainer = { id: 'u2', role: 'trainer', organization_id: 'org-1' };
+// The studio's trainer runs the studio's outward actions; a member runs none.
+const admin = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
+const member = { id: 'u2', role: 'member', organization_id: 'org-1', pt_client_id: 'c-1' };
 const reqAs = (user, body = {}) => ({ user, body, headers: {} });
 
 beforeEach(() => {
@@ -39,12 +40,18 @@ beforeEach(() => {
 });
 
 describe('who may run an action', () => {
-  test('a trainer is not offered outward actions, and cannot run one', () => {
-    expect(listFor(trainer)).toEqual([]);
-    expect(canRun(findAction('renewal_reminders'), trainer)).toBe(false);
+  test('a member is not offered outward actions, and cannot run one', () => {
+    expect(listFor(member)).toEqual([]);
+    expect(canRun(findAction('renewal_reminders'), member)).toBe(false);
   });
 
-  test('an admin is', () => {
+  test('a removed staff role is not offered them either', () => {
+    for (const role of ['admin', 'manager', 'super_admin']) {
+      expect(listFor({ id: 'x', role, organization_id: 'org-1' })).toEqual([]);
+    }
+  });
+
+  test('the studio trainer is', () => {
     expect(listFor(admin).map((a) => a.id).sort())
       .toEqual(['dues_reminders', 'renewal_reminders']);
     expect(canRun(findAction('renewal_reminders'), admin)).toBe(true);
@@ -98,7 +105,7 @@ describe('recipients come from the server, scoped to the org', () => {
   test('an org-less tenant user filters on NULL, which matches nobody', async () => {
     mockQuery.mockResolvedValue({ rows: [] });
     await findAction('dues_reminders').resolve(
-      reqAs({ id: 'u9', role: 'admin', organization_id: null }), { min_balance: 1 },
+      reqAs({ id: 'u9', role: 'trainer', organization_id: null }), { min_balance: 1 },
     );
     const [sql, values] = mockQuery.mock.calls[0];
     expect(sql).toMatch(/organization_id = \$2/);

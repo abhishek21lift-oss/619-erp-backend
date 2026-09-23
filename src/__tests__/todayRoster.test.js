@@ -199,19 +199,16 @@ describe('client status', () => {
   });
 });
 
-describe('trainer ownership', () => {
-  it('is a property of the client, applied once', () => {
-    // Not per-source: a client belongs to a trainer regardless of why they
-    // are on today's list.
-    expect(SRC).toContain('AND c.trainer_id = $');
+describe('the studio is the unit — no per-coach narrowing', () => {
+  it('has no trainer filter left to apply', () => {
+    // The assistant-coach roster filter went with the staff roles: the
+    // trainer owns the studio and sees every client in it.
+    expect(SRC).not.toContain('AND c.trainer_id = $');
+    expect(SRC).not.toMatch(/getTodayRoster\(\{[^}]*trainerId/);
   });
 
-  it('reaches getOpsSummary too, so the dashboard cannot outrank the roster', () => {
-    // The dashboard's programme panel is derived from this rule now. Before
-    // the merge it had no trainer scoping at all, so a trainer's dashboard
-    // listed every client in the studio while /pt-os/today showed them only
-    // their own — the same question, two answers.
-    expect(SRC).toMatch(/getTodayRoster\(\{ date: today, scope, trainerId \}\)/);
+  it('reaches getOpsSummary with the same arguments, so the dashboard cannot outrank the roster', () => {
+    expect(SRC).toMatch(/getTodayRoster\(\{ date: today, scope \}\)/);
   });
 });
 
@@ -322,8 +319,10 @@ describe('tenancy', () => {
     expect(q).toContain('AND c2.organization_id =');
   });
 
-  it('still limits a plain trainer to their own clients', () => {
-    expect(SRC).toContain('AND c.trainer_id = $');
+  it('binds the outer client read to the organization as well', () => {
+    // The candidate ids are already scoped per source; the outer join is
+    // bound again so it can never resolve a client from another studio.
+    expect(q).toMatch(/JOIN pt_clients c ON c\.id = r\.client_id AND c\.deleted_at IS NULL AND c\.organization_id = \$4/);
   });
 });
 

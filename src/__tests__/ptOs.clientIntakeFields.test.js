@@ -42,12 +42,9 @@ jest.mock('../lib/subscription', () => ({
 
 const ORG_A = '11111111-1111-1111-1111-111111111111';
 jest.mock('../middleware/auth', () => ({
-  auth: (req, _res, next) => { req.user = { id: 'u1', role: 'admin', organization_id: ORG_A }; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  auth: (req, _res, next) => { req.user = { id: 'u1', role: 'trainer', organization_id: ORG_A }; next(); },
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 

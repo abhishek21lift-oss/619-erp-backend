@@ -16,8 +16,9 @@ app.use('/api/modules', operationsRouter);
 
 function makeUser(id) {
   return {
-    id, name: 'Admin', email: 'admin@619fitness.com', role: 'admin',
-    trainer_id: null, member_id: null, branch_id: null, is_active: true, token_version: 0,
+    id, name: 'Admin', email: 'admin@619fitness.com', role: 'trainer',
+    trainer_id: null, member_id: null, is_active: true, token_version: 0,
+  organization_id: '11111111-1111-4111-8111-111111111111',
   };
 }
 

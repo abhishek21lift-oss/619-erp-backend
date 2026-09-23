@@ -24,12 +24,10 @@ jest.mock('../db/pool', () => ({
   }),
 }));
 
-let mockCurrentUser = { id: 'usr-1', role: 'admin', organization_id: ORG_A };
+let mockCurrentUser = { id: 'usr-1', role: 'trainer', organization_id: ORG_A };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockCurrentUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 const express = require('express');
@@ -44,7 +42,7 @@ const settingsSql = () => mockQueries.filter((q) => /\bsystem_settings\b/i.test(
 beforeEach(() => {
   mockQueries.length = 0;
   mockRows = [];
-  mockCurrentUser = { id: 'usr-1', role: 'admin', organization_id: ORG_A };
+  mockCurrentUser = { id: 'usr-1', role: 'trainer', organization_id: ORG_A };
 });
 
 describe('every settings read is bounded by the caller studio', () => {
@@ -53,7 +51,6 @@ describe('every settings read is bounded by the caller studio', () => {
     ['GET /studio',      '/api/settings/studio'],
     ['GET /branches',    '/api/settings/branches'],
     ['GET /gym',         '/api/settings/gym'],
-    ['GET /permissions', '/api/settings/permissions'],
   ])('%s filters on organization_id and binds the caller org', async (_label, url) => {
     await request(app).get(url).expect(200);
 
@@ -85,14 +82,13 @@ describe('every settings write is bounded by the caller studio', () => {
     expect(q.params).toContain(ORG_A);
   });
 
-  it('PUT /permissions upserts on (organization_id, key)', async () => {
-    // Role permissions: unscoped, one studio's admin changed what trainers in
-    // every other studio could reach.
-    await request(app).put('/api/settings/permissions')
-      .send({ perm_trainer_finance: true }).expect(200);
-    const [q] = settingsSql();
-    expect(q.sql).toMatch(/ON CONFLICT \(organization_id, key\)/i);
-    expect(q.params).toContain(ORG_A);
+  it('the per-role permission matrix is gone with the staff roles', async () => {
+    // perm_trainer_* / perm_reception_* decided what staff could reach. The
+    // trainer owns the studio, so there is nothing to grant (migration 208
+    // deletes the stored rows).
+    await request(app).get('/api/settings/permissions').expect(404);
+    await request(app).put('/api/settings/permissions').send({ perm_trainer_finance: true }).expect(404);
+    expect(settingsSql()).toHaveLength(0);
   });
 
   it('POST /branches stamps the creating studio', async () => {
@@ -122,33 +118,27 @@ describe('every settings write is bounded by the caller studio', () => {
 });
 
 describe('a caller with no studio cannot read or write anything', () => {
-  it('a write is refused rather than landing nowhere', async () => {
-    // A platform super admin who has not picked a studio. Settings are
-    // per-studio business configuration, so "all studios at once" is not a
-    // mode this router offers — the write is refused outright.
-    mockCurrentUser = { id: 'usr-0', role: 'super_admin', organization_id: null };
-    const res = await request(app).put('/api/settings').send({ studio_name: 'X' }).expect(400);
-    expect(res.body.error.code).toBe('NO_ORG');
+  // Settings are per-studio business configuration; there is no "all studios
+  // at once" mode. A caller with no studio — the platform operator, or a
+  // trainer row somehow missing its organization — is refused at the router
+  // guard, before a single statement runs.
+  it.each([
+    ['the platform operator', { id: 'usr-0', role: 'super_admin', organization_id: null }],
+    ['an org-less trainer', { id: 'usr-2', role: 'trainer', organization_id: null }],
+  ])('%s: a write is refused', async (_label, user) => {
+    mockCurrentUser = user;
+    await request(app).put('/api/settings').send({ studio_name: 'X' }).expect(403);
     expect(settingsSql()).toHaveLength(0);
   });
 
-  it('a read binds null, which matches no row', async () => {
-    // Fail-closed rather than fail-open: the query still runs, but
-    // `organization_id = NULL` is never true, so it returns nothing instead of
-    // every studio's settings.
-    mockCurrentUser = { id: 'usr-0', role: 'super_admin', organization_id: null };
-    await request(app).get('/api/settings').expect(200);
-
-    const [q] = settingsSql();
-    expect(q.sql).toMatch(/organization_id\s*=\s*\$\d/i);
-    expect(q.params[0]).toBeNull();
-  });
-
-  it('an org-less tenant user is filtered too, not exempted', async () => {
-    mockCurrentUser = { id: 'usr-2', role: 'admin', organization_id: null };
-    await request(app).get('/api/settings/gym').expect(200);
-    const [q] = settingsSql();
-    expect(q.sql).toMatch(/organization_id\s*=\s*\$\d/i);
+  it.each([
+    ['the platform operator', { id: 'usr-0', role: 'super_admin', organization_id: null }],
+    ['an org-less trainer', { id: 'usr-2', role: 'trainer', organization_id: null }],
+  ])('%s: a read is refused', async (_label, user) => {
+    mockCurrentUser = user;
+    await request(app).get('/api/settings').expect(403);
+    await request(app).get('/api/settings/gym').expect(403);
+    expect(settingsSql()).toHaveLength(0);
   });
 });
 

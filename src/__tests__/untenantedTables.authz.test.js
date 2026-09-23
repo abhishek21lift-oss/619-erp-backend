@@ -53,22 +53,15 @@ jest.mock('../lib/logger', () => ({
 }));
 jest.mock('../lib/activityLog', () => ({ logActivity: jest.fn(async () => {}) }));
 
-let mockUser = { id: 'u-b', role: 'admin', organization_id: ORG_B };
+let mockUser = { id: 'u-b', role: 'trainer', organization_id: ORG_B };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../middleware/rbac', () => ({
-  requireRole: () => (_req, _res, next) => next(),
-  requireStaff: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../middleware/validate', () => ({ validate: () => (_req, _res, next) => next() }));
-jest.mock('../middleware/branch-scope', () => ({
-  branchScope: (req, _res, next) => { req.branchScope = { isAdmin: true, branchId: null }; next(); },
-}));
 
 const express = require('express');
 const request = require('supertest');
@@ -94,7 +87,7 @@ function expectScopedToCaller() {
 beforeEach(() => {
   mockQueries.length = 0;
   mockRows = [];
-  mockUser = { id: 'u-b', role: 'admin', organization_id: ORG_B };
+  mockUser = { id: 'u-b', role: 'trainer', organization_id: ORG_B };
 });
 
 // ── Health records ──────────────────────────────────────────────────────────
@@ -254,15 +247,16 @@ describe('integrations', () => {
     expectScopedToCaller();
   });
 
-  test('a platform-wide operator with no studio selected cannot write at all', async () => {
-    // orgIdOf() is null for a super admin who has not named a studio, and NULLs
-    // are distinct in the unique index — so an unguarded upsert would insert a
-    // fresh unowned row on every call instead of updating anything.
+  test('a caller with no studio cannot write at all', async () => {
+    // orgIdOf() is null for the platform operator, and NULLs are distinct in
+    // the unique index — so an unguarded upsert would insert a fresh unowned
+    // row on every call instead of updating anything. The router guard now
+    // refuses such a caller before the handler runs.
     mockUser = { id: 'u-super', role: 'super_admin', organization_id: null };
     const res = await request(integrations())
       .post('/api/integrations/razorpay/disconnect')
       .send({});
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
     expect(allSql()).not.toMatch(/INSERT INTO integrations/);
   });
 });
@@ -272,10 +266,9 @@ describe('integrations', () => {
 describe('module records', () => {
   const operations = () => app('/api/modules', '../modules/operations/operations.routes');
 
-  test('an admin\'s read is scoped to their studio, not to TRUE', async () => {
-    // scopedClause() returns the literal 'TRUE' for an admin, which was the
-    // entire filter. The org clause is now the boundary; branch stays a
-    // within-studio refinement.
+  test('the trainer\'s read is scoped to their studio, not to TRUE', async () => {
+    // scopedClause() used to return the literal 'TRUE' for an owner, which was
+    // the entire filter. The org clause is the boundary.
     await request(operations()).get('/api/modules/finance');
     expectScopedToCaller();
   });

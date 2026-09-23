@@ -41,7 +41,7 @@ beforeEach(() => pool.query.mockReset());
 describe('requireFeature', () => {
   it('403s with FEATURE_DISABLED when the studio has it off', async () => {
     pool.query.mockResolvedValue({ rows: [row('ai_suite', { enabled: false })] });
-    const res = await request(appWith({ organization_id: ORG, role: 'admin' })).get('/thing');
+    const res = await request(appWith({ organization_id: ORG, role: 'trainer' })).get('/thing');
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('FEATURE_DISABLED');
     expect(res.body.error.feature).toBe('ai_suite');
@@ -49,15 +49,18 @@ describe('requireFeature', () => {
 
   it('lets the request through when the studio has it on', async () => {
     pool.query.mockResolvedValue({ rows: [row('ai_suite', { enabled: true })] });
-    const res = await request(appWith({ organization_id: ORG, role: 'admin' })).get('/thing');
+    const res = await request(appWith({ organization_id: ORG, role: 'trainer' })).get('/thing');
     expect(res.status).toBe(200);
   });
 
-  it('never gates a platform operator', async () => {
-    // A super admin is not inside a tenant, so tenant flags do not apply.
-    pool.query.mockResolvedValue({ rows: [row('ai_suite', { enabled: false })] });
-    const res = await request(appWith({ organization_id: ORG, role: 'super_admin' })).get('/thing');
-    expect(res.status).toBe(200);
+  it('refuses an account with no studio instead of waving it through', async () => {
+    // A feature flag is a property of a studio. The platform operator has no
+    // studio — and auth.js refuses it on every tenant route before this runs
+    // — so an org-less caller on a feature-gated route is refused.
+    pool.query.mockResolvedValue({ rows: [row('ai_suite', { enabled: true })] });
+    const res = await request(appWith({ organization_id: null, role: 'super_admin' })).get('/thing');
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('NO_TENANT');
     expect(pool.query).not.toHaveBeenCalled();
   });
 
@@ -65,14 +68,16 @@ describe('requireFeature', () => {
     // A typo in a guard should not take a working feature away from every
     // studio. The registry is validated when a key is written, not read.
     pool.query.mockResolvedValue({ rows: [row('something_else')] });
-    const res = await request(appWith({ organization_id: ORG, role: 'admin' })).get('/thing');
+    const res = await request(appWith({ organization_id: ORG, role: 'trainer' })).get('/thing');
     expect(res.status).toBe(200);
   });
 
-  it('does nothing without a user — which is why mount order matters', async () => {
-    // Documents the footgun the wiring tests below exist to prevent.
+  it('fails closed without a user — mounting it before auth refuses, rather than enforcing nothing', async () => {
+    // It used to call next() here, which made "mounted before auth" a silent
+    // no-op. The wiring tests below still pin the order; this makes a mistake
+    // in it loud instead of open.
     const res = await request(appWith(undefined)).get('/thing');
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(403);
     expect(pool.query).not.toHaveBeenCalled();
   });
 });
@@ -88,15 +93,15 @@ describe('server.js wiring', () => {
     expect(order).toBe('auth,requireFeature(key)');
   });
 
-  it('puts auth and requireStaff BEFORE requireFeature in staffGate', () => {
+  it('puts auth and requireTrainer BEFORE requireFeature in studioGate', () => {
     // Same reasoning as the gate() ordering test above, and one more: a
-    // feature flag is not an authorisation decision, so requireStaff has to
+    // feature flag is not an authorisation decision, so requireTrainer has to
     // run for the mounts whose data belongs to the studio rather than to the
     // caller. If requireFeature moved first, turning a feature ON would be
     // enough to expose it to a member.
-    const helper = server.match(/const staffGate = \(key\) => \[([^\]]+)\]/);
+    const helper = server.match(/const studioGate = \(key\) => \[([^\]]+)\]/);
     expect(helper).not.toBeNull();
-    expect(helper[1].replace(/\s/g, '')).toBe('auth,requireStaff,requireFeature(key)');
+    expect(helper[1].replace(/\s/g, '')).toBe('auth,requireTrainer,requireFeature(key)');
   });
 
   it('gates the capabilities the Control Centre advertises', () => {
@@ -104,9 +109,9 @@ describe('server.js wiring', () => {
       'ai_suite', 'ai_knowledge_base', 'attendance', 'programs',
       'insights', 'communication', 'integrations', 'packages', 'finance',
     ]) {
-      // Either helper counts: staffGate() is gate() plus requireStaff, so a
+      // Either helper counts: studioGate() is gate() plus requireTrainer, so a
       // capability behind it is still feature-gated.
-      expect(server).toMatch(new RegExp(`(?:staffG|g)ate\\('${key}'\\)`));
+      expect(server).toMatch(new RegExp(`(?:studioG|g)ate\\('${key}'\\)`));
     }
   });
 
@@ -114,7 +119,7 @@ describe('server.js wiring', () => {
     // A studio must always be able to sign in and pay us, whatever else an
     // operator has switched off. Gating these could lock a studio out of
     // fixing its own billing — the one thing that must never happen.
-    const gatedMounts = [...server.matchAll(/app\.use\('([^']+)'[^\n]*(?:staffG|g)ate\(/g)].map((m) => m[1]);
+    const gatedMounts = [...server.matchAll(/app\.use\('([^']+)'[^\n]*(?:studioG|g)ate\(/g)].map((m) => m[1]);
     for (const mount of gatedMounts) {
       expect(mount).not.toMatch(/^\/api\/(auth|subscription|payments)/);
     }

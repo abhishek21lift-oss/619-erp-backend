@@ -212,7 +212,7 @@ async function approveHandler(req, res, next) {
     // invitation link to notice.
     await client.query(
       `INSERT INTO users (id, name, email, password, role, trainer_id, organization_id, is_active)
-       VALUES ($1,$2,$3,$4,'admin',$5,$6,TRUE)`,
+       VALUES ($1,$2,$3,$4,'trainer',$5,$6,TRUE)`,
       [userId, app.full_name, app.email, app.password_hash, trainerRows[0].id, org.id]
     );
 

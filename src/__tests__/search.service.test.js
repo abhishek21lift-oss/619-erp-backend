@@ -26,12 +26,12 @@ describe('scopeClause — tenant isolation', () => {
     expect(params).toEqual(['org-1']);
   });
 
-  test('a trainer is pinned to their own roster ON TOP OF their organization', () => {
+  test('a trainer id on the context narrows nothing — the organization is the boundary', () => {
+    // The assistant-coach roster filter is gone: the trainer owns the studio.
     const params = [];
     const sql = scopeClause({ scope: { applyFilter: true, orgId: 'org-1' }, trainerId: 'trn-9' }, 'c', params);
-    // Both clauses, ANDed — the trainer filter must never replace the org one.
-    expect(sql).toBe('c.organization_id = $1 AND c.trainer_id = $2');
-    expect(params).toEqual(['org-1', 'trn-9']);
+    expect(sql).toBe('c.organization_id = $1');
+    expect(params).toEqual(['org-1']);
   });
 
   test('an org-less tenant user matches nothing rather than everything', () => {
@@ -44,17 +44,18 @@ describe('scopeClause — tenant isolation', () => {
     expect(params).toEqual([null]);
   });
 
-  test('only a platform-wide super admin gets an unfiltered clause', () => {
+  test('nobody gets an unfiltered clause — not even a scope that claims "no filter"', () => {
+    // There used to be a "TRUE" clause for a platform-wide super admin.
     const params = [];
     const sql = scopeClause({ scope: { applyFilter: false, orgId: null }, trainerId: null }, 'c', params);
-    expect(sql).toBe('TRUE');
-    expect(params).toEqual([]);
+    expect(sql).toBe('c.organization_id = $1');
+    expect(params).toEqual([null]);
   });
 
   test('parameter numbering continues from whatever the caller already pushed', () => {
     const params = ['like', 'lower', 'digits'];
-    const sql = scopeClause({ scope: { applyFilter: true, orgId: 'org-1' }, trainerId: 'trn-9' }, 'c', params);
-    expect(sql).toBe('c.organization_id = $4 AND c.trainer_id = $5');
+    const sql = scopeClause({ scope: { applyFilter: true, orgId: 'org-1' } }, 'c', params);
+    expect(sql).toBe('c.organization_id = $4');
   });
 });
 
@@ -70,10 +71,11 @@ describe('libraryScope — workout plans and diet templates', () => {
     expect(params).toEqual(['like', 'lower', 'org-1']);
   });
 
-  test('a platform-wide super admin sees everything', () => {
+  test('nobody sees everything: a scope that claims "no filter" still gets shared-plus-own', () => {
     const params = [];
-    expect(libraryScope({ scope: { applyFilter: false, orgId: null } }, 'x', params)).toBe('TRUE');
-    expect(params).toEqual([]);
+    expect(libraryScope({ scope: { applyFilter: false, orgId: null } }, 'x', params))
+      .toBe('(x.organization_id IS NULL OR x.organization_id = $1)');
+    expect(params).toEqual([null]);
   });
 
   test('an org-less user still sees the shared catalogue, and nothing authored', () => {
@@ -88,19 +90,17 @@ describe('libraryScope — workout plans and diet templates', () => {
 describe('provider visibility', () => {
   const base = (over = {}) => ({
     q: normalise('rahul'), scope: { applyFilter: true, orgId: 'org-1' },
-    userId: 'user-1', role: 'admin', limit: 8, ...over,
+    userId: 'user-1', role: 'trainer', limit: 8, ...over,
   });
 
   test('clients lead, archived clients follow', () => {
     expect(providerTypes().slice(0, 2)).toEqual(['clients', 'archived_clients']);
   });
 
-  test('a trainer is not offered studio broadcasts', () => {
-    // communication_history has no per-coach ownership, so rather than invent
-    // one the group is withheld. If this ever flips, it must be because the
-    // table gained an owner — not because the filter was relaxed.
-    expect(providersFor(base({ role: 'trainer' }))).not.toContain('messages');
-    expect(providersFor(base({ role: 'admin' }))).toContain('messages');
+  test('the trainer is offered studio broadcasts — the studio is theirs', () => {
+    // Withheld from an assistant coach once, because broadcasts had no
+    // per-coach owner. The trainer owns the studio, so the group is offered.
+    expect(providersFor(base({ role: 'trainer' }))).toContain('messages');
   });
 
   test('AI conversations need a user to scope to', () => {

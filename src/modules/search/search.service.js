@@ -93,22 +93,12 @@ function normalise(raw) {
  * tenant user with no organization resolves to orgId=null, and
  * `organization_id = NULL` matches no rows.
  *
- * `trainerId` is set when the caller is a trainer, pinning them to their own
- * roster. Admins and managers see the whole studio.
+ * The trainer owns the studio, so the organization is the whole boundary —
+ * there is no narrower roster. There is no unfiltered case.
  */
-function scopeClause({ scope, trainerId }, alias, params) {
-  const clauses = [];
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    clauses.push(`${alias}.organization_id = $${params.length}`);
-  }
-  if (trainerId) {
-    params.push(trainerId);
-    clauses.push(`${alias}.trainer_id = $${params.length}`);
-  }
-  // A super admin operating platform-wide has no filter at all; that is the
-  // one and only case where this returns TRUE.
-  return clauses.length ? clauses.join(' AND ') : 'TRUE';
+function scopeClause({ scope }, alias, params) {
+  params.push(scope.orgId);
+  return `${alias}.organization_id = $${params.length}`;
 }
 
 // ── Clients provider ─────────────────────────────────────────────────────────
@@ -336,7 +326,6 @@ function inr(amount) {
  * everyone; anything else belongs to one studio.
  */
 function libraryScope(ctx, alias, params) {
-  if (!ctx.scope.applyFilter) return 'TRUE';
   params.push(ctx.scope.orgId);
   return `(${alias}.organization_id IS NULL OR ${alias}.organization_id = $${params.length})`;
 }
@@ -557,10 +546,8 @@ function toAssessmentItem(row) {
 async function searchMessages(ctx) {
   const params = [ctx.q.like, ctx.q.lower];
   const predicates = ['TRUE'];
-  if (ctx.scope.applyFilter) {
-    params.push(ctx.scope.orgId);
-    predicates[0] = `x.organization_id = $${params.length}`;
-  }
+  params.push(ctx.scope.orgId);
+  predicates[0] = `x.organization_id = $${params.length}`;
   return textSearch(ctx, {
     from: 'communication_history x',
     columns: 'x.id, x.title, x.type, x.audience, x.status, x.sent_at',
@@ -629,7 +616,7 @@ function toAiConversationItem(row) {
  * Adding an entity type means adding a row here and nothing else.
  *
  * `enabled` lets a provider opt out per request — used for the noise floor on
- * short queries, and for the two providers that are not visible to every role.
+ * short queries, and for the provider that needs a signed-in user to scope by.
  */
 const PROVIDERS = [
   {
@@ -682,10 +669,8 @@ const PROVIDERS = [
   {
     type: 'messages',
     label: 'Messages',
-    // Broadcasts belong to the studio, not to a coach. Rather than invent an
-    // ownership rule for a table that has none, the group is simply not offered
-    // to trainers.
-    enabled: (ctx) => ctx.role !== 'trainer' && ctx.q.lower.length >= 3,
+    // Broadcasts belong to the studio, and the trainer owns the studio.
+    enabled: (ctx) => ctx.q.lower.length >= 3,
     run: (ctx) => searchMessages(ctx).then((r) => r.map(toMessageItem)),
   },
   {
@@ -714,7 +699,7 @@ const MAX_TOTAL_ITEMS = 24;
  * parts — exactly the thing the <200ms budget cannot afford once there are five
  * entity types instead of two.
  */
-async function search({ query, scope, trainerId, userId, role, limit, types }) {
+async function search({ query, scope, userId, limit, types }) {
   const started = Date.now();
   const q = normalise(query);
 
@@ -726,9 +711,7 @@ async function search({ query, scope, trainerId, userId, role, limit, types }) {
   const ctx = {
     q,
     scope,
-    trainerId,
     userId,
-    role,
     limit: requested,
     // Everything below the two client groups is a supporting answer, so it gets
     // a shorter list. Clients keep the full limit.

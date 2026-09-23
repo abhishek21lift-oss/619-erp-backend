@@ -15,8 +15,8 @@ jest.mock('../lib/ai/embeddings', () => ({
   EMBEDDING_DIM: 384,
 }));
 jest.mock('../middleware/auth', () => ({
-  auth: (req, _res, next) => { req.user = { id: 'u1', role: 'admin', organization_id: 'org-1' }; next(); },
-  adminOnly: (_req, _res, next) => next(),
+  auth: (req, _res, next) => { req.user = { id: 'u1', role: 'trainer', organization_id: 'org-1' }; next(); },
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../lib/ai/router', () => ({ routedStream: jest.fn(), routedChat: jest.fn() }));
 jest.mock('../lib/ai/models', () => ({ models: { primary: 'primary-model' } }));
@@ -171,7 +171,7 @@ describe('POST /api/ai/progress/analyze — bounded historical context (P2-1)', 
     expect(res.headers['content-type']).toMatch(/json/);
     // The org predicate is on the parent lookup itself, and its org param is
     // bound — never derived from the request body.
-    expect(pool.query.mock.calls[0][0]).toContain('($2::uuid IS NULL OR organization_id=$2)');
+    expect(pool.query.mock.calls[0][0]).toContain('AND organization_id = $2');
     expect(pool.query.mock.calls[0][1][0]).toBe('other-org-client');
     expect(pool.query.mock.calls[0][1][1]).toBe('org-1');
     // Nothing is streamed, prompted, or handed to the model.
@@ -186,7 +186,7 @@ describe('POST /api/ai/progress/analyze — bounded historical context (P2-1)', 
     expect(res.status).toBe(200);
 
     const [parentSql, parentParams] = pool.query.mock.calls[0];
-    expect(parentSql).toContain('($2::uuid IS NULL OR organization_id=$2)');
+    expect(parentSql).toContain('AND organization_id = $2');
     expect(parentParams[0]).toBe('client-1');
     expect(parentParams[1]).toBe('org-1');
 

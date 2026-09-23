@@ -9,11 +9,10 @@
 
 jest.mock('../db/pool', () => ({ query: jest.fn() }));
 
-let mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+let mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 
 // The transport, not Twilio: these actions send on the STUDIO's own connected
@@ -59,7 +58,7 @@ beforeEach(() => {
   pool.query.mockReset();
   mockSend.mockReset();
   mockSend.mockResolvedValue({ status: 'sent' });
-  mockUser = { id: 'u1', role: 'admin', organization_id: 'org-1' };
+  mockUser = { id: 'u1', role: 'trainer', organization_id: 'org-1' };
 });
 
 describe('planning', () => {
@@ -76,8 +75,8 @@ describe('planning', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
-  test('a trainer is refused', async () => {
-    mockUser = { id: 'u2', role: 'trainer', organization_id: 'org-1' };
+  test('a member is refused', async () => {
+    mockUser = { id: 'u2', role: 'member', organization_id: 'org-1', pt_client_id: 'c-1' };
     const res = await request(app()).post('/api/ai/actions/dues_reminders/plan').send({});
     expect(res.status).toBe(403);
     expect(pool.query).not.toHaveBeenCalled();
@@ -215,8 +214,8 @@ describe('executing', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
-  test('a trainer cannot execute even with a valid plan id', async () => {
-    mockUser = { id: 'u2', role: 'trainer', organization_id: 'org-1' };
+  test('a member cannot execute even with a valid plan id', async () => {
+    mockUser = { id: 'u2', role: 'member', organization_id: 'org-1', pt_client_id: 'c-1' };
     const res = await request(app())
       .post('/api/ai/actions/dues_reminders/execute')
       .send({ plan_id: 'plan-1' });

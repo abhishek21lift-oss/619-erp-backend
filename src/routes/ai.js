@@ -5,20 +5,18 @@
 const { randomUUID } = require('crypto');
 const express    = require('express');
 const pool       = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
-const { requireStaff } = require('../middleware/rbac');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
 const logger     = require('../lib/logger');
 const aiConfig   = require('../lib/ai/config');
 
-// Null-safe tenant param: a tenant user gets their org id (queries then filter
-// `organization_id = $x`); a platform super admin operating platform-wide gets
-// NULL, and `$x IS NULL OR organization_id = $x` matches every row. A super
-// admin targeting one org via x-org-id gets that org id and is filtered.
+// The caller's organization, bound into every query as `organization_id = $x`.
+// Always a real org for the trainer these routes admit; if it were ever null
+// the strict equality matches no rows, rather than every studio's.
 function orgParam(req) {
   const scope = tenantScope(req);
-  return scope.applyFilter ? scope.orgId : null;
+  return scope.orgId;
 }
 const { routedChat, routedStream }     = require('../lib/ai/router');
 const { pingModel }                    = require('../lib/ai/openrouter');
@@ -144,7 +142,7 @@ async function buildClientContext(client_id, org) {
     // confirm the client exists, is not deleted, and passes the tenant
     // predicate BEFORE any child query executes. Same columns as before.
     const clientRes = await pool.query(
-      'SELECT name, dob, gender, mobile FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)',
+      'SELECT name, dob, gender, mobile FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
       [client_id, org]
     );
     const c = clientRes.rows[0];
@@ -311,7 +309,7 @@ async function retrieveExerciseLibrary({ organizationId, userId, query, limit = 
 // latency/failure metadata for the ai_generate_rag_retrieval event.
 async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerciseQuery = null, exerciseUserId = null, retrievalStats = null } = {}) {
   const { rows: clientRows } = await pool.query(
-    'SELECT * FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)',
+    'SELECT * FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
     [client_id, org]
   );
   const client = clientRows[0];
@@ -737,15 +735,15 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
    client is currently training, and how much history there is to program
    from. Cheap enough to run on page load — no retrieval, no model.
 */
-// requireStaff: the whole point of this route is to summarise a CLIENT for the
+// requireTrainer: the whole point of this route is to summarise a CLIENT for the
 // person training them. `auth` alone let any member of the studio read any
 // other client's context by id — facts, data quality, the digital twin's
 // safety gate and their training history. orgParam() below bounds the studio,
-// which is the same org-not-role gap staffGate() exists to close.
+// which is the same org-not-role gap studioGate() exists to close.
 //
 // No member surface calls this; the member app calls only api.me.*, bookings,
 // classes and UPI payments.
-router.get('/workout/context/:client_id', auth, requireStaff, async (req, res) => {
+router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res) => {
   const clientId = req.params.client_id;
   const org = orgParam(req);
 
@@ -1655,7 +1653,7 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
     const org = orgParam(req);
     // Fetch all progress data for this client
     const [clientRes, assessRes, goalsRes, checkinsRes, strengthRes, attRes, photosRes] = await Promise.all([
-      pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)', [client_id, org]),
+      pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2', [client_id, org]),
       // Historical datasets are bounded at the DATABASE (audit P2-1):
       // newest-first with LIMIT so the prompt cannot grow with the client's
       // entire history; the rows are reversed below to restore the
@@ -1789,7 +1787,7 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
     // wrong-org assessment_id yields no row → 404, so neither the assessment
     // nor the client it points at can be read across tenants.
     const org = orgParam(req);
-    const { rows: assessRows } = await pool.query('SELECT * FROM pt_assessments WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2)', [assessment_id, org]);
+    const { rows: assessRows } = await pool.query('SELECT * FROM pt_assessments WHERE id = $1 AND organization_id = $2', [assessment_id, org]);
     const assessment = assessRows[0];
     if (!assessment) return res.status(404).json({ error: 'Assessment not found' });
 
@@ -1891,11 +1889,10 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   6. BUSINESS INSIGHTS  (admin only)
+   6. BUSINESS INSIGHTS  (the studio's trainer)
    POST /api/ai/business/insights
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/business/insights', auth, requireConfigured, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+router.post('/business/insights', auth, requireTrainer, requireConfigured, async (req, res) => {
 
   const { from, to } = req.body || {};
   const fromDate = from ? new Date(from) : new Date(Date.now() - 30 * 86400000);
@@ -1922,14 +1919,14 @@ router.post('/business/insights', auth, requireConfigured, async (req, res) => {
            COUNT(*) FILTER (WHERE status='inactive') AS inactive_members,
            COUNT(*) FILTER (WHERE pt_start_date BETWEEN $1 AND $2) AS new_members_period
          FROM pt_clients WHERE deleted_at IS NULL
-           AND ($3::uuid IS NULL OR organization_id = $3)`,
+           AND organization_id = $3`,
         [fromDate, toDate, org]
       );
     const sessionsRes = await pool.query(
         `SELECT COUNT(*) AS total_sessions,
                 COUNT(DISTINCT client_id) AS active_clients
          FROM pt_sessions WHERE session_date BETWEEN $1 AND $2
-           AND ($3::uuid IS NULL OR organization_id = $3)`,
+           AND organization_id = $3`,
         [fromDate, toDate, org]
       );
 
@@ -2081,18 +2078,18 @@ router.get('/usage', auth, async (req, res) => {
   res.json({ data: stats });
 });
 
-router.get('/model-stats', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const stats = await getModelStats();
+// The studio's own AI usage by model. Scoped to the caller's organization —
+// it used to aggregate ai_usage_log across every studio on the platform.
+router.get('/model-stats', auth, requireTrainer, async (req, res) => {
+  const stats = await getModelStats(orgParam(req));
   res.json({ data: stats });
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   8. MODEL HEALTH CHECK  (admin)
+   8. MODEL HEALTH CHECK  (the studio's trainer)
    GET /api/ai/health
    ═══════════════════════════════════════════════════════════════════════════ */
-router.get('/health', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+router.get('/health', auth, requireTrainer, async (req, res) => {
   // Read through lib/ai/config.js, not process.env directly. This line used to
   // check OPENROUTER_API_KEY alone while the code that CALLS the provider
   // checks AI_API_KEY first — so a box configured with AI_API_KEY had working
@@ -2120,11 +2117,10 @@ router.get('/health', auth, async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   9. TEST  (admin)
+   9. TEST  (the studio's trainer)
    POST /api/ai/test
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/test', auth, requireConfigured, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+router.post('/test', auth, requireTrainer, requireConfigured, async (req, res) => {
 
   const { intent = 'chat', prompt = 'Say "MY PT STUDIO AI is ready" and nothing else.' } = req.body || {};
   try {
@@ -2150,7 +2146,7 @@ router.post('/test', auth, requireConfigured, async (req, res) => {
 /* ═══════════════════════════════════════════════════════════════════════════
    10. PROVIDER SETTINGS  (admin — for integrations page)
    ═══════════════════════════════════════════════════════════════════════════ */
-router.get('/provider-settings', auth, adminOnly, async (req, res) => {
+router.get('/provider-settings', auth, requireTrainer, async (req, res) => {
   res.json({
     data: {
       provider:   'openrouter',

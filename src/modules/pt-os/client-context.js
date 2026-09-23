@@ -167,7 +167,7 @@ async function loadDigitalTwin(clientId, orgId, {
             health_conditions, organization_id
        FROM pt_clients
       WHERE id = $1 AND deleted_at IS NULL
-        AND ($2::uuid IS NULL OR organization_id = $2)`,
+        AND organization_id = $2`,
     [clientId, orgId],
   );
   const client = clientRows[0];
@@ -632,7 +632,7 @@ async function sweepRoster(orgId, { trainerId = null, windowWeeks = DEFAULT_WIND
                 AND ${TRAINING_HAPPENED}) AS last_session
        FROM pt_clients c
       WHERE c.deleted_at IS NULL
-        AND ($1::uuid IS NULL OR c.organization_id = $1)
+        AND c.organization_id = $1
         AND ($2::text IS NULL OR c.trainer_id = $2)
       ORDER BY c.name`,
     [orgId || null, trainerId || null],
@@ -649,7 +649,7 @@ async function sweepRoster(orgId, { trainerId = null, windowWeeks = DEFAULT_WIND
          JOIN pt_clients c ON c.id = ws.client_id
          LEFT JOIN exercises e ON e.id = wse.exercise_id
         WHERE c.deleted_at IS NULL
-          AND ($1::uuid IS NULL OR c.organization_id = $1)
+          AND c.organization_id = $1
           AND ($2::text IS NULL OR c.trainer_id = $2)
           AND ws.session_date >= CURRENT_DATE - ($3 * INTERVAL '1 week')
         ORDER BY ws.session_date DESC

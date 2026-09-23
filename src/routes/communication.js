@@ -1,19 +1,18 @@
 'use strict';
 const express = require('express');
 const pool = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
 
 const router = express.Router();
-router.use(auth, adminOnly);
+router.use(auth, requireTrainer);
 
-// Null-safe tenant param: for a tenant user this is their org id (queries then
-// filter `organization_id = $x`); for a platform super admin operating
-// platform-wide it is NULL, and `$x IS NULL OR organization_id = $x` matches
-// every row (god-mode). A super admin targeting one org via x-org-id filters.
+// The caller's organization, bound into every query as `organization_id = $x`.
+// Always a real org for the trainer these routes admit; if it were ever null
+// the strict equality matches no rows, rather than every studio's.
 function orgParam(req) {
   const scope = tenantScope(req);
-  return scope.applyFilter ? scope.orgId : null;
+  return scope.orgId;
 }
 
 // GET /api/communication/history
@@ -26,7 +25,7 @@ router.get('/history', async (req, res, next) => {
     // Tenant isolation: an admin sees only their own studio's sent-message log
     // (null-safe for a platform super admin, who sees all).
     values.push(orgParam(req));
-    conditions.push(`($${values.length}::uuid IS NULL OR organization_id = $${values.length})`);
+    conditions.push(`organization_id = $${values.length}`);
     const where = `WHERE ${conditions.join(' AND ')}`;
     values.push(Number(limit), Number(offset));
     const result = await pool.query(
@@ -46,7 +45,7 @@ router.get('/history/:id', async (req, res, next) => {
     const result = await pool.query(
       `SELECT id, title, body, type, audience, recipients, status, sent_by, sent_at
          FROM communication_history
-        WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2)`,
+        WHERE id = $1 AND organization_id = $2`,
       [req.params.id, orgParam(req)]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Message not found' });
@@ -76,27 +75,27 @@ router.post('/send', async (req, res, next) => {
       if (audience === 'expiring') {
         const r = await pool.query(
           `SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND pt_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
-            AND ($1::uuid IS NULL OR organization_id = $1)`, [org]);
+            AND organization_id = $1`, [org]);
         recipientCount = Number(r.rows[0].count);
       } else if (audience === 'dues') {
         const r = await pool.query(
           `SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND balance_amount > 0
-            AND ($1::uuid IS NULL OR organization_id = $1)`, [org]);
+            AND organization_id = $1`, [org]);
         recipientCount = Number(r.rows[0].count);
       } else if (audience === 'pt') {
         const r = await pool.query(
-          "SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND ($1::uuid IS NULL OR organization_id = $1)", [org]);
+          "SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active' AND organization_id = $1", [org]);
         recipientCount = Number(r.rows[0].count);
       } else if (audience === 'expired') {
         const r = await pool.query(
           `SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'expired'
-            AND ($1::uuid IS NULL OR organization_id = $1)`, [org]);
+            AND organization_id = $1`, [org]);
         recipientCount = Number(r.rows[0].count);
       } else {
         // 'all' or unspecified
         const r = await pool.query(
           `SELECT COUNT(*) FROM pt_clients WHERE deleted_at IS NULL AND status = 'active'
-            AND ($1::uuid IS NULL OR organization_id = $1)`, [org]);
+            AND organization_id = $1`, [org]);
         recipientCount = Number(r.rows[0].count);
       }
     }
@@ -116,10 +115,10 @@ router.post('/send', async (req, res, next) => {
        SELECT u.id, 'announcement', $1, $2
          FROM users u
         WHERE u.is_active = true
-          AND ($3::uuid IS NULL OR u.organization_id = $3)
+          AND u.organization_id = $3
           AND u.pt_client_id IN (
             SELECT id FROM pt_clients WHERE deleted_at IS NULL AND status = 'active'
-              AND ($3::uuid IS NULL OR organization_id = $3)
+              AND organization_id = $3
           )
        LIMIT 500`,
       [title, body, org]
@@ -133,7 +132,7 @@ router.post('/send', async (req, res, next) => {
 router.delete('/history/:id', async (req, res, next) => {
   try {
     const result = await pool.query(
-      'DELETE FROM communication_history WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2) RETURNING id',
+      'DELETE FROM communication_history WHERE id = $1 AND organization_id = $2 RETURNING id',
       [req.params.id, orgParam(req)]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Message not found' });

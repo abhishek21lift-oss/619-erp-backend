@@ -6,7 +6,7 @@
 // `requireSuperAdminMfa` applied at the mount point, so every handler in every
 // router below runs as an authenticated super admin.
 //
-// SECURITY: platform-level only. Tenant admins (role='admin') never reach here.
+// SECURITY: platform-level only. Tenant accounts (trainer, member) never reach here.
 // Every mutation is written to activity_log for audit.
 //
 // ── Why this file is only a mount list ──────────────────────────────────────

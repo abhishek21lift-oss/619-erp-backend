@@ -309,8 +309,8 @@ const { makeStore } = require('./lib/rateLimitStore');
 const cookieParser  = require('cookie-parser');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
-const { auth, adminOnly }        = require('./middleware/auth');
-const { requireStaff, requireClient } = require('./middleware/rbac');
+const { auth }                   = require('./middleware/auth');
+const { requireTrainer, requireClient } = require('./middleware/rbac');
 const { requireSuperAdmin, requireSuperAdminMfa } = require('./middleware/tenant');
 const { requirePlatformOwner } = require('./middleware/platformAuth');
 
@@ -324,7 +324,6 @@ const { requirePlatformOwner } = require('./middleware/platformAuth');
 // Written as one array rather than repeated at each mount so the platform
 // surface cannot end up with two different definitions of who may reach it.
 const PLATFORM_GUARD = [auth, requireSuperAdmin, requireSuperAdminMfa, requirePlatformOwner];
-const { branchScope }            = require('./middleware/branch-scope');
 const { requireFeature }         = require('./lib/features');
 const { requireAiQuota }         = require('./lib/aiQuota');
 
@@ -364,7 +363,7 @@ const gate = (key) => [auth, requireFeature(key)];
 //
 // Use this for any mount whose data belongs to the studio rather than to the
 // person asking.
-const staffGate = (key) => [auth, requireStaff, requireFeature(key)];
+const studioGate = (key) => [auth, requireTrainer, requireFeature(key)];
 
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -442,11 +441,10 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  // x-org-id lets a platform super_admin scope requests to one tenant org
-  // (the org-switcher). It is ignored for every non-super_admin (tenant users
-  // are always locked to their JWT org — see lib/tenant-db.js), so allowing it
-  // through CORS cannot widen any tenant user's access.
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-org-id'],
+  // No tenant header. A request's organization is read from the session
+  // (req.user.organization_id) and nothing the browser sends can name it —
+  // see lib/tenant-db.js.
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 // ────────────────────────
@@ -673,8 +671,6 @@ for (const p of LOGIN_PATHS) {
 }
 app.use('/api/v1/auth/forgot-password', registerLimiter);
 app.use('/api/v1/auth/reset-password',  registerLimiter);
-app.use('/api/auth/create-user', registerLimiter);
-app.use('/api/auth/users',      registerLimiter);
 app.use('/api/auth/forgot-password', registerLimiter);
 app.use('/api/auth/reset-password',  registerLimiter);
 // Its OWN budget and its own store prefix. Sharing `login`'s prefix meant a
@@ -683,15 +679,6 @@ app.use('/api/auth/reset-password',  registerLimiter);
 app.use('/api/v1/auth/refresh',      refreshLimiter);
 app.use('/api/auth/refresh',         refreshLimiter);
 
-// ────────────────────────
-// BRANCH SCOPE (ISSUE-004)
-// Must run AFTER auth middleware (so req.user is set) but BEFORE route handlers.
-// branchScope is safe to apply globally — it is a no-op when req.user is absent
-// or when the user has no branch_id (single-branch / legacy installs).
-// TODO: downstream route handlers should append req.branchScope.sql / params to
-//       multi-branch-aware queries once branch_id columns are fully populated.
-// ────────────────────────
-app.use('/api/', branchScope);
 
 // ────────────────────────
 // v2 ROUTES (production)
@@ -730,7 +717,7 @@ app.use('/api/features',          require('./routes/features'));
 // no request-controlled org parameter; internal operator notes are excluded by
 // lib/support.TENANT_MESSAGE_SQL. Deliberately NOT feature-gated — a studio
 // must always be able to reach us, whatever else is switched off.
-// requireStaff, not bare auth. routes/support.js mounts `router.use(auth)` and
+// requireTrainer, not bare auth. routes/support.js mounts `router.use(auth)` and
 // then scopes every handler by organization_id — which bounds the STUDIO but
 // says nothing about the ROLE. A `member` (the account client activation
 // creates for a gym client) passed that filter and could list every support
@@ -743,15 +730,17 @@ app.use('/api/features',          require('./routes/features'));
 // at every mount; the audit asked for that test by name (Section 11).
 // src/app/(chrome)/support/page.tsx is the only caller and lives in the staff
 // shell, so no client-facing screen loses anything.
-app.use('/api/support',           auth, requireStaff, require('./routes/support'));
+app.use('/api/support',           auth, requireTrainer, require('./routes/support'));
 app.use('/api/subscription',      require('./routes/subscription'));
 // Global top-nav search. Carries its own rate limiter (see routes/search.js),
 // so it is deliberately NOT wrapped in userApiLimiter — debounced typing would
 // otherwise consume the shared per-user budget that real API calls need.
-// requireStaff: search fans out across the studio's clients, and its own
-// narrowing is `role === 'trainer' ? trainer_id : null` — so a member fell
-// through that branch with NO narrowing and searched the whole studio.
-app.use('/api/search',            auth, requireStaff, require('./routes/search'));
+// requireTrainer: search fans out across the studio's clients. Its own
+// narrowing used to be `role === 'trainer' ? trainer_id : null`, so a member
+// fell through that branch with NO narrowing and searched the whole studio.
+// The narrowing is gone (the trainer owns the studio) and the guard is what
+// keeps a member out.
+app.use('/api/search',            auth, requireTrainer, require('./routes/search'));
 
 // ONE router, deliberately. This mount used to carry a second file,
 // routes/client-actions.js, whose thirteen endpoints read and wrote the legacy
@@ -771,15 +760,16 @@ app.use('/api/search',            auth, requireStaff, require('./routes/search')
 // already lived. Removed outright rather than left as an alias: two URLs for
 // one resource is how the duplication started.
 
-// requireStaff: returns t.* per trainer PLUS month_revenue and
-// all_time_revenue. Staff earnings are not client-facing data.
-app.use('/api/trainers',          auth, requireStaff, require('./routes/trainers'));
+// /api/trainers (staff CRUD with per-trainer revenue) and /api/leave (staff
+// leave requests) are gone with the staff roles: a studio has exactly one
+// trainer, so there is no team to manage. The trainer's own profile is read
+// through GET /api/pt-os/trainers.
 // Manual UTR verification payments. MUST be mounted before the finance ledger
 // router below: that one owns DELETE /:id and a bare /:id would otherwise
 // swallow /api/payments/upi/... before this router ever sees it.
 app.use('/api/payments/upi',      userApiLimiter, require('./routes/upi-payments'));
-app.use('/api/payments',          userApiLimiter, auth, requireStaff, require('./routes/payments'));
-app.use('/api/attendance',        auth, requireStaff, ...gate('attendance'), require('./routes/attendance'));
+app.use('/api/payments',          userApiLimiter, auth, requireTrainer, require('./routes/payments'));
+app.use('/api/attendance',        auth, requireTrainer, ...gate('attendance'), require('./routes/attendance'));
 
 // ROUTE INTEGRITY NOTE (R-03) — SUPERSEDED, and deliberately reversed.
 //
@@ -800,22 +790,19 @@ app.use('/api/attendance',        auth, requireStaff, ...gate('attendance'), req
 // So "legacy" had it backwards: /api/reports is the tenant-safe, live
 // implementation, and the migration target was the unsafe one. Do not
 // reintroduce a v1 reports router without organization_id on its tables.
-app.use('/api/reports',           userApiLimiter, ...staffGate('insights'), require('./routes/reports'));
+app.use('/api/reports',           userApiLimiter, ...studioGate('insights'), require('./routes/reports'));
 // Canonical Insights — ONE source of truth (Metric Engine → Insights Engine).
 // /api/reports above is the frozen compatibility surface delegating to the
 // same engine; new clients must use these routes. Same guard, same feature.
-app.use('/api/insights',         userApiLimiter, ...staffGate('insights'), require('./modules/insights/insights.routes'));
+app.use('/api/insights',         userApiLimiter, ...studioGate('insights'), require('./modules/insights/insights.routes'));
 
 app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
-// requireStaff: staff leave requests — who is off, when, and why. HR data
-// about employees, org-scoped but not role-scoped.
-app.use('/api/leave',             auth, requireStaff, require('./routes/leave'));
-// staffGate, not gate: routes/expenses.js narrows with `if (req.user.role ===
-// 'trainer')` and then applies the org filter — so a member fell through the
-// trainer branch and got the studio's whole expense stats. Third instance of
-// that fall-through after reports/monthly and search; a feature flag is not an
-// authorisation decision.
-app.use('/api/expenses',          ...staffGate('finance'), require('./routes/expenses'));
+// studioGate, not gate: routes/expenses.js used to narrow with
+// `if (req.user.role === 'trainer')` and apply the org filter inside that
+// branch — so a member fell through it and got the studio's whole expense
+// stats. Third instance of that fall-through after reports/monthly and
+// search; a feature flag is not an authorisation decision.
+app.use('/api/expenses',          ...studioGate('finance'), require('./routes/expenses'));
 
 // ROUTE INTEGRITY NOTE (R-03 / bookings):
 // /api/bookings and /api/v1/bookings both mount the same router.
@@ -823,22 +810,15 @@ app.use('/api/expenses',          ...staffGate('finance'), require('./routes/exp
 app.use('/api/v1/bookings',       require('./modules/bookings/bookings.routes'));
 app.use('/api/bookings',          require('./modules/bookings/bookings.routes'));
 
-// FIX (Route Integrity R-10, tightened by audit finding C-1):
-// /api/admin previously relied solely on individual route handlers to apply
-// auth + adminOnly middleware. This left the mount unguarded — any handler
-// that forgot to include the middleware chain would be publicly accessible.
-// We enforce auth at the mount level as defense-in-depth. Individual handlers
-// may still include their own middleware; it is a no-op.
-//
-// C-1: admin-reset.js performs platform-wide, unscoped destructive operations
-// (DELETE/DROP across every tenant's data, no organization_id filter — these
-// are irreversible bulk-wipe tools, not ordinary tenant-admin actions). Gating
-// them behind `adminOnly` (role==='admin', the ordinary Studio Owner role
-// auto-granted to every self-serve trial signup) let any trial signup wipe
-// every tenant on the platform. This must be `requireSuperAdmin` +
-// `requireSuperAdminMfa`, matching every other platform-destructive route.
+// /api/admin is the CONTROL plane, not a studio "admin" area — the name
+// predates the Trainer → Members model and is kept because compiled mobile
+// clients and operator bookmarks call it. admin-reset.js performs
+// platform-wide, unscoped destructive operations (DELETE/DROP across every
+// tenant's data, no organization_id filter), so it sits behind the full
+// PLATFORM_GUARD like every other cross-tenant route (audit finding C-1: it
+// was once reachable by any studio owner).
 app.use('/api/admin',             ...PLATFORM_GUARD, require('./routes/admin-reset'));
-app.use('/api/debug',             auth, adminOnly, require('./routes/debug'));
+app.use('/api/debug',             auth, requireTrainer, require('./routes/debug'));
 
 // ── The Command Center API — the platform control plane ─────────────────────
 //
@@ -860,23 +840,23 @@ const platformRoutes = require('./modules/platform/super-admin.routes');
 app.use('/api/platform',          ...PLATFORM_GUARD, platformRoutes);
 app.use('/api/super-admin',       ...PLATFORM_GUARD, platformRoutes);
 
-// requireStaff: the operations workspace behind eight (chrome) tabs —
+// requireTrainer: the operations workspace behind eight (chrome) tabs —
 // attendance, finance, settings, reports. Migration 174 gave module_records a
 // tenant column and Phase 1 added orgWhere(), which bounds the studio; this
 // bounds the role.
-app.use('/api/modules',           auth, requireStaff, require('./modules/operations/operations.routes'));
+app.use('/api/modules',           auth, requireTrainer, require('./modules/operations/operations.routes'));
 
 // ────────────────────────
 // PREMIUM FEATURE ROUTES (v4)
 // ────────────────────────
 app.use('/api/calendar',          require('./routes/calendar'));
 app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-checkin'));
-// requireStaff: the handler already hides internal_/geo_/biometric_/feature_
+// requireTrainer: the handler already hides internal_/geo_/biometric_/feature_
 // keys from non-admins, but system_settings carries NO organization_id at all
 // (it is on tenantColumns' KNOWN_GAPS as per-studio keys inside a shared
 // table), so the query is unfiltered by studio as well as by role.
-app.use('/api/settings',          auth, requireStaff, require('./routes/settings'));
-app.use('/api/invoices',          ...staffGate('finance'), require('./routes/invoices'));
+app.use('/api/settings',          auth, requireTrainer, require('./routes/settings'));
+app.use('/api/invoices',          ...studioGate('finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
 // The Exercise Library. Sits behind the same 'programs' feature as the Workout
 // Builder it feeds — a studio with programmes always has the library, and one
@@ -903,13 +883,13 @@ app.use('/api/diet',              require('./routes/diet'));
 // id='whatsapp' — storing an api_key nothing reads and reporting success.
 //
 // gate() is auth + feature flag and says nothing about role (see its comment
-// above); routes/whatsapp.js applies adminOnly itself.
+// above); routes/whatsapp.js applies requireTrainer itself.
 app.use('/api/integrations/whatsapp', ...gate('integrations'), require('./routes/whatsapp'));
 app.use('/api/integrations',      ...gate('integrations'), require('./routes/integrations'));
 app.use('/api/campaigns',         ...gate('communication'), require('./routes/campaigns'));
 app.use('/api/offers',            require('./routes/offers'));
 app.use('/api/feedback',          require('./routes/feedback'));
-app.use('/api/communication',     auth, requireStaff, ...gate('communication'), require('./routes/communication'));
+app.use('/api/communication',     auth, requireTrainer, ...gate('communication'), require('./routes/communication'));
 // Mounted before /api/ai so /api/ai/knowledge/* is matched here first,
 // regardless of what routes/ai.js's own router does internally.
 // The AI mounts additionally carry a token-quota guard. It runs AFTER the
@@ -941,14 +921,14 @@ app.use('/api/classes',           require('./routes/classes'));
 // the gap this closes came about. Read routes here were `auth`-only, harmless
 // only for as long as no account held the `member` role. Client logins end
 // that, and an ungated GET /api/pt-os/clients hands a client the studio's
-// whole client list. See requireStaff in middleware/rbac.js.
+// whole client list. See requireTrainer in middleware/rbac.js.
 //
 // auth() running twice is cheap: the second call is a user-cache hit.
 // A client's own data is served by /api/me, which scopes to the caller.
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/pt-os.routes'));
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/parq.routes'));
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/informed-consent.routes'));
-app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/workout-log.routes'));
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/pt-os.routes'));
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/parq.routes'));
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/informed-consent.routes'));
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/workout-log.routes'));
 
 // The client's own surfaces. Mirror image of the block above: requireClient
 // refuses anyone who is not a `member` linked to a client record, and every
@@ -957,13 +937,13 @@ app.use('/api/pt-os',            auth, requireStaff, require('./modules/pt-os/wo
 app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-portal.routes'));
 
 // Trainer-side control of client logins. Staff only, org-scoped.
-app.use('/api/client-login',     auth, requireStaff, require('./routes/client-login'));
+app.use('/api/client-login',     auth, requireTrainer, require('./routes/client-login'));
 
 // ────────────────────────
 // BUSINESS FLOW ROUTES (v4 — Progress, Automation)
 // ────────────────────────
 //
-// requireStaff, for the same reason /api/pt-os carries it: both modules serve
+// requireTrainer, for the same reason /api/pt-os carries it: both modules serve
 // the studio's back office, and both were mounted on `auth` alone — which was
 // survivable only while no account held the `member` role. Client activation
 // creates those accounts by the hundred, and until this line existed a client
@@ -976,8 +956,8 @@ app.use('/api/client-login',     auth, requireStaff, require('./routes/client-lo
 // userApiLimiter as well: these two mounts had only the 2000-per-15-minutes
 // global bucket, which is a generous ceiling for an endpoint that returns
 // health records a page at a time.
-app.use('/api/progress',   userApiLimiter, auth, requireStaff, require('./modules/progress/progress.routes'));
-app.use('/api/automation', userApiLimiter, auth, requireStaff, require('./modules/automation/automation.routes'));
+app.use('/api/progress',   userApiLimiter, auth, requireTrainer, require('./modules/progress/progress.routes'));
+app.use('/api/automation', userApiLimiter, auth, requireTrainer, require('./modules/automation/automation.routes'));
 
 // ────────────────────────
 // v3 MODULE ROUTES

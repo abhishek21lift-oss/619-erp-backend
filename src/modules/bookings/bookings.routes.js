@@ -1,7 +1,7 @@
 // src/modules/bookings/bookings.routes.js
 const router = require('express').Router();
 const { auth } = require('../../middleware/auth');
-const { requireRole } = require('../../middleware/rbac');
+const { requireTrainer } = require('../../middleware/rbac');
 const { tenantScope } = require('../../lib/tenant-db');
 const svc = require('./bookings.service');
 const cal = require('../../lib/google-calendar');
@@ -47,7 +47,7 @@ router.delete('/:id', auth, wrap(async (req, res) => {
 }));
 
 // POST /api/v1/bookings/:id/check-in
-router.post('/:id/check-in', auth, requireRole('admin','manager','trainer'), wrap(async (req, res) => {
+router.post('/:id/check-in', auth, requireTrainer, wrap(async (req, res) => {
   const booking = await svc.checkIn(req.params.id, { method: req.body?.method || 'manual' }, ctx(req));
   res.json({ data: booking });
 }));

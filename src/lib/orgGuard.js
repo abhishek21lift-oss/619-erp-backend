@@ -16,7 +16,6 @@ const { tenantScope } = require('./tenant-db');
 async function clientInOrg(req, clientId) {
   if (!clientId) return true;
   const scope = tenantScope(req);
-  if (!scope.applyFilter) return true;
   const { rowCount } = await pool.query(
     'SELECT 1 FROM pt_clients WHERE id = $1 AND deleted_at IS NULL AND organization_id = $2',
     [clientId, scope.orgId]

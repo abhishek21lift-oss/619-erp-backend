@@ -1,127 +1,9 @@
 const pool = require('../../db/pool');
 const { today: studioToday, todayShortDay: studioShortDay } = require('../../lib/appTime');
 
-async function calculateMonthlyCommissions(month, scope = {}) {
-  const monthStart = `${month}-01`;
-  // UTC arithmetic only. The previous form built the next month from the
-  // LOCAL getFullYear()/getMonth() of a UTC-parsed date, so west of UTC the
-  // month-end collapsed onto the month start (e.g. [2026-08-01, 2026-08-01]
-  // on America/Los_Angeles), narrowing the window to a single day and
-  // under-counting commissions.
-  const mStart = new Date(monthStart + 'T00:00:00Z');
-  const mEnd = new Date(Date.UTC(mStart.getUTCFullYear(), mStart.getUTCMonth() + 1, 1));
-  const mEndStr = mEnd.toISOString().slice(0, 10);
-
-  const params = [mStart.toISOString().slice(0, 10), mEndStr];
-  let orgClause = '';
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    orgClause = ` AND c.organization_id = $${params.length}`;
-  }
-  // ── One statement, not one per client ────────────────────────────────────
-  //
-  // This used to SELECT the eligible clients and then loop, issuing an
-  // INSERT … ON CONFLICT per client. Two problems, both of which get worse
-  // exactly where this function matters most — a studio with a lot of PT
-  // clients at month end:
-  //
-  //   · No transaction wrapped the loop. A failure partway through — a
-  //     timeout, a dropped connection, one bad row — left some commissions
-  //     written and the rest not, with no signal beyond the error. Re-running
-  //     recovers because the upsert is idempotent, but nothing said it needed
-  //     re-running.
-  //   · N+1 round trips. With TENANT_RLS_ENFORCE on, db/pool.js wraps every
-  //     query in BEGIN → set_config → … → COMMIT on a dedicated pooled client,
-  //     so each iteration costs four round trips and holds one of twenty
-  //     connections. A thousand PT clients is four thousand round trips, which
-  //     passes the 15s query_timeout somewhere in the hundreds.
-  //
-  // Folding the read into the write fixes both at once. A single statement is
-  // atomic in Postgres, so this needs no explicit BEGIN/COMMIT — adding one
-  // would suggest the atomicity came from the transaction rather than from
-  // there being one statement.
-  //
-  // The ON CONFLICT arbiter is (trainer_id, client_id, month). A multi-row
-  // upsert raises if the same arbiter appears twice in one statement, which
-  // cannot happen here: the source is one row per pt_clients.id and client_id
-  // is part of the key.
-  //
-  // COALESCE on trainer_commission preserves the loop's behaviour exactly —
-  // it read the value through Number(), and Number(null) is 0, where passing
-  // a SQL NULL into a NOT NULL column would now fail instead.
-  const { rows: written } = await pool.query(`
-    INSERT INTO pt_commissions
-      (trainer_id, trainer_name, client_id, client_name,
-       month, commission_amt, incentive_rate, status)
-    SELECT c.trainer_id, c.trainer_name, c.id, c.name,
-           $1::DATE, COALESCE(c.trainer_commission, 0), t.incentive_rate, 'pending'
-    FROM pt_clients c
-    JOIN trainers t ON t.id = c.trainer_id
-    WHERE c.deleted_at IS NULL
-      AND c.status IN ('active','frozen')
-      AND c.trainer_id IS NOT NULL
-      AND c.pt_start_date IS NOT NULL
-      -- NULLIF(c.pt_end_date, '') here made this endpoint 500 unconditionally.
-      -- pt_end_date is a DATE column, so Postgres has to coerce the '' literal
-      -- to date to type the NULLIF, and that fails at plan time — before any
-      -- row is examined, so it errored even with nothing to calculate:
-      --   invalid input syntax for type date: ""
-      -- The idiom belongs to a TEXT column (getActiveClients still reads
-      -- pt_end_date::TEXT != '' because it handles both shapes); this one was
-      -- left behind when the column became a date, and a NULL end date is
-      -- already covered by the IS NULL arm. Found by the E2E isolation suite.
-      AND (c.pt_end_date IS NULL OR c.pt_end_date >= $1::DATE)
-      AND c.pt_start_date <= $2::DATE
-      AND c.monthly_pt_amount > 0${orgClause}
-    ON CONFLICT (trainer_id, client_id, month)
-    DO UPDATE SET commission_amt = EXCLUDED.commission_amt,
-                  incentive_rate = EXCLUDED.incentive_rate,
-                  updated_at = NOW()
-    RETURNING *
-  `, params);
-
-  return { count: written.length, total: written.reduce((s, r) => s + Number(r.commission_amt), 0) };
-}
-
-async function getTrainerPayouts(month, scope = {}) {
-  const monthStart = `${month}-01`;
-  const params = [monthStart];
-  let orgClause = '';
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    orgClause = ` AND t.organization_id = $${params.length}`;
-  }
-  const { rows } = await pool.query(`
-    SELECT
-      t.id AS trainer_id,
-      t.name AS trainer_name,
-      COUNT(DISTINCT pc.client_id) AS commission_clients,
-      COALESCE(SUM(pc.commission_amt), 0) AS total_commission,
-      COALESCE(pp.net_amount, 0) AS paid_amount,
-      COALESCE(pp.status, 'pending') AS payout_status,
-      pp.id AS payout_id
-    FROM trainers t
-    LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
-    LEFT JOIN pt_payouts pp ON pp.trainer_id = t.id AND pp.month = $1
-    WHERE t.deleted_at IS NULL AND t.status = 'active'${orgClause}
-    GROUP BY t.id, t.name, pp.net_amount, pp.status, pp.id
-    ORDER BY total_commission DESC
-  `, params);
-  return rows;
-}
-
-async function getBalanceSheet(trainerId, scope = {}) {
-  const where = [];
-  const params = [];
-  if (trainerId) {
-    params.push(trainerId);
-    where.push(`c.trainer_id = $${params.length}`);
-  }
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    where.push(`c.organization_id = $${params.length}`);
-  }
-  const whereSql = where.length ? `AND ${where.join(' AND ')}` : '';
+async function getBalanceSheet(scope = {}) {
+  const params = [scope.orgId];
+  const whereSql = 'AND c.organization_id = $1';
   const { rows } = await pool.query(`
     SELECT c.id, c.client_id, c.unique_id, c.name, c.mobile, c.email, c.photo_url,
            c.weight, c.emergency_contact,
@@ -167,7 +49,7 @@ async function getBalanceSheet(trainerId, scope = {}) {
  * Unfiltered behaviour is unchanged: no options still returns every
  * non-deleted client, which is what the All Clients page relies on.
  */
-async function getActiveClients(trainerId, scope = {}, opts = {}) {
+async function getActiveClients(scope = {}, opts = {}) {
   const where = ['TRUE'];
   const params = [];
 
@@ -175,14 +57,8 @@ async function getActiveClients(trainerId, scope = {}, opts = {}) {
   // operator view does.
   if (!opts.includeDeleted) where.push('c.deleted_at IS NULL');
 
-  if (trainerId) {
-    params.push(trainerId);
-    where.push(`c.trainer_id = $${params.length}`);
-  }
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    where.push(`c.organization_id = $${params.length}`);
-  }
+  params.push(scope.orgId);
+  where.push(`c.organization_id = $${params.length}`);
   if (opts.search && String(opts.search).trim()) {
     params.push(`%${String(opts.search).trim()}%`);
     const p = params.length;
@@ -246,13 +122,11 @@ function pageClause(limit, offset, alreadyBound) {
 }
 
 async function getDashboardStats(scope = {}) {
-  // Tenant scope: filter every aggregate to the caller's org. $1 (when present)
-  // is the org id; bare `organization_id` for single-table queries, aliased
+  // Tenant scope: filter every aggregate to the caller's org. $1 is the org
+  // id; bare `organization_id` for single-table queries, aliased
   // `c.organization_id` for the trainer/client join.
-  const apply = Boolean(scope.applyFilter);
-  const orgParams = apply ? [scope.orgId] : [];
-  const orgBare = apply ? ' AND organization_id = $1' : '';
-  const orgC = apply ? ' AND c.organization_id = $1' : '';
+  const orgParams = [scope.orgId];
+  const orgBare = ' AND organization_id = $1';
 
   const { rows: [totals] } = await pool.query(`
     SELECT
@@ -294,18 +168,10 @@ async function getDashboardStats(scope = {}) {
   totals.today_collected = todayRow.collected;
   totals.today_payments = todayRow.payments;
 
-  const { rows: trainerStats } = await pool.query(`
-    SELECT
-      t.id, t.name,
-      COUNT(c.id) FILTER (WHERE c.status = 'active')::INT AS active_clients,
-      COALESCE(SUM(c.monthly_pt_amount) FILTER (WHERE c.status = 'active'), 0) AS monthly_revenue,
-      COALESCE(SUM(c.trainer_commission) FILTER (WHERE c.status = 'active'), 0) AS monthly_commission
-    FROM trainers t
-    LEFT JOIN pt_clients c ON c.trainer_id = t.id AND c.deleted_at IS NULL AND c.pt_start_date IS NOT NULL${orgC}
-    WHERE t.deleted_at IS NULL AND t.status = 'active'
-    GROUP BY t.id, t.name
-    ORDER BY active_clients DESC
-  `, orgParams);
+  // The per-coach breakdown (active clients / revenue / commission per
+  // trainer profile) went with the multi-coach model. It was also unscoped:
+  // the org filter sat only in the LEFT JOIN, so the WHERE clause listed every
+  // active trainer on the platform, by name, to every studio.
 
   const { rows: revenueTrend } = await pool.query(`
     SELECT
@@ -320,98 +186,7 @@ async function getDashboardStats(scope = {}) {
     ORDER BY month ASC
   `, orgParams);
 
-  return { ...totals, trainers: trainerStats, revenueTrend };
-}
-
-async function getCommissionHistory(trainerId, scope = {}) {
-  const where = ['c.deleted_at IS NULL'];
-  const params = [];
-  if (trainerId) {
-    params.push(trainerId);
-    where.push(`pc.trainer_id = $${params.length}`);
-  }
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    where.push(`c.organization_id = $${params.length}`);
-  }
-  const { rows } = await pool.query(`
-    SELECT pc.*, c.name AS client_name
-    FROM pt_commissions pc
-    JOIN pt_clients c ON c.id = pc.client_id
-    WHERE ${where.join(' AND ')}
-    ORDER BY pc.month DESC, pc.client_name
-    LIMIT 200
-  `, params);
-  return rows;
-}
-
-async function createPayout(trainerId, month, deductions, processedBy, scope = {}) {
-  const monthStart = `${month}-01`;
-  const params = [monthStart, trainerId];
-  let orgClause = '';
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    orgClause = ` AND t.organization_id = $${params.length}`;
-  }
-  const { rows: [commData] } = await pool.query(`
-    SELECT
-      t.name AS trainer_name,
-      COALESCE(SUM(pc.commission_amt), 0) AS total_commission
-    FROM trainers t
-    LEFT JOIN pt_commissions pc ON pc.trainer_id = t.id AND pc.month = $1
-    WHERE t.id = $2 AND t.deleted_at IS NULL${orgClause}
-    GROUP BY t.name
-  `, params);
-
-  if (!commData) throw new Error('Trainer not found');
-
-  const totalCommission = Number(commData.total_commission);
-  const netAmount = Math.max(0, totalCommission - (deductions || 0));
-
-  const { rows } = await pool.query(`
-    INSERT INTO pt_payouts
-      (trainer_id, trainer_name, month, total_commission, deductions, net_amount, status, processed_by)
-    VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)
-    ON CONFLICT (trainer_id, month)
-    DO UPDATE SET total_commission = EXCLUDED.total_commission,
-                  deductions = EXCLUDED.deductions,
-                  net_amount = EXCLUDED.net_amount,
-                  processed_by = EXCLUDED.processed_by,
-                  updated_at = NOW()
-    RETURNING *
-  `, [trainerId, commData.trainer_name, monthStart, totalCommission, deductions || 0, netAmount, processedBy]);
-
-  return rows[0];
-}
-
-async function markPayoutPaid(payoutId, paymentMethod, paymentRef, processedBy, scope = {}) {
-  const params = [payoutId, paymentMethod, paymentRef, processedBy];
-  let orgClause = '';
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    orgClause = ` AND trainer_id IN (SELECT id FROM trainers WHERE organization_id = $${params.length})`;
-  }
-  const { rows } = await pool.query(`
-    UPDATE pt_payouts
-    SET status = 'paid',
-        payment_method = COALESCE($2, payment_method),
-        payment_ref = COALESCE($3, payment_ref),
-        paid_at = NOW(),
-        processed_by = COALESCE($4, processed_by),
-        updated_at = NOW()
-    WHERE id = $1${orgClause}
-    RETURNING *
-  `, params);
-
-  if (rows.length > 0) {
-    const payout = rows[0];
-    await pool.query(`
-      UPDATE pt_commissions
-      SET status = 'paid', updated_at = NOW()
-      WHERE trainer_id = $1 AND month = $2 AND status IN ('pending', 'approved')
-    `, [payout.trainer_id, payout.month]);
-  }
-  return rows[0];
+  return { ...totals, revenueTrend };
 }
 
 /**
@@ -488,7 +263,7 @@ async function syncClientAssignments(clientId) {
  *
  * Returns { date, dow, dayToken, rows }. Callers shape their own response.
  */
-async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
+async function getTodayRoster({ date, scope = {} } = {}) {
   const d = (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) ? date : studioToday();
   // ISO weekday: Postgres ISODOW gives Monday=1, matching
   // workout_exercises.day_of_week and the WEEKDAYS array above.
@@ -501,20 +276,11 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
   const dayToken = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][dow - 1];
 
   const params = [d, dow, dayToken];
-  // $4 when filtering. Each source carries its own org column, so the filter
-  // is applied per-source inside the union rather than once at the end —
+  // $4 is the org. Each source carries its own org column, so the filter is
+  // applied per-source inside the union rather than once at the end —
   // otherwise a foreign row could enter the candidate set and be deduplicated
   // against a local one.
-  const org = scope.applyFilter ? (params.push(scope.orgId), `$${params.length}`) : null;
-
-  // A trainer who is not admin/manager sees only their own clients. Mirrors
-  // the ownership rule used across pt-os reads. Applied once, at the end,
-  // because it is a property of the CLIENT rather than of the source.
-  let trainerClause = '';
-  if (trainerId) {
-    params.push(trainerId);
-    trainerClause = `AND c.trainer_id = $${params.length}`;
-  }
+  params.push(scope.orgId);
 
   // pt_clients.preferred_workout_time is free text holding TWO formats, and
   // sorting it as text is nonsense: the enrolment form's dropdown writes
@@ -543,7 +309,7 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
         WHERE s.session_date = $1::date
           AND s.deleted_at IS NULL
           AND s.status <> 'cancelled'
-          ${org ? `AND s.organization_id = ${org}` : ''}
+          AND s.organization_id = $4
 
        UNION ALL
 
@@ -573,7 +339,7 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
         WHERE wa.status = 'active'
           AND wa.start_date <= $1::date
           AND (wa.end_date IS NULL OR wa.end_date >= $1::date)
-          ${org ? `AND wa.organization_id = ${org}` : ''}
+          AND wa.organization_id = $4
 
        UNION ALL
 
@@ -586,7 +352,7 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
           AND c2.status = 'active'
           AND c2.preferred_training_days IS NOT NULL
           AND $3 = ANY(string_to_array(replace(c2.preferred_training_days, ' ', ''), ','))
-          ${org ? `AND c2.organization_id = ${org}` : ''}
+          AND c2.organization_id = $4
      ),
      -- One row per client. MIN(source_rank) keeps the most specific reason
      -- they are on the list; MIN(start_time) keeps the earliest time any
@@ -621,7 +387,9 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
                        WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
                          AND we.week_number = 1), 0) AS planned_exercises
        FROM roster r
-       JOIN pt_clients c ON c.id = r.client_id AND c.deleted_at IS NULL
+       -- Org-bound again here: the candidate ids are already scoped per source,
+       -- and this keeps the outer read from ever resolving a foreign client.
+       JOIN pt_clients c ON c.id = r.client_id AND c.deleted_at IS NULL AND c.organization_id = $4
        -- LEFT, not INNER: a client can be on today's roster with no programme
        -- at all, which is the state this endpoint used to make invisible.
        -- LATERAL with LIMIT 1 because two active assignments would otherwise
@@ -671,7 +439,7 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
           ORDER BY (s.status = 'in_progress') DESC, s.created_at DESC
           LIMIT 1
        ) ws ON TRUE
-      WHERE TRUE ${trainerClause}
+      WHERE TRUE
       -- Clock order. Rest days (nothing prescribed and no booking) sink to the
       -- bottom; among the rest, timed before untimed, then by name so the list
       -- is stable between refreshes.
@@ -702,18 +470,17 @@ async function getTodayRoster({ date, scope = {}, trainerId = null } = {}) {
  *   session_stats    — this-month vs last-month completed session counts
  *   trainer_sessions — per-trainer session totals this month
  */
-async function getOpsSummary(scope = {}, trainerId = null) {
+async function getOpsSummary(scope = {}) {
   // Studio-local, not UTC. `toISOString()` here meant the panel showed
   // yesterday's sessions between midnight and 05:30 IST — see src/lib/appTime.js.
   const today = studioToday();
   const todayDay = studioShortDay();   // 'Mon' … 'Sun', matching the enrolment format
-  // Tenant scope: $1 is always `today`; when filtering, $2 is the org id.
-  const apply = Boolean(scope.applyFilter);
-  const orgS = apply ? ' AND s.organization_id = $2' : '';   // aliased pt_sessions
-  const sessParams = apply ? [today, scope.orgId] : [today];
+  // Tenant scope: $1 is `today` and $2 the org id.
+  const orgS = ' AND s.organization_id = $2';   // aliased pt_sessions
+  const sessParams = [today, scope.orgId];
   // For queries whose only param is the org id (bare table, $1).
-  const orgBare1 = apply ? ' AND organization_id = $1' : '';
-  const bareParams = apply ? [scope.orgId] : [];
+  const orgBare1 = ' AND organization_id = $1';
+  const bareParams = [scope.orgId];
 
   // Today's booked slots, in time order.
   //
@@ -734,7 +501,7 @@ async function getOpsSummary(scope = {}, trainerId = null) {
       wa.plan_name, wa.plan_id
     FROM pt_sessions s
     LEFT JOIN pt_clients c  ON c.id = s.client_id
-    LEFT JOIN trainers t ON t.id = s.trainer_id
+    LEFT JOIN trainers t ON t.id = s.trainer_id AND t.organization_id = s.organization_id
     LEFT JOIN LATERAL (
       SELECT wp.name AS plan_name, wp.id AS plan_id
         FROM workout_assignments a
@@ -774,7 +541,7 @@ async function getOpsSummary(scope = {}, trainerId = null) {
   //
   // Shape is unchanged: the roster returns a superset of the fields this panel
   // published, so its consumer (the AI Coach card) sees exactly what it did.
-  const roster = await getTodayRoster({ date: today, scope, trainerId });
+  const roster = await getTodayRoster({ date: today, scope });
   const today_unscheduled = roster.rows
     .filter((r) => r.source_rank === 2 && Number(r.planned_exercises) > 0)
     .map((r) => ({
@@ -840,7 +607,7 @@ async function getOpsSummary(scope = {}, trainerId = null) {
                AND we.week_number = 1
           )
      )
-     ${apply ? 'AND c.organization_id = $3' : ''}
+     AND c.organization_id = $3
    -- Parsed to a real TIME, not sorted as text. The column is free text
    -- holding two formats: the enrolment dropdown writes '6:00 AM' and its
    -- custom field, an <input type="time">, writes '06:00'. As strings
@@ -857,7 +624,7 @@ async function getOpsSummary(scope = {}, trainerId = null) {
      END NULLS LAST,
      c.name
    LIMIT 25
-  `, apply ? [today, todayDay, scope.orgId] : [today, todayDay]);
+  `, [today, todayDay, scope.orgId]);
 
   const { rows: renewals_due } = await pool.query(`
     SELECT
@@ -938,7 +705,7 @@ async function getOpsSummary(scope = {}, trainerId = null) {
   // The `s` filter belongs in the JOIN condition, not the WHERE clause. In the
   // WHERE it would discard the NULL-extended rows a LEFT JOIN produces and
   // silently turn this into an INNER JOIN, dropping every trainer who has no
-  // sessions this month — who are precisely the ones a manager is looking for.
+  // sessions this month — who are precisely the ones the trainer is looking for.
   const { rows: trainer_sessions } = await pool.query(`
     SELECT
       t.name AS trainer_name,
@@ -951,9 +718,9 @@ async function getOpsSummary(scope = {}, trainerId = null) {
       AND s.session_date >= DATE_TRUNC('month', CURRENT_DATE)
       AND s.session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
       AND s.deleted_at IS NULL
-      ${apply ? 'AND s.organization_id = $1' : ''}
+      AND s.organization_id = $1
     WHERE t.deleted_at IS NULL AND t.status = 'active'
-      ${apply ? 'AND t.organization_id = $1' : ''}
+      AND t.organization_id = $1
     GROUP BY t.id, t.name
     ORDER BY completed DESC
   `, bareParams);
@@ -996,10 +763,8 @@ async function getOpsSummary(scope = {}, trainerId = null) {
 async function findClientForAccess(clientId, scope = {}) {
   const params = [clientId];
   let orgClause = '';
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    orgClause = ` AND organization_id = $${params.length}`;
-  }
+  params.push(scope.orgId);
+  orgClause = ` AND organization_id = $${params.length}`;
   const { rows } = await pool.query(
     `SELECT id, trainer_id FROM pt_clients WHERE id = $1${orgClause}`,
     params
@@ -1010,62 +775,25 @@ async function findClientForAccess(clientId, scope = {}) {
 /**
  * Search this studio's clients by name, mobile, client id or email.
  *
- * ── The three filters, and why each one survives the move ───────────────────
- *
- * · ORG. `scope.applyFilter` is the same tenant predicate every other read in
- *   this file carries.
- *
- * · TRAINER. A trainer may only search their own roster, and a trainer account
- *   with no linked trainer record matches NOTHING rather than the whole studio.
- *   That fail-closed default is deliberate: the original comment records that
- *   this route once lacked the check the list endpoint had, so the roster rule
- *   could be sidestepped by calling /search instead of /. Restating it here
- *   rather than relying on the caller is what keeps that from recurring.
- *
- * · BRANCH. pt_clients has no branch_id, so the subselect synthesises a NULL
- *   one and the branch predicate is applied against it. That looks pointless
- *   and is not: for a user WITH a branch (reception, trainer, member) the
- *   predicate `branch_id = $n` against NULL is never true, so they match
- *   nothing — which is exactly what branch-scope means by "legacy rows with a
- *   NULL branch are not visible". Dropping the shim on the way across would
- *   have turned "sees nothing" into "sees everything" for those roles, which
- *   is a widening of access disguised as a simplification.
+ * The organization is the only filter and it is always applied: the trainer
+ * owns the whole studio, so there is no narrower roster to restrict to, and a
+ * request with no organization binds NULL and matches nothing.
  */
-async function searchClients({ q, limit = 20, trainerId, scope = {}, branch = null }) {
+async function searchClients({ q, limit = 20, scope = {} }) {
   const term = String(q || '').trim();
   if (!term) return [];
 
   const capped = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
-  const params = [`%${term}%`];
-  let where = '';
-
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    where += ` AND c.organization_id = $${params.length}`;
-  }
-  // `undefined` means "no trainer restriction"; ANY other value — null
-  // included — means "restrict to this trainer". The distinction is the
-  // fail-closed rule and it is easy to lose: a trainer account with no linked
-  // trainer record has trainer_id null, and treating null as "no filter" would
-  // hand that account the entire studio's roster. Passed through as a bound
-  // parameter, `c.trainer_id = NULL` is never true and it matches nothing,
-  // which is the intended answer.
-  if (trainerId !== undefined) {
-    params.push(trainerId);
-    where += ` AND c.trainer_id = $${params.length}`;
-  }
-
-  const branchSql = branch ? branch.appendTo(params) : { sql: 'TRUE', params };
   const { rows } = await pool.query(
     `SELECT c.*, t.name AS computed_trainer_name
-       FROM (SELECT pc.*, NULL::text AS branch_id FROM pt_clients pc) c
-       LEFT JOIN trainers t ON t.id = c.trainer_id
+       FROM pt_clients c
+       LEFT JOIN trainers t ON t.id = c.trainer_id AND t.organization_id = c.organization_id
       WHERE c.deleted_at IS NULL
-        AND (c.name ILIKE $1 OR c.mobile ILIKE $1 OR c.client_id ILIKE $1 OR c.email ILIKE $1)${where}
-        AND c.${branchSql.sql}
+        AND c.organization_id = $2
+        AND (c.name ILIKE $1 OR c.mobile ILIKE $1 OR c.client_id ILIKE $1 OR c.email ILIKE $1)
       ORDER BY c.created_at DESC
-      LIMIT $${branchSql.params.length + 1}`,
-    [...branchSql.params, capped]
+      LIMIT $3`,
+    [`%${term}%`, scope.orgId, capped]
   );
   return rows;
 }
@@ -1138,10 +866,8 @@ function clampOffset(value) {
 async function getCheckinInsightInputs(clientId, scope = {}, limit = 12) {
   const cParams = [clientId];
   let cOrg = '';
-  if (scope.applyFilter) {
-    cParams.push(scope.orgId);
-    cOrg = ` AND organization_id = $${cParams.length}`;
-  }
+  cParams.push(scope.orgId);
+  cOrg = ` AND organization_id = $${cParams.length}`;
   const { rows: clientRows } = await pool.query(
     `SELECT id FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${cOrg}`,
     cParams
@@ -1150,10 +876,8 @@ async function getCheckinInsightInputs(clientId, scope = {}, limit = 12) {
 
   const wParams = [clientId];
   let wOrg = '';
-  if (scope.applyFilter) {
-    wParams.push(scope.orgId);
-    wOrg = ` AND organization_id = $${wParams.length}`;
-  }
+  wParams.push(scope.orgId);
+  wOrg = ` AND organization_id = $${wParams.length}`;
   wParams.push(limit);
   const { rows } = await pool.query(
     `SELECT week_start_date, weight, mood, sleep_hours, water_glasses, workout_count,
@@ -1197,10 +921,8 @@ async function getCheckinInsightInputs(clientId, scope = {}, limit = 12) {
 async function getTransformations(scope = {}) {
   const params = [];
   let orgClause = '';
-  if (scope.applyFilter) {
-    params.push(scope.orgId);
-    orgClause = ` AND c.organization_id = $${params.length}`;
-  }
+  params.push(scope.orgId);
+  orgClause = ` AND c.organization_id = $${params.length}`;
 
   const { rows } = await pool.query(
     `WITH ranked AS (
@@ -1272,8 +994,6 @@ async function getTransformations(scope = {}) {
 module.exports = {
   syncClientAssignments,
   getTodayRoster,
-  calculateMonthlyCommissions,
-  getTrainerPayouts,
   getBalanceSheet,
   getActiveClients,
   findClientForAccess,
@@ -1281,9 +1001,6 @@ module.exports = {
   getClientAttendance,
   getClientPayments,
   getDashboardStats,
-  getCommissionHistory,
-  createPayout,
-  markPayoutPaid,
   getOpsSummary,
   getCheckinInsightInputs,
   getTransformations,

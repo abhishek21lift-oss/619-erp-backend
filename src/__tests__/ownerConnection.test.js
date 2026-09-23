@@ -121,7 +121,10 @@ describe('auth.js is the only grant of platform-wide status', () => {
     // req.user.role is loaded from the users table by this middleware; a
     // header or body value would be caller-controlled and is the one thing
     // that must never reach this decision.
-    expect(auth).toMatch(/const platformWide = req\.user\.role === 'super_admin' && orgId == null;/);
+    expect(auth).toMatch(/const platformWide = req\.user\.role === ROLES\.SUPER_ADMIN;/);
+    // …and a super_admin only ever gets that far off the tenant plane: the
+    // same middleware refuses it on every tenant path first.
+    expect(auth).toMatch(/user\.role === ROLES\.SUPER_ADMIN && isTenantPlanePath\(/);
   });
 
   it('is granted nowhere else in the codebase', () => {

@@ -64,8 +64,7 @@ const TRIGGER_EVENTS = Object.freeze([
  *
  * Enumerated because "nothing happened" is the failure mode this feature will
  * actually have in production, and an operator needs to tell a disabled studio
- * from an ungranted trainer from a client with no phone number without reading
- * the source.
+ * from a client with no phone number without reading the source.
  */
 const Outcome = Object.freeze({
   QUEUED: 'queued',
@@ -73,7 +72,6 @@ const Outcome = Object.freeze({
   NO_ACTIVE_RULE: 'no_active_rule',
   RECIPIENT_NOT_FOUND: 'recipient_not_found',
   NO_PHONE: 'no_phone',
-  TRAINER_NOT_PERMITTED: 'trainer_not_permitted',
   DAILY_LIMIT_REACHED: 'daily_limit_reached',
   DUPLICATE_EVENT: 'duplicate_event',
   NOT_ENQUEUED: 'not_enqueued',
@@ -177,28 +175,12 @@ async function emit({
     if (!recipient) return done(Outcome.RECIPIENT_NOT_FOUND);
     if (!recipient.phone) return done(Outcome.NO_PHONE);
 
-    // ── The permission gate ─────────────────────────────────────────────────
+    // ── Permission ──────────────────────────────────────────────────────────
     //
-    // Whose permission? The trainer the CLIENT belongs to, not whoever
-    // happened to trigger the event. A payment recorded by the front desk
-    // still produces a message that appears, to the client, to come from their
-    // trainer's studio relationship — so it is that trainer's grant that has
-    // to exist.
-    //
-    // A client with no trainer is a studio-level message: there is no
-    // individual to attribute it to, the studio switch above is the whole
-    // authorisation, and requiring a grant that cannot exist would make
-    // unassigned clients silently unmessageable.
-    if (recipient.trainer_id) {
-      const granted = await repo.trainerIsGranted(orgId, recipient.trainer_id);
-      if (!granted) {
-        logger.info(
-          { org_id: orgId, event, trainer_id: recipient.trainer_id },
-          'automation_skipped_trainer_not_permitted'
-        );
-        return done(Outcome.TRAINER_NOT_PERMITTED);
-      }
-    }
+    // The studio switch above is the whole authorisation. There used to be a
+    // second, per-trainer grant keyed on the trainer the client belongs to; it
+    // went with the staff roles, because the studio has one trainer and that
+    // trainer is the one who turned the switch on.
 
     // ── The daily limit is checked INSIDE the insert, per rule ──────────────
     //

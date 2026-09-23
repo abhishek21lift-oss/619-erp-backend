@@ -87,7 +87,7 @@ router.get('/search', async (req, res, next) => {
         SELECT u.id, u.name, u.email, u.organization_id AS org_id, o.name AS org_name
           FROM users u
           JOIN organizations o ON o.id = u.organization_id
-         WHERE u.role = 'admin'
+         WHERE u.role = 'trainer'
            AND u.deleted_at IS NULL
            AND (u.name ILIKE $1 ESCAPE '\\' OR u.email ILIKE $1 ESCAPE '\\')
          ORDER BY u.last_login DESC NULLS LAST

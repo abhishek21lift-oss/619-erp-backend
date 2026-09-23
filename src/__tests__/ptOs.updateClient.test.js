@@ -37,14 +37,11 @@ jest.mock('../db/pool', () => ({
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
 const ORG_A = '11111111-1111-1111-1111-111111111111';
-let mockUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+let mockUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 
@@ -81,7 +78,7 @@ const updateSql = () => queries.find((q) => /^UPDATE pt_clients/i.test(q.sql));
 beforeEach(() => {
   queries.length = 0;
   mockExistingRow = { final_amount: '0', paid_amount: '0' };
-  mockUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+  mockUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
 });
 
 describe('PATCH /pt-os/clients/:id with a zero price', () => {

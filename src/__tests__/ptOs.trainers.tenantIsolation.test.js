@@ -24,14 +24,11 @@ jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jes
 const ORG_A = '11111111-1111-1111-1111-111111111111';
 
 // Impersonates whoever the test needs to be, in place of the real JWT middleware.
-let mockUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+let mockUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
-  adminOnly: (_req, _res, next) => next(),
-  adminOrManager: (_req, _res, next) => next(),
-  adminManagerOrTrainer: (_req, _res, next) => next(),
-  requireRole: () => (_req, _res, next) => next(),
-  requireSelfOrRole: () => (_req, _res, next) => next(),
+  requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
+  requireTrainerOrSelf: (...a) => jest.requireActual('../middleware/rbac').requireTrainerOrSelf(...a),
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 
@@ -45,26 +42,27 @@ function app() {
   return a;
 }
 
-/** The trainer-list query, whichever of the recorded statements it is. */
+/** The trainer-profile listing query. */
 function trainerQuery() {
-  return queries.find((q) => /FROM trainers/i.test(q.sql) && /UNION/i.test(q.sql));
+  return queries.find((q) => /FROM trainers/i.test(q.sql) && /status = 'active'/i.test(q.sql));
 }
 
 beforeEach(() => {
   queries.length = 0;
-  mockUser = { id: 'u1', role: 'admin', organization_id: ORG_A };
+  mockUser = { id: 'u1', role: 'trainer', organization_id: ORG_A };
 });
 
 describe('GET /pt-os/trainers tenant isolation', () => {
-  test('filters BOTH tables by the caller organization', async () => {
+  test('lists this studio\'s trainer profile only, bound to the caller organization', async () => {
     await request(app()).get('/api/pt-os/trainers');
     const q = trainerQuery();
 
     expect(q).toBeTruthy();
-    // Once for `trainers`, once for `pt_trainers` — a filter on only one half
-    // of the UNION still leaks the other half.
-    expect(q.sql.match(/organization_id = \$1/g)).toHaveLength(2);
+    expect(q.sql).toMatch(/organization_id = \$1/);
     expect(q.params).toEqual([ORG_A]);
+    // The legacy pt_trainers union is gone: it held no rows, and a second
+    // table is a second place a filter can be forgotten.
+    expect(q.sql).not.toMatch(/pt_trainers/i);
   });
 
   test('a trainer from another studio cannot be reached by asking', async () => {
@@ -74,27 +72,21 @@ describe('GET /pt-os/trainers tenant isolation', () => {
     expect(trainerQuery().params).toEqual([ORG_A]);
   });
 
-  test('a platform super admin operating platform-wide is not filtered', async () => {
-    mockUser = { id: 'sa', role: 'super_admin', organization_id: null };
-    await request(app()).get('/api/pt-os/trainers');
-    const q = trainerQuery();
-    expect(q.sql).not.toMatch(/organization_id = \$/);
-    expect(q.params).toEqual([]);
-  });
-
-  test('a super admin targeting one studio IS filtered to it', async () => {
-    mockUser = { id: 'sa', role: 'super_admin', organization_id: null };
-    await request(app())
-      .get('/api/pt-os/trainers')
-      .set('x-org-id', ORG_A);
+  test('an x-org-id header cannot retarget it either', async () => {
+    await request(app()).get('/api/pt-os/trainers').set('x-org-id', '22222222-2222-2222-2222-222222222222');
     expect(trainerQuery().params).toEqual([ORG_A]);
   });
 
-  test('creating a trainer stamps the organization, or it would be invisible to its own studio', async () => {
-    await request(app()).post('/api/pt-os/trainers').send({ name: 'New Coach' });
-    const insert = queries.find((q) => /INSERT INTO trainers/i.test(q.sql));
-    expect(insert).toBeTruthy();
-    expect(insert.sql).toMatch(/organization_id/);
-    expect(insert.params).toContain(ORG_A);
+  test('the platform operator is refused rather than listing every studio', async () => {
+    mockUser = { id: 'sa', role: 'super_admin', organization_id: null };
+    const res = await request(app()).get('/api/pt-os/trainers');
+    expect(res.status).toBe(403);
+    expect(trainerQuery()).toBeUndefined();
+  });
+
+  test('there is no create: a studio has one trainer profile, made with the studio', async () => {
+    const res = await request(app()).post('/api/pt-os/trainers').send({ name: 'New Coach' });
+    expect([404, 405]).toContain(res.status);
+    expect(queries.find((q) => /INSERT INTO trainers/i.test(q.sql))).toBeUndefined();
   });
 });

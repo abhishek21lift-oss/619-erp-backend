@@ -69,8 +69,12 @@ jest.mock('../lib/google-calendar', () => ({
 const svc = require('../modules/bookings/bookings.service');
 
 /** The SQL statements that touched a given table. */
+// Comments are stripped before matching. A SQL comment naming a file — "same
+// guard as routes/attendance.js" — is not the query touching a table, and a
+// scanner that cannot tell the two apart fails on prose.
+const sqlOnly = (sql) => String(sql).replace(/--[^\n]*/g, ' ');
 const touching = (table) =>
-  mockQueries.filter((q) => new RegExp(`\\b${table}\\b`, 'i').test(q.sql));
+  mockQueries.filter((q) => new RegExp(`\\b${table}\\b`, 'i').test(sqlOnly(q.sql)));
 
 beforeEach(() => {
   mockQueries.length = 0;
@@ -79,7 +83,7 @@ beforeEach(() => {
 
 const ctxB = {
   user_id: 'u-b', user_name: 'B Admin', organization_id: ORG_B,
-  role: 'admin', member_id: null,
+  role: 'trainer', member_id: null,
 };
 
 describe('bookings service is bounded by the caller\'s studio', () => {
@@ -221,12 +225,15 @@ describe('bookings service is bounded by the caller\'s studio', () => {
       expect(q.params).toContain(ORG_B);
     });
 
-    it('omits it for a platform super admin operating platform-wide', async () => {
+    it('never omits it — a scope with no organization binds NULL and matches nothing', async () => {
+      // There used to be an unfiltered branch for a platform-wide super admin.
+      // tenantScope() no longer produces one and the operator never reaches a
+      // tenant route, so even a scope that claims "no filter" is filtered.
       await svc.listForMember('member-of-A', {}, { applyFilter: false, orgId: null });
 
       const [q] = mockQueries;
-      expect(q.sql).not.toMatch(/b\.organization_id/);
-      expect(q.params).not.toContain(null);
+      expect(q.sql).toMatch(/b\.organization_id = \$\d/);
+      expect(q.params).toContain(null);
     });
   });
 });

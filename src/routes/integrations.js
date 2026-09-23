@@ -39,11 +39,11 @@
 // have no arbiter to match and would raise instead.
 const express = require('express');
 const pool = require('../db/pool');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth, requireTrainer } = require('../middleware/auth');
 const { orgWhere, orgIdOf } = require('../lib/tenant-db');
 
 const router = express.Router();
-router.use(auth, adminOnly);
+router.use(auth, requireTrainer);
 
 /**
  * The studio this write belongs to, or null after answering the request.

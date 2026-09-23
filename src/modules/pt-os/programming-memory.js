@@ -88,7 +88,7 @@ async function markAccepted(generationId, planId, orgId) {
     `UPDATE ai_workout_generations
         SET accepted_plan_id = $2, accepted_at = NOW()
       WHERE id = $1
-        AND ($3::uuid IS NULL OR organization_id = $3)
+        AND organization_id = $3
         AND accepted_plan_id IS NULL`,
     [generationId, planId, orgId || null],
   );
@@ -117,7 +117,7 @@ async function recentGenerations(clientId, orgId, { limit = MEMORY_WINDOW } = {}
             ) AS accepted_exercises
        FROM ai_workout_generations g
       WHERE g.client_id = $1
-        AND ($2::uuid IS NULL OR g.organization_id = $2)
+        AND g.organization_id = $2
       ORDER BY g.created_at DESC
       LIMIT $3`,
     [clientId, orgId || null, Math.max(1, Math.min(50, limit))],
@@ -283,7 +283,7 @@ async function acceptGeneration({ generationId, orgId, userId, name = null } = {
   const { rows } = await pool.query(
     `SELECT id, client_id, proposed_plan, accepted_plan_id
        FROM ai_workout_generations
-      WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2)`,
+      WHERE id = $1 AND organization_id = $2`,
     [generationId, orgId || null],
   );
   const generation = rows[0];
@@ -467,7 +467,7 @@ async function planOutcomes(clientId, orgId, { today, limit = MEMORY_WINDOW } = 
              AND a.client_id = g.client_id
       WHERE g.client_id = $1
         AND g.accepted_plan_id IS NOT NULL
-        AND ($2::uuid IS NULL OR g.organization_id = $2)
+        AND g.organization_id = $2
       ORDER BY g.accepted_at DESC
       LIMIT $3`,
     [clientId, orgId || null, Math.max(1, Math.min(50, limit))],

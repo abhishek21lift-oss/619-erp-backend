@@ -6,101 +6,54 @@
 //
 //   ORGANISATION  a studio never sees another studio's anything. Enforced in
 //                 SQL on every query, and again by RLS underneath.
-//   TRAINER       a trainer who is not an admin or manager sees only the
-//                 clients assigned to them. A property of the CLIENT, so it
-//                 is applied once against pt_clients rather than repeated on
-//                 each child table.
+//   TRAINER       the trainer owns the studio and sees every client in it —
+//                 and only in it. There is no narrower staff role: the
+//                 assistant-coach rule that once limited a trainer to their
+//                 "assigned" clients went with the Trainer → Members model.
 //   MEMBER        a gym client with a login may act on their OWN client row
-//                 and nothing else. This one was missing, and its absence did
-//                 not read as a gap: a member is neither an all-clients role
-//                 nor a trainer, so they fell through both tests into the
-//                 unconstrained default.
+//                 and nothing else.
 //   CHILD ROWS    a set belongs to a performance belongs to a session belongs
 //                 to a client. None of those child tables carry an
 //                 organization_id, so reaching one safely means walking back
 //                 up to the client and checking THAT.
 //
-// The third is where this kind of code usually goes wrong. `UPDATE
+// The last is where this kind of code usually goes wrong. `UPDATE
 // set_performances WHERE id = $1` looks scoped — it names one row — and is
 // completely unscoped: any authenticated trainer in any studio can pass any
-// id. Every write below therefore joins back to the client before it touches
+// id. Every write therefore joins back to the client before it touches
 // anything, and the tests assert it by attacking across the boundary rather
 // than by reading the SQL.
 //
-// Reads return null for "not yours" rather than throwing, so a route can
+// Reads return false for "not yours" rather than throwing, so a route can
 // answer 404 and reveal nothing about whether the row exists elsewhere.
 'use strict';
 
 const pool = require('../../db/pool');
-const { tenantScope } = require('../../lib/tenant-db');
-
-/** Roles that see every client in their studio. In the 1 Studio = 1 Trainer model, the trainer is the studio owner. */
-const ALL_CLIENT_ROLES = ['trainer', 'admin', 'manager', 'super_admin'];
-
-function seesAllClients(req) {
-  return ALL_CLIENT_ROLES.includes(req.user?.role);
-}
-
-/**
- * ` AND <col> = $N`, pushing the org id onto `params`.
- *
- * Returns '' for a platform super admin operating platform-wide — the same
- * contract orgWhere() has in pt-os.routes.js, so a reader who knows one knows
- * the other.
- */
-function orgWhere(req, params, col = 'organization_id') {
-  const scope = tenantScope(req);
-  if (!scope.applyFilter) return '';
-  params.push(scope.orgId);
-  return ` AND ${col} = $${params.length}`;
-}
-
-/**
- * ` AND c.trainer_id = $N` for a trainer who owns only their own clients.
- *
- * `col` names the pt_clients alias in the caller's query, because this clause
- * is about the client's trainer and not about whoever happens to be on the
- * session row. A session logged by a covering trainer still belongs to the
- * client's own trainer.
- */
-function trainerWhere(req, params, col = 'c.trainer_id') {
-  // A member is neither an all-clients role nor a trainer, so without this it
-  // fell through to '' — no narrowing at all. Matching nothing is the correct
-  // answer here: this clause constrains by TRAINER, and a member has no
-  // trainer relationship to constrain by. A member-facing list must scope on
-  // the client id itself rather than reach for this.
-  if (req.user?.role === 'member') return ' AND FALSE';
-  if (seesAllClients(req) || !req.user?.trainer_id) return '';
-  params.push(req.user.trainer_id);
-  return ` AND ${col} = $${params.length}`;
-}
+const { orgWhere } = require('../../lib/tenant-db');
 
 /**
  * True when this request may act on this client at all.
  *
- * The member branch is the boundary the header above did not name, and its
- * absence was a latent hole rather than a live one: `trainerWhere` returns ''
- * when the caller has no trainer_id, and a member has none — so for a member
- * this degraded to an ORG-ONLY check and any client in the studio passed.
- *
- * Every current caller sits behind requireRole('admin','manager','trainer'),
- * so no member can reach one today. This closes it anyway, because the next
- * caller added without that gate would inherit the hole silently, and "safe
- * because of something in another file" is how the twelve untenanted tables
- * happened.
+ *   trainer  — the client must be a live row in the trainer's own studio.
+ *   member   — the client must be their own record (pt_client_id, loaded from
+ *              the database by auth.js, never from the request).
+ *   anything else — no. A role this module does not name gets nothing,
+ *              rather than falling through to an org-only check the way a
+ *              member once did.
  */
 async function canAccessClient(req, clientId) {
   if (!clientId) return false;
-  if (req.user?.role === 'member') {
-    const own = req.user.pt_client_id || req.user.client_id || null;
+  const role = req.user?.role;
+  if (role === 'member') {
+    const own = req.user.pt_client_id || null;
     return Boolean(own) && own === clientId;
   }
+  if (role !== 'trainer' || !req.user.organization_id) return false;
   const params = [clientId];
-  const org = orgWhere(req, params);
-  const trainer = trainerWhere(req, params);
+  const org = orgWhere(req, params, 'c.organization_id');
   const { rowCount } = await pool.query(
     `SELECT 1 FROM pt_clients c
-      WHERE c.id = $1 AND c.deleted_at IS NULL${org}${trainer}`,
+      WHERE c.id = $1 AND c.deleted_at IS NULL${org}`,
     params
   );
   return rowCount > 0;
@@ -112,14 +65,7 @@ async function canAccessClient(req, clientId) {
 // `archive` schema (193 and 195), so the function could only ever have raised
 // "relation does not exist". It went with the routes that called it.
 //
-// What stays is the part that was never about the training domain. orgWhere,
-// trainerWhere and canAccessClient are the shared answer to the trainer
-// fall-through described above, they are still the only implementation of it,
-// and trainerFallthrough.authz.test.js pins their behaviour against the four
-// times that bug has been written by hand.
+// trainerWhere and seesAllClients went with the staff roles: with one trainer
+// per studio there is no subset of the studio's clients to narrow to.
 
-module.exports = {
-  ALL_CLIENT_ROLES, seesAllClients,
-  orgWhere, trainerWhere,
-  canAccessClient,
-};
+module.exports = { canAccessClient };

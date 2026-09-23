@@ -66,8 +66,8 @@ describeIf('notification inbox, against a real database', () => {
        ON CONFLICT (id) DO NOTHING`, [ORG]);
     await db.query(
       `INSERT INTO users (id, name, email, password, role, is_active, organization_id, created_at, updated_at)
-       VALUES ($1,'Notif A','notif-a@e2e.test','x','admin',TRUE,$3,NOW(),NOW()),
-              ($2,'Notif B','notif-b@e2e.test','x','admin',TRUE,$3,NOW(),NOW())
+       VALUES ($1,'Notif A','notif-a@e2e.test','x','trainer',TRUE,$3,NOW(),NOW()),
+              ($2,'Notif B','notif-b@e2e.test','x','member',TRUE,$3,NOW(),NOW())
        ON CONFLICT (id) DO NOTHING`, [USER, OTHER, ORG]);
   });
 

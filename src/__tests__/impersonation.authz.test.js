@@ -35,7 +35,7 @@ const ORG_B = '22222222-2222-4222-8222-222222222222';
 
 const TARGET_ADMIN = {
   id: 'admin-a', name: 'Studio A Admin', email: 'a@example.com',
-  role: 'admin', organization_id: ORG_A, is_active: true, token_version: 7,
+  role: 'trainer', organization_id: ORG_A, is_active: true, token_version: 7,
 };
 
 let mockDbUser = { ...TARGET_ADMIN };
@@ -124,23 +124,31 @@ describe('1. a read-only session cannot write', () => {
 describe('2. impersonation can never reach the control plane', () => {
   const { requirePlatformOwner } = require('../middleware/platformAuth');
 
-  it('is refused even when the impersonated account would otherwise qualify', async () => {
-    // The role check would already refuse an `admin`. This asserts the explicit
-    // impersonation refusal fires FIRST, so the guarantee does not depend on
-    // the target's role — which is what would break if a platform account were
-    // ever impersonable.
-    mockDbUser = { ...TARGET_ADMIN, role: 'super_admin' };
+  it('an impersonated studio session is refused at the control plane, by the impersonation check', async () => {
     const app = appWithAuth(requirePlatformOwner);
     const res = await request(app).get('/probe').set('Authorization', `Bearer ${impToken()}`);
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('PLATFORM_FORBIDDEN_IMPERSONATING');
+  });
+
+  it('a token naming a platform account is refused outright, before any plane is considered', async () => {
+    // The mint already refuses to impersonate a platform account. If such a
+    // token existed anyway, auth.js refuses it: an impersonation must load a
+    // studio account (trainer or member), never an operator.
+    mockDbUser = { ...TARGET_ADMIN, role: 'super_admin', organization_id: null };
+    const app = appWithAuth(requirePlatformOwner);
+    const res = await request(app).get('/probe').set('Authorization', `Bearer ${impToken()}`);
+    // 403 (the operator is refused on the tenant plane) or 401 (the token is
+    // refused as an impersonation) — both are auth.js, both before any route.
+    expect([401, 403]).toContain(res.status);
+    expect(res.body.userId).toBeUndefined();
   });
 });
 
 describe('3. impersonation cannot escape its studio', () => {
   const { tenantScope } = require('../lib/tenant-db');
 
-  it('ignores x-org-id, because req.user is an admin and not a super_admin', async () => {
+  it('ignores x-org-id: the studio comes from the impersonated account only', async () => {
     const app = express();
     app.use(auth);
     app.get('/scope', (req, res) => res.json(tenantScope(req)));
@@ -150,20 +158,22 @@ describe('3. impersonation cannot escape its studio', () => {
     expect(res.status).toBe(200);
     expect(res.body.orgId).toBe(ORG_A);
     expect(res.body.applyFilter).toBe(true);
-    expect(res.body.isSuperAdmin).toBe(false);
   });
 
-  it('an org-less target matches no rows rather than everything', async () => {
-    // applyFilter must stay true with a null org: `organization_id = NULL`
-    // matches nothing, which is the fail-closed outcome. applyFilter false
-    // would mean platform-wide.
+  it('a target that has since moved to another studio is refused, not followed', async () => {
+    // The token was minted for ORG_A. The account now sits in ORG_B; carrying
+    // the impersonation over would open ORG_B to an operator who was only ever
+    // granted a look at ORG_A.
+    mockDbUser = { ...TARGET_ADMIN, organization_id: ORG_B };
+    const res = await request(appWithAuth()).get('/probe').set('Authorization', `Bearer ${impToken({ org: ORG_A })}`);
+    expect(res.status).toBe(401);
+  });
+
+  it('an org-less target is refused rather than scoped to nothing', async () => {
     mockDbUser = { ...TARGET_ADMIN, organization_id: null };
-    const app = express();
-    app.use(auth);
-    app.get('/scope', (req, res) => res.json(tenantScope(req)));
-    const res = await request(app).get('/scope').set('Authorization', `Bearer ${impToken()}`);
-    expect(res.body.applyFilter).toBe(true);
-    expect(res.body.orgId).toBeNull();
+    const res = await request(appWithAuth()).get('/probe').set('Authorization', `Bearer ${impToken()}`);
+    expect([401, 403]).toContain(res.status);
+    expect(res.body.userId).toBeUndefined();
   });
 });
 

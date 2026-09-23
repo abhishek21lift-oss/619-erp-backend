@@ -7,7 +7,7 @@
 
 const router = require('express').Router();
 const {
-  EMAIL_RE, TENANT_ROLES, TRIAL_DAYS, audit, bcrypt, crypto, deliverInvitation, detectLogoType, invalidateUserCache, invitations, logger, logoUpload, pool, saveFile, sendPasswordReset, slugify, smtpConfigured, uniqueSlug,
+  EMAIL_RE, TRIAL_DAYS, audit, bcrypt, crypto, deliverInvitation, detectLogoType, invalidateUserCache, invitations, logger, logoUpload, pool, saveFile, sendPasswordReset, slugify, smtpConfigured, uniqueSlug,
 } = require('./shared');
 // ── GET /organizations ───────────────────────────────────────────────────────
 router.get('/organizations', async (req, res, next) => {
@@ -17,7 +17,7 @@ router.get('/organizations', async (req, res, next) => {
              (SELECT count(*) FROM users u    WHERE u.organization_id = o.id AND u.deleted_at IS NULL)    AS user_count,
              (SELECT count(*) FROM trainers t WHERE t.organization_id = o.id AND t.deleted_at IS NULL)     AS trainer_count,
              (SELECT count(*) FROM pt_clients c
-                 JOIN trainers t ON t.id = c.trainer_id
+                 JOIN trainers t ON t.id = c.trainer_id AND t.organization_id = c.organization_id
                 WHERE t.organization_id = o.id AND c.deleted_at IS NULL)                                   AS client_count
         FROM organizations o
        ORDER BY o.created_at DESC`);
@@ -40,9 +40,10 @@ router.get('/organizations/:id', async (req, res, next) => {
 });
 
 // ── POST /organizations ───────────────────────────────────────────────────────
-// Creates a tenant workspace in one transaction: the organization, its owner
-// trainer record, and the trainer's login (role='admin' — full control of
-// their own isolated workspace; the platform god is role='super_admin').
+// Creates a tenant workspace in one transaction: the organization, its trainer
+// profile, and the trainer's login (role='trainer' — the studio's owner and
+// full control of their own isolated workspace; the platform operator is
+// role='super_admin').
 router.post('/organizations', async (req, res, next) => {
   const client = await pool.connect();
   try {
@@ -116,8 +117,8 @@ router.post('/organizations', async (req, res, next) => {
     const trainerId = trainerRows[0].id;
     await client.query(
       `INSERT INTO users (id, name, email, password, role, trainer_id, organization_id, is_active)
-       VALUES ($1,$2,$3,$4,'admin',$5,$6,$7)`,
-      // is_active FALSE for an invited admin. This is the actual lock — the
+       VALUES ($1,$2,$3,$4,'trainer',$5,$6,$7)`,
+      // is_active FALSE for an invited trainer. This is the actual lock — the
       // auth middleware refuses inactive users — so an unclaimed studio cannot
       // be logged into even by someone who guesses the random password.
       [userId, trainerName, email, hashed, trainerId, org.id, !useInvite]
@@ -158,7 +159,7 @@ router.post('/organizations', async (req, res, next) => {
     res.status(201).json({
       data: {
         organization: org,
-        owner: { id: userId, name: trainerName, email, role: 'admin', trainer_id: trainerId },
+        owner: { id: userId, name: trainerName, email, role: 'trainer', trainer_id: trainerId },
         onboarding: useInvite ? 'invitation' : 'password',
         invitation: invitation ? invitations.present({ ...invitation, status: emailSent ? 'sent' : invitation.status }) : null,
         email_sent: emailSent,
@@ -218,10 +219,12 @@ router.patch('/organizations/:id', async (req, res, next) => {
 });
 
 // ── PATCH /users/:id ──────────────────────────────────────────────────────────
-// Edit a tenant login: name, email, role, and/or activate/deactivate. Changing
-// role or is_active bumps token_version so the account re-authenticates with its
-// new powers (and a deactivation immediately revokes existing sessions).
-// Platform (super_admin) accounts cannot be edited through this portal.
+// Edit a tenant login: name, email, and/or activate/deactivate. Changing
+// is_active bumps token_version so a deactivation immediately revokes existing
+// sessions. Platform (super_admin) accounts cannot be edited through this
+// portal, and a login's ROLE cannot be changed at all: a studio's trainer is
+// created with the studio and its members by client activation, and turning
+// one into the other would either orphan the studio or give it a second owner.
 router.patch('/users/:id', async (req, res, next) => {
   try {
     const { rows: existing } = await pool.query(
@@ -249,9 +252,8 @@ router.patch('/users/:id', async (req, res, next) => {
       if (dupe.length) return res.status(409).json({ error: { code: 'CONFLICT', message: 'That email is already in use' } });
       params.push(v); sets.push(`email = $${params.length}`);
     }
-    if (role !== undefined) {
-      if (!TENANT_ROLES.includes(role)) return res.status(400).json({ error: { code: 'VALIDATION', message: `role must be one of: ${TENANT_ROLES.join(', ')}` } });
-      params.push(role); sets.push(`role = $${params.length}`); securityChange = true;
+    if (role !== undefined && role !== existing[0].role) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'A login\'s role cannot be changed.' } });
     }
     if (is_active !== undefined) {
       if (typeof is_active !== 'boolean') return res.status(400).json({ error: { code: 'VALIDATION', message: 'is_active must be a boolean' } });
@@ -274,42 +276,10 @@ router.patch('/users/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── POST /organizations/:id/users ─────────────────────────────────────────────
-// Add another login account to a studio (beyond the owner created with the org).
-router.post('/organizations/:id/users', async (req, res, next) => {
-  try {
-    const { rows: orgs } = await pool.query('SELECT id FROM organizations WHERE id = $1', [req.params.id]);
-    if (!orgs.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
-
-    const name = String(req.body.name || '').trim();
-    const email = String(req.body.email || '').trim().toLowerCase();
-    const password = String(req.body.password || '');
-    const role = req.body.role || 'admin';
-
-    if (!name) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Name is required' } });
-    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: { code: 'VALIDATION', message: 'A valid email is required' } });
-    if (password.length < 8) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Password must be at least 8 characters' } });
-    if (!TENANT_ROLES.includes(role)) return res.status(400).json({ error: { code: 'VALIDATION', message: `role must be one of: ${TENANT_ROLES.join(', ')}` } });
-
-    const { rows: dupe } = await pool.query('SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
-    if (dupe.length) return res.status(409).json({ error: { code: 'CONFLICT', message: 'That email is already in use' } });
-
-    const hashed = await bcrypt.hash(password, 12);
-    const userId = crypto.randomUUID();
-    const { rows } = await pool.query(
-      `INSERT INTO users (id, name, email, password, role, organization_id, is_active)
-       VALUES ($1,$2,$3,$4,$5,$6,true)
-       RETURNING id, name, email, role, organization_id, is_active, created_at`,
-      [userId, name, email, hashed, role, req.params.id]
-    );
-    await audit(req, 'user_created', 'user', userId, { email, role, organization_id: req.params.id });
-    res.status(201).json({ data: rows[0] });
-  } catch (err) { next(err); }
-});
-
 // ── DELETE /users/:id ─────────────────────────────────────────────────────────
 // Soft-delete a tenant login and revoke its sessions. Guards: cannot delete the
-// platform account, yourself, or a studio's last remaining active admin.
+// platform account, yourself, or a studio's trainer (the studio's one owner —
+// suspend or remove the studio instead).
 router.delete('/users/:id', async (req, res, next) => {
   try {
     if (req.params.id === req.user?.id) {
@@ -323,15 +293,8 @@ router.delete('/users/:id', async (req, res, next) => {
     if (target.role === 'super_admin') {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Platform accounts cannot be deleted here' } });
     }
-    if ((target.role === 'admin' || target.role === 'trainer') && target.organization_id) {
-      const { rows: [{ count }] } = await pool.query(
-        `SELECT count(*)::int AS count FROM users
-          WHERE organization_id = $1 AND role IN ('admin', 'trainer') AND is_active = true AND deleted_at IS NULL AND id <> $2`,
-        [target.organization_id, req.params.id]
-      );
-      if (count === 0) {
-        return res.status(409).json({ error: { code: 'LAST_ADMIN', message: "Cannot delete a studio's only active trainer. Assign another trainer first." } });
-      }
+    if (target.role === 'trainer') {
+      return res.status(409).json({ error: { code: 'STUDIO_TRAINER', message: "A studio's trainer cannot be deleted. Suspend or remove the studio instead." } });
     }
     await pool.query(
       `UPDATE users SET deleted_at = now(), is_active = false, token_version = token_version + 1, updated_at = now()

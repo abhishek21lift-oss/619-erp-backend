@@ -5,7 +5,7 @@ jest.mock('../db/pool', () => {
       name: 'Admin',
       email: 'admin@619fitness.com',
       password: '$2a$10$abcdefghijklmnopqrstuv', // not a real hash; bcrypt.compare mocked below
-      role: 'admin',
+      role: 'trainer',
       trainer_id: null,
       member_id: null,
       is_active: true,

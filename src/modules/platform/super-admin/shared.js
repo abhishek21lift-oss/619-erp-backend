@@ -29,9 +29,10 @@ const { frontendUrl } = require('../../../lib/frontendUrl');
 const { apiUrl } = require('../../../lib/apiUrl');
 const { TRIAL_DAYS } = subscription;
 
-// Roles a tenant login may hold (never 'super_admin' — that is platform-only and
-// cannot be created, edited, or impersonated through this tenant-facing portal).
-const TENANT_ROLES = ['admin', 'manager', 'trainer', 'member'];
+// Roles a tenant login may hold: the studio's trainer and its members. Never
+// 'super_admin' — that is platform-only and cannot be created, edited, or
+// impersonated through this portal. One definition, owned by rbac.js.
+const { TENANT_ROLES } = require('../../../middleware/rbac');
 // How long an impersonation session stays valid before the operator must
 // re-enter the studio. Short by design — impersonation is a spot check.
 //

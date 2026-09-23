@@ -4,7 +4,8 @@ const pool = require('../db/pool');
 const { computeAccess } = require('../lib/subscription');
 const { resolveOrgId } = require('./tenant');
 const { runWithTenantContext } = require('../lib/tenant-context');
-const { platformSessionBlocked, TENANT_SESSION_REQUIRED } = require('./platformAuth');
+const { platformSessionBlocked, TENANT_SESSION_REQUIRED, isTenantPlanePath } = require('./platformAuth');
+const { ROLES, TENANT_ROLES, ALL_ROLES } = require('./rbac');
 
 // Defaults to ON in production for security. Explicitly set to 'off' to disable
 // (staged rollout only). See TENANT-RLS-PLAN.md and server.js startup validation.
@@ -94,66 +95,66 @@ async function auth(req, res, next) {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
+    // Only a session token is a session. The same secret also signs short-lived
+    // single-purpose tokens (the WebAuthn step-up action token carries `id` and
+    // `purpose`), and every session mint site writes token_version. A token
+    // that names a purpose, or that has no token_version to revoke it by, is
+    // refused here rather than accepted as a login — otherwise a five-minute
+    // action token would work as a bearer session, and revocation (password
+    // change, deactivation, the role migration's version bump) would not reach
+    // a token that simply omitted the claim.
+    if (decoded.purpose !== undefined || !Number.isInteger(decoded.token_version) || !decoded.id) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
     let user = _cacheGet(decoded.id);
     if (!user) {
-      let rows;
-      try {
-        const result = await pool.query(
-          // FIX: token_version is now selected so revocation check below works.
-          // member_id is needed by requireSelfOrRole (v3 RBAC).
-          // organization_id carries the tenant boundary onto req.user for the
-          // multi-tenant isolation layer (migration 078).
-          // SECURITY: filter out soft-deleted users (deleted_at IS NOT NULL).
-          // pt_client_id is the client-account link, and it is a DIFFERENT
-          // column from member_id — member_id carries a foreign key to the
-          // legacy, empty `clients` table (migration 154 explains why).
-          // requireClient and every /api/me query read it off req.user, so it
-          // has to load here with role and organization_id: taking a client id
-          // from the request instead is the exact mistake the isolation layer
-          // exists to prevent.
-          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.pt_client_id, u.branch_id,
-                  u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
-                  o.is_founder, o.founder_number,
-                  o.status AS organization_status, o.subscription_status,
-                  o.trial_ends_at, o.current_period_end,
-                  u.is_active, u.token_version
-             FROM users u
-             LEFT JOIN organizations o ON o.id = u.organization_id
-            WHERE u.id = $1
-              AND (u.deleted_at IS NULL)`,
-          [decoded.id]
-        );
-        rows = result.rows;
-      } catch {
-        // Fallback if deleted_at column doesn't exist (pre-migration).
-        // pt_client_id is selected here too: this branch runs on a database
-        // behind on migrations, and a client whose account silently loads
-        // without its link would be refused by requireClient with no clue why.
-        // If 154 has not run either, this query fails and the caller gets a
-        // clean 401 rather than a session missing its tenant identity.
-        const result = await pool.query(
-          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.pt_client_id, u.branch_id,
-                  u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
-                  o.is_founder, o.founder_number,
-                  u.is_active, u.token_version
-             FROM users u
-             LEFT JOIN organizations o ON o.id = u.organization_id
-            WHERE u.id = $1`,
-          [decoded.id]
-        );
-        rows = result.rows;
-      }
+      // One query and no fallback. There used to be a second SELECT, run
+      // whenever this one threw for ANY reason, that dropped the deleted_at
+      // filter "for pre-migration databases" — so a transient error on this
+      // query authenticated soft-deleted accounts. A failure here is a 401.
+      //
+      // organization_id carries the tenant boundary onto req.user; it is the
+      // only source of the tenant for every tenant route. pt_client_id is the
+      // client-account link (a DIFFERENT column from member_id, which points
+      // at the dropped legacy `clients` table — see migration 154), and
+      // requireClient and every /api/me query read it off req.user: taking a
+      // client id from the request instead is the exact mistake the isolation
+      // layer exists to prevent.
+      const { rows } = await pool.query(
+        `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.pt_client_id,
+                u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
+                o.is_founder, o.founder_number,
+                o.status AS organization_status, o.subscription_status,
+                o.trial_ends_at, o.current_period_end,
+                u.is_active, u.token_version
+           FROM users u
+           LEFT JOIN organizations o ON o.id = u.organization_id
+          WHERE u.id = $1
+            AND u.deleted_at IS NULL`,
+        [decoded.id]
+      );
       user = rows[0];
       if (!user || !user.is_active) {
         return res.status(401).json({ error: 'Account not found or disabled' });
       }
-      // Token revocation: if the JWT's token_version doesn't match the DB,
-      // the user's token has been invalidated (e.g. password changed, deactivated).
-      if (decoded.token_version !== undefined && user.token_version !== undefined &&
-          user.token_version !== decoded.token_version) {
-        return res.status(401).json({ error: 'Session expired, please log in again' });
+      // The account must hold one of the three roles, and a tenant role must
+      // carry its tenant. Both are also database constraints (migration 208);
+      // checked here as well so that a row which somehow violated them is a
+      // refused session rather than a session with no role or no studio.
+      if (!ALL_ROLES.includes(user.role)
+          || (TENANT_ROLES.includes(user.role) && !user.organization_id)
+          || (user.role === ROLES.SUPER_ADMIN && user.organization_id)) {
+        return res.status(403).json({ error: { code: 'ACCOUNT_MISCONFIGURED', message: 'This account cannot sign in. Contact support.' } });
       }
       _cacheSet(user.id, user);
+    }
+
+    // Token revocation, checked on every request rather than only on a cache
+    // miss: the cache holds the user row, and a revoked token must not ride
+    // out the cache TTL on the strength of someone else's cache fill.
+    if (user.token_version !== decoded.token_version) {
+      return res.status(401).json({ error: 'Session expired, please log in again' });
     }
 
     req.user = user;
@@ -196,18 +197,44 @@ async function auth(req, res, next) {
       return res.status(403).json(TENANT_SESSION_REQUIRED);
     }
 
+    // The platform operator has no authority inside a studio.
+    //
+    // This is the role half of the boundary above (which is the audience
+    // half): super_admin is a control-plane role, and every tenant route —
+    // including the ones whose only guard is `auth` — is refused to it here,
+    // once. It used to pass every role gate and, with no x-org-id header, have
+    // tenantScope() apply NO organization filter at all, which made it an
+    // unaudited superuser over every studio's data. The only way for the
+    // operator to see inside a studio now is impersonation, which is minted by
+    // an audited platform endpoint and loads the studio's own account as
+    // req.user — so a request that gets past this line is always acting as a
+    // trainer or member of exactly one organization.
+    if (user.role === ROLES.SUPER_ADMIN && isTenantPlanePath((req.originalUrl || req.url || '').split('?')[0])) {
+      return res.status(403).json({
+        error: { code: 'TENANT_ACCESS_DENIED', message: 'Platform accounts cannot act inside a studio. Use impersonation from the Command Center.' },
+      });
+    }
+
     // Super-admin impersonation: the token carries an `imp` claim minted by the
-    // platform portal. req.user is already the impersonated admin (loaded above),
-    // so the whole app renders as them. While read-only (`ro`), reject every
-    // mutating request — the operator must exit impersonation to make changes.
+    // platform portal. req.user is already the impersonated account (loaded
+    // above), so the whole app renders as them. While read-only (`ro`), reject
+    // every mutating request — the operator must exit impersonation to make
+    // changes.
     if (decoded.imp) {
+      // The claim names the studio it was minted for. The account it loaded
+      // must still belong to that studio and still be a tenant account — a
+      // token for a user who has since moved or been re-roled is not a
+      // licence to act wherever they are now.
+      if (!TENANT_ROLES.includes(user.role) || String(decoded.imp.org) !== String(user.organization_id)) {
+        return res.status(401).json({ error: 'Session expired, please log in again' });
+      }
       req.impersonation = decoded.imp;
       const method = (req.method || 'GET').toUpperCase();
       if (decoded.imp.ro && method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
         return res.status(403).json({
           error: {
             code: 'IMPERSONATION_READONLY',
-            message: 'Read-only impersonation: changes are disabled. Exit impersonation to act as admin.',
+            message: 'Read-only impersonation: changes are disabled. Enter full access from the Command Center to make changes.',
           },
         });
       }
@@ -232,24 +259,23 @@ async function auth(req, res, next) {
     }
 
     // Tenant context for db/pool.js's RLS query wrapper. Resolution failure
-    // must never block the request — this flag is for testing whether the
-    // wrapper works, not a new authorization gate, and NO_TENANT is already
-    // handled properly by requireRole/requireClient/etc. further down the
-    // chain for routes that actually need it.
+    // must never block the request — the role guards (requireTrainer /
+    // requireClient) are the authorization gate, and they refuse an account
+    // with no organization on their own.
     if (TENANT_RLS_ENFORCE) {
       let orgId = null;
       try { orgId = resolveOrgId(req); } catch { /* see comment above */ }
       // The ONLY place platform-wide status is granted, and the only reason
       // it is safe: it requires the role loaded from the database on this
-      // request — never a header, a body field or anything the caller sent —
-      // AND that no target org was resolved. A super admin who named a studio
-      // via x-org-id is scoped to it like anybody else.
+      // request — never a header, a body field or anything the caller sent.
+      // A super_admin only gets this far on a platform or plane-neutral path
+      // (the tenant plane was refused above).
       //
       // Everything downstream (db/pool.js) treats this as "use the owner
       // connection, which bypasses RLS", so a bug that set it for a tenant
       // user would hand them the whole platform. That is why it is computed
       // here, from req.user.role, and nowhere else.
-      const platformWide = req.user.role === 'super_admin' && orgId == null;
+      const platformWide = req.user.role === ROLES.SUPER_ADMIN;
       return runWithTenantContext(orgId, next, { platformWide });
     }
 
@@ -262,51 +288,15 @@ async function auth(req, res, next) {
   }
 }
 
-function trainerOnly(req, res, next) {
-  const role = req.user?.role;
-  if (role !== 'trainer' && role !== 'admin' && role !== 'super_admin') {
-    return res.status(403).json({ error: 'Trainer access required' });
-  }
-  next();
-}
-
-function adminOnly(req, res, next) {
-  return trainerOnly(req, res, next);
-}
-
-/**
- * Allows trainer / studio owner or super_admin.
- */
-function adminOrManager(req, res, next) {
-  return trainerOnly(req, res, next);
-}
-
-/**
- * Allows trainer / studio owner or super_admin.
- */
-function adminManagerOrTrainer(req, res, next) {
-  return trainerOnly(req, res, next);
-}
-
-// FIX (Route Integrity R-09):
-// requireRole and requireSelfOrRole were previously duplicated between
-// auth.js and rbac.js with different signatures and error response shapes:
-//   auth.js   — requireRole(roles: string[])  → { error: 'string' }
-//   rbac.js   — requireRole(...roles)          → { error: { code, message } }
-//
-// The canonical implementations now live in rbac.js. We re-export them
-// from auth.js for backward compatibility so existing route files that
-// import from './middleware/auth' continue to work without changes.
-// Do not re-implement these functions here — import from rbac.js.
-const { requireRole, requireSelfOrRole } = require('./rbac');
+// The role guards live in rbac.js. They are re-exported so a route file can
+// take its whole auth chain from one module; there is no second
+// implementation and no alias with a legacy name.
+const { requireTrainer, requireClient, requireTrainerOrSelf } = require('./rbac');
 
 module.exports = {
   auth,
-  trainerOnly,
-  adminOnly,
-  adminOrManager,
-  adminManagerOrTrainer,
-  requireRole,
-  requireSelfOrRole,
+  requireTrainer,
+  requireClient,
+  requireTrainerOrSelf,
   invalidateUserCache,
 };

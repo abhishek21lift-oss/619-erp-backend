@@ -25,7 +25,7 @@ router.post('/organizations/:id/impersonate', async (req, res, next) => {
     if (!orgs.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
     const org = orgs[0];
 
-    // Target: an explicit user in this org, else the studio's primary admin.
+    // Target: an explicit account in this org, else the studio's trainer.
     let target;
     if (req.body.user_id) {
       const { rows } = await pool.query(
@@ -37,18 +37,18 @@ router.post('/organizations/:id/impersonate', async (req, res, next) => {
     } else {
       const { rows } = await pool.query(
         `SELECT id, name, email, role, token_version, is_active FROM users
-          WHERE organization_id = $1 AND role = 'admin' AND deleted_at IS NULL
+          WHERE organization_id = $1 AND role = 'trainer' AND deleted_at IS NULL
           ORDER BY is_active DESC, created_at ASC LIMIT 1`,
         [org.id]
       );
       target = rows[0];
     }
 
-    if (!target) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'No admin account to impersonate in this studio' } });
+    if (!target) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'No trainer account to impersonate in this studio' } });
     if (target.role === 'super_admin') return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot impersonate a platform account' } });
     if (!target.is_active) return res.status(409).json({ error: { code: 'INACTIVE', message: 'That account is deactivated' } });
 
-    // Mode: read-only by default (safe). 'full' allows writes as the admin — every
+    // Mode: read-only by default (safe). 'full' allows writes as the account — every
     // audited write during that window is stamped with who really acted
     // (_impersonated_by) by the shared activity logger.
     const readonly = req.body.mode !== 'full';
@@ -67,7 +67,7 @@ router.post('/organizations/:id/impersonate', async (req, res, next) => {
         id: target.id,
         token_version: target.token_version,
         aud: AUD_TENANT,
-        imp: { by: req.user.id, byName: req.user.name || 'Admin', ro: readonly, org: org.id },
+        imp: { by: req.user.id, byName: req.user.name || 'Platform operator', ro: readonly, org: org.id },
       },
       process.env.JWT_SECRET,
       { expiresIn: IMPERSONATION_TTL }
@@ -78,7 +78,10 @@ router.post('/organizations/:id/impersonate', async (req, res, next) => {
       data: {
         token,
         readonly,
-        admin: { id: target.id, name: target.name, email: target.email, role: target.role },
+        // The account being acted as — the studio's trainer unless the
+        // operator named another. (Was `admin`, from before the studio's
+        // owner was its trainer.)
+        account: { id: target.id, name: target.name, email: target.email, role: target.role },
         organization: { id: org.id, name: org.name, slug: org.slug, logo_url: org.logo_url },
       },
     });
