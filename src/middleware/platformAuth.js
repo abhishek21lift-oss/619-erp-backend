@@ -129,16 +129,21 @@ async function hasPlatformGrant(userId) {
     // a tenant-data question, and it must be answered the same way regardless
     // of which studio the request happens to name.
     //
-    // Without runAsPlatform it is not. db/pool.js routes to the owner
-    // connection only when isPlatformWide() is true, and auth.js computes that
-    // as `role === 'super_admin' && orgId == null` — so the moment an operator
-    // has the org-switcher pinned, `x-org-id` is set, orgId is non-null, and
-    // this query runs as app_tenant instead. platform_owners has RLS on and no
-    // app_tenant policy, deliberately, so it would return zero rows, the grant
-    // would read as absent, and the operator would be locked out of their own
-    // console with PLATFORM_GRANT_REQUIRED. The frontend sends x-org-id from
-    // localStorage on EVERY request, so a pin set once, weeks earlier, is
+    // Without runAsPlatform it was not. db/pool.js routes to the owner
+    // connection only when isPlatformWide() is true, and auth.js used to
+    // compute that as `role === 'super_admin' && orgId == null` — so the moment
+    // an operator had the org-switcher pinned, `x-org-id` was set, orgId was
+    // non-null, and this query ran as app_tenant instead. platform_owners has
+    // RLS on and no app_tenant policy, deliberately, so it returned zero rows,
+    // the grant read as absent, and the operator was locked out of their own
+    // console with PLATFORM_GRANT_REQUIRED. The frontend sent x-org-id from
+    // localStorage on EVERY request, so a pin set once, weeks earlier, was
     // enough to trigger it.
+    //
+    // The header and the switcher are gone (Trainer → Members, migration 208)
+    // and auth.js now grants platform-wideness on the role alone. This stays
+    // wrapped anyway: an authorization answer must not depend on how the
+    // ambient tenant context happens to be derived.
     //
     // Latent until TENANT_RLS_ENFORCE is on and ADMIN_DATABASE_URL differs —
     // which is exactly the deployment this whole mechanism exists for, and the
@@ -247,11 +252,13 @@ async function requirePlatformOwner(req, res, next) {
   // ── The whole handler runs platform-wide, not just the grant lookup ───────
   //
   // hasPlatformGrant() above wraps its own query in runAsPlatform for a
-  // reason spelled out at length there: auth.js computes platform-wideness as
-  // `role === 'super_admin' && orgId == null`, and the frontend sends
-  // `x-org-id` from localStorage on EVERY request, so an operator who once
-  // pinned a studio in the org-switcher arrives with a non-null orgId and is
-  // therefore NOT platform-wide as far as db/pool.js is concerned.
+  // reason spelled out at length there: auth.js used to compute
+  // platform-wideness as `role === 'super_admin' && orgId == null`, and the
+  // frontend sent `x-org-id` from localStorage on EVERY request, so an
+  // operator who once pinned a studio in the org-switcher arrived with a
+  // non-null orgId and was therefore NOT platform-wide as far as db/pool.js
+  // was concerned. (Both are gone now; the wrapper stays, for the reason
+  // given there.)
   //
   // That reasoning does not stop at the grant lookup. Until this line, the
   // guard fixed its own query and then called a bare next(), leaving every

@@ -36,14 +36,17 @@ const { runAsPlatform } = require('../../lib/tenant-context');
 // ── The control plane reads as the PLATFORM, at one door ────────────────────
 //
 // db/pool.js routes a query to the owner connection only when isPlatformWide()
-// is true, and middleware/auth.js computes that as
+// is true, and middleware/auth.js used to compute that as
 //
 //     req.user.role === 'super_admin' && orgId == null
 //
-// The frontend forwards `x-org-id` from localStorage on every request
-// (lib/http.ts), so an operator who has ever pinned a studio in the org
-// switcher arrives with an org id — and every query below then runs as
+// The frontend forwarded `x-org-id` from localStorage on every request
+// (lib/http.ts), so an operator who had ever pinned a studio in the org
+// switcher arrived with an org id — and every query below then ran as
 // app_tenant, under RLS, on the API whose entire job is to cross tenants.
+// The header and the switcher are gone (Trainer → Members, migration 208) and
+// platform-wideness is now the role alone; the explicit wrapper stays so this
+// API never depends on how the ambient context is derived.
 //
 // Nothing raises. Tables with a tenant_isolation policy quietly return ONE
 // studio's rows under a platform heading; tables with no app_tenant policy at
