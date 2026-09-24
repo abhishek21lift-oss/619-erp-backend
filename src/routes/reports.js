@@ -191,8 +191,9 @@ router.post('/revenue-target', auth, requireTrainer, async (req, res, next) => {
   try {
     const orgId = orgParam(req);
     if (!orgId) {
-      // A platform super admin with no x-org-id has no studio to set a target
-      // for. Fail loudly rather than writing an orphan row.
+      // No studio on the session — a trainer always has one, and auth.js
+      // refuses the platform operator here. Fail loudly rather than writing
+      // an orphan row.
       return res.status(400).json({ error: 'Select an organization first' });
     }
 

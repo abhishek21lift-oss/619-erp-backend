@@ -49,11 +49,11 @@ router.use(auth, requireTrainer);
  * The studio this write belongs to, or null after answering the request.
  *
  * Connecting an integration is a tenant action: it stores a credential that
- * belongs to one studio. A platform super admin operating platform-wide has no
- * studio, and NULLs are distinct in the unique index — so letting one through
- * would insert a fresh unowned row on every call instead of updating anything.
- * They can still act on a studio by naming it with x-org-id, which is the same
- * mechanism the rest of the API uses.
+ * belongs to one studio. An account with no studio — only the platform super
+ * admin, whom auth.js already refuses on tenant routes — would, since NULLs are
+ * distinct in the unique index, insert a fresh unowned row on every call
+ * instead of updating anything. An operator supporting a studio does it through
+ * impersonation, which acts as that studio's trainer.
  */
 function writableOrg(req, res) {
   const orgId = orgIdOf(req);

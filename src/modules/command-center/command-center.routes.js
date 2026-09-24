@@ -27,17 +27,21 @@ registerCollectors();
 // ── Every read here is platform-wide, and has to SAY so ─────────────────────
 //
 // db/pool.js picks the owner connection only when isPlatformWide() is true,
-// and middleware/auth.js computes that as
+// and middleware/auth.js used to compute that as
 //
 //     req.user.role === 'super_admin' && orgId == null
 //
-// The frontend sends `x-org-id` from localStorage on every request, so an
-// operator who has ever pinned a studio in the org switcher arrives with
-// orgId set. platformWide is then false, and every query below runs as
+// while the frontend sent `x-org-id` from localStorage on every request, so an
+// operator who had ever pinned a studio in the org switcher arrived with
+// orgId set. platformWide was then false, and every query below ran as
 // app_tenant with RLS applied — on a console whose entire job is to report
 // the state of the whole platform.
 //
-// What that does, measured against the live policies:
+// The header and the switcher are gone (Trainer → Members, migration 208) and
+// platform-wideness is now the role alone. These reads still say so
+// explicitly: they must not depend on how the ambient context is derived.
+//
+// What that did, measured against the live policies:
 //
 //   ai_usage_log         tenant_isolation via users.organization_id
 //                        -> AI telemetry for ONE studio, labelled platform-wide

@@ -10,9 +10,10 @@
 const pool = require('../db/pool');
 const { tenantScope } = require('./tenant-db');
 
-// True when `clientId` belongs to the caller's org. A platform super admin
-// operating platform-wide (no x-org-id) is unrestricted. A missing clientId
-// passes (nothing to check — the caller isn't referencing a client).
+// True when `clientId` belongs to the caller's org. There is no platform-wide
+// bypass: a caller with no studio resolves to orgId = null, which matches no
+// client, so the check fails closed. A missing clientId passes (nothing to
+// check — the caller isn't referencing a client).
 async function clientInOrg(req, clientId) {
   if (!clientId) return true;
   const scope = tenantScope(req);

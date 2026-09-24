@@ -14,13 +14,15 @@
 // requirement rather than a style choice.
 //
 // db/pool.js routes to the owner connection only when isPlatformWide() is
-// true, and auth.js computes that as `role === 'super_admin' && orgId == null`.
-// The frontend sends `x-org-id` from localStorage on every request, so an
-// operator who once pinned the org-switcher makes orgId non-null on every
-// request thereafter — and a cross-tenant directory would quietly become a
-// single-studio directory, showing a short list with no indication it had been
-// filtered. Once DATABASE_URL points at app_tenant it would show nothing at
-// all for most tables.
+// true, and auth.js used to compute that as
+// `role === 'super_admin' && orgId == null`. The frontend sent `x-org-id`
+// from localStorage on every request, so an operator who once pinned the
+// org-switcher made orgId non-null on every request thereafter — and a
+// cross-tenant directory would quietly become a single-studio directory,
+// showing a short list with no indication it had been filtered. Once
+// DATABASE_URL points at app_tenant it would show nothing at all for most
+// tables. The header and the switcher are gone (Trainer → Members, migration
+// 208); the explicit runAsPlatform is what keeps that from mattering again.
 //
 // The same trap cost the platform grant lookup a lockout bug (see
 // middleware/platformAuth.js). A directory that is meant to span tenants says
