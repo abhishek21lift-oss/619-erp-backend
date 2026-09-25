@@ -63,6 +63,20 @@ describe('a fact is recorded, stated, or missing — never assumed', () => {
 });
 
 describe('precedence', () => {
+  test("the client's active goal wins over the profile and enrolment goals", () => {
+    const { facts, data_quality: dq } = resolveClientFacts({
+      client: { goal: 'General Fitness' },
+      profile: { goal: 'muscle_gain' },
+      goals: [{ goal_type: 'fat_loss' }],
+    });
+    expect(facts.goal).toMatchObject({ value: 'fat_loss', source: 'pt_goals.goal_type' });
+    // The older answers are not dropped: they are what the trainer is shown
+    // as the disagreement.
+    const goal = dq.conflicting.find((c) => c.field === 'goal');
+    expect(goal.rejected.map((r) => r.source))
+      .toEqual(['client_fitness_profiles.goal', 'pt_clients.goal']);
+  });
+
   test('a recorded value always beats a trainer-stated one', () => {
     const { facts } = resolveClientFacts(
       bare({ goal: 'fat_loss' }),

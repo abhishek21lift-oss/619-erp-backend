@@ -244,10 +244,16 @@ function resolveClientFacts(ctx, stated = {}) {
       ['pt_clients.height', client.height],
     ], num),
 
+    // The client's ACTIVE goal first. pt_goals is the dated record a trainer
+    // sets and changes as the client progresses (loaded is_active, newest
+    // first); the profile and enrolment goals are what was typed when the
+    // client joined and are rarely revisited. Programming to the enrolment
+    // goal after the trainer has set a new one wrote plans for who the client
+    // was at sign-up. The older values are still reported as a disagreement.
     goal: fromSources([
+      ['pt_goals.goal_type', goals[0]?.goal_type],
       ['client_fitness_profiles.goal', profile?.goal],
       ['pt_clients.goal', client.goal],
-      ['pt_goals.goal_type', goals[0]?.goal_type],
     ], text),
 
     experience_level: fromSources([

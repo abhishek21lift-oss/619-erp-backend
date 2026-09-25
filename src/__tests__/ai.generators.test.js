@@ -1175,12 +1175,12 @@ describe('conflicting authoritative records', () => {
       .find((c) => c.field === 'goal');
     expect(goalConflict).toEqual({
       field: 'goal',
-      chosen: { source: 'client_fitness_profiles.goal', value: 'fat_loss' },
-      rejected: [{ source: 'pt_goals.goal_type', value: 'muscle_gain' }],
+      chosen: { source: 'pt_goals.goal_type', value: 'muscle_gain' },
+      rejected: [{ source: 'client_fitness_profiles.goal', value: 'fat_loss' }],
     });
 
     const prompt = routedStream.mock.calls[0][0].messages[1].content;
-    expect(prompt).toContain('Goal: fat_loss (from client_fitness_profiles.goal; DISPUTED — muscle_gain in pt_goals.goal_type)');
+    expect(prompt).toContain('Goal: muscle_gain (from pt_goals.goal_type; DISPUTED — fat_loss in client_fitness_profiles.goal)');
     expect(prompt).toContain('do not decide which record is right');
   });
 
@@ -1198,6 +1198,7 @@ describe('conflicting authoritative records', () => {
     expect(res.status).toBe(200);
     expect(donePayloadOf(res.text).data_quality.conflicting.map((c) => c.field))
       .not.toContain('goal');
-    expect(routedStream.mock.calls[0][0].messages[1].content).toContain('Goal: Fat-Loss');
+    // The active goal wins, so its spelling is the one the prompt carries.
+    expect(routedStream.mock.calls[0][0].messages[1].content).toContain('Goal: fat_loss');
   });
 });
