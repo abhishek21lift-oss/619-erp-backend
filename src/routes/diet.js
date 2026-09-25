@@ -6,6 +6,7 @@ const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
 const { parseStrict } = require('../lib/zodNumbers');
+const { saveAiDietPlan, DietPlanError } = require('../modules/nutrition/ai-diet.service');
 
 // ─── MEALS ───────────────────────────────────────────────────
 
@@ -470,6 +471,36 @@ router.get('/supplements', auth, async (req, res, next) => {
       { id: '6', name: 'Magnesium', dosage: '400mg before bed', timing: 'Before sleep', benefit: 'Better sleep & recovery', emoji: '🌙' },
     ]);
   } catch (err) {
+    next(err);
+  }
+});
+
+// ─── SAVE A GENERATED PLAN ───────────────────────────────────
+
+// POST /api/diet/plans/from-ai  { client_id, plan }
+//
+// The AI diet generator's output could only be previewed; a trainer who liked
+// it retyped it meal by meal. This saves the reviewed plan as the studio's own
+// template, its meals and an active assignment to the client, in one
+// transaction. The SQL lives in modules/nutrition/ai-diet.service.js — this
+// adapter parses, guards and answers.
+router.post('/plans/from-ai', auth, requireTrainer, async (req, res, next) => {
+  try {
+    const { client_id: clientId, plan } = req.body || {};
+    if (!clientId) return res.status(400).json({ error: 'client_id required' });
+    // Same 404 as /assign: a caller who may not use a client should not learn
+    // whether its id exists.
+    if (!await clientInOrg(req, clientId)) return res.status(404).json({ error: 'Client not found' });
+    const saved = await saveAiDietPlan({
+      plan,
+      clientId,
+      orgId: orgIdOf(req),
+      userId: req.user.id,
+      trainerId: req.user.trainer_id,
+    });
+    res.status(201).json({ message: 'Diet plan saved and assigned', ...saved });
+  } catch (err) {
+    if (err instanceof DietPlanError) return res.status(400).json({ error: err.message });
     next(err);
   }
 });
