@@ -159,9 +159,16 @@ async function issueAndSend(req, res, c, { reactivate = false } = {}) {
       // Re-issuing for an existing account. is_active goes FALSE until the new
       // link is used: a resend must not leave the old password working, or
       // "resend because the account may be compromised" achieves nothing.
+      //
+      // deleted_at is cleared: the trainer inviting this client again is the
+      // decision to give them access. Without it a soft-deleted login stayed
+      // deleted through every resend — the client set a password, signed in,
+      // and was refused on every request after — and the trainer had no way
+      // to repair it from here.
       await client.query(
         `UPDATE users
             SET is_active = FALSE,
+                deleted_at = NULL,
                 token_version = token_version + 1,
                 email = $2,
                 updated_at = now()
