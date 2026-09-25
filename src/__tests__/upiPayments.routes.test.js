@@ -33,6 +33,7 @@ class MockPaymentError extends Error {
 const mockUpi = {
   PaymentError: MockPaymentError,
   REJECT_REASONS: { AMOUNT_MISMATCH: 'The amount did not match', OTHER: 'Other' },
+  ORDER_KIND: { MEMBERSHIP: 'membership', BALANCE: 'balance' },
   approve: jest.fn(async () => ({
     order: { id: 'ord-1', order_no: 'UPI-1', plan_name: 'Quarterly', total_amount: 9000 },
     submission: { utr: '123456789012' },

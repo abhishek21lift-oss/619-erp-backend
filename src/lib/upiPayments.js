@@ -48,6 +48,17 @@ const SUBMISSION_STATUS = Object.freeze({
   CANCELLED: 'CANCELLED',
 });
 
+// What an order is for. A membership order buys a plan and extends the
+// membership window when approved; a balance order pays down what the member
+// already owes (pt_clients.balance_amount) and buys no time. Migration 209.
+const ORDER_KIND = Object.freeze({
+  MEMBERSHIP: 'membership',
+  BALANCE: 'balance',
+});
+
+/** Printed on the balance order, its receipt and its invoice. */
+const BALANCE_ORDER_NAME = 'Outstanding balance';
+
 // Statuses an order can still be paid against. Used by the expiry sweep and
 // by every "can this order accept a UTR" check, so the two can never drift.
 const OPEN_ORDER_STATUSES = Object.freeze([ORDER_STATUS.CREATED, ORDER_STATUS.PAYMENT_PENDING]);
@@ -365,7 +376,7 @@ async function nextOrderNo(client) {
 
 const ORDER_COLUMNS = `
   o.id, o.organization_id, o.order_no, o.client_id, o.plan_id, o.plan_name,
-  o.duration_months, o.base_amount, o.gst_percent, o.gst_amount, o.total_amount,
+  o.kind, o.duration_months, o.base_amount, o.gst_percent, o.gst_amount, o.total_amount,
   o.upi_id, o.merchant_name, o.status, o.expires_at, o.notes,
   o.created_by, o.created_at, o.updated_at`;
 
@@ -381,7 +392,10 @@ const ORDER_COLUMNS = `
  */
 async function createOrder({ orgId, client: memberRow, plan, actor }, db = pool) {
   const settings = await requireActiveSettings(orgId, db);
-  const totals = computeTotals(plan.base_amount, settings.gst_percent);
+  const kind = plan.kind === ORDER_KIND.BALANCE ? ORDER_KIND.BALANCE : ORDER_KIND.MEMBERSHIP;
+  // A balance is what the member already owes, as the trainer recorded it.
+  // Adding GST on top would ask them for more than their balance says.
+  const totals = computeTotals(plan.base_amount, kind === ORDER_KIND.BALANCE ? 0 : settings.gst_percent);
 
   const tx = await db.connect();
   try {
@@ -392,10 +406,34 @@ async function createOrder({ orgId, client: memberRow, plan, actor }, db = pool)
         WHERE o.organization_id = $1 AND o.client_id = $2
           AND COALESCE(o.plan_id, '') = COALESCE($3, '') AND o.plan_name = $4
           AND o.status = ANY($5::text[])
-        LIMIT 1`,
+        LIMIT 1
+        FOR UPDATE`,
       [orgId, memberRow.id, plan.plan_id || null, plan.plan_name,
        [...OPEN_ORDER_STATUSES, ORDER_STATUS.VERIFICATION_PENDING]]
     );
+
+    // A balance changes under an open order whenever the trainer records a
+    // cash payment or edits the package. An unpaid balance order for the old
+    // figure is superseded rather than reused, so the QR never asks for money
+    // the member no longer owes. One already awaiting verification is left
+    // alone: the member says they have paid it, and the trainer decides.
+    if (existing[0] && kind === ORDER_KIND.BALANCE
+        && OPEN_ORDER_STATUSES.includes(existing[0].status)
+        && round2(existing[0].total_amount) !== totals.total_amount) {
+      await tx.query(
+        `UPDATE payment_orders SET status = $1 WHERE id = $2 AND status = $3`,
+        [ORDER_STATUS.CANCELLED, existing[0].id, existing[0].status]
+      );
+      await audit(tx, {
+        orgId, orderId: existing[0].id, action: 'CANCELLED',
+        from: existing[0].status, to: ORDER_STATUS.CANCELLED,
+        detail: {
+          reason: 'Balance changed; superseded by a new order',
+          old_amount: existing[0].total_amount, new_amount: totals.total_amount,
+        }, actor,
+      });
+      existing.length = 0;
+    }
 
     if (existing[0]) {
       await audit(tx, {
@@ -412,23 +450,23 @@ async function createOrder({ orgId, client: memberRow, plan, actor }, db = pool)
       `INSERT INTO payment_orders
          (id, organization_id, order_no, client_id, plan_id, plan_name, duration_months,
           base_amount, gst_percent, gst_amount, total_amount, upi_id, merchant_name,
-          status, expires_at, notes, created_by)
+          status, expires_at, notes, created_by, kind)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
-               NOW() + ($15 || ' minutes')::interval, $16, $17)
+               NOW() + ($15 || ' minutes')::interval, $16, $17, $18)
        RETURNING ${ORDER_COLUMNS.replace(/o\./g, '')}`,
       [
         randomUUID(), orgId, orderNo, memberRow.id, plan.plan_id || null, plan.plan_name,
         plan.duration_months, totals.base_amount, totals.gst_percent, totals.gst_amount,
         totals.total_amount, settings.upi_id, settings.merchant_name,
         ORDER_STATUS.CREATED, String(settings.order_ttl_minutes), plan.notes || null,
-        actor?.id || null,
+        actor?.id || null, kind,
       ]
     );
 
     await audit(tx, {
       orgId, orderId: rows[0].id, action: 'ORDER_CREATED',
       from: null, to: ORDER_STATUS.CREATED,
-      detail: { order_no: orderNo, total_amount: totals.total_amount, plan: plan.plan_name },
+      detail: { order_no: orderNo, total_amount: totals.total_amount, plan: plan.plan_name, kind },
       actor,
     });
 
@@ -440,6 +478,44 @@ async function createOrder({ orgId, client: memberRow, plan, actor }, db = pool)
   } finally {
     tx.release();
   }
+}
+
+/**
+ * An order for the member's own outstanding balance.
+ *
+ * The amount is read here, from pt_clients.balance_amount in the caller's
+ * studio — never from the request — so a member cannot choose what they owe.
+ * Nothing owed is a 409, not a zero-rupee QR.
+ */
+async function createBalanceOrder({ orgId, clientId, actor }, db = pool) {
+  const { rows } = await db.query(
+    `SELECT id, name, email, mobile, organization_id, balance_amount
+       FROM pt_clients
+      WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+    [clientId, orgId]
+  );
+  const member = rows[0];
+  if (!member) throw new PaymentError('NOT_FOUND', 'Member not found', 404);
+
+  const owed = round2(member.balance_amount);
+  if (!Number.isFinite(owed) || owed <= 0) {
+    throw new PaymentError('NO_BALANCE', 'You have no outstanding balance to pay.', 409);
+  }
+
+  const result = await createOrder({
+    orgId,
+    client: member,
+    plan: {
+      kind: ORDER_KIND.BALANCE,
+      plan_id: null,
+      plan_name: BALANCE_ORDER_NAME,
+      duration_months: 0,
+      base_amount: owed,
+      notes: null,
+    },
+    actor,
+  }, db);
+  return { ...result, member };
 }
 
 /**
@@ -647,19 +723,35 @@ async function approve({ orderId, orgId, actor }, db = pool) {
     const member = clientRows[0];
     if (!member) throw new PaymentError('NOT_FOUND', 'Member not found', 404);
 
-    const window = computeMembershipWindow(member.pt_end_date, order.duration_months);
+    // A balance payment buys no time: the money moves from balance_amount to
+    // paid_amount and the membership dates and status are left as they are.
+    const isBalance = order.kind === ORDER_KIND.BALANCE;
+    const window = isBalance
+      ? { activated_from: null, activated_to: null }
+      : computeMembershipWindow(member.pt_end_date, order.duration_months);
 
-    await tx.query(
-      `UPDATE pt_clients
-          SET pt_start_date  = COALESCE(NULLIF(pt_start_date, ''), $1),
-              pt_end_date    = $2,
-              paid_amount    = paid_amount + $3,
-              balance_amount = GREATEST(0, balance_amount - $3),
-              status         = 'active',
-              updated_at     = NOW()
-        WHERE id = $4`,
-      [window.activated_from, window.activated_to, order.total_amount, member.id]
-    );
+    if (isBalance) {
+      await tx.query(
+        `UPDATE pt_clients
+            SET paid_amount    = paid_amount + $1,
+                balance_amount = GREATEST(0, balance_amount - $1),
+                updated_at     = NOW()
+          WHERE id = $2`,
+        [order.total_amount, member.id]
+      );
+    } else {
+      await tx.query(
+        `UPDATE pt_clients
+            SET pt_start_date  = COALESCE(NULLIF(pt_start_date, ''), $1),
+                pt_end_date    = $2,
+                paid_amount    = paid_amount + $3,
+                balance_amount = GREATEST(0, balance_amount - $3),
+                status         = 'active',
+                updated_at     = NOW()
+          WHERE id = $4`,
+        [window.activated_from, window.activated_to, order.total_amount, member.id]
+      );
+    }
 
     // ── 4. Finance ledger ──
     // Trainer commission mirrors routes/payments.js: the FK target is verified
@@ -771,7 +863,10 @@ async function approve({ orderId, orgId, actor }, db = pool) {
         receipt_no: receiptNo, invoice_no: invoiceId ? invoiceNo : null,
       }, actor,
     });
-    await audit(tx, {
+    await audit(tx, isBalance ? {
+      orgId, orderId: order.id, submissionId: submission.id, action: 'BALANCE_SETTLED',
+      detail: { amount: order.total_amount }, actor,
+    } : {
       orgId, orderId: order.id, submissionId: submission.id, action: 'MEMBERSHIP_ACTIVATED',
       detail: { from: window.activated_from, to: window.activated_to, plan: order.plan_name }, actor,
     });
@@ -955,6 +1050,8 @@ async function expireStaleOrders(db = pool) {
 
 module.exports = {
   ORDER_STATUS,
+  ORDER_KIND,
+  BALANCE_ORDER_NAME,
   SUBMISSION_STATUS,
   OPEN_ORDER_STATUSES,
   REJECT_REASONS,
@@ -979,6 +1076,7 @@ module.exports = {
   audit,
   nextOrderNo,
   createOrder,
+  createBalanceOrder,
   markIntentOpened,
   submitUtr,
   approve,
