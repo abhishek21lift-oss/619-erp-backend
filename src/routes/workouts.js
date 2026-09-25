@@ -123,6 +123,12 @@ router.get('/plans', auth, async (req, res, next) => {
     // itself stays global — 086 says so explicitly — but which client was
     // ASSIGNED a plan is tenant data.
     if (client_id) {
+      // Which client was assigned a plan, and their progress on it, is the
+      // trainer's view. The library itself stays readable to a member; naming a
+      // client does not.
+      if (req.user.role !== 'trainer') {
+        return res.status(403).json({ error: 'This area is for the studio trainer.' });
+      }
       conds.push(`wa.client_id = $${p++}`); params.push(client_id);
       const wscope = tenantScope(req);
       conds.push(`wa.organization_id = $${p++}`); params.push(wscope.orgId);
@@ -1089,7 +1095,10 @@ router.delete('/plans/:id', auth, requireTrainer, async (req, res, next) => {
 // ─── WORKOUT ASSIGNMENTS ──────────────────────────────────────
 
 // GET /api/workouts/assignments?client_id=&status=
-router.get('/assignments', auth, async (req, res, next) => {
+// requireTrainer. Same shape as GET /assignments/:id below: the org filter
+// bounds the studio, not the client, and client_id comes from the query — so a
+// member could list any other client's assignments and progress.
+router.get('/assignments', auth, requireTrainer, async (req, res, next) => {
   try {
     const { client_id, status } = req.query;
     if (!client_id) return res.status(400).json({ error: 'client_id required' });

@@ -215,7 +215,11 @@ router.post('/templates', auth, requireTrainer, async (req, res, next) => {
 // ─── DIET ASSIGNMENTS ────────────────────────────────────────
 
 // GET /api/diet/assignments?client_id=&status=
-router.get('/assignments', auth, async (req, res, next) => {
+// requireTrainer. tenantScope() bounds the studio and says nothing about which
+// client inside it, and client_id comes from the request — so on `auth` alone a
+// member could name any other client in their studio. No member surface calls
+// this: the client portal is /api/me.
+router.get('/assignments', auth, requireTrainer, async (req, res, next) => {
   try {
     const { client_id, status } = req.query;
     if (!client_id) return res.status(400).json({ error: 'client_id required' });
@@ -292,7 +296,11 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
 // ─── NUTRITION LOGS ──────────────────────────────────────────
 
 // GET /api/diet/tracker — Daily nutrition log for a client
-router.get('/tracker', auth, async (req, res, next) => {
+// requireTrainer. tenantScope() bounds the studio and says nothing about which
+// client inside it, and client_id comes from the request — so on `auth` alone a
+// member could name any other client in their studio. No member surface calls
+// this: the client portal is /api/me.
+router.get('/tracker', auth, requireTrainer, async (req, res, next) => {
   try {
     const { client_id, date } = req.query;
     if (!client_id) return res.status(400).json({ error: 'client_id required' });
@@ -327,7 +335,11 @@ router.get('/tracker', auth, async (req, res, next) => {
 });
 
 // PUT /api/diet/tracker — Upsert daily nutrition log
-router.put('/tracker', auth, async (req, res, next) => {
+// requireTrainer. tenantScope() bounds the studio and says nothing about which
+// client inside it, and client_id comes from the request — so on `auth` alone a
+// member could name any other client in their studio. No member surface calls
+// this: the client portal is /api/me.
+router.put('/tracker', auth, requireTrainer, async (req, res, next) => {
   try {
     const d = req.body;
     if (!d.client_id)

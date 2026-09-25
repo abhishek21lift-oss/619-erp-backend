@@ -110,7 +110,10 @@ const MEMBER_REACHABLE = {
   '/api/diet': 'The meal library a member\'s own diet plan is built from; shared-shape table, same as exercises.',
   '/api/exercises': 'The exercise library a member\'s own workout is built from. Platform reference content.',
   '/api/workouts': 'Same library, reached through the workouts router.',
-  '/api/ai': 'Conversations are keyed WHERE c.user_id = $1 — the member\'s own threads — and /actions returns only what canRun() permits for the caller\'s role.',
+  // '/api/ai' was exempt here on the strength of its conversation routes
+  // (keyed by user_id), and that mount-wide exemption also covered /chat and
+  // the four generators, which load any client in the studio by a client_id
+  // from the request. It is behind studioGate() now and probed like the rest.
   '/api/v1/notifications': 'svc.inbox(req.user.id) — the member\'s own notification inbox.',
   '/api/qr': 'Generates the caller\'s OWN check-in QR, keyed from req.user.pt_client_id / member_id.',
   '/api/plans': 'The studio\'s membership price list. Org-scoped by migration 174. A member seeing what their own studio charges is the renewal screen working, not a leak — reviewed and left reachable.',

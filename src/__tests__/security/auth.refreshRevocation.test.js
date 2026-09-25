@@ -347,6 +347,37 @@ describe('existing refresh semantics are preserved', () => {
     expect((await useRefresh(res.body.refresh_token)).status).toBe(200);
   });
 
+  test('two refreshes racing on one token: exactly one is issued a new session', async () => {
+    // The lookup's FOR UPDATE is autocommitted and locks nothing, so both
+    // requests pass it. The rotation UPDATE is the claim; only one may win.
+    //
+    // A barrier holds each lookup until both have run, which is the
+    // interleaving production can produce and a serial mock never would.
+    const pool = require('../../db/pool');
+    const real = pool.query.getMockImplementation();
+    let arrived = 0;
+    let release;
+    const bothLookedUp = new Promise((r) => { release = r; });
+    pool.query.mockImplementation(async (sql, params) => {
+      const result = await real(sql, params);
+      if (/FROM refresh_tokens rt JOIN users u/i.test(String(sql).replace(/\s+/g, ' '))) {
+        arrived += 1;
+        if (arrived === 2) release();
+        await bothLookedUp;
+      }
+      return result;
+    });
+
+    try {
+      const raw = giveRefreshToken(USER_A);
+      const results = await Promise.all([useRefresh(raw), useRefresh(raw)]);
+      const statuses = results.map((r) => r.status).sort();
+      expect(statuses).toEqual([200, 401]);
+    } finally {
+      pool.query.mockImplementation(real);
+    }
+  });
+
   test('no raw token or hash is ever written to the logs', async () => {
     const logger = require('../../lib/logger');
     const raw = giveRefreshToken(USER_A);
