@@ -90,3 +90,35 @@ describe('POST /api/auth/login', () => {
     expect(res.status).toBe(401);
   });
 });
+
+// ── Session tokens in the JSON body ─────────────────────────────────────────
+//
+// A browser gets both tokens as httpOnly cookies on the same response; a copy
+// in the body is the only place page script (i.e. an XSS) could read them.
+// Browsers always send Origin on a POST and script cannot remove it, so its
+// presence withholds the body copy. Scripts, the E2E API suite and native
+// clients send no Origin and keep the tokens they read today.
+describe('login body tokens are for non-browser callers only', () => {
+  const creds = { email: 'admin@619fitness.com', password: 'correct-password' };
+
+  it('a browser request (Origin present) gets cookies but no tokens in the body', async () => {
+    const res = await request(app)
+      .post('/api/auth/login')
+      .set('Origin', 'https://test.example.com')
+      .send(creds);
+    expect(res.status).toBe(200);
+    expect(res.body.user.email).toBe('admin@619fitness.com');
+    expect(res.body).not.toHaveProperty('token');
+    expect(res.body).not.toHaveProperty('refresh_token');
+    const cookies = res.headers['set-cookie'].join(';');
+    expect(cookies).toMatch(/(^|;|,)\s*token=/);
+    expect(cookies).toMatch(/refresh_token=/);
+  });
+
+  it('a non-browser request (no Origin) still gets the tokens in the body', async () => {
+    const res = await request(app).post('/api/auth/login').send(creds);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.token).toBe('string');
+    expect(typeof res.body.refresh_token).toBe('string');
+  });
+});
