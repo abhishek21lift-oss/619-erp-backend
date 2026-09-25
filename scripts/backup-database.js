@@ -40,6 +40,9 @@
 //
 // ── Usage ───────────────────────────────────────────────────────────────
 //
+//   Production runs it in a container — the VPS host has no node or pg_dump of
+//   its own. See infra/backup/Dockerfile and .github/workflows/backup.yml.
+//
 //   DATABASE_URL='...' node scripts/backup-database.js
 //   DATABASE_URL='...' BACKUP_DIR=/var/backups/619 node scripts/backup-database.js
 //
@@ -67,9 +70,38 @@ function safeUrl(url) {
   return String(url).replace(/:\/\/([^:@/]+):[^@]*@/, '://$1:***@');
 }
 
+/**
+ * The connection to dump from.
+ *
+ * Not simply DATABASE_URL, for two reasons that each produce a useless dump:
+ *
+ *   1. Role. With TENANT_RLS_ENFORCE on, DATABASE_URL is the `app_tenant`
+ *      role, which row-level security confines to the org named in
+ *      `app.org_id`. pg_dump sets no org, so it would read almost nothing or be
+ *      refused. ADMIN_DATABASE_URL is the owner connection (db/pool.js) and is
+ *      what can see every studio. BACKUP_DATABASE_URL overrides both.
+ *
+ *   2. Pooler mode. Supabase's pooler serves TRANSACTION mode on :6543 and
+ *      SESSION mode on :5432, same host, same credentials. pg_dump holds one
+ *      snapshot across many statements, which transaction pooling cannot
+ *      guarantee, so a :6543 pooler URL is moved to :5432.
+ */
+function resolveDumpUrl(env = process.env) {
+  const raw = env.BACKUP_DATABASE_URL || env.ADMIN_DATABASE_URL || env.DATABASE_URL;
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    if (u.hostname.endsWith('.pooler.supabase.com') && u.port === '6543') {
+      u.port = '5432';
+      return u.toString();
+    }
+  } catch { /* not a URL pg_dump would take either; hand it over unchanged */ }
+  return raw;
+}
+
 function main() {
-  const url = process.env.DATABASE_URL;
-  if (!url) fail('DATABASE_URL is not set.');
+  const url = resolveDumpUrl();
+  if (!url) fail('None of BACKUP_DATABASE_URL, ADMIN_DATABASE_URL or DATABASE_URL is set.');
 
   // A dump inside the repo is one `git add -A` away from being published,
   // and this repository has been public. Refuse outright rather than warn.
@@ -180,4 +212,6 @@ async function upload(file) {
   console.log('Set a lifecycle rule on that bucket for retention — this script prunes only local copies.');
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { resolveDumpUrl };

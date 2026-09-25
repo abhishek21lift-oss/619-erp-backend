@@ -68,13 +68,29 @@ jobs:
             . /opt/myptstudio/.env
             set +a
 
+            # In a container, not on the host. The host has no node and no
+            # pg_dump (the app runs in Docker), so the previous
+            # `node scripts/backup-database.js` failed with "node: command not
+            # found" on every run since this workflow was added — not one
+            # backup was ever taken. infra/backup/Dockerfile carries node and a
+            # pg_dump matching the server's major version.
+            #
             # BACKUP_DIR must sit outside the repository — the script refuses
             # otherwise, because a dump inside a working tree is one `git add`
-            # away from being published.
-            BACKUP_DIR="${BACKUP_DIR:-/var/backups/619}" \
-            BACKUP_UPLOAD="${BACKUP_UPLOAD:-1}" \
-            BACKUP_RETAIN_DAYS="${BACKUP_RETAIN_DAYS:-30}" \
-              node scripts/backup-database.js
+            # away from being published. Secrets travel as `-e NAME` (value
+            # taken from this shell, which sourced .env): never in argv, never
+            # baked into the image.
+            BACKUP_HOST_DIR="${BACKUP_DIR:-/var/backups/619}"
+            install -d -m 700 "$BACKUP_HOST_DIR"
+            docker build --quiet -t myptstudio-backup -f infra/backup/Dockerfile .
+            docker run --rm \
+              -e DATABASE_URL -e ADMIN_DATABASE_URL -e BACKUP_DATABASE_URL \
+              -e R2_ACCOUNT_ID -e R2_ACCESS_KEY_ID -e R2_SECRET_ACCESS_KEY -e BACKUP_R2_BUCKET \
+              -e BACKUP_DIR=/backups \
+              -e BACKUP_UPLOAD="${BACKUP_UPLOAD:-1}" \
+              -e BACKUP_RETAIN_DAYS="${BACKUP_RETAIN_DAYS:-30}" \
+              -v "$BACKUP_HOST_DIR:/backups" \
+              myptstudio-backup
 
       - name: Say so loudly if the backup did not run
         if: failure()
