@@ -20,7 +20,7 @@ branch as this document, each with a regression test that fails without the fix.
 | 4 | Medium | UPI order prices from **any studio's** plan id (cross-tenant read + price manipulation) | Fixed |
 | 5 | Medium | Member class booking cannot work: member accounts have no `member_id`, and booking reads the empty v3 tables | Open |
 | 6 | Medium | The member authz test skips exempt mounts wholesale — the blind spot behind #1/#2 | Partly fixed |
-| 7 | Medium | Runtime on Node 20, which reached end-of-life in April 2026 | Open |
+| 7 | Medium | Runtime on Node 20, which reached end-of-life in April 2026 | Fixed (all three repos) |
 | 8 | Medium | `/login` returns `token` + `refresh_token` in the JSON body to browsers too | Open |
 | 9 | Medium | Google Calendar OAuth `state` is not bound to the browser that started the flow | Open |
 | 10 | Low | Postgres TLS uses `rejectUnauthorized: false` unless `DATABASE_SSL_CA` is set | Open |
@@ -117,8 +117,14 @@ Remaining member-reachable writes worth a look: `POST /api/profile/portfolio`
 ## 7. Medium — Node 20 is end-of-life
 
 All three Dockerfiles use `node:20-*` and CI pins `node-version: '20'`. Node 20
-left maintenance on 2026-04-30 — no more security releases. Move to Node 22 LTS
-(or 24) in Dockerfiles, CI, and `engines`, then run the suites.
+left maintenance on 2026-04-30 — no more security releases.
+
+**Fixed:** Dockerfiles, CI (including the Android APK job) and `engines`
+(`>=22.12`) moved to Node 22 LTS in all three repos. Verified on Node 22.22:
+all three test suites, the frontend production build, the gateway `tsc` build,
+and the backend's native modules (`onnxruntime-node`) rebuilding and loading.
+The images themselves were not built here (no Docker daemon); the first
+deploy is the image-level check.
 
 ## 8. Medium — Tokens in the login response body
 
