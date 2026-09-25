@@ -144,7 +144,8 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
                 o.is_founder, o.founder_number
            FROM users u
            LEFT JOIN organizations o ON o.id = u.organization_id
-          WHERE LOWER(u.email) = LOWER($1) AND u.is_active = true`,
+          WHERE LOWER(u.email) = LOWER($1) AND u.is_active = true
+            AND u.deleted_at IS NULL`,
         [email]
       );
       rows = result.rows;
@@ -155,8 +156,14 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
 
     const user = rows[0];
     if (!user) {
-      // The query already filters on is_active, so a missing row means either
-      // no such account or a deactivated one. They are recorded the same way
+      // The query filters on is_active and deleted_at, so a missing row means
+      // no such account, a deactivated one or a deleted one.
+      //
+      // deleted_at was missing here while middleware/auth.js filtered it. A
+      // soft-deleted account with is_active still TRUE passed the password,
+      // was handed a session, and had every request after it refused with
+      // 401 — bounced back to the sign-in page, again and again, with nothing
+      // saying why. They are recorded the same way
       // because the RESPONSE is the same — distinguishing them here would tell
       // an attacker which addresses are real.
       loginEvents.record(req, { outcome: loginEvents.OUTCOMES.UNKNOWN_USER, email });
@@ -518,7 +525,9 @@ router.post('/forgot-password', async (req, res) => {
     // — would never match, and the request would then look exactly like a
     // broken mailer: the caller is told a link was sent, and nothing is sent.
     const { rows } = await pool.query(
-      'SELECT id FROM users WHERE btrim(LOWER(email)) = btrim(LOWER($1))',
+      // deleted_at: a deleted account gets no reset link — resetting it would
+      // only lead to a sign-in the rest of the app refuses.
+      'SELECT id FROM users WHERE btrim(LOWER(email)) = btrim(LOWER($1)) AND deleted_at IS NULL',
       [email]
     );
 
@@ -573,7 +582,9 @@ router.post('/reset-password', async (req, res) => {
     const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
 
     const { rows } = await pool.query(
-      'SELECT id FROM users WHERE password_reset_token = $1 AND password_reset_expires > NOW()',
+      `SELECT id FROM users
+        WHERE password_reset_token = $1 AND password_reset_expires > NOW()
+          AND deleted_at IS NULL`,
       [hashedToken]
     );
 

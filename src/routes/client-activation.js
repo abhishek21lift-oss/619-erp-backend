@@ -126,7 +126,12 @@ router.post('/:token/accept', activationLimiter, async (req, res, next) => {
     // lockout counters matters because a client who forgot they had a link and
     // guessed at a password several times would otherwise activate straight
     // into a locked account.
-    await client.query(
+    // deleted_at IS NULL: a link issued for an account that has since been
+    // deleted must not "succeed". Activating into a deleted row set a password
+    // the sign-in accepted and every later request refused — a loop back to the
+    // sign-in page. A fresh invitation from the trainer restores the account
+    // (routes/client-login.js); this link is simply no longer good.
+    const { rowCount: activated } = await client.query(
       `UPDATE users
           SET password = $1,
               is_active = TRUE,
@@ -138,9 +143,13 @@ router.post('/:token/accept', activationLimiter, async (req, res, next) => {
               password_reset_token = NULL,
               password_reset_expires = NULL,
               updated_at = now()
-        WHERE id = $2`,
+        WHERE id = $2 AND deleted_at IS NULL`,
       [hashed, inv.user_id]
     );
+    if (activated !== 1) {
+      await client.query('ROLLBACK');
+      return res.status(410).json({ error: { code: 'INVALID', message: REJECT.invalid } });
+    }
 
     // Clicking the link proves the address works, which is the only evidence
     // of email ownership this flow ever gets.
