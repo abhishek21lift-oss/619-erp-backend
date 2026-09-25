@@ -903,8 +903,17 @@ app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), 
 // swallowed by anything there, and deliberately outside requireAiQuota():
 // these endpoints run no model. Confirming a WhatsApp send must not fail
 // because the studio is over its token allowance for the month.
-app.use('/api/ai',               userApiLimiter, ...gate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
-app.use('/api/ai',               ...gate('ai_suite'), requireAiQuota(), require('./routes/ai'));
+//
+// studioGate, not gate. routes/ai.js loads a client's whole record into the
+// prompt — health conditions, injuries, medical notes, assessments — by a
+// client_id taken from the request and checked only against the STUDIO
+// (/chat, /workout/generate, /diet/generate, /progress/analyze,
+// /fitness-testing/analyze). On gate() a member was the only caller that
+// check did not stop: any client could have another client's health record
+// summarised back to them. The member app calls none of these; a client's own
+// data is /api/me. Every AI action is trainer-only in its registry as well.
+app.use('/api/ai',               userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
+app.use('/api/ai',               ...studioGate('ai_suite'), requireAiQuota(), require('./routes/ai'));
 
 // ────────────────────────
 // MEMBER PORTAL ROUTES

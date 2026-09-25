@@ -386,10 +386,15 @@ router.post('/create', auth, validate(schemas.createOrder), wrap(async (req, res
     };
 
     if (plan.plan_id) {
+      // Scoped to the caller's studio, the same strict match GET /api/plans
+      // applies. Without it any studio's plan id resolved here, so a member
+      // could price their own order from another studio's cheapest plan — and
+      // read its name, price and duration back out of the response.
       const { rows } = await pool.query(
         `SELECT id, name, final_amount, duration FROM plans
-          WHERE id = $1 AND deleted_at IS NULL AND is_active = TRUE`,
-        [plan.plan_id]
+          WHERE id = $1 AND organization_id = $2
+            AND deleted_at IS NULL AND is_active = TRUE`,
+        [plan.plan_id, orgId]
       );
       if (!rows[0]) {
         return res.status(404).json({ error: { code: 'PLAN_NOT_FOUND', message: 'Plan not found' } });

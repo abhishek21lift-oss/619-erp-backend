@@ -115,7 +115,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     try {
       const result = await pool.query(
         `SELECT u.id, u.name, u.email, u.role, u.password, u.token_version,
-                u.trainer_id, u.member_id, u.is_active,
+                u.trainer_id, u.member_id, u.pt_client_id, u.is_active,
                 u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
                 -- Founder status rides along on the session rather than being
                 -- fetched separately. The badge appears beside the studio name
@@ -455,8 +455,22 @@ router.post('/refresh', async (req, res) => {
 
     const { user_id, token_version, audience } = rows[0];
 
-    // Rotate: revoke old token, issue new ones
-    await pool.query('UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1', [tokenHash]);
+    // Rotate: claim the old token, then issue new ones.
+    //
+    // The claim is the UPDATE, not the SELECT above. That SELECT's FOR UPDATE
+    // runs on an autocommitted pool.query, so its lock is released before this
+    // line — two requests presenting the same token both passed it, and both
+    // were issued a fresh pair. `AND revoked_at IS NULL` makes exactly one of
+    // them win; the loser gets the same 401 as an already-used token, so a
+    // replayed refresh token can never fork into two live sessions.
+    const claim = await pool.query(
+      'UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL',
+      [tokenHash]
+    );
+    if (claim.rowCount !== 1) {
+      res.clearCookie('refresh_token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/api/auth' });
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
 
     const newAccessToken = signAccessToken(user_id, token_version, audience);
     setTokenCookie(res, newAccessToken);
