@@ -239,3 +239,135 @@ Performance:
 | backend | 268 suites / 3,855 passed, 201 skipped (need a live DB) — after fixes | lint clean (`--max-warnings=0`) | 2 moderate → fixed |
 | whatsapp | 19 files / 221 passed | typecheck clean | 0 |
 | frontend | 180 files / 2,630 passed | typecheck + lint clean | 0 |
+
+---
+
+# Second pass — 2026-09-25 (later the same day)
+
+The first pass was mostly backend request security. This pass covered what it
+did not reach: the platform control plane, billing, public token flows,
+automation, the WhatsApp gateway, infra and backups, and the **live**
+database (read-only, count-only queries through the Supabase connector).
+
+## Severity summary (second pass)
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 14 | **Critical** | Nightly backup has **never** run: every run failed with `node: command not found`; free-plan Supabase has no backups of its own | Fix in PR #169 — needs one manual run to confirm |
+| 15 | **Critical** | Production connects as `postgres` (BYPASSRLS, table owner): the 336 RLS policies are not in effect | Open — needs the server's `.env` |
+| 16 | **High** | Client health data was sent to free-tier AI models; most calls are logged only as `auto` | Open |
+| 17 | **High** | Changing the login email needs no password, no verification, and notifies nobody | Open |
+| 18 | Medium | Full-access impersonation can change the owner's email or enrol a passkey — access that outlives the audited session | Open |
+| 19 | Medium | Backups are unencrypted and share the app's R2 credentials; no restore drill | Open |
+| 20 | Medium | Frontend E2E checks against backend `main` only, so paired PRs cannot both go green | Open (process) |
+| 21 | Low | Password policy differs by path (activation strict, reset/change only 8 chars) | Open |
+| 22 | Low | WhatsApp: ban-risk acceptance not recorded server-side; no opt-out or quiet hours for automated messages | Open |
+| 23 | Low | nginx: `admin.myptstudio.com` is on the :80 block but has no :443 block (wrong certificate) | Open |
+| 24 | Low | `archive.role_model_users_backup` / `_settings_backup` still hold copies of user rows | Open |
+
+## 14. Critical — backups have never run
+
+`.github/workflows/backup.yml` SSHes to the VPS and ran `node
+scripts/backup-database.js` on the host. The host has no `node` and no
+`pg_dump` (the app runs in Docker), so all 9 scheduled runs failed at
+`node: command not found`. The project is on Supabase's free plan, which has
+no backups — so there has been **no restore point** for any studio's data.
+
+Two more bugs would have made the dump incomplete even with node present: the
+script dumped `DATABASE_URL` (the RLS-confined `app_tenant` role once
+enforcement is on) and the documented URL is Supabase's transaction pooler
+(:6543), which cannot hold pg_dump's snapshot.
+
+**Fix (PR #169):** a `postgres:17` + node image (`infra/backup/Dockerfile`),
+the workflow runs it, and the script dumps `BACKUP_DATABASE_URL` →
+`ADMIN_DATABASE_URL` → `DATABASE_URL`, moving a :6543 pooler URL to session
+mode (:5432). Unverified end to end — **run the workflow once by hand after
+merging** and check for `Verified: … tables with data` and `Uploaded to r2://…`.
+
+## 15. Critical — RLS is not in effect in production
+
+RLS is enabled on all 153 public tables with 336 policies, but at the time of
+checking the live connections were `postgres` ×7 and `app_tenant` ×0.
+`postgres` has `BYPASSRLS` and owns the tables, so every policy is skipped and
+tenant isolation rests solely on the `organization_id` filters in application
+code — which the tests cover well, but which is one layer, not two.
+
+To confirm: on the VPS, check `TENANT_RLS_ENFORCE` and the user in
+`DATABASE_URL` in `/opt/myptstudio/.env`. The cutover is already designed in
+`src/db/migrations/TENANT-RLS-PLAN.md` (`DATABASE_URL` → `app_tenant`,
+`ADMIN_DATABASE_URL` → owner). A pool that happened to be idle would also show
+zero `app_tenant` connections, so treat this as strong evidence, not proof.
+
+## 16. High — health data to free-tier AI models
+
+`src/lib/ai/models.js` defaults all three routes to OpenRouter `:free` models,
+and `platform_ai_settings` has no override. `ai_usage_log`, last 30 days:
+`nvidia/nemotron-3-super-120b-a12b:free` 40 calls (to 2026-09-13), `auto` 149,
+`gemini-3.5-flash-lite` 4. Workout/diet/progress prompts carry injuries,
+medical conditions and allergies. Free endpoints may log or train on prompts,
+and have no SLA. `auto` also means the model that actually processed the data
+is not recorded.
+
+**Fix:** set paid models (env or `platform_ai_settings`), enable OpenRouter's
+"no prompt logging / no training" data policy for the key, and record the
+resolved model OpenRouter returns instead of the requested alias.
+
+## 17. High — email change without re-authentication
+
+`PUT /api/profile/me` updates `users.email` with no current password, no
+confirmation to the new address and no notice to the old one. Any session —
+stolen, XSS'd, or impersonated — can switch the address and then use
+forgot-password to own the account permanently. Require the current password
+(or a recent step-up), verify the new address before switching, and email the
+old one.
+
+## 18. Medium — impersonation can outlive itself
+
+Full-access impersonation (`mode: 'full'`) runs as the owner, so it can change
+the owner's email (above) and enrol a passkey (`/api/auth/webauthn/register/*`),
+leaving a credential that logs in after the audited session ends. Refuse
+credential changes (email, password, passkeys, MFA) whenever `req.impersonation`
+is set.
+
+## 19. Medium — backup confidentiality and restore
+
+Dumps upload unencrypted with the app's own R2 key, so a compromised app can
+read or delete every backup. Encrypt before upload (age/GPG), use a separate
+write-only key and bucket, set R2 object lock or a lifecycle rule, and restore
+into a scratch database periodically.
+
+## 20. Medium — cross-repo PRs cannot both go green
+
+The frontend E2E job checks out backend `main` (`BACKEND_REF` unset), so a
+frontend change that needs a new backend route fails its contract check until
+the backend merges first — and if the backend change also needs the frontend,
+one side is always briefly broken in production. Hit on #247/#168 today. Let
+the job use a backend branch of the same name when one exists.
+
+## 21–24. Low
+
+- **Password policy** — `validatePassword` (activation/invitation) requires
+  upper, lower, digit and symbol; `/reset-password` and profile change-password
+  require only 8 characters. Use one policy everywhere.
+- **WhatsApp** — the UI shows the ban-risk disclosure, but acceptance is not
+  stored (who, when). Automated sends have no per-client opt-out and no quiet
+  hours; the gateway's own throttles (20/min, 1,000/day, jitter) are sound.
+- **nginx** — `admin.myptstudio.com` redirects to HTTPS but no :443 block
+  serves it, so it lands on the `myptstudio.com` certificate.
+- **Archive tables** — drop `archive.role_model_*_backup` once migration 208
+  is confirmed; they duplicate user rows outside the live table's controls.
+
+## Verified healthy (second pass)
+
+- Impersonation: audited, read-only by default, scoped to one studio, cannot
+  target platform accounts, and refused on the control plane.
+- Billing: coupon validity and redemption limits checked; redemption under a
+  row lock; discount capped at the price.
+- Invitation / activation tokens: 32 random bytes, stored hashed, expiry and
+  single-use enforced.
+- Frontend: `safeReturnTo` blocks open redirects (scheme-relative, backslash,
+  control characters, cross-portal); chat Markdown uses react-markdown's
+  default URL filtering with `rel="noopener noreferrer"`.
+- Live DB: RLS enabled on all 153 tables; 7 studios, 7 trainers, 1 platform
+  operator, 35 clients, **0 client logins** — so the member-role leaks fixed in
+  PR #166 had no account able to exploit them.
