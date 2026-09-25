@@ -75,11 +75,18 @@ async function generateUpiReceiptPdf({ order, submission, activation, member, or
   drawLabelValue(doc, 'Mobile:', member?.mobile);
   drawLabelValue(doc, 'Email:', member?.email);
 
-  drawSectionHeading(doc, 'Membership');
-  drawLabelValue(doc, 'Plan:', order.plan_name);
-  drawLabelValue(doc, 'Duration:', `${order.duration_months} month${order.duration_months === 1 ? '' : 's'}`);
-  drawLabelValue(doc, 'Valid From:', fmtDate(activation.activated_from));
-  drawLabelValue(doc, 'Valid Until:', fmtDate(activation.activated_to));
+  // A balance payment bought no time, so it prints what it paid for and no
+  // validity window — "Valid Until" on it would be a date nobody granted.
+  if (order.kind === 'balance') {
+    drawSectionHeading(doc, 'Payment For');
+    drawLabelValue(doc, 'Description:', order.plan_name);
+  } else {
+    drawSectionHeading(doc, 'Membership');
+    drawLabelValue(doc, 'Plan:', order.plan_name);
+    drawLabelValue(doc, 'Duration:', `${order.duration_months} month${order.duration_months === 1 ? '' : 's'}`);
+    drawLabelValue(doc, 'Valid From:', fmtDate(activation.activated_from));
+    drawLabelValue(doc, 'Valid Until:', fmtDate(activation.activated_to));
+  }
 
   // ── Amounts ──
   drawSectionHeading(doc, 'Amount');

@@ -424,6 +424,33 @@ router.post('/create', auth, validate(schemas.createOrder), wrap(async (req, res
   }
 }));
 
+// POST /api/payments/upi/balance — a member pays their own outstanding
+// balance. Members only: the order is always for the caller's own client
+// record, and the amount is the balance the server holds for them — the body
+// is ignored entirely. Staff record a desk payment through /api/payments.
+router.post('/balance', auth, wrap(async (req, res) => {
+  try {
+    if (req.user.role !== 'member') {
+      return res.status(403).json({
+        error: { code: 'MEMBERS_ONLY', message: 'Only a member can pay their own balance online.' },
+      });
+    }
+    if (!req.user.pt_client_id) {
+      throw new upi.PaymentError('NO_MEMBER', 'No member is linked to this account', 403);
+    }
+    const orgId = requireOrg(req);
+    const { order, reused, member } = await upi.createBalanceOrder({
+      orgId, clientId: req.user.pt_client_id, actor: actorOf(req),
+    });
+    const view = await upi.buildPaymentView(order);
+    res.status(reused ? 200 : 201).json({
+      data: { order: { ...order, client_name: member.name }, payment: view, reused },
+    });
+  } catch (err) {
+    sendPaymentError(res, err);
+  }
+}));
+
 // GET /api/payments/upi/:id/status — the payment page's polling target and
 // the member's detail view. Rebuilds the QR and intents on every read so a
 // page left open overnight cannot show a stale amount.
@@ -601,7 +628,7 @@ router.post('/:id/submit-utr', auth, validate(schemas.submitUtr), wrap(async (re
     await notify(
       memberUserId, 'payment', 'Payment submitted',
       'Your payment reference is with the studio for verification.',
-      `/member/payments/${order.id}`
+      `/member/pay/${order.id}`
     );
 
     await logActivity(req, 'upi_payment.submit_utr', 'payment_orders', order.id, {
@@ -804,8 +831,10 @@ router.post('/:id/approve', auth, requireTrainer, validate(schemas.idParam), wra
     const memberUserId = await userIdForClient(result.member.id);
     await notify(
       memberUserId, 'payment', 'Payment approved',
-      `Your ${result.order.plan_name} membership is active until ${result.activation.activated_to}.`,
-      `/member/payments/${result.order.id}`
+      result.order.kind === upi.ORDER_KIND.BALANCE
+        ? `Your payment of Rs. ${result.order.total_amount} towards your balance has been received.`
+        : `Your ${result.order.plan_name} membership is active until ${result.activation.activated_to}.`,
+      `/member/pay/${result.order.id}`
     );
 
     await logActivity(req, 'upi_payment.approve', 'payment_orders', result.order.id, {
@@ -838,7 +867,7 @@ router.post('/:id/reject', auth, requireTrainer, validate(schemas.reject), wrap(
     await notify(
       memberUserId, 'payment', 'Payment could not be verified',
       `${upi.REJECT_REASONS[result.reason]}${result.note ? ` — ${result.note}` : ''} You can submit a new reference.`,
-      `/member/payments/${req.params.id}`
+      `/member/pay/${req.params.id}`
     );
 
     await logActivity(req, 'upi_payment.reject', 'payment_orders', req.params.id, {
@@ -869,7 +898,7 @@ router.post('/:id/request-correction', auth, requireTrainer, validate(schemas.re
       await notify(
         memberUserId, 'payment', 'Please check your payment reference',
         `${result.note || upi.REJECT_REASONS[result.reason]} Submit the corrected reference to continue.`,
-        `/member/payments/${req.params.id}`
+        `/member/pay/${req.params.id}`
       );
       res.json({ data: result });
     } catch (err) {
