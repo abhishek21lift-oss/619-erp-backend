@@ -36,7 +36,10 @@ jest.mock('../db/pool', () => {
   return new Pool({ connectionString: mockDbUrl, max: 4 });
 });
 
-const ORG = '99999999-9999-4999-8999-999999999991';
+// Unique to this suite. The real-database suites run in parallel against one
+// database, so a studio id shared with another suite means each one's cleanup
+// deletes rows the other still holds.
+const ORG = 'c1e70000-0000-4000-8000-000000000174';
 const CLIENT = 'me-int-client';
 const USER = 'me-int-user';
 const TRAINER = 'me-int-trainer';
@@ -55,7 +58,7 @@ describeIf('/api/me against a real database', () => {
        ON CONFLICT (id) DO NOTHING`, [TRAINER, ORG]);
     await pool.query(
       `INSERT INTO pt_clients (id, name, mobile, email, organization_id, trainer_id, balance_amount)
-       VALUES ($1, 'Mina', '+919000009001', 'mina@portal.test', $2, $3, 1500)
+       VALUES ($1, 'Mina', '+919000017401', 'mina@portal.test', $2, $3, 1500)
        ON CONFLICT (id) DO NOTHING`, [CLIENT, ORG, TRAINER]);
     await pool.query(
       `INSERT INTO users (id, name, email, password, role, organization_id, pt_client_id, is_active)
