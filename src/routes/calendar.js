@@ -2,7 +2,10 @@
 // Google Calendar OAuth flow + connection status endpoints.
 //
 // GET  /api/calendar/auth-url    — returns the Google consent URL (auth required)
-// GET  /api/calendar/callback    — OAuth2 redirect handler (no auth — Google calls this)
+// GET  /api/calendar/callback    — OAuth2 redirect handler (no auth — Google calls this);
+//                                  hands code+state to the frontend, stores nothing
+// POST /api/calendar/complete    — exchanges the code, for the signed-in user who
+//                                  started the flow and nobody else (auth required)
 // GET  /api/calendar/status      — connection status for current user (auth required)
 // DELETE /api/calendar/disconnect — revoke & delete tokens (auth required)
 
@@ -37,50 +40,83 @@ router.get('/auth-url', auth, (req, res) => {
   );
 
   const url = cal.generateAuthUrl(stateToken);
-  // Log the redirect_uri so mismatches are easy to diagnose in Render logs
-  const redirectUri = process.env.GOOGLE_CALENDAR_REDIRECT_URI;
-  logger.info({ redirectUri }, 'Google Calendar: generated auth URL');
-  res.json({ url, _debug_redirect_uri: redirectUri });
+  // Log the redirect_uri so mismatches are easy to diagnose in the server logs.
+  // Not returned to the browser: it was only ever a debugging aid.
+  logger.info({ redirectUri: process.env.GOOGLE_CALENDAR_REDIRECT_URI }, 'Google Calendar: generated auth URL');
+  res.json({ url });
 });
 
 // ── GET /api/calendar/callback ────────────────────────────────────────────────
-// Google redirects the user here after consent. We exchange the code for tokens,
-// persist them, then redirect the browser to the frontend integrations page.
-router.get('/callback', async (req, res) => {
-  if (!cal.isConfigured()) return notConfigured(res);
-
-  const { code, state, error } = req.query;
+// Google redirects the browser here after consent. It stores nothing: it hands
+// code + state to the frontend Integrations page, which completes the
+// connection through POST /complete below, inside the user's own session.
+//
+// This route used to verify `state` and save the tokens straight onto
+// state.user_id. `state` names who STARTED the flow; nothing checked who
+// FINISHED it. So anyone could mint a state for their own account, send
+// someone the Google consent link built from it, and — if that person clicked
+// "Allow" — have the victim's Google Calendar written onto the attacker's ERP
+// account (OAuth login CSRF).
+//
+// Bound through the session rather than a nonce cookie because the callback
+// may be served on a different host (api.) from the one that minted the state,
+// where such a cookie would never be sent.
+router.get('/callback', (req, res) => {
   // Normalised: FRONTEND_URL carries a trailing slash in production, which
   // would send the user to ".com//settings/integrations" after authorising.
   const redirectBase = frontendUrl('/settings/integrations') || 'http://localhost:3000/settings/integrations';
+  if (!cal.isConfigured()) return res.redirect(`${redirectBase}?calendar=error&reason=not_configured`);
 
+  const { code, state, error } = req.query;
   if (error) {
     logger.warn({ error }, 'Google Calendar OAuth denied by user');
     return res.redirect(`${redirectBase}?calendar=denied`);
   }
-
-  if (!code || !state) {
+  if (typeof code !== 'string' || typeof state !== 'string' || !code || !state) {
     return res.redirect(`${redirectBase}?calendar=error&reason=missing_params`);
   }
 
-  // Verify state token
-  let userId;
+  const params = new URLSearchParams({ calendar: 'confirm', code, state });
+  return res.redirect(`${redirectBase}?${params.toString()}`);
+});
+
+// ── POST /api/calendar/complete  { code, state } ──────────────────────────────
+// Exchanges the code for the signed-in user — and only when the state was
+// minted for that same user. The browser Google redirected carries its own
+// session, so a consent link forwarded from someone else's account is refused
+// here before the code is ever exchanged.
+const EXPIRED_LINK = 'This connection link has expired. Please try connecting again.';
+
+router.post('/complete', auth, async (req, res) => {
+  if (!cal.isConfigured()) return notConfigured(res);
+
+  const { code, state } = req.body || {};
+  if (typeof code !== 'string' || typeof state !== 'string' || !code || !state) {
+    return res.status(400).json({ error: 'code and state are required' });
+  }
+
+  let payload;
   try {
-    const payload = jwt.verify(state, process.env.JWT_SECRET);
-    if (payload.purpose !== 'calendar_oauth') throw new Error('Wrong purpose');
-    userId = payload.user_id;
+    payload = jwt.verify(state, process.env.JWT_SECRET);
   } catch (stateErr) {
     logger.warn({ err: stateErr.message }, 'Google Calendar: invalid state token');
-    return res.redirect(`${redirectBase}?calendar=error&reason=invalid_state`);
+    return res.status(400).json({ error: EXPIRED_LINK });
+  }
+  if (payload.purpose !== 'calendar_oauth' || !payload.user_id) {
+    return res.status(400).json({ error: EXPIRED_LINK });
+  }
+  if (String(payload.user_id) !== String(req.user.id)) {
+    logger.warn({ userId: req.user.id }, 'Google Calendar: state was minted for a different user — refused');
+    return res.status(403).json({ error: 'This connection was started from a different account. Please try connecting again.' });
   }
 
   try {
-    await cal.saveTokensFromCode(userId, code);
-    logger.info({ userId }, 'Google Calendar: tokens saved');
-    return res.redirect(`${redirectBase}?calendar=connected`);
+    await cal.saveTokensFromCode(req.user.id, code);
+    logger.info({ userId: req.user.id }, 'Google Calendar: tokens saved');
+    return res.json({ connected: true });
   } catch (tokenErr) {
-    logger.error({ userId, err: tokenErr.message }, 'Google Calendar: token exchange failed');
-    return res.redirect(`${redirectBase}?calendar=error&reason=token_exchange`);
+    logger.error({ userId: req.user.id, err: tokenErr.message }, 'Google Calendar: token exchange failed');
+    return res.status(502).json({ error: 'Google did not accept the connection. Please try again.' });
   }
 });
 

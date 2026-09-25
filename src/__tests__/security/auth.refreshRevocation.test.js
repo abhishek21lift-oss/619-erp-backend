@@ -378,6 +378,16 @@ describe('existing refresh semantics are preserved', () => {
     }
   });
 
+  test('a browser refresh (Origin present) rotates via cookies and returns no tokens in the body', async () => {
+    const raw = giveRefreshToken(USER_A);
+    const res = await request(app()).post('/api/auth/refresh')
+      .set('Origin', 'https://app.example.com')
+      .send({ refresh_token: raw });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(res.headers['set-cookie'].join(';')).toMatch(/refresh_token=/);
+  });
+
   test('no raw token or hash is ever written to the logs', async () => {
     const logger = require('../../lib/logger');
     const raw = giveRefreshToken(USER_A);

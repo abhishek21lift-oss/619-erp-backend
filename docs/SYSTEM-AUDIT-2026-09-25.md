@@ -21,8 +21,8 @@ branch as this document, each with a regression test that fails without the fix.
 | 5 | Medium | Member class booking cannot work: member accounts have no `member_id`, and booking reads the empty v3 tables | Open |
 | 6 | Medium | The member authz test skips exempt mounts wholesale — the blind spot behind #1/#2 | Partly fixed |
 | 7 | Medium | Runtime on Node 20, which reached end-of-life in April 2026 | Fixed (all three repos) |
-| 8 | Medium | `/login` returns `token` + `refresh_token` in the JSON body to browsers too | Open |
-| 9 | Medium | Google Calendar OAuth `state` is not bound to the browser that started the flow | Open |
+| 8 | Medium | `/login` returns `token` + `refresh_token` in the JSON body to browsers too | Fixed |
+| 9 | Medium | Google Calendar OAuth `state` is not bound to the browser that started the flow | Fixed (backend + frontend) |
 | 10 | Low | Postgres TLS uses `rejectUnauthorized: false` unless `DATABASE_SSL_CA` is set | Open |
 | 11 | Low | `qs` DoS advisories via Express | Fixed (lockfile) |
 | 12 | Low | Assorted: login timing enumeration, `staff` portal still in schema, sanitizer false positives, etc. | Open |
@@ -136,6 +136,13 @@ token. Return body tokens only when the client asks (e.g. an explicit
 `X-Client: mobile` header or `portal`/`client` field), and keep cookies-only for
 the browser.
 
+**Fixed:** `/login` and `/refresh` leave the tokens out of the body whenever
+the request carries an `Origin` header. Browsers attach `Origin` to every POST
+and page script cannot remove it; the web app and the Android WebView (same
+origin) run on the cookies alone. Callers with no `Origin` — ops scripts, the
+E2E API suite, any native client — keep the body tokens they use today, so no
+opt-in header had to be rolled out.
+
 ## 9. Medium — OAuth CSRF on Google Calendar connect
 
 `/api/calendar/auth-url` signs `state = {user_id}` but the callback never checks
@@ -145,6 +152,16 @@ consents, the victim's calendar tokens are stored on the attacker's account.
 Bind `state` to the session (e.g. set a short-lived httpOnly nonce cookie at
 `auth-url` and require it at `callback`). Also drop `_debug_redirect_uri` from
 the response.
+
+**Fixed:** bound through the session, not a nonce cookie, because the callback
+may be served on a different host (`api.`) from the one that minted the state,
+where such a cookie would never arrive. `GET /callback` now stores nothing and
+forwards `code` + `state` to `/settings/integrations?calendar=confirm`; the page
+POSTs them to the new `POST /api/calendar/complete` behind `auth`, which
+exchanges the code only when `state.user_id` is the signed-in caller. A
+forwarded consent link lands in the victim's session, doesn't match, and is
+refused before the exchange. `_debug_redirect_uri` is gone. No Google Console
+change is needed; the redirect URI is unchanged.
 
 ## 10. Low — Database TLS without certificate verification
 

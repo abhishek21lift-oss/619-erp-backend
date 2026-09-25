@@ -64,6 +64,25 @@ function signAccessToken(userId, tokenVersion, audience) {
   });
 }
 
+/**
+ * May this response carry the session tokens in its JSON body?
+ *
+ * Only for a caller that is not a browser. A browser already holds both
+ * tokens as httpOnly cookies — set on this same response — and a copy in the
+ * body is the one place page script can read them, so any XSS could lift a
+ * seven-day refresh token. The web app never reads it (its login call is
+ * typed `{ user }`), and the Android app is a WebView of the same origin, so
+ * it rides the cookies too.
+ *
+ * `Origin` is the signal because browsers attach it to every POST and page
+ * script cannot remove it (a forbidden header name). Scripts, the E2E API
+ * suite and any native client send none, and keep the body tokens they use
+ * today.
+ */
+function bodyTokensAllowed(req) {
+  return !req.headers.origin;
+}
+
 async function issueRefreshToken(res, userId, audience = null) {
   const rawToken = crypto.randomBytes(48).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
@@ -384,8 +403,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         founder_number:        user.founder_number ?? null,
         mfaSetupRequired,
       },
-      token,
-      refresh_token: refreshToken,
+      ...(bodyTokensAllowed(req) ? { token, refresh_token: refreshToken } : {}),
     });
 
   } catch (err) {
@@ -407,7 +425,10 @@ router.post('/logout', async function(req, res) {
 // POST /api/auth/refresh — exchange a valid refresh token for a new access token (token rotation)
 router.post('/refresh', async (req, res) => {
   const rawToken = req.cookies?.refresh_token || req.body?.refresh_token;
-  const isMobile = !req.cookies?.refresh_token;
+  // Body tokens only for a cookieless, non-browser caller. A browser that has
+  // lost its cookie but replays a refresh token from the body still gets
+  // cookies only — see bodyTokensAllowed.
+  const isMobile = !req.cookies?.refresh_token && bodyTokensAllowed(req);
   if (!rawToken) return res.status(401).json({ error: 'No refresh token' });
 
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
