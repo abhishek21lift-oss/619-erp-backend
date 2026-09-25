@@ -48,6 +48,12 @@ function orgClause(orgId, params, col = 'organization_id') {
 // The column list is an allow-list, and deliberately narrow. `SELECT *` here
 // would hand the client their own commission figures, internal notes and the
 // studio's margin on them the moment somebody adds a column.
+//
+// trainer_photo is NULL, not t.photo_url: `trainers` has no photo column in
+// any migration or in production. Selecting it made this route a 500 for
+// every member, and the member dashboard — the first screen after sign-in —
+// needs it, so the whole app read as broken. The field stays in the response
+// so the client contract does not change; the dashboard shows initials.
 router.get('/profile', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
   const params = [clientId];
@@ -57,7 +63,7 @@ router.get('/profile', wrap(async (req, res) => {
             c.package_type, c.goal, c.height, c.weight,
             c.joining_date, c.pt_start_date, c.pt_end_date, c.duration_months,
             c.status,
-            t.name AS trainer_name, t.photo_url AS trainer_photo,
+            t.name AS trainer_name, NULL::text AS trainer_photo,
             t.specialization AS trainer_specialization,
             o.name AS studio_name, o.logo_url AS studio_logo
        FROM pt_clients c
