@@ -20,6 +20,7 @@
 
 const router = require('express').Router();
 const pool = require('../../db/pool');
+const portal = require('./client-portal.service');
 
 /** Wrap an async handler so a rejection reaches the error middleware. */
 const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
@@ -142,6 +143,49 @@ router.get('/measurements', wrap(async (req, res) => {
     [clientId]
   );
   res.json({ data: rows });
+}));
+
+// ── My programme, my diet, my weekly check-ins ─────────────────────────────
+//
+// The member app used to stop at profile, payments, attendance and weight:
+// a client could not see the programme their trainer wrote, the diet they
+// were given, or tell their trainer how the week went. The SQL for these is
+// in client-portal.service.js; each route passes it the identity from the
+// session and nothing from the request.
+
+// GET /api/me/workout — active programmes, this week's exercises by day
+router.get('/workout', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await portal.myWorkout(clientId, orgId) });
+}));
+
+// GET /api/me/diet — active diet plans with daily targets and meals
+router.get('/diet', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await portal.myDiet(clientId, orgId) });
+}));
+
+// GET /api/me/checkins — recent weekly check-ins, and which week is "this week"
+router.get('/checkins', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await portal.myCheckins(clientId, orgId) });
+}));
+
+// POST /api/me/checkins — this week's check-in (the server picks the week)
+router.post('/checkins', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    const saved = await portal.upsertMyCheckin(clientId, orgId, req.user.id, req.body || {});
+    if (!saved) {
+      return res.status(409).json({ error: { code: 'CONFLICT', message: 'This week\'s check-in could not be saved.' } });
+    }
+    res.status(201).json({ data: saved });
+  } catch (err) {
+    if (err instanceof portal.PortalInputError) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
+    }
+    throw err;
+  }
 }));
 
 module.exports = router;
