@@ -106,7 +106,7 @@ function rel(file) {
  */
 const BUDGETS = {
   'modules/pt-os/pt-os.routes.js': 93,
-  'modules/pt-os/workout-log.routes.js': 45,
+  'modules/pt-os/workout-log.routes.js': 42,
   'routes/exercises.js': 43,
   'routes/workouts.js': 43,
   'routes/ai.js': 42,
@@ -221,8 +221,9 @@ describe('the migration has a number attached to it', () => {
     // 782 at the start of phase 5; 773 after the training programmes cluster
     // moved to a repository; 755 once the rest of that adapter followed and
     // its entry was deleted outright — the first file in the register to
-    // reach zero. Lower it with each extraction — the number only means
+    // reach zero. 704 once the workout log's PR and plan-progress rules moved
+    // to workout-log.service, where the member app's self-logging reuses them. Lower it with each extraction — the number only means
     // something if it tracks reality.
-    expect(ceiling).toBe(707);
+    expect(ceiling).toBe(704);
   });
 });

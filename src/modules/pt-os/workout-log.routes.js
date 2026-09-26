@@ -28,6 +28,8 @@ const { today: studioToday } = require('../../lib/appTime');
 const { weekOf, resolveWeek } = require('./progression');
 const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./training-analytics');
 const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
+// Shared with the member app's self-logged workouts (client-portal).
+const { recomputeAssignmentProgress, computePrFlags } = require('./workout-log.service');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -39,28 +41,6 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 const numOpt = () => z.coerce.number().optional().nullable();
 
 const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-
-// Recomputes a linked assignment's progress_pct from how many distinct
-// completed sessions have been logged against it, relative to the plan's
-// target (sessions_per_week * duration_weeks). The only writer of
-// progress_pct outside the trainer's manual PUT /assignments/:id/progress.
-async function recomputeAssignmentProgress(assignmentId) {
-  if (!assignmentId) return;
-  const { rows } = await pool.query(
-    `SELECT wp.sessions_per_week, wp.duration_weeks,
-            (SELECT COUNT(DISTINCT ws.id) FROM workout_sessions ws
-              WHERE ws.workout_assignment_id = wa.id AND ws.status = 'completed') AS completed_count
-       FROM workout_assignments wa
-       JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-      WHERE wa.id = $1`,
-    [assignmentId]
-  );
-  const row = rows[0];
-  if (!row) return;
-  const target = (row.sessions_per_week || 0) * (row.duration_weeks || 0);
-  const pct = target > 0 ? Math.min(100, Math.round((row.completed_count / target) * 100)) : 0;
-  await pool.query('UPDATE workout_assignments SET progress_pct = $1, updated_at = NOW() WHERE id = $2', [pct, assignmentId]);
-}
 
 // ─── Schemas ────────────────────────────────────────────────
 
@@ -143,36 +123,6 @@ const setUpdateSchema = {
 };
 
 // ─── Helpers ────────────────────────────────────────────────
-
-// Never trust a client-submitted "is this a PR" flag — always recompute
-// against the client's prior completed sets for the same exercise
-// (matched by exercise_id when the exercise is in the library, else by
-// exact exercise_name for ad-hoc entries).
-async function computePrFlags(client, clientId, exerciseId, exerciseName, weight, reps, excludeSetId) {
-  if (weight == null || reps == null) return { is_pr_weight: false, is_pr_reps: false, is_pr_volume: false };
-
-  const matchClause = exerciseId ? 'wse.exercise_id = $2' : 'wse.exercise_name = $2';
-  const matchParam = exerciseId || exerciseName;
-  const params = [clientId, matchParam];
-  let excludeClause = '';
-  if (excludeSetId) { params.push(excludeSetId); excludeClause = `AND s.id != $${params.length}`; }
-
-  const { rows } = await client.query(
-    `SELECT MAX(s.weight_kg) AS max_weight, MAX(s.reps) AS max_reps, MAX(s.weight_kg * s.reps) AS max_volume
-       FROM workout_sets s
-       JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
-       JOIN workout_sessions ws ON ws.id = wse.session_id
-      WHERE ws.client_id = $1 AND ${matchClause} AND s.completed = true ${excludeClause}`,
-    params
-  );
-  const prev = rows[0] || {};
-  const volume = weight * reps;
-  return {
-    is_pr_weight: prev.max_weight == null || weight > Number(prev.max_weight),
-    is_pr_reps: prev.max_reps == null || reps > Number(prev.max_reps),
-    is_pr_volume: prev.max_volume == null || volume > Number(prev.max_volume),
-  };
-}
 
 // ─── Sessions ───────────────────────────────────────────────
 
@@ -409,7 +359,7 @@ router.patch('/workout-log/sessions/:id', auth, requireTrainer, validate(session
   const { rows } = await pool.query(`UPDATE workout_sessions SET ${sets.join(', ')} WHERE id = $1${whereGuard} RETURNING *`, params);
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   if (b.status !== undefined && rows[0].workout_assignment_id) {
-    await recomputeAssignmentProgress(rows[0].workout_assignment_id);
+    await recomputeAssignmentProgress(rows[0].workout_assignment_id, scope.orgId);
   }
   res.json({ data: rows[0] });
 }));
@@ -423,7 +373,7 @@ router.delete('/workout-log/sessions/:id', auth, requireTrainer, wrap(async (req
     [req.params.id, scope.orgId]
   );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-  if (rows[0].workout_assignment_id) await recomputeAssignmentProgress(rows[0].workout_assignment_id);
+  if (rows[0].workout_assignment_id) await recomputeAssignmentProgress(rows[0].workout_assignment_id, scope.orgId);
   await logActivity(req, 'workout_log.session.delete', 'workout_sessions', req.params.id, { client_id: rows[0].client_id });
   res.json({ message: 'Session deleted' });
 }));
@@ -492,7 +442,10 @@ router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireTrain
 
   let prFlags = { is_pr_weight: false, is_pr_reps: false, is_pr_volume: false };
   if (b.completed && b.weight_kg != null && b.reps != null) {
-    prFlags = await computePrFlags(pool, ex.client_id, ex.exercise_id, ex.exercise_name, b.weight_kg, b.reps, null);
+    prFlags = await computePrFlags(pool, {
+      clientId: ex.client_id, orgId: scope.orgId, exerciseId: ex.exercise_id, exerciseName: ex.exercise_name,
+      weight: b.weight_kg, reps: b.reps,
+    });
   }
 
   const { rows } = await pool.query(
@@ -539,7 +492,10 @@ router.patch('/workout-log/sets/:id', auth, requireTrainer, validate(setUpdateSc
 
   let prFlags = { is_pr_weight: existing.is_pr_weight, is_pr_reps: existing.is_pr_reps, is_pr_volume: existing.is_pr_volume };
   if (merged.completed && merged.weight_kg != null && merged.reps != null) {
-    prFlags = await computePrFlags(pool, existing.client_id, existing.exercise_id, existing.exercise_name, merged.weight_kg, merged.reps, id);
+    prFlags = await computePrFlags(pool, {
+      clientId: existing.client_id, orgId: scope.orgId, exerciseId: existing.exercise_id,
+      exerciseName: existing.exercise_name, weight: merged.weight_kg, reps: merged.reps, excludeSetId: id,
+    });
   } else if (!merged.completed) {
     prFlags = { is_pr_weight: false, is_pr_reps: false, is_pr_volume: false };
   }

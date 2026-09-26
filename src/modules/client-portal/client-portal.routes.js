@@ -22,6 +22,10 @@ const router = require('express').Router();
 const pool = require('../../db/pool');
 const portal = require('./client-portal.service');
 const messages = require('../client-messages/client-messages.service');
+const training = require('./member-training.service');
+const goals = require('./member-goals.service');
+const recap = require('./member-recap.service');
+const { isTrainingBlocked } = require('../../lib/screeningGate');
 const { randomUUID } = require('crypto');
 const multer = require('multer');
 const { serveFile, saveFile, deleteFile } = require('../../lib/fileStorage');
@@ -384,6 +388,81 @@ router.post('/checkins', wrap(async (req, res) => {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
     }
     throw err;
+  }
+}));
+
+// ── Guided workout, goals, monthly recap ────────────────────────────────────
+//
+// SQL for all three lives in their services; these routes pass the identity
+// from the session and the body, and map input errors to 4xx.
+
+/** Send a service's input error as a 4xx; anything else goes to the error middleware. */
+function inputError(res, err, Kind) {
+  if (!(err instanceof Kind)) return false;
+  const status = err.status || 400;
+  const code = status === 429 ? 'RATE_LIMITED' : status === 409 ? 'CONFLICT' : 'BAD_REQUEST';
+  res.status(status).json({ error: { code, message: err.message } });
+  return true;
+}
+
+// GET /api/me/workout/last?name=Squat&name=Bench — what they did last time
+router.get('/workout/last', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  const raw = req.query.name;
+  const names = (Array.isArray(raw) ? raw : raw ? [raw] : []).map(String).filter((n) => n.length <= 120);
+  res.json({ data: await training.lastPerformance(clientId, orgId, names) });
+}));
+
+// POST /api/me/workouts — a finished workout the member did on their own
+router.post('/workouts', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  // The same medical gate as the trainer's log: a member whose PAR-Q blocks
+  // training cannot log training either.
+  if (await isTrainingBlocked(clientId)) {
+    return res.status(403).json({ error: {
+      code: 'PARQ_BLOCKED',
+      message: 'Your health screening needs your trainer\'s clearance before you log workouts.',
+    } });
+  }
+  try {
+    const { created, summary } = await training.logMyWorkout(clientId, orgId, req.user.id, req.body || {});
+    res.status(created ? 201 : 200).json({ data: summary });
+  } catch (err) {
+    if (!inputError(res, err, training.TrainingInputError)) throw err;
+  }
+}));
+
+// GET /api/me/goals — the member's goals with progress, and the studio's target
+router.get('/goals', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await goals.myGoals(clientId, orgId) });
+}));
+
+// POST /api/me/goals — set a new goal
+router.post('/goals', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    res.status(201).json({ data: await goals.createMyGoal(clientId, orgId, req.user.id, req.body || {}) });
+  } catch (err) {
+    if (!inputError(res, err, goals.GoalInputError)) throw err;
+  }
+}));
+
+// DELETE /api/me/goals/:id — take a goal off the list
+router.delete('/goals/:id', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  const removed = await goals.archiveMyGoal(clientId, orgId, req.params.id);
+  if (!removed) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Goal not found.' } });
+  res.status(204).end();
+}));
+
+// GET /api/me/recap?month=YYYY-MM — the month in numbers (latest active month by default)
+router.get('/recap', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    res.json({ data: await recap.myRecap(clientId, orgId, req.query.month ? String(req.query.month) : null) });
+  } catch (err) {
+    if (!inputError(res, err, recap.RecapInputError)) throw err;
   }
 }));
 

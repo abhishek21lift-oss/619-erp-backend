@@ -515,7 +515,7 @@ describe('when did this client last actually train', () => {
     const fs = require('fs');
     const path = require('path');
     const log = fs.readFileSync(
-      path.join(__dirname, '..', 'modules', 'pt-os', 'workout-log.routes.js'), 'utf8',
+      path.join(__dirname, '..', 'modules', 'pt-os', 'workout-log.service.js'), 'utf8',
     );
     expect(log).toMatch(/ws\.status = 'completed'\) AS completed_count/);
   });

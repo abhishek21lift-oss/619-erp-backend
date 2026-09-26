@@ -104,4 +104,24 @@ function todayShortDay(date = new Date()) {
   }).format(date);
 }
 
-module.exports = { DEFAULT_TIME_ZONE, appTimeZone, todayIn, today, todayShortDay };
+/**
+ * A value read from the database, as the studio's 'YYYY-MM-DD'.
+ *
+ * node-postgres returns DATE and TIMESTAMPTZ columns as JS Dates (no type
+ * parser is registered in db/pool.js), and `String(date).slice(0, 10)` of a
+ * Date is "Mon Aug 03" — not a date at all. Code that assumed a string got
+ * NaN from every date sum after it; the member app's programme filtered out
+ * every exercise that way.
+ *
+ * A Date is formatted in the studio's zone, which is right for both column
+ * kinds: a TIMESTAMPTZ is an instant, and a DATE is parsed as midnight in the
+ * Node process's zone, which lands on the same studio day for a UTC or
+ * studio-zone process. A string is taken as already being 'YYYY-MM-DD…'.
+ */
+function dbDate(value) {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : today(value);
+  return String(value).slice(0, 10);
+}
+
+module.exports = { DEFAULT_TIME_ZONE, appTimeZone, todayIn, today, todayShortDay, dbDate };
