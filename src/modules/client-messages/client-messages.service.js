@@ -146,7 +146,7 @@ async function memberSend(clientId, orgId, userId, raw) {
     [clientId, orgId],
   );
   await Promise.all(people.map((p) => notifyOnce(
-    p.id, `New message from ${p.client_name}`, body, `/messages?client=${encodeURIComponent(clientId)}`,
+    p.id, `New message from ${p.client_name}`, body, `/pt-os/messages?client=${encodeURIComponent(clientId)}`,
   )));
   return msg;
 }

@@ -116,7 +116,7 @@ describeIf('member ↔ studio messaging against a real database', () => {
     // Two messages, one notification: a burst is one "new message".
     const { rows } = await pool.query(
       `SELECT title, link FROM notifications WHERE user_id = $1 AND type = 'message'`, [TRAINER_USER]);
-    expect(rows).toEqual([{ title: 'New message from Ravi', link: `/messages?client=${CLIENT}` }]);
+    expect(rows).toEqual([{ title: 'New message from Ravi', link: `/pt-os/messages?client=${CLIENT}` }]);
   });
 
   test('the trainer opening the thread marks the member\'s messages read', async () => {
