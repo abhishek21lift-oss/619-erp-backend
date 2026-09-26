@@ -123,6 +123,13 @@ describe('buildAppIntents', () => {
 });
 
 describe('computeMembershipWindow', () => {
+  it('extends from a DATE column read back as a JS Date, not from today', () => {
+    // pt_end_date is a DATE column; node-postgres returns a Date. That used to
+    // read as "no membership", so paying early restarted the plan from today.
+    const w = upi.computeMembershipWindow(new Date('2026-09-01T00:00:00Z'), 1, '2026-07-26');
+    expect(w).toEqual({ activated_from: '2026-09-01', activated_to: '2026-10-01' });
+  });
+
   test('starts today when there is no existing membership', () => {
     const w = upi.computeMembershipWindow(null, 3, '2026-07-26');
     expect(w).toEqual({ activated_from: '2026-07-26', activated_to: '2026-10-26' });

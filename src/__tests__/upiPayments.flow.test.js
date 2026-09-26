@@ -221,7 +221,7 @@ function scriptHappyApproval() {
     { rows: [{ id: SUB_ID, utr: '123456789012', submitted_at: '2026-07-26T10:00:00Z' }] });
   on(/UPDATE payment_orders SET status = \$1 WHERE id = \$2 AND status = \$3/s,
     { rows: [], rowCount: 1 });
-  on(/SELECT id, name, email, mobile, trainer_id, pt_end_date, organization_id FROM pt_clients/s,
+  on(/SELECT id, name, email, mobile, trainer_id, trainer_name, package_type, pt_end_date, organization_id\s+FROM pt_clients/s,
     { rows: [{ id: 'client-1', name: 'Rohit', trainer_id: 'trn-1', pt_end_date: EXISTING_END }] });
   on(/SELECT id, incentive_rate FROM trainers/s, { rows: [{ id: 'trn-1', incentive_rate: 0.5 }] });
   on(/INSERT INTO membership_payments/s, {

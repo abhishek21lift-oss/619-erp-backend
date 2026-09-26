@@ -25,6 +25,8 @@ const messages = require('../client-messages/client-messages.service');
 const training = require('./member-training.service');
 const goals = require('./member-goals.service');
 const recap = require('./member-recap.service');
+const renewal = require('./member-renewal.service');
+const { generatePaymentReceiptPdf } = require('../../lib/paymentReceiptPdf');
 const { isTrainingBlocked } = require('../../lib/screeningGate');
 const { randomUUID } = require('crypto');
 const multer = require('multer');
@@ -400,7 +402,7 @@ router.post('/checkins', wrap(async (req, res) => {
 function inputError(res, err, Kind) {
   if (!(err instanceof Kind)) return false;
   const status = err.status || 400;
-  const code = status === 429 ? 'RATE_LIMITED' : status === 409 ? 'CONFLICT' : 'BAD_REQUEST';
+  const code = status === 429 ? 'RATE_LIMITED' : status === 409 ? 'CONFLICT' : status === 404 ? 'NOT_FOUND' : 'BAD_REQUEST';
   res.status(status).json({ error: { code, message: err.message } });
   return true;
 }
@@ -464,6 +466,39 @@ router.get('/recap', wrap(async (req, res) => {
   } catch (err) {
     if (!inputError(res, err, recap.RecapInputError)) throw err;
   }
+}));
+
+// ── Renewal and receipts ─────────────────────────────────────────────────────
+
+// GET /api/me/renewal — where the plan stands, and the trainer's offer if any
+router.get('/renewal', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  const data = await renewal.myRenewal(clientId, orgId);
+  if (!data) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Membership not found.' } });
+  res.json({ data });
+}));
+
+// POST /api/me/renewal/request — ask the trainer for a renewal offer
+router.post('/renewal/request', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    res.json({ data: await renewal.requestRenewal(clientId, orgId, req.body?.note) });
+  } catch (err) {
+    if (!inputError(res, err, renewal.RenewalError)) throw err;
+  }
+}));
+
+// GET /api/me/payments/:id/receipt — PDF receipt for one payment of theirs
+router.get('/payments/:id/receipt', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  const payment = await renewal.myPaymentForReceipt(clientId, orgId, req.params.id);
+  if (!payment) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Payment not found.' } });
+  const pdf = await generatePaymentReceiptPdf(payment);
+  // Names a person and what they paid: never cache it anywhere shared.
+  res.set('Cache-Control', 'private, no-store');
+  res.type('application/pdf');
+  res.set('Content-Disposition', `inline; filename="receipt-${payment.payment_ref || String(payment.id).slice(0, 8)}.pdf"`);
+  res.send(pdf);
 }));
 
 module.exports = router;

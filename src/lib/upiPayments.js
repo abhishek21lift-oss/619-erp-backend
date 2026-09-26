@@ -26,6 +26,7 @@
 const { randomUUID } = require('crypto');
 const QRCode = require('qrcode');
 const pool = require('../db/pool');
+const { dbDate } = require('./appTime');
 const { genReceiptNo } = require('../db/receipts');
 const logger = require('./logger');
 const automation = require('../modules/automation/automation.triggers');
@@ -50,10 +51,21 @@ const SUBMISSION_STATUS = Object.freeze({
 
 // What an order is for. A membership order buys a plan and extends the
 // membership window when approved; a balance order pays down what the member
-// already owes (pt_clients.balance_amount) and buys no time. Migration 209.
+// already owes (pt_clients.balance_amount) and buys no time (migration 209).
+// A renewal order is a new term the trainer offered this client at a price
+// they chose; approving it starts the term without touching any older
+// balance (migration 213).
 const ORDER_KIND = Object.freeze({
   MEMBERSHIP: 'membership',
   BALANCE: 'balance',
+  RENEWAL: 'renewal',
+});
+
+/** Bounds on a renewal offer, shared with the route's validation. */
+const RENEWAL_LIMITS = Object.freeze({
+  minMonths: 1, maxMonths: 24,
+  maxAmount: 1_000_000,
+  minValidDays: 1, maxValidDays: 30, defaultValidDays: 7,
 });
 
 /** Printed on the balance order, its receipt and its invoice. */
@@ -220,13 +232,21 @@ function todayIso() {
 }
 
 /**
- * pt_clients.pt_end_date is a TEXT column dating back to migration 017 and can
- * legitimately hold an empty string, a null, or — on old imported rows —
- * something that is not a date at all. Anything that does not parse cleanly is
- * treated as "no existing membership" rather than being cast in SQL, where a
- * bad value would abort the whole approval transaction.
+ * pt_clients.pt_end_date began as a TEXT column (migration 017) that could
+ * hold an empty string, a null, or — on old imported rows — something that is
+ * not a date at all. Anything that does not parse cleanly is treated as "no
+ * existing membership" rather than being cast in SQL, where a bad value would
+ * abort the whole approval transaction.
+ *
+ * It is a DATE column now, in production and in the migrated schema, so the
+ * driver hands back a JS Date. That used to fail the string check and read as
+ * "no membership": a renewal paid before the plan ran out restarted from
+ * today and the member lost the days they had left — the exact case
+ * computeMembershipWindow exists to prevent. A Date is converted to the
+ * studio's calendar date first (dbDate), then held to the same rule.
  */
 function parseIsoDate(value) {
+  if (value instanceof Date) value = dbDate(value);
   if (typeof value !== 'string' || !ISO_DATE_RE.test(value.trim())) return null;
   const d = new Date(`${value.trim()}T00:00:00Z`);
   return Number.isNaN(d.getTime()) ? null : value.trim();
@@ -519,6 +539,139 @@ async function createBalanceOrder({ orgId, clientId, actor }, db = pool) {
 }
 
 /**
+ * A renewal offer: a new term the trainer is offering this client, at the
+ * months and price they chose, payable by the member in the app.
+ *
+ * At most one live offer per client (migration 213's partial unique index).
+ * Sending a new one replaces an unpaid one — the trainer changed their mind
+ * about the price — but never one the member says they have already paid:
+ * that must be verified or rejected first, or the member would be looking at
+ * a new price for money they have sent.
+ *
+ * The offer stays payable for `validDays`, not the studio's checkout TTL in
+ * minutes: it is sent now and paid whenever the member gets to it.
+ */
+async function createRenewalOffer({
+  orgId, clientId, durationMonths, amount, packageName, note, validDays, actor,
+}, db = pool) {
+  const L = RENEWAL_LIMITS;
+  const months = Number(durationMonths);
+  if (!Number.isInteger(months) || months < L.minMonths || months > L.maxMonths) {
+    throw new PaymentError('INVALID_DURATION', `Months must be a whole number from ${L.minMonths} to ${L.maxMonths}.`, 400);
+  }
+  const price = round2(Number(amount));
+  if (!Number.isFinite(price) || price <= 0 || price > L.maxAmount) {
+    throw new PaymentError('INVALID_AMOUNT', 'Enter a price greater than zero.', 400);
+  }
+  const days = validDays === undefined || validDays === null || validDays === '' ? L.defaultValidDays : Number(validDays);
+  if (!Number.isInteger(days) || days < L.minValidDays || days > L.maxValidDays) {
+    throw new PaymentError('INVALID_VALIDITY', `An offer can stay open for ${L.minValidDays} to ${L.maxValidDays} days.`, 400);
+  }
+  const name = String(packageName || '').trim().slice(0, 120)
+    || `PT renewal · ${months} month${months === 1 ? '' : 's'}`;
+  const noteText = note ? String(note).trim().slice(0, 500) || null : null;
+
+  const settings = await requireActiveSettings(orgId, db);
+  const totals = computeTotals(price, settings.gst_percent);
+
+  const tx = await db.connect();
+  try {
+    await tx.query('BEGIN');
+
+    const { rows: clientRows } = await tx.query(
+      `SELECT id, name, email, mobile, organization_id, pt_end_date
+         FROM pt_clients
+        WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL
+        FOR UPDATE`,
+      [clientId, orgId]
+    );
+    const member = clientRows[0];
+    if (!member) throw new PaymentError('NOT_FOUND', 'Client not found', 404);
+
+    const { rows: live } = await tx.query(
+      `SELECT ${ORDER_COLUMNS} FROM payment_orders o
+        WHERE o.organization_id = $1 AND o.client_id = $2 AND o.kind = $3
+          AND o.status = ANY($4::text[])
+        FOR UPDATE`,
+      [orgId, clientId, ORDER_KIND.RENEWAL, [...OPEN_ORDER_STATUSES, ORDER_STATUS.VERIFICATION_PENDING]]
+    );
+    for (const prev of live) {
+      if (prev.status === ORDER_STATUS.VERIFICATION_PENDING) {
+        throw new PaymentError(
+          'OFFER_AWAITING_VERIFICATION',
+          `${member.name || 'This client'} has already paid the current offer. Approve or reject it in Verify Payments first.`,
+          409,
+          { order_id: prev.id }
+        );
+      }
+      await tx.query(
+        `UPDATE payment_orders SET status = $1 WHERE id = $2 AND status = $3`,
+        [ORDER_STATUS.CANCELLED, prev.id, prev.status]
+      );
+      await audit(tx, {
+        orgId, orderId: prev.id, action: 'CANCELLED', from: prev.status, to: ORDER_STATUS.CANCELLED,
+        detail: { reason: 'Replaced by a new renewal offer' }, actor,
+      });
+    }
+
+    const orderNo = await nextOrderNo(tx);
+    const { rows } = await tx.query(
+      `INSERT INTO payment_orders
+         (id, organization_id, order_no, client_id, plan_id, plan_name, duration_months,
+          base_amount, gst_percent, gst_amount, total_amount, upi_id, merchant_name,
+          status, expires_at, notes, created_by, kind)
+       VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+               NOW() + ($14 || ' days')::interval, $15, $16, $17)
+       RETURNING ${ORDER_COLUMNS.replace(/o\./g, '')}`,
+      [
+        randomUUID(), orgId, orderNo, member.id, name, months,
+        totals.base_amount, totals.gst_percent, totals.gst_amount, totals.total_amount,
+        settings.upi_id, settings.merchant_name, ORDER_STATUS.CREATED, String(days),
+        noteText, actor?.id || null, ORDER_KIND.RENEWAL,
+      ]
+    );
+    await audit(tx, {
+      orgId, orderId: rows[0].id, action: 'ORDER_CREATED', from: null, to: ORDER_STATUS.CREATED,
+      detail: { order_no: orderNo, kind: ORDER_KIND.RENEWAL, months, total_amount: totals.total_amount, valid_days: days },
+      actor,
+    });
+
+    await tx.query('COMMIT');
+    return {
+      order: rows[0],
+      member,
+      replaced: live.map((o) => o.id),
+      preview: computeMembershipWindow(member.pt_end_date, months),
+    };
+  } catch (err) {
+    await tx.query('ROLLBACK').catch(() => {});
+    if (err.code === '23505') {
+      throw new PaymentError('OFFER_CONFLICT', 'Another renewal offer was just sent to this client. Refresh and try again.', 409);
+    }
+    throw err;
+  } finally {
+    tx.release();
+  }
+}
+
+/**
+ * The client's live renewal offer (unpaid, or paid and awaiting
+ * verification), or null. Expired and cancelled offers are history.
+ */
+async function currentRenewalOffer(orgId, clientId, db = pool) {
+  const { rows } = await db.query(
+    `SELECT ${ORDER_COLUMNS} FROM payment_orders o
+      WHERE o.organization_id = $1 AND o.client_id = $2 AND o.kind = $3
+        AND o.status = ANY($4::text[]) AND (o.status = $5 OR o.expires_at > NOW())
+      ORDER BY o.created_at DESC
+      LIMIT 1`,
+    [orgId, clientId, ORDER_KIND.RENEWAL,
+     [...OPEN_ORDER_STATUSES, ORDER_STATUS.VERIFICATION_PENDING], ORDER_STATUS.VERIFICATION_PENDING]
+  );
+  return rows[0] || null;
+}
+
+/**
  * Everything the payment page needs, assembled from the stored order rather
  * than from anything the client sent: the intent URL, the per-app links and
  * the QR are all derived from the VPA and amount recorded at creation time.
@@ -716,7 +869,7 @@ async function approve({ orderId, orgId, actor }, db = pool) {
 
     // ── 3. Membership window ──
     const { rows: clientRows } = await tx.query(
-      `SELECT id, name, email, mobile, trainer_id, pt_end_date, organization_id
+      `SELECT id, name, email, mobile, trainer_id, trainer_name, package_type, pt_end_date, organization_id
          FROM pt_clients WHERE id = $1 FOR UPDATE`,
       [order.client_id]
     );
@@ -738,6 +891,47 @@ async function approve({ orderId, orgId, actor }, db = pool) {
                 updated_at     = NOW()
           WHERE id = $2`,
         [order.total_amount, member.id]
+      );
+    } else if (order.kind === ORDER_KIND.RENEWAL) {
+      // A new term, the way the trainer's Renew screen records one: the
+      // package fields describe the new term, and the term is fully paid by
+      // this payment. balance_amount is NOT touched — an older debt is still
+      // owed, and paying for next month does not settle it.
+      await tx.query(
+        `UPDATE pt_clients
+            SET package_type    = $1,
+                base_amount     = $2,
+                discount        = 0,
+                final_amount    = $2,
+                duration_months = $3,
+                pt_start_date   = $4,
+                pt_end_date     = $5,
+                paid_amount     = paid_amount + $6,
+                status          = 'active',
+                updated_at      = NOW()
+          WHERE id = $7`,
+        [order.plan_name, order.base_amount, order.duration_months,
+         window.activated_from, window.activated_to, order.total_amount, member.id]
+      );
+      // The two histories the client profile reads, written as the Renew
+      // screen writes them.
+      await tx.query(
+        `INSERT INTO pt_client_renewals
+           (client_id, client_name, trainer_name, old_package, new_package,
+            old_end_date, new_start_date, new_end_date, duration_months,
+            base_amount, discount, final_amount, paid_amount, balance_amount, notes, organization_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$10,$11,0,$12,$13)`,
+        [member.id, member.name, member.trainer_name, member.package_type, order.plan_name,
+         member.pt_end_date, window.activated_from, window.activated_to, order.duration_months,
+         order.base_amount, order.total_amount, `Paid online · ${order.order_no}`, orgId]
+      );
+      await tx.query(
+        `INSERT INTO pt_client_subscriptions
+           (client_id, plan_name, start_date, end_date, duration_months,
+            selling_price, amount_paid, balance_amount, trainer_name, status, source)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,0,$8,'active','upi_renewal')`,
+        [member.id, order.plan_name, window.activated_from, window.activated_to,
+         order.duration_months, order.base_amount, order.total_amount, member.trainer_name]
       );
     } else {
       await tx.query(
@@ -1051,6 +1245,7 @@ async function expireStaleOrders(db = pool) {
 module.exports = {
   ORDER_STATUS,
   ORDER_KIND,
+  RENEWAL_LIMITS,
   BALANCE_ORDER_NAME,
   SUBMISSION_STATUS,
   OPEN_ORDER_STATUSES,
@@ -1077,6 +1272,8 @@ module.exports = {
   nextOrderNo,
   createOrder,
   createBalanceOrder,
+  createRenewalOffer,
+  currentRenewalOffer,
   markIntentOpened,
   submitUtr,
   approve,
