@@ -25,10 +25,29 @@ function serve(handler) {
   });
 }
 
+// The failure path runs `docker compose logs` and the success path `docker
+// image prune`. On a CI runner that is the REAL docker, which can take several
+// seconds to answer — enough to push a failure-path test past Jest's default
+// 5s and fail CI on main, skipping a deploy. A stub `docker` first on PATH
+// keeps the test hermetic and fast; the calls are `|| true` in the script, so
+// what docker says never decides the outcome being tested.
+const FAKE_BIN = fs.mkdtempSync(path.join(os.tmpdir(), 'deployverify-bin-'));
+fs.writeFileSync(path.join(FAKE_BIN, 'docker'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+// The script itself is allowed 30s (execFile's timeout below); the test is
+// given the same, so a slow runner fails on the script's limit, not Jest's.
+jest.setTimeout(30000);
+
 function runScript(args, env = {}) {
   return new Promise((resolve) => {
     execFile('bash', [SCRIPT, ...args], {
-      env: { ...process.env, VERIFY_ATTEMPTS: '2', VERIFY_INTERVAL: '0', ...env },
+      env: {
+        ...process.env,
+        PATH: `${FAKE_BIN}${path.delimiter}${process.env.PATH}`,
+        VERIFY_ATTEMPTS: '2',
+        VERIFY_INTERVAL: '0',
+        ...env,
+      },
       timeout: 30000,
     }, (err, stdout, stderr) => {
       resolve({ code: err ? (err.code ?? 1) : 0, stdout: String(stdout), stderr: String(stderr) });
