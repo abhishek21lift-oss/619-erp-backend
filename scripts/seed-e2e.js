@@ -34,6 +34,7 @@ const FIXTURE = {
     secondClientMobile: '9000000011',
     amount: 11111,
     memberEmail: 'member-a@e2e.test',
+    upiId: 'alphastudio@okaxis',
     memberUserId: 'usr-e2e-alpha-member',
   },
   b: {
@@ -126,6 +127,17 @@ async function seedStudio(s, hash) {
      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, organization_id = EXCLUDED.organization_id`,
     [s.secondClientId, s.secondClientName, s.secondClientMobile, s.trainerId, s.amount, s.orgId]
   );
+
+  // Alpha takes UPI payments, so a trainer journey can send a renewal offer
+  // (an offer is a UPI order and needs a payee). Bravo is left unconfigured.
+  if (s.upiId) {
+    await pool.query(
+      `INSERT INTO payment_settings (organization_id, upi_id, merchant_name, gst_percent, is_enabled)
+       VALUES ($1, $2, $3, 0, TRUE)
+       ON CONFLICT (organization_id) DO UPDATE SET upi_id = EXCLUDED.upi_id, is_enabled = TRUE`,
+      [s.orgId, s.upiId, s.orgName]
+    );
+  }
 
   // Alpha's client can sign in to the member app. The member journeys
   // (e2e/member-*.ui.spec.ts in the frontend) act as this account; Bravo has
