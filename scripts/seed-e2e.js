@@ -33,6 +33,8 @@ const FIXTURE = {
     secondClientName: 'ALPHA-ONLY-CLIENT-TWO',
     secondClientMobile: '9000000011',
     amount: 11111,
+    memberEmail: 'member-a@e2e.test',
+    memberUserId: 'usr-e2e-alpha-member',
   },
   b: {
     orgId: ORG_B,
@@ -124,6 +126,20 @@ async function seedStudio(s, hash) {
      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, organization_id = EXCLUDED.organization_id`,
     [s.secondClientId, s.secondClientName, s.secondClientMobile, s.trainerId, s.amount, s.orgId]
   );
+
+  // Alpha's client can sign in to the member app. The member journeys
+  // (e2e/member-*.ui.spec.ts in the frontend) act as this account; Bravo has
+  // no member login, so nothing here widens what the isolation suite checks.
+  if (s.memberEmail) {
+    await pool.query(
+      `INSERT INTO users (id, name, email, password, role, is_active, organization_id,
+                          pt_client_id, token_version, failed_login_attempts, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'member', TRUE, $5, $6, 0, 0, NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET password = EXCLUDED.password, organization_id = EXCLUDED.organization_id,
+                                      pt_client_id = EXCLUDED.pt_client_id`,
+      [s.memberUserId, s.clientName, s.memberEmail, hash, s.orgId, s.clientId]
+    );
+  }
 
   await pool.query(
     `INSERT INTO pt_payments (id, client_id, trainer_id, amount, incentive_amt, payment_method,

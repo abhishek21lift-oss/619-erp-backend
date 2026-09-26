@@ -11,7 +11,7 @@
 // authorship, pricing) are never selected.
 
 const pool = require('../../db/pool');
-const { today } = require('../../lib/appTime');
+const { today, dbDate } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
 
 const MOODS = ['great', 'good', 'okay', 'tired', 'stressed'];
@@ -28,10 +28,14 @@ function mondayOf(ymd) {
   return d.toISOString().slice(0, 10);
 }
 
-/** Whole weeks since `start` (1-based), for picking a programme's current week. */
+/**
+ * Whole weeks since `start` (1-based), for picking a programme's current week.
+ * `startYmd` may be the Date node-postgres returns for a DATE column.
+ */
 function weekNumberSince(startYmd, nowYmd) {
-  if (!startYmd) return 1;
-  const start = new Date(`${String(startYmd).slice(0, 10)}T00:00:00Z`);
+  const startDay = dbDate(startYmd);
+  if (!startDay) return 1;
+  const start = new Date(`${startDay}T00:00:00Z`);
   const now = new Date(`${nowYmd}T00:00:00Z`);
   const days = Math.floor((now - start) / 86400000);
   return days < 0 ? 1 : Math.floor(days / 7) + 1;
@@ -244,7 +248,8 @@ async function upsertMyCheckin(clientId, orgId, userId, body) {
 const num = (v) => (v === null || v === undefined ? null : Number(v));
 
 /**
- * The sessions the trainer logged for this client — newest first, with each
+ * The client's logged sessions — by the trainer, or by the member in the
+ * guided workout (`source`) — newest first, with each
  * exercise and the sets actually done (load, reps, RPE, personal-best flags,
  * and time/distance for cardio work).
  *
@@ -257,7 +262,7 @@ const num = (v) => (v === null || v === undefined ? null : Number(v));
  */
 async function mySessions(clientId, orgId, { limit = 30 } = {}) {
   const { rows: sessions } = await pool.query(
-    `SELECT id, session_date, program_name, workout_day, duration_minutes, status
+    `SELECT id, session_date, program_name, workout_day, duration_minutes, status, source
        FROM workout_sessions
       WHERE client_id = $1 AND organization_id = $2
       ORDER BY session_date DESC, created_at DESC
@@ -308,6 +313,7 @@ async function mySessions(clientId, orgId, { limit = 30 } = {}) {
     workout_day: s.workout_day,
     duration_minutes: s.duration_minutes,
     status: s.status,
+    source: s.source,
     exercises: bySession.get(s.id) || [],
   }));
 }

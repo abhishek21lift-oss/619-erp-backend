@@ -152,11 +152,30 @@ async function existingByRequest(clientId, orgId, requestId) {
   return rows[0] ? summary(rows[0].id) : null;
 }
 
-/** Totals and new personal bests for one session, as the finish screen shows them. */
+/**
+ * Totals and personal bests for one session, as the finish screen shows them.
+ *
+ * A PR here is a record BROKEN: the set carries a PR flag AND the member had
+ * logged that exercise in an earlier session. The log flags a first-ever set
+ * as a PR (there was nothing to beat), and "2 personal bests!" for trying a
+ * new exercise would be noise — the same rule the monthly recap applies.
+ */
 async function summary(sessionId, db = pool) {
   const { rows } = await db.query(
-    `SELECT e.exercise_name, s.weight_kg, s.reps, s.is_pr_weight, s.is_pr_reps, s.is_pr_volume
+    `SELECT e.exercise_name, s.weight_kg, s.reps,
+            (s.is_pr_weight OR s.is_pr_reps OR s.is_pr_volume) AND EXISTS (
+              SELECT 1
+                FROM workout_session_exercises pe
+                JOIN workout_sessions pws ON pws.id = pe.session_id
+                JOIN workout_sets ps ON ps.session_exercise_id = pe.id AND ps.completed IS NOT FALSE
+               WHERE pws.client_id = ws.client_id AND pws.organization_id = ws.organization_id
+                 AND pws.id <> ws.id
+                 AND (pws.session_date, pws.created_at) < (ws.session_date, ws.created_at)
+                 AND lower(btrim(pe.exercise_name)) = lower(btrim(e.exercise_name))
+            ) AS broke_record,
+            s.is_pr_weight, s.is_pr_reps
        FROM workout_session_exercises e
+       JOIN workout_sessions ws ON ws.id = e.session_id
        JOIN workout_sets s ON s.session_exercise_id = e.id
       WHERE e.session_id = $1
       ORDER BY e.sort_order, s.set_number`,
@@ -166,7 +185,7 @@ async function summary(sessionId, db = pool) {
   let volume = 0;
   for (const r of rows) {
     if (r.weight_kg !== null && r.reps !== null) volume += Number(r.weight_kg) * r.reps;
-    if (r.is_pr_weight || r.is_pr_reps || r.is_pr_volume) {
+    if (r.broke_record) {
       prs.push({
         exercise: r.exercise_name,
         weight_kg: r.weight_kg === null ? null : Number(r.weight_kg),

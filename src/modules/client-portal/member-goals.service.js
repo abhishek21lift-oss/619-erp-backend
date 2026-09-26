@@ -20,7 +20,7 @@
 // session's, never the request's.
 
 const pool = require('../../db/pool');
-const { today } = require('../../lib/appTime');
+const { today, dbDate } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
 const { TRAINING_HAPPENED } = require('../pt-os/client-context');
 
@@ -33,7 +33,7 @@ const MAX_ACTIVE = 5;
 const DAY_MS = 86_400_000;
 const LIMITS = { weight: [25, 300], lift: [1, 500], sessions: [1, 1000] };
 
-const ymd = (v) => (v instanceof Date ? v.toISOString() : String(v)).slice(0, 10);
+const ymd = (v) => dbDate(v);
 const dayNumber = (v) => Math.floor(new Date(`${ymd(v)}T00:00:00Z`).getTime() / DAY_MS);
 const addDays = (v, n) => new Date(new Date(`${ymd(v)}T00:00:00Z`).getTime() + n * DAY_MS).toISOString().slice(0, 10);
 const round1 = (n) => Math.round(n * 10) / 10;

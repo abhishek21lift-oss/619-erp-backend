@@ -158,6 +158,21 @@ describeIf('member premium features against a real database', () => {
       expect(rows[0].n).toBe(1);
     });
 
+    it('does not call a first-ever exercise a personal best', async () => {
+      const res = await request(app).post('/api/me/workouts').send({
+        request_id: 'req-ffffffff-0009',
+        exercises: [{ name: 'Farmer carry', sets: [{ weight_kg: 30, reps: 20 }] }],
+      });
+      expect(res.status).toBe(201);
+      expect(res.body.data.prs).toEqual([]);
+      const { rows } = await pool.query(
+        `SELECT s.is_pr_weight FROM workout_sets s
+           JOIN workout_session_exercises e ON e.id = s.session_exercise_id
+          WHERE e.session_id = $1`, [res.body.data.session_id]);
+      // The log's own flag is unchanged — only the summary is stricter.
+      expect(rows[0].is_pr_weight).toBe(true);
+    });
+
     it('rejects a workout with no real sets, and bad numbers', async () => {
       expect((await request(app).post('/api/me/workouts')
         .send({ request_id: 'req-cccccccc-0003', exercises: [{ name: 'Row', sets: [{ reps: 0 }] }] })).status).toBe(400);
@@ -168,9 +183,8 @@ describeIf('member premium features against a real database', () => {
     });
 
     it('stops at the daily limit', async () => {
-      // Two logged above; two more reach the limit of four.
+      // Three logged above; one more reaches the limit of four.
       await request(app).post('/api/me/workouts').send(workout('req-dddddddd-0005'));
-      await request(app).post('/api/me/workouts').send(workout('req-dddddddd-0006'));
       const res = await request(app).post('/api/me/workouts').send(workout('req-dddddddd-0007'));
       expect(res.status).toBe(429);
     });
@@ -191,6 +205,38 @@ describeIf('member premium features against a real database', () => {
       expect(res.body.data['back squat'].sets.length).toBeGreaterThan(0);
       expect(res.body.data['back squat'].best_kg).toBe(70);
       expect(res.body.data.deadlift).toBeUndefined();
+    });
+  });
+
+  // ── The programme the guided workout starts from ──────────────────────────
+
+  describe('GET /api/me/workout', () => {
+    it('returns the programme\'s exercises when start_date comes back as a Date', async () => {
+      // node-postgres returns DATE columns as JS Dates. weekNumberSince read
+      // one as a string ("Mon Aug 03"), got NaN, and filtered out every
+      // exercise: every member with a plan saw an empty programme.
+      await pool.query(
+        `INSERT INTO exercises (id, name, muscle_group) VALUES ('mp-int-ex', 'MP Goblet Squat', 'Legs')
+         ON CONFLICT (id) DO NOTHING`);
+      await pool.query(
+        `INSERT INTO workout_plans (id, name, sessions_per_week, duration_weeks, organization_id)
+         VALUES ('mp-int-plan', 'Base', 3, 8, $1)`, [ORG]);
+      await pool.query(
+        `INSERT INTO workout_exercises (workout_plan_id, exercise_id, day_of_week, sets, reps)
+         VALUES ('mp-int-plan', 'mp-int-ex', 1, 3, 10)`);
+      await pool.query(
+        `INSERT INTO workout_assignments (workout_plan_id, client_id, start_date, status, organization_id)
+         VALUES ('mp-int-plan', $1, $2, 'active', $3)`, [CLIENT, ymd(-20), ORG]);
+
+      const res = await request(app).get('/api/me/workout');
+      expect(res.status).toBe(200);
+      const [plan] = res.body.data;
+      expect(plan.current_week).toBe(1);
+      expect(plan.days).toEqual([{ day_of_week: 1, exercises: [expect.objectContaining({ name: 'MP Goblet Squat', sets: 3, reps: 10 })] }]);
+
+      await pool.query(`DELETE FROM workout_assignments WHERE workout_plan_id = 'mp-int-plan'`);
+      await pool.query(`DELETE FROM workout_plans WHERE id = 'mp-int-plan'`);
+      await pool.query(`DELETE FROM exercises WHERE id = 'mp-int-ex'`);
     });
   });
 

@@ -24,7 +24,8 @@ jest.mock('../db/pool', () => ({
 }));
 
 // Wednesday 2026-09-23 → the week starts Monday 2026-09-21.
-jest.mock('../lib/appTime', () => ({ today: () => '2026-09-23' }));
+// Pin "today"; everything else (dbDate for DATE columns) is the real module.
+jest.mock('../lib/appTime', () => ({ ...jest.requireActual('../lib/appTime'), today: () => '2026-09-23' }));
 
 const express = require('express');
 const request = require('supertest');
@@ -149,6 +150,10 @@ describe('helpers', () => {
     expect(weekNumberSince('2026-09-21', '2026-09-27')).toBe(1);
     expect(weekNumberSince('2026-09-14', '2026-09-21')).toBe(2);
     expect(weekNumberSince('2026-10-01', '2026-09-21')).toBe(1);
+    // node-postgres hands a DATE column back as a Date, not a string. This was
+    // NaN, and a programme's every exercise was filtered out of the member app.
+    expect(weekNumberSince(new Date('2026-09-14T00:00:00Z'), '2026-09-21')).toBe(2);
+    expect(weekNumberSince(new Date(2026, 8, 14), '2026-09-21')).toBe(2);
   });
 
   describe('weekStreaks', () => {
