@@ -317,7 +317,9 @@ describe('change-password revokes other sessions but keeps the caller', () => {
     const res = await request(app()).put('/api/auth/change-password')
       .send({ currentPassword: 'WrongPassword!', newPassword: 'BrandNewPass1!' });
 
-    expect(res.status).toBe(401);
+    // 400, not 401: the caller is authenticated and only mistyped a field. A
+    // 401 made the frontend treat it as an expired session and sign them out.
+    expect(res.status).toBe(400);
     expect((await useRefresh(live)).status).toBe(200);
   });
 });

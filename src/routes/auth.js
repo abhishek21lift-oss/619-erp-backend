@@ -657,7 +657,15 @@ async function changePasswordHandler(req, res) {
     if (!rows[0]) return res.status(404).json({ error: 'User not found' });
 
     const valid = await bcrypt.compare(currentPassword, rows[0].password);
-    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
+    // 400, not 401. The caller IS authenticated — they mistyped a form field.
+    // A 401 here made the frontend's session layer refresh the token, retry,
+    // get 401 again and sign the user out: one typo on "current password"
+    // ended the session of the person trying to secure it.
+    if (!valid) {
+      return res.status(400).json({
+        error: { code: 'WRONG_CURRENT_PASSWORD', message: 'Current password is incorrect' },
+      });
+    }
 
     const hashed = await bcrypt.hash(newPassword, 12);
     // AUD-005, the change-password half. Same revocation as reset-password, but
