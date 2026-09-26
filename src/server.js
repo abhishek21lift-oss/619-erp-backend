@@ -945,6 +945,11 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 // request.
 app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-portal.routes'));
 
+// The studio's side of member ↔ studio messaging. The member's side is
+// /api/me/messages above; this one takes a client id, so it is trainer-only and
+// every id is checked against the caller's studio before use.
+app.use('/api/messages',         auth, requireTrainer, require('./modules/client-messages/client-messages.routes'));
+
 // Trainer-side control of client logins. Staff only, org-scoped.
 app.use('/api/client-login',     auth, requireTrainer, require('./routes/client-login'));
 

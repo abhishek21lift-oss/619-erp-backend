@@ -304,6 +304,8 @@ const DOMAINS = {
     tables: [
       'campaigns', 'offers', 'feedback', 'communication_history', 'communication_logs',
       'automation_rules', 'notifications', 'notification_log', 'churn_risk_log',
+      // Member ↔ studio conversation, one thread per client (migration 211).
+      'client_messages',
     ],
   },
 
