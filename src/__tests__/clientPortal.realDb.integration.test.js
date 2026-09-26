@@ -245,6 +245,18 @@ describeIf('/api/me against a real database', () => {
     expect((await request().get('/api/me/forms/consent/not-mine/pdf')).status).toBe(404);
   });
 
+  test('achievements count what was logged: records, PRs, volume and streaks', async () => {
+    const res = await request().get('/api/me/achievements');
+    expect(res.status).toBe(200);
+    const a = res.body.data;
+    expect(a.totals).toMatchObject({ sessions: 1, sets: 2, volume_kg: 60 * 8 + 65 * 6, prs: 1 });
+    expect(a.training).toMatchObject({ current: 1, this_week: true });
+    expect(a.checkins.this_week).toBe(true); // the check-in sent earlier in this suite
+    expect(a.records).toEqual([expect.objectContaining({ exercise: 'Back squat', weight_kg: 65, reps: 6 })]);
+    expect(a.recent_prs).toEqual([expect.objectContaining({ exercise: 'Back squat', weight_kg: 65, kind: 'weight' })]);
+    expect(JSON.stringify(res.body)).not.toContain('INTERNAL');
+  });
+
   test('measurements carry body measurements as well as weight', async () => {
     const res = await request().get('/api/me/measurements');
     const m = res.body.data.find((x) => x.source === 'trainer');

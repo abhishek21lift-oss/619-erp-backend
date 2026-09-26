@@ -28,7 +28,7 @@ jest.mock('../lib/appTime', () => ({ today: () => '2026-09-23' }));
 
 const express = require('express');
 const request = require('supertest');
-const { mondayOf, weekNumberSince, normaliseCheckin } = require('../modules/client-portal/client-portal.service');
+const { mondayOf, weekNumberSince, normaliseCheckin, weekStreaks } = require('../modules/client-portal/client-portal.service');
 
 const app = express();
 app.use(express.json());
@@ -149,6 +149,34 @@ describe('helpers', () => {
     expect(weekNumberSince('2026-09-21', '2026-09-27')).toBe(1);
     expect(weekNumberSince('2026-09-14', '2026-09-21')).toBe(2);
     expect(weekNumberSince('2026-10-01', '2026-09-21')).toBe(1);
+  });
+
+  describe('weekStreaks', () => {
+    const NOW = '2026-09-24'; // a Thursday; this week starts 2026-09-21
+
+    it('counts back from this week when this week is active', () => {
+      expect(weekStreaks(['2026-09-21', '2026-09-14', '2026-09-07'], NOW))
+        .toEqual({ current: 3, longest: 3, this_week: true });
+    });
+
+    it('keeps the streak alive through a week that has not happened yet', () => {
+      expect(weekStreaks(['2026-09-14', '2026-09-07'], NOW))
+        .toEqual({ current: 2, longest: 2, this_week: false });
+    });
+
+    it('breaks once a whole week is missed, but remembers the longest run', () => {
+      expect(weekStreaks(['2026-08-31', '2026-08-24', '2026-08-17', '2026-08-10'], NOW))
+        .toEqual({ current: 0, longest: 4, this_week: false });
+    });
+
+    it('is all zeros with nothing logged', () => {
+      expect(weekStreaks([], NOW)).toEqual({ current: 0, longest: 0, this_week: false });
+    });
+
+    it('runs across a year boundary', () => {
+      expect(weekStreaks(['2025-12-22', '2025-12-29', '2026-01-05'], '2026-01-07'))
+        .toEqual({ current: 3, longest: 3, this_week: true });
+    });
   });
 
   it('trims notes and keeps only member-writable fields', () => {
