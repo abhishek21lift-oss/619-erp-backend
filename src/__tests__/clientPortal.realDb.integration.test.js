@@ -257,6 +257,51 @@ describeIf('/api/me against a real database', () => {
     expect(JSON.stringify(res.body)).not.toContain('INTERNAL');
   });
 
+  describe('progress photos', () => {
+    const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64)]);
+
+    afterAll(async () => {
+      await pool.query(`DELETE FROM progress_photos WHERE client_id = ANY($1)`, [[CLIENT, CLIENT_2]]);
+    });
+
+    test('a member uploads a photo, sees it, and deletes it — file and all', async () => {
+      const up = await request().post('/api/me/progress-photos')
+        .field('photo_type', 'side').attach('photo', PNG, { filename: 'me.png', contentType: 'image/png' });
+      expect({ status: up.status, error: up.body.error }).toEqual({ status: 201, error: undefined });
+      expect(up.body.data).toMatchObject({ photo_type: 'side', by_me: true });
+      expect(up.body.data.photo_url).toBe(`/uploads/progress-photos/${up.body.data.id}.png`);
+
+      const list = await request().get('/api/me/progress-photos');
+      expect(list.body.data.map((p) => p.id)).toContain(up.body.data.id);
+
+      const del = await request().delete(`/api/me/progress-photos/${up.body.data.id}`);
+      expect(del.status).toBe(204);
+      expect((await request().get('/api/me/progress-photos')).body.data.map((p) => p.id)).not.toContain(up.body.data.id);
+    });
+
+    test('a file that is not an image is refused, whatever its header says', async () => {
+      const res = await request().post('/api/me/progress-photos')
+        .field('photo_type', 'front').attach('photo', Buffer.from('not an image at all'), { filename: 'x.png', contentType: 'image/png' });
+      expect(res.status).toBe(400);
+    });
+
+    test('a member cannot delete a photo the trainer took, or another client\'s', async () => {
+      await pool.query(
+        `INSERT INTO progress_photos (id, client_id, photo_url, photo_type, uploaded_by, organization_id)
+         VALUES ('me-int-photo-trainer', $1, 'data:image/png;base64,AAAA', 'front', $2, $3),
+                ('me-int-photo-other', $4, 'data:image/png;base64,AAAA', 'front', NULL, $3)
+         ON CONFLICT (id) DO NOTHING`, [CLIENT, TRAINER_USER, ORG, CLIENT_2]);
+      expect((await request().delete('/api/me/progress-photos/me-int-photo-trainer')).status).toBe(404);
+      expect((await request().delete('/api/me/progress-photos/me-int-photo-other')).status).toBe(404);
+
+      const list = await request().get('/api/me/progress-photos');
+      const ids = list.body.data.map((p) => p.id);
+      expect(ids).toContain('me-int-photo-trainer');   // theirs to see
+      expect(ids).not.toContain('me-int-photo-other'); // not theirs at all
+      expect(list.body.data.find((p) => p.id === 'me-int-photo-trainer').by_me).toBe(false);
+    });
+  });
+
   test('measurements carry body measurements as well as weight', async () => {
     const res = await request().get('/api/me/measurements');
     const m = res.body.data.find((x) => x.source === 'trainer');

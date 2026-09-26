@@ -22,7 +22,11 @@ const router = require('express').Router();
 const pool = require('../../db/pool');
 const portal = require('./client-portal.service');
 const messages = require('../client-messages/client-messages.service');
-const { serveFile } = require('../../lib/fileStorage');
+const { randomUUID } = require('crypto');
+const multer = require('multer');
+const { serveFile, saveFile, deleteFile } = require('../../lib/fileStorage');
+const { detectFileType, LOGO_IMAGES } = require('../../lib/fileSignatures');
+const logger = require('../../lib/logger');
 
 /** Wrap an async handler so a rejection reaches the error middleware. */
 const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
@@ -280,6 +284,72 @@ router.post('/messages', wrap(async (req, res) => {
     }
     throw err;
   }
+}));
+
+// ── Progress photos ──────────────────────────────────────────────────────────
+//
+// A member's own photos: GET lists them (the trainer's and their own), POST
+// adds one from their phone, DELETE removes one they uploaded themselves.
+//
+// Uploads are files, not data URLs in a JSON body: multipart, 8 MB at most
+// (the app downscales to well under 1 MB first), and the BYTES decide the
+// type — the Content-Type header is the caller's to forge. Stored as
+// progress-photos/<row id>.<ext>, which is exactly the shape /uploads resolves
+// to the owning row, so only this member and their studio can read it back.
+const photoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024, files: 1 },
+  fileFilter(_req, file, cb) {
+    if (!/^image\/(png|jpe?g|webp)$/i.test(file.mimetype || '')) {
+      return cb(new portal.PortalInputError('Use a JPG, PNG or WebP photo.'));
+    }
+    cb(null, true);
+  },
+});
+
+router.get('/progress-photos', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await portal.myPhotos(clientId, orgId, req.user.id) });
+}));
+
+router.post('/progress-photos', (req, res, next) => {
+  photoUpload.single('photo')(req, res, (err) => {
+    if (!err) return next();
+    const message = err.code === 'LIMIT_FILE_SIZE' ? 'That photo is too large (8 MB at most).' : err.message;
+    res.status(400).json({ error: { code: 'UPLOAD_REJECTED', message } });
+  });
+}, wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    if (!req.file) throw new portal.PortalInputError('Choose a photo to upload.');
+    const meta = portal.normalisePhotoMeta(req.body);
+    const detected = detectFileType(req.file.buffer, LOGO_IMAGES);
+    if (!detected) throw new portal.PortalInputError('That file is not a JPG, PNG or WebP photo.');
+    if (await portal.photoUploadsToday(clientId, orgId, req.user.id) >= portal.PHOTO_DAILY_LIMIT) {
+      return res.status(429).json({ error: { code: 'RATE_LIMITED', message: 'That is plenty of photos for today — try again tomorrow.' } });
+    }
+    const id = randomUUID();
+    const url = await saveFile('progress-photos', `${id}.${detected.ext}`, req.file.buffer, detected.mime,
+      { organizationId: orgId, uploadedBy: req.user.id });
+    res.status(201).json({ data: await portal.insertMyPhoto(clientId, orgId, req.user.id, { id, ...meta, url }) });
+  } catch (err) {
+    if (err instanceof portal.PortalInputError) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
+    }
+    throw err;
+  }
+}));
+
+router.delete('/progress-photos/:id', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  const url = await portal.deleteMyPhoto(clientId, orgId, req.user.id, req.params.id);
+  if (url === null) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Photo not found.' } });
+  // The row is gone either way; a file left behind is tidied, not surfaced.
+  if (url.startsWith('/uploads/progress-photos/')) {
+    deleteFile(url.slice('/uploads/'.length)).catch((err) =>
+      logger.warn({ err: err.message, url }, 'client-portal: progress photo file delete failed'));
+  }
+  res.status(204).end();
 }));
 
 // GET /api/me/achievements — records and streaks, counted from what was logged
