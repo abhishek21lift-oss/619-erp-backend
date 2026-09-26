@@ -12,6 +12,7 @@
 
 const pool = require('../../db/pool');
 const { today } = require('../../lib/appTime');
+const logger = require('../../lib/logger');
 
 const MOODS = ['great', 'good', 'okay', 'tired', 'stressed'];
 
@@ -512,8 +513,101 @@ async function myAchievements(clientId, orgId) {
   };
 }
 
+// ── Progress photos ─────────────────────────────────────────────────────────
+//
+// The member's own photos, whoever took them: the trainer at the studio (the
+// existing /pt-os/progress-photos page, which stores a data URL) or the member
+// from their phone (a file in storage, see the route). Only photos the member
+// uploaded themselves can be deleted by them — a trainer's record of their
+// starting point is not the member's to erase.
+
+const PHOTO_TYPES = ['front', 'side', 'back', 'flexed', 'full_body', 'other'];
+/** Uploads a member may make in 24 hours: a full set every day is 3; this is a wall for scripts. */
+const PHOTO_DAILY_LIMIT = 12;
+
+async function myPhotos(clientId, orgId, userId) {
+  const { rows } = await pool.query(
+    `SELECT id, photo_type, taken_at, notes, photo_url, created_at,
+            (uploaded_by IS NOT NULL AND uploaded_by = $3) AS by_me
+       FROM progress_photos
+      WHERE client_id = $1 AND organization_id = $2
+      ORDER BY taken_at DESC, created_at DESC
+      LIMIT 120`,
+    [clientId, orgId, userId],
+  );
+  return rows;
+}
+
+function normalisePhotoMeta(body = {}) {
+  const type = String(body.photo_type || 'front');
+  if (!PHOTO_TYPES.includes(type)) throw new PortalInputError('Choose front, side, back, flexed, full body or other.');
+  let takenAt = today();
+  if (body.taken_at) {
+    const d = String(body.taken_at).slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || Number.isNaN(Date.parse(d)) || d > today()) {
+      throw new PortalInputError('The date must be today or earlier.');
+    }
+    takenAt = d;
+  }
+  return { photoType: type, takenAt };
+}
+
+async function photoUploadsToday(clientId, orgId, userId) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM progress_photos
+      WHERE client_id = $1 AND organization_id = $2 AND uploaded_by = $3
+        AND created_at > NOW() - INTERVAL '24 hours'`,
+    [clientId, orgId, userId],
+  );
+  return rows[0].n;
+}
+
+async function insertMyPhoto(clientId, orgId, userId, { id, photoType, takenAt, url }) {
+  const { rows } = await pool.query(
+    `INSERT INTO progress_photos (id, client_id, photo_url, photo_type, taken_at, uploaded_by, organization_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING id, photo_type, taken_at, notes, photo_url, created_at, TRUE AS by_me`,
+    [id, clientId, url, photoType, takenAt, userId, orgId],
+  );
+
+  // Tell the trainer, once per day's batch rather than once per photo.
+  try {
+    await pool.query(
+      `INSERT INTO notifications (user_id, type, title, body, link)
+       SELECT u.id, 'progress_photo', c.name || ' added progress photos',
+              'New photos are in their progress timeline.',
+              '/pt-os/progress-photos?client_id=' || c.id
+         FROM pt_clients c
+         JOIN users u ON u.organization_id = c.organization_id AND u.role = 'trainer'
+                     AND u.is_active = TRUE AND u.deleted_at IS NULL
+        WHERE c.id = $1 AND c.organization_id = $2
+          AND NOT EXISTS (
+            SELECT 1 FROM notifications n
+             WHERE n.user_id = u.id AND n.type = 'progress_photo' AND n.is_read = FALSE
+               AND n.link = '/pt-os/progress-photos?client_id=' || c.id)`,
+      [clientId, orgId],
+    );
+  } catch (err) {
+    // A missed notification must never lose the photo.
+    logger.warn({ err: err.message, clientId }, 'client-portal: progress photo notification failed');
+  }
+  return rows[0];
+}
+
+/** Deletes one of the member's OWN uploads; returns its storage URL, or null if none matched. */
+async function deleteMyPhoto(clientId, orgId, userId, photoId) {
+  const { rows } = await pool.query(
+    `DELETE FROM progress_photos
+      WHERE id = $1 AND client_id = $2 AND organization_id = $3 AND uploaded_by = $4
+      RETURNING photo_url`,
+    [String(photoId), clientId, orgId, userId],
+  );
+  return rows[0] ? rows[0].photo_url : null;
+}
+
 module.exports = {
   myAchievements, weekStreaks,
+  myPhotos, normalisePhotoMeta, photoUploadsToday, insertMyPhoto, deleteMyPhoto, PHOTO_TYPES, PHOTO_DAILY_LIMIT,
   updateMyContact, normaliseContact, myForms, myConsentPdfKey,
   myWorkout, myDiet, myCheckins, upsertMyCheckin, mySessions,
   normaliseCheckin, mondayOf, weekNumberSince, PortalInputError, MOODS,

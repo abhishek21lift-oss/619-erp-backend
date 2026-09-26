@@ -48,6 +48,7 @@ describe('a member', () => {
   test.each([
     ['parq', `parq/pdf/${REC}.pdf`],
     ['informed-consent', `informed-consent/pdf/${REC}.pdf`],
+    ['progress-photos', `progress-photos/${REC}.jpg`],
   ])('reads their own %s', async (_c, key) => {
     mockRow = { organization_id: ORG, owner_client: 'client-me' };
     const res = await request(app()).get(`/uploads/${key}`);
@@ -60,6 +61,7 @@ describe('a member', () => {
     ['informed-consent', `informed-consent/pdf/${REC}.pdf`],
     ['upi-proof', `upi-proof/${REC}-abc.png`],
     ['progress-reports', `progress-reports/${REC}-2026-09-01.pdf`],
+    ['progress-photos', `progress-photos/${REC}.jpg`],
   ])('cannot read another client\'s %s in the same studio', async (_c, key) => {
     mockRow = { organization_id: ORG, owner_client: 'client-someone-else' };
     const res = await request(app()).get(`/uploads/${key}`);

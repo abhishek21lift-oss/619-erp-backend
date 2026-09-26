@@ -39,6 +39,8 @@ const OWNED_CATEGORIES = {
   'parq': 'pt_parq_forms',
   'informed-consent': 'pt_informed_consents',
   'knowledge': 'ai_documents',
+  // Photos a member uploads from the member app: progress-photos/<row id>.<ext>.
+  'progress-photos': 'progress_photos',
 };
 
 // Payment proofs are keyed differently: routes/upi-payments.js writes
@@ -116,6 +118,7 @@ const MEMBER_OWNER_COLUMN = {
   pt_informed_consents: 'client_id',
   payment_orders: 'client_id',
   pt_clients: 'id',
+  progress_photos: 'client_id',
 };
 
 async function callerOwnsRecord(req, category, key) {
