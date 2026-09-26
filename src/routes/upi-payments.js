@@ -119,6 +119,21 @@ const schemas = {
       notes: safeText(500),
     }),
   },
+  // A trainer's renewal offer to one client. Bounds are re-checked in
+  // upi.createRenewalOffer (RENEWAL_LIMITS), which is the authority.
+  renewalOffer: {
+    body: z.object({
+      client_id: z.string().min(1).max(64),
+      duration_months: z.coerce.number().int().min(1).max(24),
+      amount: strictNumber({ label: 'amount', min: 1, max: 1_000_000 }),
+      package_name: safeText(120),
+      note: safeText(500),
+      valid_days: z.coerce.number().int().min(1).max(30).optional().nullable(),
+    }),
+  },
+  renewalOfferQuery: {
+    query: z.object({ client_id: z.string().min(1).max(64) }),
+  },
   submitUtr: {
     params: z.object({ id: uuidSchema }),
     body: z.object({
@@ -446,6 +461,52 @@ router.post('/balance', auth, wrap(async (req, res) => {
     res.status(reused ? 200 : 201).json({
       data: { order: { ...order, client_name: member.name }, payment: view, reused },
     });
+  } catch (err) {
+    sendPaymentError(res, err);
+  }
+}));
+
+// ════════════════════════════════════════════════════════════════════════════
+//  RENEWAL OFFERS — the trainer offers a client their next term
+// ════════════════════════════════════════════════════════════════════════════
+
+// POST /api/payments/upi/renewal-offers — send (or replace) a client's offer.
+// The member is told in the app; they pay it from /member/renew.
+router.post('/renewal-offers', auth, requireTrainer, validate(schemas.renewalOffer), wrap(async (req, res) => {
+  try {
+    const orgId = requireOrg(req);
+    const b = req.body;
+    const { order, member, replaced, preview } = await upi.createRenewalOffer({
+      orgId, clientId: b.client_id, durationMonths: b.duration_months, amount: b.amount,
+      packageName: b.package_name, note: b.note, validDays: b.valid_days, actor: actorOf(req),
+    });
+
+    const memberUserId = await userIdForClient(member.id);
+    await notify(
+      memberUserId, 'renewal_offer', 'Your renewal is ready',
+      `${order.plan_name}: ${order.duration_months} month${order.duration_months === 1 ? '' : 's'} for Rs. ${order.total_amount}. Tap to renew.`,
+      '/member/renew'
+    );
+    await logActivity(req, 'upi_payment.renewal_offer', 'payment_orders', order.id, {
+      order_no: order.order_no, client_id: member.id, months: order.duration_months,
+      amount: order.total_amount, replaced,
+    });
+
+    res.status(201).json({
+      data: { order: { ...order, client_name: member.name }, preview, member_can_see: Boolean(memberUserId) },
+    });
+  } catch (err) {
+    sendPaymentError(res, err);
+  }
+}));
+
+// GET /api/payments/upi/renewal-offers?client_id= — the client's live offer.
+router.get('/renewal-offers', auth, requireTrainer, validate(schemas.renewalOfferQuery), wrap(async (req, res) => {
+  try {
+    const orgId = requireOrg(req);
+    const member = await resolveTargetClient(req, req.query.client_id, orgId);
+    const order = await upi.currentRenewalOffer(orgId, member.id);
+    res.json({ data: { order } });
   } catch (err) {
     sendPaymentError(res, err);
   }
@@ -833,7 +894,9 @@ router.post('/:id/approve', auth, requireTrainer, validate(schemas.idParam), wra
       memberUserId, 'payment', 'Payment approved',
       result.order.kind === upi.ORDER_KIND.BALANCE
         ? `Your payment of Rs. ${result.order.total_amount} towards your balance has been received.`
-        : `Your ${result.order.plan_name} membership is active until ${result.activation.activated_to}.`,
+        : result.order.kind === upi.ORDER_KIND.RENEWAL
+          ? `Renewed: ${result.order.plan_name}, active until ${result.activation.activated_to}.`
+          : `Your ${result.order.plan_name} membership is active until ${result.activation.activated_to}.`,
       `/member/pay/${result.order.id}`
     );
 
