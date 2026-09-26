@@ -390,7 +390,130 @@ async function myConsentPdfKey(clientId, orgId, consentId) {
   return rows[0] ? `informed-consent/pdf/${rows[0].id}.pdf` : null;
 }
 
+// ── Records and streaks ─────────────────────────────────────────────────────
+//
+// Everything here is counted from what was actually logged: the sessions the
+// trainer recorded, the member's studio visits and their weekly check-ins.
+// Nothing is estimated. A session counts as trained when it has at least one
+// set logged, whatever its status — most sessions are never formally closed.
+
+/** 'YYYY-MM-DD' of the Monday `n` weeks before `ymd`'s Monday. */
+function weeksBefore(ymd, n) {
+  const d = new Date(`${mondayOf(ymd)}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - 7 * n);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Consecutive active weeks. The current streak is still alive while this week
+ * is empty (it only breaks once a whole week passes with nothing), so it is
+ * counted back from this week if it is active, otherwise from last week.
+ */
+function weekStreaks(weeks, nowYmd) {
+  const set = new Set(weeks);
+  const thisWeek = mondayOf(nowYmd);
+  let current = 0;
+  const start = set.has(thisWeek) ? 0 : 1;
+  while (set.has(weeksBefore(thisWeek, start + current))) current += 1;
+
+  let longest = 0;
+  let run = 0;
+  let prev = null;
+  for (const w of [...set].sort()) {
+    run = prev && weeksBefore(w, 1) === prev ? run + 1 : 1;
+    longest = Math.max(longest, run);
+    prev = w;
+  }
+  return { current, longest: Math.max(longest, current), this_week: set.has(thisWeek) };
+}
+
+async function myAchievements(clientId, orgId) {
+  const [weeks, checkinWeeks, totals, records, recent] = await Promise.all([
+    pool.query(
+      `SELECT DISTINCT to_char(date_trunc('week', d)::date, 'YYYY-MM-DD') AS wk
+         FROM (
+           SELECT ws.session_date AS d
+             FROM workout_sessions ws
+            WHERE ws.client_id = $1 AND ws.organization_id = $2
+              AND EXISTS (SELECT 1 FROM workout_session_exercises e
+                            JOIN workout_sets s ON s.session_exercise_id = e.id
+                           WHERE e.session_id = ws.id)
+           UNION ALL
+           SELECT a.date FROM attendance_logs a
+            WHERE a.ref_id = $1 AND a.ref_type = 'client' AND a.organization_id = $2
+         ) x
+        WHERE d IS NOT NULL`,
+      [clientId, orgId],
+    ),
+    pool.query(
+      `SELECT DISTINCT to_char(week_start_date, 'YYYY-MM-DD') AS wk
+         FROM weekly_checkins WHERE client_id = $1 AND organization_id = $2`,
+      [clientId, orgId],
+    ),
+    pool.query(
+      `SELECT COUNT(DISTINCT ws.id)::int AS sessions,
+              COUNT(s.id) FILTER (WHERE s.completed IS NOT FALSE)::int AS sets,
+              COALESCE(SUM(s.weight_kg * s.reps) FILTER (WHERE s.completed IS NOT FALSE), 0)::float AS volume_kg,
+              COUNT(s.id) FILTER (WHERE s.is_pr_weight OR s.is_pr_reps OR s.is_pr_volume)::int AS prs,
+              MIN(ws.session_date) AS first_session,
+              (SELECT COUNT(*)::int FROM attendance_logs a
+                WHERE a.ref_id = $1 AND a.ref_type = 'client' AND a.organization_id = $2) AS visits
+         FROM workout_sessions ws
+         JOIN workout_session_exercises e ON e.session_id = ws.id
+         JOIN workout_sets s ON s.session_exercise_id = e.id
+        WHERE ws.client_id = $1 AND ws.organization_id = $2`,
+      [clientId, orgId],
+    ),
+    // Heaviest completed set per exercise; ties go to more reps, then the
+    // earlier date (the day it was first lifted).
+    pool.query(
+      `SELECT DISTINCT ON (lower(btrim(e.exercise_name)))
+              e.exercise_name AS exercise, s.weight_kg, s.reps, ws.session_date AS date
+         FROM workout_sets s
+         JOIN workout_session_exercises e ON e.id = s.session_exercise_id
+         JOIN workout_sessions ws ON ws.id = e.session_id
+        WHERE ws.client_id = $1 AND ws.organization_id = $2
+          AND s.weight_kg > 0 AND s.completed IS NOT FALSE AND e.exercise_name IS NOT NULL
+        ORDER BY lower(btrim(e.exercise_name)), s.weight_kg DESC, s.reps DESC NULLS LAST, ws.session_date ASC`,
+      [clientId, orgId],
+    ),
+    pool.query(
+      `SELECT e.exercise_name AS exercise, s.weight_kg, s.reps, ws.session_date AS date,
+              CASE WHEN s.is_pr_weight THEN 'weight' WHEN s.is_pr_reps THEN 'reps' ELSE 'volume' END AS kind
+         FROM workout_sets s
+         JOIN workout_session_exercises e ON e.id = s.session_exercise_id
+         JOIN workout_sessions ws ON ws.id = e.session_id
+        WHERE ws.client_id = $1 AND ws.organization_id = $2
+          AND (s.is_pr_weight OR s.is_pr_reps OR s.is_pr_volume)
+        ORDER BY ws.session_date DESC, s.created_at DESC
+        LIMIT 6`,
+      [clientId, orgId],
+    ),
+  ]);
+
+  const now = today();
+  const t = totals.rows[0] || {};
+  const byDate = (a, b) => String(b.date).localeCompare(String(a.date));
+  const lift = (r) => ({ exercise: r.exercise, weight_kg: num(r.weight_kg), reps: r.reps, date: r.date });
+
+  return {
+    training: weekStreaks(weeks.rows.map((r) => r.wk), now),
+    checkins: weekStreaks(checkinWeeks.rows.map((r) => r.wk), now),
+    totals: {
+      sessions: t.sessions || 0,
+      sets: t.sets || 0,
+      volume_kg: Math.round(Number(t.volume_kg) || 0),
+      prs: t.prs || 0,
+      visits: t.visits || 0,
+      first_session: t.first_session || null,
+    },
+    records: records.rows.map(lift).sort(byDate).slice(0, 20),
+    recent_prs: recent.rows.map((r) => ({ ...lift(r), kind: r.kind })),
+  };
+}
+
 module.exports = {
+  myAchievements, weekStreaks,
   updateMyContact, normaliseContact, myForms, myConsentPdfKey,
   myWorkout, myDiet, myCheckins, upsertMyCheckin, mySessions,
   normaliseCheckin, mondayOf, weekNumberSince, PortalInputError, MOODS,

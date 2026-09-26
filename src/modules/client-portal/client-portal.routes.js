@@ -254,6 +254,12 @@ router.get('/forms/consent/:id/pdf', wrap(async (req, res) => {
   await serveFile(key, res, {});
 }));
 
+// GET /api/me/achievements — records and streaks, counted from what was logged
+router.get('/achievements', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await portal.myAchievements(clientId, orgId) });
+}));
+
 // GET /api/me/sessions — the sessions the trainer logged, with what was lifted
 router.get('/sessions', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
