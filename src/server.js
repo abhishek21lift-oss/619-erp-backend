@@ -1219,6 +1219,20 @@ runMigrationsWithRetry()
       logger.info({ interval: '15min' }, 'UPI expiry sweeps scheduled');
     }
 
+    // Trainer-logged sessions left open after the day they happened: a log
+    // with sets marked done is completed, so programme progress and adherence
+    // count the workout. Empty logs are left alone. Idempotent, so a plain
+    // interval is safe. Disable with WORKOUT_SESSION_SWEEP=off.
+    if (process.env.WORKOUT_SESSION_SWEEP !== 'off') {
+      const { closeStaleSessions } = require('./modules/pt-os/workout-log.service');
+      const sweep = () => closeStaleSessions()
+        .then((n) => { if (n) logger.info({ closed: n }, 'Stale workout sessions completed'); })
+        .catch((err) => logger.warn({ err: err.message }, 'Workout session sweep failed'));
+      setTimeout(sweep, 2 * 60 * 1000).unref();
+      setInterval(sweep, 60 * 60 * 1000).unref();
+      logger.info({ interval: '1h' }, 'Workout session sweep scheduled');
+    }
+
     // Command Center log persistence (D4). The ring buffer needs no scheduling
     // — it is filled synchronously by the logger — but the critical lines it
     // queues are written in batches, and the table needs a retention sweep or

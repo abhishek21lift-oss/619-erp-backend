@@ -14,6 +14,8 @@
 // Pure functions, no database: the SQL that fetches rows lives with the routes,
 // and everything here is arithmetic that can be tested directly.
 
+const { dbDate } = require('../../lib/appTime');
+
 /** Weeks a plan may run for. Guards against a bad duration turning into a loop. */
 const MAX_WEEKS = 104;
 
@@ -27,12 +29,30 @@ const MAX_WEEKS = 104;
  * @returns {number} 1-based week, clamped to [1, MAX_WEEKS]
  */
 function weekOf(startDate, onDate) {
-  const start = new Date(`${String(startDate).slice(0, 10)}T00:00:00Z`);
-  const on = new Date(`${String(onDate).slice(0, 10)}T00:00:00Z`);
+  // Either side may be the Date node-postgres returns for a DATE column.
+  // String() of that is "Mon Aug 24 …", which is no date at all — every
+  // session the trainer logged was resolved as week 1, so a progression rule
+  // never reached the gym floor.
+  const start = new Date(`${dbDate(startDate)}T00:00:00Z`);
+  const on = new Date(`${dbDate(onDate)}T00:00:00Z`);
   if (Number.isNaN(start.getTime()) || Number.isNaN(on.getTime())) return 1;
   const days = Math.floor((on - start) / 86400000);
   if (days < 0) return 1;
   return Math.min(MAX_WEEKS, Math.floor(days / 7) + 1);
+}
+
+/**
+ * The programme week a date falls in, held at the plan's last week.
+ *
+ * A client still training after a twelve-week block ends is repeating week
+ * 12, not starting a week 13 that the rule would keep loading forever. Both
+ * the trainer's session and the member app ask this, so they are handed the
+ * same week.
+ */
+function programmeWeek(startDate, onDate, durationWeeks) {
+  const week = weekOf(startDate, onDate);
+  const last = Math.floor(Number(durationWeeks));
+  return Number.isFinite(last) && last >= 1 ? Math.min(week, last) : week;
 }
 
 /**
@@ -199,5 +219,5 @@ function counterpartOf(rows, exercise) {
 }
 
 module.exports = {
-  weekOf, stepsFor, applyProgression, resolveWeek, anchorWeekFor, previewWeeks, MAX_WEEKS,
+  weekOf, programmeWeek, stepsFor, applyProgression, resolveWeek, anchorWeekFor, previewWeeks, MAX_WEEKS,
 };

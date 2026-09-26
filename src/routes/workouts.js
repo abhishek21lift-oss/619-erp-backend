@@ -8,6 +8,7 @@ const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
 const { markAccepted, acceptGeneration } = require('../modules/pt-os/programming-memory');
 const logger = require('../lib/logger');
+const { today: studioToday } = require('../lib/appTime');
 
 // '/api/workouts/exercises' and '/exercises/meta' were here: read-only
 // duplicates of /api/exercises kept for older clients. There are none — the
@@ -122,6 +123,11 @@ router.get('/plans', auth, async (req, res, next) => {
     // client id read that client's assignment and progress. workout_plans
     // itself stays global — 086 says so explicitly — but which client was
     // ASSIGNED a plan is tenant data.
+    // The placeholder the client's own progress is read through. Named rather
+    // than assumed: this was a hard-coded $1 and a join on $${p-1}, which
+    // pointed at the ORGANIZATION id — so asking for a client's plans matched
+    // nothing, and the client's "Their plans" screen was always empty.
+    let clientParam = null;
     if (client_id) {
       // Which client was assigned a plan, and their progress on it, is the
       // trainer's view. The library itself stays readable to a member; naming a
@@ -129,14 +135,14 @@ router.get('/plans', auth, async (req, res, next) => {
       if (req.user.role !== 'trainer') {
         return res.status(403).json({ error: 'This area is for the studio trainer.' });
       }
-      conds.push(`wa.client_id = $${p++}`); params.push(client_id);
+      clientParam = `$${p++}`; params.push(client_id);
       const wscope = tenantScope(req);
-      conds.push(`wa.organization_id = $${p++}`); params.push(wscope.orgId);
+      conds.push(`EXISTS (SELECT 1 FROM workout_assignments wa
+                           WHERE wa.workout_plan_id = wp.id AND wa.client_id = ${clientParam}
+                             AND wa.organization_id = $${p++})`);
+      params.push(wscope.orgId);
     }
 
-    const joinClause = client_id
-      ? `LEFT JOIN workout_assignments wa ON wa.workout_plan_id = wp.id AND wa.client_id = $${p-1}`
-      : '';
 
     const tenant = planReadFilter(req, p);
     if (tenant.sql) { conds.push(tenant.sql); params.push(...tenant.params); p += tenant.params.length; }
@@ -167,7 +173,7 @@ router.get('/plans', auth, async (req, res, next) => {
     const { rows } = await pool.query(`
       SELECT wp.*,
         COALESCE((SELECT COUNT(*) FROM workout_exercises we WHERE we.workout_plan_id = wp.id), 0)::int AS exercise_count,
-        ${client_id ? `(SELECT wa2.progress_pct FROM workout_assignments wa2 WHERE wa2.workout_plan_id = wp.id AND wa2.client_id = $1 AND wa2.status = 'active' LIMIT 1)::int AS progress,` : '0 AS progress,'}
+        ${clientParam ? `(SELECT wa2.progress_pct FROM workout_assignments wa2 WHERE wa2.workout_plan_id = wp.id AND wa2.client_id = ${clientParam} AND wa2.status = 'active' LIMIT 1)::int AS progress,` : '0 AS progress,'}
         COALESCE((SELECT json_agg(json_build_object(
           'id', we.id, 'exercise_id', we.exercise_id, 'name', e.name,
           'muscle_group', e.muscle_group, 'sets', we.sets, 'reps', we.reps,
@@ -190,7 +196,6 @@ router.get('/plans', auth, async (req, res, next) => {
         WHERE wa_r.workout_plan_id = wp.id
           AND ${assignConds.join(' AND ').replace(/\bwa\./g, 'wa_r.')}), '[]'::json) AS assignments
       FROM workout_plans wp
-      ${joinClause}
       WHERE ${conds.join(' AND ')}
       ORDER BY wp.created_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}`,
@@ -1236,7 +1241,9 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
          OR workout_assignments.organization_id = EXCLUDED.organization_id
       RETURNING *`,
       [randomUUID(), d.workout_plan_id, d.client_id, req.user.trainer_id || null,
-       d.start_date || new Date().toISOString().split('T')[0],
+       // The studio's today, not UTC's: before 05:30 in India that was
+       // yesterday, and the programme's week 1 began a day early.
+       d.start_date || studioToday(),
        d.end_date || null, 'active', d.notes || null, orgIdOf(req)]
     );
     res.status(201).json({ message: 'Plan assigned', assignment: rows[0], screening_warnings: warnings });
