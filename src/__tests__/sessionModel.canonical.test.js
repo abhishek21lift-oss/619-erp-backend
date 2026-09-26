@@ -115,8 +115,11 @@ describe('the canonical models survive, and stay distinct', () => {
   it('the pt-os workout log still reads workout_sessions', () => {
     // The negative assertions above are also satisfied by deleting both
     // subsystems. This is what separates "consolidated" from "deleted".
-    const log = fs.readFileSync(
-      path.join(SRC, 'modules', 'pt-os', 'workout-log.routes.js'), 'utf8');
+    // The routes and the service they write through: starting a session
+    // (the INSERT) lives in workout-log.service.js.
+    const log = ['workout-log.routes.js', 'workout-log.service.js']
+      .map((f) => fs.readFileSync(path.join(SRC, 'modules', 'pt-os', f), 'utf8'))
+      .join('\n');
     // \b matters: without it `workout_sessions_x` satisfies this, so renaming
     // the canonical table out from under the log would pass. (`_` is a word
     // character, so the boundary refuses the suffixed name.)

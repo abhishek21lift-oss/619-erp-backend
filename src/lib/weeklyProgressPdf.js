@@ -26,6 +26,7 @@
 const PDFDocument = require('pdfkit');
 const { fmtDate, drawSectionHeading, drawLabelValue } = require('./pdfHelpers');
 const { saveFile } = require('./fileStorage');
+const { dbDate } = require('./appTime');
 
 const DAY_NAME = ['', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
@@ -93,7 +94,7 @@ async function generateWeeklyProgressPdf(input) {
         s.total_volume ? kg(s.total_volume) : null,
         s.duration_minutes ? `${s.duration_minutes} min` : null,
       ].filter(Boolean);
-      drawLabelValue(doc, `${day} ${fmtDate(s.session_date)}:`, bits.join(' · ') || 'logged');
+      drawLabelValue(doc, `${day} ${fmtDate(dbDate(s.session_date))}:`, bits.join(' · ') || 'logged');
       if (s.notes) {
         // The trainer's note from that session, verbatim. It is the most
         // specific thing in the document and the part a client actually reads.
@@ -172,7 +173,8 @@ async function generateWeeklyProgressPdf(input) {
 }
 
 function isoDow(date) {
-  const d = new Date(`${String(date).slice(0, 10)}T00:00:00Z`);
+  // A pg DATE arrives as a Date; String() of it is not a date.
+  const d = new Date(`${dbDate(date)}T00:00:00Z`);
   return Number.isNaN(d.getTime()) ? 0 : ((d.getUTCDay() + 6) % 7) + 1;
 }
 

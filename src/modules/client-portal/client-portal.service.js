@@ -13,6 +13,7 @@
 const pool = require('../../db/pool');
 const { today, dbDate } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
+const { programmeWeek, resolveWeek } = require('../pt-os/progression');
 
 const MOODS = ['great', 'good', 'okay', 'tired', 'stressed'];
 
@@ -47,16 +48,19 @@ function weekNumberSince(startYmd, nowYmd) {
  * The client's active workout programmes, each with the exercises for the
  * current week grouped by training day.
  *
- * A plan may be written week by week (week_number set) or as one repeating
- * week (week_number NULL). For the former the current week is the one the
- * assignment has reached, clamped to the last week written, so a client past
- * the end still sees their final week rather than nothing.
+ * The week is resolved exactly as the trainer's session resolves it
+ * (pt-os/progression.js): the plan's own rows for that week where the trainer
+ * wrote them, otherwise the nearest earlier week progressed by the plan's rule,
+ * day by day. This used to filter rows by week number, which gave a member on
+ * a +2.5 kg/week plan week 1's numbers forever, and — once a trainer edited
+ * one day of a later week — showed that one day and hid the rest.
  */
 async function myWorkout(clientId, orgId) {
   const { rows: assignments } = await pool.query(
     `SELECT a.id AS assignment_id, a.start_date, a.end_date, a.progress_pct,
             p.id AS plan_id, p.name, p.description, p.goal, p.difficulty,
-            p.duration_weeks, p.sessions_per_week
+            p.duration_weeks, p.sessions_per_week,
+            p.progression_type, p.progression_amount, p.progression_every_weeks
        FROM workout_assignments a
        JOIN workout_plans p ON p.id = a.workout_plan_id AND p.deleted_at IS NULL
       WHERE a.client_id = $1 AND a.organization_id = $2 AND a.status = 'active'
@@ -67,36 +71,46 @@ async function myWorkout(clientId, orgId) {
   if (assignments.length === 0) return [];
 
   const { rows: exercises } = await pool.query(
-    `SELECT we.workout_plan_id, we.day_of_week, we.week_number, we.sort_order,
+    `SELECT we.workout_plan_id, we.exercise_id, we.day_of_week, we.week_number, we.sort_order,
             we.sets, we.reps, we.rest_seconds, we.target_weight, we.tempo, we.rpe,
             we.notes, e.name, e.equipment, e.video_url, e.image_url, e.gif_url
        FROM workout_exercises we
        LEFT JOIN exercises e ON e.id = we.exercise_id
       WHERE we.workout_plan_id = ANY($1::text[])
-      ORDER BY we.workout_plan_id, we.week_number NULLS FIRST, we.day_of_week, we.sort_order`,
+      ORDER BY we.workout_plan_id, we.day_of_week, we.week_number, we.sort_order`,
     [assignments.map((a) => a.plan_id)],
   );
 
   const now = today();
   return assignments.map((a) => {
-    const own = exercises.filter((x) => x.workout_plan_id === a.plan_id);
-    const weeks = [...new Set(own.map((x) => x.week_number).filter((w) => w != null))].sort((x, y) => x - y);
-    const reached = weekNumberSince(a.start_date, now);
-    const currentWeek = weeks.length ? Math.min(reached, weeks[weeks.length - 1]) : null;
-    const thisWeek = own.filter((x) => x.week_number == null || x.week_number === currentWeek);
+    const week = programmeWeek(a.start_date, now, a.duration_weeks);
 
-    const byDay = new Map();
-    for (const x of thisWeek) {
+    const rowsByDay = new Map();
+    for (const x of exercises) {
+      if (x.workout_plan_id !== a.plan_id) continue;
       const day = x.day_of_week ?? 0;
-      if (!byDay.has(day)) byDay.set(day, []);
-      byDay.get(day).push({
-        name: x.name || 'Exercise',
-        sets: x.sets, reps: x.reps, rest_seconds: x.rest_seconds,
-        target_weight: x.target_weight != null ? Number(x.target_weight) : null,
-        tempo: x.tempo, rpe: x.rpe != null ? Number(x.rpe) : null, notes: x.notes,
-        equipment: x.equipment, media_url: x.gif_url || x.image_url || null, video_url: x.video_url,
-      });
+      if (!rowsByDay.has(day)) rowsByDay.set(day, []);
+      rowsByDay.get(day).push(x);
     }
+
+    const days = [...rowsByDay.entries()]
+      .sort(([x], [y]) => x - y)
+      .map(([day_of_week, rows]) => ({
+        day_of_week,
+        exercises: resolveWeek(rows, a, week).exercises
+          .sort((x, y) => (x.sort_order ?? 0) - (y.sort_order ?? 0))
+          .map((x) => ({
+            exercise_id: x.exercise_id ?? null,
+            name: x.name || 'Exercise',
+            sets: x.sets, reps: x.reps, rest_seconds: x.rest_seconds,
+            target_weight: x.target_weight != null ? Number(x.target_weight) : null,
+            tempo: x.tempo, rpe: x.rpe != null ? Number(x.rpe) : null, notes: x.notes,
+            equipment: x.equipment, media_url: x.gif_url || x.image_url || null, video_url: x.video_url,
+          })),
+      }))
+      // A week the trainer emptied for a day (a deload that drops it) is a rest
+      // day in that week, not a day with nothing on it.
+      .filter((d) => d.exercises.length > 0);
 
     return {
       assignment_id: a.assignment_id,
@@ -108,10 +122,8 @@ async function myWorkout(clientId, orgId) {
       sessions_per_week: a.sessions_per_week,
       start_date: a.start_date,
       end_date: a.end_date,
-      current_week: currentWeek ?? (a.duration_weeks ? Math.min(reached, a.duration_weeks) : null),
-      days: [...byDay.entries()]
-        .sort(([x], [y]) => x - y)
-        .map(([day_of_week, list]) => ({ day_of_week, exercises: list })),
+      current_week: week,
+      days,
     };
   });
 }

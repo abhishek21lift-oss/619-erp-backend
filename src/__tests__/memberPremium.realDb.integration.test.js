@@ -73,6 +73,10 @@ describeIf('member premium features against a real database', () => {
     await pool.query(`DELETE FROM notifications WHERE user_id = $1`, [TRAINER_USER]);
     await pool.query(`DELETE FROM member_goals WHERE organization_id = $1`, [ORG]);
     await pool.query(`DELETE FROM workout_sessions WHERE organization_id = $1`, [ORG]);
+    await pool.query(`DELETE FROM workout_assignments WHERE organization_id = $1`, [ORG]);
+    await pool.query(`DELETE FROM workout_exercises WHERE workout_plan_id IN (SELECT id FROM workout_plans WHERE organization_id = $1)`, [ORG]);
+    await pool.query(`DELETE FROM workout_plans WHERE organization_id = $1`, [ORG]);
+    await pool.query(`DELETE FROM exercises WHERE id IN ('mp-int-ex', 'mp-int-ex2')`);
     await pool.query(`DELETE FROM weekly_checkins WHERE organization_id = $1`, [ORG]);
     await pool.query(`DELETE FROM pt_parq_forms WHERE client_id = ANY($1)`, [[CLIENT, OTHER]]);
     await pool.query(`DELETE FROM users WHERE id = ANY($1)`, [[USER, TRAINER_USER]]);
@@ -169,8 +173,8 @@ describeIf('member premium features against a real database', () => {
         `SELECT s.is_pr_weight FROM workout_sets s
            JOIN workout_session_exercises e ON e.id = s.session_exercise_id
           WHERE e.session_id = $1`, [res.body.data.session_id]);
-      // The log's own flag is unchanged — only the summary is stricter.
-      expect(rows[0].is_pr_weight).toBe(true);
+      // A first attempt is a baseline, so the log's own flag says so too.
+      expect(rows[0].is_pr_weight).toBe(false);
     });
 
     it('rejects a workout with no real sets, and bad numbers', async () => {
@@ -231,12 +235,49 @@ describeIf('member premium features against a real database', () => {
       const res = await request(app).get('/api/me/workout');
       expect(res.status).toBe(200);
       const [plan] = res.body.data;
-      expect(plan.current_week).toBe(1);
+      // Twenty days in is week 3; week 1's rows carry it, as the trainer's log does.
+      expect(plan.current_week).toBe(3);
       expect(plan.days).toEqual([{ day_of_week: 1, exercises: [expect.objectContaining({ name: 'MP Goblet Squat', sets: 3, reps: 10 })] }]);
 
       await pool.query(`DELETE FROM workout_assignments WHERE workout_plan_id = 'mp-int-plan'`);
       await pool.query(`DELETE FROM workout_plans WHERE id = 'mp-int-plan'`);
       await pool.query(`DELETE FROM exercises WHERE id = 'mp-int-ex'`);
+    });
+
+    it('applies the progression rule, and keeps days a later week did not edit', async () => {
+      // The member saw week 1's numbers for the whole block, and a trainer's
+      // edit to one day of a later week hid every other day of it.
+      await pool.query(
+        `INSERT INTO exercises (id, name, muscle_group) VALUES ('mp-int-ex', 'MP Goblet Squat', 'Legs'),
+                ('mp-int-ex2', 'MP Row', 'Back') ON CONFLICT (id) DO NOTHING`);
+      await pool.query(
+        `INSERT INTO workout_plans (id, name, sessions_per_week, duration_weeks, organization_id,
+                                    progression_type, progression_amount, progression_every_weeks)
+         VALUES ('mp-int-plan', 'Base', 2, 4, $1, 'weight', 2.5, 1)`, [ORG]);
+      await pool.query(
+        `INSERT INTO workout_exercises (workout_plan_id, exercise_id, day_of_week, week_number, sort_order, sets, reps, target_weight)
+         VALUES ('mp-int-plan', 'mp-int-ex', 1, 1, 0, 3, 10, 60),
+                ('mp-int-plan', 'mp-int-ex2', 3, 1, 0, 3, 12, 40),
+                ('mp-int-plan', 'mp-int-ex', 1, 2, 0, 5, 5, 70)`);
+      // 20 days in → week 3. Monday derives from the week-2 edit (+1 step),
+      // Wednesday from week 1 (+2 steps).
+      await pool.query(
+        `INSERT INTO workout_assignments (workout_plan_id, client_id, start_date, status, organization_id)
+         VALUES ('mp-int-plan', $1, $2, 'active', $3)`, [CLIENT, ymd(-20), ORG]);
+
+      const res = await request(app).get('/api/me/workout');
+      const [plan] = res.body.data;
+      expect(plan.current_week).toBe(3);
+      expect(plan.days).toEqual([
+        { day_of_week: 1, exercises: [expect.objectContaining({ exercise_id: 'mp-int-ex', sets: 5, reps: 5, target_weight: 72.5 })] },
+        { day_of_week: 3, exercises: [expect.objectContaining({ exercise_id: 'mp-int-ex2', sets: 3, reps: 12, target_weight: 45 })] },
+      ]);
+
+      // Past the end of the block the member repeats the last week.
+      await pool.query(`UPDATE workout_assignments SET start_date = $1 WHERE workout_plan_id = 'mp-int-plan'`, [ymd(-70)]);
+      const late = await request(app).get('/api/me/workout');
+      expect(late.body.data[0].current_week).toBe(4);
+      expect(late.body.data[0].days[1].exercises[0].target_weight).toBe(47.5);
     });
   });
 

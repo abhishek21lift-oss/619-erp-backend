@@ -273,7 +273,7 @@ async function logMyWorkout(clientId, orgId, userId, body) {
         // Sequential on purpose: each set is compared with the ones before it,
         // including earlier sets of this same workout.
         const flags = await computePrFlags(tx, {
-          clientId, orgId, exerciseId, exerciseName: x.name, weight: s.weight_kg, reps: s.reps,
+          clientId, orgId, exerciseId, exerciseName: x.name, weight: s.weight_kg, reps: s.reps, sessionId,
         });
         await tx.query(
           `INSERT INTO workout_sets (

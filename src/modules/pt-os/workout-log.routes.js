@@ -24,12 +24,14 @@ const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 // re-implement it — see pt-os.service.getTodayRoster.
 const svc = require('./pt-os.service');
 const { clientInOrg } = require('../../lib/orgGuard');
-const { today: studioToday } = require('../../lib/appTime');
-const { weekOf, resolveWeek } = require('./progression');
+const { today: studioToday, dbDate } = require('../../lib/appTime');
+const { programmeWeek, resolveWeek } = require('./progression');
 const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./training-analytics');
 const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
 // Shared with the member app's self-logged workouts (client-portal).
-const { recomputeAssignmentProgress, computePrFlags } = require('./workout-log.service');
+const {
+  recomputeAssignmentProgress, computePrFlags, startSession, SessionStartError,
+} = require('./workout-log.service');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -220,7 +222,7 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
       // and the date of THIS session — not today. Back-filling last Tuesday's
       // workout must show last Tuesday's week, or the trainer is handed the
       // wrong prescription for a session that already happened.
-      const week = weekOf(plan.start_date, session.session_date);
+      const week = programmeWeek(plan.start_date, session.session_date, plan.duration_weeks);
       const resolved = resolveWeek(allWeeks, plan, week);
       planned = {
         plan_name: plan.plan_name,
@@ -289,27 +291,31 @@ router.post('/workout-log/sessions', auth, requireTrainer, validate(sessionCreat
   const { blocked, warnings } = await checkScreeningGate(req, b.client_id);
   if (blocked) return res.status(blocked.status).json(blocked.body);
 
-  // Auto-link the client's single active plan assignment only when the
-  // field was omitted entirely — an explicit null (freestyle, opted out
-  // of the client's active plan) or an explicit id is left as-is, so the
-  // frontend can distinguish "didn't say" from "said no plan".
-  const orgId = orgIdOf(req);
-  let assignmentId = b.workout_assignment_id;
-  if (assignmentId === undefined) {
-    const { rows: activeRows } = await pool.query(
-      `SELECT id FROM workout_assignments WHERE client_id = $1 AND status = 'active'`,
-      [b.client_id]
-    );
-    assignmentId = activeRows.length === 1 ? activeRows[0].id : null;
+  // Starting is idempotent, dated in the studio's zone, and links the
+  // programme the client is on that day — see startSession. An explicit null
+  // (freestyle) or an id is honoured; an id must be this client's.
+  let started;
+  try {
+    started = await startSession({
+      orgId: orgIdOf(req),
+      userId: req.user.id,
+      clientId: b.client_id,
+      sessionDate: b.session_date,
+      programName: b.program_name,
+      workoutDay: b.workout_day,
+      notes: b.notes,
+      assignmentId: b.workout_assignment_id,
+    });
+  } catch (err) {
+    if (err instanceof SessionStartError) {
+      return res.status(err.status).json({ error: { code: err.code, message: err.message } });
+    }
+    throw err;
   }
-
-  const { rows } = await pool.query(
-    `INSERT INTO workout_sessions (
-       client_id, trainer_id, workout_assignment_id, session_date, program_name, workout_day, notes, created_by, organization_id
-     ) VALUES ($1, (SELECT trainer_id FROM pt_clients WHERE id = $1), $2, COALESCE($3, CURRENT_DATE), $4, $5, $6, $7, $8)
-     RETURNING *`,
-    [b.client_id, assignmentId, b.session_date || null, b.program_name || null, b.workout_day || null, b.notes || null, req.user.id, orgId]
-  );
+  const rows = [started.session];
+  if (started.resumed) {
+    return res.status(200).json({ data: rows[0], resumed: true, screening_warnings: warnings });
+  }
   await logActivity(req, 'workout_log.session.create', 'workout_sessions', rows[0].id, { client_id: b.client_id });
   res.status(201).json({ data: rows[0], screening_warnings: warnings });
 }));
@@ -431,7 +437,7 @@ router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireTrain
   const scope = tenantScope(req);
   const exGuard = ' AND ws.organization_id = $2';
   const { rows: exRows } = await pool.query(
-    `SELECT wse.exercise_id, wse.exercise_name, ws.client_id
+    `SELECT wse.exercise_id, wse.exercise_name, ws.client_id, ws.id AS session_id
        FROM workout_session_exercises wse
        JOIN workout_sessions ws ON ws.id = wse.session_id
       WHERE wse.id = $1${exGuard}`,
@@ -444,7 +450,7 @@ router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireTrain
   if (b.completed && b.weight_kg != null && b.reps != null) {
     prFlags = await computePrFlags(pool, {
       clientId: ex.client_id, orgId: scope.orgId, exerciseId: ex.exercise_id, exerciseName: ex.exercise_name,
-      weight: b.weight_kg, reps: b.reps,
+      weight: b.weight_kg, reps: b.reps, sessionId: ex.session_id,
     });
   }
 
@@ -474,7 +480,7 @@ router.patch('/workout-log/sets/:id', auth, requireTrainer, validate(setUpdateSc
   const scope = tenantScope(req);
   const setGuard = ' AND ws.organization_id = $2';
   const { rows: existingRows } = await pool.query(
-    `SELECT s.*, wse.exercise_id, wse.exercise_name, ws.client_id
+    `SELECT s.*, wse.exercise_id, wse.exercise_name, ws.client_id, ws.id AS session_id
        FROM workout_sets s
        JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
        JOIN workout_sessions ws ON ws.id = wse.session_id
@@ -495,6 +501,7 @@ router.patch('/workout-log/sets/:id', auth, requireTrainer, validate(setUpdateSc
     prFlags = await computePrFlags(pool, {
       clientId: existing.client_id, orgId: scope.orgId, exerciseId: existing.exercise_id,
       exerciseName: existing.exercise_name, weight: merged.weight_kg, reps: merged.reps, excludeSetId: id,
+      sessionId: existing.session_id,
     });
   } else if (!merged.completed) {
     prFlags = { is_pr_weight: false, is_pr_reps: false, is_pr_volume: false };
@@ -628,7 +635,10 @@ router.get('/workout-log/previous', auth, wrap(async (req, res) => {
   if (!client_id || (!exercise_id && !exercise_name)) {
     return res.status(400).json({ error: { code: 'MISSING_PARAMS' } });
   }
-  const matchClause = exercise_id ? 'wse.exercise_id = $2' : 'wse.exercise_name = $2';
+  // By name, the way PR flags and records match: "Back Squat" and
+  // "back squat " are one lift, so last time's numbers must not vanish over a
+  // capital letter.
+  const matchClause = exercise_id ? 'wse.exercise_id = $2' : 'lower(btrim(wse.exercise_name)) = lower(btrim($2))';
   const matchParam = exercise_id || exercise_name;
   const params = [client_id, matchParam];
   let excludeClause = '';
@@ -663,7 +673,7 @@ router.get('/workout-log/progress', auth, wrap(async (req, res) => {
   if (!client_id || (!exercise_id && !exercise_name)) {
     return res.status(400).json({ error: { code: 'MISSING_PARAMS' } });
   }
-  const matchClause = exercise_id ? 'wse.exercise_id = $2' : 'wse.exercise_name = $2';
+  const matchClause = exercise_id ? 'wse.exercise_id = $2' : 'lower(btrim(wse.exercise_name)) = lower(btrim($2))';
   const matchParam = exercise_id || exercise_name;
   const scope = tenantScope(req);
   const params = [client_id, matchParam];
@@ -683,7 +693,9 @@ router.get('/workout-log/progress', auth, wrap(async (req, res) => {
 
   const bySession = new Map();
   for (const r of rows) {
-    const key = String(r.session_date).slice(0, 10);
+    // A pg DATE is a Date; String() of it is "Sat Sep 26", which the chart
+    // printed as its axis label.
+    const key = dbDate(r.session_date);
     if (!bySession.has(key)) bySession.set(key, []);
     bySession.get(key).push(r);
   }

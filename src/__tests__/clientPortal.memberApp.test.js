@@ -58,7 +58,7 @@ describe('GET /api/me/workout', () => {
     expect(mockQueries[0].sql).toMatch(/a\.status = 'active'/);
   });
 
-  it("groups the current week's exercises by day and clamps past the last written week", async () => {
+  it("groups the current week's exercises by day, carrying the last written week forward", async () => {
     mockResponder = (sql) => {
       if (/FROM workout_assignments/.test(sql)) {
         return { rows: [{ assignment_id: 'as1', plan_id: 'p1', name: 'Base Phase', start_date: '2026-09-02', duration_weeks: 8 }] };
@@ -73,8 +73,9 @@ describe('GET /api/me/workout', () => {
     };
     const res = await request(app).get('/api/me/workout').expect(200);
     const [plan] = res.body.data;
-    // Started 2026-09-02, today 2026-09-23 → week 4 reached, but only 2 are written.
-    expect(plan.current_week).toBe(2);
+    // Started 2026-09-02, today 2026-09-23 → week 4. Only weeks 1-2 are
+    // written, so week 4 is week 2's prescription (no rule on this plan).
+    expect(plan.current_week).toBe(4);
     expect(plan.days.map((d) => d.day_of_week)).toEqual([1, 3]);
     expect(plan.days[0].exercises[0]).toMatchObject({ name: 'Squat', sets: 4 });
   });

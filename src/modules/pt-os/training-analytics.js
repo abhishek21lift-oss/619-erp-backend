@@ -20,6 +20,17 @@
 // What IS shown for recovery is days since a muscle was last trained, which is
 // a fact about the log and nothing more.
 
+const { dbDate } = require('../../lib/appTime');
+
+/**
+ * A date as 'YYYY-MM-DD', whether it arrived as a string or as the Date
+ * node-postgres returns for a DATE column. `String(date).slice(0, 10)` of a
+ * Date is "Mon Aug 24", so every helper below read a real session as no date
+ * at all: adherence came back empty and the week's missed days were never
+ * counted.
+ */
+const ymd = (date) => dbDate(date) ?? '';
+
 /** A session counts toward adherence only once it is finished. */
 const COMPLETED = 'completed';
 
@@ -31,7 +42,7 @@ const COMPLETED = 'completed';
  * week and make adherence disagree with the plan it is measured against.
  */
 function weekStart(date) {
-  const d = new Date(`${String(date).slice(0, 10)}T00:00:00Z`);
+  const d = new Date(`${ymd(date)}T00:00:00Z`);
   if (Number.isNaN(d.getTime())) return null;
   const dow = (d.getUTCDay() + 6) % 7;          // 0 = Monday
   d.setUTCDate(d.getUTCDate() - dow);
@@ -40,8 +51,8 @@ function weekStart(date) {
 
 /** Whole days between two dates, or null if either is unusable. */
 function daysBetween(from, to) {
-  const a = new Date(`${String(from).slice(0, 10)}T00:00:00Z`);
-  const b = new Date(`${String(to).slice(0, 10)}T00:00:00Z`);
+  const a = new Date(`${ymd(from)}T00:00:00Z`);
+  const b = new Date(`${ymd(to)}T00:00:00Z`);
   if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return null;
   return Math.floor((b - a) / 86400000);
 }
@@ -116,9 +127,8 @@ function muscleWeek(setRows, { asOf, landmarks = new Map() }) {
     if (!muscle) { unattributed += Number(r.sets) || 0; continue; }
     const cur = byMuscle.get(muscle) ?? { target_muscle: muscle, sets: 0, last_trained: null };
     cur.sets += Number(r.sets) || 0;
-    if (!cur.last_trained || String(r.last_date) > cur.last_trained) {
-      cur.last_trained = String(r.last_date).slice(0, 10);
-    }
+    const last = ymd(r.last_date) || null;
+    if (last && (!cur.last_trained || last > cur.last_trained)) cur.last_trained = last;
     byMuscle.set(muscle, cur);
   }
 
@@ -156,7 +166,7 @@ function prTimeline(rows, { limit = 50 } = {}) {
   return rows
     .filter((r) => r.is_pr_weight || r.is_pr_reps || r.is_pr_volume)
     .map((r) => ({
-      session_date: String(r.session_date).slice(0, 10),
+      session_date: ymd(r.session_date),
       exercise_name: r.exercise_name,
       weight_kg: r.weight_kg == null ? null : Number(r.weight_kg),
       reps: r.reps == null ? null : Number(r.reps),
@@ -186,12 +196,12 @@ function missedDays(plannedDays, sessions, { weekOf, asOf }) {
   for (const s of sessions) {
     if (s.status !== COMPLETED) continue;
     if (weekStart(s.session_date) !== start) continue;
-    const d = new Date(`${String(s.session_date).slice(0, 10)}T00:00:00Z`);
+    const d = new Date(`${ymd(s.session_date)}T00:00:00Z`);
     doneDows.add(((d.getUTCDay() + 6) % 7) + 1);        // 1 = Monday
   }
 
   const todayDow = (() => {
-    const d = new Date(`${String(asOf).slice(0, 10)}T00:00:00Z`);
+    const d = new Date(`${ymd(asOf)}T00:00:00Z`);
     return Number.isNaN(d.getTime()) ? 7 : ((d.getUTCDay() + 6) % 7) + 1;
   })();
 
