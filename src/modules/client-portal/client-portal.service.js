@@ -311,7 +311,87 @@ async function mySessions(clientId, orgId, { limit = 30 } = {}) {
   }));
 }
 
+// ── Contact details the member keeps up to date themselves ──────────────────
+//
+// Mobile and address only. Email is the sign-in identity and changing it
+// needs verification this flow does not have; name, dates, package and
+// money are the studio's record and stay the trainer's to edit.
+const MOBILE_RE = /^[6-9]\d{9}$/; // the same rule the trainer's client form applies
+
+function normaliseContact(body = {}) {
+  const out = {};
+  if (body.mobile !== undefined) {
+    const m = String(body.mobile ?? '').replace(/[\s-]/g, '').replace(/^(\+91|91|0)(?=[6-9]\d{9}$)/, '');
+    if (!MOBILE_RE.test(m)) throw new PortalInputError('Enter a valid 10-digit Indian mobile number.');
+    out.mobile = m;
+  }
+  if (body.address !== undefined) {
+    const a = body.address === null ? '' : String(body.address).trim();
+    if (a.length > 500) throw new PortalInputError('Address must be 500 characters or fewer.');
+    out.address = a || null;
+  }
+  if (Object.keys(out).length === 0) throw new PortalInputError('Nothing to update.');
+  return out;
+}
+
+async function updateMyContact(clientId, orgId, body) {
+  const c = normaliseContact(body);
+  const { rows } = await pool.query(
+    `UPDATE pt_clients
+        SET mobile  = CASE WHEN $3::boolean THEN $4 ELSE mobile END,
+            address = CASE WHEN $5::boolean THEN $6 ELSE address END,
+            updated_at = NOW()
+      WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL
+      RETURNING mobile, address`,
+    [clientId, orgId, 'mobile' in c, c.mobile ?? null, 'address' in c, c.address ?? null],
+  );
+  return rows[0] || null;
+}
+
+// ── The member's own signed forms ───────────────────────────────────────────
+//
+// Their latest PAR-Q (what they declared, and the risk level it came to) and
+// their latest informed consent. The trainer's private notes on the PAR-Q are
+// not returned; nor are signature images or device/IP audit fields.
+async function myForms(clientId, orgId) {
+  const { rows: parq } = await pool.query(
+    `SELECT id, assessment_date, status, risk_level, risk_message, parq_yes_count,
+            parq_answers, current_health, past_history, created_at
+       FROM pt_parq_forms
+      WHERE client_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+      ORDER BY assessment_date DESC NULLS LAST, created_at DESC
+      LIMIT 1`,
+    [clientId, orgId],
+  );
+  const { rows: consent } = await pool.query(
+    `SELECT id, version, status, client_signed_at, trainer_signed_at, completed_at,
+            (pdf_url IS NOT NULL) AS has_pdf, created_at
+       FROM pt_informed_consents
+      WHERE client_id = $1 AND organization_id = $2
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [clientId, orgId],
+  );
+  return { parq: parq[0] || null, consent: consent[0] || null };
+}
+
+/**
+ * The storage key of the member's OWN consent PDF, or null. Ownership is the
+ * query: the row must be this client's, in this studio, with a PDF. The key
+ * is derived from the record id, the same way lib/informedConsentPdf.js wrote
+ * it, so nothing about the stored URL's format is trusted.
+ */
+async function myConsentPdfKey(clientId, orgId, consentId) {
+  const { rows } = await pool.query(
+    `SELECT id FROM pt_informed_consents
+      WHERE id::text = $1 AND client_id = $2 AND organization_id = $3 AND pdf_url IS NOT NULL`,
+    [String(consentId), clientId, orgId],
+  );
+  return rows[0] ? `informed-consent/pdf/${rows[0].id}.pdf` : null;
+}
+
 module.exports = {
+  updateMyContact, normaliseContact, myForms, myConsentPdfKey,
   myWorkout, myDiet, myCheckins, upsertMyCheckin, mySessions,
   normaliseCheckin, mondayOf, weekNumberSince, PortalInputError, MOODS,
 };

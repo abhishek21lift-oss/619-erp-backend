@@ -161,3 +161,14 @@ describe('the trainer re-inviting a client restores their login', () => {
     expect(restore.params[0]).toBe('usr-m');
   });
 });
+
+describe('change-password with a wrong current password', () => {
+  test('is a 400, not a 401 — a typo must not look like an expired session', async () => {
+    on(/^SELECT password FROM users WHERE id = \$1/, { rows: [{ password: '$2a$12$stored' }] });
+    const res = await request(app()).post('/api/auth/change-password')
+      .send({ currentPassword: 'not-it', newPassword: 'a-new-passw0rd' });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('WRONG_CURRENT_PASSWORD');
+  });
+});
+

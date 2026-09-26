@@ -21,6 +21,7 @@
 const router = require('express').Router();
 const pool = require('../../db/pool');
 const portal = require('./client-portal.service');
+const { serveFile } = require('../../lib/fileStorage');
 
 /** Wrap an async handler so a rejection reaches the error middleware. */
 const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
@@ -180,12 +181,17 @@ router.get('/attendance', wrap(async (req, res) => {
 router.get('/measurements', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
   const { rows } = await pool.query(
-    `SELECT weight_kg, measured_at, source FROM (
-       SELECT weight_kg, measured_at, 'trainer'::text AS source
+    `SELECT weight_kg, measured_at, source, body_fat_pct, chest_cm, waist_cm, hip_cm,
+            arms_cm, thighs_cm, shoulders_cm FROM (
+       SELECT weight_kg, measured_at, 'trainer'::text AS source,
+              body_fat_pct, chest_cm, waist_cm, hip_cm, arms_cm, thighs_cm, shoulders_cm
          FROM pt_os_measurements
-        WHERE client_id = $1 AND weight_kg IS NOT NULL
+        WHERE client_id = $1
+          AND COALESCE(weight_kg, body_fat_pct, chest_cm, waist_cm, hip_cm,
+                       arms_cm, thighs_cm, shoulders_cm) IS NOT NULL
        UNION ALL
-       SELECT weight, week_start_date::timestamptz, 'checkin'
+       SELECT weight, week_start_date::timestamptz, 'checkin',
+              NULL, NULL, NULL, NULL, NULL, NULL, NULL
          FROM weekly_checkins
         WHERE client_id = $1 AND organization_id = $2 AND weight IS NOT NULL
      ) m
@@ -214,6 +220,38 @@ router.get('/workout', wrap(async (req, res) => {
 router.get('/diet', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
   res.json({ data: await portal.myDiet(clientId, orgId) });
+}));
+
+// PATCH /api/me/profile — the member updates their own mobile / address
+router.patch('/profile', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    const saved = await portal.updateMyContact(clientId, orgId, req.body || {});
+    if (!saved) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Profile not found.' } });
+    res.json({ data: saved });
+  } catch (err) {
+    if (err instanceof portal.PortalInputError) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
+    }
+    throw err;
+  }
+}));
+
+// GET /api/me/forms — the member's own latest PAR-Q and informed consent
+router.get('/forms', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await portal.myForms(clientId, orgId) });
+}));
+
+// GET /api/me/forms/consent/:id/pdf — their own signed consent, as a PDF.
+// The id only selects WHICH of the member's consents; ownership is enforced
+// by the lookup (client + studio from the session), and a miss is a 404.
+router.get('/forms/consent/:id/pdf', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  const key = await portal.myConsentPdfKey(clientId, orgId, req.params.id);
+  if (!key) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Consent form not found.' } });
+  res.set('Cache-Control', 'private, no-store');
+  await serveFile(key, res, {});
 }));
 
 // GET /api/me/sessions — the sessions the trainer logged, with what was lifted

@@ -102,8 +102,28 @@ function normaliseKey(req, res) {
  * deny. There is no unrestricted caller: tenantScope() always scopes to the
  * account's own organization.
  */
+// ── Members see only their own records ──────────────────────────────────────
+//
+// The ownership check above is per STUDIO, which is right for the trainer and
+// was enough while members could not sign in. A member is one client of that
+// studio, and a studio-wide check would let them read another client's PAR-Q,
+// consent PDF, payment screenshot or progress report given its key. For a
+// member the record must also be THEIR client record: the column below names
+// which client owns each category's row. Categories not listed here (the
+// studio's AI documents, portfolio media) are never a member's to read.
+const MEMBER_OWNER_COLUMN = {
+  pt_parq_forms: 'client_id',
+  pt_informed_consents: 'client_id',
+  payment_orders: 'client_id',
+  pt_clients: 'id',
+};
+
 async function callerOwnsRecord(req, category, key) {
   const scope = tenantScope(req);
+  const isMember = req.user?.role === 'member';
+
+  // A member never reads portfolio media; see MEMBER_OWNER_COLUMN.
+  if (isMember && category === PORTFOLIO_CATEGORY) return false;
 
   // Portfolio media is resolved by KEY, not by an id parsed out of the
   // filename. A before/after row owns two objects and each carries its own
@@ -154,13 +174,22 @@ async function callerOwnsRecord(req, category, key) {
   if (!UUID_RE.test(id)) return false;
 
   // Table name comes from the OWNED_CATEGORIES allowlist above, never from
-  // the request, so it is not an injection vector.
+  // the request, so it is not an injection vector. The owner column likewise
+  // comes from MEMBER_OWNER_COLUMN, never from the request.
+  const ownerCol = isMember ? MEMBER_OWNER_COLUMN[table] : null;
+  if (isMember && !ownerCol) return false;
   const { rows } = await pool.query(
-    `SELECT organization_id FROM ${table} WHERE id = $1`,
+    `SELECT organization_id${ownerCol ? `, ${ownerCol}::text AS owner_client` : ''}
+       FROM ${table} WHERE id = $1`,
     [id]
   );
   if (rows.length === 0) return false;
-  return rows[0].organization_id === scope.orgId;
+  const sameStudio = rows[0].organization_id === scope.orgId;
+  if (!sameStudio) return false;
+  if (isMember) {
+    return Boolean(req.user.pt_client_id) && rows[0].owner_client === String(req.user.pt_client_id);
+  }
+  return true;
 }
 
 // ── Tier 1: public branding assets (no session required) ────────────────────

@@ -86,6 +86,17 @@ describeIf('/api/me against a real database', () => {
       `INSERT INTO pt_payments (id, client_id, amount, payment_method, date, organization_id)
        VALUES ('me-int-pay', $1, 20000, 'CASH', CURRENT_DATE, $2) ON CONFLICT (id) DO NOTHING`, [CLIENT, ORG]);
     await pool.query(
+      `INSERT INTO pt_parq_forms (id, client_id, full_name, organization_id, risk_level, status,
+                                  parq_yes_count, trainer_notes)
+       VALUES ('me-int-parq', $1, 'Mina', $2, 'low', 'reviewed', 0, '"INTERNAL: watch her knee"')
+       ON CONFLICT (id) DO NOTHING`, [CLIENT, ORG]);
+    await pool.query(
+      `INSERT INTO pt_informed_consents (id, client_id, full_name, organization_id, status, version)
+       VALUES ('me-int-consent', $1, 'Mina', $2, 'completed', 1) ON CONFLICT (id) DO NOTHING`, [CLIENT, ORG]);
+    await pool.query(
+      `INSERT INTO pt_os_measurements (id, client_id, waist_cm, body_fat_pct, measured_at)
+       VALUES ('me-int-meas', $1, 82.5, 21.4, NOW() - INTERVAL '3 days') ON CONFLICT (id) DO NOTHING`, [CLIENT]);
+    await pool.query(
       `INSERT INTO workout_sessions (id, client_id, session_date, program_name, workout_day,
                                      duration_minutes, status, notes, organization_id)
        VALUES ($1, $2, CURRENT_DATE, 'Strength base', 'Day 1', 55, 'completed',
@@ -119,6 +130,9 @@ describeIf('/api/me against a real database', () => {
     await pool.query(`DELETE FROM workout_sessions WHERE id = $1`, [SESSION]);
     await pool.query(`DELETE FROM pt_payments WHERE id = 'me-int-pay'`);
     await pool.query(`DELETE FROM pt_goals WHERE client_id = $1`, [CLIENT]);
+    await pool.query(`DELETE FROM pt_parq_forms WHERE id = 'me-int-parq'`);
+    await pool.query(`DELETE FROM pt_informed_consents WHERE id = 'me-int-consent'`);
+    await pool.query(`DELETE FROM pt_os_measurements WHERE id = 'me-int-meas'`);
     await pool.query(`DELETE FROM users WHERE id = ANY($1)`, [[USER, TRAINER_USER]]);
     await pool.query(`DELETE FROM pt_clients WHERE id = ANY($1)`, [[CLIENT, CLIENT_2]]);
     await pool.query(`DELETE FROM trainers WHERE id = $1`, [TRAINER]);
@@ -138,6 +152,7 @@ describeIf('/api/me against a real database', () => {
     '/api/me/diet',
     '/api/me/checkins',
     '/api/me/sessions',
+    '/api/me/forms',
   ])('GET %s runs against the real schema', async (path) => {
     const res = await request().get(path);
     expect({ path, status: res.status, error: res.body.error }).toEqual({ path, status: 200, error: undefined });
@@ -201,5 +216,40 @@ describeIf('/api/me against a real database', () => {
       expect.objectContaining({ source: 'checkin' }),
     ]));
     expect(Number(res.body.data.find((m) => m.source === 'checkin').weight_kg)).toBe(71.2);
+  });
+
+  test('a member updates their own mobile and address, and nothing else', async () => {
+    const res = await request().patch('/api/me/profile')
+      .send({ mobile: '+91 98765 43210', address: '12 Park Street', name: 'Hacker', balance_amount: 0 });
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual({ mobile: '9876543210', address: '12 Park Street' });
+    const { rows } = await pool.query('SELECT name, balance_amount FROM pt_clients WHERE id = $1', [CLIENT]);
+    expect(rows[0].name).toBe('Mina');
+    expect(Number(rows[0].balance_amount)).toBe(1500);
+  });
+
+  test('an invalid mobile is refused', async () => {
+    const res = await request().patch('/api/me/profile').send({ mobile: '12345' });
+    expect(res.status).toBe(400);
+  });
+
+  test('forms return the member\'s PAR-Q and consent, never the trainer\'s notes', async () => {
+    const res = await request().get('/api/me/forms');
+    expect(res.body.data.parq).toMatchObject({ id: 'me-int-parq', risk_level: 'low' });
+    expect(res.body.data.consent).toMatchObject({ id: 'me-int-consent', status: 'completed', has_pdf: false });
+    expect(JSON.stringify(res.body)).not.toContain('INTERNAL');
+  });
+
+  test('a consent with no PDF, or somebody else\'s, is a 404', async () => {
+    expect((await request().get('/api/me/forms/consent/me-int-consent/pdf')).status).toBe(404);
+    expect((await request().get('/api/me/forms/consent/not-mine/pdf')).status).toBe(404);
+  });
+
+  test('measurements carry body measurements as well as weight', async () => {
+    const res = await request().get('/api/me/measurements');
+    const m = res.body.data.find((x) => x.source === 'trainer');
+    expect(Number(m.waist_cm)).toBe(82.5);
+    expect(Number(m.body_fat_pct)).toBe(21.4);
+    expect(m.weight_kg).toBeNull();
   });
 });
