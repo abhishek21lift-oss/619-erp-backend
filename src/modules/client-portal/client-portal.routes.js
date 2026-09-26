@@ -21,6 +21,7 @@
 const router = require('express').Router();
 const pool = require('../../db/pool');
 const portal = require('./client-portal.service');
+const messages = require('../client-messages/client-messages.service');
 const { serveFile } = require('../../lib/fileStorage');
 
 /** Wrap an async handler so a rejection reaches the error middleware. */
@@ -252,6 +253,33 @@ router.get('/forms/consent/:id/pdf', wrap(async (req, res) => {
   if (!key) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Consent form not found.' } });
   res.set('Cache-Control', 'private, no-store');
   await serveFile(key, res, {});
+}));
+
+// ── Messages with the studio ─────────────────────────────────────────────────
+// One thread, the member's own: the client id comes from the session, never
+// the request. Opening it marks the studio's messages read.
+router.get('/messages', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  const before = typeof req.query.before === 'string' && !Number.isNaN(Date.parse(req.query.before))
+    ? req.query.before : null;
+  res.json({ data: await messages.memberThread(clientId, orgId, { before }) });
+}));
+
+router.get('/messages/unread-count', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: { unread: await messages.memberUnread(clientId, orgId) } });
+}));
+
+router.post('/messages', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    res.status(201).json({ data: await messages.memberSend(clientId, orgId, req.user.id, req.body?.body) });
+  } catch (err) {
+    if (err instanceof messages.MessageInputError) {
+      return res.status(err.status).json({ error: { code: err.code, message: err.message } });
+    }
+    throw err;
+  }
 }));
 
 // GET /api/me/achievements — records and streaks, counted from what was logged
