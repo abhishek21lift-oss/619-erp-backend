@@ -1082,8 +1082,21 @@ router.delete('/plans/:id', auth, requireTrainer, async (req, res, next) => {
     const plan = await loadEditablePlan(req, req.params.id);
     if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
 
+    // One statement: delete the plan AND end every live assignment of it.
+    // Deleting only the plan left its assignments 'active' — the trainer's
+    // client screen kept counting programmes the member could no longer see
+    // (the member app joins on live plans), and 38 such rows had built up.
+    // 'cancelled' rather than 'completed': the client did not finish it.
     const { rows } = await pool.query(
-      'UPDATE workout_plans SET deleted_at=NOW(), is_active=false WHERE id=$1 AND deleted_at IS NULL RETURNING id',
+      `WITH p AS (
+         UPDATE workout_plans SET deleted_at = NOW(), is_active = false
+          WHERE id = $1 AND deleted_at IS NULL
+          RETURNING id
+       ), a AS (
+         UPDATE workout_assignments SET status = 'cancelled', updated_at = NOW()
+          WHERE workout_plan_id IN (SELECT id FROM p) AND status IN ('active', 'paused')
+       )
+       SELECT id FROM p`,
       [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Workout plan not found' });

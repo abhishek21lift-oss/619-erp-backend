@@ -54,20 +54,47 @@ function orgClause(orgId, params, col = 'organization_id') {
 // every member, and the member dashboard — the first screen after sign-in —
 // needs it, so the whole app read as broken. The field stays in the response
 // so the client contract does not change; the dashboard shows initials.
+//
+// goal: the client's ACTIVE goal from pt_goals, which is where the trainer
+// sets it today; pt_clients.goal is the older free-text field and is the
+// fallback only. Reading the old field alone showed "—" to a member with an
+// active goal. The same precedence the AI generators use (lib/client-facts).
+//
+// trainer: the assigned trainer, else the studio's own trainer. A studio has
+// exactly one live trainer account (migration 208), so a client nobody got
+// round to assigning still has a trainer — the studio's — and the card says so
+// instead of disappearing.
 router.get('/profile', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
   const params = [clientId];
   const { rows } = await pool.query(
     `SELECT c.id, c.client_id AS member_code, c.name, c.email, c.mobile,
             c.gender, c.dob, c.photo_url, c.address,
-            c.package_type, c.goal, c.height, c.weight,
+            c.package_type, COALESCE(g.goal, c.goal) AS goal, c.height, c.weight,
             c.joining_date, c.pt_start_date, c.pt_end_date, c.duration_months,
             c.status,
-            t.name AS trainer_name, NULL::text AS trainer_photo,
-            t.specialization AS trainer_specialization,
+            COALESCE(t.name, st.name) AS trainer_name, NULL::text AS trainer_photo,
+            CASE WHEN t.id IS NOT NULL THEN t.specialization ELSE st.specialization END
+              AS trainer_specialization,
             o.name AS studio_name, o.logo_url AS studio_logo
        FROM pt_clients c
        LEFT JOIN trainers t ON t.id = c.trainer_id AND t.organization_id = c.organization_id
+       LEFT JOIN LATERAL (
+         SELECT st.name, st.specialization
+           FROM users su
+           JOIN trainers st ON st.id = su.trainer_id AND st.organization_id = su.organization_id
+          WHERE su.organization_id = c.organization_id AND su.role = 'trainer'
+            AND su.deleted_at IS NULL AND st.deleted_at IS NULL
+          ORDER BY su.created_at
+          LIMIT 1
+       ) st ON TRUE
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(NULLIF(pg.priority_goal, ''), NULLIF(pg.goal_type, ''), pg.goal_other) AS goal
+           FROM pt_goals pg
+          WHERE pg.client_id = c.id AND pg.is_active
+          ORDER BY pg.updated_at DESC NULLS LAST
+          LIMIT 1
+       ) g ON TRUE
        LEFT JOIN organizations o ON o.id = c.organization_id
       WHERE c.id = $1 AND c.deleted_at IS NULL${orgClause(orgId, params, 'c.organization_id')}`,
     params
@@ -96,14 +123,20 @@ router.get('/membership', wrap(async (req, res) => {
 }));
 
 // ── GET /api/me/payments ─────────────────────────────────────────────────────
+// Every payment the studio has on its ledger for this client — cash, card and
+// approved UPI alike. upi_order_id names the online order a row came from, so
+// the payments screen can show that one once (with its receipt) rather than
+// twice.
 router.get('/payments', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
   const params = [clientId];
   const { rows } = await pool.query(
-    `SELECT id, amount, date, payment_method, notes, created_at
-       FROM pt_payments
-      WHERE client_id = $1 AND deleted_at IS NULL${orgClause(orgId, params)}
-      ORDER BY date DESC, created_at DESC
+    `SELECT p.id, p.amount, p.date, p.payment_method, p.notes, p.created_at,
+            mp.payment_order_id AS upi_order_id
+       FROM pt_payments p
+       LEFT JOIN membership_payments mp ON mp.pt_payment_id = p.id
+      WHERE p.client_id = $1 AND p.deleted_at IS NULL${orgClause(orgId, params, 'p.organization_id')}
+      ORDER BY p.date DESC, p.created_at DESC
       LIMIT 200`,
     params
   );
@@ -138,15 +171,27 @@ router.get('/attendance', wrap(async (req, res) => {
 // might reference a column that does not exist and 500 the whole route. Scoping
 // on client_id alone is already sufficient — pt_clients.id is unique
 // platform-wide and comes from the session, never the request.
+//
+// The member's own check-in weights are included, marked source 'checkin'.
+// Without them a member who reported their weight every week still saw
+// "Weight: not recorded" on their dashboard, because only the trainer's
+// measurements were read. weekly_checkins IS migration-defined, so it is
+// scoped by organization as well.
 router.get('/measurements', wrap(async (req, res) => {
-  const { clientId } = selfOf(req);
+  const { clientId, orgId } = selfOf(req);
   const { rows } = await pool.query(
-    `SELECT weight_kg, measured_at
-       FROM pt_os_measurements
-      WHERE client_id = $1 AND weight_kg IS NOT NULL
+    `SELECT weight_kg, measured_at, source FROM (
+       SELECT weight_kg, measured_at, 'trainer'::text AS source
+         FROM pt_os_measurements
+        WHERE client_id = $1 AND weight_kg IS NOT NULL
+       UNION ALL
+       SELECT weight, week_start_date::timestamptz, 'checkin'
+         FROM weekly_checkins
+        WHERE client_id = $1 AND organization_id = $2 AND weight IS NOT NULL
+     ) m
       ORDER BY measured_at DESC
       LIMIT 200`,
-    [clientId]
+    [clientId, orgId]
   );
   res.json({ data: rows });
 }));
@@ -169,6 +214,12 @@ router.get('/workout', wrap(async (req, res) => {
 router.get('/diet', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
   res.json({ data: await portal.myDiet(clientId, orgId) });
+}));
+
+// GET /api/me/sessions — the sessions the trainer logged, with what was lifted
+router.get('/sessions', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await portal.mySessions(clientId, orgId) });
 }));
 
 // GET /api/me/checkins — recent weekly check-ins, and which week is "this week"

@@ -240,7 +240,78 @@ async function upsertMyCheckin(clientId, orgId, userId, body) {
   return rows[0] || null;
 }
 
+const num = (v) => (v === null || v === undefined ? null : Number(v));
+
+/**
+ * The sessions the trainer logged for this client — newest first, with each
+ * exercise and the sets actually done (load, reps, RPE, personal-best flags,
+ * and time/distance for cardio work).
+ *
+ * The trainer's free-text notes on a session, exercise or set are NOT
+ * returned: they are written for the studio, not for the client, and nothing
+ * about them promises the client will read them.
+ *
+ * Scoped to the client AND the studio on the session row; exercises and sets
+ * are reached only through those sessions' ids.
+ */
+async function mySessions(clientId, orgId, { limit = 30 } = {}) {
+  const { rows: sessions } = await pool.query(
+    `SELECT id, session_date, program_name, workout_day, duration_minutes, status
+       FROM workout_sessions
+      WHERE client_id = $1 AND organization_id = $2
+      ORDER BY session_date DESC, created_at DESC
+      LIMIT $3`,
+    [clientId, orgId, limit],
+  );
+  if (sessions.length === 0) return [];
+
+  const { rows: sets } = await pool.query(
+    `SELECT e.session_id, e.id AS exercise_row_id, e.exercise_name, e.sort_order,
+            s.set_number, s.weight_kg, s.reps, s.rpe, s.completed,
+            s.is_pr_weight, s.is_pr_reps, s.is_pr_volume,
+            s.duration_seconds, s.distance, s.distance_unit
+       FROM workout_session_exercises e
+       LEFT JOIN workout_sets s ON s.session_exercise_id = e.id
+      WHERE e.session_id = ANY($1::text[])
+      ORDER BY e.session_id, e.sort_order NULLS LAST, e.created_at, s.set_number NULLS LAST`,
+    [sessions.map((s) => s.id)],
+  );
+
+  const bySession = new Map(sessions.map((s) => [s.id, []]));
+  const exerciseIndex = new Map();
+  for (const r of sets) {
+    let ex = exerciseIndex.get(r.exercise_row_id);
+    if (!ex) {
+      ex = { name: r.exercise_name, sets: [] };
+      exerciseIndex.set(r.exercise_row_id, ex);
+      bySession.get(r.session_id)?.push(ex);
+    }
+    if (r.set_number === null && r.reps === null && r.weight_kg === null && r.duration_seconds === null) continue;
+    ex.sets.push({
+      set_number: r.set_number,
+      weight_kg: num(r.weight_kg),
+      reps: r.reps,
+      rpe: num(r.rpe),
+      completed: r.completed,
+      is_pr: Boolean(r.is_pr_weight || r.is_pr_reps || r.is_pr_volume),
+      duration_seconds: r.duration_seconds,
+      distance: num(r.distance),
+      distance_unit: r.distance_unit,
+    });
+  }
+
+  return sessions.map((s) => ({
+    id: s.id,
+    session_date: s.session_date,
+    program_name: s.program_name,
+    workout_day: s.workout_day,
+    duration_minutes: s.duration_minutes,
+    status: s.status,
+    exercises: bySession.get(s.id) || [],
+  }));
+}
+
 module.exports = {
-  myWorkout, myDiet, myCheckins, upsertMyCheckin,
+  myWorkout, myDiet, myCheckins, upsertMyCheckin, mySessions,
   normaliseCheckin, mondayOf, weekNumberSince, PortalInputError, MOODS,
 };
