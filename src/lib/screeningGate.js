@@ -71,4 +71,21 @@ async function checkScreeningGate(req, clientId) {
   return { blocked: null, warnings };
 }
 
-module.exports = { checkScreeningGate };
+/**
+ * Is this client medically blocked from training by their latest PAR-Q?
+ *
+ * The quiet half of checkScreeningGate, for the member app: the member logging
+ * their own workout is not a trainer assigning one, so there is nothing to
+ * warn about and no audit event to write — only the hard stop applies.
+ */
+async function isTrainingBlocked(clientId) {
+  const { rows } = await pool.query(
+    `SELECT workout_gate_status FROM pt_parq_forms
+      WHERE client_id = $1 AND deleted_at IS NULL
+      ORDER BY assessment_date DESC LIMIT 1`,
+    [clientId]
+  );
+  return rows[0]?.workout_gate_status === 'blocked';
+}
+
+module.exports = { checkScreeningGate, isTrainingBlocked };

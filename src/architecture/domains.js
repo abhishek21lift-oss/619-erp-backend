@@ -256,6 +256,8 @@ const DOMAINS = {
       'pt_posture_assessments', 'pt_mobility_performance_assessments',
       'pt_nutrition_assessments', 'pt_lifestyle_assessments', 'pt_os_measurements',
       'body_metrics', 'progress_photos', 'weekly_checkins', 'pt_goals', 'weight_logs',
+      // Personal targets the member sets in the member app (migration 212).
+      'member_goals',
     ],
   },
 
