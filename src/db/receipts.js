@@ -9,9 +9,14 @@
 // rejects the insert because `payments.receipt_no` is UNIQUE — surfacing
 // as a 500 to the cashier mid-payment.
 //
-// FIX: draw from a Postgres sequence; format as RCP-YYYYMMDD-NNNNNN. The
-// sequence is created lazily on first call (idempotent) so we don't need
-// a new migration for existing deployments.
+// FIX: draw from a Postgres sequence; format as RCP-YYYYMMDD-NNNNNN.
+//
+// The sequence is created by migration 214. The lazy CREATE below is only a
+// fallback for a database that has not run it, and it is issued ONLY when the
+// sequence is missing: Postgres checks the CREATE privilege before it looks
+// for the object, so `CREATE SEQUENCE IF NOT EXISTS` fails for app_tenant —
+// which may not create objects — even when the sequence exists. Issued on
+// every call, it failed every payment under RLS.
 //
 // USAGE:
 //   const { genReceiptNo } = require('../db/receipts');
@@ -19,10 +24,18 @@
 
 const pool = require('./pool');
 
+// Once the sequence is known to exist it cannot stop existing, so the check
+// runs once per process rather than once per receipt.
+let sequenceKnown = false;
+
 async function ensureSequence(client) {
-  // CREATE SEQUENCE IF NOT EXISTS is safe to call repeatedly. Postgres ignores
-  // the CREATE if the sequence already exists.
-  await client.query(`CREATE SEQUENCE IF NOT EXISTS receipt_no_seq START 100001`);
+  if (sequenceKnown) return;
+  // to_regclass needs no privilege on the schema, unlike CREATE.
+  const { rows } = await client.query(`SELECT to_regclass('receipt_no_seq') IS NOT NULL AS present`);
+  if (!rows[0]?.present) {
+    await client.query(`CREATE SEQUENCE IF NOT EXISTS receipt_no_seq START 100001`);
+  }
+  sequenceKnown = true;
 }
 
 function pad(n, w) {
