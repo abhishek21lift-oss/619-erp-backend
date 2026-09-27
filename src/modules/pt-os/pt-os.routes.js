@@ -20,6 +20,7 @@ const { generateCheckinInsight, MAX_WEEKS } = require('./checkin-ai');
 const { buildRecovery } = require('./recovery');
 const { routedChat } = require('../../lib/ai/router');
 const { logActivity } = require('../../lib/activityLog');
+const { recordPtPayment } = require('../../lib/ptPayments');
 
 /**
  * Where a client found the studio.
@@ -1447,121 +1448,33 @@ router.post('/payments', auth, wrap(async (req, res) => {
     });
   }
 
-  // A payment can only be recorded against a client in the caller's own org.
-  if (client_id && !await clientInOrg(req, client_id))
+  // The write — client lock, ledger row, balance, receipt number, activity
+  // log, and payment_received after COMMIT — is lib/ptPayments.js, shared with
+  // Finance → Record Payment (POST /api/payments) so the two paths cannot
+  // drift again. It used to be a second copy here that had drifted: no
+  // receipt number unless the form typed a reference, no activity log, and a
+  // trainer only when the form named one.
+  //
+  // What stays here is this endpoint's contract: a client is optional (a
+  // payment can be recorded with none, and then nothing is locked and no
+  // balance moves), the incentive is whatever the form entered, and the
+  // form's own reference is kept as the receipt number when it gives one.
+  const result = await recordPtPayment(req, {
+    orgId: orgIdOf(req),
+    clientId: client_id || null,
+    amount: numAmount,
+    method: payment_method ?? null,
+    date: date || new Date(),
+    notes: notes ?? null,
+    paymentRef: payment_ref || null,
+    trainerId: trainer_id || null,
+    incentive: { amount: incentive_amt ?? 0 },
+  });
+  if (result.notFound) {
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-
-  // pt_payments.trainer_id references trainers (migration 072). Resolved
-  // within this studio only: the id the caller sent if it is this studio's
-  // trainer profile, else the client's own trainer profile, else null. Every
-  // lookup carries the organization, so a trainer id from another studio can
-  // neither be stored here nor be used to read that studio's profile.
-  const orgId = orgIdOf(req);
-  let resolvedTrainerId = (await trainerForOrg(pool, orgId, trainer_id))?.id || null;
-  if (!resolvedTrainerId && trainer_id && client_id) {
-    const { rows: cl } = await pool.query(
-      'SELECT trainer_id FROM pt_clients WHERE id = $1 AND deleted_at IS NULL AND organization_id = $2',
-      [client_id, orgId]
-    );
-    resolvedTrainerId = (await trainerForOrg(pool, orgId, cl[0]?.trainer_id))?.id || null;
   }
 
-  // The ledger row and the client's balance move together, or not at all.
-  //
-  // These were two bare pool.query() calls. Both are individually correct —
-  // the balance update is relative (`paid_amount + $1`), so concurrent
-  // payments cannot lose each other's increments — but nothing tied them
-  // together. A failure between them (a constraint, a dropped connection, the
-  // 15s query_timeout in db/pool.js) left the payment recorded and the balance
-  // untouched: money in the ledger that the client's outstanding figure does
-  // not know about, silent, and surfacing much later as a reconciliation
-  // discrepancy nobody can account for.
-  //
-  // /api/payments has always done this correctly — BEGIN, lock the client row,
-  // insert, update, COMMIT — and this endpoint is the one the PT-OS client
-  // payments screen actually calls. The two paths write the same two tables
-  // and should not disagree about how.
-  //
-  // FOR UPDATE on the client, matching routes/payments.js: it serialises
-  // concurrent payments for one client so the row's balance cannot drift, and
-  // it is what makes a double-submitted "Record Payment" queue rather than
-  // interleave.
-  const tx = await pool.connect();
-  try {
-    await tx.query('BEGIN');
-
-    // Only lock when there is a client to lock. client_id is optional on this
-    // endpoint (a payment can be recorded without one), and `WHERE id = NULL`
-    // would match nothing while still costing a round trip.
-    if (client_id) {
-      await tx.query(
-        'SELECT 1 FROM pt_clients WHERE id = $1 AND deleted_at IS NULL AND organization_id = $2 FOR UPDATE',
-        [client_id, orgId]
-      );
-    }
-
-    const { rows } = await tx.query(
-      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes, organization_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [client_id, resolvedTrainerId, numAmount, incentive_amt ?? 0, payment_method, payment_ref, date || new Date(), notes,
-       orgId]
-    );
-
-    if (client_id) {
-      await tx.query(
-        `UPDATE pt_clients SET
-           paid_amount = paid_amount + $1,
-           balance_amount = GREATEST(balance_amount - $1, 0),
-           updated_at = NOW()
-         WHERE id = $2 AND deleted_at IS NULL AND organization_id = $3`,
-        [numAmount, client_id, orgId]
-      );
-    }
-
-    await tx.query('COMMIT');
-
-    // ── The automation event, which this endpoint never emitted ────────────
-    //
-    // Money can arrive through five paths in this codebase. Before this, only
-    // two of them told automation about it: /clients/:id/renew and the
-    // enrolment PATCH on /clients/:id. This one — the endpoint the PT-OS
-    // client payments screen actually calls, as the comment above says —
-    // recorded the payment, updated the balance, and stopped.
-    //
-    // So a studio with an active payment_received rule and a CONNECTED
-    // WhatsApp saw messages for some payments and silence for others, with no
-    // failed row and nothing in the queue to explain the difference. It was
-    // not a delivery failure; the message was never asked for. Production on
-    // 2026-09-11 shows all three of it: two payments recorded through the
-    // profile PATCH both sent within two seconds, and one recorded here, in
-    // between them, produced no communication_logs row at all.
-    //
-    // AFTER the commit, deliberately, and outside the transaction. A
-    // rolled-back payment must never message the client, and automation must
-    // never be able to fail a payment. emit() does not throw, but it also has
-    // no business holding a transaction open. This matches how logActivity is
-    // sequenced in routes/payments.js for the same reason.
-    //
-    // The payment's own id is the event key. The two older call sites compose
-    // one from client + amount + date because they have no payment id to hand
-    // and say so; here we do. That makes two genuine same-amount payments on
-    // one day two events rather than one, while a retried request still
-    // dedupes to one.
-    if (client_id) {
-      await automation.paymentReceived(req, {
-        clientId: client_id,
-        amount: numAmount,
-        eventKey: rows[0].id,
-      });
-    }
-
-    res.status(201).json({ data: rows[0] });
-  } catch (err) {
-    await tx.query('ROLLBACK').catch(() => {});
-    throw err;
-  } finally {
-    tx.release();
-  }
+  res.status(201).json({ data: result.payment });
 }));
 
 // ─── Execute Duplicate Merge ─────────────────────────────────

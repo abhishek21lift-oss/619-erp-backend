@@ -157,14 +157,36 @@ describe('every payment writer raises payment_received', () => {
   it('pins the two endpoints the incident was actually about', () => {
     const byFile = Object.fromEntries(writers.map((w) => [w.file, w.code]));
 
-    // POST /api/pt-os/payments — the PT-OS payments screen. This is the one
-    // that recorded a payment in production and sent nothing.
-    expect(byFile['src/modules/pt-os/pt-os.routes.js']).toBeDefined();
-    expect(byFile['src/modules/pt-os/pt-os.routes.js']).toMatch(RAISES_EVENT);
+    // POST /api/pt-os/payments (the PT-OS payments screen — the one that
+    // recorded a payment in production and sent nothing) and POST
+    // /api/payments (the finance ledger, same gap) now both write through
+    // lib/ptPayments.js. So the writer that must raise the event is that one…
+    expect(byFile['src/lib/ptPayments.js']).toBeDefined();
+    expect(byFile['src/lib/ptPayments.js']).toMatch(RAISES_EVENT);
 
-    // POST /api/payments — the finance ledger, same gap.
-    expect(byFile['src/routes/payments.js']).toBeDefined();
-    expect(byFile['src/routes/payments.js']).toMatch(RAISES_EVENT);
+    // …and each endpoint's POST handler must actually go through it. Checked
+    // per handler: a file-level match would still pass if one of the two
+    // grew its own INSERT back and the other kept the delegation.
+    const postHandler = (file, route) => {
+      const code = stripComments(fs.readFileSync(path.join(SRC, '..', file), 'utf8'));
+      return code.split(/(?=router\.(?:get|post|patch|put|delete)\()/)
+        .find((chunk) => chunk.startsWith(`router.post(${route}`));
+    };
+    for (const [file, route] of [
+      ['src/modules/pt-os/pt-os.routes.js', "'/payments'"],
+      ['src/routes/payments.js', "'/'"],
+    ]) {
+      const handler = postHandler(file, route);
+      expect({ file, handler: Boolean(handler) }).toEqual({ file, handler: true });
+      expect({ file, delegates: /recordPtPayment\s*\(/.test(handler) })
+        .toEqual({ file, delegates: true });
+      expect({ file, ownInsert: /INSERT\s+INTO\s+pt_payments/i.test(handler) })
+        .toEqual({ file, ownInsert: false });
+    }
+
+    // The enrolment and renewal handlers still write their own rows, and
+    // still raise the event themselves.
+    expect(byFile['src/modules/pt-os/pt-os.routes.js']).toMatch(RAISES_EVENT);
   });
 });
 
@@ -194,7 +216,7 @@ describe('the event is raised outside the transaction that owns the payment', ()
 
   it.each([
     ['src/modules/pt-os/pt-os.routes.js'],
-    ['src/routes/payments.js'],
+    ['src/lib/ptPayments.js'],
   ])('%s never raises it with a transaction still open', (file) => {
     const handlers = handlersRaising(file);
     expect(handlers.length).toBeGreaterThan(0);
@@ -235,7 +257,7 @@ describe('the event key is a payment identity, not a clock reading', () => {
 
   const CALL_SITES = [
     'src/modules/pt-os/pt-os.routes.js',
-    'src/routes/payments.js',
+    'src/lib/ptPayments.js',
     'src/routes/invoices.js',
     'src/lib/upiPayments.js',
   ];
@@ -275,10 +297,11 @@ describe('the event key is a payment identity, not a clock reading', () => {
 
   it('every payment call site was actually examined', () => {
     // A regex that quietly matches nothing would pass both guards above
-    // without reading a line of the thing it claims to check. Six call sites
-    // exist across the four files; this fails if that stops being true rather
+    // without reading a line of the thing it claims to check. Five call sites
+    // exist across the four files (six until the two manual-payment
+    // endpoints were folded into lib/ptPayments.js); this fails if that stops being true rather
     // than silently narrowing.
     const total = CALL_SITES.reduce((n, f) => n + eventKeysIn(f).length, 0);
-    expect(total).toBe(6);
+    expect(total).toBe(5);
   });
 });

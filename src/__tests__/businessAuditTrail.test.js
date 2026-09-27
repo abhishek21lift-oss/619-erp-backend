@@ -17,6 +17,8 @@ const ptOs = fs.readFileSync(
   path.join(__dirname, '..', 'modules', 'pt-os', 'pt-os.routes.js'), 'utf8');
 const payments = fs.readFileSync(
   path.join(__dirname, '..', 'routes', 'payments.js'), 'utf8');
+const ptPayments = fs.readFileSync(
+  path.join(__dirname, '..', 'lib', 'ptPayments.js'), 'utf8');
 
 describe('client writes are audited', () => {
   it('logs create, update and delete, each with the record\'s own id', () => {
@@ -44,11 +46,20 @@ describe('the trainer commission endpoint', () => {
 
 describe('payment writes are audited', () => {
   it('logs create only after COMMIT — never before, where a later rollback could make the row a lie', () => {
-    const create = payments.slice(payments.indexOf("router.post('/', auth"));
-    const commitAt = create.indexOf("tx.query('COMMIT')");
-    const logAt = create.indexOf("logActivity(req, 'payment.create'");
+    // The write lives in lib/ptPayments.js, shared by both manual-payment
+    // endpoints — so the client profile's Payments tab, which never used to
+    // log a payment at all, is now audited by the same line.
+    const commitAt = ptPayments.indexOf("tx.query('COMMIT')");
+    const logAt = ptPayments.indexOf("logActivity(req, 'payment.create'");
     expect(commitAt).toBeGreaterThan(-1);
     expect(logAt).toBeGreaterThan(commitAt);
+  });
+
+  it('routes both manual-payment endpoints through that audited write', () => {
+    const financePost = payments.slice(payments.indexOf("router.post('/', auth"));
+    expect(financePost).toMatch(/recordPtPayment\(req,/);
+    const ptOsPost = ptOs.slice(ptOs.indexOf("router.post('/payments', auth"));
+    expect(ptOsPost.slice(0, ptOsPost.indexOf('router.', 10))).toMatch(/recordPtPayment\(req,/);
   });
 
   it('logs the delete on the one ledger it can delete from', () => {

@@ -16,17 +16,14 @@
 //   • DELETE handles rows from either ledger and reverses the balance on
 //     the owning client table.
 const router = require('express').Router();
-const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
-const { genReceiptNo } = require('../db/receipts');
 const { auth, requireTrainer } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { paymentSchemas } = require('../lib/validation');
 const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 const { logActivity } = require('../lib/activityLog');
-const automation = require('../modules/automation/automation.triggers');
-const { trainerForOrg } = require('../lib/studioTrainer');
+const { recordPtPayment } = require('../lib/ptPayments');
 
 // The studio's finance ledger: the trainer's, and nobody else's. Declared on
 // the router as well as at the mount (server.js) so the guard travels with the
@@ -106,9 +103,15 @@ router.get('/', auth, async (req, res, next) => {
   }
 });
 
-// POST /api/payments
+// POST /api/payments — Finance → Record Payment.
+//
+// The write itself — the client lock, the ledger row, the balance, the
+// receipt number, the activity log and payment_received after COMMIT — is
+// lib/ptPayments.js, shared with the client profile's Payments tab so the two
+// cannot drift. What stays here is this endpoint's own contract: a client is
+// required, the incentive is the trainer's rate, and the receipt number is
+// always issued rather than taken from the request.
 router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) => {
-  const tx = await pool.connect();
   try {
     const d = req.body;
     if (!d.client_id || !d.amount || !d.date)
@@ -118,91 +121,24 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
     if (!Number.isFinite(amount) || amount <= 0)
       return res.status(400).json({ error: 'Amount must be a positive number' });
 
-    await tx.query('BEGIN');
-
-    // Get client info (lock the row to prevent concurrent balance drift)
-    // The client must belong to the caller's organization — otherwise this
-    // is a cross-tenant write. Filtered in the lookup itself (not compared
-    // afterwards) and answered 404, so another studio's id is
-    // indistinguishable from one that does not exist.
-    const scope = tenantScope(req);
-    const { rows: cl } = await tx.query(
-      'SELECT * FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id=$2 FOR UPDATE',
-      [d.client_id, scope.orgId]
-    );
-    if (!cl[0]) {
-      await tx.query('ROLLBACK');
-      return res.status(404).json({ error: 'Client not found' });
-    }
-
-    // The client's trainer profile, resolved inside this studio. A stale or
-    // foreign trainer_id resolves to NULL rather than failing the payment on
-    // the FK (23503).
-    let resolvedTrainerId = null;
-    let incentiveRate = 0.5;
-    const tr = await trainerForOrg(tx, cl[0].organization_id, cl[0].trainer_id);
-    if (tr) {
-      resolvedTrainerId = tr.id;
-      incentiveRate     = tr.incentive_rate ?? 0.5;
-    }
-
-    const id = randomUUID();
-    const receiptNo = await genReceiptNo(tx);
-
-    await tx.query(`
-      INSERT INTO pt_payments (id, client_id, trainer_id, amount, incentive_amt,
-        payment_method, payment_ref, date, notes, organization_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [id, d.client_id, resolvedTrainerId,
-       amount, Math.round(amount * incentiveRate),
-       String(d.method || 'CASH').toUpperCase(), receiptNo, d.date,
-       d.notes || null, cl[0].organization_id]
-    );
-
-    // Update client balance
-    await tx.query(`
-      UPDATE pt_clients
-      SET paid_amount = paid_amount + $1,
-          balance_amount = GREATEST(0, balance_amount - $1),
-          updated_at = NOW()
-      WHERE id = $2 AND organization_id = $3`, [amount, d.client_id, cl[0].organization_id]
-    );
-
-    await tx.query('COMMIT');
-
-    const { rows } = await pool.query(`
-      SELECT p.*, UPPER(p.payment_method) AS method, p.payment_ref AS receipt_no,
-             c.name AS client_name
-      FROM pt_payments p LEFT JOIN pt_clients c ON c.id = p.client_id AND c.organization_id = p.organization_id
-      WHERE p.id=$1 AND p.organization_id=$2`, [id, cl[0].organization_id]);
-    // After COMMIT, on pool.query rather than tx — logActivity opens its own
-    // connection, and a row logged before the transaction actually lands
-    // would describe a payment that, on rollback, never happened.
-    await logActivity(req, 'payment.create', 'pt_payment', id, rows[0]);
-
-    // Same reasoning as logActivity above, and the same placement: after
-    // COMMIT, on its own connection, outside the transaction. A rolled-back
-    // payment must not message the client, and automation must never be able
-    // to fail a payment.
-    //
-    // This endpoint recorded payments without emitting payment_received, so a
-    // studio's automation stayed silent for money taken through the finance
-    // ledger while firing for the same money taken through the client profile.
-    // The payment id is the event key, so a retried request dedupes to one
-    // event while two genuine payments of equal amount on one day stay two.
-    await automation.paymentReceived(req, {
+    // Scoped in the lookup itself and answered 404, so another studio's
+    // client id is indistinguishable from one that does not exist.
+    const result = await recordPtPayment(req, {
+      orgId: tenantScope(req).orgId,
       clientId: d.client_id,
       amount,
-      eventKey: id,
+      method: String(d.method || 'CASH').toUpperCase(),
+      date: d.date,
+      notes: d.notes || null,
+      paymentRef: null,
+      incentive: 'trainer_rate',
     });
+    if (result.notFound) return res.status(404).json({ error: 'Client not found' });
 
-    res.status(201).json({ message: 'Payment recorded', payment: rows[0] });
+    res.status(201).json({ message: 'Payment recorded', payment: result.payment });
   } catch (err) {
-    await tx.query('ROLLBACK').catch(() => {});
     logger.error({ err: err.message }, 'Payment error');
     next(err);
-  } finally {
-    tx.release();
   }
 });
 
@@ -236,7 +172,9 @@ router.get('/stats', auth, async (req, res, next) => {
         COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'CASH'),  0)          AS cash,
         COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'UPI'),   0)          AS upi,
         COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'CARD'),  0)          AS card,
-        COALESCE(SUM(p.amount) FILTER (WHERE p.method = 'NEFT' OR p.method = 'BANK'), 0) AS bank,
+        -- BANK_TRANSFER is what the client profile's Payments tab records;
+        -- leaving it out put those payments in the total but in no method.
+        COALESCE(SUM(p.amount) FILTER (WHERE p.method IN ('NEFT', 'BANK', 'BANK_TRANSFER')), 0) AS bank,
         COALESCE(SUM(p.incentive_amt), 0)                                     AS total_incentives
       FROM (${LEDGER_SQL}) p
       ${where}

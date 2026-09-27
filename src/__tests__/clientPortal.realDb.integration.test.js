@@ -36,6 +36,13 @@ jest.mock('../db/pool', () => {
   return new Pool({ connectionString: mockDbUrl, max: 4 });
 });
 
+// The studio's calendar date, which is what the service reads "this week"
+// from. NOT the database's CURRENT_DATE: CI's Postgres runs in UTC, so from
+// 18:30 UTC on a Sunday the database is still on Sunday while the studio (IST)
+// is already on Monday — a new week. A session dated CURRENT_DATE then lands
+// in last week and "trained this week" reads false for 5½ hours every week.
+const { today: studioToday } = require('../lib/appTime');
+
 // Unique to this suite. The real-database suites run in parallel against one
 // database, so a studio id shared with another suite means each one's cleanup
 // deletes rows the other still holds.
@@ -84,7 +91,7 @@ describeIf('/api/me against a real database', () => {
        VALUES ($1, 'fat_loss', 'fat_loss', TRUE, $2)`, [CLIENT, ORG]);
     await pool.query(
       `INSERT INTO pt_payments (id, client_id, amount, payment_method, date, organization_id)
-       VALUES ('me-int-pay', $1, 20000, 'CASH', CURRENT_DATE, $2) ON CONFLICT (id) DO NOTHING`, [CLIENT, ORG]);
+       VALUES ('me-int-pay', $1, 20000, 'CASH', $3, $2) ON CONFLICT (id) DO NOTHING`, [CLIENT, ORG, studioToday()]);
     await pool.query(
       `INSERT INTO pt_parq_forms (id, client_id, full_name, organization_id, risk_level, status,
                                   parq_yes_count, trainer_notes)
@@ -99,8 +106,8 @@ describeIf('/api/me against a real database', () => {
     await pool.query(
       `INSERT INTO workout_sessions (id, client_id, session_date, program_name, workout_day,
                                      duration_minutes, status, notes, organization_id)
-       VALUES ($1, $2, CURRENT_DATE, 'Strength base', 'Day 1', 55, 'completed',
-               'INTERNAL: knee niggle, go easy', $3) ON CONFLICT (id) DO NOTHING`, [SESSION, CLIENT, ORG]);
+       VALUES ($1, $2, $4, 'Strength base', 'Day 1', 55, 'completed',
+               'INTERNAL: knee niggle, go easy', $3) ON CONFLICT (id) DO NOTHING`, [SESSION, CLIENT, ORG, studioToday()]);
     await pool.query(
       `INSERT INTO workout_session_exercises (id, session_id, exercise_name, sort_order)
        VALUES ($1, $2, 'Back squat', 1) ON CONFLICT (id) DO NOTHING`, [SESSION_EX, SESSION]);
