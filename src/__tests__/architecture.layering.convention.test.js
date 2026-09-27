@@ -105,7 +105,7 @@ function rel(file) {
  * describe the same thing.
  */
 const BUDGETS = {
-  'modules/pt-os/pt-os.routes.js': 93,
+  'modules/pt-os/pt-os.routes.js': 75,
   'modules/pt-os/workout-log.routes.js': 40,
   'routes/exercises.js': 43,
   'routes/workouts.js': 40,
@@ -124,7 +124,7 @@ const BUDGETS = {
   'routes/qr-checkin.js': 14,
   'modules/automation/automation.routes.js': 14,
   'routes/admin-reset.js': 14,
-  'routes/payments.js': 13,
+  'routes/payments.js': 7,
   'routes/diet.js': 12,
   'routes/client-login.js': 11,
   'routes/communication.js': 10,
@@ -223,8 +223,9 @@ describe('the migration has a number attached to it', () => {
     // its entry was deleted outright — the first file in the register to
     // reach zero. 704 once the workout log's PR and plan-progress rules moved
     // to workout-log.service, where the member app's self-logging reuses them. 699 once
-    // starting a session moved there too, and workouts.js was re-measured. Lower it with each extraction — the number only means
+    // starting a session moved there too, and workouts.js was re-measured. 675 once both manual-payment endpoints
+    // moved their write to lib/ptPayments.js and those two files were re-measured. Lower it with each extraction — the number only means
     // something if it tracks reality.
-    expect(ceiling).toBe(699);
+    expect(ceiling).toBe(675);
   });
 });

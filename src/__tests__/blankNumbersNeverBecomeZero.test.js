@@ -106,7 +106,8 @@ describe('POST /api/pt-os/payments — a blank amount is not ₹0', () => {
   it('still records a real payment, with the parsed number', async () => {
     await post({ client_id: 'c1', amount: '1500.50' }).expect(201);
     const params = paramsOf(/INSERT INTO pt_payments/i);
-    expect(params[2]).toBe(1500.5);
+    // (id, client_id, trainer_id, amount, …) — the shared writer's order.
+    expect(params[3]).toBe(1500.5);
   });
 
   it('reads a figure typed with a separator rather than banking its prefix', async () => {
