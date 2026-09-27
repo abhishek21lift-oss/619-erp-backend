@@ -335,12 +335,21 @@ function scopeClient(client, orgId, log = logger) {
   // so the next borrow would bind that copy, and the chain would grow one
   // layer per borrow for the life of the process. Caught by the identity
   // assertion in tenantScopedClient.test.js.
+  //
+  // query only. release is NOT cached across borrows: pg-pool hands each
+  // checkout a fresh release-once closure (pg-pool _releaseOnce), so the one
+  // this borrow must call is the one on the client right now. Caching the
+  // first checkout's closure made every later scoped borrow of the same
+  // connection call a spent closure — "Release called on client which has
+  // already been released to the pool", a 500 on whatever transaction drew
+  // that connection, and the live checkout never returned to the pool.
   if (!client[PRISTINE]) {
-    client[PRISTINE] = { query: client.query, release: client.release };
+    client[PRISTINE] = { query: client.query };
   }
-  const { query: pristineQuery, release: pristineRelease } = client[PRISTINE];
+  const { query: pristineQuery } = client[PRISTINE];
+  const checkoutRelease = client.release;
   const origQuery = (...a) => pristineQuery.apply(client, a);
-  const origRelease = (...a) => pristineRelease.apply(client, a);
+  const origRelease = (...a) => checkoutRelease.apply(client, a);
   let inTransaction = false;
   let warned = false;
 
@@ -380,7 +389,7 @@ function scopeClient(client, orgId, log = logger) {
 
   client.release = function scopedRelease(...args) {
     client.query = pristineQuery;
-    client.release = pristineRelease;
+    client.release = checkoutRelease;
     return origRelease(...args);
   };
 

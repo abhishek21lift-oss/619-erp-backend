@@ -178,6 +178,33 @@ describe('scopeClient', () => {
     expect(c.log).toHaveLength(150);
   });
 
+  it('releases THIS checkout, not the first one, when a connection is reused', () => {
+    // pg-pool gives every checkout its own release-once closure. The wrapper
+    // used to cache the first checkout's and call it forever after, so the
+    // second scoped borrow of a connection threw "Release called on client
+    // which has already been released to the pool" — and never released the
+    // live checkout. A fake with one shared release could not see it.
+    const c = fakeClient();
+    const checkouts = [];
+    const checkout = () => {
+      let released = false;
+      const rel = jest.fn(() => {
+        if (released) throw new Error('Release called on client which has already been released to the pool.');
+        released = true;
+      });
+      checkouts.push(rel);
+      c.release = rel;             // what pg-pool does on every acquire
+    };
+
+    for (let i = 0; i < 3; i++) {
+      checkout();
+      scopeClient(c, `org-${i}`, silent);
+      expect(() => c.release()).not.toThrow();
+    }
+    // Each checkout's own closure was called exactly once.
+    expect(checkouts.map((r) => r.mock.calls.length)).toEqual([1, 1, 1]);
+  });
+
   it('passes callback-style query straight through', async () => {
     // pg still supports it; nothing in this repo uses it, and a wrapper that
     // assumed a promise would break it silently.
