@@ -12,6 +12,7 @@ const lifestyleScoring = require('./lifestyle-scoring');
 const nutritionScoring = require('./nutrition-scoring');
 const mobilityScoring = require('./mobility-scoring');
 const postureScoring = require('./posture-scoring');
+const strengthLogs = require('./strength-logs.repo');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -138,6 +139,19 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
 
   // ── Step 1: Blood Pressure ──
   const bp = scoring.classifyBp(b.bp_systolic ?? null, b.bp_diastolic ?? null);
+  // An unsafe resting reading (stage-2 hypertension or hypotension) stops
+  // the exertion tests: a step test, a 1RM or an endurance set to failure
+  // on top of it is the risk the reading exists to catch. The reading itself,
+  // the measurements and flexibility are still recorded. The wizard skips
+  // these steps on its own; this is the rule, for any caller.
+  const exertion = [b.cardio_test_type, b.strength_exercise, b.strength_exercise_2, b.endurance_test_type, b.endurance_test_type_2]
+    .some((v) => v != null && v !== '');
+  if (bp.isUnsafe && exertion) {
+    return res.status(400).json({ error: {
+      code: 'BP_UNSAFE',
+      message: `Resting blood pressure is ${bp.category} — exertion tests (cardio, strength, endurance) cannot be recorded. Refer for medical clearance.`,
+    } });
+  }
 
   // ── Step 2: Anthropometric ──
   const bmi = scoring.calcBmi(b.weight, b.height_cm);
@@ -554,13 +568,8 @@ router.post('/strength-logs', auth, requireTrainer, validate(strengthLogCreateSc
   if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   // An assessment link is a foreign key into another table; it must be one
   // of this studio's assessments for this client, or none.
-  if (assessment_id) {
-    const aParams = [assessment_id, client_id];
-    const aOrg = orgWhere(req, aParams);
-    const { rowCount } = await pool.query(
-      `SELECT 1 FROM pt_assessments WHERE id = $1 AND client_id = $2${aOrg}`, aParams
-    );
-    if (!rowCount) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Assessment not found' } });
+  if (assessment_id && !await strengthLogs.assessmentBelongs(req, assessment_id, client_id)) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Assessment not found' } });
   }
   const formula = one_rm_formula === 'brzycki' ? 'brzycki' : 'epley';
   const direct = Boolean(is_direct_1rm);
@@ -570,13 +579,59 @@ router.post('/strength-logs', auth, requireTrainer, validate(strengthLogCreateSc
   const oneRm = direct
     ? num(one_rm_estimate, num(weight_kg))
     : scoring.calc1RM(num(weight_kg), reps, formula);
-  const { rows } = await pool.query(
-    `INSERT INTO strength_logs (client_id, exercise_name, weight_kg, sets_done, reps_done, one_rm_estimate, notes, assessment_id, one_rm_formula, is_direct_1rm, organization_id, log_date)
-     VALUES ($1,$2,$3,$4,$5,ROUND($6::NUMERIC,2),$7,$8,$9,$10,$11,COALESCE($12::date, CURRENT_DATE)) RETURNING *`,
-    [client_id, exercise_name, num(weight_kg), num(sets_done, direct ? 1 : 3), reps, oneRm, notes || null,
-     assessment_id || null, formula, direct, orgIdOf(req), log_date || null]
-  );
-  res.status(201).json({ data: rows[0] });
+  const row = await strengthLogs.insertLog({
+    clientId: client_id, exerciseName: exercise_name, weightKg: num(weight_kg), setsDone: num(sets_done, direct ? 1 : 3),
+    repsDone: reps, oneRm, notes: notes || null, assessmentId: assessment_id || null, formula, direct,
+    organizationId: orgIdOf(req), logDate: log_date || null,
+  });
+  res.status(201).json({ data: row });
+}));
+
+// PATCH / DELETE /strength-logs/:id — a strength log used to be permanent,
+// so a 2000 kg typo stayed the client's "latest" lift and a spike on their
+// trend for good. Same bounds as create; the 1RM is recomputed from the
+// merged row, never taken from the body for an estimated lift.
+const strengthLogUpdateSchema = {
+  body: z.object({
+    exercise_name: z.string().trim().min(1).max(100).optional(),
+    weight_kg: z.coerce.number().positive().max(1000).optional(),
+    sets_done: z.coerce.number().int().min(1).max(50).optional().nullable(),
+    reps_done: z.coerce.number().int().min(1).max(100).optional(),
+    notes: z.string().max(1000).optional().nullable(),
+    one_rm_formula: z.enum(['epley', 'brzycki']).optional(),
+    is_direct_1rm: z.boolean().optional(),
+    one_rm_estimate: z.coerce.number().positive().max(1000).optional().nullable(),
+    log_date: z.string().optional().refine(
+      (v) => !v || (!Number.isNaN(Date.parse(v)) && Date.parse(v) <= Date.now() + 86400000),
+      { message: 'log_date must be a valid date, not in the future' }
+    ),
+  }),
+};
+
+router.patch('/strength-logs/:id', auth, requireTrainer, validate(strengthLogUpdateSchema), wrap(async (req, res) => {
+  const existing = await strengthLogs.findLog(req, req.params.id);
+  if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
+  const b = req.body;
+  const m = { ...existing, ...Object.fromEntries(Object.entries(b).filter(([, v]) => v !== undefined)) };
+  const direct = Boolean(m.is_direct_1rm);
+  const formula = m.one_rm_formula === 'brzycki' ? 'brzycki' : 'epley';
+  const weight = num(m.weight_kg);
+  const reps = direct ? 1 : num(m.reps_done);
+  const oneRm = direct
+    ? num(b.one_rm_estimate, weight)
+    : scoring.calc1RM(weight, reps, formula);
+
+  const row = await strengthLogs.updateLog(existing.id, {
+    exerciseName: m.exercise_name, weightKg: weight, setsDone: m.sets_done ?? null, repsDone: reps, oneRm,
+    notes: m.notes ?? null, formula, direct, logDate: m.log_date,
+  });
+  res.json({ data: row });
+}));
+
+router.delete('/strength-logs/:id', auth, requireTrainer, wrap(async (req, res) => {
+  if (!await strengthLogs.deleteLog(req, req.params.id)) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  res.status(204).end();
 }));
 
 router.get('/progress-photos', auth, wrap(async (req, res) => {
@@ -1128,6 +1183,18 @@ const mobilityPerformanceAssessmentCreateSchema = {
   }),
 };
 
+// Referrals are derived from what is stored (pain flags, scoliosis), never
+// stored themselves, so every row read back carries them — including rows
+// saved before the rule existed.
+function withMobilityReferrals(row) {
+  if (!row) return row;
+  return { ...row, referrals: mobilityScoring.calcMobilityReferrals(row.body_regions, row.mobility_tests) };
+}
+function withPostureReferrals(row) {
+  if (!row) return row;
+  return { ...row, referrals: postureScoring.calcPostureReferrals(row.front_issues, row.side_issues, row.back_issues) };
+}
+
 function computeMobilityAnalysis(b) {
   const mobilityScore = mobilityScoring.calcMobilityScore(b.body_regions ?? null, b.mobility_tests ?? null);
   const mobilityCategory = mobilityScoring.classifyMobility(mobilityScore);
@@ -1147,7 +1214,7 @@ router.get('/mobility-performance-assessments', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT * FROM pt_mobility_performance_assessments ${whereSql} ORDER BY assessment_date DESC`, params
   );
-  res.json({ data: rows });
+  res.json({ data: rows.map(withMobilityReferrals) });
 }));
 
 router.post('/mobility-performance-assessments', auth, requireTrainer, validate(mobilityPerformanceAssessmentCreateSchema), wrap(async (req, res) => {
@@ -1174,7 +1241,7 @@ router.post('/mobility-performance-assessments', auth, requireTrainer, validate(
       analysis.mobilityScore, analysis.mobilityCategory, req.user.id, orgIdOf(req),
     ]
   );
-  res.status(201).json({ data: rows[0] });
+  res.status(201).json({ data: withMobilityReferrals(rows[0]) });
 }));
 
 router.patch('/mobility-performance-assessments/:id', auth, wrap(async (req, res) => {
@@ -1210,7 +1277,7 @@ router.patch('/mobility-performance-assessments/:id', auth, wrap(async (req, res
 
   sets.push('updated_at = NOW()');
   const { rows } = await pool.query(`UPDATE pt_mobility_performance_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
-  res.json({ data: rows[0] });
+  res.json({ data: withMobilityReferrals(rows[0]) });
 }));
 
 const postureAssessmentCreateSchema = {
@@ -1245,7 +1312,7 @@ router.get('/posture-assessments', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT * FROM pt_posture_assessments ${whereSql} ORDER BY assessment_date DESC`, params
   );
-  res.json({ data: rows });
+  res.json({ data: rows.map(withPostureReferrals) });
 }));
 
 router.post('/posture-assessments', auth, requireTrainer, validate(postureAssessmentCreateSchema), wrap(async (req, res) => {
@@ -1275,7 +1342,7 @@ router.post('/posture-assessments', auth, requireTrainer, validate(postureAssess
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
   );
-  res.status(201).json({ data: rows[0] });
+  res.status(201).json({ data: withPostureReferrals(rows[0]) });
 }));
 
 router.patch('/posture-assessments/:id', auth, wrap(async (req, res) => {
@@ -1308,7 +1375,7 @@ router.patch('/posture-assessments/:id', auth, wrap(async (req, res) => {
 
   sets.push('updated_at = NOW()');
   const { rows } = await pool.query(`UPDATE pt_posture_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
-  res.json({ data: rows[0] });
+  res.json({ data: withPostureReferrals(rows[0]) });
 }));
 
 module.exports = router;

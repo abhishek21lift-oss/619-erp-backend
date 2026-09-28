@@ -38,7 +38,21 @@ Fixed on `claude/project-setup-understanding-9t82iv` (backend + frontend):
 | S-1, S-2, S-3 | Bodyweight comes from the latest fitness test. NUMERIC values are coerced. The list limit is 200. |
 | S-5, S-6, S-7 | Strength logs are bounded, reps are required for an estimate, a direct 1RM is weight × 1, `log_date` is accepted, and `assessment_id` is org-checked. |
 
-Still open: A-6 (a live BP stop in the wizard), C-1 to C-6, F-2, F-4 to F-8, S-4, S-8, G-1 to G-4, L-1 (other PATCH schemas), L-2, L-3, M-1, PO-1, P-2, P-5 to P-9.
+Second batch (follow-up PR):
+
+| ID | Fix |
+|---|---|
+| A-6 | An unsafe resting BP skips the cardio, strength and endurance steps in the wizard. The API refuses exertion results with `BP_UNSAFE`. |
+| C-1 | A content change to a signed draft clears every signature. An unchanged re-save does not. |
+| C-2 | Only a completed consent can be revoked (409 otherwise), and the reason is logged. |
+| S-4 | Strength logs can be edited (with the 1RM recomputed) and deleted, org-scoped, with UI in Strength Tracking. The SQL moved to `strength-logs.repo.js`. |
+| F-2 | Harvard PEI uses the published bands. |
+| F-4 | No category for lifts or endurance tests without norms. Plank keeps its single scale. |
+| F-8 | An unknown sex gives no sex-split category, instead of female norms. |
+| G-1 | Goal readiness is scored out of the questions answered. |
+| M-1, PO-1 | Pain on a movement screen, or suspected scoliosis, produces a referral. It's derived on every read and shown live in the wizard. |
+
+Still open: C-3 to C-6, F-5, F-6, F-7, S-8, G-2 to G-4, L-1 (other PATCH schemas), L-2, L-3, P-2, P-5 to P-9.
 
 ---
 

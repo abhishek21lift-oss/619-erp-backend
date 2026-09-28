@@ -112,6 +112,38 @@ async function fetchClientSnapshot(clientId, req) {
   return rows[0] || null;
 }
 
+// Signed text must be the text that was signed. A draft is signed in two
+// calls (client, then trainer), and a PATCH between them could rewrite the
+// name, the acknowledgements or the medical answers under a signature
+// already given — the completed PDF would then show the client "signing"
+// words they never saw. So a content change to a draft that already carries
+// a signature clears every signature on it, and signing starts again.
+// Compared by value, not by presence in the body: the wizard re-sends the
+// whole form on every save, and an unchanged re-save must not unsign it.
+const SIGNED_CONTENT_FIELDS = [
+  ...SNAPSHOT_FIELDS, 'acknowledgements', 'physician_advised_against',
+  'physician_name', 'hospital', 'medical_condition',
+];
+
+function sameValue(a, b) {
+  const norm = (v) => {
+    if (v === undefined || v === null || v === '') return null;
+    if (v instanceof Date) {
+      const pad = (x) => String(x).padStart(2, '0');
+      return `${v.getFullYear()}-${pad(v.getMonth() + 1)}-${pad(v.getDate())}`;
+    }
+    if (typeof v === 'object') {
+      return JSON.stringify(Object.keys(v).sort().reduce((o, k) => { o[k] = v[k]; return o; }, {}));
+    }
+    return String(v);
+  };
+  return norm(a) === norm(b);
+}
+
+function changesSignedContent(existing, body) {
+  return SIGNED_CONTENT_FIELDS.some((k) => body[k] !== undefined && !sameValue(existing[k], body[k]));
+}
+
 // ─── Informed Consents ──────────────────────────────────────
 
 // GET /informed-consent?client_id= — active record first, then history.
@@ -272,6 +304,16 @@ router.patch('/informed-consent/:id', auth, requireTrainer, validate(updateSchem
       sets.push('exercise_consent_signed_at = NOW()');
     }
 
+    const hasSignature = existing.client_signature || existing.trainer_signature || existing.witness_signature;
+    const unsign = targetId === id && hasSignature && changesSignedContent(existing, b);
+    if (unsign) {
+      sets.push(
+        'client_signature = NULL', 'client_signed_at = NULL',
+        'trainer_signature = NULL', 'trainer_signed_at = NULL',
+        'witness_signature = NULL', 'witness_signed_at = NULL', 'witness_name = NULL'
+      );
+    }
+
     if (sets.length) {
       sets.push('updated_at = NOW()');
       await tx.query(`UPDATE pt_informed_consents SET ${sets.join(', ')} WHERE id = $1`, params);
@@ -280,6 +322,9 @@ router.patch('/informed-consent/:id', auth, requireTrainer, validate(updateSchem
     await tx.query('COMMIT');
 
     const { rows } = await pool.query('SELECT * FROM pt_informed_consents WHERE id = $1', [targetId]);
+    if (unsign) {
+      await logActivity(req, 'informed_consent.signatures_cleared', 'pt_informed_consents', targetId, { reason: 'content_changed' });
+    }
     if (targetId !== id) {
       await logActivity(req, 'informed_consent.new_version', 'pt_informed_consents', targetId, { previous_version_id: id });
     }
@@ -369,16 +414,40 @@ router.post('/informed-consent/:id/sign', auth, requireTrainer, validate(signSch
 }));
 
 // POST /informed-consent/:id/revoke
-router.post('/informed-consent/:id/revoke', auth, requireTrainer, wrap(async (req, res) => {
+//
+// Only a COMPLETED consent can be revoked: it is the client withdrawing an
+// agreement they gave. A draft was never given (discard or finish it), and
+// an archived version is history. Revoking either used to succeed and, for
+// an archived row, changed nothing the gate reads while looking as if it had.
+// A revocation is a hard stop on training (see lib/screeningGate.js), so the
+// reason is recorded with it.
+const revokeSchema = {
+  body: z.object({ reason: z.string().trim().max(1000).optional().nullable() }).optional().default({}),
+};
+
+router.post('/informed-consent/:id/revoke', auth, requireTrainer, validate(revokeSchema), wrap(async (req, res) => {
   const scope = tenantScope(req);
   const rvGuard = ' AND organization_id = $2';
-  const { rows } = await pool.query(
-    `UPDATE pt_informed_consents SET status = 'revoked', updated_at = NOW() WHERE id = $1${rvGuard} RETURNING *`,
+  // One statement: find the record in this studio, revoke it only if it is
+  // completed, and report its prior status either way (404 vs 409).
+  const { rows: [r] } = await pool.query(
+    `WITH target AS (
+       SELECT id, status FROM pt_informed_consents WHERE id = $1${rvGuard}
+     ), revoked AS (
+       UPDATE pt_informed_consents ic SET status = 'revoked', updated_at = NOW()
+         FROM target WHERE ic.id = target.id AND target.status = 'completed'
+       RETURNING ic.*
+     )
+     SELECT (SELECT status FROM target) AS prior_status,
+            (SELECT row_to_json(revoked) FROM revoked) AS record`,
     [req.params.id, scope.orgId]
   );
-  if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-  await logActivity(req, 'informed_consent.revoke', 'pt_informed_consents', req.params.id, {});
-  res.json({ data: rows[0] });
+  if (!r || !r.prior_status) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (!r.record) return res.status(409).json({ error: { code: 'NOT_REVOCABLE', status: r.prior_status } });
+  await logActivity(req, 'informed_consent.revoke', 'pt_informed_consents', req.params.id, {
+    reason: req.body?.reason || null,
+  });
+  res.json({ data: r.record });
 }));
 
 // ─── Medical Clearance Upload ───────────────────────────────
