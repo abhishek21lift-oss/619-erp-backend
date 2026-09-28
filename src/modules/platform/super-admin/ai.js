@@ -23,9 +23,14 @@ function aiDays(v, dflt = 30) {
 // Cost in rupees for a row's tokens, given the rate table. LEFT JOIN so an
 // unpriced model still contributes its tokens; COALESCE(...,0) on the rate
 // means it contributes zero cost rather than dropping the row to NULL.
+// What the provider actually charged when it said (cost_inr, recorded from
+// OpenRouter's usage.cost since the AI audit of 2026-09-28), otherwise the
+// operator's rate card. The rate card alone could only ever price the tokens
+// the log recorded, and the streaming paths recorded no prompt tokens at all.
 const COST_SQL = `
-  (COALESCE(r.prompt_per_1k_inr, 0)     * l.tokens_prompt     / 1000.0
- + COALESCE(r.completion_per_1k_inr, 0) * l.tokens_completion / 1000.0)`;
+  COALESCE(l.cost_inr,
+    COALESCE(r.prompt_per_1k_inr, 0)     * l.tokens_prompt     / 1000.0
+  + COALESCE(r.completion_per_1k_inr, 0) * l.tokens_completion / 1000.0)`;
 
 // ── GET /ai/overview ─────────────────────────────────────────────────────────
 router.get('/ai/overview', async (req, res, next) => {
@@ -57,6 +62,7 @@ router.get('/ai/overview', async (req, res, next) => {
            LEFT JOIN ai_model_rates r ON r.model = l.model
           WHERE l.created_at >= now() - ($1 || ' days')::interval
             AND l.model IS NOT NULL
+            AND l.cost_inr IS NULL -- the provider's own charge prices a call
             AND (r.model IS NULL OR (r.prompt_per_1k_inr = 0 AND r.completion_per_1k_inr = 0))
           ORDER BY 1`,
         [String(days)]

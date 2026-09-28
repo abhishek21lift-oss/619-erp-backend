@@ -22,6 +22,7 @@ const { routedChat, routedStream }     = require('../lib/ai/router');
 const { pingModel }                    = require('../lib/ai/openrouter');
 const { models }                       = require('../lib/ai/models');
 const { logUsage, getUserUsage, getModelStats } = require('../lib/ai/usage');
+const { usageFields, meteredChat } = require('../lib/ai/metering');
 const { retrieveContext }              = require('../lib/ai/knowledgeBase');
 const { runTools }                     = require('../lib/ai/tools');
 const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
@@ -142,7 +143,7 @@ async function buildClientContext(client_id, org) {
     // confirm the client exists, is not deleted, and passes the tenant
     // predicate BEFORE any child query executes. Same columns as before.
     const clientRes = await pool.query(
-      'SELECT name, dob, gender, mobile FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
+      'SELECT name, dob, gender FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
       [client_id, org]
     );
     const c = clientRes.rows[0];
@@ -661,9 +662,17 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       return resolveModel('chat');
     })();
 
+    // Iterated by hand rather than with `for await`: the stream's RETURN value
+    // carries the model that answered, the provider's exact token counts and
+    // cost, and the latency — `for await` throws it away, which is why chat
+    // usage was logged as zero prompt tokens and an estimated completion.
+    let chatMeta = null;
     try {
-      const gen = routedStream({ intent: 'chat', messages, temperature: 0.75, max_tokens: 1024 });
-      for await (const chunk of gen) {
+      const it = routedStream({ intent: 'chat', messages, temperature: 0.75, max_tokens: 1024 })[Symbol.asyncIterator]();
+      let step;
+      while (!(step = await it.next()).done) {
+        const chunk = step.value;
+        if (typeof chunk !== 'string') continue;
         if (chunk.startsWith('\n\n[Retrying')) {
           // Fallback retry status: shown to the user while streaming (existing
           // UX), but it is internal routing noise, not part of the answer.
@@ -677,6 +686,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
           send({ type: 'chunk', content: chunk });
         }
       }
+      chatMeta = step.value || null;
     } catch (streamErr) {
       send({ type: 'error', message: streamErr.message });
       res.end();
@@ -696,10 +706,11 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     await logUsage({
       user_id:         req.user.id,
       conversation_id: convId,
-      model:           routedModel,
+      model:           chatMeta?.model || routedModel,
       intent_type:     'chat',
-      tokens_prompt:   0,
-      tokens_completion: Math.ceil(fullContent.length / 4),
+      ...usageFields(chatMeta?.usage, fullContent),
+      latency_ms:      chatMeta?.latency_ms ?? 0,
+      used_fallback:   Boolean(chatMeta?.used_fallback),
     });
 
     send({ type: 'done', conversation_id: convId });
@@ -1261,7 +1272,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     if (audit.needs_revision) {
       const instruction = buildRevisionInstruction(audit);
       try {
-        const retry = await routedChat({
+        const retry = await meteredChat(req, 'workout_revision', routedChat)({
           intent: 'workout',
           temperature: 0.2,      // correction, not invention
           max_tokens: 8000,
@@ -1308,7 +1319,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     // that must always run.
     let critique = { critique: [], verdict: null };
     try {
-      const reviewed = await routedChat({
+      const reviewed = await meteredChat(req, 'workout_review', routedChat)({
         intent: 'workout',
         temperature: 0.3,
         max_tokens: 900,
@@ -1402,8 +1413,8 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       user_id:           req.user.id,
       model:             streamMeta.model,
       intent_type:       'workout',
-      tokens_prompt:     0,
-      tokens_completion: Math.ceil(fullContent.length / 4),
+      ...usageFields(streamMeta.usage, fullContent),
+      latency_ms:        streamMeta.latency_ms ?? 0,
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
@@ -1613,8 +1624,8 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       user_id:           req.user.id,
       model:             streamMeta.model,
       intent_type:       'diet',
-      tokens_prompt:     0,
-      tokens_completion: Math.ceil(fullContent.length / 4),
+      ...usageFields(streamMeta.usage, fullContent),
+      latency_ms:        streamMeta.latency_ms ?? 0,
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
@@ -1747,8 +1758,8 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
       user_id:           req.user.id,
       model:             streamMeta.model,
       intent_type:       'progress',
-      tokens_prompt:     0,
-      tokens_completion: Math.ceil(fullContent.length / 4),
+      ...usageFields(streamMeta.usage, fullContent),
+      latency_ms:        streamMeta.latency_ms ?? 0,
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
@@ -1866,8 +1877,8 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
       user_id:           req.user.id,
       model:             streamMeta.model,
       intent_type:       'fitness_testing',
-      tokens_prompt:     0,
-      tokens_completion: Math.ceil(fullContent.length / 4),
+      ...usageFields(streamMeta.usage, fullContent),
+      latency_ms:        streamMeta.latency_ms ?? 0,
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
@@ -1972,8 +1983,7 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
       user_id:           req.user.id,
       model:             result.model,
       intent_type:       'business',
-      tokens_prompt:     result.usage?.prompt_tokens     || 0,
-      tokens_completion: result.usage?.completion_tokens || 0,
+      ...usageFields(result.usage, result.content),
       latency_ms:        result.latency_ms,
       used_fallback:     result.used_fallback,
     });
