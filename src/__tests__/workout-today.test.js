@@ -66,7 +66,7 @@ describe('GET /workout-log/today', () => {
           { source_rank: 2, start_time: null,
             assignment_id: 'a1', client_id: 'c1', client_name: 'Rest Client', client_photo: null,
             plan_id: 'p1', plan_name: 'Upper / Lower', progress_pct: 0,
-            session_id: null, session_status: null, planned_exercises: '0' },
+            session_id: null, session_status: null, planned_exercises: '0', plan_exercise_total: '4' },
           { source_rank: 2, start_time: null,
             assignment_id: 'a2', client_id: 'c2', client_name: 'Training Client', client_photo: null,
             plan_id: 'p1', plan_name: 'Full Body', progress_pct: 20,
@@ -119,9 +119,11 @@ describe('GET /workout-log/today', () => {
     expect(dayKey).toBeGreaterThan(-1);
     expect(dateKey).toBeGreaterThan(-1);
     expect(dayKey).toBeLessThan(dateKey);
-    // week_number = 1, matching planned_exercises — otherwise the row this
-    // picks and the count it displays can disagree.
-    expect(head).toMatch(/we\.week_number = 1/);
+    // The client's current programme week, the same function planned_exercises
+    // counts with — otherwise the row this picks and the count it displays can
+    // disagree (training audit T-3).
+    expect(head).toMatch(/we\.week_number = plan_effective_week\(a\.workout_plan_id, a\.start_date, \$1::date\)/);
+    expect(sql).toMatch(/we\.week_number = plan_effective_week\(wp\.id, wa\.start_date, \$1::date\)\), 0\) AS planned_exercises/);
   });
 
   it('still calls it a rest day when NO assignment prescribes today', async () => {
@@ -132,13 +134,30 @@ describe('GET /workout-log/today', () => {
         rows: [{ source_rank: 2, start_time: null,
           assignment_id: 'a1', client_id: 'c1', client_name: 'Resting', client_photo: null,
           plan_id: 'p1', plan_name: 'Lower', progress_pct: 0,
-          session_id: null, session_status: null, planned_exercises: '0' }],
+          session_id: null, session_status: null, planned_exercises: '0', plan_exercise_total: '4' }],
       });
     const res = await request(app()).get('/api/pt-os/workout-log/today').expect(200);
     expect(res.body.data.clients[0].is_rest_day).toBe(true);
     expect(res.body.data.clients[0].source).toBe('programme');
   });
 
+
+  it('does not call an EMPTY programme a rest day', async () => {
+    // Training audit T-9: a programme with no exercises at all is unfinished,
+    // not resting — and a rest day is hidden from the dashboard card, so the
+    // client whose plan still needs writing surfaced nowhere.
+    pool.query
+      .mockResolvedValueOnce(DOW_ROW)
+      .mockResolvedValueOnce({
+        rows: [{ source_rank: 2, start_time: null, client_id: 'c9', client_name: 'Navneet',
+          assignment_id: 'a9', plan_id: 'p9', plan_name: 'Muscle gain',
+          session_id: null, session_status: null, planned_exercises: '0', plan_exercise_total: '0' }],
+      });
+    const res = await request(app()).get('/api/pt-os/workout-log/today').expect(200);
+    const [row] = res.body.data.clients;
+    expect(row.is_rest_day).toBe(false);
+    expect(row.plan_exercise_total).toBe(0);
+  });
   it('keeps a booked slot a booked slot, with its time', async () => {
     pool.query
       .mockResolvedValueOnce(DOW_ROW)
@@ -146,7 +165,7 @@ describe('GET /workout-log/today', () => {
         rows: [{ source_rank: 1, start_time: '06:00:00',
           assignment_id: null, client_id: 'c1', client_name: 'Booked', client_photo: null,
           plan_id: null, plan_name: null, progress_pct: null,
-          session_id: null, session_status: null, planned_exercises: '0' }],
+          session_id: null, session_status: null, planned_exercises: '0', plan_exercise_total: '4' }],
       });
     const res = await request(app()).get('/api/pt-os/workout-log/today').expect(200);
     const row = res.body.data.clients[0];
@@ -245,7 +264,7 @@ describe('GET /workout-log/today', () => {
         rows: [
           { source_rank: 1, start_time: '06:00:00', client_id: 'c1', client_name: 'Booked',
             assignment_id: null, plan_id: null, plan_name: null, progress_pct: null,
-            session_id: null, session_status: null, planned_exercises: '0' },
+            session_id: null, session_status: null, planned_exercises: '0', plan_exercise_total: '4' },
         ],
       });
 
@@ -267,7 +286,7 @@ describe('GET /workout-log/today', () => {
         rows: [
           { source_rank: 1, start_time: '07:00:00', client_id: 'c1', client_name: 'No plan yet',
             assignment_id: null, plan_id: null, plan_name: null, progress_pct: null,
-            session_id: null, session_status: null, planned_exercises: '0' },
+            session_id: null, session_status: null, planned_exercises: '0', plan_exercise_total: '4' },
         ],
       });
 
@@ -284,7 +303,7 @@ describe('GET /workout-log/today', () => {
         rows: [
           { source_rank: 3, start_time: null, client_id: 'c1', client_name: 'Habit only',
             assignment_id: null, plan_id: null, plan_name: null, progress_pct: null,
-            session_id: null, session_status: null, planned_exercises: '0' },
+            session_id: null, session_status: null, planned_exercises: '0', plan_exercise_total: '4' },
         ],
       });
 

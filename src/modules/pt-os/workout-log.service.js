@@ -92,12 +92,20 @@ async function startSession({ orgId, userId, clientId, sessionDate, programName,
       linked = rows[0]?.id ?? null;
     }
 
+    // Resume rather than fork. When the caller named nothing — the Today
+    // list's Start — ANY log already open for this client today is the one to
+    // go back to, preferring one on the same programme: a freestyle log and a
+    // programme log opened from two screens used to become two sessions for
+    // one workout (36 production sessions sat on such a day). An explicit
+    // choice — a named programme, or freestyle — is still honoured as asked.
     const { rows: open } = await tx.query(
       `SELECT * FROM workout_sessions
         WHERE client_id = $1 AND organization_id = $2 AND session_date = $3::date
-          AND status = 'in_progress' AND workout_assignment_id IS NOT DISTINCT FROM $4
-        ORDER BY created_at DESC LIMIT 1`,
-      [clientId, orgId, day, linked]
+          AND status = 'in_progress'
+          AND (workout_assignment_id IS NOT DISTINCT FROM $4 OR $5::boolean)
+        ORDER BY (workout_assignment_id IS NOT DISTINCT FROM $4) DESC, created_at DESC
+        LIMIT 1`,
+      [clientId, orgId, day, linked, assignmentId === undefined]
     );
     if (open[0]) {
       await tx.query('COMMIT');
@@ -158,31 +166,53 @@ async function closeStaleSessions(orgId = null, db = pool) {
   return rows.length;
 }
 
+/**
+ * Mark the empty logs left open on an earlier day as abandoned.
+ *
+ * closeStaleSessions completes an old log that has sets done and, on
+ * purpose, leaves one with nothing done alone — it was not a workout. Left
+ * alone they piled up: 56 of production's 136 sessions were empty logs still
+ * "in progress" weeks later, and every screen that counted sessions counted
+ * them. 'abandoned' keeps the row (a trainer can still open it, log sets and
+ * finish it) while nothing counts it as a session.
+ *
+ * Run after closeStaleSessions, so a log with sets is completed first.
+ *
+ * @returns {Promise<number>} sessions abandoned
+ */
+async function abandonEmptyStaleSessions(orgId = null, db = pool) {
+  const { rowCount } = await db.query(
+    `UPDATE workout_sessions ws
+        SET status = 'abandoned', updated_at = NOW()
+      WHERE ws.status = 'in_progress'
+        AND ws.session_date < $1::date
+        AND ($2::uuid IS NULL OR ws.organization_id = $2::uuid)
+        AND NOT EXISTS (SELECT 1 FROM workout_session_exercises wse
+                          JOIN workout_sets s ON s.session_exercise_id = wse.id
+                         WHERE wse.session_id = ws.id AND s.completed = true)`,
+    [studioToday(), orgId]
+  );
+  return rowCount || 0;
+}
+
 // Recomputes a linked assignment's progress_pct from how many distinct
-// completed sessions have been logged against it, relative to the plan's
-// target (sessions_per_week * duration_weeks). The only writer of
-// progress_pct outside the trainer's manual PUT /assignments/:id/progress.
+// completed sessions — with at least one set done — have been logged against
+// it, relative to the plan's target (sessions_per_week * duration_weeks).
 //
 // Scoped to the studio as well as the id: the callers have already checked
 // the assignment is theirs, and this keeps it that way if one ever does not.
 async function recomputeAssignmentProgress(assignmentId, orgId, db = pool) {
   if (!assignmentId) return;
-  const { rows } = await db.query(
-    `SELECT wp.sessions_per_week, wp.duration_weeks,
-            (SELECT COUNT(DISTINCT ws.id) FROM workout_sessions ws
-              WHERE ws.workout_assignment_id = wa.id AND ws.status = 'completed') AS completed_count
+  // The rule itself lives in the database (recompute_assignment_progress,
+  // migration 220) so the plan-size trigger and this path cannot drift:
+  // completed sessions with at least one set done, over sessions a week ×
+  // weeks, capped at 100. The org predicate keeps a caller from recomputing
+  // another studio's row.
+  await db.query(
+    `SELECT recompute_assignment_progress(wa.id)
        FROM workout_assignments wa
-       JOIN workout_plans wp ON wp.id = wa.workout_plan_id
       WHERE wa.id = $1 AND wa.organization_id = $2`,
     [assignmentId, orgId]
-  );
-  const row = rows[0];
-  if (!row) return;
-  const target = (row.sessions_per_week || 0) * (row.duration_weeks || 0);
-  const pct = target > 0 ? Math.min(100, Math.round((row.completed_count / target) * 100)) : 0;
-  await db.query(
-    'UPDATE workout_assignments SET progress_pct = $1, updated_at = NOW() WHERE id = $2 AND organization_id = $3',
-    [pct, assignmentId, orgId]
   );
 }
 
@@ -232,7 +262,8 @@ async function computePrFlags(client, { clientId, orgId, exerciseId, exerciseNam
 }
 
 module.exports = {
-  recomputeAssignmentProgress, computePrFlags, startSession, closeStaleSessions, SessionStartError,
+  recomputeAssignmentProgress, computePrFlags, startSession, closeStaleSessions,
+  abandonEmptyStaleSessions, SessionStartError,
   // exported for tests
   requestDate, weekdayOf,
 };

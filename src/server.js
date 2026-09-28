@@ -1219,12 +1219,16 @@ runMigrationsWithRetry()
 
     // Trainer-logged sessions left open after the day they happened: a log
     // with sets marked done is completed, so programme progress and adherence
-    // count the workout. Empty logs are left alone. Idempotent, so a plain
-    // interval is safe. Disable with WORKOUT_SESSION_SWEEP=off.
+    // count the workout; an empty one is marked abandoned, so no total counts
+    // it. Idempotent, so a plain interval is safe. Disable with
+    // WORKOUT_SESSION_SWEEP=off.
     if (process.env.WORKOUT_SESSION_SWEEP !== 'off') {
-      const { closeStaleSessions } = require('./modules/pt-os/workout-log.service');
+      const { closeStaleSessions, abandonEmptyStaleSessions } = require('./modules/pt-os/workout-log.service');
+      // Completed first, so a log with sets done is never marked abandoned.
       const sweep = () => closeStaleSessions()
         .then((n) => { if (n) logger.info({ closed: n }, 'Stale workout sessions completed'); })
+        .then(() => abandonEmptyStaleSessions())
+        .then((n) => { if (n) logger.info({ abandoned: n }, 'Empty stale workout sessions abandoned'); })
         .catch((err) => logger.warn({ err: err.message }, 'Workout session sweep failed'));
       setTimeout(sweep, 2 * 60 * 1000).unref();
       setInterval(sweep, 60 * 60 * 1000).unref();

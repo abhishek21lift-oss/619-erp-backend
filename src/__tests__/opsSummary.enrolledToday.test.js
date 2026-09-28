@@ -91,10 +91,16 @@ describe('the enrolled-today query', () => {
     expect(q).toContain('s.session_date = $1');
   });
 
-  it('excludes clients whose programme already covers today', () => {
-    const q = enrolledQuery();
+  it('excludes clients on a live programme that has exercises', () => {
+    // Training audit T-2: a client on a programme trains on the programme's
+    // days. Excluding them only when the programme covered TODAY put a
+    // Saturday-only client on Monday's list from their enrolment days.
+    const q = enrolledQuery().replace(/\s+/g, ' ');
     expect(q).toContain('FROM workout_assignments a');
-    expect(q).toContain('EXTRACT(ISODOW FROM $1::date)');
+    expect(q).toContain("a.status = 'active'");
+    expect(q).toContain('a.start_date <= $1::date');
+    expect(q).toContain('(a.end_date IS NULL OR a.end_date >= $1::date)');
+    expect(q).toContain('EXISTS (SELECT 1 FROM workout_exercises we WHERE we.workout_plan_id = a.workout_plan_id)');
   });
 
   it('leaves out inactive and deleted clients', () => {

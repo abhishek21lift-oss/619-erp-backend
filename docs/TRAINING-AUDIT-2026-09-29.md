@@ -9,6 +9,24 @@ Where the dashboard's **Today's Sessions** gets its clients and exercises, and t
 
 Production numbers are from read-only queries on 29 Sep.
 
+## Status
+
+Fixed on `claude/project-setup-understanding-9t82iv` (migration 220):
+
+| ID | Fix |
+|---|---|
+| T-1 | The hourly sweep now marks a past-date `in_progress` log with nothing done as the new `abandoned` status (a log with sets done is still completed first). The Workout Log's totals leave abandoned logs out and list them as "Not logged". |
+| T-2 | Owner's call, taken as recommended: a client on a programme with exercises trains on the programme's days. Enrolment days only put a client on Today when they have no programme (or an empty one). |
+| T-3 | The Today count, the pick between assignments and the rest-day sort all use the client's current programme week (`plan_effective_week`), falling back to week 1. |
+| T-4 | Progress is one database rule (`recompute_assignment_progress`), recomputed for every running assignment by the migration, and again whenever a plan's sessions a week or weeks change. |
+| T-5 | Sessions naming a programme (program name + day) but never linked are linked to the assignment live on that date. Freestyle sessions stay unlinked. |
+| T-6 | Today rows and plan cards say when a programme ran past its end ("Finished 3 weeks ago · week 7 of 4"). Expired clients are flagged on plan cards and left out of the plan stats. |
+| T-7 | Start with no choice resumes any open log for that client today rather than opening a second. |
+| T-8 | Progress counts completed sessions with at least one set done; finishing an empty session asks first. |
+| T-9 | An empty programme is not a rest day: Today shows the client with "Programme has no exercises yet". |
+
+The Today's Sessions card was also redesigned: an activity ring for the day, state chips, a time column, gradient halos by state, always-readable buttons, and the programme warnings above.
+
 ## Where Today's Sessions comes from
 
 The card calls `GET /api/pt-os/workout-log/today`, which runs `pt-os.service.getTodayRoster`. The full list at `/pt-os/today` uses the same endpoint, and the card simply shows its first two rows.

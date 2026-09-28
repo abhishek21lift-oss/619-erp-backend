@@ -353,6 +353,21 @@ async function getTodayRoster({ date, scope = {} } = {}) {
           AND c2.preferred_training_days IS NOT NULL
           AND $3 = ANY(string_to_array(replace(c2.preferred_training_days, ' ', ''), ','))
           AND c2.organization_id = $4
+          -- A client on a programme trains on the programme's days, not the
+          -- ones ticked at enrolment. The two disagreed (training audit T-2):
+          -- Ajeet enrolled for Mon/Wed/Fri on a Saturday-only plan was listed
+          -- on Monday, and Start could offer only Saturday's workout. The
+          -- enrolment days now speak only for clients with no programme — or
+          -- one with nothing in it yet, which cannot say when they train.
+          AND NOT EXISTS (
+            SELECT 1 FROM workout_assignments ea
+             WHERE ea.client_id = c2.id
+               AND ea.organization_id = $4
+               AND ea.status = 'active'
+               AND ea.start_date <= $1::date
+               AND (ea.end_date IS NULL OR ea.end_date >= $1::date)
+               AND EXISTS (SELECT 1 FROM workout_exercises ee
+                            WHERE ee.workout_plan_id = ea.workout_plan_id))
      ),
      -- One row per client. MIN(source_rank) keeps the most specific reason
      -- they are on the list; MIN(start_time) keeps the earliest time any
@@ -383,9 +398,23 @@ async function getTodayRoster({ date, scope = {} } = {}) {
             -- Weeks a trainer has edited have rows of their own, so without
             -- the filter a plan whose week 6 was edited reports Monday twice
             -- over: "8 exercises planned" for a four-exercise day.
+            -- The client's CURRENT programme week (training audit T-3): a
+            -- week the trainer edited has rows of its own, any other week is
+            -- week 1's rows. Counting week 1 regardless showed one number on
+            -- the card and logged another. plan_effective_week (migration
+            -- 220) is the same rule the lateral pick and the sort below use.
             COALESCE((SELECT COUNT(*) FROM workout_exercises we
                        WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
-                         AND we.week_number = 1), 0) AS planned_exercises
+                         AND we.week_number = plan_effective_week(wp.id, wa.start_date, $1::date)), 0) AS planned_exercises,
+            -- Everything in the programme, any day: 0 is a programme with no
+            -- exercises (audit T-9), which the card names rather than
+            -- showing an unexplained rest day every day.
+            (SELECT COUNT(*) FROM workout_exercises we2 WHERE we2.workout_plan_id = wp.id) AS plan_exercise_total,
+            -- Where the client is in the block, NOT held to its length, so a
+            -- programme that ran past its last week can say so (audit T-6).
+            CASE WHEN wa.start_date IS NULL THEN NULL
+                 ELSE (($1::date - wa.start_date) / 7) + 1 END AS programme_week,
+            wp.duration_weeks
        FROM roster r
        -- Org-bound again here: the candidate ids are already scoped per source,
        -- and this keeps the outer read from ever resolving a foreign client.
@@ -395,7 +424,7 @@ async function getTodayRoster({ date, scope = {} } = {}) {
        -- LATERAL with LIMIT 1 because two active assignments would otherwise
        -- fan one client into two rows.
        LEFT JOIN LATERAL (
-         SELECT a.id, a.workout_plan_id, a.progress_pct
+         SELECT a.id, a.workout_plan_id, a.progress_pct, a.start_date
            FROM workout_assignments a
           WHERE a.client_id = r.client_id
             AND a.status = 'active'
@@ -417,13 +446,14 @@ async function getTodayRoster({ date, scope = {} } = {}) {
           -- programmed client-days across the week resolved to the wrong
           -- assignment and showed as rest days — 8 of 14 on a Tuesday.
           --
-          -- week_number = 1 to match planned_exercises below, so the row this
-          -- picks and the count it then displays cannot disagree.
+          -- The client's current programme week, to match planned_exercises
+          -- below, so the row this picks and the count it then displays
+          -- cannot disagree.
           ORDER BY (EXISTS (
                      SELECT 1 FROM workout_exercises we
                       WHERE we.workout_plan_id = a.workout_plan_id
                         AND we.day_of_week = $2
-                        AND we.week_number = 1)) DESC,
+                        AND we.week_number = plan_effective_week(a.workout_plan_id, a.start_date, $1::date))) DESC,
                    a.start_date DESC
           LIMIT 1
        ) wa ON TRUE
@@ -444,13 +474,13 @@ async function getTodayRoster({ date, scope = {} } = {}) {
       -- bottom; among the rest, timed before untimed, then by name so the list
       -- is stable between refreshes.
       ORDER BY
-        -- week_number = 1 here too: without it a plan whose week 3 alone
-        -- touches this weekday sorted as a training day while displaying
-        -- "0 exercises", which is the same disagreement in a different place.
+        -- The same programme week here too: otherwise a plan whose current
+        -- week alone touches this weekday sorted as a training day while
+        -- displaying "0 exercises" — the same disagreement elsewhere.
         (r.source_rank = 2 AND wp.id IS NOT NULL AND NOT EXISTS (
            SELECT 1 FROM workout_exercises we
             WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
-              AND we.week_number = 1)),
+              AND we.week_number = plan_effective_week(wp.id, wa.start_date, $1::date))),
         (r.start_time IS NULL),
         r.start_time,
         c.name`,
@@ -595,17 +625,17 @@ async function getOpsSummary(scope = {}) {
        SELECT 1 FROM pt_sessions s
         WHERE s.client_id = c.id AND s.session_date = $1 AND s.deleted_at IS NULL
      )
+     -- Same rule as the Today roster (training audit T-2): a client on a
+     -- programme with exercises trains on the programme's days, so their
+     -- enrolment days no longer put them on today's list.
      AND NOT EXISTS (
        SELECT 1
          FROM workout_assignments a
-         JOIN workout_plans wp ON wp.id = a.workout_plan_id
         WHERE a.client_id = c.id AND a.status = 'active'
-          AND EXISTS (
-            SELECT 1 FROM workout_exercises we
-             WHERE we.workout_plan_id = wp.id
-               AND we.day_of_week = EXTRACT(ISODOW FROM $1::date)::int
-               AND we.week_number = 1
-          )
+          AND a.start_date <= $1::date
+          AND (a.end_date IS NULL OR a.end_date >= $1::date)
+          AND EXISTS (SELECT 1 FROM workout_exercises we
+                       WHERE we.workout_plan_id = a.workout_plan_id)
      )
      AND c.organization_id = $3
    -- Parsed to a real TIME, not sorted as text. The column is free text

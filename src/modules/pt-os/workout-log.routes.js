@@ -607,6 +607,12 @@ router.get('/workout-log/today', auth, wrap(async (req, res) => {
           plan_name: r.plan_name,
           progress_pct: r.progress_pct,
           planned_exercises: planned,
+          // 0 means the programme has nothing in it yet — not a rest day.
+          plan_exercise_total: r.plan_id ? Number(r.plan_exercise_total) : null,
+          // Week of the block, unclamped, beside its length: week 7 of 4 is
+          // a programme that ran past its end and nobody renewed.
+          programme_week: r.programme_week != null ? Number(r.programme_week) : null,
+          duration_weeks: r.duration_weeks != null ? Number(r.duration_weeks) : null,
           // 'HH:MM', or null when nobody has said when. Only a booked slot or
           // an enrolment preference carries one; a programme names a weekday,
           // never an hour.
@@ -621,7 +627,13 @@ router.get('/workout-log/today', auth, wrap(async (req, res) => {
           // and no plan also has zero planned exercises, and calling that a
           // rest day would grey out and sink the one row with a real
           // appointment on it.
-          is_rest_day: source === 'programme' && planned === 0,
+          //
+          // And not for a programme with nothing in it at all (audit T-9):
+          // that is not a rest day, it is an unfinished programme, and a rest
+          // day is hidden from the dashboard card — so the client whose plan
+          // needs writing never surfaced anywhere.
+          is_rest_day: source === 'programme' && planned === 0
+            && Number(r.plan_exercise_total) > 0,
           session_id: r.session_id,
           session_status: r.session_status,
         };

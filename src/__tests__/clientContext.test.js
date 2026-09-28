@@ -508,15 +508,24 @@ describe('when did this client last actually train', () => {
   });
 
   it('does not widen the counters that measure a prescription', () => {
-    // Deliberately narrow. recomputeAssignmentProgress and the public stats
-    // count COMPLETED sessions against what a plan asked for; silently
-    // swapping this definition in would change what a studio's progress bar
-    // and public numbers mean, and that needs its own evidence.
+    // Deliberately narrow. Progress counts COMPLETED sessions against what a
+    // plan asked for; silently swapping a looser definition in would change
+    // what a studio's progress bar means, and that needs its own evidence.
+    //
+    // It was narrowed once, with evidence (training audit T-8, 29 Sep): 18
+    // production sessions were "completed" with no set done and counted as
+    // workouts. The rule now lives in one place — the database function
+    // migration 220 defines, which the service calls — and must stay at
+    // least this narrow: completed, AND a set actually done.
     const fs = require('fs');
     const path = require('path');
     const log = fs.readFileSync(
       path.join(__dirname, '..', 'modules', 'pt-os', 'workout-log.service.js'), 'utf8',
     );
-    expect(log).toMatch(/ws\.status = 'completed'\) AS completed_count/);
+    expect(log).toMatch(/SELECT recompute_assignment_progress\(wa\.id\)/);
+    const sql = fs.readFileSync(
+      path.join(__dirname, '..', 'db', 'migrations', '220_workout_sessions_abandoned_and_progress.sql'), 'utf8',
+    ).replace(/\s+/g, ' ');
+    expect(sql).toMatch(/ws\.status = 'completed' AND EXISTS \(SELECT 1 FROM workout_session_exercises wse JOIN workout_sets s ON s\.session_exercise_id = wse\.id WHERE wse\.session_id = ws\.id AND s\.completed = TRUE\)/);
   });
 });
