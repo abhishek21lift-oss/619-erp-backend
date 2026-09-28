@@ -190,7 +190,12 @@ router.get('/plans', auth, async (req, res, next) => {
           'client_id',    pc.id,
           'client_name',  pc.name,
           'progress_pct', COALESCE(wa_r.progress_pct, 0),
-          'start_date',   wa_r.start_date
+          'start_date',   wa_r.start_date,
+          -- The client's own status, so the page can leave an expired
+          -- client's programme out of the studio's numbers (training audit
+          -- T-6) while still showing who was on it.
+          'client_status', pc.status,
+          'end_date',     wa_r.end_date
         ) ORDER BY pc.name)
         FROM workout_assignments wa_r
         JOIN pt_clients pc ON pc.id = wa_r.client_id AND pc.organization_id = wa_r.organization_id

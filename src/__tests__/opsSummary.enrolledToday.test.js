@@ -91,10 +91,16 @@ describe('the enrolled-today query', () => {
     expect(q).toContain('s.session_date = $1');
   });
 
-  it('excludes clients whose programme already covers today', () => {
-    const q = enrolledQuery();
+  it('excludes clients on a live programme that has exercises', () => {
+    // Training audit T-2: a client on a programme trains on the programme's
+    // days. Excluding them only when the programme covered TODAY put a
+    // Saturday-only client on Monday's list from their enrolment days.
+    const q = enrolledQuery().replace(/\s+/g, ' ');
     expect(q).toContain('FROM workout_assignments a');
-    expect(q).toContain('EXTRACT(ISODOW FROM $1::date)');
+    expect(q).toContain("a.status = 'active'");
+    expect(q).toContain('a.start_date <= $1::date');
+    expect(q).toContain('(a.end_date IS NULL OR a.end_date >= $1::date)');
+    expect(q).toContain('EXISTS (SELECT 1 FROM workout_exercises we WHERE we.workout_plan_id = a.workout_plan_id)');
   });
 
   it('leaves out inactive and deleted clients', () => {
@@ -286,13 +292,16 @@ describe('the session-stats query', () => {
     expect(statsQuery()).toMatch(/status\s*=\s*'completed'/);
   });
 
-  it('counts Total without filtering on status', () => {
+  it('counts Total as every session started, finished or not — but not abandoned ones', () => {
     // Total is every session STARTED this month, in progress or finished.
-    // A status filter on that count would make Total equal Done and the card
-    // would read 100% completion forever.
+    // Filtering it to completed would make Total equal Done and the card
+    // would read 100% completion forever. The one exclusion is 'abandoned'
+    // (migration 220): an empty log the sweep closed was never a session.
     const total = statsQuery().match(/COUNT\(\*\) FILTER \(([\s\S]*?)\)::INT AS this_month_total/);
     expect(total).not.toBeNull();
-    expect(total[1]).not.toMatch(/status/);
+    expect(total[1]).not.toMatch(/status\s*=\s*'completed'/);
+    expect(total[1]).not.toMatch(/'in_progress'/);
+    expect(total[1]).toMatch(/status\s*<>\s*'abandoned'/);
   });
 
   it('reaches back exactly one month for Last month', () => {
