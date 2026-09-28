@@ -26,7 +26,10 @@ function calcLifestyleReadinessScore(answers) {
     if (isFavorable) favorable++;
   }
   if (answered === 0) return null;
-  return Math.round((favorable / keys.length) * 100);
+  // Out of the questions actually answered: an unanswered question is not an
+  // unfavourable one, and dividing by all six marked a client who answered
+  // three favourably as 50% ready rather than 100%.
+  return Math.round((favorable / answered) * 100);
 }
 
 // ── Weight-change rate ──────────────────────────────────────
