@@ -671,7 +671,7 @@ router.put('/plans/:id', auth, requireTrainer, async (req, res, next) => {
     // A programme that got longer or shorter moves the end date of every
     // client currently running it — see syncAssignmentEnds for which rows.
     if (d.duration_weeks && Number(existing.duration_weeks) !== Number(rows[0].duration_weeks)) {
-      await syncAssignmentEnds(client, req.params.id, rows[0].duration_weeks, orgIdOf(req));
+      await syncAssignmentEnds(client, req.params.id, existing.duration_weeks, rows[0].duration_weeks, orgIdOf(req));
     }
 
     await client.query('COMMIT');

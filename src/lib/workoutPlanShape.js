@@ -48,22 +48,32 @@ function shapeError(d) {
  * 4-week programme started Monday ends on the fourth Sunday. When the
  * programme's length is edited, the assignments running it follow.
  *
- * Only rows that HAVE an end date move. Assignments made before end dates
- * were derived carry NULL, meaning "open-ended", and turning that into a date
- * after the fact could make a programme a client is still on disappear from
- * the Today roster without anyone having decided it should.
+ * Only DERIVED dates move — rows whose end date is still exactly what the old
+ * length gave. Two kinds of row are left alone:
+ *
+ *   · an end date the trainer set when assigning (POST /assign takes one as
+ *     an override), which a shared plan's length must not silently rewrite;
+ *   · NULL, meaning "open-ended" — assignments made before end dates were
+ *     derived. Turning that into a date after the fact could make a
+ *     programme a client is still on disappear from the Today roster without
+ *     anyone having decided it should.
+ *
+ * `organization_id` is a UUID column, so the parameter is cast to uuid — a
+ * text parameter has no `uuid = text` operator and the whole edit 500'd.
  */
-async function syncAssignmentEnds(db, planId, weeks, orgId) {
-  const w = Number(weeks);
-  if (!Number.isInteger(w) || w < WEEKS_MIN) return;
+async function syncAssignmentEnds(db, planId, oldWeeks, newWeeks, orgId) {
+  const from = Number(oldWeeks);
+  const to = Number(newWeeks);
+  if (!Number.isInteger(from) || from < WEEKS_MIN) return;
+  if (!Number.isInteger(to) || to < WEEKS_MIN || to === from) return;
   await db.query(
     `UPDATE workout_assignments
-        SET end_date = start_date + ($2::int * 7 - 1), updated_at = NOW()
+        SET end_date = start_date + ($3::int * 7 - 1), updated_at = NOW()
       WHERE workout_plan_id = $1
         AND status = 'active'
-        AND end_date IS NOT NULL
-        AND ($3::text IS NULL OR organization_id = $3)`,
-    [planId, w, orgId ?? null]
+        AND end_date = start_date + ($2::int * 7 - 1)
+        AND ($4::uuid IS NULL OR organization_id = $4::uuid)`,
+    [planId, from, to, orgId ?? null]
   );
 }
 

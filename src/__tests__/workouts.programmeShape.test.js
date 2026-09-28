@@ -128,11 +128,14 @@ describe('PUT /plans/:id', () => {
 
     const call = callFor(/UPDATE workout_assignments SET end_date = start_date/);
     expect(call).toBeTruthy();
-    // Only dated, active rows of this plan and studio — an open-ended legacy
-    // assignment is never given an end it did not have.
-    expect(flat(call[0])).toMatch(/end_date IS NOT NULL/);
+    // Only active rows whose end is still the one the OLD length derived: a
+    // trainer-set end date and an open-ended (NULL) one both stay put.
+    expect(flat(call[0])).toMatch(/end_date = start_date \+ \(\$2::int \* 7 - 1\)/);
     expect(flat(call[0])).toMatch(/status = 'active'/);
-    expect(call[1]).toEqual(['p1', 6, ORG]);
+    // uuid, not text: organization_id is a uuid column and uuid = text has
+    // no operator — the edit 500'd.
+    expect(flat(call[0])).toMatch(/organization_id = \$4::uuid/);
+    expect(call[1]).toEqual(['p1', 4, 6, ORG]);
   });
 
   it('leaves assignments alone when the length did not change', async () => {
