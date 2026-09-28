@@ -90,17 +90,20 @@ CREATE TRIGGER workout_plans_recompute_progress
   AFTER UPDATE OF sessions_per_week, duration_weeks ON workout_plans
   FOR EACH ROW EXECUTE FUNCTION trg_workout_plans_recompute_progress();
 
--- ── 2b. Which week of a programme a date falls in ──────────────────────
+-- ── 2b. Which week's rows a date's workout comes from ──────────────────
 --
 -- T-3: the Today roster counted week 1's exercises whatever week the client
 -- was in, while the logged session resolves their current week — so a plan
 -- whose later weeks were edited showed one count and logged another.
 --
--- The programme week is the one progression.programmeWeek computes: weeks
--- since the assignment started, held to the plan's length. A week the
--- trainer edited has rows of its own (migration 137); any other week is
--- computed from week 1, so week 1's rows are the ones to count.
-CREATE OR REPLACE FUNCTION plan_effective_week(p_plan_id TEXT, p_start DATE, p_on DATE)
+-- This is progression.resolveWeek's anchor, in SQL, so the two cannot
+-- differ: the programme week is weeks since the assignment started, held to
+-- the plan's length (progression.programmeWeek); the rows used are those of
+-- the LATEST week at or before it that has rows of its own for that weekday
+-- (an edit in week 4 carries into weeks 5+), else week 1. Per weekday,
+-- because resolveWeek is handed one weekday's rows.
+DROP FUNCTION IF EXISTS plan_effective_week(TEXT, DATE, DATE);
+CREATE OR REPLACE FUNCTION plan_effective_week(p_plan_id TEXT, p_start DATE, p_on DATE, p_dow INT)
 RETURNS INT LANGUAGE sql STABLE AS $$
   WITH w AS (
     SELECT LEAST(
@@ -108,13 +111,40 @@ RETURNS INT LANGUAGE sql STABLE AS $$
              GREATEST(1, COALESCE((SELECT duration_weeks FROM workout_plans WHERE id = p_plan_id), 1))
            ) AS n
   )
-  SELECT CASE
-           WHEN EXISTS (SELECT 1 FROM workout_exercises we, w
-                         WHERE we.workout_plan_id = p_plan_id AND we.week_number = w.n)
-           THEN (SELECT n FROM w)
-           ELSE 1
-         END
+  SELECT COALESCE(
+           (SELECT MAX(we.week_number) FROM workout_exercises we, w
+             WHERE we.workout_plan_id = p_plan_id
+               AND we.day_of_week = p_dow
+               AND we.week_number <= w.n),
+           1)
 $$;
+
+-- ── 2c. Progress follows the sets, not only the session ────────────────
+--
+-- Progress counts a completed session only while it has a set done, so
+-- ticking, unticking or deleting a set on a completed session changes the
+-- percentage. The set routes did not recompute; this does, for every writer.
+CREATE OR REPLACE FUNCTION trg_workout_sets_recompute_progress()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  a_id TEXT;
+BEGIN
+  SELECT ws.workout_assignment_id INTO a_id
+    FROM workout_session_exercises wse
+    JOIN workout_sessions ws ON ws.id = wse.session_id
+   WHERE wse.id = COALESCE(NEW.session_exercise_id, OLD.session_exercise_id)
+     AND ws.status = 'completed';
+  IF a_id IS NOT NULL THEN
+    PERFORM recompute_assignment_progress(a_id);
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS workout_sets_recompute_progress ON workout_sets;
+CREATE TRIGGER workout_sets_recompute_progress
+  AFTER INSERT OR DELETE OR UPDATE OF completed ON workout_sets
+  FOR EACH ROW EXECUTE FUNCTION trg_workout_sets_recompute_progress();
 
 -- ── 3. Link programme sessions that were never linked ───────────────────
 --

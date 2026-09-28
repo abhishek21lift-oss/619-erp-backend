@@ -122,8 +122,8 @@ describe('GET /workout-log/today', () => {
     // The client's current programme week, the same function planned_exercises
     // counts with — otherwise the row this picks and the count it displays can
     // disagree (training audit T-3).
-    expect(head).toMatch(/we\.week_number = plan_effective_week\(a\.workout_plan_id, a\.start_date, \$1::date\)/);
-    expect(sql).toMatch(/we\.week_number = plan_effective_week\(wp\.id, wa\.start_date, \$1::date\)\), 0\) AS planned_exercises/);
+    expect(head).toMatch(/we\.week_number = plan_effective_week\(a\.workout_plan_id, a\.start_date, \$1::date, \$2\)/);
+    expect(sql).toMatch(/we\.week_number = plan_effective_week\(wp\.id, wa\.start_date, \$1::date, \$2\)\), 0\) AS planned_exercises/);
   });
 
   it('still calls it a rest day when NO assignment prescribes today', async () => {

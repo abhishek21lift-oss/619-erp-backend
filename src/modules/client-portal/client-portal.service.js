@@ -480,7 +480,9 @@ async function myAchievements(clientId, orgId) {
          FROM workout_sessions ws
          JOIN workout_session_exercises e ON e.session_id = ws.id
          JOIN workout_sets s ON s.session_exercise_id = e.id
-        WHERE ws.client_id = $1 AND ws.organization_id = $2`,
+        WHERE ws.client_id = $1 AND ws.organization_id = $2
+          -- An abandoned log (migration 220) was never a workout.
+          AND ws.status <> 'abandoned'`,
       [clientId, orgId],
     ),
     // Heaviest completed set per exercise; ties go to more reps, then the

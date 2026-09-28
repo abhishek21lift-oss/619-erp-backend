@@ -292,13 +292,16 @@ describe('the session-stats query', () => {
     expect(statsQuery()).toMatch(/status\s*=\s*'completed'/);
   });
 
-  it('counts Total without filtering on status', () => {
+  it('counts Total as every session started, finished or not — but not abandoned ones', () => {
     // Total is every session STARTED this month, in progress or finished.
-    // A status filter on that count would make Total equal Done and the card
-    // would read 100% completion forever.
+    // Filtering it to completed would make Total equal Done and the card
+    // would read 100% completion forever. The one exclusion is 'abandoned'
+    // (migration 220): an empty log the sweep closed was never a session.
     const total = statsQuery().match(/COUNT\(\*\) FILTER \(([\s\S]*?)\)::INT AS this_month_total/);
     expect(total).not.toBeNull();
-    expect(total[1]).not.toMatch(/status/);
+    expect(total[1]).not.toMatch(/status\s*=\s*'completed'/);
+    expect(total[1]).not.toMatch(/'in_progress'/);
+    expect(total[1]).toMatch(/status\s*<>\s*'abandoned'/);
   });
 
   it('reaches back exactly one month for Last month', () => {

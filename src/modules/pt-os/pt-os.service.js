@@ -405,7 +405,7 @@ async function getTodayRoster({ date, scope = {} } = {}) {
             -- 220) is the same rule the lateral pick and the sort below use.
             COALESCE((SELECT COUNT(*) FROM workout_exercises we
                        WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
-                         AND we.week_number = plan_effective_week(wp.id, wa.start_date, $1::date)), 0) AS planned_exercises,
+                         AND we.week_number = plan_effective_week(wp.id, wa.start_date, $1::date, $2)), 0) AS planned_exercises,
             -- Everything in the programme, any day: 0 is a programme with no
             -- exercises (audit T-9), which the card names rather than
             -- showing an unexplained rest day every day.
@@ -453,7 +453,7 @@ async function getTodayRoster({ date, scope = {} } = {}) {
                      SELECT 1 FROM workout_exercises we
                       WHERE we.workout_plan_id = a.workout_plan_id
                         AND we.day_of_week = $2
-                        AND we.week_number = plan_effective_week(a.workout_plan_id, a.start_date, $1::date))) DESC,
+                        AND we.week_number = plan_effective_week(a.workout_plan_id, a.start_date, $1::date, $2))) DESC,
                    a.start_date DESC
           LIMIT 1
        ) wa ON TRUE
@@ -480,7 +480,7 @@ async function getTodayRoster({ date, scope = {} } = {}) {
         (r.source_rank = 2 AND wp.id IS NOT NULL AND NOT EXISTS (
            SELECT 1 FROM workout_exercises we
             WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
-              AND we.week_number = plan_effective_week(wp.id, wa.start_date, $1::date))),
+              AND we.week_number = plan_effective_week(wp.id, wa.start_date, $1::date, $2))),
         (r.start_time IS NULL),
         r.start_time,
         c.name`,
@@ -699,9 +699,12 @@ async function getOpsSummary(scope = {}) {
   // month" and Done is the subset that was finished.
   const { rows: [session_stats] } = await pool.query(`
     SELECT
+      -- Abandoned logs (migration 220) were never workouts: an empty log
+      -- closed by the sweep must not count as a session this month.
       COUNT(*) FILTER (
         WHERE session_date >= DATE_TRUNC('month', CURRENT_DATE)
           AND session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+          AND status <> 'abandoned'
       )::INT AS this_month_total,
       COUNT(*) FILTER (
         WHERE session_date >= DATE_TRUNC('month', CURRENT_DATE)
