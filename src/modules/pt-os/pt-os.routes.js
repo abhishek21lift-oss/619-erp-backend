@@ -19,6 +19,9 @@ const { generateCoach } = require('./coach-ai');
 const { generateCheckinInsight, MAX_WEEKS } = require('./checkin-ai');
 const { buildRecovery } = require('./recovery');
 const { routedChat } = require('../../lib/ai/router');
+const { meteredChat } = require('../../lib/ai/metering');
+const { requireAiQuota } = require('../../lib/aiQuota');
+const { aiLimiter } = require('../../middleware/aiRateLimit');
 const { logActivity } = require('../../lib/activityLog');
 const { recordPtPayment } = require('../../lib/ptPayments');
 const { renewClient } = require('./renewal.service');
@@ -1539,7 +1542,7 @@ router.get('/clients/:id/snapshot', auth, wrap(async (req, res) => {
 // unconfigured, times out, or answers with something uncited, the derived
 // prompts stand in: a coach card that vanishes when the API does teaches a
 // trainer not to rely on it.
-router.post('/clients/:id/coach', auth, wrap(async (req, res) => {
+router.post('/clients/:id/coach', auth, aiLimiter, requireAiQuota(), wrap(async (req, res) => {
   const clientId = req.params.id;
   const params = [clientId];
   const orgClause = orgWhere(req, params, 'c.organization_id');
@@ -1595,7 +1598,7 @@ router.post('/clients/:id/coach', auth, wrap(async (req, res) => {
     snapshot,
     brief,
     client: brief.client,
-    chat: routedChat,
+    chat: meteredChat(req, 'coach', routedChat),
     // The rule-based prompts are true whatever the model does, so they are
     // what the card falls back to rather than an empty state.
     fallback: snapshot.coach,
@@ -1625,12 +1628,12 @@ router.get('/transformations', auth, wrap(async (req, res) => {
 // "not yours" miss that becomes the 404 below — because SQL in an HTTP adapter
 // is the debt architecture.layering.convention.test.js is ratcheting down, and
 // a route written today has no business adding to it.
-router.post('/clients/:id/checkin-insight', auth, wrap(async (req, res) => {
+router.post('/clients/:id/checkin-insight', auth, aiLimiter, requireAiQuota(), wrap(async (req, res) => {
   const checkins = await svc.getCheckinInsightInputs(req.params.id, tenantScope(req), MAX_WEEKS);
   if (checkins === null) {
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   }
-  const data = await generateCheckinInsight({ checkins, chat: routedChat });
+  const data = await generateCheckinInsight({ checkins, chat: meteredChat(req, 'checkin', routedChat) });
   return res.json({ data });
 }));
 

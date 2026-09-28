@@ -7,7 +7,7 @@ const { fmtDate, drawSectionHeading, drawLabelValue, embedSignature } = require(
 const { saveFile } = require('./fileStorage');
 
 const ACK_LABELS = {
-  understands_confidentiality: 'I understand my personal and medical information will remain confidential and used only for my training program.',
+  understands_confidentiality: 'I understand my personal and medical information will remain confidential and used only for my training program. Parts of my programme may be drafted with the help of AI tools; to do this, relevant details (such as my goals, measurements and health or injury notes, but not my phone number) are sent to an AI service provider that is not permitted to store or train on them, and my trainer reviews everything before it is used.',
   voluntary_participation: 'I understand participation is voluntary and I can withdraw at any time.',
   final_declaration: 'I confirm I have read this entire document, understand the risks and benefits, asked my questions, had them answered, and voluntarily agree to participate.',
 };

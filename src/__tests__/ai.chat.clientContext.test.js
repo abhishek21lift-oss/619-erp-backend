@@ -59,7 +59,7 @@ const ASSESS_ROWS = [{ weight: 73.2, body_fat_pct: 22, chest_cm: null, waist_cm:
 const CHECKIN_ROWS = [{ weight: 73, mood: 'good', sleep_hours: 7, client_notes: 'ok', created_at: '2026-08-10' }];
 
 // The parent pt_clients gate buildClientContext must run FIRST.
-const PARENT_SQL = /SELECT name, dob, gender, mobile FROM pt_clients WHERE id=\$1 AND deleted_at IS NULL AND organization_id = \$2/;
+const PARENT_SQL = /SELECT name, dob, gender FROM pt_clients WHERE id=\$1 AND deleted_at IS NULL AND organization_id = \$2/;
 const CHILD_TABLES = /pt_goals|pt_assessments|weekly_checkins/;
 
 function clientDispatch({ client = CLIENT_ROWS, goals = GOAL_ROWS, assess = ASSESS_ROWS, checkins = CHECKIN_ROWS } = {}) {

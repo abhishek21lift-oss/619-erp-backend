@@ -102,6 +102,10 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
       model: (meta && meta.model) || model,
       requested_model: model,
       tier, intent, used_fallback: false,
+      // Exact token counts and cost from the provider, and how long the
+      // stream took — what the usage log and the quota count.
+      usage: meta?.usage ?? null,
+      latency_ms: meta?.latency_ms ?? null,
     };
   } catch (primaryErr) {
     logger.warn({ model, tier, intent, err: primaryErr.message }, 'ai_stream_primary_failed');
@@ -118,6 +122,8 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
           model: (meta && meta.model) || step.model,
           requested_model: step.model,
           tier: step.tier, intent, used_fallback: true,
+          usage: meta?.usage ?? null,
+          latency_ms: meta?.latency_ms ?? null,
         };
       } catch (fbErr) {
         attempts.push({ model: step.model, tier: step.tier, err: fbErr });

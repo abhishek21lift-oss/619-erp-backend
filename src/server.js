@@ -306,6 +306,7 @@ const helmet    = require('helmet');
 const compression = require('compression');
 const rateLimit     = require('express-rate-limit');
 const { makeStore } = require('./lib/rateLimitStore');
+const { aiLimiter } = require('./middleware/aiRateLimit');
 const cookieParser  = require('cookie-parser');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
@@ -895,7 +896,7 @@ app.use('/api/communication',     auth, requireTrainer, ...gate('communication')
 // the studio is over its monthly allowance. Enforcement ships OFF, and the
 // guard fails open if the check itself errors — a cost control must not be
 // able to take the AI Suite down. See lib/aiQuota.js.
-app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), requireAiQuota(), require('./routes/aiKnowledge'));
+app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), aiLimiter, requireAiQuota(), require('./routes/aiKnowledge'));
 // Executable actions. Mounted BEFORE routes/ai so /api/ai/actions/* is not
 // swallowed by anything there, and deliberately outside requireAiQuota():
 // these endpoints run no model. Confirming a WhatsApp send must not fail
@@ -910,7 +911,7 @@ app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), 
 // summarised back to them. The member app calls none of these; a client's own
 // data is /api/me. Every AI action is trainer-only in its registry as well.
 app.use('/api/ai',               userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
-app.use('/api/ai',               ...studioGate('ai_suite'), requireAiQuota(), require('./routes/ai'));
+app.use('/api/ai',               ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/ai'));
 
 // ────────────────────────
 // MEMBER PORTAL ROUTES

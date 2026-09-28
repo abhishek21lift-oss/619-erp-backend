@@ -203,7 +203,7 @@ const TOOLS = [
       conds.push(`organization_id = $${p++}`); params.push(org.orgId);
 
       const { rows } = await pool.query(
-        `SELECT name, status, mobile, package_type, trainer_name, balance_amount,
+        `SELECT name, status, package_type, trainer_name, balance_amount,
                 paid_amount, final_amount, pt_start_date, pt_end_date, goal
          FROM pt_clients WHERE ${conds.join(' AND ')} ORDER BY created_at DESC LIMIT 3`,
         params
@@ -229,7 +229,9 @@ const TOOLS = [
         c.goal ? `goal: ${c.goal}` : null,
         `fee: ${fmtINR(c.final_amount)}, paid: ${fmtINR(c.paid_amount)}, balance due: ${fmtINR(c.balance_amount)}`,
         `PT period: ${c.pt_start_date ? new Date(c.pt_start_date).toLocaleDateString('en-IN') : 'n/a'} → ${c.pt_end_date ? new Date(c.pt_end_date).toLocaleDateString('en-IN') : 'n/a'}`,
-        c.mobile ? `mobile: ${c.mobile}` : null,
+        // No mobile number (AI audit 2026-09-28, AI-1): prompts go to a
+        // third-party model, and a phone number answers nothing a coaching
+        // question needs. The trainer sees it on the client's profile.
       ].filter(Boolean).join(', ')).join('\n');
     },
   },

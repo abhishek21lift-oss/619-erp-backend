@@ -34,6 +34,36 @@ function getApiKey() {
   return key;
 }
 
+// ── Privacy and accounting, on every request (AI audit 2026-09-28) ─────────
+//
+// AI-1: prompts carry client health context (conditions, injuries, allergies,
+// assessed limitations). OpenRouter lets the caller refuse any endpoint whose
+// provider may store or train on prompts; without this the router — and the
+// free-tier defaults especially — may send them to one that does. Denied by
+// default. An operator can opt out explicitly (AI_ALLOW_DATA_COLLECTION=true),
+// never by omission.
+//
+// AI-3: `usage.include` makes OpenRouter return exact prompt and completion
+// token counts and the request's cost, on the final stream chunk too. Without
+// it the streaming paths guessed completion tokens from string length and
+// logged every prompt as zero tokens — the part of the request that carries
+// the client context — so the AI quota counted a fraction of real use and
+// every cost read ₹0.
+//
+// Both are OpenRouter request fields. Another OpenAI-compatible endpoint
+// (AI_BASE_URL) may reject unknown fields, so they are sent to OpenRouter
+// only.
+const isOpenRouter = () => /(^|\.)openrouter\.ai(\/|$)/.test(new URL(BASE_URL).host + '/');
+
+function requestExtras() {
+  if (!isOpenRouter()) return {};
+  const allowCollection = String(process.env.AI_ALLOW_DATA_COLLECTION || '').toLowerCase() === 'true';
+  return {
+    provider: { data_collection: allowCollection ? 'allow' : 'deny' },
+    usage: { include: true },
+  };
+}
+
 function buildHeaders() {
   return {
     'Authorization':  `Bearer ${getApiKey()}`,
@@ -56,7 +86,7 @@ async function chatCompletion({ model, messages, temperature = 0.7, max_tokens =
     const res = await fetch(`${BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: buildHeaders(),
-      body: JSON.stringify({ model, messages, temperature, max_tokens }),
+      body: JSON.stringify({ model, messages, temperature, max_tokens, ...requestExtras() }),
       signal: controller.signal,
     });
 
@@ -107,7 +137,7 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
     res = await fetch(`${BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: buildHeaders(),
-      body: JSON.stringify({ model, messages, temperature, max_tokens, stream: true }),
+      body: JSON.stringify({ model, messages, temperature, max_tokens, stream: true, ...requestExtras() }),
       signal: controller.signal,
     });
   } catch (err) {
@@ -196,7 +226,7 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
   // an object before too; `served_model` is additive and `model` names what
   // was REQUESTED, so a caller can report "asked for auto, got X" rather than
   // having to choose between the two facts.
-  return { usage, model: servedModel || model, requested_model: model };
+  return { usage, model: servedModel || model, requested_model: model, latency_ms: Date.now() - start };
 }
 
 /**
@@ -218,4 +248,4 @@ async function pingModel(model) {
   }
 }
 
-module.exports = { chatCompletion, streamCompletion, pingModel };
+module.exports = { chatCompletion, streamCompletion, pingModel, requestExtras };

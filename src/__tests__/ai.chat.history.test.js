@@ -277,7 +277,7 @@ describe('POST /api/ai/chat — bounded conversation history (F-5)', () => {
     // whether the client's data may reach the prompt. This names the second —
     // the one this test is about — rather than taking whichever came first.
     const clientGate = pool.query.mock.calls.find(
-      ([sql]) => sql.includes('SELECT name, dob, gender, mobile FROM pt_clients'));
+      ([sql]) => sql.includes('SELECT name, dob, gender FROM pt_clients'));
     expect(clientGate).toBeTruthy();
     expect(clientGate[0]).toContain('organization_id = $2');
     expect(clientGate[1]).toEqual(['cli-1', 'org-1']);

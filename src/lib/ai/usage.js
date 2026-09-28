@@ -9,15 +9,15 @@ const logger = require('../logger');
 async function logUsage({
   user_id, conversation_id, model, provider = 'openrouter',
   intent_type = 'fitness', tokens_prompt = 0, tokens_completion = 0,
-  latency_ms = 0, used_fallback = false,
+  latency_ms = 0, used_fallback = false, cost_inr = null, usage_source = null,
 }) {
   try {
     await pool.query(
       `INSERT INTO ai_usage_log
          (user_id, conversation_id, model, provider, intent_type,
           tokens_prompt, tokens_completion, tokens_total,
-          latency_ms, used_fallback)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          latency_ms, used_fallback, cost_inr, usage_source)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [
         user_id,
         conversation_id || null,
@@ -27,8 +27,10 @@ async function logUsage({
         tokens_prompt,
         tokens_completion,
         tokens_prompt + tokens_completion,
-        latency_ms,
+        Math.round(Number(latency_ms) || 0),
         used_fallback,
+        cost_inr,
+        usage_source,
       ]
     );
   } catch (err) {
@@ -89,4 +91,5 @@ async function getModelStats(orgId) {
   return rows;
 }
 
-module.exports = { logUsage, getUserUsage, getModelStats };
+module.exports = {
+  logUsage, getUserUsage, getModelStats };
