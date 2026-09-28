@@ -906,9 +906,12 @@ router.post('/:id/approve', auth, requireTrainer, validate(schemas.idParam), wra
       amount: result.order.total_amount,
       receipt_no: result.activation.receipt_no,
       activated_to: result.activation.activated_to,
+      overpaid: result.overpaid,
     });
 
-    res.json({ data: { order: result.order, activation: result.activation } });
+    // overpaid > 0: the member paid more than the balance they now owe (a desk
+    // payment landed after they submitted). The verify screen tells the trainer.
+    res.json({ data: { order: result.order, activation: result.activation, overpaid: result.overpaid } });
   } catch (err) {
     sendPaymentError(res, err);
   }

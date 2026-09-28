@@ -153,7 +153,7 @@ describe('createBalanceOrder', () => {
 });
 
 describe('approving a balance order', () => {
-  function scriptApproval() {
+  function scriptApproval({ balanceNow = '4500.00' } = {}) {
     on(/SELECT .* FROM payment_orders o WHERE o\.id = \$1 AND o\.organization_id = \$2 FOR UPDATE/, {
       rows: [{
         id: 'ord-1', organization_id: ORG, order_no: 'UPI-20260925-100001', client_id: 'client-1',
@@ -166,7 +166,8 @@ describe('approving a balance order', () => {
       { rows: [{ id: 'sub-1', utr: '123456789012' }] });
     on(/UPDATE payment_orders SET status = \$1 WHERE id = \$2 AND status = \$3/, { rows: [], rowCount: 1 });
     on(/FROM pt_clients WHERE id = \$1 FOR UPDATE/,
-      { rows: [{ id: 'client-1', name: 'Rohit', trainer_id: null, pt_end_date: '2026-12-31' }] });
+      { rows: [{ id: 'client-1', name: 'Rohit', trainer_id: null, pt_end_date: '2026-12-31',
+                 balance_amount: balanceNow }] });
     on(/INSERT INTO membership_payments/, (params) => ({
       rows: [{ receipt_no: params[6], amount: params[7], activated_from: params[9], activated_to: params[10] }],
     }));
@@ -197,5 +198,32 @@ describe('approving a balance order', () => {
     const actions = audits.flatMap((e) => e.params).filter((v) => typeof v === 'string' && /^[A-Z_]+$/.test(v));
     expect(actions).toContain('BALANCE_SETTLED');
     expect(actions).not.toContain('MEMBERSHIP_ACTIVATED');
+  });
+
+  test('reports no overpayment when the balance is still what was submitted', async () => {
+    scriptApproval();
+    const result = await upi.approve({ orderId: 'ord-1', orgId: ORG, actor: ACTOR });
+
+    expect(result.overpaid).toBe(0);
+    expect(find(/INSERT INTO pt_payments/).params).not.toContainEqual(
+      expect.stringMatching(/more than the balance/));
+  });
+
+  // The trainer recorded Rs. 3,000 at the desk after the member submitted a
+  // Rs. 4,500 UPI payment, so only Rs. 1,500 is owed when it is approved.
+  // The money has arrived: approval still goes through, but the Rs. 3,000
+  // excess must be visible rather than swallowed by GREATEST(0, …).
+  test('approves a payment larger than the balance now owed and reports the excess', async () => {
+    scriptApproval({ balanceNow: '1500.00' });
+    const result = await upi.approve({ orderId: 'ord-1', orgId: ORG, actor: ACTOR });
+
+    expect(result.order.status).toBe('APPROVED');
+    expect(result.overpaid).toBe(3000);
+    expect(find(/INSERT INTO pt_payments/).params).toContainEqual(
+      expect.stringMatching(/Rs\. 3000 more than the balance owed/));
+    const settled = state.log.find((e) => /INSERT INTO payment_audit_logs/.test(e.sql)
+      && e.params.includes('BALANCE_SETTLED'));
+    const detail = JSON.parse(settled.params.find((v) => typeof v === 'string' && v.startsWith('{')));
+    expect(detail).toMatchObject({ owed: 1500, overpaid: 3000 });
   });
 });
