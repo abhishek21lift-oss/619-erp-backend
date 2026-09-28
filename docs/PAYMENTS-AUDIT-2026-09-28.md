@@ -34,6 +34,29 @@ stops being consistent.
 
 Severity: **High**, **Medium**, **Low**.
 
+## Status
+
+Fixed on `claude/project-setup-understanding-9t82iv`:
+
+| ID | Fix |
+|---|---|
+| PAY-1 | `PATCH /clients/:id` refuses money fields for a client with renewal history (`409 USE_RENEW`), and refuses lowering `paid_amount`. The Enroll page sends a renewed client to Renew instead. |
+| PAY-2 | Renewal moved to `renewal.service.js`: one transaction, client `FOR UPDATE`, a repeat within 10 minutes refused (`409 DUPLICATE_RENEWAL`), overpayment refused, a zod schema, base/discount no longer zeroed. |
+| PAY-3 | New `pt_payments.balance_applied` (migration 217), written by every path that moves the balance. `DELETE` restores exactly that. Rows from before 217 keep the old rule. |
+| PAY-4 | `remind` returns 501 honestly. The Invoices page no longer offers Send Reminder. |
+| PAY-5 | `PUT` can't set `paid`/`cancelled`. `mark-paid` books only the remainder and never writes a ₹0 payment. |
+| PAY-6 | Enrolment and renewal payments get receipt numbers. Migration 217 numbers the existing unnumbered rows, oldest first. |
+| PAY-12 | Renewal end dates are clamped to month end (31 Jan + 1 month = 28/29 Feb). |
+| PAY-15 | The `mark-paid` client update is org-scoped. Its receipt reference no longer doubles the `INV-` prefix. |
+
+Verified against a migrated Postgres:
+- the migration backfill (ordering, dates, existing references kept);
+- renewal balances, receipt and `balance_applied`;
+- **two simultaneous renewals produce one term and one payment**;
+- overpayment leaves nothing changed.
+
+Still open: PAY-7 (GST invoice numbering and fields), PAY-8, PAY-9, PAY-10, PAY-11, PAY-13, PAY-14, PAY-16.
+
 ---
 
 ## High

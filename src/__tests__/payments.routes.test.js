@@ -311,3 +311,37 @@ describe('DELETE /api/payments/:id', () => {
     expect(verbs()).toEqual(['BEGIN', 'ROLLBACK']);
   });
 });
+
+// Payments audit 2026-09-28, PAY-3: a delete restores what the payment took
+// off the balance, not its full amount.
+describe('balance_applied', () => {
+  test('recording a payment larger than the balance applies only what is owed', async () => {
+    mockClientRow = { id: CLIENT_A, organization_id: ORG_A, balance_amount: '1000.00', trainer_id: null };
+
+    const res = await request(app()).post('/api/payments').send({ client_id: CLIENT_A, amount: 1500, date: '2026-09-28' });
+
+    expect(res.status).toBe(201);
+    const [ins] = sqlAt(/INSERT INTO pt_payments/i);
+    expect(ins.sql).toMatch(/balance_applied/);
+    expect(ins.params[ins.params.length - 1]).toBe(1000);
+  });
+
+  test('deleting that payment restores 1000, not 1500', async () => {
+    mockDeletedPtPayment = { id: 'pay-1', amount: 1500, balance_applied: '1000.00', client_id: CLIENT_A };
+
+    await request(app()).delete('/api/payments/pay-1');
+
+    const [upd] = sqlAt(/UPDATE pt_clients SET paid_amount = GREATEST/i);
+    expect(upd.sql).toMatch(/balance_amount = balance_amount \+ COALESCE\(\$4, \$1\)/);
+    expect(upd.params).toEqual([1500, CLIENT_A, ORG_A, '1000.00']);
+  });
+
+  test('a payment from before migration 217 falls back to its amount', async () => {
+    mockDeletedPtPayment = { id: 'pay-1', amount: 700, balance_applied: null, client_id: CLIENT_A };
+
+    await request(app()).delete('/api/payments/pay-1');
+
+    const [upd] = sqlAt(/UPDATE pt_clients SET paid_amount = GREATEST/i);
+    expect(upd.params).toEqual([700, CLIENT_A, ORG_A, null]);
+  });
+});

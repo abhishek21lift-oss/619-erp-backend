@@ -982,8 +982,8 @@ async function approve({ orderId, orgId, actor }, db = pool) {
     await tx.query(
       `INSERT INTO pt_payments
          (id, client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref,
-          date, notes, organization_id)
-       VALUES ($1,$2,$3,$4,$5,'UPI',$6,$7,$8,$9)`,
+          date, notes, organization_id, balance_applied)
+       VALUES ($1,$2,$3,$4,$5,'UPI',$6,$7,$8,$9,$10)`,
       [
         ptPaymentId, member.id, trainerId, order.total_amount,
         Math.round(Number(order.total_amount) * incentiveRate), receiptNo,
@@ -991,6 +991,11 @@ async function approve({ orderId, orgId, actor }, db = pool) {
         `UPI ${order.order_no} · UTR ${submission.utr}`
           + (overpaid > 0 ? ` · Rs. ${overpaid} more than the balance owed` : ''),
         orgId,
+        // What this payment took off balance_amount, so deleting it restores
+        // exactly that (payments audit PAY-3): a balance payment applies what
+        // was owed, a package purchase applies nothing — the balance is not
+        // touched above.
+        isBalance ? Math.min(round2(Number(order.total_amount)), owedNow) : 0,
       ]
     );
 

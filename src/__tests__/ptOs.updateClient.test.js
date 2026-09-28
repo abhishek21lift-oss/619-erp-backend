@@ -24,14 +24,19 @@ jest.mock('../db/pool', () => ({
   query: jest.fn(async (sql, params) => {
     queries.push({ sql: String(sql).replace(/\s+/g, ' ').trim(), params });
     // The pre-check SELECT that reads the current amounts.
-    if (/SELECT final_amount, paid_amount FROM pt_clients/i.test(sql)) {
+    if (/SELECT final_amount, paid_amount\b[\s\S]*FROM pt_clients/i.test(sql)) {
       return { rows: mockExistingRow ? [mockExistingRow] : [], rowCount: mockExistingRow ? 1 : 0 };
     }
     if (/^UPDATE pt_clients/i.test(sql)) {
       return { rows: [{ id: 'c1', name: 'Shailendra Shukla' }], rowCount: 1 };
     }
+    if (/INSERT INTO pt_payments/i.test(sql)) return { rows: [{ id: 'pay-1' }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   }),
+}));
+jest.mock('../db/receipts', () => ({ genReceiptNo: jest.fn(async () => 'RCP-20260928-100600') }));
+jest.mock('../modules/automation/automation.triggers', () => ({
+  paymentReceived: jest.fn(), memberCreated: jest.fn(), leadCreated: jest.fn(), trialScheduled: jest.fn(),
 }));
 
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
@@ -161,5 +166,45 @@ describe('the validation that still has to hold', () => {
       .patch('/api/pt-os/clients/nope')
       .send(fullForm());
     expect(res.status).toBe(404);
+  });
+});
+
+// Payments audit 2026-09-28, PAY-1: after a renewal paid_amount is a lifetime
+// total and final_amount the current term, so the enrolment arithmetic here
+// would refuse the save or wipe paid history. Those clients go through Renew.
+describe('money fields on a renewed client', () => {
+  test('are refused with USE_RENEW, and nothing is written', async () => {
+    mockExistingRow = { final_amount: '11000', paid_amount: '20000', renewals: 1 };
+    queries.length = 0;
+    const res = await request(app()).patch('/api/pt-os/clients/c1').send({ final_amount: 11000, paid_amount: 11000 });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('USE_RENEW');
+    expect(queries.filter((q) => /^UPDATE pt_clients|^INSERT INTO pt_payments/.test(q.sql))).toHaveLength(0);
+  });
+
+  test('personal fields on the same client still save', async () => {
+    mockExistingRow = { final_amount: '11000', paid_amount: '20000', renewals: 1 };
+    const res = await request(app()).patch('/api/pt-os/clients/c1').send({ mobile: '9000000001' });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('paid_amount cannot be lowered from the client form', () => {
+  test('lowering it is refused — the ledger would disagree', async () => {
+    mockExistingRow = { final_amount: '12000', paid_amount: '10000', renewals: 0 };
+    const res = await request(app()).patch('/api/pt-os/clients/c1').send({ final_amount: 12000, paid_amount: 8000 });
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/cannot be lowered/);
+  });
+
+  test('raising it books the difference with a receipt number and the amount applied', async () => {
+    mockExistingRow = { final_amount: '12000', paid_amount: '10000', renewals: 0 };
+    queries.length = 0;
+    const res = await request(app()).patch('/api/pt-os/clients/c1').send({ final_amount: 12000, paid_amount: 12000 });
+    expect(res.status).toBe(200);
+    const ins = queries.find((q) => /^INSERT INTO pt_payments/.test(q.sql));
+    expect(ins.sql).toMatch(/payment_ref/);
+    expect(ins.params[2]).toBe(2000);
+    expect(ins.params[ins.params.length - 1]).toBe(2000);
   });
 });

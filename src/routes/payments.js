@@ -213,9 +213,14 @@ router.delete('/:id', auth, requireTrainer, async (req, res, next) => {
       await tx.query(`
         UPDATE pt_clients
         SET paid_amount = GREATEST(0, paid_amount - $1),
-            balance_amount = balance_amount + $1,
+            -- Exactly what this payment took off the balance, not its full
+            -- amount: an overpayment or a UPI package purchase applied less
+            -- (or nothing), and restoring the full amount left the client
+            -- owing more than was ever due (payments audit PAY-3). Rows from
+            -- before migration 217 have no record and keep the old rule.
+            balance_amount = balance_amount + COALESCE($4, $1),
             updated_at = NOW()
-        WHERE id = $2 AND organization_id = $3`, [ptRows[0].amount, ptRows[0].client_id, scope.orgId]
+        WHERE id = $2 AND organization_id = $3`, [ptRows[0].amount, ptRows[0].client_id, scope.orgId, ptRows[0].balance_applied]
       );
       await tx.query('COMMIT');
       await logActivity(req, 'payment.delete', 'pt_payment', ptRows[0].id, null, ptRows[0]);

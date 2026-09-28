@@ -21,6 +21,8 @@ const { buildRecovery } = require('./recovery');
 const { routedChat } = require('../../lib/ai/router');
 const { logActivity } = require('../../lib/activityLog');
 const { recordPtPayment } = require('../../lib/ptPayments');
+const { renewClient } = require('./renewal.service');
+const { genReceiptNo } = require('../../db/receipts');
 
 /**
  * Where a client found the studio.
@@ -572,140 +574,46 @@ router.get('/clients/:id/renewals', auth, wrap(async (req, res) => {
 }));
 
 // ─── Renew PT client ────────────────────────────────────────
-router.post('/clients/:id/renew', auth, requireTrainer, wrap(async (req, res) => {
-  const d = req.body;
-  if (!d.pt_start_date || !d.duration_months)
-    return res.status(400).json({ error: { code: 'VALIDATION', message: 'pt_start_date and duration_months are required' } });
+//
+// The work — one transaction, the client locked, duplicate submits refused,
+// the payment on the ledger with a receipt number — is renewal.service.js
+// (payments audit PAY-2). What stays here is the request contract.
+const MAX_MONEY = 10_000_000; // ₹1 crore: far above any PT term, far below a typo's reach
+const money = () => z.coerce.number().min(0).max(MAX_MONEY).optional().nullable();
+const renewSchema = {
+  body: z.object({
+    pt_start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}/, 'pt_start_date must be YYYY-MM-DD')
+      .refine((v) => !Number.isNaN(Date.parse(v.slice(0, 10))), 'pt_start_date is not a valid date'),
+    duration_months: z.coerce.number().int().min(1).max(60),
+    base_amount: money(),
+    discount: money(),
+    final_amount: money(),
+    paid_amount: money(),
+    monthly_pt_amount: money(),
+    package_type: z.string().max(100).optional().nullable(),
+    payment_method: z.string().transform((v) => v.toUpperCase())
+      .refine((v) => PT_PAYMENT_METHODS.has(v), 'payment_method must be CASH, UPI, CARD or BANK_TRANSFER')
+      .optional().nullable(),
+    notes: z.string().max(1000).optional().nullable(),
+  }).refine((b) => b.discount == null || b.base_amount == null || b.discount <= b.base_amount,
+    { message: 'discount cannot exceed base_amount', path: ['discount'] }),
+};
 
-  const endDate = new Date(d.pt_start_date);
-  endDate.setMonth(endDate.getMonth() + Number(d.duration_months));
-  const ptEndDate = endDate.toISOString().slice(0, 10);
-
-  const baseAmt    = Number(d.base_amount)       || 0;
-  const disc       = Number(d.discount)           || 0;
-  const finalAmt   = d.final_amount !== undefined ? Number(d.final_amount) : Math.max(baseAmt - disc, 0);
-  const paidNow    = Number(d.paid_amount)        || 0;
-  const monthlyAmt = Number(d.monthly_pt_amount)  || 0;
-  const packageType = d.package_type || null;
-
-  const exParams = [req.params.id];
-  const exOrg = orgWhere(req, exParams);
-  const { rows: existing } = await pool.query(
-    `SELECT * FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${exOrg}`,
-    exParams
-  );
-  if (existing.length === 0)
+router.post('/clients/:id/renew', auth, requireTrainer, validate(renewSchema), wrap(async (req, res) => {
+  const result = await renewClient(req, req.params.id, req.body);
+  if (result.notFound) {
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-  const c = existing[0];
-
-  const { rows } = await pool.query(`
-    UPDATE pt_clients SET
-      package_type      = COALESCE($2, package_type),
-      base_amount       = $3,
-      discount          = $4,
-      final_amount      = $5,
-      monthly_pt_amount = $6,
-      pt_start_date     = $7,
-      pt_end_date       = $8,
-      duration_months   = $9,
-      paid_amount       = paid_amount + $10,
-      -- What they owed before, plus the new term, less what they paid now.
-      -- paid_amount is a lifetime total, so the old "$5 - (paid_amount + $10)"
-      -- subtracted every earlier term's money from this term's price: a
-      -- returning client renewed with nothing paid came out owing Rs. 0.
-      balance_amount    = GREATEST(COALESCE(balance_amount, 0) + $5 - $10, 0),
-      status            = 'active',
-      updated_at        = NOW()
-    WHERE id = $1 AND deleted_at IS NULL AND organization_id = $11
-    RETURNING *
-  `, [req.params.id, packageType, baseAmt, disc, finalAmt, monthlyAmt,
-      d.pt_start_date, ptEndDate, d.duration_months, paidNow, c.organization_id]);
-
-  // Log to renewal history
-  await pool.query(`
-    INSERT INTO pt_client_renewals
-      (client_id, client_name, trainer_name, old_package, new_package,
-       old_end_date, new_start_date, new_end_date, duration_months,
-       base_amount, discount, final_amount, paid_amount, balance_amount, notes,
-       organization_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-  `, [
-    req.params.id, c.name, c.trainer_name,
-    c.package_type, packageType || c.package_type,
-    c.pt_end_date, d.pt_start_date, ptEndDate, d.duration_months,
-    baseAmt, disc, finalAmt, paidNow, Math.max(finalAmt - paidNow, 0),
-    d.notes || null,
-    // Stamped from the CLIENT, not from the caller's header — the same rule
-    // payments.routes.test.js pins for pt_payments. Migration 196 added the
-    // column; before it, this table could only be scoped by joining back to
-    // pt_clients, and five rows whose client was later deleted became
-    // permanently unattributable.
-    c.organization_id,
-  ]);
-
-  // Also write to pt_client_subscriptions (canonical term history used by the profile page)
-  await pool.query(`
-    INSERT INTO pt_client_subscriptions
-      (client_id, plan_name, start_date, end_date, duration_months,
-       selling_price, amount_paid, balance_amount, trainer_name, status, source)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','renewal')
-    ON CONFLICT DO NOTHING
-  `, [
-    req.params.id,
-    packageType || c.package_type,
-    d.pt_start_date, ptEndDate, d.duration_months,
-    finalAmt, paidNow, Math.max(finalAmt - paidNow, 0),
-    c.trainer_name,
-  ]);
-
-  // Ledger: money collected at renewal must land in pt_payments — the revenue
-  // reports sum the payment ledgers, not pt_clients.paid_amount, so without
-  // this row renewal income was invisible to every financial report.
-  if (paidNow > 0) {
-    let ledgerTrainerId = null;
-    let incentiveRate = 0;
-    if (c.trainer_id) {
-      const tr = await trainerForOrg(pool, c.organization_id, c.trainer_id);
-      if (tr) { ledgerTrainerId = tr.id; incentiveRate = tr.incentive_rate ?? 0.5; }
-    }
-    // RETURNING id, because the id is what the automation event is keyed on.
-    // See the event below.
-    const { rows: paid } = await pool.query(
-      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes, organization_id)
-       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6,$7)
-       RETURNING id`,
-      [req.params.id, ledgerTrainerId, paidNow, Math.round(paidNow * incentiveRate),
-       String(d.payment_method || 'CASH').toUpperCase(), `Renewal — ${packageType || c.package_type || 'PT package'}`,
-       orgIdOf(req)]
-    );
-
-    // The payment's own id is the event key, the same as every other payment
-    // trigger in this codebase.
-    //
-    // It used to be `renewal:<client>:<amount>:<new Date().toISOString()…>`,
-    // composed because "the payment row carries no id we can read back here" —
-    // which was true only for as long as the INSERT above declined to return
-    // one. That composition was wrong in both directions. Two genuinely
-    // separate payments of the same amount from one client on one day
-    // collapsed into a single event, so the second one's message was suppressed
-    // as a duplicate. And the date came from `new Date()` in the Node process,
-    // which is UTC: for a studio in IST every payment taken between midnight
-    // and 05:30 local was keyed to the PREVIOUS day, so a payment late on one
-    // evening and another early the next morning shared a key and the second
-    // client heard nothing. automation.sweep.js documents that exact trap —
-    // "a Node process is not guaranteed to agree with the database about what
-    // day it is" — and this was the one place still falling into it.
-    //
-    // A payment id is stable across a retried request, unique across payments,
-    // and carries no clock at all, so all three problems go away together.
-    await automation.paymentReceived(req, {
-      clientId: req.params.id,
-      amount: paidNow,
-      eventKey: paid[0].id,
-    });
   }
-
-  res.json({ data: rows[0] });
+  if (result.duplicate) {
+    return res.status(409).json({ error: { code: 'DUPLICATE_RENEWAL', message: 'This renewal was just recorded — it has not been added twice.' } });
+  }
+  if (result.overpaid != null) {
+    return res.status(400).json({ error: {
+      code: 'OVERPAID',
+      message: `Amount paid (Rs. ${result.overpaid}) is more than the client owes including this term (Rs. ${result.owed}).`,
+    } });
+  }
+  res.json({ data: result.client });
 }));
 
 // ─── Update PT client ───────────────────────────────────────
@@ -771,12 +679,28 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
     const exParams = [req.params.id];
     const exOrg = orgWhere(req, exParams);
     const { rows: existingRows } = await pool.query(
-      `SELECT final_amount, paid_amount FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${exOrg}`,
+      `SELECT final_amount, paid_amount,
+              (SELECT COUNT(*) FROM pt_client_renewals r WHERE r.client_id = pt_clients.id)::int AS renewals
+         FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${exOrg}`,
       exParams
     );
     if (existingRows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
     const existing = existingRows[0];
     previousPaid = Number(existing.paid_amount) || 0;
+
+    // Payments audit PAY-1. After a renewal, paid_amount is a LIFETIME total
+    // (renewal adds to it) while final_amount is the current term's price —
+    // so the enrolment arithmetic below (balance = final − paid, paid <= final,
+    // book paid − previous paid as the payment) is wrong for that client: it
+    // refused the save outright, or, once "corrected", wiped part of the paid
+    // history and booked only the difference as revenue. A renewed client's
+    // term is changed from Renew and their money from Payments.
+    if (existing.renewals > 0) {
+      return res.status(409).json({ error: {
+        code: 'USE_RENEW',
+        message: 'This client has renewed before. Change their current term with Renew PT, and record money on the Payments tab.',
+      } });
+    }
 
     if (wantsFinalAmount) {
       // `>= 0`, not `> 0`. This rejected every save on a client priced at zero
@@ -802,6 +726,16 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
       paidAmount = Number(req.body.paid_amount);
       if (!Number.isFinite(paidAmount) || paidAmount < 0) {
         return res.status(400).json({ error: { code: 'VALIDATION', message: 'Amount Paid cannot be negative.' } });
+      }
+      // Lowering it here would move the client's total away from the ledger:
+      // money already booked would stay booked while the client showed less
+      // paid. A payment recorded by mistake is deleted from Payments, which
+      // reverses the balance with it.
+      if (paidAmount < previousPaid) {
+        return res.status(400).json({ error: {
+          code: 'VALIDATION',
+          message: `Amount Paid cannot be lowered below the Rs. ${previousPaid} already recorded — delete the payment on the Payments tab instead.`,
+        } });
       }
     }
     const effectiveFinal = finalAmount ?? (Number(existing.final_amount) || 0);
@@ -913,13 +847,16 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
       const tr = await trainerForOrg(pool, rows[0].organization_id, rows[0].trainer_id);
       if (tr) { ledgerTrainerId = tr.id; incentiveRate = tr.incentive_rate ?? 0.5; }
     }
+    // A receipt number like every other payment (payments audit PAY-6), and
+    // the amount taken off the balance so a delete restores exactly that: the
+    // whole delta, because paid <= final is enforced above.
     const { rows: paid } = await pool.query(
-      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, date, notes, organization_id)
-       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,$6,$7)
+      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes, organization_id, balance_applied)
+       VALUES ($1,$2,$3,$4,$5,$6,CURRENT_DATE,$7,$8,$9)
        RETURNING id`,
       [req.params.id, ledgerTrainerId, delta, Math.round(delta * incentiveRate),
-       String(req.body.payment_method || 'CASH').toUpperCase(), 'Collected via client profile / enrolment',
-       orgIdOf(req)]
+       String(req.body.payment_method || 'CASH').toUpperCase(), await genReceiptNo(pool),
+       'Collected via client profile / enrolment', orgIdOf(req), delta]
     );
 
     // The payment's own id, for the reasons set out at the renewal path above:

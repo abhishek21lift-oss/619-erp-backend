@@ -232,6 +232,17 @@ router.put('/:id', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'Cannot update a paid invoice' });
 
     const d = req.body;
+    // Payments audit PAY-5. This took any status string, 'paid' included, so
+    // an invoice could be marked paid with no payment on the ledger, no paid_at
+    // and no change to what the client owes. Paying goes through
+    // POST /:id/mark-paid, which records the money; cancelling through
+    // POST /:id/cancel. Here only the unpaid lifecycle states are settable.
+    const EDITABLE_STATUSES = ['draft', 'sent', 'overdue'];
+    if (d.status != null && d.status !== ex[0].status && !EDITABLE_STATUSES.includes(d.status)) {
+      return res.status(400).json({
+        error: `status can only be set to ${EDITABLE_STATUSES.join(', ')} here — use Mark as paid or Cancel`,
+      });
+    }
     const { rows } = await pool.query(`
       UPDATE invoices SET
         status = COALESCE($1, status),
@@ -276,8 +287,14 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
     const guard = ' AND organization_id = $2';
     const params = [req.params.id, scope.orgId];
     const { rows: inv } = await tx.query(
-      `UPDATE invoices SET status='paid', paid_at=NOW(), paid_amount=total_amount, updated_at=NOW()
-       WHERE id=$1 AND status IN ('sent','draft','partial','overdue')${guard} RETURNING *`,
+      // prev_paid is what had already been paid on this invoice before this
+      // call (the FROM row is read from the pre-update snapshot). Only the
+      // remainder is money arriving now: marking a part-paid invoice paid
+      // used to book its FULL total again (payments audit PAY-5).
+      `UPDATE invoices i SET status='paid', paid_at=NOW(), paid_amount=i.total_amount, updated_at=NOW()
+         FROM (SELECT COALESCE(paid_amount, 0) AS prev_paid FROM invoices WHERE id=$1) prev
+       WHERE i.id=$1 AND i.status IN ('sent','draft','partial','overdue')${guard.replace('organization_id', 'i.organization_id')}
+       RETURNING i.*, prev.prev_paid`,
       params
     );
     if (!inv[0]) { await tx.query('ROLLBACK'); return res.status(404).json({ error: 'Invoice not found or already paid' }); }
@@ -318,8 +335,10 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
     //
     // COALESCE on the SET, because ON CONFLICT DO NOTHING can return no row —
     // without it a conflicting insert would blank an existing link.
-    const receiptNo = 'INV-' + inv[0].invoice_no;
-    await tx.query(`
+    const receiptNo = inv[0].invoice_no;
+    const remaining = Math.max(0, Number(inv[0].total_amount) - Number(inv[0].prev_paid || 0));
+    // Nothing left to pay is no money arriving: no ₹0 ledger row.
+    if (remaining > 0) await tx.query(`
       WITH new_payment AS (
         INSERT INTO pt_payments
           (id, client_id, trainer_id, amount, payment_method, date, payment_ref,
@@ -331,7 +350,7 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
       UPDATE invoices
          SET payment_id = COALESCE((SELECT id FROM new_payment), payment_id)
        WHERE id = $8 AND organization_id = $7`,
-      [randomUUID(), inv[0].client_id, inv[0].total_amount,
+      [randomUUID(), inv[0].client_id, remaining,
        req.body.payment_method || 'CASH', receiptNo,
        'Payment for invoice ' + inv[0].invoice_no, inv[0].organization_id, inv[0].id]
     );
@@ -340,14 +359,14 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
     // stays correct. pt_clients is the live client table (the legacy `clients`
     // table has been empty since PT-OS shipped), and invoices.client_id keys
     // into it — so this is what actually reflects the payment on the client.
-    if (inv[0].client_id) {
+    if (inv[0].client_id && remaining > 0) {
       await tx.query(`
         UPDATE pt_clients
         SET paid_amount    = COALESCE(paid_amount, 0) + $1,
             balance_amount = GREATEST(0, COALESCE(balance_amount, 0) - $1),
             updated_at     = NOW()
-        WHERE id = $2 AND deleted_at IS NULL`,
-        [inv[0].total_amount, inv[0].client_id]
+        WHERE id = $2 AND deleted_at IS NULL AND organization_id = $3`,
+        [remaining, inv[0].client_id, inv[0].organization_id]
       );
     }
 
@@ -369,10 +388,10 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
     //
     // Guarded on client_id because an invoice need not have one; the balance
     // update above is guarded the same way.
-    if (inv[0].client_id) {
+    if (inv[0].client_id && remaining > 0) {
       await automation.paymentReceived(req, {
         clientId: inv[0].client_id,
-        amount: inv[0].total_amount,
+        amount: remaining,
         eventKey: `invoice:${inv[0].id}`,
       });
     }
@@ -387,6 +406,11 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
 });
 
 // POST /api/invoices/:id/remind
+//
+// Payments audit PAY-4. This wrote a log line and answered "Reminder sent to
+// <name>", which the Invoices page showed as success — nothing was ever sent,
+// and the trainer believed the client had been reminded. Until a reminder is
+// actually delivered through the studio's messaging, say so plainly.
 router.post('/:id/remind', auth, async (req, res, next) => {
   try {
     const scope = tenantScope(req);
@@ -394,8 +418,10 @@ router.post('/:id/remind', auth, async (req, res, next) => {
     const params = [req.params.id, scope.orgId];
     const { rows } = await pool.query(`SELECT * FROM invoices WHERE id=$1${guard}`, params);
     if (!rows[0]) return res.status(404).json({ error: 'Invoice not found' });
-    logger.info({ invoiceId: req.params.id, userId: req.user.id }, 'Payment reminder sent');
-    res.json({ message: 'Reminder sent to ' + rows[0].client_name });
+    res.status(501).json({
+      error: 'Invoice reminders are not sent automatically yet — message the client from their profile.',
+      code: 'NOT_IMPLEMENTED',
+    });
   } catch (err) {
     next(err);
   }
