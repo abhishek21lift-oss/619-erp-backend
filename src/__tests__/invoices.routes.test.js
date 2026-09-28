@@ -36,7 +36,7 @@ const mockTxClient = {
     if (/SELECT id, name FROM pt_clients/i.test(text)) {
       return { rows: mockClientRow ? [mockClientRow] : [], rowCount: mockClientRow ? 1 : 0 };
     }
-    if (/UPDATE invoices SET status='paid'/i.test(text)) {
+    if (/UPDATE invoices i SET status='paid'/i.test(text)) {
       return { rows: mockInvoiceRow ? [mockInvoiceRow] : [], rowCount: mockInvoiceRow ? 1 : 0 };
     }
     return { rows: [], rowCount: 0 };
@@ -212,8 +212,8 @@ describe('POST /api/invoices/:id/mark-paid', () => {
     const res = await request(app()).post('/api/invoices/inv-1/mark-paid').send({});
 
     expect(res.status).toBe(200);
-    const [upd] = sqlAt(/UPDATE invoices SET status='paid'/i);
-    expect(upd.sql).toMatch(/organization_id = \$2/);
+    const [upd] = sqlAt(/UPDATE invoices i SET status='paid'/i);
+    expect(upd.sql).toMatch(/i\.organization_id = \$2/);
     expect(upd.params).toEqual(['inv-1', ORG_A]);
   });
 
@@ -222,9 +222,9 @@ describe('POST /api/invoices/:id/mark-paid', () => {
 
     await request(app()).post('/api/invoices/inv-1/mark-paid').send({});
 
-    const [upd] = sqlAt(/UPDATE invoices SET status='paid'/i);
+    const [upd] = sqlAt(/UPDATE invoices i SET status='paid'/i);
     // Guards double-payment: a row already 'paid' matches nothing and 404s.
-    expect(upd.sql).toMatch(/status IN \('sent','draft','partial','overdue'\)/);
+    expect(upd.sql).toMatch(/i\.status IN \('sent','draft','partial','overdue'\)/);
   });
 
   test('404s and rolls back when the invoice is already paid or not this tenant', async () => {
@@ -238,12 +238,13 @@ describe('POST /api/invoices/:id/mark-paid', () => {
   });
 
   test('credits the client balance by the invoice total, floored at zero', async () => {
-    mockInvoiceRow = { id: 'inv-1', invoice_no: 'INV-1', client_id: 'ptc-9', client_name: 'A', total_amount: 3200 };
+    mockInvoiceRow = { id: 'inv-1', invoice_no: 'INV-1', client_id: 'ptc-9', client_name: 'A', total_amount: 3200, organization_id: ORG_A };
 
     await request(app()).post('/api/invoices/inv-1/mark-paid').send({});
 
     const [upd] = sqlAt(/UPDATE pt_clients/i);
-    expect(upd.params).toEqual([3200, 'ptc-9']);
+    expect(upd.params).toEqual([3200, 'ptc-9', ORG_A]);
+    expect(upd.sql).toMatch(/organization_id = \$3/);
     expect(upd.sql).toMatch(/GREATEST\(0, COALESCE\(balance_amount, 0\) - \$1\)/i);
     expect(verbs()).toEqual(['BEGIN', 'COMMIT']);
   });
@@ -257,5 +258,54 @@ describe('POST /api/invoices/:id/mark-paid', () => {
 
     expect(res.status).toBe(200);
     expect(sqlAt(/UPDATE pt_clients/i)).toHaveLength(0);
+  });
+});
+
+// Payments audit 2026-09-28, PAY-4 / PAY-5.
+describe('invoices no longer claim what did not happen', () => {
+  test('marking a part-paid invoice paid books only the remainder', async () => {
+    mockInvoiceRow = {
+      id: 'inv-1', invoice_no: 'INV-1', client_id: 'ptc-9', client_name: 'A',
+      total_amount: 5000, prev_paid: '2000.00', organization_id: ORG_A,
+    };
+
+    await request(app()).post('/api/invoices/inv-1/mark-paid').send({});
+
+    const [pay] = sqlAt(/INSERT INTO pt_payments/i);
+    expect(pay.params[2]).toBe(3000);
+    const [upd] = sqlAt(/UPDATE pt_clients/i);
+    expect(upd.params[0]).toBe(3000);
+  });
+
+  test('an invoice already fully paid through partials writes no ₹0 payment', async () => {
+    mockInvoiceRow = {
+      id: 'inv-1', invoice_no: 'INV-1', client_id: 'ptc-9', client_name: 'A',
+      total_amount: 5000, prev_paid: '5000.00', organization_id: ORG_A,
+    };
+
+    const res = await request(app()).post('/api/invoices/inv-1/mark-paid').send({});
+
+    expect(res.status).toBe(200);
+    expect(sqlAt(/INSERT INTO pt_payments/i)).toHaveLength(0);
+    expect(sqlAt(/UPDATE pt_clients/i)).toHaveLength(0);
+  });
+});
+
+describe('PUT status and remind', () => {
+  test('PUT cannot set an invoice to paid — only mark-paid records money', async () => {
+    const res = await request(app()).put('/api/invoices/inv-1').send({ status: 'paid' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Mark as paid/);
+  });
+
+  test('PUT still moves an invoice through its unpaid states', async () => {
+    const res = await request(app()).put('/api/invoices/inv-1').send({ status: 'sent' });
+    expect(res.status).toBe(200);
+  });
+
+  test('remind says plainly that nothing is sent', async () => {
+    const res = await request(app()).post('/api/invoices/inv-1/remind');
+    expect(res.status).toBe(501);
+    expect(res.body.code).toBe('NOT_IMPLEMENTED');
   });
 });

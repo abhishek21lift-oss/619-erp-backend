@@ -98,12 +98,20 @@ async function recordPtPayment(req, p) {
 
     const paymentRef = p.paymentRef || await genReceiptNo(tx);
 
+    // What this payment takes off the balance: the balance is clamped at zero
+    // below, so a payment larger than what is owed applies only what is owed.
+    // Stored so that deleting the payment restores exactly this and no more
+    // (payments audit PAY-3). Read from the row locked above.
+    const balanceApplied = client
+      ? Math.min(p.amount, Math.max(0, Number(client.balance_amount) || 0))
+      : null;
+
     await tx.query(
       `INSERT INTO pt_payments (id, client_id, trainer_id, amount, incentive_amt,
-         payment_method, payment_ref, date, notes, organization_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+         payment_method, payment_ref, date, notes, organization_id, balance_applied)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
       [paymentId, p.clientId || null, trainer?.id ?? null, p.amount, incentiveAmt,
-       p.method ?? null, paymentRef, p.date, p.notes ?? null, orgId],
+       p.method ?? null, paymentRef, p.date, p.notes ?? null, orgId, balanceApplied],
     );
 
     if (client) {

@@ -257,6 +257,9 @@ describe('the event key is a payment identity, not a clock reading', () => {
 
   const CALL_SITES = [
     'src/modules/pt-os/pt-os.routes.js',
+    // Renewal's payment event moved here with the renewal itself (payments
+    // audit PAY-2: one transaction, raised after COMMIT).
+    'src/modules/pt-os/renewal.service.js',
     'src/lib/ptPayments.js',
     'src/routes/invoices.js',
     'src/lib/upiPayments.js',
@@ -298,7 +301,7 @@ describe('the event key is a payment identity, not a clock reading', () => {
   it('every payment call site was actually examined', () => {
     // A regex that quietly matches nothing would pass both guards above
     // without reading a line of the thing it claims to check. Five call sites
-    // exist across the four files (six until the two manual-payment
+    // exist across the five files (six until the two manual-payment
     // endpoints were folded into lib/ptPayments.js); this fails if that stops being true rather
     // than silently narrowing.
     const total = CALL_SITES.reduce((n, f) => n + eventKeysIn(f).length, 0);
