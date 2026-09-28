@@ -49,7 +49,6 @@ describe('every settings read is bounded by the caller studio', () => {
   it.each([
     ['GET /',            '/api/settings'],
     ['GET /studio',      '/api/settings/studio'],
-    ['GET /branches',    '/api/settings/branches'],
     ['GET /gym',         '/api/settings/gym'],
   ])('%s filters on organization_id and binds the caller org', async (_label, url) => {
     await request(app).get(url).expect(200);
@@ -91,29 +90,12 @@ describe('every settings write is bounded by the caller studio', () => {
     expect(settingsSql()).toHaveLength(0);
   });
 
-  it('POST /branches stamps the creating studio', async () => {
-    await request(app).post('/api/settings/branches').send({ name: 'North' }).expect(201);
-    const [q] = settingsSql();
-    expect(q.sql).toMatch(/INSERT INTO system_settings \(organization_id, key/i);
-    expect(q.params).toContain(ORG_A);
-  });
-
-  it('PUT /branches/:id scopes both the lookup and the update', async () => {
-    mockRows = [{ value: JSON.stringify({ name: 'Old' }) }];
-    await request(app).put('/api/settings/branches/abc').send({ name: 'New' }).expect(200);
-    for (const q of settingsSql()) {
-      expect(q.sql).toMatch(/organization_id\s*=\s*\$\d/i);
-      expect(q.params).toContain(ORG_A);
-    }
-  });
-
-  it('DELETE /branches/:id scopes both the lookup and the delete', async () => {
-    mockRows = [{ key: 'branch_abc', member_count: 0 }];
-    await request(app).delete('/api/settings/branches/abc').expect(200);
-    for (const q of settingsSql()) {
-      expect(q.sql).toMatch(/organization_id\s*=\s*\$\d/i);
-      expect(q.params).toContain(ORG_A);
-    }
+  it('the Branches feature is gone: its routes do not exist and touch nothing', async () => {
+    await request(app).get('/api/settings/branches').expect(404);
+    await request(app).post('/api/settings/branches').send({ name: 'North' }).expect(404);
+    await request(app).put('/api/settings/branches/abc').send({ name: 'New' }).expect(404);
+    await request(app).delete('/api/settings/branches/abc').expect(404);
+    expect(settingsSql()).toHaveLength(0);
   });
 });
 

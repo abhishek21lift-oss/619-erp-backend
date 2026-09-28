@@ -45,17 +45,15 @@ const MIGRATIONS = path.join(SRC, 'db', 'migrations');
 /**
  * Tables the application creates at runtime rather than in a migration.
  *
- * Adding an entry says "this DDL is deliberate", not "quiet the test". Both
- * current entries are created inside a request handler, which is worth
- * knowing: CREATE TABLE takes an ACCESS EXCLUSIVE lock, so a handler that
- * issues one is a handler that can block every reader of that table.
+ * Adding an entry says "this DDL is deliberate", not "quiet the test". A
+ * table created inside a request handler is worth knowing about: CREATE TABLE
+ * takes an ACCESS EXCLUSIVE lock, so a handler that issues one is a handler
+ * that can block every reader of that table.
+ *
+ * Empty since the duplicate-client merge tool (which created
+ * pt_clients_merge_backup and pt_clients_merge_log) was removed.
  */
-const CREATED_BY_APPLICATION = {
-  pt_clients_merge_backup:
-    'Snapshot table for the duplicate-client merge tool; CREATE TABLE IF NOT EXISTS in pt-os.routes.js, shaped LIKE pt_clients so a migration cannot express it.',
-  pt_clients_merge_log:
-    'Audit trail for the same merge tool, created alongside its backup table in the same handler.',
-};
+const CREATED_BY_APPLICATION = {};
 
 /** Relations any migration or the base schema brings into existence. */
 function schemaRelations() {
