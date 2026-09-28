@@ -59,35 +59,74 @@ jobs:
           script_stop: true
           script: |
             set -euo pipefail
-            cd /opt/myptstudio/619-erp-backend
+            cd /opt/myptstudio
 
-            # The environment comes from the box, never from this file. The
-            # API container already reads these; the backup reuses them rather
-            # than introducing a second copy of the credential.
-            set -a
-            . /opt/myptstudio/.env
-            set +a
+            # Box-level knobs (BACKUP_DIR, BACKUP_UPLOAD, BACKUP_RETAIN_DAYS,
+            # BACKUP_DATABASE_URL, BACKUP_R2_BUCKET) may live in .env.
+            if [ -f .env ]; then set -a; . ./.env; set +a; fi
 
-            # In a container, not on the host. The host has no node and no
-            # pg_dump (the app runs in Docker), so the previous
-            # `node scripts/backup-database.js` failed with "node: command not
-            # found" on every run since this workflow was added — not one
-            # backup was ever taken. infra/backup/Dockerfile carries node and a
-            # pg_dump matching the server's major version.
+            # ── The credentials come from the running API container ──────
+            #
+            # Every run from #1 to #13 failed. The first ones died at
+            # "node: command not found"; once that was fixed (the backup
+            # image below), every run died at "None of BACKUP_DATABASE_URL,
+            # ADMIN_DATABASE_URL or DATABASE_URL is set": the API does not
+            # get its connection string from /opt/myptstudio/.env, so
+            # sourcing that file handed the backup nothing.
+            #
+            # Rather than guess where Compose resolves it from, read what the
+            # live backend container was actually started with. That is, by
+            # definition, a connection string that works right now, and it
+            # cannot drift from the app's: rotate the password and the next
+            # backup uses the new one. Only the variables the backup needs
+            # are copied, into a 0600 file that is deleted on exit; secrets
+            # never appear in argv or in the log.
+            BACKEND_CID="$(docker compose ps -q backend)"
+            if [ -z "$BACKEND_CID" ]; then
+              echo "backup failed: the backend container is not running, so there is no connection string to use."
+              exit 1
+            fi
+            ENV_FILE="$(mktemp)"
+            chmod 600 "$ENV_FILE"
+            trap 'rm -f "$ENV_FILE"' EXIT
+            docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$BACKEND_CID" \
+              | grep -E '^(DATABASE_URL|ADMIN_DATABASE_URL|R2_ACCOUNT_ID|R2_ACCESS_KEY_ID|R2_SECRET_ACCESS_KEY)=.' \
+              > "$ENV_FILE" || true
+            # Explicit backup-only overrides from .env win (docker takes the
+            # last occurrence of a name).
+            for v in BACKUP_DATABASE_URL BACKUP_R2_BUCKET; do
+              if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$ENV_FILE"; fi
+            done
+            if ! grep -qE '^(DATABASE_URL|ADMIN_DATABASE_URL|BACKUP_DATABASE_URL)=' "$ENV_FILE"; then
+              echo "backup failed: the backend container has no DATABASE_URL either."
+              exit 1
+            fi
+
+            # Off-site upload needs the R2 keys. Without them the dump is
+            # still taken and verified on this box — a real restore point —
+            # and the run says plainly that it is not off-site, instead of
+            # failing and hiding that a good local dump exists.
+            UPLOAD="${BACKUP_UPLOAD:-1}"
+            if [ "$UPLOAD" != "0" ] && ! grep -q '^R2_SECRET_ACCESS_KEY=' "$ENV_FILE"; then
+              echo "::warning::R2 credentials are not set on the backend — this backup stays on the VPS only (not off-site)."
+              UPLOAD=""
+            fi
+            if [ "$UPLOAD" = "0" ]; then UPLOAD=""; fi
+
+            # In a container, not on the host: the host has no node and no
+            # pg_dump. infra/backup/Dockerfile carries both, with pg_dump
+            # matching the server's major version.
             #
             # BACKUP_DIR must sit outside the repository — the script refuses
             # otherwise, because a dump inside a working tree is one `git add`
-            # away from being published. Secrets travel as `-e NAME` (value
-            # taken from this shell, which sourced .env): never in argv, never
-            # baked into the image.
+            # away from being published.
             BACKUP_HOST_DIR="${BACKUP_DIR:-/var/backups/619}"
             install -d -m 700 "$BACKUP_HOST_DIR"
-            docker build --quiet -t myptstudio-backup -f infra/backup/Dockerfile .
+            docker build --quiet -t myptstudio-backup -f 619-erp-backend/infra/backup/Dockerfile 619-erp-backend
             docker run --rm \
-              -e DATABASE_URL -e ADMIN_DATABASE_URL -e BACKUP_DATABASE_URL \
-              -e R2_ACCOUNT_ID -e R2_ACCESS_KEY_ID -e R2_SECRET_ACCESS_KEY -e BACKUP_R2_BUCKET \
+              --env-file "$ENV_FILE" \
               -e BACKUP_DIR=/backups \
-              -e BACKUP_UPLOAD="${BACKUP_UPLOAD:-1}" \
+              -e BACKUP_UPLOAD="$UPLOAD" \
               -e BACKUP_RETAIN_DAYS="${BACKUP_RETAIN_DAYS:-30}" \
               -v "$BACKUP_HOST_DIR:/backups" \
               myptstudio-backup
