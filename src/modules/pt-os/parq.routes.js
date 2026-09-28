@@ -18,6 +18,9 @@ const { logActivity } = require('../../lib/activityLog');
 const { generateConsentPdf } = require('../../lib/parqPdf');
 const { saveFile } = require('../../lib/fileStorage');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+const { clientInOrg } = require('../../lib/orgGuard');
+const { computeParqAnalysis } = require('./parq-scoring');
+const { clearanceApprovalProblem } = require('./parq-clearance');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -30,27 +33,7 @@ const numOpt = () => z.coerce.number().optional().nullable();
 
 // ─── Analysis helpers (shared by POST + PATCH so derived columns never drift) ───
 
-// Rule: count answer === 'yes' across the 10 fixed PAR-Q questions.
-// 0 yes = low, 1-2 = medium, 3+ = high. Never trust a client-supplied risk
-// level — a malicious/buggy client could self-report LOW risk to bypass
-// the workout-assignment gate, so this is always recomputed server-side.
-function computeParqAnalysis(parqAnswers) {
-  const answers = Array.isArray(parqAnswers) ? parqAnswers : [];
-  const yesCount = answers.filter((a) => a && a.answer === 'yes').length;
-  let riskLevel;
-  let riskMessage;
-  if (yesCount === 0) {
-    riskLevel = 'low';
-    riskMessage = 'Approved for Exercise';
-  } else if (yesCount <= 2) {
-    riskLevel = 'medium';
-    riskMessage = 'Trainer Review Required';
-  } else {
-    riskLevel = 'high';
-    riskMessage = 'Medical Clearance Required — Workout Assignment Disabled';
-  }
-  return { yesCount, riskLevel, riskMessage };
-}
+// PAR-Q risk rule — see ./parq-scoring.js.
 
 function calcBmi(weightKg, heightCm) {
   const w = Number(weightKg);
@@ -144,10 +127,17 @@ const familyHistorySchema = z.object({
   notes: z.string().max(1000).optional().nullable(),
 });
 
-const parqFormCreateSchema = {
-  body: z.object({
-    client_id: z.string(),
-    assessment_date: z.string().optional().nullable(),
+// The screening gate reads the LATEST form by assessment_date, so a
+// future-dated form would sit on top of every real one — a low-risk form dated
+// next year hides today's high-risk answers. One day of slack absorbs a
+// device whose clock or timezone is ahead of the server's.
+const notFutureDate = () => z.string().optional().nullable().refine(
+  (v) => !v || Number.isNaN(Date.parse(v)) || Date.parse(v) <= Date.now() + 86400000,
+  { message: 'assessment_date cannot be in the future' }
+);
+
+const parqFormFields = {
+    assessment_date: notFutureDate(),
 
     // Step 1: Client snapshot
     full_name: z.string().min(1).max(255),
@@ -172,13 +162,31 @@ const parqFormCreateSchema = {
 
     // Step 5: PAR-Q — up to the 10 fixed questions; a draft created on step 1
     // may carry blank/unanswered entries (see parqAnswerSchema).
-    parq_answers: z.array(parqAnswerSchema).max(10).optional().default([]),
+    parq_answers: z.array(parqAnswerSchema).max(10).optional(),
 
     // Step 7: Trainer Notes
     trainer_notes: z.record(z.string(), z.unknown()).optional().nullable(),
 
     status: z.enum(['draft', 'submitted', 'reviewed']).optional(),
+};
+
+const parqFormCreateSchema = {
+  body: z.object({
+    client_id: z.string(),
+    ...parqFormFields,
+    parq_answers: parqFormFields.parq_answers.default([]),
   }),
+};
+
+// No .default() may sit in parqFormFields: zod 4 applies defaults inside
+// .partial(), so a PATCH that omitted parq_answers would arrive as [] and the
+// recompute would silently re-score the client as low risk.
+//
+// PATCH used to take any body at all: parq_answers of any shape or length and
+// any status string went straight into the row and into the risk recompute.
+// Same field rules as create, every field optional, client_id not movable.
+const parqFormUpdateSchema = {
+  body: z.object(parqFormFields).partial(),
 };
 
 const clearanceCreateSchema = {
@@ -191,6 +199,10 @@ const clearanceCreateSchema = {
     expiry_date: z.string().optional().nullable(),
     approval_status: z.enum(['approved', 'rejected', 'pending']).optional(),
   }),
+};
+
+const clearanceUpdateSchema = {
+  body: clearanceCreateSchema.body.partial(),
 };
 
 // All 7 keys from the migration's pt_consent_records.consent_checkboxes comment.
@@ -280,6 +292,10 @@ router.get('/parq/forms/:id/gate-status', auth, wrap(async (req, res) => {
 // POST /parq/forms
 router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema), wrap(async (req, res) => {
   const b = req.body;
+  // The screening gate decides whether this client may train from their
+  // latest form, so a form written against another studio's client would be
+  // a cross-tenant write into a medical-safety control.
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computeParqAnalysis(b.parq_answers);
   const gateStatus = analysis.riskLevel === 'high' ? 'blocked' : 'cleared';
   const bmi = b.bmi ?? calcBmi(b.weight_kg, b.height_cm);
@@ -350,7 +366,7 @@ router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema),
 }));
 
 // PATCH /parq/forms/:id
-router.patch('/parq/forms/:id', auth, requireTrainer, wrap(async (req, res) => {
+router.patch('/parq/forms/:id', auth, requireTrainer, validate(parqFormUpdateSchema), wrap(async (req, res) => {
   const { id } = req.params;
   const b = req.body;
 
@@ -453,6 +469,9 @@ router.post('/parq/forms/:formId/clearance', auth, requireTrainer, validate(clea
   if (!form) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
   const b = req.body;
+  const problem = await clearanceApprovalProblem(formId, b);
+  if (problem) return res.status(400).json({ error: { code: 'CLEARANCE_EVIDENCE_REQUIRED', message: problem } });
+
   const { rows } = await pool.query(
     `INSERT INTO pt_medical_clearances (
        parq_form_id, client_id, doctor_name, hospital, clearance_date,
@@ -470,7 +489,7 @@ router.post('/parq/forms/:formId/clearance', auth, requireTrainer, validate(clea
 }));
 
 // PATCH /parq/clearance/:id
-router.patch('/parq/clearance/:id', auth, requireTrainer, wrap(async (req, res) => {
+router.patch('/parq/clearance/:id', auth, requireTrainer, validate(clearanceUpdateSchema), wrap(async (req, res) => {
   const allowed = ['doctor_name', 'hospital', 'clearance_date', 'certificate_url', 'doctor_contact', 'expiry_date', 'approval_status'];
 
   const scope = tenantScope(req);
@@ -481,6 +500,14 @@ router.patch('/parq/clearance/:id', auth, requireTrainer, wrap(async (req, res) 
   );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
+  // Judged on the record as it will stand after this edit, so neither
+  // approving a bare record nor stripping the evidence from an approved one
+  // gets through.
+  const merged = { ...existing };
+  for (const key of allowed) if (req.body[key] !== undefined) merged[key] = req.body[key];
+  const problem = await clearanceApprovalProblem(existing.parq_form_id, merged);
+  if (problem) return res.status(400).json({ error: { code: 'CLEARANCE_EVIDENCE_REQUIRED', message: problem } });
 
   const sets = [];
   const params = [req.params.id];

@@ -5,6 +5,7 @@ const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { tenantScope, orgIdOf, orgWhere } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
+const { checkScreeningGate } = require('../../lib/screeningGate');
 const scoring = require('./fitness-scoring');
 const goalScoring = require('./goal-scoring');
 const lifestyleScoring = require('./lifestyle-scoring');
@@ -101,6 +102,12 @@ router.get('/assessments', auth, wrap(async (req, res) => {
 router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  // Fitness testing includes maximal efforts — a 1RM, a step test, endurance
+  // to failure — so the same medical stop that guards assigning a workout
+  // guards recording one of these. Missing paperwork is only a warning here
+  // too, returned as screening_warnings.
+  const { blocked, warnings: screeningWarnings } = await checkScreeningGate(req, b.client_id);
+  if (blocked) return res.status(blocked.status).json(blocked.body);
   // The assessor is the studio's trainer profile, from the session. A
   // trainer_id in the body is ignored: it is a foreign key, and taking it
   // from the request would let a row point at another studio's trainer.
@@ -272,7 +279,7 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
       orgIdOf(req),
     ]
   );
-  res.status(201).json({ data: { ...rows[0], bp_unsafe: bp.isUnsafe } });
+  res.status(201).json({ data: { ...rows[0], bp_unsafe: bp.isUnsafe }, screening_warnings: screeningWarnings });
 }));
 
 const GOAL_TYPES = [
@@ -514,33 +521,60 @@ router.get('/strength-logs', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
+// Bounded because a strength log is permanent — there is no edit or delete —
+// and a typo (2000 kg, -60 kg, 0 reps) would otherwise become the client's
+// "latest" lift and a spike on their trend for good. The ceilings sit well
+// above any human lift (the heaviest raw deadlift is ~500 kg). Reps are
+// required for an estimated 1RM: defaulting a missing count to 10 invented a
+// 1RM from a set nobody performed.
 const strengthLogCreateSchema = {
   body: z.object({
     client_id: z.string(),
-    exercise_name: z.string().min(1).max(100),
-    weight_kg: z.coerce.number(),
-    sets_done: numOpt(), reps_done: numOpt(),
+    exercise_name: z.string().trim().min(1).max(100),
+    weight_kg: z.coerce.number().positive().max(1000),
+    sets_done: z.coerce.number().int().min(1).max(50).optional().nullable(),
+    reps_done: z.coerce.number().int().min(1).max(100).optional().nullable(),
     notes: z.string().max(1000).optional().nullable(),
     assessment_id: z.string().optional().nullable(),
     one_rm_formula: z.enum(['epley', 'brzycki']).optional(),
     is_direct_1rm: z.boolean().optional(),
-    one_rm_estimate: numOpt(),
+    one_rm_estimate: z.coerce.number().positive().max(1000).optional().nullable(),
+    log_date: z.string().optional().nullable().refine(
+      (v) => !v || (!Number.isNaN(Date.parse(v)) && Date.parse(v) <= Date.now() + 86400000),
+      { message: 'log_date must be a valid date, not in the future' }
+    ),
+  }).refine((b) => b.is_direct_1rm || b.reps_done != null, {
+    message: 'reps_done is required unless the lift is a direct 1RM', path: ['reps_done'],
   }),
 };
 
 router.post('/strength-logs', auth, requireTrainer, validate(strengthLogCreateSchema), wrap(async (req, res) => {
   const { client_id, exercise_name, weight_kg, sets_done, reps_done, notes,
-    assessment_id, one_rm_formula, is_direct_1rm, one_rm_estimate } = req.body;
+    assessment_id, one_rm_formula, is_direct_1rm, one_rm_estimate, log_date } = req.body;
   if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  // An assessment link is a foreign key into another table; it must be one
+  // of this studio's assessments for this client, or none.
+  if (assessment_id) {
+    const aParams = [assessment_id, client_id];
+    const aOrg = orgWhere(req, aParams);
+    const { rowCount } = await pool.query(
+      `SELECT 1 FROM pt_assessments WHERE id = $1 AND client_id = $2${aOrg}`, aParams
+    );
+    if (!rowCount) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Assessment not found' } });
+  }
   const formula = one_rm_formula === 'brzycki' ? 'brzycki' : 'epley';
-  const oneRm = is_direct_1rm
-    ? num(one_rm_estimate, null)
-    : scoring.calc1RM(num(weight_kg), num(reps_done, 10), formula);
+  const direct = Boolean(is_direct_1rm);
+  // A direct 1RM is one rep at the weight lifted; the estimate, if sent,
+  // is the same number.
+  const reps = direct ? 1 : num(reps_done);
+  const oneRm = direct
+    ? num(one_rm_estimate, num(weight_kg))
+    : scoring.calc1RM(num(weight_kg), reps, formula);
   const { rows } = await pool.query(
-    `INSERT INTO strength_logs (client_id, exercise_name, weight_kg, sets_done, reps_done, one_rm_estimate, notes, assessment_id, one_rm_formula, is_direct_1rm, organization_id)
-     VALUES ($1,$2,$3,$4,$5,ROUND($6::NUMERIC,2),$7,$8,$9,$10,$11) RETURNING *`,
-    [client_id, exercise_name, num(weight_kg), num(sets_done, 3), num(reps_done, 10), oneRm, notes || null,
-     assessment_id || null, formula, Boolean(is_direct_1rm), orgIdOf(req)]
+    `INSERT INTO strength_logs (client_id, exercise_name, weight_kg, sets_done, reps_done, one_rm_estimate, notes, assessment_id, one_rm_formula, is_direct_1rm, organization_id, log_date)
+     VALUES ($1,$2,$3,$4,$5,ROUND($6::NUMERIC,2),$7,$8,$9,$10,$11,COALESCE($12::date, CURRENT_DATE)) RETURNING *`,
+    [client_id, exercise_name, num(weight_kg), num(sets_done, direct ? 1 : 3), reps, oneRm, notes || null,
+     assessment_id || null, formula, direct, orgIdOf(req), log_date || null]
   );
   res.status(201).json({ data: rows[0] });
 }));
