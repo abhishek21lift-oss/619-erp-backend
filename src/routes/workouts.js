@@ -9,6 +9,7 @@ const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progr
 const { markAccepted, acceptGeneration } = require('../modules/pt-os/programming-memory');
 const logger = require('../lib/logger');
 const { today: studioToday } = require('../lib/appTime');
+const { shapeError, syncAssignmentEnds } = require('../lib/workoutPlanShape');
 
 // '/api/workouts/exercises' and '/exercises/meta' were here: read-only
 // duplicates of /api/exercises kept for older clients. There are none — the
@@ -540,6 +541,8 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
   const d = req.body;
   if (!d.name?.trim())
     return res.status(400).json({ error: 'Plan name required' });
+  const badShape = shapeError(d);
+  if (badShape) return res.status(400).json({ error: badShape });
 
   try {
     const id = randomUUID();
@@ -549,7 +552,10 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [id, d.name.trim(), d.description || null, d.goal || 'general_fitness',
        d.difficulty || 'beginner', parseInt(d.duration_weeks) || 4,
-       parseInt(d.sessions_per_week) || 3, d.is_template !== false, req.user.id,
+       // is_template is TRUE only when asked for. Absent used to mean TRUE, and
+       // the New programme sheet never sent it — so every client programme a
+       // studio wrote was stored as a template (migration 219 has the count).
+       parseInt(d.sessions_per_week) || 3, d.is_template === true, req.user.id,
        // Stamps the owning studio (migration 106). NULL only for a platform
        // operator authoring a template that every studio should see — the same
        // meaning the seeded rows carry.
@@ -614,6 +620,8 @@ router.put('/plans/:id', auth, requireTrainer, async (req, res, next) => {
   const client = await pool.connect();
   try {
     const d = req.body;
+    const badShape = shapeError(d);
+    if (badShape) return res.status(400).json({ error: badShape });
     await client.query('BEGIN');
 
     const existing = await loadEditablePlan(req, req.params.id, client);
@@ -658,6 +666,12 @@ router.put('/plans/:id', auth, requireTrainer, async (req, res, next) => {
            num(ex.rest_seconds, 60), ex.notes || null, ...exerciseParams(ex)]
         );
       }
+    }
+
+    // A programme that got longer or shorter moves the end date of every
+    // client currently running it — see syncAssignmentEnds for which rows.
+    if (d.duration_weeks && Number(existing.duration_weeks) !== Number(rows[0].duration_weeks)) {
+      await syncAssignmentEnds(client, req.params.id, rows[0].duration_weeks, orgIdOf(req));
     }
 
     await client.query('COMMIT');
@@ -1198,7 +1212,7 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
     //      a studio could revive or rewrite another studio's assignment.
     const tenant = planReadFilter(req, 2);
     const { rows: planRows } = await pool.query(
-      `SELECT wp.id FROM workout_plans wp
+      `SELECT wp.id, wp.duration_weeks FROM workout_plans wp
         WHERE wp.id = $1 AND wp.deleted_at IS NULL
         ${tenant.sql ? `AND ${tenant.sql}` : ''}`,
       [d.workout_plan_id, ...tenant.params]
@@ -1222,7 +1236,13 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
     const { rows } = await pool.query(`
       INSERT INTO workout_assignments (id, workout_plan_id, client_id, trainer_id,
         start_date, end_date, status, notes, organization_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      -- The end date is the programme's own length unless the caller set one:
+      -- start + weeks − 1 day. It was always NULL, so a 4-week plan stayed
+      -- "active" — on the Today roster, linked by every logged session —
+      -- for as long as nobody remembered to retire it.
+      VALUES ($1,$2,$3,$4,$5,
+              COALESCE($6::date, $5::date + ($10::int * 7 - 1)),
+              $7,$8,$9)
       -- Keyed on (plan, client) since 197. It used to include status, which
       -- made status part of row identity: re-assigning a plan to a client
       -- whose row had been paused found no conflict and inserted a SECOND
@@ -1244,7 +1264,8 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
        // The studio's today, not UTC's: before 05:30 in India that was
        // yesterday, and the programme's week 1 began a day early.
        d.start_date || studioToday(),
-       d.end_date || null, 'active', d.notes || null, orgIdOf(req)]
+       d.end_date || null, 'active', d.notes || null, orgIdOf(req),
+       Number(planRows[0].duration_weeks) || null]
     );
     res.status(201).json({ message: 'Plan assigned', assignment: rows[0], screening_warnings: warnings });
   } catch (err) {
