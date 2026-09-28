@@ -19,6 +19,27 @@ Production snapshot (read-only, today):
 
 Severity: **Critical**, **High**, **Medium**, **Low**.
 
+## Status
+
+Fixed on `claude/project-setup-understanding-9t82iv` (backend + frontend):
+
+| ID | Fix |
+|---|---|
+| A-1 | Red-flag questions 1, 3, 4, 5 are high risk on their own. The frontend preview is mirrored, and the rule is now in the CI parity check. |
+| A-2 | `clientInOrg` on PAR-Q create. Gate reads are pinned to the client's own studio. |
+| A-3 | Clearance expiry is checked at read time inside the gate. |
+| A-4 | Approval needs a doctor, a clearance date (not in the future), an expiry on or after it, and a certificate. There is now a Clearance Status control in the wizard, since there was no way to approve before. A high-risk form can be submitted as Pending and stays blocked. |
+| A-5 | Fitness testing is gated. Revoked consent and "physician advised against" (with no uploaded clearance) hard-block. Frontend toasts name the reason and link the fixing screen. |
+| P-1 | Stage-2 hypertension is classified before hypotension. |
+| P-3 | Future-dated forms are refused. The gate skips drafts and breaks ties by `created_at`. |
+| P-4 | PAR-Q and clearance `PATCH` validate. The zod 4 `.partial()` default trap is avoided, so an edit can no longer wipe the answers. |
+| F-1 | A strength-log failure after an assessment is saved is a warning, not "failed to save", so there are no duplicate assessments. A direct 1RM now sends its weight. |
+| F-3 | For Epley, a single is its own 1RM. |
+| S-1, S-2, S-3 | Bodyweight comes from the latest fitness test. NUMERIC values are coerced. The list limit is 200. |
+| S-5, S-6, S-7 | Strength logs are bounded, reps are required for an estimate, a direct 1RM is weight × 1, `log_date` is accepted, and `assessment_id` is org-checked. |
+
+Still open: A-6 (a live BP stop in the wizard), C-1 to C-6, F-2, F-4 to F-8, S-4, S-8, G-1 to G-4, L-1 (other PATCH schemas), L-2, L-3, M-1, PO-1, P-2, P-5 to P-9.
+
 ---
 
 ## Critical / High: client safety and tenant isolation
