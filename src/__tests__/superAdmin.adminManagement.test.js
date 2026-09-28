@@ -210,3 +210,38 @@ describe('internal notes', () => {
     expect(res.status).toBe(404);
   });
 });
+
+// Command Center audit 2026-09-28, CC-5: edit and delete already refused a
+// platform account; the password reset did not, so an open console session
+// could set a new password on the operator account without the current one.
+describe('reset password', () => {
+  it('refuses a platform account and writes nothing', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [{ role: 'super_admin' }] });
+
+    const res = await request(app()).post('/api/super-admin/users/op-1/reset-password')
+      .send({ password: 'a-new-password-123' });
+
+    expect(res.status).toBe(403);
+    expect(pool.query.mock.calls.some(([sql]) => /UPDATE users SET password/.test(sql))).toBe(false);
+  });
+
+  it('still resets a studio account, and the write itself excludes platform accounts', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ role: 'trainer' }] })
+      .mockResolvedValueOnce({ rows: [{ id: 'u9', email: 'a@studio.com' }] })
+      .mockResolvedValue({ rows: [] });
+
+    const res = await request(app()).post('/api/super-admin/users/u9/reset-password')
+      .send({ password: 'a-new-password-123' });
+
+    expect(res.status).toBe(200);
+    expect(call(/UPDATE users SET password/)[0]).toMatch(/role <> 'super_admin'/);
+  });
+
+  it('404s on an unknown user before hashing anything', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [] });
+    const res = await request(app()).post('/api/super-admin/users/nope/reset-password')
+      .send({ password: 'a-new-password-123' });
+    expect(res.status).toBe(404);
+  });
+});

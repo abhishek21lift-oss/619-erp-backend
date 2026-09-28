@@ -44,7 +44,13 @@ function validateAnnouncement(body, { partial = false } = {}) {
     const l = String(body.link ?? '').trim();
     // Relative paths only. An absolute URL in a platform notice is a phishing
     // vector waiting for whoever gets write access to this table next.
-    if (l && !l.startsWith('/')) return { error: 'link must be an in-app path starting with /' };
+    // An in-app path: '/' then something that is not another '/' or '\\'.
+    // '//host' and '/\\host' start with '/' too, but browsers read them as a
+    // different site, and this link is shown to every targeted studio
+    // (Command Center audit CC-7).
+    if (l && (!l.startsWith('/') || l.startsWith('//') || l.startsWith('/\\'))) {
+      return { error: 'link must be an in-app path starting with /' };
+    }
     v.link = l || null;
   }
   if (has('audience')) {

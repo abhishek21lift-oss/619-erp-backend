@@ -325,8 +325,27 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         // promise in the enrolment dialog could not be kept. redeem() spends
         // the code atomically (see lib/mfaRecoveryCodes.js); TOTP is tried
         // first so the ordinary path costs no extra query.
-        let mfaOk = /^\d{6}$/.test(code)
-          && verifySync({ secret: mfaSecret, token: code, strategy: 'totp', epochTolerance: 30 }).valid;
+        const totp = /^\d{6}$/.test(code)
+          ? verifySync({ secret: mfaSecret, token: code, strategy: 'totp', epochTolerance: 30 })
+          : null;
+        let mfaOk = Boolean(totp && totp.valid);
+        // One use per code. A code stays valid for its whole step, so without
+        // this a code seen once could be replayed to sign in again inside that
+        // window (Command Center audit CC-8). The claim and the check are one
+        // UPDATE: only a step newer than the last accepted one moves the
+        // marker, so two concurrent logins with the same code cannot both win.
+        if (mfaOk) {
+          const step = Number(totp.timeStep);
+          const claimed = Number.isFinite(step) && (await pool.query(
+            `UPDATE user_profiles SET mfa_last_step = $2
+              WHERE user_id = $1 AND (mfa_last_step IS NULL OR mfa_last_step < $2)`,
+            [user.id, step]
+          )).rowCount === 1;
+          if (!claimed) {
+            logger.warn({ userId: user.id }, 'mfa_code_replayed — a TOTP code was presented again inside its window');
+            mfaOk = false;
+          }
+        }
         let usedRecoveryCode = false;
         if (!mfaOk && recovery.looksLikeRecoveryCode(code)) {
           mfaOk = await recovery.redeem(pool, user.id, code);

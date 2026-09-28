@@ -15,20 +15,21 @@ Scope: the platform operator's console end to end.
 - **Live production (read-only):** `platform_owners`, operator MFA,
   `admin_reset_intents`, leftover isolation-probe studios.
 
-No code was changed in this pass.
+Fixes landed on the same branch as this document (both repos), each with
+tests that fail without the fix. CC-4 remains open.
 
 ## Severity summary
 
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| CC-1 | **High** | A crafted `#imp=` link runs attacker script in a logged-in studio user's session when they click **Exit** on the impersonation banner | Open; **reproduced in Chromium** |
-| CC-2 | **High** | `/api/admin/reset-all-data` (and two siblings) wipe **every studio's** data behind one emailed code; unused by the UI, unaudited, drops a table | Open |
-| CC-3 | Medium | The Docker socket-proxy template would allow creating containers, not just restarting two, which means host root if the API is compromised | Open (template is commented out) |
+| CC-1 | **High** | A crafted `#imp=` link runs attacker script in a logged-in studio user's session when they click **Exit** on the impersonation banner | **Fixed**; reproduced in Chromium before, blocked after |
+| CC-2 | **High** | `/api/admin/reset-all-data` (and two siblings) wipe **every studio's** data behind one emailed code; unused by the UI, unaudited, drops a table | **Fixed** (removed) |
+| CC-3 | Medium | The Docker socket-proxy template would allow creating containers, not just restarting two, which means host root if the API is compromised | **Fixed** (template now path-allow-listed; still commented out) |
 | CC-4 | Medium | The enforced CSP still allows inline script; the strict nonce policy is report-only. That is what let CC-1 execute | Open |
-| CC-5 | Low | `POST /users/:id/reset-password` does not refuse platform accounts (edit and delete do) | Open |
-| CC-6 | Low | A live stream never re-checks the operator's grant or session after connecting | Open |
-| CC-7 | Low | Announcement `link` accepts `//other-host` (protocol-relative, so off-site) | Open |
-| CC-8 | Low | Platform-login TOTP codes can be replayed inside their window (carried over from #12) | Open |
+| CC-5 | Low | `POST /users/:id/reset-password` does not refuse platform accounts (edit and delete do) | **Fixed** |
+| CC-6 | Low | A live stream never re-checks the operator's grant or session after connecting | **Fixed** |
+| CC-7 | Low | Announcement `link` accepts `//other-host` (protocol-relative, so off-site) | **Fixed** |
+| CC-8 | Low | Platform-login TOTP codes can be replayed inside their window (carried over from #12) | **Fixed** (migration 216) |
 
 ---
 
@@ -225,3 +226,21 @@ can be reused. Store the last accepted time-step per user and reject a repeat.
 2. **CC-4**, flipping the nonce CSP to enforced, which blunts any future XSS.
 3. **CC-5**, **CC-7**, **CC-8**: one-line to few-line fixes.
 4. **CC-3** before anyone enables container restarts; **CC-6** when convenient.
+
+---
+
+## Fixes (same branch)
+
+| # | Change | Proof |
+|---|---|---|
+| CC-1 | `lib/http.ts`: a `#imp=` hand-off is adopted only if its token is a JWT whose `imp.org` matches the payload's studio (only the platform mints those). `safeImpersonationReturnTo()` allows only an http(s) `/platform` address and is applied at hand-off and again on Exit in `ImpersonationBanner.tsx`. | 5 new cases in `command-center-separation.test.ts` fail on the old code. In Chromium, the original attack now shows no banner, stores nothing, never sends the attacker's token and strips the fragment. A genuine hand-off still shows the banner, and Exit still goes to `/platform`. |
+| CC-2 | `routes/admin-reset.js` and its `/api/admin` mount deleted, with its two tests. The layering ceiling is lowered 675 → 661. `/api/admin` stays a platform-plane prefix. | `platformWipe.removed.test.js`; `platformNamespace.test.js` now asserts nothing is mounted there. |
+| CC-3 | The `docker-compose.yml` template now uses `wollomatic/socket-proxy`, allow-listing only `POST /containers/(api\|worker)/restart` from the `api` service, with a read-only filesystem, all capabilities dropped and no-new-privileges. The comment explains why tecnativa's section switches cannot express this. | Template parses; still commented out. |
+| CC-5 | `reset-password` refuses `super_admin` targets (403), and the UPDATE itself excludes them. | 3 cases in `superAdmin.adminManagement.test.js`; 2 fail on the old code. |
+| CC-6 | Stream tickets carry `token_version`. Every 60 s each connection re-checks the account is an active, undeleted super_admin on the same `token_version` with a live grant; otherwise it closes with 4401. It fails closed. | 6 cases in `commandCenter.stream.test.js`; they fail on the old code. |
+| CC-7 | Announcement links must be `/` followed by neither `/` nor `\`. | `announcements.linkValidation.test.js` (driven through the route). |
+| CC-8 | Migration 216 adds `user_profiles.mfa_last_step`. Login accepts a TOTP code only if one conditional UPDATE moves the marker forward to that code's step. | `mfa.replay.integration.test.js`, against a real database: replay, earlier step, next step, and two concurrent logins with one code (exactly one wins). 3 of 4 fail on the old code. |
+
+Full runs after the fixes: backend 295 suites / 4,269 tests (with the real-DB
+suites), lint `--max-warnings=0` clean. Frontend 188 files / 2,676 tests,
+typecheck clean.

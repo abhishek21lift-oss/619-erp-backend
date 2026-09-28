@@ -91,7 +91,9 @@ const MAX_OUTSTANDING = coordination.MAX_LOCAL_TICKETS;
  */
 async function issue(user) {
   const ticket = await coordination.putTicket(
-    { userId: user.id, email: user.email, issuedAt: Date.now() },
+    // tokenVersion lets the stream notice a force-logout or deactivation after
+    // it has connected (see stream.js revalidate; Command Center audit CC-6).
+    { userId: user.id, email: user.email, tokenVersion: user.token_version ?? null, issuedAt: Date.now() },
     TTL_MS,
   );
   return { ticket, expires_in_ms: TTL_MS };
@@ -111,7 +113,7 @@ async function redeem(ticket) {
   // is the belt: a clock skew or a future change to the store must not be able
   // to hand back a credential minted an hour ago.
   if (typeof rec.issuedAt === 'number' && Date.now() - rec.issuedAt > TTL_MS) return null;
-  return { userId: rec.userId, email: rec.email };
+  return { userId: rec.userId, email: rec.email, tokenVersion: rec.tokenVersion ?? null };
 }
 
 /** Test/diagnostic only: outstanding tickets in the in-memory fallback. */

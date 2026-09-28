@@ -288,7 +288,7 @@ const PLATFORM_PATH_PREFIXES = [
   // The pre-existing name for the same surface, kept mounted for the mobile
   // app and any bookmarked console URL. See server.js.
   '/api/super-admin',
-  // admin-reset.js: platform-wide destructive tooling that was never tenant
+  // /api/admin once served admin-reset.js (removed, CC-2): platform-wide tooling that was never tenant
   // scoped. It has always been gated as a platform surface (see the C-1 note
   // in server.js) and belongs on this list for the same reason.
   '/api/admin',

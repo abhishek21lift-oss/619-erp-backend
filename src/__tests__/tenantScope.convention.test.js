@@ -114,6 +114,12 @@ const REVIEWED_EXCEPTIONS = {
     'Platform-operator alerting. Both user queries are explicitly ' +
     "WHERE role = 'super_admin', i.e. accounts that have no organization by " +
     'design. Mounted under /api/super-admin behind requireSuperAdmin.',
+  'modules/command-center/stream.js':
+    'Stream revalidation (Command Center audit CC-6) reads ONE users row by ' +
+    'id: the operator the stream ticket was minted for, whose account has no ' +
+    'organization by design, to confirm it is still an active super_admin on ' +
+    'the same token_version. Nothing from the row is sent to the client. Only ' +
+    'reachable through a single-use ticket issued behind PLATFORM_GUARD.',
   'modules/command-center/collectors/smtp.collector.js':
     'Command Center SMTP health collector — reads admin_invitations delivery ' +
     'errors platform-wide, which is the operator console\'s purpose. Mounted ' +

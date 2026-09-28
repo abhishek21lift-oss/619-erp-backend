@@ -123,7 +123,6 @@ const BUDGETS = {
   'routes/invoices.js': 17,
   'routes/qr-checkin.js': 14,
   'modules/automation/automation.routes.js': 14,
-  'routes/admin-reset.js': 14,
   'routes/payments.js': 7,
   'routes/diet.js': 12,
   'routes/client-login.js': 11,
@@ -224,8 +223,9 @@ describe('the migration has a number attached to it', () => {
     // reach zero. 704 once the workout log's PR and plan-progress rules moved
     // to workout-log.service, where the member app's self-logging reuses them. 699 once
     // starting a session moved there too, and workouts.js was re-measured. 675 once both manual-payment endpoints
-    // moved their write to lib/ptPayments.js and those two files were re-measured. Lower it with each extraction — the number only means
+    // moved their write to lib/ptPayments.js and those two files were re-measured; 675 → 661 when routes/admin-reset.js (14) was deleted
+    // (Command Center audit CC-2). Lower it with each extraction — the number only means
     // something if it tracks reality.
-    expect(ceiling).toBe(675);
+    expect(ceiling).toBe(661);
   });
 });
