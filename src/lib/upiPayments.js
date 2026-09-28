@@ -869,7 +869,8 @@ async function approve({ orderId, orgId, actor }, db = pool) {
 
     // ── 3. Membership window ──
     const { rows: clientRows } = await tx.query(
-      `SELECT id, name, email, mobile, trainer_id, trainer_name, package_type, pt_end_date, organization_id
+      `SELECT id, name, email, mobile, trainer_id, trainer_name, package_type, pt_end_date, organization_id,
+              balance_amount
          FROM pt_clients WHERE id = $1 FOR UPDATE`,
       [order.client_id]
     );
@@ -882,6 +883,15 @@ async function approve({ orderId, orgId, actor }, db = pool) {
     const window = isBalance
       ? { activated_from: null, activated_to: null }
       : computeMembershipWindow(member.pt_end_date, order.duration_months);
+
+    // A balance order's amount was fixed when the member submitted it. If the
+    // trainer recorded a desk payment for the same debt in the meantime, the
+    // member has now paid more than they owe. The money has arrived, so the
+    // approval still goes through, but the excess is worked out here and
+    // reported (ledger note, audit, response) instead of vanishing into
+    // GREATEST(0, …) with nothing to show the trainer a refund is due.
+    const owedNow = round2(Number(member.balance_amount) || 0);
+    const overpaid = isBalance ? Math.max(0, round2(Number(order.total_amount) - owedNow)) : 0;
 
     if (isBalance) {
       await tx.query(
@@ -934,12 +944,16 @@ async function approve({ orderId, orgId, actor }, db = pool) {
          order.duration_months, order.base_amount, order.total_amount, member.trainer_name]
       );
     } else {
+      // A plan order buys a NEW term (the window above extends from the current
+      // end date), so like a renewal it leaves balance_amount alone: an older
+      // debt is still owed. It used to subtract the new term's price from that
+      // debt, so a client owing Rs. 5,000 who paid Rs. 12,000 for a new plan
+      // got the term AND had the Rs. 5,000 wiped.
       await tx.query(
         `UPDATE pt_clients
             SET pt_start_date  = COALESCE(NULLIF(pt_start_date, ''), $1),
                 pt_end_date    = $2,
                 paid_amount    = paid_amount + $3,
-                balance_amount = GREATEST(0, balance_amount - $3),
                 status         = 'active',
                 updated_at     = NOW()
           WHERE id = $4`,
@@ -973,7 +987,10 @@ async function approve({ orderId, orgId, actor }, db = pool) {
       [
         ptPaymentId, member.id, trainerId, order.total_amount,
         Math.round(Number(order.total_amount) * incentiveRate), receiptNo,
-        todayIso(), `UPI ${order.order_no} · UTR ${submission.utr}`, orgId,
+        todayIso(),
+        `UPI ${order.order_no} · UTR ${submission.utr}`
+          + (overpaid > 0 ? ` · Rs. ${overpaid} more than the balance owed` : ''),
+        orgId,
       ]
     );
 
@@ -1059,7 +1076,7 @@ async function approve({ orderId, orgId, actor }, db = pool) {
     });
     await audit(tx, isBalance ? {
       orgId, orderId: order.id, submissionId: submission.id, action: 'BALANCE_SETTLED',
-      detail: { amount: order.total_amount }, actor,
+      detail: { amount: order.total_amount, owed: owedNow, overpaid }, actor,
     } : {
       orgId, orderId: order.id, submissionId: submission.id, action: 'MEMBERSHIP_ACTIVATED',
       detail: { from: window.activated_from, to: window.activated_to, plan: order.plan_name }, actor,
@@ -1090,7 +1107,7 @@ async function approve({ orderId, orgId, actor }, db = pool) {
 
     return {
       order: { ...order, status: ORDER_STATUS.APPROVED },
-      submission, activation, member,
+      submission, activation, member, overpaid,
       invoice: invoiceId ? { id: invoiceId, invoice_no: invoiceNo } : null,
     };
   } catch (err) {

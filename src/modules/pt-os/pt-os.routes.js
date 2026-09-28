@@ -647,7 +647,11 @@ router.post('/clients/:id/renew', auth, requireTrainer, wrap(async (req, res) =>
       pt_end_date       = $8,
       duration_months   = $9,
       paid_amount       = paid_amount + $10,
-      balance_amount    = GREATEST($5 - (paid_amount + $10), 0),
+      -- What they owed before, plus the new term, less what they paid now.
+      -- paid_amount is a lifetime total, so the old "$5 - (paid_amount + $10)"
+      -- subtracted every earlier term's money from this term's price: a
+      -- returning client renewed with nothing paid came out owing Rs. 0.
+      balance_amount    = GREATEST(COALESCE(balance_amount, 0) + $5 - $10, 0),
       status            = 'active',
       updated_at        = NOW()
     WHERE id = $1 AND deleted_at IS NULL AND organization_id = $11

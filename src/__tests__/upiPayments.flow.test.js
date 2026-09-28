@@ -221,7 +221,7 @@ function scriptHappyApproval() {
     { rows: [{ id: SUB_ID, utr: '123456789012', submitted_at: '2026-07-26T10:00:00Z' }] });
   on(/UPDATE payment_orders SET status = \$1 WHERE id = \$2 AND status = \$3/s,
     { rows: [], rowCount: 1 });
-  on(/SELECT id, name, email, mobile, trainer_id, trainer_name, package_type, pt_end_date, organization_id\s+FROM pt_clients/s,
+  on(/SELECT id, name, email, mobile, trainer_id, trainer_name, package_type, pt_end_date, organization_id, balance_amount\s+FROM pt_clients/s,
     { rows: [{ id: 'client-1', name: 'Rohit', trainer_id: 'trn-1', pt_end_date: EXISTING_END }] });
   on(/SELECT id, incentive_rate FROM trainers/s, { rows: [{ id: 'trn-1', incentive_rate: 0.5 }] });
   on(/INSERT INTO membership_payments/s, {
@@ -262,6 +262,19 @@ describe('approval', () => {
     // the member the days they had left.
     expect(update.params[0]).toBe(EXISTING_END);   // activated_from
     expect(update.params[1]).toBe(EXTENDED_END);   // activated_to
+  });
+
+  // A plan order buys a new term. It must not also settle the client's older
+  // debt: that used to run `balance_amount = GREATEST(0, balance_amount - $3)`,
+  // so paying for the next three months wiped whatever was still owed.
+  test('leaves an existing balance owed when a plan order is approved', async () => {
+    scriptHappyApproval();
+    const result = await upi.approve({ orderId: ORDER_ID, orgId: ORG, actor: ACTOR });
+
+    const update = state.log.find((e) => /UPDATE pt_clients/.test(e.sql));
+    expect(update.sql).toMatch(/paid_amount = paid_amount \+ \$3/);
+    expect(update.sql).not.toMatch(/balance_amount/);
+    expect(result.overpaid).toBe(0);
   });
 
   test('guards the status transition so a double approve cannot double-activate', async () => {

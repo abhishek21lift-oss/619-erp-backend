@@ -14,7 +14,8 @@ This pass does two things:
    goals, self-logged workouts, recap, renewal, receipts), UPI balance and
    renewal-offer payments, and member ↔ studio messaging.
 
-No code was changed in this pass. Each open item says what to do.
+E, F and E2 are fixed on the same branch as this document, each with tests
+that fail without the fix. Every other item is open and says what to do.
 
 ## Baseline
 
@@ -32,8 +33,10 @@ No code was changed in this pass. Each open item says what to do.
 | B | **Critical** | Production still connects as `postgres`; RLS policies are not in effect (was #15) | Open — needs the VPS env file |
 | C | **High** | Email change needs no password or verification (was #17) | Open |
 | D | **High** | Client health data still goes to unrecorded (`auto`) and free-tier AI models (was #16) | Open |
-| E | Medium | Approving a trainer-created UPI **plan** order wipes the client's old unpaid balance | **New** — Open |
-| F | Medium | A UPI balance payment approved after a desk payment silently loses the overpayment | **New** — Open |
+| E | Medium | Approving a trainer-created UPI **plan** order wipes the client's old unpaid balance | **New** — Fixed |
+| E2 | Medium | The trainer's Renew screen can leave a returning client owing ₹0 for an unpaid term | **New** — Fixed |
+| F | Medium | A UPI balance payment approved after a desk payment silently loses the overpayment | **New** — Fixed |
+| E3 | Medium | `paid_amount` is lifetime but `final_amount` is per-term, so `final − paid` is wrong after any renewal | **New** — Open (design) |
 | G | Medium | Full-access impersonation can still change email / enrol a passkey (was #18) | Open |
 | H | Medium | Member class booking cannot work (was #5) | Open — product decision |
 | I | Low | Refresh-token reuse is not detected (follow-up from #3) | Open |
@@ -115,10 +118,38 @@ path writes both).
 
 Production has 0 approved plan orders, so no data is affected yet.
 
-**Fix:** make the membership branch match the renewal branch (new term, new
-package fields and history, balance untouched), or retire trainer-created plan
-orders in favour of renewal offers. Add a test that seeds a balance, approves a
-plan order and asserts the balance is unchanged.
+**Fixed:** the plan-order branch of `approve()` no longer touches
+`balance_amount`. Test: `upiPayments.flow.test.js` "leaves an existing balance
+owed when a plan order is approved". Still open: plan orders do not update
+`package_type` / `final_amount` or write renewal history the way renewal offers
+do; consider retiring trainer-created plan orders in favour of renewal offers.
+
+## E2. Medium (new) — the Renew screen could zero an unpaid term
+
+`POST /api/pt-os/clients/:id/renew` set
+`balance_amount = GREATEST(final_amount - (paid_amount + paidNow), 0)`, where
+`paid_amount` is a lifetime total. A client who had paid ₹20,000 over earlier
+terms, renewed for ₹12,000 with nothing paid, came out owing ₹0. Production's
+one renewal so far was paid in full at the time, so no balance was affected.
+
+**Fixed:** new balance = previous balance + new term price − paid now (floored
+at 0), which also carries an older debt into the new term. Proven against a
+real database in `ptOs.renewBalance.integration.test.js` (3 of its 4 cases fail
+on the old SQL).
+
+## E3. Medium (new, design) — lifetime paid vs per-term price
+
+`pt_clients.paid_amount` accumulates across terms while `final_amount` is the
+current term's price. Enrolment (`pt-os.routes.js` ~547), the client PATCH when
+money fields are sent (~876) and duplicate-merge (~1577) all compute
+`balance = final_amount − paid_amount`, which understates the balance of any
+client who has renewed. The PATCH check "Amount Paid cannot exceed Final
+Selling Price" will also refuse a renewed client whenever money fields are
+sent. The client edit form currently omits money fields, which is why this is
+not biting today. The profile read already works around it (lifetime paid minus
+closed terms). The durable fix is term attribution: a `subscription_id` on
+`pt_payments`, or a `term_paid_amount` column, and one shared balance
+function.
 
 ## F. Medium (new) — balance overpayment disappears
 
@@ -129,10 +160,12 @@ zero: the extra money lands in `paid_amount` with no credit or warning.
 `createOrder` already supersedes an *unpaid* stale balance order; one awaiting
 verification is (rightly) left alone, so the check has to be at approval time.
 
-**Fix:** in `approve()`, when `kind = BALANCE` and `total > current balance`,
-refuse with 409 and a message ("the balance changed to ₹X since this was
-submitted") or record the excess as a credit, and show it on the verify
-screen.
+**Fixed:** approval still goes through (the money has arrived), but
+`approve()` now reads the balance under the row lock and reports any excess:
+in the `pt_payments` note, in the `BALANCE_SETTLED` audit (`owed`, `overpaid`)
+and as `overpaid` in the API response. The verify screen in the frontend shows
+a warning so the trainer knows a refund is due. Tests in
+`upiPayments.balance.test.js`.
 
 ## G–I. Medium / Low — unchanged since 25 Sept
 
@@ -179,8 +212,8 @@ Supabase security advisors are unchanged: 2 functions with mutable
 1. **A** (backups) and **B** (RLS) — both are VPS `.env` work, can be done
    together, and nothing else on this list matters as much if the database is
    lost.
-2. **E** and **F** — small, contained changes in `approve()` with tests, before
-   studios start using online plan payments.
+2. **E3** — decide how a term's paid amount is recorded before more clients
+   renew (E, E2, F are fixed).
 3. **C** and **G** together (credential changes need step-up and are blocked
    under impersonation).
 4. **D** (AI model and data policy settings).
