@@ -74,10 +74,12 @@ describe('the platform API mount', () => {
     expect(chain).toMatch(/requirePlatformOwner\b/);
   });
 
-  it('guards the platform-destructive reset tooling the same way', () => {
-    // /api/admin wipes data across every tenant with no organization_id
-    // filter (audit C-1). It is platform surface and takes the platform guard.
-    expect(serverSrc).toMatch(/app\.use\('\/api\/admin',\s*\.\.\.PLATFORM_GUARD,/);
+  it('no longer mounts the platform-wide reset tooling at all', () => {
+    // /api/admin served admin-reset.js, which wiped data across every tenant
+    // with no organization_id filter (audit C-1). It was removed outright
+    // (Command Center audit CC-2, platformWipe.removed.test.js); nothing may
+    // be mounted there again without the platform guard.
+    expect(serverSrc).not.toMatch(/app\.use\('\/api\/admin'/);
   });
 });
 

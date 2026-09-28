@@ -40,6 +40,9 @@ const { WebSocketServer } = require('ws');
 const logger = require('../../lib/logger');
 const snapshot = require('./snapshot.service');
 const tickets = require('./tickets');
+const pool = require('../../db/pool');
+const { runAsPlatform } = require('../../lib/tenant-context');
+const { hasPlatformGrant } = require('../../middleware/platformAuth');
 
 /** The path nginx is configured to proxy with an Upgrade. Keep in sync with
  *  infra/nginx/myptstudio.conf. */
@@ -62,6 +65,16 @@ const MAX_CONSECUTIVE_SKIPS = 10;
 
 /** Per-connection cooldown for the client's Refresh button. */
 const REFRESH_COOLDOWN_MS = 2000;
+
+/**
+ * How often an open connection re-proves its operator is still allowed in.
+ *
+ * The ticket is checked once, at the upgrade. Before this, revoking the
+ * platform grant, deactivating the account or force-logging it out left an
+ * open console streaming until the socket happened to close (Command Center
+ * audit CC-6). A minute bounds that, at one indexed lookup per connection.
+ */
+const REVALIDATE_MS = Number(process.env.COMMAND_CENTER_STREAM_REVALIDATE_MS) || 60_000;
 
 /** Close codes. 4001–4999 is the application-defined range. */
 const CLOSE = {
@@ -172,7 +185,41 @@ function originAllowed(origin, allowedOrigins) {
   return allowedOrigins.includes(origin);
 }
 
+/**
+ * Is this operator still allowed to watch the console?
+ *
+ * The same facts the HTTP guard rests on: an active, undeleted super_admin
+ * account, the same session generation the ticket was minted under, and a
+ * live platform grant. Fails CLOSED: an error reads as "no", like
+ * hasPlatformGrant itself.
+ */
+async function stillAuthorized(operator) {
+  try {
+    const { rows } = await runAsPlatform(() => pool.query(
+      'SELECT role, is_active, deleted_at, token_version FROM users WHERE id = $1', [operator.userId]
+    ));
+    const u = rows[0];
+    if (!u || u.deleted_at || !u.is_active || u.role !== 'super_admin') return false;
+    if (operator.tokenVersion != null && Number(u.token_version) !== Number(operator.tokenVersion)) return false;
+    return await hasPlatformGrant(operator.userId);
+  } catch (err) {
+    logger.warn({ err: err.message }, 'Command Center stream: revalidation failed, closing to be safe');
+    return false;
+  }
+}
+
+async function revalidateAll() {
+  for (const ws of liveClients()) {
+    if (!ws._operator) continue;
+    if (!(await stillAuthorized(ws._operator))) {
+      logger.warn({ userId: ws._operator.userId }, 'Command Center stream: closing a connection whose access was revoked');
+      try { ws.close(CLOSE.UNAUTHORIZED, 'Access revoked'); } catch { ws.terminate(); }
+    }
+  }
+}
+
 function handleConnection(ws, operator) {
+  ws._operator = operator;
   ws._skips = 0;
   ws._lastRefresh = 0;
   ws.isAlive = true;
@@ -246,7 +293,9 @@ function attach(server, opts = {}) {
     }
   }, PING_MS);
   heartbeat.unref?.();
-  wss.on('close', () => clearInterval(heartbeat));
+  const revalidate = setInterval(() => { revalidateAll().catch(() => {}); }, REVALIDATE_MS);
+  revalidate.unref?.();
+  wss.on('close', () => { clearInterval(heartbeat); clearInterval(revalidate); });
 
   upgradeHandler = async (req, socket, head) => {
     let pathname;
@@ -315,6 +364,8 @@ module.exports = {
   MAX_CONSECUTIVE_SKIPS,
   // Test seams.
   _originAllowed: originAllowed,
+  _stillAuthorized: stillAuthorized,
+  _revalidateAll: revalidateAll,
   _isLooping: () => loopRunning,
   _clientCount: () => liveClients().length,
   /** The SERVER's side of each open socket — the only way a test can simulate

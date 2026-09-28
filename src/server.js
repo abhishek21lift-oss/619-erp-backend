@@ -810,14 +810,11 @@ app.use('/api/expenses',          ...studioGate('finance'), require('./routes/ex
 app.use('/api/v1/bookings',       require('./modules/bookings/bookings.routes'));
 app.use('/api/bookings',          require('./modules/bookings/bookings.routes'));
 
-// /api/admin is the CONTROL plane, not a studio "admin" area — the name
-// predates the Trainer → Members model and is kept because compiled mobile
-// clients and operator bookmarks call it. admin-reset.js performs
-// platform-wide, unscoped destructive operations (DELETE/DROP across every
-// tenant's data, no organization_id filter), so it sits behind the full
-// PLATFORM_GUARD like every other cross-tenant route (audit finding C-1: it
-// was once reachable by any studio owner).
-app.use('/api/admin',             ...PLATFORM_GUARD, require('./routes/admin-reset'));
+// /api/admin used to mount admin-reset.js: DELETE/DROP across every studio's
+// data with no organization_id filter, behind nothing but an emailed code. No
+// screen called it and it had never been used, so it is gone (Command Center
+// audit 2026-09-28, CC-2; platformWipe.removed.test.js). The path stays a
+// control-plane prefix in middleware/platformAuth.js.
 app.use('/api/debug',             auth, requireTrainer, require('./routes/debug'));
 
 // ── The Command Center API — the platform control plane ─────────────────────

@@ -420,6 +420,17 @@ router.post('/users/:id/reset-password', async (req, res, next) => {
     if (password.length < 8) {
       return res.status(400).json({ error: { code: 'VALIDATION', message: 'Password must be at least 8 characters' } });
     }
+    // The same refusal as PATCH and DELETE above. Without it an open console
+    // session could set a new password on the operator account itself, with
+    // no current password asked for (Command Center audit CC-5). An operator
+    // changes their own password in Profile, which does ask.
+    const { rows: target } = await pool.query(
+      'SELECT role FROM users WHERE id = $1 AND deleted_at IS NULL', [req.params.id]
+    );
+    if (!target.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
+    if (target[0].role === 'super_admin') {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Platform account passwords cannot be reset here' } });
+    }
     const hashed = await bcrypt.hash(password, 12);
     // AUD-005. This route's comment and its response both promised "existing
     // sessions revoked", but it only bumped token_version — which expires the
@@ -430,7 +441,7 @@ router.post('/users/:id/reset-password', async (req, res, next) => {
     const { rows } = await pool.query(
       `WITH pw AS (
          UPDATE users SET password = $2, token_version = token_version + 1, updated_at = now()
-           WHERE id = $1 AND deleted_at IS NULL
+           WHERE id = $1 AND deleted_at IS NULL AND role <> 'super_admin'
          RETURNING id, email
        ), revoked AS (
          UPDATE refresh_tokens

@@ -44,10 +44,20 @@ jest.mock('../modules/command-center/snapshot.service', () => ({
   invalidate: jest.fn(),
 }));
 
+// Revalidation (CC-6) reads the account and the platform grant. Both are
+// scripted here; by default the operator is still fully authorized.
+const mockUserRow = jest.fn(() => ({ role: 'super_admin', is_active: true, deleted_at: null, token_version: 3 }));
+const mockGrant = jest.fn(async () => true);
+jest.mock('../db/pool', () => ({
+  query: jest.fn(async () => { const r = mockUserRow(); return { rows: r ? [r] : [] }; }),
+}));
+jest.mock('../middleware/platformAuth', () => ({ hasPlatformGrant: (...a) => mockGrant(...a) }));
+jest.mock('../lib/tenant-context', () => ({ runAsPlatform: (fn) => fn() }));
+
 const tickets = require('../modules/command-center/tickets');
 const stream = require('../modules/command-center/stream');
 
-const OPERATOR = { id: 'usr_1', email: 'ops@myptstudio.com' };
+const OPERATOR = { id: 'usr_1', email: 'ops@myptstudio.com', token_version: 3 };
 
 // ── Harness ─────────────────────────────────────────────────────────────────
 
@@ -151,7 +161,7 @@ const nextTicket = async () => (await tickets.issue(OPERATOR)).ticket;
 describe('tickets', () => {
   test('a ticket is redeemable exactly once', async () => {
     const { ticket } = await tickets.issue(OPERATOR);
-    expect(await tickets.redeem(ticket)).toEqual({ userId: 'usr_1', email: 'ops@myptstudio.com' });
+    expect(await tickets.redeem(ticket)).toEqual({ userId: 'usr_1', email: 'ops@myptstudio.com', tokenVersion: 3 });
     expect(await tickets.redeem(ticket)).toBeNull();
   });
 
@@ -431,5 +441,48 @@ describe('capacity', () => {
 
     for (const ws of [...open.slice(1), late]) ws.close();
     await Promise.all([...open.slice(1), late].map(closed));
+  });
+});
+
+
+// ── Revocation after connecting (Command Center audit 2026-09-28, CC-6) ────
+//
+// The ticket is checked once. Without a periodic re-check, revoking the grant,
+// deactivating the account or force-logging it out left an open console
+// streaming until the socket happened to close.
+describe('an operator whose access is revoked while connected', () => {
+  const openAs = async () => {
+    const { ticket } = await tickets.issue(OPERATOR);
+    const ws = await connect({ ticket });
+    await nextFrame(ws, 'hello');
+    return ws;
+  };
+  const closeCode = (ws) => new Promise((resolve) => ws.once('close', (code) => resolve(code)));
+
+  afterEach(() => {
+    mockUserRow.mockImplementation(() => ({ role: 'super_admin', is_active: true, deleted_at: null, token_version: 3 }));
+    mockGrant.mockImplementation(async () => true);
+  });
+
+  it('keeps a still-authorized operator connected', async () => {
+    const ws = await openAs();
+    await stream._revalidateAll();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close(); await closed(ws);
+  });
+
+  it.each([
+    ['the platform grant is revoked', () => mockGrant.mockImplementation(async () => false)],
+    ['the account is deactivated', () => mockUserRow.mockImplementation(() => ({ role: 'super_admin', is_active: false, deleted_at: null, token_version: 3 }))],
+    ['the account is force-logged out (token_version bumped)', () => mockUserRow.mockImplementation(() => ({ role: 'super_admin', is_active: true, deleted_at: null, token_version: 4 }))],
+    ['the account is gone', () => mockUserRow.mockImplementation(() => null)],
+    ['the lookup fails (fails closed)', () => mockGrant.mockImplementation(async () => { throw new Error('db down'); })],
+  ])('closes the stream when %s', async (_label, revoke) => {
+    const ws = await openAs();
+    const code = closeCode(ws);
+    revoke();
+    await stream._revalidateAll();
+    expect(await code).toBe(stream.CLOSE.UNAUTHORIZED);
   });
 });

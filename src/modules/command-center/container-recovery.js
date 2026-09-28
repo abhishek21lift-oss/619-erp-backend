@@ -90,7 +90,7 @@ function isConfigured() {
 function unavailableReason(target) {
   if (!proxyUrl()) {
     return 'Container restart is not wired up on this deployment. It needs a Docker '
-      + 'socket-proxy (POST only) beside the API and DOCKER_PROXY_URL pointing at it — '
+      + 'socket-proxy allow-listed to the restart call only (see docker-compose.yml) beside the API and DOCKER_PROXY_URL pointing at it — '
       + 'the API container deliberately has no /var/run/docker.sock of its own.';
   }
   if (target !== undefined) {

@@ -195,40 +195,48 @@ services:
 # on the host: the Docker API includes `containers/create` (any image, any
 # command, any bind mount) and `containers/{id}/exec`. Mounting the socket into
 # the API container to gain a restart button would trade a restart button for a
-# remote root shell. The proxy below exposes POST and nothing else, and the ERP
-# client (modules/command-center/container-recovery.js) can only construct
-# `POST /containers/{id}/restart` — two independent limits, in two files, one of
-# which is asserted by a test.
+# remote root shell.
+#
+# The proxy must allow the two restart calls and NOTHING else. An earlier
+# version of this template used tecnativa/docker-socket-proxy with POST=1 and
+# CONTAINERS=1. That grants every POST under /containers, including
+# `containers/create` with a privileged container and `/` bind-mounted, i.e.
+# host root for anyone who compromises the API process. The `:ro` on the socket
+# mount does not restrict API calls at all (Command Center audit 2026-09-28,
+# CC-3). tecnativa can only switch whole API sections on or off, so it cannot
+# express "restart these two containers".
+#
+# wollomatic/socket-proxy allow-lists by method AND path regex. Below, the only
+# thing it forwards is POST /containers/<api or worker>/restart. The ERP client
+# (modules/command-center/container-recovery.js) builds only that call, so the
+# limit is held in two independent places.
 #
 # To enable: uncomment the service, uncomment the container_name lines on api
-# and worker above so the names are stable rather than compose-generated, and
-# set DOCKER_PROXY_URL / CC_WORKER_CONTAINER / CC_API_CONTAINER in .env.
+# and worker above so the names are stable rather than compose-generated, set
+# DOCKER_PROXY_URL=http://docker-socket-proxy:2375 plus CC_WORKER_CONTAINER /
+# CC_API_CONTAINER in .env, and check the flags against the README of the
+# image tag you pin (they are command-line flags, not env vars).
 #
 #  docker-socket-proxy:
-#    image: tecnativa/docker-socket-proxy:0.1.2
+#    image: wollomatic/socket-proxy:1
 #    restart: unless-stopped
-#    environment:
-#      # POST is what a restart needs. Everything else stays off, INCLUDING
-#      # the ones that look harmless: CONTAINERS=1 would allow listing and
-#      # inspecting every container on the host, and EXEC=1 or a writable
-#      # IMAGES would give away the box.
-#      POST: '1'
-#      CONTAINERS: '1'
-#      EXEC: '0'
-#      IMAGES: '0'
-#      VOLUMES: '0'
-#      NETWORKS: '0'
-#      INFO: '0'
-#      SERVICES: '0'
-#      SWARM: '0'
-#      SYSTEM: '0'
-#      TASKS: '0'
+#    command:
+#      - '-loglevel=info'
+#      - '-listenip=0.0.0.0'
+#      # Only the api service may connect (compose service name).
+#      - '-allowfrom=api'
+#      # The whole allow-list. Every other method and path is refused.
+#      - '-allowPOST=^(/v[0-9.]+)?/containers/(${CC_API_CONTAINER}|${CC_WORKER_CONTAINER})/restart$$'
+#      - '-watchdoginterval=3600'
+#      - '-stoponwatchdog'
+#      - '-shutdowngracetime=5'
 #    volumes:
-#      # Read-only on the proxy side as well. The proxy is the only thing on
-#      # this host that ever sees the socket.
 #      - /var/run/docker.sock:/var/run/docker.sock:ro
-#    # Never published to the host. Only the api container needs to reach it,
-#    # and it does so over the compose network by service name.
+#    read_only: true
+#    cap_drop: [ALL]
+#    security_opt: ['no-new-privileges:true']
+#    # Never published to the host. Only the api container reaches it, over
+#    # the compose network by service name.
 #    expose:
 #      - '2375'
 
