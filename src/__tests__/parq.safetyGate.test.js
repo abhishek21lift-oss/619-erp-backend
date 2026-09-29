@@ -94,8 +94,11 @@ describe('PAR-Q risk rule', () => {
   });
 });
 
+// Every question answered, with "yes" to the ones listed.
+const answers = (...yeses) => Array.from({ length: 10 }, (_, i) => (yeses.includes(i + 1) ? yes(i + 1) : no(i + 1)));
+
 describe('POST /parq/forms', () => {
-  const body = { client_id: 'c1', full_name: 'Test', parq_answers: [yes(3)] };
+  const body = { client_id: 'c1', full_name: 'Test', parq_answers: answers(3) };
 
   test('refuses another studio\'s client with 404, writing nothing', async () => {
     mockClientInOrg = false;
@@ -121,7 +124,7 @@ describe('POST /parq/forms', () => {
 
 describe('PATCH /parq/forms/:id', () => {
   test('omitting parq_answers keeps the stored answers and their risk', async () => {
-    mockExistingForm = { id: FORM_ID, parq_answers: [yes(1)], height_cm: null, weight_kg: null, bmi: null };
+    mockExistingForm = { id: FORM_ID, status: 'submitted', parq_answers: answers(1), height_cm: null, weight_kg: null, bmi: null };
     const res = await request(app()).patch(`/api/pt-os/parq/forms/${FORM_ID}`).send({ trainer_name: 'Coach' });
     expect(res.status).toBe(200);
     const update = mockQueries.find((q) => /^UPDATE pt_parq_forms SET (?!workout_gate_status)/i.test(q.sql));
@@ -181,5 +184,71 @@ describe('medical clearance approval needs evidence', () => {
     };
     const res = await request(app()).patch('/api/pt-os/parq/clearance/mc-1').send({ approval_status: 'approved' });
     expect(res.status).toBe(200);
+  });
+});
+
+describe('a PAR-Q is only screened when every question is answered (safety audit 2026-09-29)', () => {
+  const { logActivity } = require('../lib/activityLog');
+  beforeEach(() => logActivity.mockClear());
+
+  test('submitting with unanswered questions is refused and writes nothing', async () => {
+    const res = await request(app()).post('/api/pt-os/parq/forms')
+      .send({ client_id: 'c1', full_name: 'Test', status: 'submitted', parq_answers: [no(1), no(2)] });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('PARQ_INCOMPLETE');
+    expect(res.body.error.unanswered).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(mockQueries.some((q) => /INSERT INTO pt_parq_forms/i.test(q.sql))).toBe(false);
+  });
+
+  test('omitting status means submitted, so it needs every answer too', async () => {
+    const res = await request(app()).post('/api/pt-os/parq/forms').send({ client_id: 'c1', full_name: 'Test' });
+    expect(res.status).toBe(400);
+  });
+
+  test('a draft may be partial, and is logged as a draft rather than a submission', async () => {
+    const res = await request(app()).post('/api/pt-os/parq/forms')
+      .send({ client_id: 'c1', full_name: 'Test', status: 'draft', parq_answers: [] });
+    expect(res.status).toBe(201);
+    expect(logActivity).toHaveBeenCalledWith(expect.anything(), 'parq.draft', 'pt_parq_forms', FORM_ID, expect.anything());
+  });
+
+  test('unknown or repeated question ids are refused', async () => {
+    const base = { client_id: 'c1', full_name: 'Test', status: 'draft' };
+    expect((await request(app()).post('/api/pt-os/parq/forms').send({ ...base, parq_answers: [no(11)] })).status).toBe(400);
+    expect((await request(app()).post('/api/pt-os/parq/forms').send({ ...base, parq_answers: [no(2), yes(2)] })).status).toBe(400);
+  });
+
+  test('a draft cannot be submitted with gaps', async () => {
+    mockExistingForm = { id: FORM_ID, status: 'draft', parq_answers: [no(1)] };
+    const res = await request(app()).patch(`/api/pt-os/parq/forms/${FORM_ID}`).send({ status: 'submitted' });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('PARQ_INCOMPLETE');
+  });
+
+  test('a submitted form cannot be sent back to draft', async () => {
+    mockExistingForm = { id: FORM_ID, status: 'submitted', parq_answers: answers(1) };
+    const res = await request(app()).patch(`/api/pt-os/parq/forms/${FORM_ID}`).send({ status: 'draft' });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('PARQ_ALREADY_SUBMITTED');
+  });
+
+  test('changing answers on a submitted form is audited with the risk before and after', async () => {
+    mockExistingForm = { id: FORM_ID, client_id: 'c1', status: 'submitted', risk_level: 'high', parq_answers: answers(1) };
+    const res = await request(app()).patch(`/api/pt-os/parq/forms/${FORM_ID}`).send({ parq_answers: answers() });
+    expect(res.status).toBe(200);
+    expect(logActivity).toHaveBeenCalledWith(expect.anything(), 'parq.update', 'pt_parq_forms', FORM_ID,
+      expect.objectContaining({ answers_changed: true, risk_level_before: 'high', risk_level_after: 'low' }));
+  });
+
+  test('marking reviewed is audited; changing answers afterwards needs a new review', async () => {
+    mockExistingForm = { id: FORM_ID, client_id: 'c1', status: 'submitted', risk_level: 'medium', parq_answers: answers(2) };
+    await request(app()).patch(`/api/pt-os/parq/forms/${FORM_ID}`).send({ status: 'reviewed' });
+    expect(logActivity).toHaveBeenCalledWith(expect.anything(), 'parq.review', 'pt_parq_forms', FORM_ID, expect.anything());
+
+    mockQueries.length = 0;
+    mockExistingForm = { ...mockExistingForm, status: 'reviewed' };
+    await request(app()).patch(`/api/pt-os/parq/forms/${FORM_ID}`).send({ status: 'reviewed', parq_answers: answers(2, 6) });
+    const update = mockQueries.find((q) => /^UPDATE pt_parq_forms SET (?!workout_gate_status)/i.test(q.sql));
+    expect(update.params).toContain('submitted');
   });
 });

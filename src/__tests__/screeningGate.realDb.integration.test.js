@@ -114,4 +114,34 @@ describeIf('screening gate against a real database', () => {
     expect(blocked).toBeNull();
     expect(warnings.join(' ')).toMatch(/No PAR-Q/);
   });
+
+  it('a draft started after a revocation does not lift the hard stop; completing it does', async () => {
+    await pool.query(
+      `INSERT INTO pt_informed_consents (client_id, full_name, organization_id, status, created_at)
+       VALUES ($1, 'Gate Client', $2, 'revoked', NOW() - INTERVAL '1 day')`, [CLIENT, ORG]);
+    const { rows: [draft] } = await pool.query(
+      `INSERT INTO pt_informed_consents (client_id, full_name, organization_id, status)
+       VALUES ($1, 'Gate Client', $2, 'draft') RETURNING id`, [CLIENT, ORG]);
+    expect(await isTrainingBlocked(CLIENT)).toBe(true);
+
+    await pool.query(`UPDATE pt_informed_consents SET status = 'completed' WHERE id = $1`, [draft.id]);
+    expect(await isTrainingBlocked(CLIENT)).toBe(false);
+  });
+
+  it('a later rejection of a high-risk client outranks an earlier approval', async () => {
+    const id = await form({ risk: 'high', gate: 'cleared', date: '2026-01-10' });
+    await pool.query(
+      `INSERT INTO pt_medical_clearances (parq_form_id, client_id, approval_status, reviewed_at, organization_id)
+       VALUES ($1, $2, 'approved', NOW() - INTERVAL '2 days', $3),
+              ($1, $2, 'rejected', NOW() - INTERVAL '1 day', $3),
+              ($1, $2, 'pending', NOW(), $3)`, [id, CLIENT, ORG]);
+    expect(await isTrainingBlocked(CLIENT)).toBe(true);
+  });
+
+  it('a submitted form with no answers warns as incomplete', async () => {
+    await form({ risk: 'low', gate: 'cleared', date: '2026-03-01' });
+    const { blocked, warnings } = await checkScreeningGate({ user: { id: 'u' } }, CLIENT);
+    expect(blocked).toBeNull();
+    expect(warnings.join(' ')).toMatch(/incomplete \(0 of 10/);
+  });
 });

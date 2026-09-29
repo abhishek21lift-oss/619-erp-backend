@@ -19,6 +19,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { generateInformedConsentPdf } = require('../../lib/informedConsentPdf');
 const { saveFile } = require('../../lib/fileStorage');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+const { consentVersions } = require('./informed-consent.repository');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -120,9 +121,14 @@ async function fetchClientSnapshot(clientId, req) {
 // a signature clears every signature on it, and signing starts again.
 // Compared by value, not by presence in the body: the wizard re-sends the
 // whole form on every save, and an unchanged re-save must not unsign it.
+//
+// The exercise programme consent text and its tick are signed content too;
+// its signature and date are not (they are filled from the step-3 signature
+// on the final save, which must not unsign the document it completes).
 const SIGNED_CONTENT_FIELDS = [
   ...SNAPSHOT_FIELDS, 'acknowledgements', 'physician_advised_against',
   'physician_name', 'hospital', 'medical_condition',
+  'exercise_consent_text', 'exercise_consent_checked',
 ];
 
 function sameValue(a, b) {
@@ -211,14 +217,36 @@ router.post('/informed-consent', auth, requireTrainer, validate(createSchema), w
     return res.status(400).json({ error: { code: 'FULL_NAME_REQUIRED' } });
   }
 
+  // A client has one live consent at a time (draft or completed — the
+  // pic_one_active_per_client_idx unique index). A second create used to
+  // surface as a raw unique-violation 500; name the record instead so the
+  // caller can resume the draft, or amend the completed consent via PATCH.
+  // A new consent after a revocation is a new version of the revoked one,
+  // so the history reads as one chain.
+  const prior = await consentVersions(b.client_id, orgIdOf(req));
+  const active = prior.find((r) => r.status === 'draft' || r.status === 'completed');
+  if (active) {
+    return res.status(409).json({
+      error: {
+        code: 'ACTIVE_CONSENT_EXISTS',
+        message: active.status === 'draft'
+          ? 'This client already has a consent in progress — continue it instead.'
+          : 'This client already has a completed consent — amend it to create a new version.',
+        id: active.id, status: active.status,
+      },
+    });
+  }
+  const previous = prior.find((r) => r.status !== 'archived') || prior[0] || null;
+  const version = prior.reduce((max, r) => Math.max(max, Number(r.version) || 1), 0) + 1;
+
   const { rows } = await pool.query(
     `INSERT INTO pt_informed_consents (
-       client_id, trainer_id, status,
+       client_id, trainer_id, status, version, previous_version_id,
        full_name, gender, dob, mobile, email, emergency_contact, emergency_phone, address, occupation,
        created_by, organization_id
-     ) VALUES ($1,$2,'draft',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+     ) VALUES ($1,$2,'draft',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
     [
-      b.client_id, snapshot.trainer_id || null,
+      b.client_id, snapshot.trainer_id || null, version, previous ? previous.id : null,
       values.full_name, values.gender, values.dob, values.mobile, values.email,
       values.emergency_contact, values.emergency_phone, values.address, values.occupation,
       req.user.id, orgIdOf(req),
@@ -226,7 +254,9 @@ router.post('/informed-consent', auth, requireTrainer, validate(createSchema), w
   );
   const record = rows[0];
 
-  await logActivity(req, 'informed_consent.create', 'pt_informed_consents', record.id, { client_id: b.client_id });
+  await logActivity(req, 'informed_consent.create', 'pt_informed_consents', record.id, {
+    client_id: b.client_id, previous_version_id: previous ? previous.id : null,
+  });
   res.status(201).json({ data: record });
 }));
 
@@ -272,11 +302,18 @@ router.patch('/informed-consent/:id', auth, requireTrainer, validate(updateSchem
            client_id, trainer_id, version, previous_version_id, status,
            full_name, gender, dob, mobile, email, emergency_contact, emergency_phone, address, occupation,
            acknowledgements, physician_advised_against, physician_name, hospital, medical_condition,
+           exercise_consent_text, medical_clearance_file_url,
            created_by, organization_id
          )
          SELECT client_id, trainer_id, version + 1, id, 'draft',
                 full_name, gender, dob, mobile, email, emergency_contact, emergency_phone, address, occupation,
                 acknowledgements, physician_advised_against, physician_name, hospital, medical_condition,
+                -- The medical clearance on file still stands for the new
+                -- version: dropping it re-blocked a client whose physician
+                -- had advised against exercise the moment the consent was
+                -- amended. The exercise consent tick and signature are
+                -- given again; its text carries forward.
+                exercise_consent_text, medical_clearance_file_url,
                 $2, organization_id
            FROM pt_informed_consents WHERE id = $1
          RETURNING id`,
@@ -360,6 +397,13 @@ router.post('/informed-consent/:id/sign', auth, requireTrainer, validate(signSch
   const allAcked = ACK_KEYS.every((k) => acks[k] === true);
   if (!allAcked) {
     return res.status(400).json({ error: { code: 'ACKNOWLEDGEMENTS_INCOMPLETE' } });
+  }
+  // The exercise programme consent is the part of the document that agrees
+  // to the training itself; a record could complete without it.
+  if (existing.exercise_consent_checked !== true) {
+    return res.status(400).json({
+      error: { code: 'EXERCISE_CONSENT_REQUIRED', message: 'The exercise programme consent must be accepted before signing.' },
+    });
   }
 
   const { signer, signature, witness_name } = req.body;

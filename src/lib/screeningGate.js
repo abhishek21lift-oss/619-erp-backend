@@ -17,11 +17,16 @@
 //       – the client has revoked their Informed Consent (CONSENT_REVOKED);
 //       – the consent records that a physician advised against exercise and
 //         no medical clearance has been uploaded (PHYSICIAN_ADVISED_AGAINST).
-//   • Missing paperwork (no submitted PAR-Q on file, or no completed Informed
-//     Consent) is a WARNING, not a block: the action proceeds and the
-//     route returns the warnings so the UI can nudge the trainer to
-//     complete screening. Blocking every unscreened client outright made
-//     the whole workout system unusable on day one.
+//   • Missing or unreliable paperwork is a WARNING, not a block: the action
+//     proceeds and the route returns the warnings so the UI can nudge the
+//     trainer. Blocking every unscreened client outright made the whole
+//     workout system unusable on day one. Warned about:
+//       – no submitted PAR-Q on file;
+//       – a "submitted" PAR-Q with unanswered questions (it scores as zero
+//         yeses, so it must not read as a clean screen);
+//       – a PAR-Q older than 12 months (PAR-Q+ asks for a re-screen yearly);
+//       – a medium-risk PAR-Q no trainer has marked reviewed;
+//       – no completed Informed Consent.
 //
 // Both reads are pinned to the client's OWN studio (the join on
 // pt_clients.organization_id). A form or consent some other studio wrote
@@ -29,17 +34,37 @@
 const pool = require('../db/pool');
 const { logActivity } = require('./activityLog');
 
+// A clearance counts when the most recent DECISION on the form approved it
+// and it has not expired. "Any approved row" let an old approval outlive a
+// later rejection of the same client. Pending rows are not decisions: a
+// renewal in progress must not suspend the clearance already on file.
+// Shared with parq.routes.js recomputeGateStatus() so the stored
+// workout_gate_status and this read-time check agree.
+const validClearanceSql = (formIdExpr) => `COALESCE((
+    SELECT mc.approval_status = 'approved'
+           AND (mc.expiry_date IS NULL OR mc.expiry_date >= CURRENT_DATE)
+      FROM pt_medical_clearances mc
+     WHERE mc.parq_form_id = ${formIdExpr} AND mc.approval_status IN ('approved', 'rejected')
+     ORDER BY COALESCE(mc.reviewed_at, mc.updated_at, mc.created_at) DESC
+     LIMIT 1), false)`;
+
+// The PAR-Q has ten fixed questions (see parq-scoring.js).
+const PARQ_QUESTION_COUNT = 10;
+const PARQ_STALE_MONTHS = 12;
+
 // Drafts are excluded: the PAR-Q wizard saves a draft with blank answers on
 // its first step, and a blank draft must not become the "latest" form and
 // hide a submitted high-risk one. Ties on assessment_date resolve to the most
 // recently written form, so "latest" is deterministic.
 const LATEST_PARQ_SQL = `
-  SELECT f.risk_level, f.workout_gate_status,
-         EXISTS (
-           SELECT 1 FROM pt_medical_clearances mc
-            WHERE mc.parq_form_id = f.id AND mc.approval_status = 'approved'
-              AND (mc.expiry_date IS NULL OR mc.expiry_date >= CURRENT_DATE)
-         ) AS has_valid_clearance
+  SELECT f.risk_level, f.workout_gate_status, f.status,
+         ${validClearanceSql('f.id')} AS has_valid_clearance,
+         (SELECT COUNT(DISTINCT a->>'question_id')
+            FROM jsonb_array_elements(
+                   CASE WHEN jsonb_typeof(f.parq_answers) = 'array' THEN f.parq_answers ELSE '[]'::jsonb END
+                 ) a
+           WHERE a->>'answer' IN ('yes', 'no'))::int AS answered_count,
+         (f.assessment_date < CURRENT_DATE - INTERVAL '${PARQ_STALE_MONTHS} months') AS is_stale
     FROM pt_parq_forms f
     JOIN pt_clients c ON c.id = f.client_id AND c.organization_id = f.organization_id
    WHERE f.client_id = $1 AND f.deleted_at IS NULL
@@ -47,13 +72,36 @@ const LATEST_PARQ_SQL = `
    ORDER BY f.assessment_date DESC NULLS LAST, f.created_at DESC
    LIMIT 1`;
 
+// The consent that decides is the newest one that was ever GIVEN or
+// WITHDRAWN (completed / revoked / expired), not simply the newest row. A
+// draft is neither: reading "newest row" let a fresh draft started after a
+// revocation sit on top of it and turn the hard stop into a warning. A
+// revocation therefore stands until a newer consent is actually completed.
+//
+// The physician check looks at the deciding record and anything newer — a
+// draft that records a physician's advice against exercise is new medical
+// information, and it binds from the moment it is written.
 const LATEST_CONSENT_SQL = `
-  SELECT ic.status, ic.physician_advised_against, ic.medical_clearance_file_url
-    FROM pt_informed_consents ic
-    JOIN pt_clients c ON c.id = ic.client_id AND c.organization_id = ic.organization_id
-   WHERE ic.client_id = $1 AND ic.status NOT IN ('archived')
-   ORDER BY ic.created_at DESC
-   LIMIT 1`;
+  WITH scoped AS (
+    SELECT ic.status, ic.created_at, ic.physician_advised_against, ic.medical_clearance_file_url
+      FROM pt_informed_consents ic
+      JOIN pt_clients c ON c.id = ic.client_id AND c.organization_id = ic.organization_id
+     WHERE ic.client_id = $1 AND ic.status <> 'archived'
+  ), deciding AS (
+    SELECT status, created_at FROM scoped
+     WHERE status IN ('completed', 'revoked', 'expired')
+     ORDER BY created_at DESC
+     LIMIT 1
+  )
+  SELECT d.status,
+         EXISTS (
+           SELECT 1 FROM scoped s
+            WHERE s.physician_advised_against IS TRUE
+              AND s.medical_clearance_file_url IS NULL
+              AND (d.created_at IS NULL OR s.created_at >= d.created_at)
+         ) AS physician_block
+    FROM (SELECT 1) one
+    LEFT JOIN deciding d ON TRUE`;
 
 const BLOCKS = {
   PARQ_BLOCKED: 'This client\'s PAR-Q screening flags them as medically blocked — clearance is required before training.',
@@ -67,6 +115,23 @@ function parqBlocks(form) {
   return high && !form.has_valid_clearance;
 }
 
+// What is wrong with the PAR-Q on file short of a hard stop.
+function parqWarnings(parq) {
+  if (!parq) return ['No PAR-Q health screening on file for this client.'];
+  const out = [];
+  const answered = Number(parq.answered_count);
+  if (Number.isFinite(answered) && answered < PARQ_QUESTION_COUNT) {
+    out.push(`The PAR-Q on file is incomplete (${answered} of ${PARQ_QUESTION_COUNT} questions answered) — complete the screening.`);
+  }
+  if (parq.is_stale === true) {
+    out.push(`The PAR-Q on file is over ${PARQ_STALE_MONTHS} months old — re-screen this client.`);
+  }
+  if (parq.risk_level === 'medium' && parq.status !== 'reviewed') {
+    out.push('The PAR-Q has "yes" answers that need trainer review — review it and mark it reviewed.');
+  }
+  return out;
+}
+
 // Reads both records and decides. Returns { code, parq, consent } where code
 // is null when nothing hard-blocks.
 async function evaluate(clientId) {
@@ -75,14 +140,13 @@ async function evaluate(clientId) {
     pool.query(LATEST_CONSENT_SQL, [clientId]),
   ]);
   const parq = parqRows[0] || null;
-  const consent = consentRows[0] || null;
+  // status is null when no consent was ever completed or revoked.
+  const consent = consentRows[0] || { status: null, physician_block: false };
 
   let code = null;
   if (parqBlocks(parq)) code = 'PARQ_BLOCKED';
-  else if (consent && consent.status === 'revoked') code = 'CONSENT_REVOKED';
-  else if (consent && consent.physician_advised_against === true && !consent.medical_clearance_file_url) {
-    code = 'PHYSICIAN_ADVISED_AGAINST';
-  }
+  else if (consent.status === 'revoked') code = 'CONSENT_REVOKED';
+  else if (consent.physician_block === true) code = 'PHYSICIAN_ADVISED_AGAINST';
   return { code, parq, consent };
 }
 
@@ -105,10 +169,8 @@ async function checkScreeningGate(req, clientId) {
     };
   }
 
-  if (!parq) {
-    warnings.push('No PAR-Q health screening on file for this client.');
-  }
-  if (!consent || consent.status !== 'completed') {
+  warnings.push(...parqWarnings(parq));
+  if (consent.status !== 'completed') {
     warnings.push('Informed Consent is not completed for this client.');
   }
 
@@ -133,4 +195,7 @@ async function isTrainingBlocked(clientId) {
   return code !== null;
 }
 
-module.exports = { checkScreeningGate, isTrainingBlocked, parqBlocks };
+module.exports = {
+  checkScreeningGate, isTrainingBlocked, parqBlocks, parqWarnings, validClearanceSql,
+  PARQ_QUESTION_COUNT,
+};
