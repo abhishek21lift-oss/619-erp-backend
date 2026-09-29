@@ -18,6 +18,10 @@ const logger   = require('../lib/logger');
 const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const metricEngine = require('../modules/insights/metric-engine');
+// The studio's calendar day, not UTC's. A check-in at 5:00 AM in India is
+// 23:30 UTC the day before: dated by UTC it vanished from "today" on the
+// scanner and the attendance page, and the member showed as unmarked.
+const { today: studioToday, appTimeZone } = require('../lib/appTime');
 
 // ── AUD-004 (P1): this router is a MIXED surface ────────────────────────────
 //
@@ -186,7 +190,7 @@ function selfIdentity(u) {
 function membershipStatus(user) {
   if (!user) return 'not_found';
   if (user.status === 'frozen') return 'frozen';
-  const today = new Date().toISOString().slice(0, 10);
+  const today = studioToday();
   const exp = user.expiry_date || user.subscription_end_date || user.pt_end_date;
   if (exp && exp < today) return 'expired';
   if (user.status && user.status !== 'active') return user.status;
@@ -210,7 +214,7 @@ function membershipStatus(user) {
  */
 async function markAttendance(userId, userType, userName, method, deviceInfo, location, orgId) {
   const refType = userType === 'trainer' ? 'trainer' : 'client';
-  const date = new Date().toISOString().slice(0, 10);
+  const date = studioToday();
 
   const { rows } = await pool.query(
     `INSERT INTO attendance_logs
@@ -317,11 +321,11 @@ router.post('/scan', auth, requireTrainer, scanLimiter, async (req, res) => {
     const refType = userType === 'trainer' ? 'trainer' : 'client';
     const { rows: recent } = await pool.query(
       `SELECT id, check_in_time FROM attendance_logs
-       WHERE ref_id = $1 AND ref_type = $2 AND date = CURRENT_DATE
+       WHERE ref_id = $1 AND ref_type = $2 AND date = $4::date
          AND check_in_time > NOW() - INTERVAL '5 minutes'
          AND organization_id = $3
        LIMIT 1`,
-      [userId, refType, orgId]
+      [userId, refType, orgId, studioToday()]
     );
     // The same shape on every outcome. The scanner draws the person's face on
     // the result card, and the branch that most needs a face is a rejection —
@@ -386,11 +390,11 @@ router.post('/checkout', auth, async (req, res) => {
     const { rows } = await pool.query(
       `UPDATE attendance_logs
           SET check_out_time = NOW()
-        WHERE ref_id = $1 AND ref_type = $2 AND date = CURRENT_DATE
+        WHERE ref_id = $1 AND ref_type = $2 AND date = $4::date
           AND check_out_time IS NULL
           AND organization_id = $3
         RETURNING id, check_in_time, check_out_time`,
-      [userId, refType, req.user.organization_id]
+      [userId, refType, req.user.organization_id, studioToday()]
     );
 
     if (!rows[0]) return res.json({ success: false, message: 'No active check-in found for today' });
@@ -420,7 +424,10 @@ router.get('/dashboard', auth, requireTrainer, async (req, res) => {
   try {
     // Tenant scope: every aggregate below is limited to the caller's org.
     const scope = tenantScope(req);
-    const oParams = [scope.orgId];
+    // $2 is the studio's today and $3 its zone — see studioToday above.
+    // Hours are the studio's hours too: EXTRACT(HOUR) of a timestamptz is
+    // the UTC hour, which put a 7 AM rush at 1 AM on the peak-hours chart.
+    const oParams = [scope.orgId, studioToday()];
     const oc = ' AND organization_id = $1';   // bare tables
     const ocA = ' AND a.organization_id = $1'; // aliased `a`
 
@@ -434,7 +441,7 @@ router.get('/dashboard', auth, requireTrainer, async (req, res) => {
                   COUNT(*) FILTER (WHERE status = 'absent')  AS absent,
                   COUNT(*)                                    AS total
              FROM attendance_logs
-            WHERE date = CURRENT_DATE${oc}
+            WHERE date = $2::date${oc}
             GROUP BY ref_type`, oParams
         ),
 
@@ -442,7 +449,7 @@ router.get('/dashboard', auth, requireTrainer, async (req, res) => {
         pool.query(
           `SELECT ref_type, COUNT(*) AS count
              FROM attendance_logs
-            WHERE date = CURRENT_DATE
+            WHERE date = $2::date
               AND check_in_time IS NOT NULL
               AND check_out_time IS NULL
               AND status = 'present'${oc}
@@ -451,17 +458,17 @@ router.get('/dashboard', auth, requireTrainer, async (req, res) => {
 
         // Hourly check-in distribution for today
         pool.query(
-          `SELECT EXTRACT(HOUR FROM check_in_time)::int AS hour, COUNT(*) AS count
+          `SELECT EXTRACT(HOUR FROM check_in_time AT TIME ZONE $3)::int AS hour, COUNT(*) AS count
              FROM attendance_logs
-            WHERE date = CURRENT_DATE AND check_in_time IS NOT NULL${oc}
-            GROUP BY hour ORDER BY hour`, oParams
+            WHERE date = $2::date AND check_in_time IS NOT NULL${oc}
+            GROUP BY hour ORDER BY hour`, [...oParams, appTimeZone()]
         ),
 
         // Past 7 days total check-ins (trend)
         pool.query(
           `SELECT date, COUNT(*) FILTER (WHERE status = 'present') AS present
              FROM attendance_logs
-            WHERE date >= CURRENT_DATE - INTERVAL '6 days'${oc}
+            WHERE date >= $2::date - 6${oc}
             GROUP BY date ORDER BY date`, oParams
         ),
 
@@ -469,7 +476,7 @@ router.get('/dashboard', auth, requireTrainer, async (req, res) => {
         pool.query(
           `SELECT method, COUNT(*) AS count
              FROM attendance_logs
-            WHERE date = CURRENT_DATE AND status = 'present'${oc}
+            WHERE date = $2::date AND status = 'present'${oc}
             GROUP BY method`, oParams
         ),
       ]);
@@ -484,7 +491,7 @@ router.get('/dashboard', auth, requireTrainer, async (req, res) => {
               pc.status AS membership_status
          FROM attendance_logs a
          LEFT JOIN pt_clients pc ON pc.id = a.ref_id AND a.ref_type = 'client' AND pc.deleted_at IS NULL
-        WHERE a.date = CURRENT_DATE AND a.status = 'present'${ocA}
+        WHERE a.date = $2::date AND a.status = 'present'${ocA}
         ORDER BY a.check_in_time DESC NULLS LAST
         LIMIT 20`, oParams
     );
