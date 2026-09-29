@@ -76,7 +76,14 @@ const updateSchema = {
     // text/checkbox/date/signature (see migration 067).
     exercise_consent_text: z.string().max(8000).optional().nullable(),
     exercise_consent_checked: z.boolean().optional(),
-    exercise_consent_date: z.string().optional().nullable(),
+    // The day it was signed: recent, and not ahead of today. Any string at
+    // all used to be accepted, so a consent could be back- or future-dated.
+    exercise_consent_date: z.string().optional().nullable().refine(
+      (v) => !v || (!Number.isNaN(Date.parse(v))
+        && Date.parse(v) <= Date.now() + 86400000
+        && Date.parse(v) >= Date.now() - 8 * 86400000),
+      { message: 'Consent date must be within the last 7 days and not in the future' }
+    ),
     exercise_consent_signature: z.string().optional().nullable(),
   }),
 };
@@ -86,6 +93,9 @@ const signSchema = {
     signer: z.enum(['client', 'trainer', 'witness']),
     signature: z.string().min(1),
     witness_name: z.string().max(255).optional().nullable(),
+  }).refine((b) => b.signer !== 'witness' || (b.witness_name && b.witness_name.trim()), {
+    // A witness signature with no name identifies nobody.
+    message: 'A witness signature needs the witness name', path: ['witness_name'],
   }),
 };
 

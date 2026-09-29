@@ -13,7 +13,19 @@ function round(n, decimals = 1) {
 // ── Step 1: Blood Pressure ──────────────────────────────────
 // AHA guideline thresholds.
 function classifyBp(systolic, diastolic) {
-  if (systolic == null || diastolic == null) return { category: null, isUnsafe: false };
+  if (systolic == null && diastolic == null) return { category: null, isUnsafe: false };
+  // One number is still a reading. 180 over a blank diastolic is stage-2
+  // hypertension, and used to classify as nothing at all — which let the
+  // exertion tests through on exactly the reading the stop exists for.
+  if (systolic == null || diastolic == null) {
+    if ((systolic != null && systolic >= 140) || (diastolic != null && diastolic >= 90)) {
+      return { category: 'Hypertension Stage 2', isUnsafe: true };
+    }
+    if ((systolic != null && systolic < 90) || (diastolic != null && diastolic < 60)) {
+      return { category: 'Hypotension', isUnsafe: true };
+    }
+    return { category: null, isUnsafe: false };
+  }
   // The more dangerous band wins when the two readings disagree: 160/58 is
   // stage-2 hypertension with a low diastolic, not hypotension. Both are
   // unsafe to test; the label is what the trainer acts on and refers with.

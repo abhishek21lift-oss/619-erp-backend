@@ -5,6 +5,7 @@
 // organization with orgWhere().
 const pool = require('../../db/pool');
 const { orgWhere } = require('../../lib/tenant-db');
+const { today: studioToday } = require('../../lib/appTime');
 
 async function assessmentBelongs(req, assessmentId, clientId) {
   const params = [assessmentId, clientId];
@@ -18,9 +19,11 @@ async function assessmentBelongs(req, assessmentId, clientId) {
 async function insertLog(v) {
   const { rows } = await pool.query(
     `INSERT INTO strength_logs (client_id, exercise_name, weight_kg, sets_done, reps_done, one_rm_estimate, notes, assessment_id, one_rm_formula, is_direct_1rm, organization_id, log_date)
-     VALUES ($1,$2,$3,$4,$5,ROUND($6::NUMERIC,2),$7,$8,$9,$10,$11,COALESCE($12::date, CURRENT_DATE)) RETURNING *`,
+     VALUES ($1,$2,$3,$4,$5,ROUND($6::NUMERIC,2),$7,$8,$9,$10,$11,$12::date) RETURNING *`,
+    // The studio's day, not the database's: CURRENT_DATE is UTC, which filed
+    // a 5 AM lift in India under yesterday.
     [v.clientId, v.exerciseName, v.weightKg, v.setsDone, v.repsDone, v.oneRm, v.notes,
-     v.assessmentId, v.formula, v.direct, v.organizationId, v.logDate]
+     v.assessmentId, v.formula, v.direct, v.organizationId, v.logDate || studioToday()]
   );
   return rows[0];
 }
