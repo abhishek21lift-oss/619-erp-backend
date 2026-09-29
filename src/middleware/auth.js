@@ -127,9 +127,12 @@ async function auth(req, res, next) {
                 o.is_founder, o.founder_number,
                 o.status AS organization_status, o.subscription_status,
                 o.trial_ends_at, o.current_period_end,
-                u.is_active, u.token_version
+                u.is_active, u.token_version,
+                -- The account's My Profile photo, for the top bar and sidebar.
+                up.avatar_url
            FROM users u
            LEFT JOIN organizations o ON o.id = u.organization_id
+           LEFT JOIN user_profiles up ON up.user_id = u.id
           WHERE u.id = $1
             AND u.deleted_at IS NULL`,
         [decoded.id]

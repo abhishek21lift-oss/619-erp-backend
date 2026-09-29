@@ -26,6 +26,7 @@ const training = require('./member-training.service');
 const goals = require('./member-goals.service');
 const recap = require('./member-recap.service');
 const renewal = require('./member-renewal.service');
+const memberCoach = require('./member-coach.service');
 const { generatePaymentReceiptPdf } = require('../../lib/paymentReceiptPdf');
 const { isTrainingBlocked } = require('../../lib/screeningGate');
 const { randomUUID } = require('crypto');
@@ -61,11 +62,10 @@ function orgClause(orgId, params, col = 'organization_id') {
 // would hand the client their own commission figures, internal notes and the
 // studio's margin on them the moment somebody adds a column.
 //
-// trainer_photo is NULL, not t.photo_url: `trainers` has no photo column in
-// any migration or in production. Selecting it made this route a 500 for
-// every member, and the member dashboard — the first screen after sign-in —
-// needs it, so the whole app read as broken. The field stays in the response
-// so the client contract does not change; the dashboard shows initials.
+// trainer_photo is the trainer's My Profile photo (user_profiles.avatar_url),
+// not t.photo_url: `trainers` has no photo column in any migration or in
+// production, and selecting it once made this route a 500 for every member.
+// Same trainer the coach page resolves (member-coach.service.js).
 //
 // goal: the client's ACTIVE goal from pt_goals, which is where the trainer
 // sets it today; pt_clients.goal is the older free-text field and is the
@@ -85,7 +85,14 @@ router.get('/profile', wrap(async (req, res) => {
             c.package_type, COALESCE(g.goal, c.goal) AS goal, c.height, c.weight,
             c.joining_date, c.pt_start_date, c.pt_end_date, c.duration_months,
             c.status,
-            COALESCE(t.name, st.name) AS trainer_name, NULL::text AS trainer_photo,
+            COALESCE(t.name, st.name) AS trainer_name,
+            (SELECT up.avatar_url
+               FROM users tu
+               LEFT JOIN user_profiles up ON up.user_id = tu.id
+              WHERE tu.organization_id = c.organization_id AND tu.role = 'trainer'
+                AND tu.deleted_at IS NULL
+              ORDER BY (c.trainer_id IS NOT NULL AND tu.trainer_id = c.trainer_id) DESC, tu.created_at
+              LIMIT 1) AS trainer_photo,
             CASE WHEN t.id IS NOT NULL THEN t.specialization ELSE st.specialization END
               AS trainer_specialization,
             o.name AS studio_name, o.logo_url AS studio_logo
@@ -113,6 +120,15 @@ router.get('/profile', wrap(async (req, res) => {
   );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Profile not found.' } });
   res.json({ data: rows[0] });
+}));
+
+// ── GET /api/me/coach ────────────────────────────────────────────────────────
+// The trainer's own profile — photo, credentials, story — as they wrote it on
+// My Profile. The allow-list lives in member-coach.service.js.
+router.get('/coach', wrap(async (req, res) => {
+  const coach = await memberCoach.coachFor(pool, selfOf(req));
+  if (!coach) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'No trainer found.' } });
+  res.json({ data: coach });
 }));
 
 // ── GET /api/me/membership ───────────────────────────────────────────────────

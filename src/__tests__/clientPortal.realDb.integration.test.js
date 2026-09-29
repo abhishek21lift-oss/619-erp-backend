@@ -82,6 +82,16 @@ describeIf('/api/me against a real database', () => {
       `INSERT INTO users (id, name, email, password, role, organization_id, trainer_id, is_active)
        VALUES ($1, 'Tara', 'tara@portal.test', '!not-a-hash', 'trainer', $2, $3, TRUE)
        ON CONFLICT (id) DO NOTHING`, [TRAINER_USER, ORG, TRAINER]);
+    // The trainer's own My Profile: what the coach page shows a member.
+    await pool.query(
+      `INSERT INTO user_profiles (user_id, avatar_url, designation, bio, phone, experience_since,
+                                  specialisations, certifications, mfa_secret)
+       VALUES ($1, '/uploads/profile/tara.jpg', 'Head coach', 'Strength first.', '+919999999999', '2018-01-01',
+               '["Powerlifting"]'::jsonb,
+               '[{"id":"c1","name":"K11 CPT","issuer":"K11","issued_on":null,"expires_on":null,"credential_id":"SECRET-1"},
+                 {"id":"c2","name":"Old CPR","issuer":"Red Cross","issued_on":null,"expires_on":"2020-01-01","credential_id":"SECRET-2"}]'::jsonb,
+               'TOTP-SECRET')
+       ON CONFLICT (user_id) DO NOTHING`, [TRAINER_USER]);
     await pool.query(
       `INSERT INTO pt_clients (id, name, mobile, organization_id)
        VALUES ($1, 'Nia', '+919000017402', $2) ON CONFLICT (id) DO NOTHING`, [CLIENT_2, ORG]);
@@ -140,6 +150,7 @@ describeIf('/api/me against a real database', () => {
     await pool.query(`DELETE FROM pt_parq_forms WHERE id = 'me-int-parq'`);
     await pool.query(`DELETE FROM pt_informed_consents WHERE id = 'me-int-consent'`);
     await pool.query(`DELETE FROM pt_os_measurements WHERE id = 'me-int-meas'`);
+    await pool.query(`DELETE FROM user_profiles WHERE user_id = $1`, [TRAINER_USER]);
     await pool.query(`DELETE FROM users WHERE id = ANY($1)`, [[USER, TRAINER_USER]]);
     await pool.query(`DELETE FROM pt_clients WHERE id = ANY($1)`, [[CLIENT, CLIENT_2]]);
     await pool.query(`DELETE FROM trainers WHERE id = $1`, [TRAINER]);
@@ -151,6 +162,7 @@ describeIf('/api/me against a real database', () => {
 
   test.each([
     '/api/me/profile',
+    '/api/me/coach',
     '/api/me/membership',
     '/api/me/payments',
     '/api/me/attendance',
@@ -167,7 +179,34 @@ describeIf('/api/me against a real database', () => {
 
   test('the profile names the member and their trainer', async () => {
     const res = await request().get('/api/me/profile');
-    expect(res.body.data).toMatchObject({ id: CLIENT, name: 'Mina', trainer_name: 'Tara', trainer_photo: null });
+    expect(res.body.data).toMatchObject({ id: CLIENT, name: 'Mina', trainer_name: 'Tara', trainer_photo: '/uploads/profile/tara.jpg' });
+  });
+
+  test('the coach page is the trainer\'s own profile, and only its public face', async () => {
+    const res = await request().get('/api/me/coach');
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({
+      name: 'Tara', photo_url: '/uploads/profile/tara.jpg', designation: 'Head coach',
+      bio: 'Strength first.', specialisations: ['Powerlifting'], studio_name: 'Portal Studio',
+    });
+    expect(res.body.data.years_experience).toBeGreaterThanOrEqual(8);
+    // A lapsed certificate is not a claim to make to a client.
+    expect(res.body.data.certifications.map((c) => c.name)).toEqual(['K11 CPT']);
+    const raw = JSON.stringify(res.body);
+    for (const secret of ['SECRET-1', 'SECRET-2', 'TOTP-SECRET', '+919999999999', 'tara@portal.test']) {
+      expect(raw).not.toContain(secret);
+    }
+  });
+
+  test('a client with no assigned trainer sees the studio\'s trainer on the coach page', async () => {
+    asClient = CLIENT_2;
+    try {
+      const res = await request().get('/api/me/coach');
+      expect(res.status).toBe(200);
+      expect(res.body.data).toMatchObject({ name: 'Tara', photo_url: '/uploads/profile/tara.jpg' });
+    } finally {
+      asClient = CLIENT;
+    }
   });
 
   test('the profile goal is the active goal the trainer set, not the empty legacy field', async () => {
