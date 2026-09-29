@@ -287,9 +287,11 @@ function computeAssessment(b, age, gender) {
     mobility: mobilityScore, cardio: cardioScore, healthRisk: healthRiskScore, strength: strengthScore,
   });
 
-  const healthNotes = !hasBp && exertion && b.bp_not_measured
-    ? [b.health_notes, 'Resting blood pressure not measured (confirmed by trainer).'].filter(Boolean).join('\n')
-    : b.health_notes || null;
+  const NOT_MEASURED = 'Resting blood pressure not measured (confirmed by trainer).';
+  const priorNotes = String(b.health_notes || '').split('\n').filter((l) => l && l !== NOT_MEASURED).join('\n');
+  const healthNotes = (!hasBp && exertion && b.bp_not_measured
+    ? [priorNotes, NOT_MEASURED].filter(Boolean).join('\n')
+    : priorNotes) || null;
 
   return {
     bpUnsafe: bp.isUnsafe,
