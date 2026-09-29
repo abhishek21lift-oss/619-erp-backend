@@ -47,7 +47,8 @@ const repo = require('./automation.repository');
 /**
  * The events a rule may be bound to.
  *
- * Character for character the CHECK constraint in migration 012. A value here
+ * Character for character the CHECK constraint (created in migration 012,
+ * last redefined in 222). A value here
  * that the constraint rejects would let the engine look for rules that can
  * never exist; a value in the constraint that is missing here is a rule a
  * studio can create and nothing will ever fire. Both are silent, so the list
@@ -57,6 +58,8 @@ const TRIGGER_EVENTS = Object.freeze([
   'member_created', 'lead_created', 'followup_due', 'membership_expiring',
   'membership_expired', 'payment_received', 'session_low', 'birthday',
   'anniversary', 'attendance_missed', 'trial_scheduled', 'trial_completed',
+  // Migration 222.
+  'payment_due',
 ]);
 
 /**

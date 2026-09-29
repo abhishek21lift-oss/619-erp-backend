@@ -26,6 +26,7 @@ jest.mock('../modules/automation/automation.repository', () => ({
   anniversariesToday: jest.fn(),
   attendanceMissedFor: jest.fn(),
   followupsDue: jest.fn(),
+  balancesDueFor: jest.fn(),
 }));
 
 jest.mock('../modules/automation/automation.engine', () => ({
@@ -52,7 +53,7 @@ const ORG_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
 const ALL_EVENTS = [
   'membership_expiring', 'membership_expired', 'birthday',
-  'anniversary', 'attendance_missed', 'followup_due',
+  'anniversary', 'attendance_missed', 'followup_due', 'payment_due',
 ];
 
 /** Every emit() the sweep made, in order. */
@@ -63,6 +64,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   delete process.env.AUTOMATION_EXPIRY_REMINDER_DAYS;
   delete process.env.AUTOMATION_ABSENCE_DAYS;
+  delete process.env.AUTOMATION_BALANCE_REMINDER_DAYS;
 
   // Every query answers empty by default, so a test that wants rows says so
   // and a test that does not is asserting on silence rather than on leftovers.
@@ -74,6 +76,7 @@ beforeEach(() => {
   repo.anniversariesToday.mockResolvedValue([]);
   repo.attendanceMissedFor.mockResolvedValue([]);
   repo.followupsDue.mockResolvedValue([]);
+  repo.balancesDueFor.mockResolvedValue([]);
   engine.emit.mockResolvedValue({ outcome: 'queued', queued: 1, results: [] });
 });
 
@@ -155,7 +158,7 @@ describe('only the events a studio has rules for', () => {
     expect(repo.attendanceMissedFor).not.toHaveBeenCalled();
   });
 
-  test('all six run when all six are active', async () => {
+  test('every sweep event runs when all are active', async () => {
     await sweep.sweepOrg(ORG_A, ALL_EVENTS);
 
     expect(repo.membershipExpiringIn).toHaveBeenCalled();
@@ -164,6 +167,7 @@ describe('only the events a studio has rules for', () => {
     expect(repo.anniversariesToday).toHaveBeenCalledWith(ORG_A);
     expect(repo.attendanceMissedFor).toHaveBeenCalledWith(ORG_A, 14);
     expect(repo.followupsDue).toHaveBeenCalledWith(ORG_A);
+    expect(repo.balancesDueFor).toHaveBeenCalledWith(ORG_A, 7);
   });
 
   test('SWEEP_EVENTS is exactly the set this file handles', () => {
@@ -263,6 +267,28 @@ describe('the idempotency key each event derives', () => {
     expect(call.context.package).toBe('Transformation');
   });
 
+  test('payment_due keys on the reminder period, not the balance', async () => {
+    // The balance is left out on purpose: a part-payment mid-week would
+    // otherwise send a second "you owe" right after the "payment received".
+    repo.balancesDueFor.mockResolvedValue([
+      { id: 'c-9', name: 'Asha', balance: '5000.00', period_start: '2026-09-28' },
+    ]);
+
+    await sweep.sweepOrg(ORG_A, ['payment_due']);
+    const call = emittedFor('payment_due')[0];
+
+    expect(call.eventKey).toBe('c-9:2026-09-28');
+    expect(call.subjectId).toBe('c-9');
+    expect(call.context.amount).toBe('₹5,000');
+  });
+
+  test('the balance reminder interval is configurable, and rubbish falls back to 7', async () => {
+    process.env.AUTOMATION_BALANCE_REMINDER_DAYS = '14';
+    expect(sweep.balanceReminderDays()).toBe(14);
+    process.env.AUTOMATION_BALANCE_REMINDER_DAYS = 'soon';
+    expect(sweep.balanceReminderDays()).toBe(7);
+  });
+
   test('no key contains a timestamp', async () => {
     // The whole point. A key with the run time in it makes every re-run a new
     // business event, and the dedupe index — which is the only thing standing
@@ -274,16 +300,17 @@ describe('the idempotency key each event derives', () => {
     repo.anniversariesToday.mockResolvedValue([{ id: 'c-4', today: '2026-09-09', years: 1 }]);
     repo.attendanceMissedFor.mockResolvedValue([{ id: 'c-5', last_visit: '2026-08-01', days_since: 39 }]);
     repo.followupsDue.mockResolvedValue([{ id: 'l-1', follow_up_date: '2026-09-01' }]);
+    repo.balancesDueFor.mockResolvedValue([{ id: 'c-6', balance: '5000.00', period_start: '2026-09-28' }]);
 
     await sweep.sweepOrg(ORG_A, ALL_EVENTS);
 
     const keys = emitted().map((a) => a.eventKey);
-    // Eight, not six: the expiring row is returned for all three reminder
+    // Nine, not seven: the expiring row is returned for all three reminder
     // buckets, which is the fixture being lazy rather than the sweep being
     // wrong — and the three keys it produces differ only in the bucket, which
     // is the point of putting the bucket in them.
-    expect(keys).toHaveLength(8);
-    expect(new Set(keys).size).toBe(8);
+    expect(keys).toHaveLength(9);
+    expect(new Set(keys).size).toBe(9);
     for (const key of keys) {
       expect(key).not.toMatch(/T\d{2}:\d{2}/);       // an ISO timestamp
       expect(key).not.toMatch(/\b1[6-9]\d{11}\b/);   // epoch milliseconds

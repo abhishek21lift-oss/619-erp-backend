@@ -155,10 +155,12 @@ describe('rules', () => {
     // are silent.
     const fs = require('fs');
     const path = require('path');
+    // The latest migration that redefines the constraint wins — 012 created
+    // it, 222 added payment_due.
     const sql = fs.readFileSync(
-      path.join(__dirname, '..', 'db/migrations/012_business_flow_complete.sql'), 'utf8',
+      path.join(__dirname, '..', 'db/migrations/222_automation_payment_due.sql'), 'utf8',
     );
-    const block = sql.match(/trigger_event\s+TEXT\s+NOT NULL\s+CHECK \(trigger_event IN \(([\s\S]*?)\)\)/);
+    const block = sql.match(/CHECK \(trigger_event IN \(([\s\S]*?)\)\)/);
     const inDb = [...block[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort();
     expect([...engine.TRIGGER_EVENTS].sort()).toEqual(inDb);
   });

@@ -293,6 +293,14 @@ describeIf('automation tenancy, against a real database', () => {
           ('sw-away-a',   'Away',       '+919000001009', NULL, $1, 'auto-trainer-a', NULL, NULL, CURRENT_DATE + 60),
           ('sw-here-a',   'Here',       '+919000001010', NULL, $1, 'auto-trainer-a', NULL, NULL, CURRENT_DATE + 60),
           ('sw-never-a',  'NeverCame',  '+919000001011', NULL, $1, 'auto-trainer-a', NULL, NULL, CURRENT_DATE + 60),
+          -- Trains, but mostly without checking in: an old check-in and a
+          -- workout two days ago. Seen, so not missed.
+          ('sw-lifter-a', 'Lifter',     '+919000001012', NULL, $1, 'auto-trainer-a', NULL, NULL, CURRENT_DATE + 60),
+          -- Never checked in; last completed workout 20 days ago.
+          ('sw-logonly-a','LogOnly',    '+919000001013', NULL, $1, 'auto-trainer-a', NULL, NULL, CURRENT_DATE + 60),
+          -- An abandoned session yesterday is not a visit; the last real
+          -- workout was 30 days ago.
+          ('sw-abandon-a','Abandoned',  '+919000001014', NULL, $1, 'auto-trainer-a', NULL, NULL, CURRENT_DATE + 60),
           -- No number at all. The engine would refuse it; the sweep should not
           -- hand it over in the first place.
           ('sw-nophone-a','NoPhone',    NULL,            '',   $1, 'auto-trainer-a',
@@ -315,8 +323,21 @@ describeIf('automation tenancy, against a real database', () => {
           ('sw-att-2', 'sw-away-a', 'client', CURRENT_DATE - 20, $1),
           ('sw-att-3', 'sw-here-a', 'client', CURRENT_DATE - 40, $1),
           ('sw-att-4', 'sw-here-a', 'client', CURRENT_DATE - 2,  $1),
-          ('sw-att-5', 'sw-away-b', 'client', CURRENT_DATE - 20, $2)
+          ('sw-att-5', 'sw-away-b', 'client', CURRENT_DATE - 20, $2),
+          ('sw-att-6', 'sw-lifter-a', 'client', CURRENT_DATE - 30, $1)
         ON CONFLICT (id) DO NOTHING`, [ORG_A, ORG_B]);
+
+      await owner.query(`
+        INSERT INTO workout_sessions (id, client_id, session_date, status, organization_id) VALUES
+          ('sw-ws-1', 'sw-lifter-a',  CURRENT_DATE - 2,  'completed', $1),
+          ('sw-ws-2', 'sw-logonly-a', CURRENT_DATE - 20, 'completed', $1),
+          ('sw-ws-3', 'sw-abandon-a', CURRENT_DATE - 30, 'completed', $1),
+          ('sw-ws-4', 'sw-abandon-a', CURRENT_DATE - 1,  'abandoned', $1)
+        ON CONFLICT (id) DO NOTHING`, [ORG_A]);
+
+      // Balances. Only the owing clients of the asked-for studio come back.
+      await owner.query(`UPDATE pt_clients SET balance_amount = 5000 WHERE id IN ('sw-away-a', 'sw-away-b', 'sw-nophone-a')`);
+      await owner.query(`UPDATE pt_clients SET balance_amount = 1500.5 WHERE id = 'sw-gone-a'`);
 
       await owner.query(`
         INSERT INTO pt_leads (id, organization_id, name, mobile, status, follow_up_date, trainer_id) VALUES
@@ -341,6 +362,7 @@ describeIf('automation tenancy, against a real database', () => {
       await owner.query(`DELETE FROM automation_rules WHERE id LIKE 'sw-rule-%'`);
       await owner.query(`DELETE FROM pt_leads WHERE id LIKE 'sw-lead-%'`);
       await owner.query(`DELETE FROM attendance_logs WHERE id LIKE 'sw-att-%'`);
+      await owner.query(`DELETE FROM workout_sessions WHERE id LIKE 'sw-ws-%'`);
       await owner.query(`DELETE FROM pt_clients WHERE id LIKE 'sw-%'`);
       await owner.query(`DELETE FROM whatsapp_automation_settings WHERE organization_id = $1`, [ORG_C]);
       await owner.query(`DELETE FROM organizations WHERE id = $1`, [ORG_C]);
@@ -456,7 +478,24 @@ describeIf('automation tenancy, against a real database', () => {
         const rows = await repo.attendanceMissedFor(ORG_A, 14);
         // sw-here-a also has a 40-day-old row. If the query looked at ANY
         // attendance rather than the most recent, it would be here too.
-        expect(ids(rows)).toEqual(['sw-away-a']);
+        expect(ids(rows)).toEqual(['sw-abandon-a', 'sw-away-a', 'sw-logonly-a']);
+      });
+
+      test('a logged workout counts as being seen, not only a check-in', async () => {
+        // sw-lifter-a last checked in 30 days ago but trained two days ago.
+        // Counting check-ins alone would tell them "we miss you".
+        expect(ids(await repo.attendanceMissedFor(ORG_A, 14))).not.toContain('sw-lifter-a');
+      });
+
+      test('a client who only logs workouts is still noticed when they stop', async () => {
+        const row = (await repo.attendanceMissedFor(ORG_A, 14)).find((r) => r.id === 'sw-logonly-a');
+        expect(row).toBeDefined();
+        expect(Number(row.days_since)).toBe(20);
+      });
+
+      test('an abandoned session is not a visit', async () => {
+        const row = (await repo.attendanceMissedFor(ORG_A, 14)).find((r) => r.id === 'sw-abandon-a');
+        expect(Number(row.days_since)).toBe(30);
       });
 
       test('never someone who has no attendance history at all', async () => {
@@ -475,8 +514,48 @@ describeIf('automation tenancy, against a real database', () => {
       });
 
       test('the window widens and narrows with the threshold', async () => {
-        expect(ids(await repo.attendanceMissedFor(ORG_A, 25))).toEqual([]);
-        expect(ids(await repo.attendanceMissedFor(ORG_A, 1))).toEqual(['sw-away-a', 'sw-here-a']);
+        expect(ids(await repo.attendanceMissedFor(ORG_A, 25))).toEqual(['sw-abandon-a']);
+        expect(ids(await repo.attendanceMissedFor(ORG_A, 1))).toEqual(
+          ['sw-abandon-a', 'sw-away-a', 'sw-here-a', 'sw-lifter-a', 'sw-logonly-a']);
+      });
+    });
+
+    describe('payment_due', () => {
+      test('owing clients of this studio only, lapsed ones included, and never one with no number', async () => {
+        const rows = await repo.balancesDueFor(ORG_A, 7);
+        expect(ids(rows)).toEqual(['sw-away-a', 'sw-gone-a']);
+        expect(ids(await repo.balancesDueFor(ORG_B, 7))).toEqual(['sw-away-b']);
+      });
+
+      test('the balance and the period start come back as text', async () => {
+        const row = (await repo.balancesDueFor(ORG_A, 7)).find((r) => r.id === 'sw-gone-a');
+        expect(row.balance).toBe('1500.50');
+        expect(row.period_start).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      });
+
+      test('a 7-day period starts on a Monday, and is today or earlier', async () => {
+        const [{ period_start: start }] = await repo.balancesDueFor(ORG_A, 7);
+        const { rows } = await owner.query(
+          `SELECT EXTRACT(ISODOW FROM $1::date)::INT AS dow, ($1::date <= CURRENT_DATE) AS past,
+                  (CURRENT_DATE - $1::date) AS gap`, [start]);
+        expect(rows[0]).toMatchObject({ dow: 1, past: true });
+        expect(Number(rows[0].gap)).toBeLessThan(7);
+      });
+    });
+
+    describe('the daily limit counts the studio\'s day', () => {
+      test('the day-start expression is midnight in the studio\'s zone', async () => {
+        const { rows } = await owner.query(
+          `SELECT to_char(${repo.STUDIO_DAY_START} AT TIME ZONE $2, 'HH24:MI') AS local_start,
+                  (NOW() - ${repo.STUDIO_DAY_START}) < INTERVAL '1 day' AS within_a_day,
+                  ${repo.STUDIO_DAY_START} <= NOW() AS not_future,
+                  $1::TEXT AS unused`,
+          [null, 'Asia/Kolkata']);
+        expect(rows[0]).toMatchObject({ local_start: '00:00', within_a_day: true, not_future: true });
+      });
+
+      test('sendsToday runs against the real schema', async () => {
+        expect(await repo.sendsToday(ORG_A)).toEqual(expect.any(Number));
       });
     });
 
