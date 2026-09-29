@@ -21,6 +21,7 @@ const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
 const { computeParqAnalysis } = require('./parq-scoring');
 const { clearanceApprovalProblem } = require('./parq-clearance');
+const { validClearanceSql, PARQ_QUESTION_COUNT } = require('../../lib/screeningGate');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -43,6 +44,40 @@ function calcBmi(weightKg, heightCm) {
   return Math.round((w / (heightM * heightM)) * 10) / 10;
 }
 
+// A form leaves draft only with every question answered. The risk rule
+// counts "yes" answers, so a blank question scores exactly like a "no": a
+// "submitted" form with nothing answered was stored as low risk and cleared
+// the client to train. Only the wizard used to enforce this.
+function unansweredQuestions(answers) {
+  const answered = new Set(
+    (Array.isArray(answers) ? answers : [])
+      .filter((a) => a && (a.answer === 'yes' || a.answer === 'no'))
+      .map((a) => Number(a.question_id))
+  );
+  const missing = [];
+  for (let q = 1; q <= PARQ_QUESTION_COUNT; q++) if (!answered.has(q)) missing.push(q);
+  return missing;
+}
+
+function incompleteResponse(res, missing) {
+  return res.status(400).json({
+    error: {
+      code: 'PARQ_INCOMPLETE',
+      message: `Answer every PAR-Q question before submitting (unanswered: ${missing.join(', ')}).`,
+      unanswered: missing,
+    },
+  });
+}
+
+const answersChanged = (before, after) => {
+  const key = (list) => JSON.stringify(
+    (Array.isArray(list) ? list : [])
+      .map((a) => [Number(a.question_id), a.answer || ''])
+      .sort((x, y) => x[0] - y[0])
+  );
+  return key(before) !== key(after);
+};
+
 // Authoritative gate-status recompute — callable from both the form routes
 // (POST/PATCH /forms) and the medical-clearance routes, since approving a
 // clearance later must flip a previously-blocked form to cleared.
@@ -55,14 +90,12 @@ async function recomputeGateStatus(pool, formId) {
 
   let gateStatus;
   if (form.risk_level === 'high') {
+    // Same rule the screening gate applies at read time: the latest
+    // decision on the form, approved and unexpired.
     const { rows: clearanceRows } = await pool.query(
-      `SELECT 1 FROM pt_medical_clearances
-        WHERE parq_form_id = $1 AND approval_status = 'approved'
-          AND (expiry_date IS NULL OR expiry_date >= CURRENT_DATE)
-        LIMIT 1`,
-      [formId]
+      `SELECT ${validClearanceSql('$1')} AS ok`, [formId]
     );
-    gateStatus = clearanceRows.length ? 'cleared' : 'blocked';
+    gateStatus = clearanceRows[0]?.ok ? 'cleared' : 'blocked';
   } else {
     gateStatus = 'cleared';
   }
@@ -99,7 +132,9 @@ async function replaceFamilyHistory(tx, formId, list) {
 // ─── Schemas ────────────────────────────────────────────────
 
 const parqAnswerSchema = z.object({
-  question_id: z.union([z.string(), z.number()]),
+  // One of the ten fixed questions. Anything else used to be stored as-is and
+  // quietly ignored by the risk rule — or double-counted as a duplicate.
+  question_id: z.coerce.number().int().min(1).max(PARQ_QUESTION_COUNT),
   // Draft-friendly: the form is created as a draft on step 1, before the user
   // reaches the PAR-Q step, so an answer may still be blank. '' / null means
   // "not yet answered". computeParqAnalysis() ignores anything that isn't
@@ -162,7 +197,10 @@ const parqFormFields = {
 
     // Step 5: PAR-Q — up to the 10 fixed questions; a draft created on step 1
     // may carry blank/unanswered entries (see parqAnswerSchema).
-    parq_answers: z.array(parqAnswerSchema).max(10).optional(),
+    parq_answers: z.array(parqAnswerSchema).max(PARQ_QUESTION_COUNT)
+      .refine((list) => new Set(list.map((a) => a.question_id)).size === list.length,
+        { message: 'Each PAR-Q question may be answered once' })
+      .optional(),
 
     // Step 7: Trainer Notes
     trainer_notes: z.record(z.string(), z.unknown()).optional().nullable(),
@@ -296,6 +334,11 @@ router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema),
   // latest form, so a form written against another studio's client would be
   // a cross-tenant write into a medical-safety control.
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  const status = b.status || 'submitted';
+  if (status !== 'draft') {
+    const missing = unansweredQuestions(b.parq_answers);
+    if (missing.length) return incompleteResponse(res, missing);
+  }
   const analysis = computeParqAnalysis(b.parq_answers);
   const gateStatus = analysis.riskLevel === 'high' ? 'blocked' : 'cleared';
   const bmi = b.bmi ?? calcBmi(b.weight_kg, b.height_cm);
@@ -336,7 +379,7 @@ router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema),
         JSON.stringify(b.parq_answers), analysis.yesCount,
         analysis.riskLevel, analysis.riskMessage,
         b.trainer_notes ? JSON.stringify(b.trainer_notes) : null,
-        b.status || 'submitted', gateStatus,
+        status, gateStatus,
         req.user.id, orgIdOf(req),
       ]
     );
@@ -357,7 +400,7 @@ router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema),
   // the single source of truth for gate status everywhere).
   await recomputeGateStatus(pool, formId);
 
-  await logActivity(req, 'parq.submit', 'pt_parq_forms', formId, {
+  await logActivity(req, status === 'draft' ? 'parq.draft' : 'parq.submit', 'pt_parq_forms', formId, {
     client_id: b.client_id, risk_level: analysis.riskLevel, yes_count: analysis.yesCount,
   });
 
@@ -380,6 +423,7 @@ router.patch('/parq/forms/:id', auth, requireTrainer, validate(parqFormUpdateSch
 
   const tx = await pool.connect();
   let formId;
+  let audit = null;
   try {
     await tx.query('BEGIN');
     const scope = tenantScope(req);
@@ -397,6 +441,29 @@ router.patch('/parq/forms/:id', auth, requireTrainer, validate(parqFormUpdateSch
     const mergedAnswers = b.parq_answers !== undefined ? b.parq_answers : existing.parq_answers;
     const analysis = computeParqAnalysis(mergedAnswers);
     const gateStatus = analysis.riskLevel === 'high' ? 'blocked' : 'cleared';
+
+    const priorStatus = existing.status || 'submitted';
+    // A screened form never goes back to draft: the gate skips drafts, so
+    // that one PATCH would hide a high-risk result and leave the client
+    // looking merely unscreened.
+    if (priorStatus !== 'draft' && b.status === 'draft') {
+      await tx.query('ROLLBACK');
+      return res.status(409).json({ error: { code: 'PARQ_ALREADY_SUBMITTED', message: 'A submitted PAR-Q cannot be returned to draft.' } });
+    }
+    const changedAnswers = b.parq_answers !== undefined && answersChanged(existing.parq_answers, mergedAnswers);
+    let nextStatus = b.status !== undefined ? b.status : priorStatus;
+    // A review covers the answers that were reviewed. Changed answers need
+    // a fresh review, so the form drops back to submitted — even when the
+    // edit screen echoes the stored 'reviewed' status back.
+    if (priorStatus === 'reviewed' && nextStatus === 'reviewed' && changedAnswers) nextStatus = 'submitted';
+    if (nextStatus !== 'draft') {
+      const missing = unansweredQuestions(mergedAnswers);
+      if (missing.length) {
+        await tx.query('ROLLBACK');
+        return incompleteResponse(res, missing);
+      }
+    }
+    if (nextStatus !== priorStatus) b.status = nextStatus;
 
     let bmi;
     if (b.bmi !== undefined) {
@@ -438,6 +505,19 @@ router.patch('/parq/forms/:id', auth, requireTrainer, validate(parqFormUpdateSch
 
     await tx.query('COMMIT');
     formId = id;
+
+    // Edits to a screened form change who may train, so every one is on the
+    // audit trail — a "yes" quietly turned into a "no" used to leave no trace.
+    if (priorStatus === 'draft' && nextStatus !== 'draft') {
+      audit = ['parq.submit', { client_id: existing.client_id, risk_level: analysis.riskLevel, yes_count: analysis.yesCount }];
+    } else if (priorStatus !== 'draft') {
+      audit = [nextStatus === 'reviewed' && priorStatus !== 'reviewed' ? 'parq.review' : 'parq.update', {
+        client_id: existing.client_id,
+        answers_changed: changedAnswers,
+        risk_level_before: existing.risk_level, risk_level_after: analysis.riskLevel,
+        status_before: priorStatus, status_after: nextStatus,
+      }];
+    }
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
     throw err;
@@ -449,6 +529,7 @@ router.patch('/parq/forms/:id', auth, requireTrainer, validate(parqFormUpdateSch
   // have cleared the gate; this re-confirms against the clearance table
   // rather than trusting the tentative value written above.
   await recomputeGateStatus(pool, formId);
+  if (audit) await logActivity(req, audit[0], 'pt_parq_forms', formId, audit[1]);
 
   const { rows } = await pool.query('SELECT * FROM pt_parq_forms WHERE id = $1', [formId]);
   res.json({ data: rows[0] });
