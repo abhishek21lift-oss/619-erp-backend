@@ -22,9 +22,20 @@
 // and a signature that pretends otherwise would invite someone to reach for
 // req.user in a context that has none.
 
+const { appTimeZone } = require('../../lib/appTime');
 const pool = require('../../db/pool');
 
 // ── Permission ──────────────────────────────────────────────────────────────
+
+
+/**
+ * Midnight, today, in the studio's time zone ($2), as a timestamptz.
+ *
+ * The daily limit used `date_trunc('day', NOW())`, which is midnight UTC — so
+ * a studio in India had its quota reset at 5:30 in the morning, and a message
+ * queued at 3 AM counted against the previous day.
+ */
+const STUDIO_DAY_START = "(date_trunc('day', NOW() AT TIME ZONE $2) AT TIME ZONE $2)";
 
 /**
  * This studio's automation settings, defaulted for a studio that has none.
@@ -52,8 +63,8 @@ async function sendsToday(orgId) {
        FROM communication_logs
       WHERE organization_id = $1
         AND automation_rule_id IS NOT NULL
-        AND created_at >= date_trunc('day', NOW())`,
-    [orgId]
+        AND created_at >= ${STUDIO_DAY_START}`,
+    [orgId, appTimeZone()]
   );
   return rows[0].n;
 }
@@ -279,8 +290,8 @@ async function insertQueuedWithinLimit(entry, dailyLimit) {
          FROM communication_logs
         WHERE organization_id = $1
           AND automation_rule_id IS NOT NULL
-          AND created_at >= date_trunc('day', NOW())`,
-      [entry.orgId]
+          AND created_at >= ${STUDIO_DAY_START}`,
+      [entry.orgId, appTimeZone()]
     );
     const usedToday = counted[0].n;
 
@@ -893,9 +904,19 @@ async function anniversariesToday(orgId) {
 }
 
 /**
- * Current clients who have not checked in for at least `days` days.
+ * Current clients who have not been seen for at least `days` days.
  *
- * ── Why only clients who have EVER checked in ───────────────────────────────
+ * ── What counts as being seen ───────────────────────────────────────────────
+ *
+ * A check-in OR a completed workout, whichever is later. It used to be
+ * check-ins alone, and in this product most training is logged as a workout
+ * rather than checked in (production: 37 completed workouts, 13 check-ins).
+ * A client who trained three times this week without tapping check-in would
+ * have been told "we miss you". GREATEST ignores a NULL, so a client with only
+ * one of the two still has a last visit; one with neither has none and is left
+ * out, for the reason below. Abandoned sessions (migration 220) are not visits.
+ *
+ * ── Why only clients who have EVER been seen ───────────────────────────────
  *
  * A client with no attendance row at all has no last visit to miss — they may
  * have enrolled yesterday, or the studio may not use check-in at all, and "we
@@ -903,12 +924,9 @@ async function anniversariesToday(orgId) {
  * Production has 34 clients and 12 attendance rows, so getting this wrong
  * would nudge almost the entire roster on the first morning.
  *
- * What enforces it is the HAVING, not the join: with no rows, MAX(a.date) is
- * NULL, `CURRENT_DATE - NULL` is NULL, and NULL >= 14 is not true. The inner
- * join says the same thing a second time and is kept for legibility — mutating
- * it to a LEFT JOIN alone changes no behaviour and no test, which is worth
- * knowing before someone "fixes" the HAVING with a COALESCE and quietly turns
- * every never-attended client into a fortnight-long absentee.
+ * What enforces it is `v.last_visit IS NOT NULL`: GREATEST of two NULLs is
+ * NULL. Replacing it with a COALESCE to some default date would quietly turn
+ * every never-seen client into a fortnight-long absentee.
  *
  * ── Why `>= days` and not `= days` ──────────────────────────────────────────
  *
@@ -919,7 +937,7 @@ async function anniversariesToday(orgId) {
  * message the next day, rather than losing it, and a client who stays away for
  * a year is messaged once rather than 350 times.
  *
- * ── Why the attendance rows are not org-filtered ────────────────────────────
+ * ── Why the attendance and workout rows are not org-filtered ────────────────
  *
  * `c` is already bound to the studio and `a.ref_id` is a pt_clients primary
  * key, so every row this joins belongs to a client this studio owns — the
@@ -931,17 +949,23 @@ async function anniversariesToday(orgId) {
 async function attendanceMissedFor(orgId, days) {
   const { rows } = await pool.query(
     `SELECT c.id, c.name,
-            to_char(MAX(a.date), 'YYYY-MM-DD') AS last_visit,
-            (CURRENT_DATE - MAX(a.date)) AS days_since
+            to_char(v.last_visit, 'YYYY-MM-DD') AS last_visit,
+            (CURRENT_DATE - v.last_visit) AS days_since
        FROM pt_clients c
-       JOIN attendance_logs a
-         ON a.ref_id = c.id AND a.ref_type = 'client'
+       CROSS JOIN LATERAL (
+         SELECT GREATEST(
+                  (SELECT MAX(a.date) FROM attendance_logs a
+                    WHERE a.ref_id = c.id AND a.ref_type = 'client'),
+                  (SELECT MAX(w.session_date) FROM workout_sessions w
+                    WHERE w.client_id = c.id AND w.status = 'completed')
+                ) AS last_visit
+       ) v
       WHERE c.organization_id = $1
         AND c.deleted_at IS NULL
         AND (c.pt_end_date IS NULL OR c.pt_end_date >= CURRENT_DATE)
         AND COALESCE(NULLIF(c.whatsapp, ''), c.mobile) IS NOT NULL
-      GROUP BY c.id, c.name
-     HAVING (CURRENT_DATE - MAX(a.date)) >= $2
+        AND v.last_visit IS NOT NULL
+        AND (CURRENT_DATE - v.last_visit) >= $2
       ORDER BY c.id`,
     [orgId, days]
   );
@@ -977,6 +1001,34 @@ async function followupsDue(orgId) {
   return rows;
 }
 
+/**
+ * Clients who still owe money, with the start of the current reminder period.
+ *
+ * `period_start` is the first day of the `interval`-day period today falls in,
+ * counted from a fixed Monday (2000-01-03) so a 7-day period is a calendar
+ * week. It goes into the dedupe key: one reminder per client per period while
+ * the balance is unpaid, however many times the sweep runs. Formatted in
+ * Postgres, like every date in this file — see the note above birthdaysToday.
+ *
+ * Every client with a balance, current or lapsed: money owed does not stop
+ * being owed when a membership ends.
+ */
+async function balancesDueFor(orgId, interval) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.name, c.balance_amount::TEXT AS balance,
+            to_char(CURRENT_DATE - ((CURRENT_DATE - DATE '2000-01-03') % $2::INT), 'YYYY-MM-DD')
+              AS period_start
+       FROM pt_clients c
+      WHERE c.organization_id = $1
+        AND c.deleted_at IS NULL
+        AND COALESCE(c.balance_amount, 0) > 0
+        AND COALESCE(NULLIF(c.whatsapp, ''), c.mobile) IS NOT NULL
+      ORDER BY c.id`,
+    [orgId, interval]
+  );
+  return rows;
+}
+
 module.exports = {
   settingsFor,
   upsertSettings,
@@ -1005,4 +1057,6 @@ module.exports = {
   anniversariesToday,
   attendanceMissedFor,
   followupsDue,
+  balancesDueFor,
+  STUDIO_DAY_START,
 };

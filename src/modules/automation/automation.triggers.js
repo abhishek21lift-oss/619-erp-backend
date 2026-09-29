@@ -287,6 +287,33 @@ async function followupDue(orgId, { leadId, followUpDate, interestedPackage }) {
   });
 }
 
+/**
+ * A client still owes money.
+ *
+ * Found by the sweep, like the date-driven events above, and keyed the same
+ * way: on a date the database owns, never the time the sweep ran. The anchor
+ * is the first day of the current reminder period (a week by default), so the
+ * sweep can run every morning and a client with an unpaid balance hears about
+ * it once a period — not once a day, and not once ever.
+ *
+ * The balance itself is deliberately NOT in the key. A partial payment would
+ * otherwise produce a second reminder the same week, straight after the
+ * client's own "payment received" message.
+ */
+async function paymentDue(orgId, { clientId, balance, periodStart, currency = '₹' }) {
+  return emit({
+    orgId,
+    event: 'payment_due',
+    subjectId: clientId,
+    eventKey: `${clientId}:${periodStart}`,
+    // "₹5,000", not "₹5000.00": the column is NUMERIC(12,2) and arrives as text.
+    context: {
+      amount: `${currency}${Number(balance).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`,
+      amount_value: balance,
+    },
+  });
+}
+
 module.exports = {
   // Request-driven: called from the handler that performs the business write.
   paymentReceived,
@@ -304,5 +331,6 @@ module.exports = {
   anniversary,
   attendanceMissed,
   followupDue,
+  paymentDue,
 };
 

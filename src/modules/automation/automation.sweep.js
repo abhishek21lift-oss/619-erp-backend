@@ -18,6 +18,7 @@
 //   anniversary           it is the anniversary of them joining
 //   attendance_missed     a client has not checked in for a fortnight
 //   followup_due          a lead's follow-up date has arrived
+//   payment_due           a client still owes money (weekly while unpaid)
 //
 // Nothing in an HTTP request will ever notice any of those. Without a sweep,
 // a studio can switch on a birthday rule, see it listed as active, and never
@@ -70,6 +71,12 @@ function reminderDays() {
     .map((n) => parseInt(String(n).trim(), 10))
     .filter((n) => Number.isInteger(n) && n > 0);
   return parsed.length > 0 ? parsed : [7, 3, 1];
+}
+
+/** How many days between reminders while a balance stays unpaid. */
+function balanceReminderDays() {
+  const n = parseInt(process.env.AUTOMATION_BALANCE_REMINDER_DAYS, 10);
+  return Number.isInteger(n) && n > 0 ? n : 7;
 }
 
 /** How long a client may be unseen before the studio says something. */
@@ -175,13 +182,24 @@ async function sweepOrg(orgId, activeEvents) {
     }
   }
 
+  if (want.has('payment_due')) {
+    const s = (stats.payment_due = EMPTY());
+    for (const row of await repo.balancesDueFor(orgId, balanceReminderDays())) {
+      tally(s, await triggers.paymentDue(orgId, {
+        clientId: row.id,
+        balance: row.balance,
+        periodStart: row.period_start,
+      }));
+    }
+  }
+
   return stats;
 }
 
-/** The six events this sweep can produce. Nothing else belongs here. */
+/** The events this sweep can produce. Nothing else belongs here. */
 const SWEEP_EVENTS = Object.freeze([
   'membership_expiring', 'membership_expired', 'birthday',
-  'anniversary', 'attendance_missed', 'followup_due',
+  'anniversary', 'attendance_missed', 'followup_due', 'payment_due',
 ]);
 
 /**
@@ -217,4 +235,4 @@ async function runSweep() {
   return summary;
 }
 
-module.exports = { runSweep, sweepOrg, SWEEP_EVENTS, reminderDays, absenceDays };
+module.exports = { runSweep, sweepOrg, SWEEP_EVENTS, reminderDays, absenceDays, balanceReminderDays };

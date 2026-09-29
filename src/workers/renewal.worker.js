@@ -44,8 +44,13 @@ async function runReminders() {
     `, [days]);
 
     for (const m of rows) {
+      // No 'whatsapp'. A studio's WhatsApp messages are sent by the automation
+      // engine only, from the rules the studio wrote (membership_expiring is
+      // one of them). This gym-era path would have been a second, rule-less
+      // sender to the same client — and its recipients carry no organization,
+      // so the channel refused them anyway.
       await notifier.send('membership_expiring', m, { days, plan: m.plan_name },
-        ['inapp', 'email', 'whatsapp']);
+        ['inapp', 'email']);
     }
     logger.info({ count: rows.length, days }, 'sent expiry reminders');
   }
@@ -157,7 +162,7 @@ async function runAutoRenew() {
 
       // 5. Notify member
       await notifier.send('payment_received', m,
-        { amount: m.price, plan: m.plan_name }, ['inapp', 'email', 'whatsapp']);
+        { amount: m.price, plan: m.plan_name }, ['inapp', 'email']);
 
       logger.info({ member: m.name }, 'auto-renew completed');
     } catch (err) {
@@ -189,7 +194,7 @@ async function runClassReminders() {
   `);
   for (const r of rows) {
     await notifier.send('class_reminder', r,
-      { class_name: r.class_name, time: r.time }, ['inapp', 'whatsapp', 'push']);
+      { class_name: r.class_name, time: r.time }, ['inapp', 'push']);
   }
 }
 
