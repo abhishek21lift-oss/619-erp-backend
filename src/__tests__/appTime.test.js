@@ -95,3 +95,32 @@ describe('todayShortDay', () => {
     expect(todayShortDay(new Date('2026-08-06T06:00:00Z'))).toMatch(/^[A-Z][a-z]{2}$/);
   });
 });
+
+describe('studioInstant', () => {
+  const { studioInstant } = require('../lib/appTime');
+
+  test('reads a wall-clock time in the studio zone, not the server zone', () => {
+    // The manual attendance form sends '07:00'. Read by the UTC server it
+    // became 12:30 PM IST; it is 01:30 UTC.
+    expect(studioInstant('2026-09-29', '07:00', 'Asia/Kolkata')).toBe('2026-09-29T01:30:00.000Z');
+  });
+
+  test('an early-morning studio time falls on the previous UTC day', () => {
+    expect(studioInstant('2026-09-29', '05:00', 'Asia/Kolkata')).toBe('2026-09-28T23:30:00.000Z');
+  });
+
+  test('seconds and a one-digit hour are accepted', () => {
+    expect(studioInstant('2026-09-29', '7:05:09', 'Asia/Kolkata')).toBe('2026-09-29T01:35:09.000Z');
+  });
+
+  test('follows the configured zone', () => {
+    expect(studioInstant('2026-09-29', '07:00', 'UTC')).toBe('2026-09-29T07:00:00.000Z');
+    expect(studioInstant('2026-07-01', '09:00', 'America/New_York')).toBe('2026-07-01T13:00:00.000Z');
+  });
+
+  test('anything unreadable is null, like a missing time', () => {
+    for (const [d, t] of [['2026-09-29', ''], ['2026-09-29', null], ['29/09/2026', '07:00'], ['2026-09-29', '24:00'], ['2026-09-29', '07:60']]) {
+      expect(studioInstant(d, t, 'Asia/Kolkata')).toBeNull();
+    }
+  });
+});

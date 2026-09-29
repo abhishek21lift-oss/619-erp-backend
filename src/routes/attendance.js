@@ -14,6 +14,7 @@ const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const { today: studioToday, studioInstant } = require('../lib/appTime');
 
 // ── AUD-004 (P1): this is the studio's back office ──────────────────────────
 //
@@ -145,8 +146,9 @@ router.post('/', auth, async (req, res, next) => {
       return res.status(404).json({ error: 'Not found' });
 
     const id = randomUUID();
-    const checkIn = d.check_in ? new Date(d.date + 'T' + d.check_in).toISOString() : null;
-    const checkOut = d.check_out ? new Date(d.date + 'T' + d.check_out).toISOString() : null;
+    // Read in the studio's zone, not the server's — see studioInstant.
+    const checkIn = studioInstant(d.date, d.check_in);
+    const checkOut = studioInstant(d.date, d.check_out);
     await pool.query(`
       INSERT INTO attendance_logs
         (id, ref_id, ref_type, ref_name, date, check_in_time, check_out_time,
@@ -188,8 +190,8 @@ router.get('/today-summary', auth, async (req, res, next) => {
         COUNT(*) FILTER (WHERE a.status='late')    AS late,
         COUNT(*)                                    AS total
       FROM attendance_logs a
-      WHERE a.date = CURRENT_DATE AND a.ref_type = 'client' ${orgFilter}`,
-      params
+      WHERE a.date = $2::date AND a.ref_type = 'client' ${orgFilter}`,
+      params.concat(studioToday())
     );
     res.json(rows[0]);
   } catch (err) {
@@ -283,8 +285,8 @@ router.post('/bulk', auth, async function(req, res, next) {
           continue;
         }
 
-        const bulkCheckIn = d.check_in ? new Date(d.date + 'T' + d.check_in).toISOString() : null;
-        const bulkCheckOut = d.check_out ? new Date(d.date + 'T' + d.check_out).toISOString() : null;
+        const bulkCheckIn = studioInstant(d.date, d.check_in);
+        const bulkCheckOut = studioInstant(d.date, d.check_out);
         await pool.query(`
           INSERT INTO attendance_logs
             (id, ref_id, ref_type, ref_name, date,
@@ -320,8 +322,8 @@ router.post('/bulk', auth, async function(req, res, next) {
 // Query params: from, to, granularity (day|week|month)
 router.get('/stats', auth, async function(req, res, next) {
   try {
-    const from = req.query.from || new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
-    const to = req.query.to || new Date().toISOString().split('T')[0];
+    const to = req.query.to || studioToday();
+    const from = req.query.from || studioToday(new Date(Date.now() - 30 * 86400000));
     const granularity = req.query.granularity || 'day';
 
     const granularityVal = ['day', 'week', 'month'].includes(granularity) ? granularity : 'day';

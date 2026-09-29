@@ -124,4 +124,41 @@ function dbDate(value) {
   return String(value).slice(0, 10);
 }
 
-module.exports = { DEFAULT_TIME_ZONE, appTimeZone, todayIn, today, todayShortDay, dbDate };
+/**
+ * A studio wall-clock time on a studio date, as the instant it names (ISO).
+ *
+ * `new Date('2026-09-29T07:00')` reads the time in the NODE PROCESS's zone,
+ * and the API runs in UTC — so a trainer who typed 7:00 AM on the manual
+ * attendance form stored 12:30 PM IST. This reads it in the studio's zone.
+ *
+ * Returns null for anything that is not 'YYYY-MM-DD' plus 'HH:MM[:SS]', so
+ * a caller can treat "no time" and "unreadable time" the same way it always
+ * treated a missing one.
+ */
+function studioInstant(ymd, hhmm, timeZone = appTimeZone()) {
+  const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ''));
+  const tm = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(String(hhmm || ''));
+  if (!dm || !tm) return null;
+  const [y, mo, d] = [Number(dm[1]), Number(dm[2]), Number(dm[3])];
+  const [h, mi, se] = [Number(tm[1]), Number(tm[2]), Number(tm[3] || 0)];
+  if (h > 23 || mi > 59 || se > 59) return null;
+
+  // The zone's offset at that moment, read back through Intl: format the
+  // naive UTC reading in the zone, and the difference is the offset.
+  const naive = Date.UTC(y, mo - 1, d, h, mi, se);
+  const offsetAt = (ms) => {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+      timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(ms)).map((p) => [p.type, p.value]));
+    const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second);
+    return asUtc - ms;
+  };
+  // Twice, so a zone with daylight saving settles on the offset in force at
+  // the result rather than at the naive guess. India has none; it costs nothing.
+  let instant = naive - offsetAt(naive);
+  instant = naive - offsetAt(instant);
+  return new Date(instant).toISOString();
+}
+
+module.exports = { DEFAULT_TIME_ZONE, appTimeZone, todayIn, today, todayShortDay, dbDate, studioInstant };
