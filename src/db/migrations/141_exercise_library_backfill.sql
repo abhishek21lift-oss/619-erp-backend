@@ -192,16 +192,19 @@ WHERE e.search_keywords IS NULL;
 -- ─── PRESCRIPTION DEFAULTS ───────────────────────────────────
 -- Rep ranges that match how the exercise is actually loaded, so a new
 -- programme starts from something defensible instead of a blank field.
+-- lower(): the category backfill above fires the legacy-sync trigger, which
+-- title-cases exercise_type ("stretching" -> "Stretching"). Comparing the raw
+-- column meant none of these branches ever matched (repaired by 221).
 UPDATE exercises SET
   recommended_sets = CASE
-    WHEN exercise_type IN ('stretching')                  THEN '1-2'
+    WHEN lower(exercise_type) IN ('stretching')           THEN '1-2'
     WHEN mechanic = 'compound'                            THEN '3-5'
     ELSE '3-4' END,
   recommended_reps = CASE
-    WHEN exercise_type = 'stretching'                     THEN '30-60s hold'
-    WHEN exercise_type = 'cardio'                         THEN '15-30 min'
-    WHEN exercise_type IN ('powerlifting','olympic weightlifting') THEN '3-5'
-    WHEN exercise_type = 'plyometrics'                    THEN '3-8'
+    WHEN lower(exercise_type) = 'stretching'              THEN '30-60s hold'
+    WHEN lower(exercise_type) = 'cardio'                  THEN '15-30 min'
+    WHEN lower(exercise_type) IN ('powerlifting','olympic weightlifting') THEN '3-5'
+    WHEN lower(exercise_type) = 'plyometrics'             THEN '3-8'
     WHEN mechanic = 'compound'                            THEN '6-10'
     ELSE '10-15' END
 WHERE recommended_reps IS NULL;

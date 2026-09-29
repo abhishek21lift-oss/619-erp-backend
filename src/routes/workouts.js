@@ -104,9 +104,17 @@ function exerciseParams(ex) {
   ];
 }
 
-/** Columns selected for a planned exercise, everywhere. One list, one source. */
+/**
+ * Columns selected for a planned exercise, everywhere. One list, one source.
+ *
+ * The prescription modes say what the exercise is measured in (load × reps,
+ * a hold, a carry, time/distance — migration 221), so the builder asks for the
+ * right numbers. Time and distance targets live in `config`
+ * (duration_seconds, distance, distance_unit), as migration 136 planned.
+ */
 const EXERCISE_SELECT = `
   we.id, we.exercise_id, e.name, e.muscle_group, e.video_url, e.gif_url,
+  e.exercise_type, e.prescription_mode_primary, e.prescription_mode_allowed,
   we.day_of_week, we.week_number, we.sort_order, we.sets, we.reps, we.rest_seconds, we.notes,
   we.target_weight, we.tempo, we.rpe, we.warmup_sets, we.superset_group, we.config`;
 
@@ -178,6 +186,7 @@ router.get('/plans', auth, async (req, res, next) => {
         COALESCE((SELECT json_agg(json_build_object(
           'id', we.id, 'exercise_id', we.exercise_id, 'name', e.name,
           'muscle_group', e.muscle_group, 'sets', we.sets, 'reps', we.reps,
+          'prescription_mode_primary', e.prescription_mode_primary,
           'rest_seconds', we.rest_seconds,
           'day_of_week', we.day_of_week, 'sort_order', we.sort_order, 'notes', we.notes,
           'target_weight', we.target_weight, 'tempo', we.tempo, 'rpe', we.rpe,
@@ -1184,7 +1193,8 @@ router.get('/assignments/:id', auth, requireTrainer, async (req, res, next) => {
 
     const { rows: exercises } = await pool.query(
       `SELECT we.id, we.exercise_id, e.name, e.muscle_group, we.sets, we.reps,
-              we.rest_seconds, we.day_of_week, we.sort_order, we.notes
+              we.rest_seconds, we.day_of_week, we.sort_order, we.notes,
+              we.target_weight, we.config, e.prescription_mode_primary
          FROM workout_exercises we
          LEFT JOIN exercises e ON e.id = we.exercise_id
         WHERE we.workout_plan_id = $1

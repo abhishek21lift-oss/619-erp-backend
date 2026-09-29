@@ -71,7 +71,12 @@ function normaliseWorkout(body = {}) {
       weight_kg: boundedNumber(s?.weight_kg, 0, 1000, 'Weight'),
       reps: boundedNumber(s?.reps, 0, 1000, 'Reps', { integer: true }),
       duration_seconds: boundedNumber(s?.duration_seconds, 0, 6 * 3600, 'Duration', { integer: true }),
-    })).filter((s) => (s.reps !== null && s.reps > 0) || (s.duration_seconds !== null && s.duration_seconds > 0));
+      // Carries, sled work and cardio are logged in metres; stored with its
+      // unit because workout_sets refuses a distance without one.
+      distance_m: boundedNumber(s?.distance_m, 0, 100000, 'Distance'),
+    })).filter((s) => (s.reps !== null && s.reps > 0)
+      || (s.duration_seconds !== null && s.duration_seconds > 0)
+      || (s.distance_m !== null && s.distance_m > 0));
     return { name, sets };
   }).filter((x) => x.sets.length > 0);
 
@@ -278,10 +283,11 @@ async function logMyWorkout(clientId, orgId, userId, body) {
         await tx.query(
           `INSERT INTO workout_sets (
              session_exercise_id, set_number, weight_kg, reps, duration_seconds, completed,
-             is_pr_weight, is_pr_reps, is_pr_volume
-           ) VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7, $8)`,
+             is_pr_weight, is_pr_reps, is_pr_volume, distance, distance_unit
+           ) VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7, $8, $9, $10)`,
           [ex[0].id, j + 1, s.weight_kg, s.reps, s.duration_seconds,
-            flags.is_pr_weight, flags.is_pr_reps, flags.is_pr_volume],
+            flags.is_pr_weight, flags.is_pr_reps, flags.is_pr_volume,
+            s.distance_m ?? null, s.distance_m != null ? 'm' : null],
         );
       }
     }

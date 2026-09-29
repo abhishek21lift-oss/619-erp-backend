@@ -115,12 +115,15 @@ describe('normaliseWorkout', () => {
       exercises: [
         { name: ' Row ', sets: [{ weight_kg: 40, reps: 10 }, { reps: 0 }, {}] },
         { name: 'Plank', sets: [{ duration_seconds: 60 }] },
+        { name: "Farmer's Walk", sets: [{ weight_kg: 32, distance_m: 40 }, { weight_kg: 32 }] },
         { name: 'Skipped', sets: [] },
       ],
     });
     expect(w.exercises).toEqual([
-      { name: 'Row', sets: [{ weight_kg: 40, reps: 10, duration_seconds: null }] },
-      { name: 'Plank', sets: [{ weight_kg: null, reps: null, duration_seconds: 60 }] },
+      { name: 'Row', sets: [{ weight_kg: 40, reps: 10, duration_seconds: null, distance_m: null }] },
+      { name: 'Plank', sets: [{ weight_kg: null, reps: null, duration_seconds: 60, distance_m: null }] },
+      // A carry is a real set on distance alone; load with nothing done is not.
+      { name: "Farmer's Walk", sets: [{ weight_kg: 32, reps: null, duration_seconds: null, distance_m: 40 }] },
     ]);
   });
 
@@ -130,6 +133,7 @@ describe('normaliseWorkout', () => {
     [{ ...base, exercises: [{ name: '', sets: [{ reps: 1 }] }] }],
     [{ ...base, exercises: [{ name: 'Row', sets: [{ reps: 2.5 }] }] }],
     [{ ...base, exercises: [{ name: 'Row', sets: [{ weight_kg: 5000, reps: 1 }] }] }],
+    [{ ...base, exercises: [{ name: 'Walk', sets: [{ distance_m: -5 }] }] }],
     [{ ...base, exercises: Array.from({ length: 31 }, () => base.exercises[0]) }],
     [{ ...base, duration_minutes: 0 }],
   ])('rejects %#', (body) => {

@@ -29,6 +29,9 @@ const { randomUUID } = require('crypto');
 const pool = require('../src/db/pool');
 
 const BACKFILL_SQL = path.join(__dirname, '..', 'src', 'db', 'migrations', '141_exercise_library_backfill.sql');
+// Tracking modes (load × reps, hold, carry, time …). Idempotent and only fills
+// rows whose mode is still NULL, so it classifies exactly what was just imported.
+const TRACKING_SQL = path.join(__dirname, '..', 'src', 'db', 'migrations', '221_exercise_tracking_modes.sql');
 
 const BODY_PART_MAP = {
   abdominals: 'Core',      obliques: 'Core',
@@ -194,6 +197,7 @@ async function run() {
     console.log('\nNormalizing…');
     const backfill = fs.readFileSync(BACKFILL_SQL, 'utf8');
     await client.query(backfill);
+    await client.query(fs.readFileSync(TRACKING_SQL, 'utf8'));
 
     if (dryRun) {
       await client.query('ROLLBACK');

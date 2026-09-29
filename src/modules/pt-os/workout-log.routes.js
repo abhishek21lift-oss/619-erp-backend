@@ -209,7 +209,7 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
       // Every week's rows for this weekday, not just week 1: resolveWeek needs
       // the overrides as well as the base to decide which wins.
       const { rows: allWeeks } = await pool.query(
-        `SELECT we.exercise_id, e.name, we.week_number, we.sets, we.reps, we.rest_seconds,
+        `SELECT we.exercise_id, e.name, e.prescription_mode_primary, we.week_number, we.sets, we.reps, we.rest_seconds,
                 we.sort_order, we.notes, we.target_weight, we.tempo, we.rpe,
                 we.warmup_sets, we.superset_group, we.config
            FROM workout_exercises we
