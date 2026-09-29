@@ -12,8 +12,9 @@ const { makeStore } = require('../lib/rateLimitStore');
 // what v12's `{ window: 1 }` meant.
 const { generateSecret, verifySync } = require('otplib');
 const pool = require('../db/pool');
-const { detectFileType, PROFILE_IMAGES } = require('../lib/fileSignatures');
-const { auth, invalidateUserCache } = require('../middleware/auth');
+const { detectFileType, PROFILE_IMAGES, LOGO_IMAGES } = require('../lib/fileSignatures');
+const { auth, requireTrainer, invalidateUserCache } = require('../middleware/auth');
+const studioBranding = require('../lib/studioBranding');
 const { logActivity } = require('../lib/activityLog');
 const recovery = require('../lib/mfaRecoveryCodes');
 const logger = require('../lib/logger');
@@ -23,12 +24,25 @@ const profileFields = require('../lib/profileFields');
 const { profileCompletion } = require('../lib/profileCompletion');
 const portfolio = require('../lib/portfolio');
 
+// 5 MB, matching the app's AVATAR_RULES. It was 2 MB, so a photo straight off
+// a phone camera passed the browser's check and was refused here.
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024 },
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter(_req, file, cb) {
     if (!/^image\/(png|jpe?g|webp|gif)$/i.test(file.mimetype || '')) {
       return cb(new Error('Only PNG, JPG, WEBP, or GIF images are allowed'));
+    }
+    cb(null, true);
+  },
+});
+
+const logoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter(_req, file, cb) {
+    if (!/^image\/(png|jpe?g|webp)$/i.test(file.mimetype || '')) {
+      return cb(new Error('Only PNG, JPG or WEBP images are allowed'));
     }
     cb(null, true);
   },
@@ -390,8 +404,50 @@ router.post('/avatar', upload.single('avatar'), async (req, res, next) => {
     const saved = await swapProfileImage(req, { column: 'avatar_url', buffer: req.file.buffer });
     if (saved.error) return res.status(saved.status).json({ error: saved.error });
 
+    // The session row carries the photo (the top bar and sidebar show it).
+    invalidateUserCache(req.user.id);
     await logActivity(req, 'profile.avatar.update', 'user', req.user.id);
     res.json({ avatarUrl: saved.value });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Studio logo ──────────────────────────────────────────────────────────────
+// The trainer owns the studio (see middleware/rbac.js), so the trainer sets
+// its logo: the mark at the top of the sidebar and on the member app. Stored
+// under org-logos/, the public tier in routes/uploads.js, exactly as the
+// platform console's upload does.
+router.post('/studio-logo', requireTrainer, logoUpload.single('logo'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Logo file is required' });
+    const detected = detectFileType(req.file.buffer, LOGO_IMAGES);
+    if (!detected) {
+      return res.status(400).json({ error: 'File content does not match an allowed image type (PNG, JPG, WEBP)' });
+    }
+    const orgId = req.user.organization_id;
+    const url = await saveFile('org-logos', `${orgId}-${Date.now()}.${detected.ext}`, req.file.buffer, detected.mime,
+      { organizationId: orgId, uploadedBy: req.user.id });
+    const set = await studioBranding.setLogo(pool, orgId, url);
+    const oldKey = studioBranding.ownedKey(set?.previous);
+    if (oldKey && set.previous !== url) forgetObject(set.previous, 'logo_url');
+    // Every account in the studio carries the logo on its session row.
+    invalidateUserCache();
+    await logActivity(req, 'profile.studio_logo.update', 'organization', orgId);
+    res.json({ logoUrl: url });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete('/studio-logo', requireTrainer, async (req, res, next) => {
+  try {
+    const orgId = req.user.organization_id;
+    const cleared = await studioBranding.clearLogo(pool, orgId);
+    if (studioBranding.ownedKey(cleared?.previous)) forgetObject(cleared.previous, 'logo_url');
+    invalidateUserCache();
+    await logActivity(req, 'profile.studio_logo.remove', 'organization', orgId);
+    res.json({ logoUrl: null });
   } catch (err) {
     next(err);
   }

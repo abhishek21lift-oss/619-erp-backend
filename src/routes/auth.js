@@ -141,9 +141,11 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
                 -- in the sidebar, on the dashboard, on every profile and team
                 -- screen — six places that would otherwise each need their own
                 -- request for two columns that change roughly once, ever.
-                o.is_founder, o.founder_number
+                o.is_founder, o.founder_number,
+                up.avatar_url
            FROM users u
            LEFT JOIN organizations o ON o.id = u.organization_id
+           LEFT JOIN user_profiles up ON up.user_id = u.id
           WHERE LOWER(u.email) = LOWER($1) AND u.is_active = true
             AND u.deleted_at IS NULL`,
         [email]
@@ -427,6 +429,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
         organization_logo_url: user.organization_logo_url,
         is_founder:            Boolean(user.is_founder),
         founder_number:        user.founder_number ?? null,
+        avatar_url:            user.avatar_url ?? null,
         mfaSetupRequired,
       },
       ...(bodyTokensAllowed(req) ? { token, refresh_token: refreshToken } : {}),
