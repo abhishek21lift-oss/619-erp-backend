@@ -243,16 +243,16 @@ const clearanceUpdateSchema = {
   body: clearanceCreateSchema.body.partial(),
 };
 
-// All 7 keys from the migration's pt_consent_records.consent_checkboxes comment.
-const CONSENT_KEYS = [
-  'info_true', 'understands_risk', 'will_inform_changes', 'understands_incorrect_info_risk',
-  'voluntary_participation', 'consents_emergency_care', 'agrees_data_storage',
-];
+// What the PAR-Q signature attests: that these answers are true. Risk,
+// voluntary participation, emergency care and data use are the Informed
+// Consent's to collect, and were being signed for twice (the other six keys
+// may still appear on older records, and still print on their PDFs).
+const CONSENT_KEYS = ['info_true'];
 
 const consentCreateSchema = {
   body: z.object({
     consent_checkboxes: z.record(z.string(), z.boolean()),
-    client_signature: z.string().min(1).optional().nullable(),
+    client_signature: z.string().min(1),
     trainer_signature: z.string().min(1).optional().nullable(),
     location: z.string().max(500).optional().nullable(),
   }),
@@ -645,7 +645,7 @@ router.post('/parq/forms/:formId/consent', auth, requireTrainer, validate(consen
   const checkboxes = b.consent_checkboxes || {};
   const allAgreed = CONSENT_KEYS.every((k) => checkboxes[k] === true);
   if (!allAgreed) {
-    return res.status(400).json({ error: 'All consent items must be agreed to' });
+    return res.status(400).json({ error: { code: 'CONSENT_REQUIRED', message: 'The client must confirm their answers are true' } });
   }
 
   const ua = String(req.headers['user-agent'] || '');

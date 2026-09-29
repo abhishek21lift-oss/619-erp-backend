@@ -68,7 +68,10 @@ async function generateConsentPdf(formData) {
 
   drawSectionHeading(doc, 'Consent Statements');
   const checkboxes = consent.consent_checkboxes || {};
+  // Only the statements this record was asked to agree to — a PAR-Q signed
+  // after the consent slimmed down carries one, older ones carry seven.
   for (const [key, label] of Object.entries(CONSENT_LABELS)) {
+    if (!(key in checkboxes)) continue;
     const checked = checkboxes[key] === true;
     doc.fontSize(10).fillColor(checked ? '#059669' : '#DC2626').font('Helvetica-Bold')
       .text(checked ? '[x] ' : '[ ] ', { continued: true });
@@ -79,7 +82,9 @@ async function generateConsentPdf(formData) {
   if (doc.y > doc.page.height - 220) doc.addPage();
   drawSectionHeading(doc, 'Signatures');
   embedSignature(doc, `Client Signature (signed ${fmtDate(consent.client_signed_at)}):`, consent.client_signature);
-  embedSignature(doc, `Trainer Signature (signed ${fmtDate(consent.trainer_signed_at)}):`, consent.trainer_signature);
+  if (consent.trainer_signature) {
+    embedSignature(doc, `Trainer Signature (signed ${fmtDate(consent.trainer_signed_at)}):`, consent.trainer_signature);
+  }
 
   drawSectionHeading(doc, 'Record Metadata');
   doc.fontSize(8).fillColor('#6B7280').font('Helvetica');

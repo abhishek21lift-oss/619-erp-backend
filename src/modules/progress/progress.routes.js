@@ -13,6 +13,8 @@ const nutritionScoring = require('./nutrition-scoring');
 const mobilityScoring = require('./mobility-scoring');
 const postureScoring = require('./posture-scoring');
 const strengthLogs = require('./strength-logs.repo');
+const assessmentsRepo = require('./assessments.repo');
+const { today: studioToday } = require('../../lib/appTime');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -27,30 +29,51 @@ function num(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-const numOpt = () => z.coerce.number().optional().nullable();
+
+// A number with a plausible range. Nothing on these forms was range-checked
+// on either side: a stress level of 55 on a 1-10 scale, -3 hours of sleep and
+// a 150% body-fat target were all stored, and the scores built on them.
+const numIn = (min, max) => z.coerce.number().min(min).max(max).optional().nullable();
+const intIn = (min, max) => z.coerce.number().int().min(min).max(max).optional().nullable();
+
+// Free text: bounded here, and the same bound is the field's maxLength on the
+// page, so a long note is stopped as it is typed rather than at the last Save.
+const text = (max) => z.string().max(max).optional().nullable();
+const textList = (item = 200, count = 40) => z.array(z.string().max(item)).max(count).optional().nullable();
+const coachNotesSchema = z.record(z.string().max(60), z.string().max(2000)).optional().nullable();
+
+// An assessment is of something that has happened. The screening gate and
+// every "latest" read order by this date, so a future-dated one would sit on
+// top of today's. One day of slack for a device clock ahead of the server's.
+const pastDate = () => z.string().optional().nullable().refine(
+  (v) => !v || (!Number.isNaN(Date.parse(v)) && Date.parse(v) <= Date.now() + 86400000),
+  { message: 'Date must be a valid date, not in the future' }
+);
 
 const assessmentCreateSchema = {
   body: z.object({
     client_id: z.string(),
     trainer_id: z.string().optional().nullable(),
-    assessment_date: z.string().optional().nullable(),
+    assessment_date: pastDate(),
     assessment_type: z.enum(['initial', 'week_4', 'week_8', 'week_12', 'monthly', 'quarterly', 'follow_up', 'custom']).optional(),
-    assessment_notes: z.string().max(2000).optional().nullable(),
-    age: numOpt(), gender: z.enum(['Male', 'Female', 'Other']).optional().nullable(),
+    assessment_notes: text(2000),
+    age: intIn(5, 110), gender: z.enum(['Male', 'Female', 'Other']).optional().nullable(),
 
     // Step 1 — Blood Pressure
-    bp_systolic: numOpt(), bp_diastolic: numOpt(), resting_heart_rate: numOpt(), resting_spo2: numOpt(),
+    // Outside these a reading is a typo, not a patient: 900/60 used to be
+    // stored with no category, which also switched the safety stop off.
+    bp_systolic: numIn(60, 260), bp_diastolic: numIn(30, 160), resting_heart_rate: numIn(25, 220), resting_spo2: numIn(50, 100),
 
     // Step 2 — Anthropometric
-    weight: numOpt(), height_cm: numOpt(), waist_cm: numOpt(), waist_iliac_cm: numOpt(), hips_cm: numOpt(), neck_cm: numOpt(), chest_cm: numOpt(),
-    arm_right_cm: numOpt(), arm_left_cm: numOpt(), thigh_right_cm: numOpt(), thigh_left_cm: numOpt(),
-    calf_right_cm: numOpt(), calf_left_cm: numOpt(),
+    weight: numIn(20, 350), height_cm: numIn(80, 250), waist_cm: numIn(30, 250), waist_iliac_cm: numIn(30, 250), hips_cm: numIn(30, 250), neck_cm: numIn(15, 80), chest_cm: numIn(40, 250),
+    arm_right_cm: numIn(10, 100), arm_left_cm: numIn(10, 100), thigh_right_cm: numIn(20, 150), thigh_left_cm: numIn(20, 150),
+    calf_right_cm: numIn(15, 100), calf_left_cm: numIn(15, 100),
 
     // Step 3 — Body Composition
     body_comp_method: z.enum(['BIA Machine', 'Skinfold', 'DEXA', 'Manual', 'Other']).optional().nullable(),
-    body_fat_pct: numOpt(), muscle_mass_pct: numOpt(), visceral_fat: numOpt(), subcutaneous_fat_pct: numOpt(),
-    body_water_pct: numOpt(), bone_mass_kg: numOpt(), bmr: numOpt(), bmr_auto_suggested: z.boolean().optional(),
-    metabolic_age: numOpt(),
+    body_fat_pct: numIn(2, 75), muscle_mass_pct: numIn(5, 80), visceral_fat: numIn(1, 60), subcutaneous_fat_pct: numIn(1, 70),
+    body_water_pct: numIn(20, 80), bone_mass_kg: numIn(0.5, 10), bmr: numIn(500, 5000), bmr_auto_suggested: z.boolean().optional(),
+    metabolic_age: intIn(10, 110),
 
     // Step 4 — Cardiorespiratory Endurance
     cardio_test_type: z.enum(['YMCA 3-Minute Step Test', 'Rockport 1-Mile Walk', 'Cooper 12-Minute Run', 'Bruce Protocol', 'Harvard Step Test', 'Custom']).optional().nullable(),
@@ -72,10 +95,17 @@ const assessmentCreateSchema = {
     // pattern; flexibility_test_data now holds {test1, test2})
     flexibility_test_data: z.record(z.string(), z.unknown()).optional().nullable(),
 
-    posture_notes: z.string().max(2000).optional().nullable(),
-    health_notes: z.string().max(2000).optional().nullable(),
-    trainer_notes: z.string().max(2000).optional().nullable(),
+    posture_notes: text(2000),
+    health_notes: text(2000),
+    trainer_notes: text(2000),
+    // An acknowledged skip of the blood-pressure reading (see BP_REQUIRED).
+    bp_not_measured: z.boolean().optional(),
   }),
+};
+
+// Edit: the same rules, every field optional, the client not movable.
+const assessmentUpdateSchema = {
+  body: assessmentCreateSchema.body.omit({ client_id: true }).partial(),
 };
 
 router.get('/assessments', auth, wrap(async (req, res) => {
@@ -100,32 +130,43 @@ router.get('/assessments', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchema), wrap(async (req, res) => {
-  const b = req.body;
-  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-  // Fitness testing includes maximal efforts — a 1RM, a step test, endurance
-  // to failure — so the same medical stop that guards assigning a workout
-  // guards recording one of these. Missing paperwork is only a warning here
-  // too, returned as screening_warnings.
-  const { blocked, warnings: screeningWarnings } = await checkScreeningGate(req, b.client_id);
-  if (blocked) return res.status(blocked.status).json(blocked.body);
-  // The assessor is the studio's trainer profile, from the session. A
-  // trainer_id in the body is ignored: it is a foreign key, and taking it
-  // from the request would let a row point at another studio's trainer.
-  const trainer_id = req.user.trainer_id || null;
+// Numeric columns come back from pg as strings; the scoring wants numbers.
+const ASSESSMENT_NUMERIC = [
+  'bp_systolic', 'bp_diastolic', 'resting_heart_rate', 'resting_spo2',
+  'weight', 'height_cm', 'waist_cm', 'waist_iliac_cm', 'hips_cm', 'neck_cm', 'chest_cm',
+  'arm_right_cm', 'arm_left_cm', 'thigh_right_cm', 'thigh_left_cm', 'calf_right_cm', 'calf_left_cm',
+  'body_fat_pct', 'muscle_mass_pct', 'visceral_fat', 'subcutaneous_fat_pct', 'body_water_pct',
+  'bone_mass_kg', 'bmr', 'metabolic_age',
+];
+const ASSESSMENT_INPUTS = [
+  ...ASSESSMENT_NUMERIC, 'assessment_type', 'assessment_date', 'body_comp_method',
+  'cardio_test_type', 'cardio_test_data', 'strength_exercise', 'strength_exercise_2', 'strength_test_data',
+  'endurance_test_type', 'endurance_test_type_2', 'endurance_test_data', 'flexibility_test_data',
+  'posture_notes', 'health_notes', 'trainer_notes',
+];
 
+/** A stored test, read back as the request body that would have produced it. */
+function assessmentAsBody(row) {
+  const out = {};
+  for (const k of ASSESSMENT_INPUTS) {
+    const v = row[k];
+    out[k] = ASSESSMENT_NUMERIC.includes(k) && v != null ? Number(v) : v;
+  }
+  if (row.assessment_date) out.assessment_date = String(row.assessment_date instanceof Date ? row.assessment_date.toISOString() : row.assessment_date).slice(0, 10);
+  // A BMR the server suggested is re-derived from the new weight, not frozen.
+  if (row.bmr_auto_suggested) out.bmr = null;
+  return out;
+}
+
+async function demographics(req, clientId, b) {
   // Age/gender: prefer what the frontend sent (it already has the client
   // record loaded); fall back to a DB lookup so BMR/VO2max/norms still work
   // if the caller omits them.
   let age = b.age ?? null;
   let gender = b.gender ?? null;
   if (age == null || gender == null) {
-    // Tenant scope: never read another studio's client demographics.
     const dScope = tenantScope(req);
-    const cParams = [b.client_id];
-    let cOrg = '';
-    cParams.push(dScope.orgId); cOrg = ' AND organization_id = $2';
-    const { rows: cRows } = await pool.query(`SELECT dob, gender FROM pt_clients WHERE id = $1${cOrg}`, cParams);
+    const { rows: cRows } = await pool.query('SELECT dob, gender FROM pt_clients WHERE id = $1 AND organization_id = $2', [clientId, dScope.orgId]);
     const c = cRows[0];
     if (c) {
       if (age == null && c.dob) {
@@ -136,21 +177,34 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
       if (gender == null) gender = c.gender;
     }
   }
+  return { age, gender };
+}
 
+/**
+ * Every derived column of a fitness test, from its inputs. Shared by create
+ * and edit so the two can never score the same numbers differently.
+ * Returns `{ error }` when the safety rules refuse the test.
+ */
+function computeAssessment(b, age, gender) {
   // ── Step 1: Blood Pressure ──
   const bp = scoring.classifyBp(b.bp_systolic ?? null, b.bp_diastolic ?? null);
+  const exertion = [b.cardio_test_type, b.strength_exercise, b.strength_exercise_2, b.endurance_test_type, b.endurance_test_type_2]
+    .some((v) => v != null && v !== '');
   // An unsafe resting reading (stage-2 hypertension or hypotension) stops
   // the exertion tests: a step test, a 1RM or an endurance set to failure
   // on top of it is the risk the reading exists to catch. The reading itself,
-  // the measurements and flexibility are still recorded. The wizard skips
-  // these steps on its own; this is the rule, for any caller.
-  const exertion = [b.cardio_test_type, b.strength_exercise, b.strength_exercise_2, b.endurance_test_type, b.endurance_test_type_2]
-    .some((v) => v != null && v !== '');
+  // the measurements and flexibility are still recorded.
   if (bp.isUnsafe && exertion) {
-    return res.status(400).json({ error: {
-      code: 'BP_UNSAFE',
-      message: `Resting blood pressure is ${bp.category} — exertion tests (cardio, strength, endurance) cannot be recorded. Refer for medical clearance.`,
-    } });
+    return { error: { status: 400, code: 'BP_UNSAFE',
+      message: `Resting blood pressure is ${bp.category} — exertion tests (cardio, strength, endurance) cannot be recorded. Refer for medical clearance.` } };
+  }
+  // No reading at all used to pass the same check: a 1RM and a step test
+  // were recorded with blood pressure never taken. The trainer may still
+  // skip it, but must say so.
+  const hasBp = b.bp_systolic != null || b.bp_diastolic != null;
+  if (exertion && !hasBp && !b.bp_not_measured) {
+    return { error: { status: 400, code: 'BP_REQUIRED',
+      message: 'Take a resting blood pressure before recording cardio, strength or endurance tests — or confirm it was not measured.' } };
   }
 
   // ── Step 2: Anthropometric ──
@@ -168,7 +222,7 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
   }
 
   // ── Step 4: Cardio ── (formula depends on the selected test)
-  const cd = b.cardio_test_data || {};
+  const cd = { ...(b.cardio_test_data || {}) };
   let vo2Max = null;
   let cardioCategory = null;
   if (b.cardio_test_type === 'Rockport 1-Mile Walk') {
@@ -187,44 +241,35 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
   if (vo2Max != null && !cardioCategory) cardioCategory = scoring.classifyVo2Max(vo2Max, age, gender);
   const cardioScore = scoring.scoreCategory(cardioCategory);
 
-  // ── Step 5: Strength (two-test battery, same shape as Endurance below —
-  //    any exercise may be tested, but only 2 are required to complete the
-  //    step; the combined score is the average of both, same averaging
-  //    scoreEnduranceBattery already does for Endurance) ──
+  // ── Step 5: Strength (two-test battery; the combined score averages both) ──
   const sd = b.strength_test_data || {};
-  const st1 = sd.test1 || {};
-  const st2 = sd.test2 || {};
-  const strengthFormula1 = st1.formula === 'brzycki' ? 'brzycki' : 'epley';
-  const strengthFormula2 = st2.formula === 'brzycki' ? 'brzycki' : 'epley';
-  const strengthOneRm1 = st1.isDirect
-    ? num(st1.direct1RM, null)
-    : scoring.calc1RM(num(st1.weightKg, null), num(st1.reps, null), strengthFormula1);
-  const strengthOneRm2 = st2.isDirect
-    ? num(st2.direct1RM, null)
-    : scoring.calc1RM(num(st2.weightKg, null), num(st2.reps, null), strengthFormula2);
+  const lifts = [];
+  const oneRmFor = (t, exercise) => {
+    const formula = t.formula === 'brzycki' ? 'brzycki' : 'epley';
+    const oneRm = t.isDirect ? num(t.direct1RM, null) : scoring.calc1RM(num(t.weightKg, null), num(t.reps, null), formula);
+    if (oneRm != null && exercise) {
+      lifts.push({
+        exerciseName: exercise, oneRm, formula, direct: Boolean(t.isDirect),
+        weightKg: t.isDirect ? oneRm : num(t.weightKg), reps: t.isDirect ? 1 : num(t.reps),
+      });
+    }
+    return oneRm;
+  };
+  const strengthOneRm1 = oneRmFor(sd.test1 || {}, b.strength_exercise);
+  const strengthOneRm2 = oneRmFor(sd.test2 || {}, b.strength_exercise_2);
   const strengthCategory = scoring.classifyStrength(strengthOneRm1, b.weight ?? null, b.strength_exercise || null, gender);
   const strengthCategory2 = scoring.classifyStrength(strengthOneRm2, b.weight ?? null, b.strength_exercise_2 || null, gender);
-  const strengthScore = scoring.scoreEnduranceBattery(
-    scoring.scoreCategory(strengthCategory),
-    scoring.scoreCategory(strengthCategory2),
-  );
+  const strengthScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(strengthCategory), scoring.scoreCategory(strengthCategory2));
 
   // ── Step 6: Endurance (two tests, combined into one averaged score) ──
   const ed = b.endurance_test_data || {};
   const t1 = ed.test1 || {};
   const t2 = ed.test2 || {};
-  const enduranceValue1 = num(t1.reps, null) ?? num(t1.durationSec, null);
-  const enduranceValue2 = num(t2.reps, null) ?? num(t2.durationSec, null);
-  const enduranceCategory = scoring.classifyEndurance(b.endurance_test_type, enduranceValue1, gender);
-  const enduranceCategory2 = scoring.classifyEndurance(b.endurance_test_type_2, enduranceValue2, gender);
-  const enduranceScore = scoring.scoreEnduranceBattery(
-    scoring.scoreCategory(enduranceCategory),
-    scoring.scoreCategory(enduranceCategory2),
-  );
+  const enduranceCategory = scoring.classifyEndurance(b.endurance_test_type, num(t1.reps, null) ?? num(t1.durationSec, null), gender);
+  const enduranceCategory2 = scoring.classifyEndurance(b.endurance_test_type_2, num(t2.reps, null) ?? num(t2.durationSec, null), gender);
+  const enduranceScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(enduranceCategory), scoring.scoreCategory(enduranceCategory2));
 
-  // ── Step 7: Flexibility (two-test battery — flexibility_test_data holds
-  //    {test1, test2} going forward; asymmetry flags if EITHER test shows
-  //    it, and the mobility score averages both tests' categories) ──
+  // ── Step 7: Flexibility (two-test battery) ──
   const fd = b.flexibility_test_data || {};
   const ft1 = fd.test1 || {};
   const ft2 = fd.test2 || {};
@@ -232,68 +277,102 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
     || scoring.checkAsymmetry(num(ft2.left, null), num(ft2.right, null));
   const flexibilityCategory = scoring.classifyFlexibilityScore(num(ft1.score, null));
   const flexibilityCategory2 = scoring.classifyFlexibilityScore(num(ft2.score, null));
-  const mobilityScore = scoring.scoreEnduranceBattery(
-    scoring.scoreCategory(flexibilityCategory),
-    scoring.scoreCategory(flexibilityCategory2),
-  );
+  const mobilityScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(flexibilityCategory), scoring.scoreCategory(flexibilityCategory2));
 
   // ── Dashboard scores ──
   const bodyCompositionScore = scoring.scoreBodyComposition(b.body_fat_pct ?? null, gender);
   const healthRiskScore = scoring.scoreHealthRisk(bp.category, bmi);
   const overallScore = scoring.computeOverallScore({
     bodyComposition: bodyCompositionScore, endurance: enduranceScore,
-    mobility: mobilityScore, cardio: cardioScore, healthRisk: healthRiskScore,
-    strength: strengthScore,
+    mobility: mobilityScore, cardio: cardioScore, healthRisk: healthRiskScore, strength: strengthScore,
   });
 
-  const { rows } = await pool.query(
-    `INSERT INTO pt_assessments (
-       client_id, trainer_id, assessment_type, assessment_number, assessment_date,
-       trainer_notes,
-       bp_systolic, bp_diastolic, resting_heart_rate, resting_spo2, bp_category,
-       weight, height_cm, bmi, waist_cm, waist_iliac_cm, hips_cm, waist_hip_ratio, neck_cm, chest_cm,
-       arm_right_cm, arm_left_cm, thigh_right_cm, thigh_left_cm, calf_right_cm, calf_left_cm,
-       body_comp_method, body_fat_pct, muscle_mass_pct, lean_body_mass_kg, fat_mass_kg,
-       visceral_fat, subcutaneous_fat_pct, body_water_pct, bone_mass_kg, bmr, bmr_auto_suggested, metabolic_age,
-       cardio_test_type, cardio_test_data, vo2_max, cardio_category, cardio_score_computed,
-       strength_exercise, strength_exercise_2, strength_category, strength_category_2, strength_test_data, strength_score_computed,
-       endurance_test_type, endurance_test_type_2, endurance_test_data, endurance_category, endurance_category_2, endurance_score_computed,
-       flexibility_test_data, flexibility_category, flexibility_category_2, has_asymmetry, mobility_score_computed,
-       body_composition_score, health_risk_score, overall_fitness_score,
-       posture_notes, health_notes, created_by, organization_id
-     ) VALUES (
-       $1,$2,$3,(SELECT COUNT(*)+1 FROM pt_assessments WHERE client_id = $1),COALESCE($4, NOW()),
-       $5,
-       $6,$7,$8,$9,$10,
-       $11,$12,$13,$14,$15,$16,$17,$18,$19,
-       $20,$21,$22,$23,$24,$25,
-       $26,$27,$28,$29,$30,
-       $31,$32,$33,$34,$35,$36,$37,
-       $38,$39::jsonb,$40,$41,$42,
-       $43,$44,$45,$46,$47::jsonb,$48,
-       $49,$50,$51::jsonb,$52,$53,$54,
-       $55::jsonb,$56,$57,$58,$59,
-       $60,$61,$62,
-       $63,$64,$65,$66
-     ) RETURNING *`,
-    [
-      b.client_id, trainer_id, b.assessment_type || 'initial', b.assessment_date || null,
-      b.trainer_notes || b.assessment_notes || null,
-      b.bp_systolic ?? null, b.bp_diastolic ?? null, b.resting_heart_rate ?? null, b.resting_spo2 ?? null, bp.category,
-      b.weight ?? null, b.height_cm ?? null, bmi, b.waist_cm ?? null, b.waist_iliac_cm ?? null, b.hips_cm ?? null, waistHipRatio, b.neck_cm ?? null, b.chest_cm ?? null,
-      b.arm_right_cm ?? null, b.arm_left_cm ?? null, b.thigh_right_cm ?? null, b.thigh_left_cm ?? null, b.calf_right_cm ?? null, b.calf_left_cm ?? null,
-      b.body_comp_method || null, b.body_fat_pct ?? null, b.muscle_mass_pct ?? null, leanBodyMass, fatMass,
-      b.visceral_fat ?? null, b.subcutaneous_fat_pct ?? null, b.body_water_pct ?? null, b.bone_mass_kg ?? null, bmr, bmrAutoSuggested, b.metabolic_age ?? null,
-      b.cardio_test_type || null, JSON.stringify(cd), vo2Max, cardioCategory, cardioScore,
-      b.strength_exercise || null, b.strength_exercise_2 || null, strengthCategory, strengthCategory2, JSON.stringify(sd), strengthScore,
-      b.endurance_test_type || null, b.endurance_test_type_2 || null, JSON.stringify(ed), enduranceCategory, enduranceCategory2, enduranceScore,
-      JSON.stringify(fd), flexibilityCategory, flexibilityCategory2, hasAsymmetry, mobilityScore,
-      bodyCompositionScore, healthRiskScore, overallScore,
-      b.posture_notes || null, b.health_notes || null, req.user.id,
-      orgIdOf(req),
-    ]
-  );
-  res.status(201).json({ data: { ...rows[0], bp_unsafe: bp.isUnsafe }, screening_warnings: screeningWarnings });
+  const NOT_MEASURED = 'Resting blood pressure not measured (confirmed by trainer).';
+  const priorNotes = String(b.health_notes || '').split('\n').filter((l) => l && l !== NOT_MEASURED).join('\n');
+  const healthNotes = (!hasBp && exertion && b.bp_not_measured
+    ? [priorNotes, NOT_MEASURED].filter(Boolean).join('\n')
+    : priorNotes) || null;
+
+  return {
+    bpUnsafe: bp.isUnsafe,
+    lifts,
+    cols: {
+      assessment_type: b.assessment_type || 'initial',
+      assessment_date: b.assessment_date || studioToday(),
+      trainer_notes: b.trainer_notes || b.assessment_notes || null,
+      bp_systolic: b.bp_systolic ?? null, bp_diastolic: b.bp_diastolic ?? null,
+      resting_heart_rate: b.resting_heart_rate ?? null, resting_spo2: b.resting_spo2 ?? null, bp_category: bp.category,
+      weight: b.weight ?? null, height_cm: b.height_cm ?? null, bmi,
+      waist_cm: b.waist_cm ?? null, waist_iliac_cm: b.waist_iliac_cm ?? null, hips_cm: b.hips_cm ?? null, waist_hip_ratio: waistHipRatio,
+      neck_cm: b.neck_cm ?? null, chest_cm: b.chest_cm ?? null,
+      arm_right_cm: b.arm_right_cm ?? null, arm_left_cm: b.arm_left_cm ?? null,
+      thigh_right_cm: b.thigh_right_cm ?? null, thigh_left_cm: b.thigh_left_cm ?? null,
+      calf_right_cm: b.calf_right_cm ?? null, calf_left_cm: b.calf_left_cm ?? null,
+      body_comp_method: b.body_comp_method || null, body_fat_pct: b.body_fat_pct ?? null, muscle_mass_pct: b.muscle_mass_pct ?? null,
+      lean_body_mass_kg: leanBodyMass, fat_mass_kg: fatMass,
+      visceral_fat: b.visceral_fat ?? null, subcutaneous_fat_pct: b.subcutaneous_fat_pct ?? null, body_water_pct: b.body_water_pct ?? null,
+      bone_mass_kg: b.bone_mass_kg ?? null, bmr, bmr_auto_suggested: bmrAutoSuggested, metabolic_age: b.metabolic_age ?? null,
+      cardio_test_type: b.cardio_test_type || null, cardio_test_data: JSON.stringify(cd), vo2_max: vo2Max,
+      cardio_category: cardioCategory, cardio_score_computed: cardioScore,
+      strength_exercise: b.strength_exercise || null, strength_exercise_2: b.strength_exercise_2 || null,
+      strength_category: strengthCategory, strength_category_2: strengthCategory2,
+      strength_test_data: JSON.stringify(sd), strength_score_computed: strengthScore,
+      endurance_test_type: b.endurance_test_type || null, endurance_test_type_2: b.endurance_test_type_2 || null,
+      endurance_test_data: JSON.stringify(ed), endurance_category: enduranceCategory, endurance_category_2: enduranceCategory2,
+      endurance_score_computed: enduranceScore,
+      flexibility_test_data: JSON.stringify(fd), flexibility_category: flexibilityCategory, flexibility_category_2: flexibilityCategory2,
+      has_asymmetry: hasAsymmetry, mobility_score_computed: mobilityScore,
+      body_composition_score: bodyCompositionScore, health_risk_score: healthRiskScore, overall_fitness_score: overallScore,
+      posture_notes: b.posture_notes || null, health_notes: healthNotes,
+    },
+  };
+}
+
+router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchema), wrap(async (req, res) => {
+  const b = req.body;
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  // Fitness testing includes maximal efforts — a 1RM, a step test, endurance
+  // to failure — so the same medical stop that guards assigning a workout
+  // guards recording one of these. Missing paperwork is only a warning here
+  // too, returned as screening_warnings.
+  const { blocked, warnings: screeningWarnings } = await checkScreeningGate(req, b.client_id);
+  if (blocked) return res.status(blocked.status).json(blocked.body);
+
+  const { age, gender } = await demographics(req, b.client_id, b);
+  const result = computeAssessment(b, age, gender);
+  if (result.error) return res.status(result.error.status).json({ error: { code: result.error.code, message: result.error.message } });
+
+  // The assessor is the studio's trainer profile, from the session. A
+  // trainer_id in the body is ignored: it is a foreign key, and taking it
+  // from the request would let a row point at another studio's trainer.
+  const row = await assessmentsRepo.insertAssessment({
+    client_id: b.client_id, trainer_id: req.user.trainer_id || null,
+    ...result.cols, created_by: req.user.id, organization_id: orgIdOf(req),
+  });
+  await assessmentsRepo.replaceAssessmentLifts(row, result.lifts);
+  await assessmentsRepo.updateClientBody(row.client_id, row.organization_id, result.cols.weight, result.cols.height_cm);
+  res.status(201).json({ data: { ...row, bp_unsafe: result.bpUnsafe }, screening_warnings: screeningWarnings });
+}));
+
+// A test used to be permanent: a typo in the weight fed the goal's starting
+// weight and the strength badges for good. Edit re-scores the merged test
+// with the same function create uses.
+router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdateSchema), wrap(async (req, res) => {
+  const existing = await assessmentsRepo.findAssessment(req, req.params.id);
+  if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  const merged = { ...assessmentAsBody(existing), ...req.body };
+  const { age, gender } = await demographics(req, existing.client_id, merged);
+  const result = computeAssessment(merged, age, gender);
+  if (result.error) return res.status(result.error.status).json({ error: { code: result.error.code, message: result.error.message } });
+  const row = await assessmentsRepo.updateAssessment(existing.id, result.cols);
+  await assessmentsRepo.replaceAssessmentLifts(row, result.lifts);
+  await assessmentsRepo.updateClientBody(row.client_id, row.organization_id, result.cols.weight, result.cols.height_cm);
+  res.json({ data: { ...row, bp_unsafe: result.bpUnsafe } });
+}));
+
+router.delete('/assessments/:id', auth, requireTrainer, wrap(async (req, res) => {
+  if (!await assessmentsRepo.deleteAssessment(req, req.params.id)) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  res.status(204).end();
 }));
 
 const GOAL_TYPES = [
@@ -302,22 +381,37 @@ const GOAL_TYPES = [
   'medical_fitness', 'senior_fitness', 'athletic_performance', 'custom',
 ];
 
+// A target date is ahead of the client, not behind: a past date used to be
+// accepted and every derived figure (weekly rate, difficulty, weeks) came
+// back blank without saying why.
+const futureDate = () => z.string().optional().nullable().refine(
+  (v) => !v || (!Number.isNaN(Date.parse(v)) && Date.parse(v) >= Date.now() - 86400000),
+  { message: 'Target date must be today or later' }
+);
+
+const goalFields = {
+  goal_type: z.enum(GOAL_TYPES),
+  goal_other: text(200),
+  goal_description: text(2000),
+  target_weight: numIn(25, 300), target_body_fat: numIn(3, 60),
+  target_date: futureDate(),
+  priority_goal: text(50),
+  motivation_reason: text(2000),
+  motivation_level: intIn(1, 10), commitment_level: intIn(1, 10),
+  biggest_challenges: textList(200, 20),
+  lifestyle_readiness: z.record(z.string().max(60), z.boolean()).optional().nullable(),
+  starting_weight: numIn(25, 350), starting_body_fat_pct: numIn(2, 75),
+  notes: text(2000),
+};
+
 const goalCreateSchema = {
-  body: z.object({
-    client_id: z.string(),
-    goal_type: z.enum(GOAL_TYPES),
-    goal_other: z.string().max(200).optional().nullable(),
-    goal_description: z.string().max(2000).optional().nullable(),
-    target_weight: numOpt(), target_body_fat: numOpt(),
-    target_date: z.string().optional().nullable(),
-    priority_goal: z.string().max(50).optional().nullable(),
-    motivation_reason: z.string().max(2000).optional().nullable(),
-    motivation_level: numOpt(), commitment_level: numOpt(),
-    biggest_challenges: z.array(z.string()).optional().nullable(),
-    lifestyle_readiness: z.record(z.string(), z.boolean()).optional().nullable(),
-    starting_weight: numOpt(), starting_body_fat_pct: numOpt(),
-    notes: z.string().max(2000).optional().nullable(),
-  }),
+  body: z.object({ client_id: z.string(), ...goalFields }),
+};
+
+// PATCH took any body at all: `target_weight: "abc"` reached the database and
+// came back as a 500 carrying the raw error. Same rules as create.
+const goalUpdateSchema = {
+  body: z.object({ ...goalFields, is_active: z.boolean().optional() }).partial(),
 };
 
 // Shared by POST (create) and PATCH (update) so the Smart Goal Analysis
@@ -407,10 +501,12 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
       req.user.id, orgIdOf(req),
     ]
   );
+  // The new goal replaces the old one. Goals used to pile up, all active.
+  await assessmentsRepo.deactivateOtherGoals(b.client_id, rows[0].organization_id, rows[0].id);
   res.status(201).json({ data: rows[0] });
 }));
 
-router.patch('/goals/:id', auth, wrap(async (req, res) => {
+router.patch('/goals/:id', auth, validate(goalUpdateSchema), wrap(async (req, res) => {
   const allowed = [
     'goal_type', 'goal_other', 'goal_description', 'target_weight', 'target_body_fat', 'target_date', 'notes', 'is_active',
     'motivation_reason', 'priority_goal', 'motivation_level', 'commitment_level', 'biggest_challenges',
@@ -459,6 +555,8 @@ router.patch('/goals/:id', auth, wrap(async (req, res) => {
 
   sets.push('updated_at = NOW()');
   const { rows } = await pool.query(`UPDATE pt_goals SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  // Re-opening an archived goal makes it THE goal again.
+  if (req.body.is_active === true) await assessmentsRepo.deactivateOtherGoals(rows[0].client_id, rows[0].organization_id, rows[0].id);
   res.json({ data: rows[0] });
 }));
 
@@ -685,40 +783,69 @@ const LIFESTYLE_OCCUPATION_TYPES = [
 const lifestyleAssessmentCreateSchema = {
   body: z.object({
     client_id: z.string(),
-    assessment_date: z.string().optional().nullable(),
+    assessment_date: pastDate(),
 
-    sleep_duration_hours: numOpt(), bed_time: z.string().optional().nullable(), wake_time: z.string().optional().nullable(),
-    sleep_quality: numOpt(),
+    sleep_duration_hours: numIn(0, 16), bed_time: text(8), wake_time: text(8),
+    sleep_quality: intIn(1, 10),
 
-    stress_level: numOpt(),
+    stress_level: intIn(1, 10),
 
-    water_intake_liters: numOpt(),
+    water_intake_liters: numIn(0, 10),
 
     occupation_type: z.enum(LIFESTYLE_OCCUPATION_TYPES).optional().nullable(),
     daily_steps_bracket: z.enum(['<3000', '3000_5000', '5000_8000', '8000_10000', '10000_plus']).optional().nullable(),
 
     workout_experience_level: z.enum(['beginner', 'intermediate', 'advanced', 'athlete']).optional().nullable(),
-    years_of_experience: numOpt(),
+    years_of_experience: numIn(0, 80),
 
-    food_preferences: z.array(z.string()).optional().nullable(),
+    food_preferences: textList(60, 20),
 
-    meal_frequency: numOpt(),
+    meal_frequency: intIn(1, 10),
     breakfast_habit: z.enum(['daily', 'sometimes', 'never']).optional().nullable(),
     late_night_eating: z.boolean().optional().nullable(),
 
     smoking_status: z.enum(['never', 'occasionally', 'daily', 'former']).optional().nullable(),
-    cigarettes_per_day: numOpt(), years_smoking: numOpt(),
+    cigarettes_per_day: intIn(0, 100), years_smoking: intIn(0, 80),
     alcohol_status: z.enum(['never', 'occasionally', 'weekly', 'frequently']).optional().nullable(),
-    drinks_per_week: numOpt(),
+    drinks_per_week: intIn(0, 100),
 
     screen_time_bracket: z.enum(['<2', '2_4', '4_6', '6_8', '8_plus']).optional().nullable(),
     travel_frequency: z.enum(['rarely', 'monthly', 'weekly', 'daily']).optional().nullable(),
-    energy_level: numOpt(), motivation_to_exercise: numOpt(),
+    energy_level: intIn(1, 10), motivation_to_exercise: intIn(1, 10),
     recovery_quality: z.enum(['poor', 'average', 'good', 'excellent']).optional().nullable(),
 
-    coach_notes: z.record(z.string(), z.string()).optional().nullable(),
+    coach_notes: coachNotesSchema,
   }),
 };
+
+const lifestyleAssessmentUpdateSchema = {
+  body: lifestyleAssessmentCreateSchema.body.omit({ client_id: true }).partial(),
+};
+
+// A count for a habit the client does not have is left over from an earlier
+// answer: choose Daily, type 10 cigarettes, switch to Never — the 10 used to
+// be stored beside "never".
+function clearHabitCounts(b) {
+  const out = { ...b };
+  if (out.smoking_status === 'never') { out.cigarettes_per_day = null; out.years_smoking = null; }
+  if (out.alcohol_status === 'never') out.drinks_per_week = null;
+  return out;
+}
+
+// Water and meals are asked in Nutrition, not here (they used to be asked in
+// both, or scored here without being asked). The latest Nutrition answers
+// fill them in when this assessment has none of its own.
+async function withNutritionHabits(clientId, b) {
+  const n = await assessmentsRepo.latestNutritionHabits(clientId);
+  const pick = (own, theirs) => (own != null ? own : theirs != null ? theirs : null);
+  return {
+    ...b,
+    water_intake_liters: pick(b.water_intake_liters, n.water_intake_liters != null ? Number(n.water_intake_liters) : null),
+    meal_frequency: pick(b.meal_frequency, n.meals_per_day != null ? Number(n.meals_per_day) : null),
+    breakfast_habit: pick(b.breakfast_habit, n.breakfast_regularity),
+    late_night_eating: pick(b.late_night_eating, n.late_night_eating),
+  };
+}
 
 // Shared by POST (create) and PATCH (update) so the Smart Lifestyle
 // Analysis columns never drift out of sync between the two write paths.
@@ -784,9 +911,9 @@ router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
 }));
 
 router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAssessmentCreateSchema), wrap(async (req, res) => {
-  const b = req.body;
+  const b = clearHabitCounts(req.body);
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-  const analysis = computeLifestyleAnalysis(b);
+  const analysis = computeLifestyleAnalysis(await withNutritionHabits(b.client_id, b));
 
   const { rows } = await pool.query(
     `INSERT INTO pt_lifestyle_assessments (
@@ -817,7 +944,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
        $42::jsonb,$43,$44
      ) RETURNING *`,
     [
-      b.client_id, b.assessment_date || null,
+      b.client_id, b.assessment_date || studioToday(),
       b.sleep_duration_hours ?? null, b.bed_time || null, b.wake_time || null, b.sleep_quality ?? null, analysis.sleepCategory, analysis.sleepScore,
       b.stress_level ?? null, analysis.stressScore,
       b.water_intake_liters ?? null, analysis.hydrationCategory, analysis.hydrationScore,
@@ -834,7 +961,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
   res.status(201).json({ data: rows[0] });
 }));
 
-router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
+router.patch('/lifestyle-assessments/:id', auth, validate(lifestyleAssessmentUpdateSchema), wrap(async (req, res) => {
   const allowed = [
     'assessment_date', 'sleep_duration_hours', 'bed_time', 'wake_time', 'sleep_quality', 'stress_level',
     'water_intake_liters', 'occupation_type', 'daily_steps_bracket', 'workout_experience_level', 'years_of_experience',
@@ -853,17 +980,18 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
+  const body = clearHabitCounts(req.body);
   const sets = []; const params = [req.params.id];
   for (const key of allowed) {
-    if (req.body[key] !== undefined) {
-      const val = key === 'coach_notes' && req.body[key] != null ? JSON.stringify(req.body[key]) : req.body[key];
+    if (body[key] !== undefined) {
+      const val = key === 'coach_notes' && body[key] != null ? JSON.stringify(body[key]) : body[key];
       params.push(val); sets.push(`${key} = $${params.length}`);
     }
   }
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
 
-  const merged = { ...existing, ...req.body };
-  const analysis = computeLifestyleAnalysis({
+  const merged = { ...existing, ...body };
+  const analysis = computeLifestyleAnalysis(await withNutritionHabits(existing.client_id, {
     sleep_duration_hours: merged.sleep_duration_hours != null ? parseFloat(merged.sleep_duration_hours) : null,
     sleep_quality: merged.sleep_quality != null ? parseInt(merged.sleep_quality, 10) : null,
     stress_level: merged.stress_level != null ? parseInt(merged.stress_level, 10) : null,
@@ -877,7 +1005,7 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
     recovery_quality: merged.recovery_quality || null,
     smoking_status: merged.smoking_status || null,
     alcohol_status: merged.alcohol_status || null,
-  });
+  }));
 
   for (const [col, val] of Object.entries({
     sleep_category: analysis.sleepCategory, sleep_score: analysis.sleepScore,
@@ -903,56 +1031,60 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
 }));
 
 const nutritionSupplementSchema = z.object({
-  name: z.string(), dose: z.string().optional().nullable(),
-  frequency: z.string().optional().nullable(), brand: z.string().optional().nullable(),
+  name: z.string().trim().min(1).max(100), dose: text(100),
+  frequency: text(100), brand: text(100),
 });
 const nutritionDigestiveIssueSchema = z.object({
-  issue: z.string(), frequency: z.enum(['daily', 'weekly', 'rare']).optional().nullable(),
-  severity: numOpt(),
+  issue: z.string().max(100), frequency: z.enum(['daily', 'weekly', 'rare']).optional().nullable(),
+  severity: intIn(1, 10),
 });
 
 const nutritionAssessmentCreateSchema = {
   body: z.object({
     client_id: z.string(),
-    assessment_date: z.string().optional().nullable(),
+    assessment_date: pastDate(),
 
-    diet_preferences: z.array(z.string()).optional().nullable(),
+    diet_preferences: textList(60, 20),
 
-    food_allergies: z.array(z.string()).optional().nullable(),
-    foods_to_avoid: z.array(z.string()).optional().nullable(),
+    food_allergies: textList(100, 30),
+    foods_to_avoid: textList(100, 30),
     foods_to_avoid_reason: z.enum(['medical', 'religious', 'personal_preference', 'taste', 'digestive_issue']).optional().nullable(),
 
-    favourite_foods: z.array(z.string()).optional().nullable(),
+    favourite_foods: textList(100, 30),
 
     takes_supplements: z.boolean().optional().nullable(),
-    supplements: z.array(nutritionSupplementSchema).optional().nullable(),
+    supplements: z.array(nutritionSupplementSchema).max(30).optional().nullable(),
 
-    digestive_issues: z.array(nutritionDigestiveIssueSchema).optional().nullable(),
+    digestive_issues: z.array(nutritionDigestiveIssueSchema).max(20).optional().nullable(),
 
-    meals_per_day: numOpt(),
+    meals_per_day: intIn(1, 10),
     breakfast_regularity: z.enum(['daily', 'sometimes', 'never']).optional().nullable(),
     lunch_regularity: z.enum(['daily', 'sometimes', 'never']).optional().nullable(),
     dinner_regularity: z.enum(['daily', 'sometimes', 'never']).optional().nullable(),
-    snacks_per_day: numOpt(),
+    snacks_per_day: intIn(0, 15),
     late_night_eating: z.boolean().optional().nullable(),
     meal_timing_consistency: z.enum(['consistent', 'somewhat_consistent', 'inconsistent']).optional().nullable(),
     eating_out_frequency: z.enum(['rarely', 'weekly', 'frequently', 'daily']).optional().nullable(),
     weekend_eating_habits: z.enum(['similar_to_weekday', 'somewhat_different', 'very_different_indulgent']).optional().nullable(),
-    eating_behaviours: z.array(z.string()).optional().nullable(),
+    eating_behaviours: textList(100, 30),
 
-    water_intake_liters: numOpt(),
-    tea_cups_per_day: numOpt(), coffee_cups_per_day: numOpt(), soft_drinks_per_day: numOpt(), juices_per_day: numOpt(),
-    alcoholic_drinks_per_week: numOpt(),
-    cravings: z.array(z.string()).optional().nullable(),
+    water_intake_liters: numIn(0, 10),
+    tea_cups_per_day: intIn(0, 30), coffee_cups_per_day: intIn(0, 30), soft_drinks_per_day: intIn(0, 30), juices_per_day: intIn(0, 30),
+    alcoholic_drinks_per_week: intIn(0, 100),
+    cravings: textList(100, 30),
     craving_frequency: z.enum(['rare', 'sometimes', 'daily']).optional().nullable(),
 
     meal_preparer: z.enum(['self', 'family', 'cook', 'restaurant', 'food_delivery', 'mess', 'hostel', 'office_cafeteria']).optional().nullable(),
     nutrition_budget: z.enum(['low', 'medium', 'high', 'premium']).optional().nullable(),
-    medical_conditions: z.array(z.string()).optional().nullable(),
-    medical_notes: z.string().optional().nullable(),
+    medical_conditions: textList(100, 30),
+    medical_notes: text(2000),
 
-    coach_notes: z.record(z.string(), z.string()).optional().nullable(),
+    coach_notes: coachNotesSchema,
   }),
+};
+
+const nutritionAssessmentUpdateSchema = {
+  body: nutritionAssessmentCreateSchema.body.omit({ client_id: true }).partial(),
 };
 
 // Shared by POST (create) and PATCH (update) so the Smart Nutrition
@@ -961,11 +1093,11 @@ const nutritionAssessmentCreateSchema = {
 // smoking/alcohol risk inputs — a plain read of an existing table, no
 // hard dependency: the two risk factors simply don't fire without it.
 async function computeNutritionAnalysis(clientId, b) {
-  const { rows: lifestyleRows } = await pool.query(
-    'SELECT smoking_status, alcohol_status FROM pt_lifestyle_assessments WHERE client_id = $1 ORDER BY assessment_date DESC LIMIT 1',
-    [clientId]
-  );
-  const lifestyle = lifestyleRows[0] || {};
+  // Alcohol and smoking are asked in Lifestyle; this form shows them rather
+  // than asking a second time. A drinks-per-week on an older Nutrition row
+  // still counts when Lifestyle has none.
+  const lifestyle = await assessmentsRepo.latestLifestyleHabits(clientId);
+  const drinksPerWeek = b.alcoholic_drinks_per_week ?? (lifestyle.drinks_per_week != null ? Number(lifestyle.drinks_per_week) : null);
 
   const dietQualityScore = nutritionScoring.calcDietQualityScore(
     b.foods_to_avoid ?? null, b.favourite_foods ?? null, b.cravings ?? null,
@@ -975,7 +1107,7 @@ async function computeNutritionAnalysis(clientId, b) {
   const dailyFluidIntake = nutritionScoring.calcDailyFluidIntake(
     b.water_intake_liters ?? null, b.tea_cups_per_day ?? null, b.coffee_cups_per_day ?? null, b.soft_drinks_per_day ?? null, b.juices_per_day ?? null
   );
-  const hydrationScore = nutritionScoring.calcHydrationScore(b.water_intake_liters ?? null, b.soft_drinks_per_day ?? null, b.alcoholic_drinks_per_week ?? null);
+  const hydrationScore = nutritionScoring.calcHydrationScore(b.water_intake_liters ?? null, b.soft_drinks_per_day ?? null, drinksPerWeek);
   const digestiveHealthScore = nutritionScoring.calcDigestiveHealthScore(b.digestive_issues ?? null);
   const supplementScore = nutritionScoring.calcSupplementScore(b.takes_supplements ?? null, b.supplements ?? null);
 
@@ -1066,7 +1198,7 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
        $44::jsonb,$45,$46
      ) RETURNING *`,
     [
-      b.client_id, b.assessment_date || null,
+      b.client_id, b.assessment_date || studioToday(),
       b.diet_preferences && b.diet_preferences.length ? b.diet_preferences : null,
       b.food_allergies && b.food_allergies.length ? b.food_allergies : null,
       b.foods_to_avoid && b.foods_to_avoid.length ? b.foods_to_avoid : null,
@@ -1088,7 +1220,7 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
   res.status(201).json({ data: rows[0] });
 }));
 
-router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
+router.patch('/nutrition-assessments/:id', auth, validate(nutritionAssessmentUpdateSchema), wrap(async (req, res) => {
   const allowed = [
     'assessment_date',
     'diet_preferences',
@@ -1161,26 +1293,32 @@ router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
   res.json({ data: rows[0] });
 }));
 
+// Scores are the page's 1-5 scale. A 42 used to be stored and pushed the
+// mobility score to 100.
 const bodyRegionSchema = z.object({
-  region: z.string(), score: numOpt(), pain: z.boolean().optional().nullable(), restriction: z.boolean().optional().nullable(),
+  region: z.string().max(60), score: intIn(1, 5), pain: z.boolean().optional().nullable(), restriction: z.boolean().optional().nullable(),
 });
 const mobilityTestSchema = z.object({
-  test: z.string(), score: numOpt(), notes: z.string().optional().nullable(),
+  test: z.string().max(60), score: intIn(1, 5), notes: text(500),
   pain: z.boolean().optional().nullable(), restriction: z.boolean().optional().nullable(),
 });
 
 const mobilityPerformanceAssessmentCreateSchema = {
   body: z.object({
     client_id: z.string(),
-    assessment_date: z.string().optional().nullable(),
+    assessment_date: pastDate(),
 
-    body_regions: z.array(bodyRegionSchema).optional().nullable(),
-    mobility_tests: z.array(mobilityTestSchema).optional().nullable(),
+    body_regions: z.array(bodyRegionSchema).max(20).optional().nullable(),
+    mobility_tests: z.array(mobilityTestSchema).max(20).optional().nullable(),
 
-    grip_strength_kg: numOpt(), vertical_jump_cm: numOpt(), sit_reach_cm: numOpt(),
-    balance_test_seconds: numOpt(), reaction_time_ms: numOpt(),
-    performance_notes: z.string().max(2000).optional().nullable(),
+    grip_strength_kg: numIn(1, 150), vertical_jump_cm: numIn(1, 150), sit_reach_cm: numIn(-50, 80),
+    balance_test_seconds: numIn(0, 600), reaction_time_ms: numIn(50, 3000),
+    performance_notes: text(2000),
   }),
+};
+
+const mobilityPerformanceAssessmentUpdateSchema = {
+  body: mobilityPerformanceAssessmentCreateSchema.body.omit({ client_id: true }).partial(),
 };
 
 // Referrals are derived from what is stored (pain flags, scoliosis), never
@@ -1235,7 +1373,7 @@ router.post('/mobility-performance-assessments', auth, requireTrainer, validate(
        $11,$12,$13,$14
      ) RETURNING *`,
     [
-      b.client_id, b.assessment_date || null,
+      b.client_id, b.assessment_date || studioToday(),
       b.body_regions ? JSON.stringify(b.body_regions) : null, b.mobility_tests ? JSON.stringify(b.mobility_tests) : null,
       b.grip_strength_kg ?? null, b.vertical_jump_cm ?? null, b.sit_reach_cm ?? null, b.balance_test_seconds ?? null, b.reaction_time_ms ?? null, b.performance_notes || null,
       analysis.mobilityScore, analysis.mobilityCategory, req.user.id, orgIdOf(req),
@@ -1244,7 +1382,7 @@ router.post('/mobility-performance-assessments', auth, requireTrainer, validate(
   res.status(201).json({ data: withMobilityReferrals(rows[0]) });
 }));
 
-router.patch('/mobility-performance-assessments/:id', auth, wrap(async (req, res) => {
+router.patch('/mobility-performance-assessments/:id', auth, validate(mobilityPerformanceAssessmentUpdateSchema), wrap(async (req, res) => {
   const allowed = [
     'assessment_date', 'body_regions', 'mobility_tests',
     'grip_strength_kg', 'vertical_jump_cm', 'sit_reach_cm', 'balance_test_seconds', 'reaction_time_ms', 'performance_notes',
@@ -1283,15 +1421,19 @@ router.patch('/mobility-performance-assessments/:id', auth, wrap(async (req, res
 const postureAssessmentCreateSchema = {
   body: z.object({
     client_id: z.string(),
-    assessment_date: z.string().optional().nullable(),
+    assessment_date: pastDate(),
 
-    front_issues: z.array(z.string()).optional().nullable(),
-    side_issues: z.array(z.string()).optional().nullable(),
-    back_issues: z.array(z.string()).optional().nullable(),
-    other_issue_notes: z.string().max(1000).optional().nullable(),
+    front_issues: textList(60, 20),
+    side_issues: textList(60, 20),
+    back_issues: textList(60, 20),
+    other_issue_notes: text(1000),
 
-    coach_notes: z.record(z.string(), z.string()).optional().nullable(),
+    coach_notes: coachNotesSchema,
   }),
+};
+
+const postureAssessmentUpdateSchema = {
+  body: postureAssessmentCreateSchema.body.omit({ client_id: true }).partial(),
 };
 
 function computePostureAnalysis(b) {
@@ -1333,7 +1475,7 @@ router.post('/posture-assessments', auth, requireTrainer, validate(postureAssess
        $9::jsonb,$10,$11
      ) RETURNING *`,
     [
-      b.client_id, b.assessment_date || null,
+      b.client_id, b.assessment_date || studioToday(),
       b.front_issues && b.front_issues.length ? b.front_issues : null,
       b.side_issues && b.side_issues.length ? b.side_issues : null,
       b.back_issues && b.back_issues.length ? b.back_issues : null,
@@ -1345,7 +1487,7 @@ router.post('/posture-assessments', auth, requireTrainer, validate(postureAssess
   res.status(201).json({ data: withPostureReferrals(rows[0]) });
 }));
 
-router.patch('/posture-assessments/:id', auth, wrap(async (req, res) => {
+router.patch('/posture-assessments/:id', auth, validate(postureAssessmentUpdateSchema), wrap(async (req, res) => {
   const allowed = ['assessment_date', 'front_issues', 'side_issues', 'back_issues', 'other_issue_notes', 'coach_notes'];
 
   const scope = tenantScope(req);
