@@ -22,6 +22,23 @@ class PortalInputError extends Error {
 }
 
 /** 'YYYY-MM-DD' of the Monday of the week containing `ymd`. */
+/**
+ * Time/distance targets the plan builder stores in workout_exercises.config
+ * (migration 136 reserved it for exactly this). Only finite, non-negative
+ * numbers leave the server; anything else in config stays internal.
+ */
+function timedTargets(config) {
+  const c = config && typeof config === 'object' ? config : {};
+  const n = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) || Number(v) < 0
+    ? null : Number(v));
+  const distance = n(c.distance);
+  return {
+    target_duration_seconds: n(c.duration_seconds),
+    target_distance: distance,
+    target_distance_unit: distance != null && ['m', 'km', 'mile'].includes(c.distance_unit) ? c.distance_unit : (distance != null ? 'm' : null),
+  };
+}
+
 function mondayOf(ymd) {
   const d = new Date(`${ymd}T00:00:00Z`);
   const dow = d.getUTCDay(); // 0 Sun … 6 Sat
@@ -73,7 +90,8 @@ async function myWorkout(clientId, orgId) {
   const { rows: exercises } = await pool.query(
     `SELECT we.workout_plan_id, we.exercise_id, we.day_of_week, we.week_number, we.sort_order,
             we.sets, we.reps, we.rest_seconds, we.target_weight, we.tempo, we.rpe,
-            we.notes, e.name, e.equipment, e.video_url, e.image_url, e.gif_url
+            we.notes, we.config, e.name, e.equipment, e.video_url, e.image_url, e.gif_url,
+            e.prescription_mode_primary
        FROM workout_exercises we
        LEFT JOIN exercises e ON e.id = we.exercise_id
       WHERE we.workout_plan_id = ANY($1::text[])
@@ -105,6 +123,10 @@ async function myWorkout(clientId, orgId) {
             sets: x.sets, reps: x.reps, rest_seconds: x.rest_seconds,
             target_weight: x.target_weight != null ? Number(x.target_weight) : null,
             tempo: x.tempo, rpe: x.rpe != null ? Number(x.rpe) : null, notes: x.notes,
+            // How the member logs it (load × reps, hold, carry, time …) and the
+            // time/distance targets the builder keeps in config.
+            tracking_mode: x.config?.tracking_mode || x.prescription_mode_primary || null,
+            ...timedTargets(x.config),
             equipment: x.equipment, media_url: x.gif_url || x.image_url || null, video_url: x.video_url,
           })),
       }))

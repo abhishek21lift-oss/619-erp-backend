@@ -24,6 +24,7 @@ const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const { normaliseTrackingModes, TrackingModeError } = require('../lib/trackingModes');
 
 // ─── PERMISSIONS ──────────────────────────────────────────────
 
@@ -489,6 +490,16 @@ router.post('/', auth, async (req, res, next) => {
     if (d.difficulty && !DIFFICULTIES.has(d.difficulty))
       return res.status(400).json({ error: 'Invalid difficulty' });
 
+    let tracking;
+    try {
+      tracking = normaliseTrackingModes(d.prescription_mode_primary, d.prescription_mode_allowed);
+    } catch (e) {
+      if (e instanceof TrackingModeError) return res.status(400).json({ error: e.message });
+      throw e;
+    }
+    const trackingPrimary = tracking.primary ?? null;
+    const trackingAllowed = tracking.allowed ?? (trackingPrimary ? [trackingPrimary] : []);
+
     await client.query('BEGIN');
 
     // Slug uniqueness is enforced by a partial unique index; resolve it here so
@@ -517,14 +528,14 @@ router.post('/', auth, async (req, res, next) => {
          beginner_notes, advanced_notes, trainer_notes,
          sets_default, reps_default, rest_seconds,
          tags, search_keywords, visibility, is_custom, organization_id,
-         created_by, updated_by
+         created_by, updated_by, prescription_mode_primary, prescription_mode_allowed
        ) VALUES (
          $1,$2,$3,$4,COALESCE($5,'Full Body'),COALESCE($6,'beginner'),
          $7,$8,$9,$10,$11,$12,$13,$14,
          COALESCE($15,'{}'),COALESCE($16,'{}'),COALESCE($17,'{}'),COALESCE($18,'{}'),
          $19,$20,$21,$22,$23,$24,$25,
          COALESCE($26,3),COALESCE($27,12),COALESCE($28,60),
-         COALESCE($29,'{}'),$30,'private',TRUE,$31,$32,$32
+         COALESCE($29,'{}'),$30,'private',TRUE,$31,$32,$32,$33,$34
        )`,
       [
         id, name, slug, nullableText(d.description) ?? null,
@@ -544,7 +555,7 @@ router.post('/', auth, async (req, res, next) => {
         d.rest_seconds ? parseInt(d.rest_seconds, 10) : null,
         textArray(d.tags, 30),
         [name, d.search_keywords || '', d.equipment_name || ''].filter(Boolean).join(' ').trim(),
-        orgId, req.user.id,
+        orgId, req.user.id, trackingPrimary, trackingAllowed,
       ]
     );
 
@@ -595,6 +606,14 @@ router.put('/:id', auth, async (req, res, next) => {
     if (d.name !== undefined && !String(d.name).trim())
       return res.status(400).json({ error: 'Exercise name cannot be empty' });
 
+    let tracking;
+    try {
+      tracking = normaliseTrackingModes(d.prescription_mode_primary, d.prescription_mode_allowed);
+    } catch (e) {
+      if (e instanceof TrackingModeError) return res.status(400).json({ error: e.message });
+      throw e;
+    }
+
     await client.query('BEGIN');
 
     // COALESCE-on-undefined: only fields the client actually sent are touched,
@@ -634,6 +653,16 @@ router.put('/:id', auth, async (req, res, next) => {
     set('sets_default',         d.sets_default !== undefined ? parseInt(d.sets_default, 10) || null : undefined);
     set('reps_default',         d.reps_default !== undefined ? parseInt(d.reps_default, 10) || null : undefined);
     set('rest_seconds',         d.rest_seconds !== undefined ? parseInt(d.rest_seconds, 10) || null : undefined);
+    set('prescription_mode_primary', tracking.primary);
+    set('prescription_mode_allowed', tracking.allowed);
+    // Primary sent without a list: keep the options the exercise already had
+    // and make sure the new default is one of them.
+    if (tracking.primary && tracking.allowed === undefined) {
+      params.push(tracking.primary);
+      const p = `$${params.length}::text`;
+      sets.push(`prescription_mode_allowed = CASE WHEN ${p} = ANY(prescription_mode_allowed)
+                   THEN prescription_mode_allowed ELSE array_prepend(${p}, prescription_mode_allowed) END`);
+    }
 
     if (d.name !== undefined && d.regenerate_slug) {
       set('slug', slugify(d.name));
@@ -716,7 +745,8 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
          contraindications, breathing_tips, tempo_recommendation,
          recommended_reps, recommended_sets, beginner_notes, advanced_notes, trainer_notes,
          sets_default, reps_default, rest_seconds, tags, search_keywords,
-         visibility, is_custom, organization_id, created_by, updated_by
+         visibility, is_custom, organization_id, created_by, updated_by,
+         prescription_mode_primary, prescription_mode_allowed
        )
        SELECT $1, $2, $3, description, muscle_group, difficulty,
               primary_muscle_id, equipment_id, category_id, movement_pattern, plane_of_motion,
@@ -724,7 +754,8 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
               contraindications, breathing_tips, tempo_recommendation,
               recommended_reps, recommended_sets, beginner_notes, advanced_notes, trainer_notes,
               sets_default, reps_default, rest_seconds, tags, $2,
-              'organization', TRUE, $4, $5, $5
+              'organization', TRUE, $4, $5, $5,
+              prescription_mode_primary, prescription_mode_allowed
          FROM exercises WHERE id = $6`,
       [id, newName, slug, orgIdOf(req), req.user.id, req.params.id]
     );
