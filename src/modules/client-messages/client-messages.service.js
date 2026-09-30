@@ -10,6 +10,7 @@
 // it was not handed by one of those two.
 
 const pool = require('../../db/pool');
+const { trainerOfClient } = require('../../lib/memberTrainer');
 const logger = require('../../lib/logger');
 
 const MAX_BODY = 2000;
@@ -98,14 +99,13 @@ async function memberThread(clientId, orgId, opts) {
   const [messages, studio] = await Promise.all([
     thread(orgId, clientId, opts),
     pool.query(
-      `SELECT o.name AS studio_name, COALESCE(t.name, u.name) AS trainer_name
+      // The trainer the member's other screens name (lib/memberTrainer).
+      // This read trainers.name, which My Profile never updates, with no
+      // deleted check — a different answer from the profile and coach page.
+      `SELECT o.name AS studio_name, tu.name AS trainer_name
          FROM organizations o
-         LEFT JOIN LATERAL (
-           SELECT id, name FROM users
-            WHERE organization_id = o.id AND role = 'trainer' AND is_active = TRUE AND deleted_at IS NULL
-            ORDER BY created_at LIMIT 1) u ON TRUE
          LEFT JOIN pt_clients c ON c.id = $2 AND c.organization_id = o.id
-         LEFT JOIN trainers t ON t.id = c.trainer_id
+         LEFT JOIN LATERAL (${trainerOfClient('c')}) tu ON TRUE
         WHERE o.id = $1`,
       [orgId, clientId],
     ),

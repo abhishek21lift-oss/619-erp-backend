@@ -13,6 +13,7 @@
 const pool = require('../../db/pool');
 const { today, dbDate } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
+const { detectFileType, LOGO_IMAGES } = require('../../lib/fileSignatures');
 const { programmeWeek, resolveWeek } = require('../pt-os/progression');
 
 const MOODS = ['great', 'good', 'okay', 'tired', 'stressed'];
@@ -276,7 +277,33 @@ async function upsertMyCheckin(clientId, orgId, userId, body) {
     [clientId, week, c.weight, c.mood, c.sleep_hours, c.water_glasses,
       c.stress_level, c.energy_level, c.soreness_level, c.client_notes, userId, orgId],
   );
-  return rows[0] || null;
+  if (!rows[0]) return null;
+
+  // Tell the trainer. Progress photos, messages and reached goals already
+  // did; a weekly check-in — the one place a member reports sleep, stress
+  // and soreness — arrived silently and was found only by opening the
+  // client. One unread notice per client: editing the same week again does
+  // not stack a second.
+  try {
+    await pool.query(
+      `INSERT INTO notifications (user_id, type, title, body, link)
+       SELECT u.id, 'member_checkin', c.name || ' sent their weekly check-in',
+              'Week of ' || to_char($3::date, 'DD Mon') || '.',
+              '/pt-os/clients/' || c.id || '?tab=checkins'
+         FROM pt_clients c
+         JOIN users u ON u.organization_id = c.organization_id AND u.role = 'trainer'
+                     AND u.is_active = TRUE AND u.deleted_at IS NULL
+        WHERE c.id = $1 AND c.organization_id = $2
+          AND NOT EXISTS (
+            SELECT 1 FROM notifications n
+             WHERE n.user_id = u.id AND n.type = 'member_checkin' AND n.is_read = FALSE
+               AND n.link = '/pt-os/clients/' || c.id || '?tab=checkins')`,
+      [clientId, orgId, week],
+    );
+  } catch (err) {
+    logger.warn({ err: err.message, clientId }, 'client-portal: check-in notification failed');
+  }
+  return rows[0];
 }
 
 const num = (v) => (v === null || v === undefined ? null : Number(v));
@@ -366,6 +393,11 @@ function normaliseContact(body = {}) {
     if (!MOBILE_RE.test(m)) throw new PortalInputError('Enter a valid 10-digit Indian mobile number.');
     out.mobile = m;
   }
+  if (body.whatsapp !== undefined && body.whatsapp !== null && String(body.whatsapp).trim() !== '') {
+    const w = String(body.whatsapp).replace(/[\s-]/g, '').replace(/^(\+91|91|0)(?=[6-9]\d{9}$)/, '');
+    if (!MOBILE_RE.test(w)) throw new PortalInputError('Enter a valid 10-digit WhatsApp number.');
+    out.whatsapp = w;
+  }
   if (body.address !== undefined) {
     const a = body.address === null ? '' : String(body.address).trim();
     if (a.length > 500) throw new PortalInputError('Address must be 500 characters or fewer.');
@@ -375,16 +407,104 @@ function normaliseContact(body = {}) {
   return out;
 }
 
+/**
+ * The member corrects their own mobile, WhatsApp number or address.
+ *
+ * WhatsApp follows the mobile. Every automated WhatsApp reads
+ * COALESCE(NULLIF(whatsapp, ''), mobile), and every client record carries a
+ * whatsapp number, so a member who changed only their mobile kept receiving
+ * messages on the old one — while the form promised the trainer would reach
+ * them on the new. Now: an explicit WhatsApp number is stored as given; if
+ * none is sent and the old WhatsApp number was the old mobile (or empty), it
+ * moves with the mobile. A WhatsApp number that deliberately differed from
+ * the mobile is left alone.
+ *
+ * The trainer is told when anything actually changed — their client's
+ * contact details are their record too.
+ */
 async function updateMyContact(clientId, orgId, body) {
   const c = normaliseContact(body);
   const { rows } = await pool.query(
-    `UPDATE pt_clients
-        SET mobile  = CASE WHEN $3::boolean THEN $4 ELSE mobile END,
-            address = CASE WHEN $5::boolean THEN $6 ELSE address END,
+    `WITH old AS (
+       SELECT id, mobile, whatsapp, address FROM pt_clients
+        WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL
+        FOR UPDATE
+     )
+     UPDATE pt_clients p
+        SET mobile   = CASE WHEN $3::boolean THEN $4 ELSE p.mobile END,
+            whatsapp = CASE WHEN $7::boolean THEN $8
+                            WHEN $3::boolean AND (
+                                   NULLIF(old.whatsapp, '') IS NULL
+                                OR right(regexp_replace(old.whatsapp, '\\D', '', 'g'), 10)
+                                 = right(regexp_replace(COALESCE(old.mobile, ''), '\\D', '', 'g'), 10))
+                            THEN $4
+                            ELSE p.whatsapp END,
+            address  = CASE WHEN $5::boolean THEN $6 ELSE p.address END,
             updated_at = NOW()
+       FROM old
+      WHERE p.id = old.id
+      RETURNING p.mobile, p.whatsapp, p.address,
+                (p.mobile IS DISTINCT FROM old.mobile
+                  OR p.whatsapp IS DISTINCT FROM old.whatsapp
+                  OR p.address IS DISTINCT FROM old.address) AS changed`,
+    [clientId, orgId, 'mobile' in c, c.mobile ?? null, 'address' in c, c.address ?? null,
+      'whatsapp' in c, c.whatsapp ?? null],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  if (row.changed) {
+    try {
+      await pool.query(
+        `INSERT INTO notifications (user_id, type, title, body, link)
+         SELECT u.id, 'member_contact', c.name || ' updated their contact details',
+                'Mobile ' || COALESCE(c.mobile, '—') || ' · WhatsApp ' || COALESCE(c.whatsapp, '—'),
+                '/pt-os/clients/' || c.id
+           FROM pt_clients c
+           JOIN users u ON u.organization_id = c.organization_id AND u.role = 'trainer'
+                       AND u.is_active = TRUE AND u.deleted_at IS NULL
+          WHERE c.id = $1 AND c.organization_id = $2`,
+        [clientId, orgId],
+      );
+    } catch (err) {
+      // A missed notification must never undo the member's own correction.
+      logger.warn({ err: err.message, clientId }, 'client-portal: contact change notification failed');
+    }
+  }
+  return { mobile: row.mobile, whatsapp: row.whatsapp, address: row.address };
+}
+
+// ── The member's own profile photo ─────────────────────────────────────────
+//
+// Only the trainer could set a client's photo, so 34 of 37 members saw their
+// initials everywhere. A member may now set or remove their own.
+//
+// Stored the way the trainer's upload stores it — a data URL on
+// pt_clients.photo_url — so every screen that already renders a client photo
+// renders this one with no change. Unlike that path, the bytes are checked:
+// only a JPEG, PNG or WebP (by signature, not by the claimed type) under the
+// size cap is accepted. The app crops and downscales to 800 px first, which
+// comes in well under it.
+const PHOTO_MAX_BYTES = 1024 * 1024;
+const DATA_URL_RE = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/;
+
+function parseMyPhoto(raw) {
+  const m = typeof raw === 'string' ? DATA_URL_RE.exec(raw) : null;
+  if (!m) throw new PortalInputError('Use a JPG, PNG or WebP photo.');
+  const bytes = Buffer.from(m[2], 'base64');
+  if (bytes.length === 0) throw new PortalInputError('The photo is empty.');
+  if (bytes.length > PHOTO_MAX_BYTES) throw new PortalInputError('The photo is too large — pick a smaller one.');
+  const detected = detectFileType(bytes, LOGO_IMAGES);
+  if (!detected) throw new PortalInputError('That file is not a JPG, PNG or WebP image.');
+  return `data:${detected.mime};base64,${m[2]}`;
+}
+
+async function setMyPhoto(clientId, orgId, raw) {
+  const photo = raw === null ? null : parseMyPhoto(raw);
+  const { rows } = await pool.query(
+    `UPDATE pt_clients SET photo_url = $3, updated_at = NOW()
       WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL
-      RETURNING mobile, address`,
-    [clientId, orgId, 'mobile' in c, c.mobile ?? null, 'address' in c, c.address ?? null],
+      RETURNING photo_url`,
+    [clientId, orgId, photo],
   );
   return rows[0] || null;
 }
@@ -650,7 +770,7 @@ async function deleteMyPhoto(clientId, orgId, userId, photoId) {
 module.exports = {
   myAchievements, weekStreaks,
   myPhotos, normalisePhotoMeta, photoUploadsToday, insertMyPhoto, deleteMyPhoto, PHOTO_TYPES, PHOTO_DAILY_LIMIT,
-  updateMyContact, normaliseContact, myForms, myConsentPdfKey,
+  updateMyContact, normaliseContact, setMyPhoto, parseMyPhoto, myForms, myConsentPdfKey,
   myWorkout, myDiet, myCheckins, upsertMyCheckin, mySessions,
   normaliseCheckin, mondayOf, weekNumberSince, PortalInputError, MOODS,
 };

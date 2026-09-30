@@ -268,7 +268,9 @@ describeIf('/api/me against a real database', () => {
     const res = await request().patch('/api/me/profile')
       .send({ mobile: '+91 98765 43210', address: '12 Park Street', name: 'Hacker', balance_amount: 0 });
     expect(res.status).toBe(200);
-    expect(res.body.data).toEqual({ mobile: '9876543210', address: '12 Park Street' });
+    // WhatsApp follows the mobile: Mina had none, so her new mobile is where
+    // WhatsApp now goes too (memberTrainerWiring covers the other cases).
+    expect(res.body.data).toEqual({ mobile: '9876543210', whatsapp: '9876543210', address: '12 Park Street' });
     const { rows } = await pool.query('SELECT name, balance_amount FROM pt_clients WHERE id = $1', [CLIENT]);
     expect(rows[0].name).toBe('Mina');
     expect(Number(rows[0].balance_amount)).toBe(1500);

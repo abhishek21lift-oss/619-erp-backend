@@ -3,6 +3,7 @@ const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
 const { optionalNumber, parseStrict } = require('../../lib/zodNumbers');
 const { auth, requireTrainer } = require('../../middleware/auth');
+const memberGoals = require('../client-portal/member-goals.service');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const logger = require('../../lib/logger');
@@ -1634,6 +1635,20 @@ router.post('/clients/:id/checkin-insight', auth, aiLimiter, requireAiQuota(), w
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   }
   const data = await generateCheckinInsight({ checkins, chat: meteredChat(req, 'checkin', routedChat) });
+  return res.json({ data });
+}));
+
+// ─── The member's own goals ────────────────────────────────
+//
+// Targets the member set for themselves in the member app (weight, a lift, a
+// session count), with the progress and projection the member sees. Nothing
+// on this side read them before; the trainer learnt of a goal only when it
+// was reached. The read lives in member-goals.service.
+router.get('/clients/:id/member-goals', auth, wrap(async (req, res) => {
+  const data = await memberGoals.goalsForStudio(req.params.id, tenantScope(req).orgId);
+  if (data === null) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
   return res.json({ data });
 }));
 

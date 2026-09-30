@@ -7,13 +7,12 @@
 // notification settings, no MFA columns. A column added to user_profiles
 // later does not reach a member unless it is named below.
 //
-// Which trainer: the user account linked to the client's assigned trainer,
-// else the studio's own trainer account. A studio has exactly one live
-// trainer account (migration 208), so the fallback is the same person the
-// member's dashboard already names.
+// Which trainer: lib/memberTrainer — the same rule the profile and the
+// message thread use, so all three name the same person.
 
 const credentials = require('../../lib/credentials');
 const profileFields = require('../../lib/profileFields');
+const { trainerOfClient } = require('../../lib/memberTrainer');
 
 const arr = (v) => (Array.isArray(v) ? v : []);
 
@@ -32,14 +31,7 @@ async function coachFor(db, { clientId, orgId }) {
             p.previous_gyms, p.education, p.achievements, p.working_hours,
             o.name AS studio_name, o.logo_url AS studio_logo
        FROM pt_clients c
-       JOIN LATERAL (
-         SELECT su.id, su.name
-           FROM users su
-          WHERE su.organization_id = c.organization_id AND su.role = 'trainer'
-            AND su.deleted_at IS NULL
-          ORDER BY (c.trainer_id IS NOT NULL AND su.trainer_id = c.trainer_id) DESC, su.created_at
-          LIMIT 1
-       ) u ON TRUE
+       JOIN LATERAL (${trainerOfClient('c')}) u ON TRUE
        LEFT JOIN user_profiles p ON p.user_id = u.id
        LEFT JOIN organizations o ON o.id = c.organization_id
       WHERE c.id = $1 AND c.deleted_at IS NULL${orgSql}`,
