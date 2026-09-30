@@ -27,6 +27,7 @@ const goals = require('./member-goals.service');
 const recap = require('./member-recap.service');
 const renewal = require('./member-renewal.service');
 const memberCoach = require('./member-coach.service');
+const { trainerOfClient, TRAINER_SPECIALISATION_SQL } = require('../../lib/memberTrainer');
 const { generatePaymentReceiptPdf } = require('../../lib/paymentReceiptPdf');
 const { isTrainingBlocked } = require('../../lib/screeningGate');
 const { randomUUID } = require('crypto');
@@ -62,10 +63,12 @@ function orgClause(orgId, params, col = 'organization_id') {
 // would hand the client their own commission figures, internal notes and the
 // studio's margin on them the moment somebody adds a column.
 //
-// trainer_photo is the trainer's My Profile photo (user_profiles.avatar_url),
-// not t.photo_url: `trainers` has no photo column in any migration or in
-// production, and selecting it once made this route a 500 for every member.
-// Same trainer the coach page resolves (member-coach.service.js).
+// trainer_name, trainer_photo and trainer_specialization all describe ONE
+// trainer account, resolved by lib/memberTrainer — the same rule the coach
+// page and the message thread use. The name used to come from `trainers`
+// while the photo came from `users`, and the specialisation from the legacy
+// trainers column that 7 of 8 studios never filled; the trainer edits
+// users.name and their My Profile specialisations, so those are what show.
 //
 // goal: the client's ACTIVE goal from pt_goals, which is where the trainer
 // sets it today; pt_clients.goal is the older free-text field and is the
@@ -80,33 +83,19 @@ router.get('/profile', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
   const params = [clientId];
   const { rows } = await pool.query(
-    `SELECT c.id, c.client_id AS member_code, c.name, c.email, c.mobile,
+    `SELECT c.id, c.client_id AS member_code, c.name, c.email, c.mobile, c.whatsapp,
             c.gender, c.dob, c.photo_url, c.address,
             c.package_type, COALESCE(g.goal, c.goal) AS goal, c.height, c.weight,
             c.joining_date, c.pt_start_date, c.pt_end_date, c.duration_months,
             c.status,
-            COALESCE(t.name, st.name) AS trainer_name,
-            (SELECT up.avatar_url
-               FROM users tu
-               LEFT JOIN user_profiles up ON up.user_id = tu.id
-              WHERE tu.organization_id = c.organization_id AND tu.role = 'trainer'
-                AND tu.deleted_at IS NULL
-              ORDER BY (c.trainer_id IS NOT NULL AND tu.trainer_id = c.trainer_id) DESC, tu.created_at
-              LIMIT 1) AS trainer_photo,
-            CASE WHEN t.id IS NOT NULL THEN t.specialization ELSE st.specialization END
-              AS trainer_specialization,
+            tu.name AS trainer_name,
+            up.avatar_url AS trainer_photo,
+            ${TRAINER_SPECIALISATION_SQL} AS trainer_specialization,
             o.name AS studio_name, o.logo_url AS studio_logo
        FROM pt_clients c
-       LEFT JOIN trainers t ON t.id = c.trainer_id AND t.organization_id = c.organization_id
-       LEFT JOIN LATERAL (
-         SELECT st.name, st.specialization
-           FROM users su
-           JOIN trainers st ON st.id = su.trainer_id AND st.organization_id = su.organization_id
-          WHERE su.organization_id = c.organization_id AND su.role = 'trainer'
-            AND su.deleted_at IS NULL AND st.deleted_at IS NULL
-          ORDER BY su.created_at
-          LIMIT 1
-       ) st ON TRUE
+       LEFT JOIN LATERAL (${trainerOfClient('c')}) tu ON TRUE
+       LEFT JOIN user_profiles up ON up.user_id = tu.id
+       LEFT JOIN trainers tt ON tt.id = tu.trainer_id AND tt.deleted_at IS NULL
        LEFT JOIN LATERAL (
          SELECT COALESCE(NULLIF(pg.priority_goal, ''), NULLIF(pg.goal_type, ''), pg.goal_other) AS goal
            FROM pt_goals pg

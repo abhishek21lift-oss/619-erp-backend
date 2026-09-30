@@ -12,6 +12,7 @@ const { makeStore } = require('../lib/rateLimitStore');
 // what v12's `{ window: 1 }` meant.
 const { generateSecret, verifySync } = require('otplib');
 const pool = require('../db/pool');
+const { syncTrainerName } = require('../lib/memberTrainer');
 const { detectFileType, PROFILE_IMAGES, LOGO_IMAGES } = require('../lib/fileSignatures');
 const { auth, requireTrainer, invalidateUserCache } = require('../middleware/auth');
 const studioBranding = require('../lib/studioBranding');
@@ -310,6 +311,9 @@ router.put('/me', async (req, res, next) => {
     }
 
     await pool.query('UPDATE users SET name = $1, email = $2, updated_at = NOW() WHERE id = $3', [name, email, req.user.id]);
+    // trainers.name and pt_clients.trainer_name hold copies of a trainer's
+    // name; a rename here left both behind (see lib/memberTrainer).
+    await syncTrainerName(pool, req.user.id, name);
 
     // Guarantee the row, then UPDATE only the columns this request carried.
     //

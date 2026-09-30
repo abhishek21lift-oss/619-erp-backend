@@ -234,7 +234,7 @@ async function studioGoal(clientId, orgId, nowYmd) {
   return { ...evaluated, label: g.priority_goal || g.goal_type || null };
 }
 
-async function myGoals(clientId, orgId) {
+async function listGoals(clientId, orgId, { stamp }) {
   const nowYmd = today();
   const { rows } = await pool.query(
     `SELECT id, kind, exercise_name, start_value, target_value, target_date, achieved_at, created_at
@@ -247,13 +247,37 @@ async function myGoals(clientId, orgId) {
   const goals = [];
   for (const g of rows) {
     const e = await evaluate(g, clientId, orgId, nowYmd);
-    if (e.reached && !g.achieved_at) {
+    if (stamp && e.reached && !g.achieved_at) {
       e.achieved_at = await markAchieved(g, clientId, orgId);
       e.just_achieved = Boolean(e.achieved_at);
     }
     goals.push(e);
   }
   return { studio: await studioGoal(clientId, orgId, nowYmd), goals };
+}
+
+/** The member's own view. Reading is also when a reached goal is stamped. */
+async function myGoals(clientId, orgId) {
+  return listGoals(clientId, orgId, { stamp: true });
+}
+
+/**
+ * The same goals, for the client's trainer.
+ *
+ * Members set their own targets on the Goals page, and until now nothing on
+ * the trainer's side read member_goals at all — the trainer heard about a
+ * goal only when it was reached. Read-only: the trainer's view never stamps
+ * a goal achieved (that is the member's moment, and its notice is the
+ * trainer's own). Returns null when the client is not in this studio, which
+ * the route turns into a 404.
+ */
+async function goalsForStudio(clientId, orgId) {
+  const { rows } = await pool.query(
+    'SELECT 1 FROM pt_clients WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL',
+    [clientId, orgId],
+  );
+  if (!rows[0]) return null;
+  return listGoals(clientId, orgId, { stamp: false });
 }
 
 const goalLabel = (g) => (g.kind === 'weight' ? `reach ${Number(g.target_value)} kg`
@@ -365,6 +389,7 @@ async function archiveMyGoal(clientId, orgId, goalId) {
 module.exports = {
   GoalInputError,
   myGoals,
+  goalsForStudio,
   createMyGoal,
   archiveMyGoal,
   // Shared with the monthly recap, and exported for tests.
