@@ -140,6 +140,22 @@ describeIf('member ↔ trainer wiring, against a real database', () => {
     expect(rows).toEqual([{ link: `/pt-os/clients/${CLIENT}?tab=checkins` }]);
   });
 
+  it('lets a member set and remove their own photo, checking the bytes rather than the claimed type', async () => {
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    const ok = await request().post('/api/me/photo').send({ photo: `data:image/png;base64,${png}` });
+    expect(ok.status).toBe(200);
+    expect(ok.body.data.photo_url).toBe(`data:image/png;base64,${png}`);
+
+    // Text dressed up as a JPEG: the prefix claims an image, the bytes do not.
+    const fake = Buffer.from('<script>alert(1)</script>').toString('base64');
+    const bad = await request().post('/api/me/photo').send({ photo: `data:image/jpeg;base64,${fake}` });
+    expect(bad.status).toBe(400);
+    expect((await request().post('/api/me/photo').send({ photo: 'javascript:alert(1)' })).status).toBe(400);
+
+    const gone = await request().delete('/api/me/photo');
+    expect(gone.body.data.photo_url).toBeNull();
+  });
+
   it('lets the trainer read the member\'s own goals, and only in their own studio', async () => {
     const made = await request().post('/api/me/goals').send({ kind: 'sessions', target_value: 20 });
     expect(made.status).toBeLessThan(300);

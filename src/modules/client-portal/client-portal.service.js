@@ -13,6 +13,7 @@
 const pool = require('../../db/pool');
 const { today, dbDate } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
+const { detectFileType, LOGO_IMAGES } = require('../../lib/fileSignatures');
 const { programmeWeek, resolveWeek } = require('../pt-os/progression');
 
 const MOODS = ['great', 'good', 'okay', 'tired', 'stressed'];
@@ -472,6 +473,42 @@ async function updateMyContact(clientId, orgId, body) {
   return { mobile: row.mobile, whatsapp: row.whatsapp, address: row.address };
 }
 
+// ── The member's own profile photo ─────────────────────────────────────────
+//
+// Only the trainer could set a client's photo, so 34 of 37 members saw their
+// initials everywhere. A member may now set or remove their own.
+//
+// Stored the way the trainer's upload stores it — a data URL on
+// pt_clients.photo_url — so every screen that already renders a client photo
+// renders this one with no change. Unlike that path, the bytes are checked:
+// only a JPEG, PNG or WebP (by signature, not by the claimed type) under the
+// size cap is accepted. The app crops and downscales to 800 px first, which
+// comes in well under it.
+const PHOTO_MAX_BYTES = 1024 * 1024;
+const DATA_URL_RE = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/;
+
+function parseMyPhoto(raw) {
+  const m = typeof raw === 'string' ? DATA_URL_RE.exec(raw) : null;
+  if (!m) throw new PortalInputError('Use a JPG, PNG or WebP photo.');
+  const bytes = Buffer.from(m[2], 'base64');
+  if (bytes.length === 0) throw new PortalInputError('The photo is empty.');
+  if (bytes.length > PHOTO_MAX_BYTES) throw new PortalInputError('The photo is too large — pick a smaller one.');
+  const detected = detectFileType(bytes, LOGO_IMAGES);
+  if (!detected) throw new PortalInputError('That file is not a JPG, PNG or WebP image.');
+  return `data:${detected.mime};base64,${m[2]}`;
+}
+
+async function setMyPhoto(clientId, orgId, raw) {
+  const photo = raw === null ? null : parseMyPhoto(raw);
+  const { rows } = await pool.query(
+    `UPDATE pt_clients SET photo_url = $3, updated_at = NOW()
+      WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL
+      RETURNING photo_url`,
+    [clientId, orgId, photo],
+  );
+  return rows[0] || null;
+}
+
 // ── The member's own signed forms ───────────────────────────────────────────
 //
 // Their latest PAR-Q (what they declared, and the risk level it came to) and
@@ -733,7 +770,7 @@ async function deleteMyPhoto(clientId, orgId, userId, photoId) {
 module.exports = {
   myAchievements, weekStreaks,
   myPhotos, normalisePhotoMeta, photoUploadsToday, insertMyPhoto, deleteMyPhoto, PHOTO_TYPES, PHOTO_DAILY_LIMIT,
-  updateMyContact, normaliseContact, myForms, myConsentPdfKey,
+  updateMyContact, normaliseContact, setMyPhoto, parseMyPhoto, myForms, myConsentPdfKey,
   myWorkout, myDiet, myCheckins, upsertMyCheckin, mySessions,
   normaliseCheckin, mondayOf, weekNumberSince, PortalInputError, MOODS,
 };

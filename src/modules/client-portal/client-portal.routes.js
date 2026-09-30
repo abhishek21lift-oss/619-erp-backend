@@ -253,6 +253,29 @@ router.patch('/profile', wrap(async (req, res) => {
   }
 }));
 
+// POST /api/me/photo — the member sets their own profile photo (a cropped,
+// downscaled data URL); DELETE removes it. Validation is the service's.
+router.post('/photo', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    const saved = await portal.setMyPhoto(clientId, orgId, req.body?.photo);
+    if (!saved) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Profile not found.' } });
+    res.json({ data: saved });
+  } catch (err) {
+    if (err instanceof portal.PortalInputError) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
+    }
+    throw err;
+  }
+}));
+
+router.delete('/photo', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  const saved = await portal.setMyPhoto(clientId, orgId, null);
+  if (!saved) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Profile not found.' } });
+  res.json({ data: saved });
+}));
+
 // GET /api/me/forms — the member's own latest PAR-Q and informed consent
 router.get('/forms', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);

@@ -497,6 +497,8 @@ const IMAGE_JSON_PATHS = [
   /^\/api\/pt-os\/clients\/[^/]+\/photo$/,
   /^\/api\/progress\/progress-photos$/,
   /^\/api\/pt-os\/informed-consent\/[^/]+\/sign$/,
+  // The member's own profile photo (client-portal.routes.js).
+  /^\/api\/me\/photo$/,
 ];
 app.use((req, res, next) => (
   req.method === 'POST' && IMAGE_JSON_PATHS.some((re) => re.test(req.path))
