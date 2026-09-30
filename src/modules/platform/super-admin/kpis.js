@@ -48,9 +48,15 @@ router.get('/overview/kpis', async (req, res, next) => {
           FROM payment_orders WHERE created_at > NOW() - INTERVAL '30 days'
         ),
         alert_kpis AS (
-          SELECT COUNT(*) FILTER (WHERE severity = 'critical' AND status = 'open')::int AS critical_alerts,
-            COUNT(*) FILTER (WHERE severity = 'high' AND status = 'open')::int AS high_alerts,
-            COUNT(*) FILTER (WHERE severity = 'medium' AND status = 'open')::int AS medium_alerts
+          -- system_alerts grades critical / warning / timeout (alerts.service).
+          -- This read 'high' and 'medium', which are never written, so both
+          -- counts were 0 on every platform. The response keys stay as they
+          -- were for existing consumers: high = warning, medium = timeout.
+          -- "Live" is open OR acknowledged — an acknowledged alert is still a
+          -- condition that has not cleared.
+          SELECT COUNT(*) FILTER (WHERE severity = 'critical' AND status IN ('open','acknowledged'))::int AS critical_alerts,
+            COUNT(*) FILTER (WHERE severity = 'warning' AND status IN ('open','acknowledged'))::int AS high_alerts,
+            COUNT(*) FILTER (WHERE severity = 'timeout' AND status IN ('open','acknowledged'))::int AS medium_alerts
           FROM system_alerts WHERE deleted_at IS NULL
         )
         SELECT ok.total_studios, ok.active_studios, ok.pending_studios, ok.trial_studios, ok.suspended_studios,
