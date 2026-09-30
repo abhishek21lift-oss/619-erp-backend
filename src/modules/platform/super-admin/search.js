@@ -65,7 +65,7 @@ router.get('/search', async (req, res, next) => {
 
     if (kinds.includes('studio')) {
       const { rows } = await pool.query(`
-        SELECT o.id, o.name, o.slug, o.status, o.organization_id AS org_id
+        SELECT o.id, o.name, o.slug, o.status, o.id AS org_id
           FROM organizations o
          WHERE o.name ILIKE $1 ESCAPE '\\' OR o.slug ILIKE $1 ESCAPE '\\'
          ORDER BY o.created_at DESC

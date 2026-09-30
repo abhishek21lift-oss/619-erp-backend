@@ -139,6 +139,9 @@ describe('super-admin API — the H-03 split', () => {
     // Phase 5 — kpis() is the brief's "ONE payload" for the home, replaced
     // the old /overview's many bespoke queries with one snapshot endpoint.
     'GET /overview/kpis',
+    // Added by the Command Center audit: the plan catalogue on the platform
+    // boundary, for the console's plan pickers.
+    'GET /plans',
     'GET /platform-payment-settings',
     'GET /registrations',
     // Phase 5 — CommandBar search (super-admin/search.js). Kinds are

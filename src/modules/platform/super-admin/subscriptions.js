@@ -230,6 +230,26 @@ router.delete('/coupons/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /plans — the plan catalogue, for the console's plan pickers.
+//
+// Finance, Coupons and Announcements each offer a plan selector, and all three
+// were reading /api/subscription/plans. That is a tenant route, and a Command
+// Center session is refused on tenant routes (TENANT_SESSION_REQUIRED), so the
+// selectors silently came up empty and a coupon or an announcement could not
+// be scoped to a plan at all. Same catalogue, same launch pricing, served on
+// the platform boundary.
+router.get('/plans', async (req, res, next) => {
+  try {
+    const plans = await subscription.getPlans();
+    const slots = await subscription.founderSlotsRemaining();
+    const priced = plans.map((p) => {
+      const { amount, isLaunch } = subscription.effectivePrice(p, slots);
+      return { ...p, effective_price_inr: amount, is_launch: isLaunch };
+    });
+    res.json({ data: { plans: priced, founder_slots_remaining: slots, founder_limit: subscription.FOUNDER_LIMIT } });
+  } catch (err) { next(err); }
+});
+
 // GET /subscription-metrics — SaaS health for the command centre.
 //
 // MRR is a RUN-RATE, not cash collected: each active subscription's recurring
@@ -259,8 +279,13 @@ router.get('/subscription-metrics', async (req, res, next) => {
       pool.query(`
         SELECT p.code, p.name, p.price_inr, p.duration_months,
                count(o.id)::int AS studios,
+               -- FILTER, because the LEFT JOIN yields one all-null studio row
+               -- for a plan nobody is on, and COALESCE(o.locked_price_inr,
+               -- p.price_inr) turned that row into the plan's own price: a
+               -- plan with zero studios reported a full month of MRR.
                COALESCE(SUM(COALESCE(o.locked_price_inr, p.price_inr)::numeric
-                            / NULLIF(p.duration_months, 0)), 0)::int AS mrr_inr
+                            / NULLIF(p.duration_months, 0))
+                        FILTER (WHERE o.id IS NOT NULL), 0)::int AS mrr_inr
           FROM subscription_plans p
           LEFT JOIN organizations o
                  ON o.plan_code = p.code

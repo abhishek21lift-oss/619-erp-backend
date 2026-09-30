@@ -145,11 +145,15 @@ router.get('/studios/:id/memberships', async (req, res, next) => {
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
     const { rows } = await pool.query(`
-      SELECT c.id, c.name, c.status, c.start_date, c.end_date,
+      -- pt_clients carries the package as a label (package_type) and the
+      -- term as pt_start_date / pt_end_date. There is no package_id or
+      -- start_date column, and selecting them made this endpoint 500 for
+      -- every studio.
+      SELECT c.id, c.name, c.status,
+             c.pt_start_date AS start_date, c.pt_end_date AS end_date,
              c.paid_amount, c.balance_amount,
-             p.name AS plan_name
+             c.package_type AS plan_name
         FROM pt_clients c
-        LEFT JOIN pt_packages p ON p.id = c.package_id
        WHERE c.organization_id = $1
          AND c.deleted_at IS NULL
        ORDER BY c.created_at DESC
