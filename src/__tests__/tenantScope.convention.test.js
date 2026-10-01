@@ -124,6 +124,13 @@ const REVIEWED_EXCEPTIONS = {
     'Command Center SMTP health collector — reads admin_invitations delivery ' +
     'errors platform-wide, which is the operator console\'s purpose. Mounted ' +
     'under /api/super-admin behind requireSuperAdmin + requireSuperAdminMfa.',
+  'modules/command-center/restart-verification.js':
+    'Command Center recovery ladder (rungs 4-5). Reads and writes only its own ' +
+    'activity_log rows — action IN command_center.worker.restart / ' +
+    'container.restart.requested / container.restart.verified — which are ' +
+    'platform-operator audit rows with no owning organisation, under ' +
+    'runAsPlatform. Reached from /api/super-admin (requireSuperAdmin + MFA) ' +
+    'and from API boot; never from a tenant request.',
   'modules/platform/super-admin/shared.js':
     'audit() logs super-admin actions (organisation suspend/activate, plan ' +
     'changes, impersonation, invitations) that operate ON a tenant from ' +

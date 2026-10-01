@@ -168,8 +168,27 @@ router.post('/command-center/commands/:name', wrap(async (req, res, next) => {
     if (!err.status) return next(err);
     res.status(err.status).json({
       error: { code: err.code || 'COMMAND_FAILED', message: err.message },
+      // What a failed recovery rung checked and found missing, when it has it.
+      ...(err.output ? { data: { output: err.output } } : {}),
     });
   }
+}));
+
+/**
+ * GET /api/super-admin/command-center/commands/container.restart/status/:requestId
+ *
+ * The API restart's result, as recorded by the NEW process once it booted and
+ * read its own health. The process that ran the command could not see it.
+ * `requestId` only selects which audit row to read; it is never used to pick
+ * a container.
+ */
+router.get('/command-center/commands/container.restart/status/:requestId', wrap(async (req, res) => {
+  const id = String(req.params.requestId || '');
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id)) {
+    return res.status(400).json({ error: { code: 'BAD_REQUEST_ID', message: 'Invalid request id' } });
+  }
+  const restartVerification = require('./restart-verification');
+  res.json({ data: await restartVerification.apiRestartStatus(id) });
 }));
 
 // ── Alert Center ────────────────────────────────────────────────────────────

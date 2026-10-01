@@ -27,12 +27,20 @@
 //      request is built. Nothing from a request body is ever interpolated into
 //      a URL or a path.
 //
-//   3. IT TALKS TO A PROXY, NOT THE SOCKET. DOCKER_PROXY_URL points at a
-//      socket-proxy (tecnativa/docker-socket-proxy or equivalent) configured
-//      with POST=1 and everything else off, so the blast radius is bounded by
-//      the proxy's own allow-list as well as by this file. Two independent
-//      constraints, because one of them is in a different repository and can
-//      be misconfigured without this code changing.
+//   3. IT TALKS TO A PROXY, NOT THE SOCKET. DOCKER_PROXY_URL points at
+//      wollomatic/socket-proxy, whose whole allow-list is one regex:
+//      POST /containers/(<api>|<worker>)/restart. Every other method and path
+//      is refused by the proxy (403/405), and only the API container may
+//      connect to it at all. (tecnativa/docker-socket-proxy with POST=1 is NOT
+//      equivalent: it forwards every POST under /containers, including
+//      `create` and `exec` — see docker-compose.yml.) Two independent
+//      constraints, because one of them is deployment config and can be
+//      misconfigured without this code changing.
+//
+//   4. NAMES ARE VALIDATED. A CC_* value that is not a plain Docker container
+//      name — a slash, `..`, a space, an empty string — makes the rung
+//      unavailable rather than reaching the proxy, and the worker and API
+//      targets must differ.
 //
 // ── Off by default, and honest about it ────────────────────────────────────
 //
@@ -73,6 +81,19 @@ function targets() {
   };
 }
 
+/**
+ * Docker's own rule for a container name, minus the dot: [a-zA-Z0-9][a-zA-Z0-9_-]+.
+ * Anything else — a slash that would change the path, `..`, a query string — is
+ * a misconfiguration, and a misconfigured target must not reach the proxy.
+ *
+ * No dot, because the same two names are pasted into the socket-proxy's
+ * allow-list REGEX (docker-compose.yml), where `.` matches any character: a
+ * target named `erp.api` would also allow restarting `erp-api` or `erpXapi`.
+ */
+const CONTAINER_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
+
+const ENV_FOR = { worker: 'CC_WORKER_CONTAINER', api: 'CC_API_CONTAINER' };
+
 function proxyUrl() {
   return process.env.DOCKER_PROXY_URL || null;
 }
@@ -94,11 +115,20 @@ function unavailableReason(target) {
       + 'the API container deliberately has no /var/run/docker.sock of its own.';
   }
   if (target !== undefined) {
-    const name = targets()[target];
+    const map = targets();
+    if (!Object.prototype.hasOwnProperty.call(ENV_FOR, target)) {
+      return `Unknown restart target "${target}".`;
+    }
+    const name = map[target];
     if (!name) {
-      return `No container is configured for "${target}". Set ${
-        target === 'worker' ? 'CC_WORKER_CONTAINER' : 'CC_API_CONTAINER'
-      }.`;
+      return `No container is configured for "${target}". Set ${ENV_FOR[target]}.`;
+    }
+    if (!CONTAINER_NAME_RE.test(name)) {
+      return `${ENV_FOR[target]} is not a valid container name, so the restart is refused.`;
+    }
+    if (map.worker && map.api && map.worker === map.api) {
+      return 'CC_WORKER_CONTAINER and CC_API_CONTAINER name the same container; '
+        + 'restarting the "worker" would take the API down. Refusing both.';
     }
   }
   return null;
@@ -162,5 +192,5 @@ async function restart(target) {
 
 module.exports = {
   restart, isConfigured, unavailableReason, targets,
-  RESTART_PATH, STOP_TIMEOUT_S, REQUEST_TIMEOUT_MS,
+  RESTART_PATH, STOP_TIMEOUT_S, REQUEST_TIMEOUT_MS, CONTAINER_NAME_RE,
 };

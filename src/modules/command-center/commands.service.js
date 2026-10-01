@@ -34,6 +34,7 @@ const pool = require('../../db/pool');
 const email = require('../../lib/email');
 const { QUEUE_NAMES } = require('../../jobs/queue');
 const dockerRecovery = require('./container-recovery');
+const restartVerification = require('./restart-verification');
 const coordination = require('./coordination');
 const queueCollector = require('./collectors/queue.collector');
 
@@ -513,16 +514,12 @@ const COMMANDS = {
         // Honest about where the ladder stops on this deployment.
         next_rung: verdict.outcome === 'recovered' ? null : {
           command: 'worker.restart',
-          available: !dockerRecovery.unavailableReason(),
-          reason: dockerRecovery.unavailableReason(),
+          available: !dockerRecovery.unavailableReason('worker'),
+          reason: dockerRecovery.unavailableReason('worker'),
         },
       };
     },
   },
-
-  // ── Recovery ladder, rungs 4–5 — declared, not yet runnable ───────────────
-  // Present so the console shows the whole ladder and says exactly what is
-  // missing, rather than hiding the rungs and looking complete.
 
   // ── Recovery ladder, rungs 4–5 ────────────────────────────────────────────
   //
@@ -542,10 +539,33 @@ const COMMANDS = {
     destructive: true,
     cooldownMs: 60_000,
     get unavailable() { return dockerRecovery.unavailableReason('worker'); },
+    // A 204 from Docker is not recovery. The result is the worker proving it
+    // came back — fresh connections on every queue, none of the old ones, no
+    // queue starved — or an error that says what is missing. See
+    // restart-verification.js.
     async run() {
+      const sentAt = Date.now();
       const out = await dockerRecovery.restart('worker');
       if (!out.ok) throw new Error(out.reason);
-      return out;
+      const verdict = await restartVerification.verifyWorkerRestart({ sentAt });
+      const result = {
+        ...out,
+        recovered: verdict.outcome === 'recovered',
+        outcome: verdict.outcome,
+        summary: verdict.summary,
+        verified: verdict.verified,
+        next_rung: verdict.outcome === 'recovered' ? null : {
+          command: 'container.restart',
+          available: !dockerRecovery.unavailableReason('api'),
+          reason: dockerRecovery.unavailableReason('api'),
+        },
+      };
+      if (verdict.outcome !== 'recovered') {
+        const err = new Error(verdict.summary);
+        err.output = result;
+        throw err;
+      }
+      return result;
     },
   },
 
@@ -558,10 +578,30 @@ const COMMANDS = {
     destructive: true,
     cooldownMs: 60_000,
     get unavailable() { return dockerRecovery.unavailableReason('api'); },
-    async run() {
+    // The last rung is never the first press: a worker restart must have been
+    // tried within the ladder window. Checked before the confirmation and the
+    // cooldown, so a refusal costs the operator nothing.
+    precondition: () => restartVerification.apiRestartLadderReason(),
+    // This process is the one being restarted, so it cannot see the result.
+    // It records the request first; the new process verifies itself on boot
+    // and writes the outcome (restart-verification.js). The console polls
+    // GET .../commands/container.restart/status/:requestId for it.
+    async run({ req, healthBefore }) {
+      await restartVerification.recordApiRestartRequest(req, { healthBefore });
       const out = await dockerRecovery.restart('api');
-      if (!out.ok) throw new Error(out.reason);
-      return out;
+      if (!out.ok) {
+        await restartVerification.recordApiRestartRefused(req, out.reason);
+        throw new Error(out.reason);
+      }
+      return {
+        ...out,
+        recovered: null,
+        outcome: 'restart_requested',
+        summary: 'Docker accepted the restart. This is NOT yet recovery: the new API process '
+          + 'verifies its own health on boot and records the outcome against request '
+          + `${req?.id ?? '(no id)'}.`,
+        verification: { request_id: req?.id ?? null, poll: 'commands/container.restart/status/:requestId' },
+      };
     },
   },
 };
@@ -614,6 +654,19 @@ async function run(name, { req, queue, confirm, dryRun = false } = {}) {
   // so a bad name is a 400 that never reaches Redis and never burns the
   // cooldown — a rejected request must not lock the operator out of the real one.
   if (cmd.acceptsQueue) assertQueue(queue);
+
+  // Ordering rules (the recovery ladder). Before the confirmation and the
+  // cooldown, like availability: a rung that may not run yet must not make the
+  // operator type its name or lock them out of the rung that may.
+  if (cmd.precondition) {
+    const why = await cmd.precondition();
+    if (why) {
+      const err = new Error(why);
+      err.status = 409;
+      err.code = 'LADDER_ORDER';
+      throw err;
+    }
+  }
 
   // Typed confirmation. Deliberately the command's own name rather than a
   // generic "yes": it cannot be satisfied by a click-through, and it means the
@@ -673,10 +726,13 @@ async function run(name, { req, queue, confirm, dryRun = false } = {}) {
   let output = null;
   let error = null;
   try {
-    output = await cmd.run({ queue, req });
+    output = await cmd.run({ queue, req, healthBefore });
   } catch (err) {
     outcome = 'error';
     error = err.message;
+    // A command that failed its own verification still has a result worth
+    // keeping — what was checked and what was missing.
+    output = err.output ?? null;
     logger.error({ err: err.message, command: name, request_id: req?.id ?? null },
       'command-center command failed');
   }
@@ -718,6 +774,7 @@ async function run(name, { req, queue, confirm, dryRun = false } = {}) {
   if (outcome === 'error') {
     const err = new Error(error);
     err.status = 500;
+    if (output) err.output = output;
     throw err;
   }
 

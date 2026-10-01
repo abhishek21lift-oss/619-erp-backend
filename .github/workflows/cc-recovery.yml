@@ -1,0 +1,44 @@
+name: Command Center recovery — enable on VPS
+
+# Manual only. Runs scripts/deploy/cc-recovery.sh on the VPS, from the copy the
+# backend deploy has already checked out at /opt/myptstudio/619-erp-backend —
+# so it runs exactly what main contains, never a branch.
+#
+#   inspect  read-only: prints the real API/worker containers, networks, the
+#            docker.sock gid, and confirms nothing is exposed yet
+#   apply    backs up the compose config, writes docker-compose.override.yml
+#            (proxy + API env only), starts the proxy, recreates ONLY the API
+#   verify   proves the proxy refuses everything except the two restarts and
+#            that no socket or port is exposed
+#
+# Run inspect first and read it. apply stops on anything ambiguous rather than
+# guessing.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'inspect | apply | verify'
+        required: true
+        default: inspect
+        type: choice
+        options: [inspect, apply, verify]
+
+concurrency:
+  # Never alongside a deploy: both touch the API container.
+  group: deploy-vps-backend
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run cc-recovery.sh ${{ inputs.mode }} on the VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 10m
+          script_stop: true
+          script: bash /opt/myptstudio/619-erp-backend/scripts/deploy/cc-recovery.sh ${{ inputs.mode }}

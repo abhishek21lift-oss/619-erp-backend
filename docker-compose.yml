@@ -60,6 +60,10 @@ services:
       start_period: 5s
 
   api:
+    # A fixed name, because the socket-proxy allow-list and CC_API_CONTAINER
+    # both name this container; a compose-generated `<project>-api-1` would
+    # change with the project directory.
+    container_name: ${CC_API_CONTAINER:-erp-api}
     build:
       context: .
       # Baked into the image, not read at runtime: a production image has no
@@ -113,6 +117,12 @@ services:
       R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
       SENTRY_DSN: ${SENTRY_DSN:-}
+      # Rungs 4-5 of the Command Center recovery ladder. Blank = off (the
+      # console shows the rungs disabled with the reason). See the
+      # docker-socket-proxy service below for what turning them on means.
+      DOCKER_PROXY_URL: ${DOCKER_PROXY_URL:-}
+      CC_API_CONTAINER: ${CC_API_CONTAINER:-erp-api}
+      CC_WORKER_CONTAINER: ${CC_WORKER_CONTAINER:-erp-worker}
     depends_on:
       redis:
         condition: service_healthy
@@ -124,6 +134,7 @@ services:
   # studio at once. RUN_WORKERS=1 on the api service is the single-container
   # alternative if this box cannot spare a second one.
   worker:
+    container_name: ${CC_WORKER_CONTAINER:-erp-worker}
     build:
       context: .
       # The worker needs its own identity for the same reason the api does: it
@@ -211,34 +222,63 @@ services:
 # (modules/command-center/container-recovery.js) builds only that call, so the
 # limit is held in two independent places.
 #
-# To enable: uncomment the service, uncomment the container_name lines on api
-# and worker above so the names are stable rather than compose-generated, set
-# DOCKER_PROXY_URL=http://docker-socket-proxy:2375 plus CC_WORKER_CONTAINER /
-# CC_API_CONTAINER in .env, and check the flags against the README of the
-# image tag you pin (they are command-line flags, not env vars).
+# ── Enabling it ─────────────────────────────────────────────────────────────
 #
-#  docker-socket-proxy:
-#    image: wollomatic/socket-proxy:1
-#    restart: unless-stopped
-#    command:
-#      - '-loglevel=info'
-#      - '-listenip=0.0.0.0'
-#      # Only the api service may connect (compose service name).
-#      - '-allowfrom=api'
-#      # The whole allow-list. Every other method and path is refused.
-#      - '-allowPOST=^(/v[0-9.]+)?/containers/(${CC_API_CONTAINER}|${CC_WORKER_CONTAINER})/restart$$'
-#      - '-watchdoginterval=3600'
-#      - '-stoponwatchdog'
-#      - '-shutdowngracetime=5'
-#    volumes:
-#      - /var/run/docker.sock:/var/run/docker.sock:ro
-#    read_only: true
-#    cap_drop: [ALL]
-#    security_opt: ['no-new-privileges:true']
-#    # Never published to the host. Only the api container reaches it, over
-#    # the compose network by service name.
-#    expose:
-#      - '2375'
+# Opt-in through the `recovery` compose profile, so nothing here starts until a
+# deployment asks for it. In the .env beside this file:
+#
+#   COMPOSE_PROFILES=recovery
+#   DOCKER_PROXY_URL=http://docker-socket-proxy:2375
+#   CC_API_CONTAINER=<api container name>        letters, digits, _ and - only
+#   CC_WORKER_CONTAINER=<worker container name>  (no dots: they are regex here)
+#   DOCKER_GID=<gid of /var/run/docker.sock>     stat -c %g /var/run/docker.sock
+#
+# The flags below were checked against the pinned image itself
+# (`docker run --rm wollomatic/socket-proxy:1.13.1 -help`) and exercised
+# against real containers: the two restarts answer 204; restarting any other
+# container, stop/start/kill/exec/create, images/volumes/networks/build/system,
+# every GET and HEAD, and any client other than the api are refused (403/405).
+# The proxy anchors each pattern with ^...$ itself.
+
+  docker-socket-proxy:
+    profiles: ['recovery']
+    # Pinned by version AND digest. The digest is what was tested.
+    image: wollomatic/socket-proxy:1.13.1@sha256:3935b709275e4ec35d6ed5a5c4a1f0d01ed31eec5e7234efc3357ecd47689002
+    restart: unless-stopped
+    command:
+      - '-loglevel=INFO'
+      # Listen inside the container network. Not published (see `expose`).
+      - '-listenip=0.0.0.0'
+      # Only the api service may connect. Resolved per request, so it follows
+      # the api container across restarts and refuses whoever inherits its IP.
+      - '-allowfrom=api'
+      # The whole allow-list. No other method is set, so every GET, HEAD, PUT,
+      # DELETE and any other POST is refused.
+      - '-allowPOST=(/v[0-9.]+)?/containers/(${CC_API_CONTAINER:-erp-api}|${CC_WORKER_CONTAINER:-erp-worker})/restart'
+      - '-allowhealthcheck'
+      - '-watchdoginterval=3600'
+      - '-stoponwatchdog'
+      - '-shutdowngracetime=5'
+    healthcheck:
+      test: ['CMD', './healthcheck']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # The image runs as nobody (65534); the socket is root:docker 0660, so the
+    # proxy joins the socket's group. Unset falls back to nogroup, which cannot
+    # read the socket: a missing DOCKER_GID fails closed (unhealthy proxy,
+    # restarts refused) rather than being guessed.
+    group_add:
+      - '${DOCKER_GID:-65534}'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    # Never published to the host. Only the api container reaches it, over the
+    # compose network, by service name.
+    expose:
+      - '2375'
 
 volumes:
   redis-data:
