@@ -117,6 +117,7 @@ describe('super-admin API — the H-03 split', () => {
     'GET /command-center/alerts',
     'GET /command-center/cards',
     'GET /command-center/commands',
+    'GET /command-center/commands/container.restart/status/:requestId',
     'GET /command-center/guardian',
     'GET /command-center/logs',
     'GET /command-center/logs/history',

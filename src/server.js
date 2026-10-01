@@ -1102,6 +1102,19 @@ runMigrationsWithRetry()
       }, 'MY PT STUDIO API listening on port %d (%s)', PORT, NODE_ENV);
     });
 
+    // ── Command Center: was this process started by an API restart? ───────
+    //
+    // The process that pressed "Restart API container" died before it could
+    // see the result. If this boot is that result, record the verdict against
+    // the request id the console is polling. Never blocks startup and never
+    // throws — see modules/command-center/restart-verification.js.
+    if (process.env.NODE_ENV !== 'test') {
+      const restartVerification = require('./modules/command-center/restart-verification');
+      const { platformHealth } = require('./modules/command-center/commands.service');
+      restartVerification.verifyPendingApiRestarts({ health: () => platformHealth({ fresh: true }) })
+        .catch((err) => logger.warn({ err: err.message }, 'command-center restart verification failed'));
+    }
+
     // ── Command Center realtime stream (Phase 3) ──────────────────────────
     //
     // Attached to the http.Server, not to Express: an Upgrade is an event on
