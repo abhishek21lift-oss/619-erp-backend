@@ -6,7 +6,28 @@ const { auth } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 const { parseStrict } = require('../lib/zodNumbers');
+const { logActivity } = require('../lib/activityLog');
 const automation = require('../modules/automation/automation.triggers');
+
+// Payments audit PAY-5. The unpaid lifecycle states — the only ones a caller
+// may set directly, on create or on edit. Paying goes through
+// POST /:id/mark-paid, which records the money; cancelling through
+// POST /:id/cancel. Any other status written here would claim money moved, or
+// stopped moving, without the ledger knowing.
+const EDITABLE_STATUSES = ['draft', 'sent', 'overdue'];
+
+/** A line-item price and quantity, parsed as strictly as the simplified path. */
+function itemNumbers(item) {
+  const price = parseStrict(item?.unit_price);
+  if (!price.ok || price.value < 0) return { error: 'unit_price must be a number of 0 or more' };
+  let quantity = 1;
+  if (item?.quantity !== undefined && item.quantity !== null && item.quantity !== '') {
+    const q = parseStrict(item.quantity);
+    if (!q.ok || !Number.isInteger(q.value) || q.value < 1) return { error: 'quantity must be a whole number of 1 or more' };
+    quantity = q.value;
+  }
+  return { price: price.value, quantity };
+}
 
 // GET /api/invoices — List invoices
 router.get('/', auth, async (req, res, next) => {
@@ -116,6 +137,30 @@ router.post('/', auth, async (req, res, next) => {
     const isSimplified = !d.client_id && !d.items?.length && (d.member_name || d.amount);
     if (!isSimplified && !d.client_id && !d.items?.length)
       return res.status(400).json({ error: 'client_id and items[] required' });
+    // Create used to store any status, `paid` included — an invoice born paid
+    // with no payment on the ledger and no change to what the client owes.
+    if (d.status != null && !EDITABLE_STATUSES.includes(d.status)) {
+      return res.status(400).json({
+        error: `status can only be ${EDITABLE_STATUSES.join(', ')} on a new invoice — use Mark as paid or Cancel`,
+      });
+    }
+    // `parseFloat(x) || 0` read '18%' as 18 and a negative rate as a discount.
+    let taxPct = 0;
+    if (d.tax_pct !== undefined && d.tax_pct !== null && d.tax_pct !== '') {
+      const t = parseStrict(d.tax_pct);
+      if (!t.ok || t.value < 0 || t.value > 100) {
+        return res.status(400).json({ error: 'tax_pct must be a number from 0 to 100' });
+      }
+      taxPct = t.value;
+    }
+    const lines = [];
+    if (!isSimplified) {
+      for (const item of d.items || []) {
+        const n = itemNumbers(item);
+        if (n.error) return res.status(400).json({ error: n.error });
+        lines.push({ item, ...n });
+      }
+    }
 
     await tx.query('BEGIN');
 
@@ -167,13 +212,9 @@ router.post('/', auth, async (req, res, next) => {
       }
       subtotal = parsed.value;
     } else {
-      for (const item of d.items) {
-        const amt = (parseFloat(item.unit_price) || 0) * (parseInt(item.quantity) || 1);
-        subtotal += amt;
-      }
+      for (const l of lines) subtotal += l.price * l.quantity;
     }
 
-    const taxPct = parseFloat(d.tax_pct) || 0;
     const taxAmt = subtotal * (taxPct / 100);
     const total = subtotal + taxAmt;
 
@@ -187,13 +228,11 @@ router.post('/', auth, async (req, res, next) => {
     );
 
     if (!isSimplified) {
-      for (const item of d.items) {
-        const amt = (parseFloat(item.unit_price) || 0) * (parseInt(item.quantity) || 1);
+      for (const { item, price, quantity } of lines) {
         await tx.query(`
           INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, amount, type)
           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [randomUUID(), id, item.description, parseInt(item.quantity) || 1,
-           parseFloat(item.unit_price) || 0, amt, item.type || 'other']
+          [randomUUID(), id, item.description, quantity, price, price * quantity, item.type || 'other']
         );
       }
     } else if (d.description) {
@@ -208,6 +247,7 @@ router.post('/', auth, async (req, res, next) => {
     await tx.query('COMMIT');
 
     const { rows } = await pool.query('SELECT * FROM invoices WHERE id=$1', [id]);
+    await logActivity(req, 'invoice.create', 'invoice', id, rows[0]);
     res.status(201).json({ message: 'Invoice created', invoice: rows[0] });
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
@@ -232,12 +272,7 @@ router.put('/:id', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'Cannot update a paid invoice' });
 
     const d = req.body;
-    // Payments audit PAY-5. This took any status string, 'paid' included, so
-    // an invoice could be marked paid with no payment on the ledger, no paid_at
-    // and no change to what the client owes. Paying goes through
-    // POST /:id/mark-paid, which records the money; cancelling through
-    // POST /:id/cancel. Here only the unpaid lifecycle states are settable.
-    const EDITABLE_STATUSES = ['draft', 'sent', 'overdue'];
+    // Only the unpaid lifecycle states are settable (EDITABLE_STATUSES, above).
     if (d.status != null && d.status !== ex[0].status && !EDITABLE_STATUSES.includes(d.status)) {
       return res.status(400).json({
         error: `status can only be set to ${EDITABLE_STATUSES.join(', ')} here — use Mark as paid or Cancel`,
@@ -254,6 +289,7 @@ router.put('/:id', auth, async (req, res, next) => {
       [d.status || ex[0].status, d.payment_method ?? ex[0].payment_method,
        d.notes ?? ex[0].notes, d.due_date ?? ex[0].due_date, req.params.id]
     );
+    await logActivity(req, 'invoice.update', 'invoice', req.params.id, rows[0], ex[0]);
     res.json({ message: 'Invoice updated', invoice: rows[0] });
   } catch (err) {
     next(err);
@@ -272,6 +308,7 @@ router.post('/:id/send', auth, async (req, res, next) => {
       params
     );
     if (!rows[0]) return res.status(404).json({ error: 'Invoice not found or already sent' });
+    await logActivity(req, 'invoice.send', 'invoice', rows[0].id, { status: rows[0].status });
     res.json({ message: 'Invoice sent', invoice: rows[0] });
   } catch (err) {
     next(err);
@@ -372,6 +409,11 @@ router.post('/:id/mark-paid', auth, async (req, res, next) => {
 
     await tx.query('COMMIT');
 
+    await logActivity(req, 'invoice.mark_paid', 'invoice', inv[0].id, {
+      invoice_no: inv[0].invoice_no, client_id: inv[0].client_id, amount_booked: remaining,
+      payment_method: req.body.payment_method || 'CASH',
+    });
+
     // Marking an invoice paid IS money arriving, so the studio's
     // payment_received automation fires here as it does on every other
     // payment path. This one raised nothing, so a client invoiced and marked
@@ -439,6 +481,7 @@ router.post('/:id/cancel', auth, async (req, res, next) => {
       params
     );
     if (!rows[0]) return res.status(404).json({ error: 'Invoice not found or cannot be cancelled' });
+    await logActivity(req, 'invoice.cancel', 'invoice', rows[0].id, { invoice_no: rows[0].invoice_no, status: rows[0].status });
     res.json({ message: 'Invoice cancelled', invoice: rows[0] });
   } catch (err) {
     next(err);

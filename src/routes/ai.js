@@ -69,6 +69,21 @@ const {
 
 const router = express.Router();
 
+/**
+ * What an AI failure may say to the browser.
+ *
+ * The AI layer's own failures are written for users (the router's
+ * ALL_MODELS_FAILED). Everything else that reaches a catch here — a Postgres
+ * error naming a table, a parser's internals, a provider's raw response body —
+ * is for the log, never the response.
+ */
+const PUBLIC_AI_ERROR_CODES = new Set(['ALL_MODELS_FAILED']);
+function publicAiMessage(err) {
+  if (PUBLIC_AI_ERROR_CODES.has(err?.code)) return err.message;
+  logger.error({ err: err?.message, code: err?.code }, 'ai_request_failed');
+  return 'The AI service could not complete this request. Please try again.';
+}
+
 /* ─── Guard ─────────────────────────────────────────────────────────────── */
 function requireConfigured(req, res, next) {
   const apiKey = aiConfig.apiKey();
@@ -521,7 +536,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       if (!rows.length) return res.status(404).json({ error: 'Conversation not found' });
     } catch (err) {
       logger.error({ err: err.message }, 'ai_chat_ownership_check_failed');
-      return res.status(503).json({ error: 'AI chat unavailable', message: err.message });
+      return res.status(503).json({ error: 'AI chat unavailable', message: publicAiMessage(err) });
     }
   }
 
@@ -688,7 +703,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       }
       chatMeta = step.value || null;
     } catch (streamErr) {
-      send({ type: 'error', message: streamErr.message });
+      send({ type: 'error', message: publicAiMessage(streamErr) });
       res.end();
       return;
     }
@@ -716,7 +731,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     send({ type: 'done', conversation_id: convId });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_chat_error');
-    send({ type: 'error', message: err.message || 'AI request failed' });
+    send({ type: 'error', message: publicAiMessage(err) });
   } finally {
     stopHeartbeat();
     if (!res.writableEnded) res.end();
@@ -837,7 +852,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_generate_load_failed');
-    return res.status(503).json({ error: 'AI workout generation failed', message: err.message });
+    return res.status(503).json({ error: 'AI workout generation failed', message: publicAiMessage(err) });
   }
   if (!ctx) return res.status(404).json({ error: 'Client not found' });
 
@@ -1476,7 +1491,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     logger.error({ err: err.message }, 'ai_workout_generate_error');
     if (!res.headersSent) {
       if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-      return res.status(503).json({ error: 'AI workout generation failed', message: err.message });
+      return res.status(503).json({ error: 'AI workout generation failed', message: publicAiMessage(err) });
     }
     send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI workout generation failed. Please try again.' });
   } finally {
@@ -1507,7 +1522,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_diet_generate_load_failed');
-    return res.status(503).json({ error: 'AI diet generation failed', message: err.message });
+    return res.status(503).json({ error: 'AI diet generation failed', message: publicAiMessage(err) });
   }
   if (!ctx) return res.status(404).json({ error: 'Client not found' });
 
@@ -1634,7 +1649,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     logger.error({ err: err.message }, 'ai_diet_generate_error');
     if (!res.headersSent) {
       if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-      return res.status(503).json({ error: 'AI diet generation failed', message: err.message });
+      return res.status(503).json({ error: 'AI diet generation failed', message: publicAiMessage(err) });
     }
     send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI diet generation failed. Please try again.' });
   } finally {
@@ -1769,7 +1784,7 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
     // Headers may or may not have been sent yet depending on where the error occurred
     if (!res.headersSent) {
       if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-      return res.status(503).json({ error: 'Progress analysis failed', message: err.message });
+      return res.status(503).json({ error: 'Progress analysis failed', message: publicAiMessage(err) });
     }
     try {
       res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Progress analysis failed. Please try again.' })}\n\n`);
@@ -1888,7 +1903,7 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
     // Headers may or may not have been sent yet depending on where the error occurred
     if (!res.headersSent) {
       if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-      return res.status(503).json({ error: 'Fitness testing analysis failed', message: err.message });
+      return res.status(503).json({ error: 'Fitness testing analysis failed', message: publicAiMessage(err) });
     }
     try {
       res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Fitness testing analysis failed. Please try again.' })}\n\n`);
@@ -1992,7 +2007,7 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
   } catch (err) {
     logger.error({ err: err.message }, 'ai_business_insights_error');
     if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-    res.status(503).json({ error: 'Business insights failed', message: err.message });
+    res.status(503).json({ error: 'Business insights failed', message: publicAiMessage(err) });
   }
 });
 
@@ -2149,7 +2164,7 @@ router.post('/test', auth, requireTrainer, requireConfigured, async (req, res) =
       used_fallback:result.used_fallback,
     });
   } catch (err) {
-    res.status(503).json({ success: false, message: err.message });
+    res.status(503).json({ success: false, message: publicAiMessage(err) });
   }
 });
 

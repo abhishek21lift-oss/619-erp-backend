@@ -6,6 +6,7 @@ const { auth, requireTrainer } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { planSchemas } = require('../lib/validation');
 const { orgWhere, orgIdOf } = require('../lib/tenant-db');
+const { logActivity } = require('../lib/activityLog');
 
 // GET /api/plans
 router.get('/', auth, async (req, res, next) => {
@@ -86,6 +87,7 @@ router.post('/', auth, requireTrainer, validate(planSchemas.create), async (req,
         orgIdOf(req),
       ]
     );
+    await logActivity(req, 'plan.create', 'plan', rows[0].id, rows[0]);
     res.status(201).json({ message: 'Plan created', plan: rows[0] });
   } catch (err) {
     next(err);
@@ -156,6 +158,8 @@ router.put('/:id', auth, requireTrainer, validate(planSchemas.update), async (re
       upParams
     );
     if (!rows[0]) return res.status(404).json({ error: 'Plan not found' });
+    // Prices: who changed what a membership costs, and from what.
+    await logActivity(req, 'plan.update', 'plan', rows[0].id, rows[0], ex[0]);
     res.json({ message: 'Plan updated', plan: rows[0] });
   } catch (err) {
     next(err);
@@ -172,6 +176,7 @@ router.delete('/:id', auth, requireTrainer, async (req, res, next) => {
       params
     );
     if (!rows[0]) return res.status(404).json({ error: 'Plan not found' });
+    await logActivity(req, 'plan.delete', 'plan', rows[0].id, null);
     res.json({ message: 'Plan deleted' });
   } catch (err) {
     next(err);

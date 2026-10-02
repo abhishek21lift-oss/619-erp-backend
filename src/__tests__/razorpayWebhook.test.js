@@ -133,6 +133,16 @@ describe('the signature gate', () => {
     expect(writes()).toHaveLength(0);
   });
 
+  test('never writes the presented signature into the log', async () => {
+    // A near-miss is the most useful thing an attacker could get written to a
+    // log file — the WhatsApp webhook already refuses to log it; this one did.
+    mockLog.warn.mockClear();
+    const forged = 'b'.repeat(64);
+    await post(appWithSecret(SECRET), captured(), forged);
+    expect(mockLog.warn).toHaveBeenCalled();
+    expect(JSON.stringify(mockLog.warn.mock.calls)).not.toContain(forged);
+  });
+
   test('rejects a signature computed with the wrong secret', async () => {
     const body = captured();
     const res = await post(appWithSecret(SECRET), body, sign(body, 'the-wrong-secret'));
