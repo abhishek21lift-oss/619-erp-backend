@@ -53,7 +53,11 @@ describeIf('assessment audit, against a real database', () => {
       ON CONFLICT (id) DO NOTHING`, [mockUser.id, ORG]);
     await pool.query(`INSERT INTO pt_clients (id, name, mobile, organization_id, workout_experience_level)
       VALUES ($1, 'Audit Client', '+919000012345', $2, 'beginner') ON CONFLICT (id) DO NOTHING`, [CID, ORG]);
-    // A low-risk, submitted PAR-Q so the screening gate lets fitness tests through.
+    // A completed Informed Consent and a low-risk, submitted PAR-Q: a client
+    // who has never had a PT term must be screened before a fitness test
+    // (lib/screeningGate, Phase 2).
+    await pool.query(`INSERT INTO pt_informed_consents (client_id, organization_id, full_name, status)
+      VALUES ($1, $2, 'Audit Client', 'completed')`, [CID, ORG]);
     const answers = Array.from({ length: 10 }, (_, i) => ({ question_id: i + 1, answer: 'no' }));
     await pool.query(`INSERT INTO pt_parq_forms (client_id, full_name, parq_answers, parq_yes_count, risk_level,
         status, workout_gate_status, organization_id, assessment_date)
@@ -74,6 +78,7 @@ describeIf('assessment audit, against a real database', () => {
       await pool.query(`DELETE FROM ${t} WHERE client_id = $1`, [CID]);
     }
     await pool.query('DELETE FROM pt_consent_records WHERE client_id = $1', [CID]);
+    await pool.query('DELETE FROM pt_informed_consents WHERE client_id = $1', [CID]);
     await pool.query('DELETE FROM pt_parq_forms WHERE client_id = $1', [CID]);
     await pool.query('DELETE FROM pt_clients WHERE id = $1', [CID]);
     await pool.query('DELETE FROM users WHERE id = $1', [mockUser.id]);
