@@ -33,10 +33,14 @@ describe('invalid input from the database is a 400', () => {
     ['22008', 'date/time field value out of range: "2026-13-45"'],
   ])('%s answers 400 without echoing the value', (code, message) => {
     logger.error.mockClear();
+    logger.warn.mockClear();
     const res = run({ code, message });
     expect(res.statusCode).toBe(400);
     expect(JSON.stringify(res.body)).not.toMatch(/lots|9999|tomorrow|2026-13/);
     expect(logger.error).not.toHaveBeenCalled();
+    // Still logged: the same codes come from server-side SQL bugs (Phase 5's
+    // UPI approval), and a 400 must not make one invisible.
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ code }), 'db_invalid_input');
   });
 
   it('an unknown database error is still a 500', () => {

@@ -62,10 +62,18 @@ function errorHandler(err, req, res, next) {
   if (err.code === '22001') return res.status(400).json({ error: 'Value too long for field.' });
   // Text Postgres cannot read as the column's type: a number that is not one
   // (22P02), out of range (22003), or a date/time that is not one (22007,
-  // 22008). The caller's error, not a server fault — and never echoed, since
-  // Postgres quotes the offending value in the message.
-  if (err.code === '22P02' || err.code === '22003') return res.status(400).json({ error: 'A value is not a valid number or identifier.' });
-  if (err.code === '22007' || err.code === '22008') return res.status(400).json({ error: 'A date or time is not valid.' });
+  // 22008). Usually the caller's error, so a 400 — never echoing the value,
+  // since Postgres quotes it in the message. But the same codes come from a
+  // server-side SQL bug (a UPI approval did exactly this), so each one is
+  // still logged: a 400 must not hide a defect.
+  if (['22P02', '22003', '22007', '22008'].includes(err.code)) {
+    logger.warn({ err: err.message, code: err.code, method: req.method, url: req.originalUrl }, 'db_invalid_input');
+    return res.status(400).json({
+      error: err.code === '22007' || err.code === '22008'
+        ? 'A date or time is not valid.'
+        : 'A value is not a valid number or identifier.',
+    });
+  }
 
   logger.error({ err: err.message, stack: err.stack, method: req.method, url: req.originalUrl }, 'Unhandled error');
   // M-01: never leak internal error details to clients in production

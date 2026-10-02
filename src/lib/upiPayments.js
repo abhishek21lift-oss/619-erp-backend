@@ -949,9 +949,12 @@ async function approve({ orderId, orgId, actor }, db = pool) {
       // debt is still owed. It used to subtract the new term's price from that
       // debt, so a client owing Rs. 5,000 who paid Rs. 12,000 for a new plan
       // got the term AND had the Rs. 5,000 wiped.
+      //
+      // pt_start_date is a DATE: `NULLIF(pt_start_date, '')` made Postgres
+      // parse '' as a date and failed every plan approval.
       await tx.query(
         `UPDATE pt_clients
-            SET pt_start_date  = COALESCE(NULLIF(pt_start_date, ''), $1),
+            SET pt_start_date  = COALESCE(pt_start_date, $1),
                 pt_end_date    = $2,
                 paid_amount    = paid_amount + $3,
                 status         = 'active',
