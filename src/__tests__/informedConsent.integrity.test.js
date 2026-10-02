@@ -31,9 +31,6 @@ jest.mock('../db/pool', () => ({
     if (/^SELECT \* FROM pt_informed_consents WHERE id = \$1 AND organization_id/.test(text)) return { rows: mockExisting ? [mockExisting] : [] };
     if (/^SELECT id, status, version FROM pt_informed_consents/.test(text)) return { rows: mockPrior };
     if (/^SELECT name AS full_name/.test(text)) return { rows: mockClientLive ? [{ full_name: 'Mina Rao', trainer_id: null }] : [] };
-    if (/^SELECT 1 FROM pt_clients WHERE id = \$1 AND organization_id = \$2 AND deleted_at IS NULL/.test(text)) {
-      return { rows: mockClientLive ? [{}] : [], rowCount: mockClientLive ? 1 : 0 };
-    }
     if (/^INSERT INTO pt_informed_consents/.test(text)) return { rows: [{ id: 'ic-new', status: 'draft' }] };
     return { rows: [] };
   }),

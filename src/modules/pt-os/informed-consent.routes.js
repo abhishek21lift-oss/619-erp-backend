@@ -403,12 +403,11 @@ router.post('/informed-consent/:id/sign', auth, requireTrainer, validate(signSch
   if (['completed', 'revoked', 'archived', 'expired'].includes(existing.status)) {
     return res.status(409).json({ error: { code: 'NOT_SIGNABLE', status: existing.status } });
   }
-  // A consent cannot be completed for a client who has since been deleted.
-  const { rowCount: liveClient } = await pool.query(
-    'SELECT 1 FROM pt_clients WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL',
-    [existing.client_id, scope.orgId]
-  );
-  if (!liveClient) return res.status(409).json({ error: { code: 'CLIENT_DELETED', message: 'This client has been deleted.' } });
+  // A consent cannot be completed for a client who has since been deleted
+  // (fetchClientSnapshot reads only live clients of this studio).
+  if (!await fetchClientSnapshot(existing.client_id, req)) {
+    return res.status(409).json({ error: { code: 'CLIENT_DELETED', message: 'This client has been deleted.' } });
+  }
 
   const acks = existing.acknowledgements || {};
   const allAcked = ACK_KEYS.every((k) => acks[k] === true);
