@@ -11,6 +11,7 @@ const svc = require('./pt-os.service');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
 const { resolveTrainerId, trainerForOrg } = require('../../lib/studioTrainer');
 const { today: studioToday } = require('../../lib/appTime');
+const { hasPtTermSql } = require('../../lib/ptTerm');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
 const { sweepRoster } = require('./client-context');
@@ -391,6 +392,9 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
            END AS due_status
     FROM (
       SELECT c.*,
+             -- Enroll vs Renew is decided from this, never from pt_start_date
+             -- (see lib/ptTerm.js).
+             ${hasPtTermSql('c')} AS has_pt_term,
              CASE
                WHEN c.pt_end_date IS NOT NULL AND c.pt_end_date::TEXT != ''
                THEN c.pt_end_date::DATE - CURRENT_DATE
@@ -496,7 +500,14 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
       }
     }
 
-    const startDate = pt_start_date || studioToday();
+    // A term exists only when one is being created here: an end date was sent,
+    // or a duration to compute it from. A bare add (name, phone, details) is
+    // NOT an enrollment, so it gets no PT dates at all. This used to default
+    // pt_start_date to today for every new client, and the profile read that
+    // date as "enrolled" and offered Renew to people who had never had a term
+    // (see lib/ptTerm.js). joining_date above still records the sign-up day.
+    const creatingTerm = Boolean(pt_end_date) || Number(resolvedDurationMonths) > 0;
+    const startDate = creatingTerm ? (pt_start_date || studioToday()) : (pt_start_date || null);
     let endDate = pt_end_date || null;
     if (!endDate && resolvedDurationMonths && resolvedDurationMonths > 0) {
       const d = new Date(startDate);
@@ -607,6 +618,12 @@ router.post('/clients/:id/renew', auth, requireTrainer, validate(renewSchema), w
   const result = await renewClient(req, req.params.id, req.body);
   if (result.notFound) {
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
+  if (result.notEnrolled) {
+    return res.status(409).json({ error: {
+      code: 'NOT_ENROLLED',
+      message: 'This client has no PT term to renew. Enroll them in PT first.',
+    } });
   }
   if (result.duplicate) {
     return res.status(409).json({ error: { code: 'DUPLICATE_RENEWAL', message: 'This renewal was just recorded — it has not been added twice.' } });
