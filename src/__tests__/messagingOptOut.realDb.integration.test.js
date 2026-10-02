@@ -190,12 +190,13 @@ describeIf('Message opt-out, against a real database', () => {
       const theirs = await client({ org: OTHER_ORG });
       const res = await broadcast([mine, theirs], ['inapp']);
       expect(res.status).toBe(200);
-      expect(res.body.data).toEqual({ count: 1, skipped: 1 });
+      expect(res.body.data).toEqual({ count: 1, skipped: 1, suppressed: 0 });
     });
 
     it('an email opt-out stops the email and records it as suppressed', async () => {
       const id = await client({ email: true });
-      await broadcast([id], ['email']);
+      const res = await broadcast([id], ['email']);
+      expect(res.body.data).toMatchObject({ count: 1, suppressed: 1 });
       expect(mockEmail).not.toHaveBeenCalled();
       const { rows } = await pool.query(
         `SELECT status, error FROM notification_log WHERE recipient_member_id = $1 AND channel = 'email'`, [id]);
