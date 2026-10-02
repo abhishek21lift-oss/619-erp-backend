@@ -238,6 +238,60 @@ async function syncClientAssignments(clientId) {
 }
 
 /**
+ * expireEndedTerms — move every client whose PT term has ended to 'expired'.
+ *
+ * Nothing did this. The daily automation sweep sends the "membership expired"
+ * message the day after a term ends, but it never changed the client, so a
+ * client whose last day had passed stayed 'active' indefinitely: counted as
+ * active on the dashboard and in campaign audiences, and — because
+ * syncClientAssignments only runs when something edits the client — still on
+ * their programme. Production had five such clients when this was written.
+ *
+ * The rule, in one statement so it is atomic and idempotent:
+ *   active AND not deleted AND pt_end_date < the studio's today → expired.
+ * The end date is the term's LAST day, so a term ending today is still live
+ * today (the same reading membershipExpiredYesterday uses for its message).
+ * 'pending', 'frozen' and anything else is left alone: only a running term
+ * can run out. Money, dates and history are not touched — this writes status
+ * and updated_at only, and renewing or re-enrolling makes the client active
+ * again.
+ *
+ * Then every expired client's active programmes are paused through the same
+ * rule syncClientAssignments applies — including any left active by an earlier
+ * path that changed status without syncing. Renew and UPI renewal resume them.
+ *
+ * Platform-wide by design (a worker job with no request): it returns ids
+ * only, reads nothing back to anyone, and each row's change depends on that
+ * row alone, so no studio can affect another's.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.today] 'YYYY-MM-DD'; defaults to the studio's today
+ * @returns {Promise<{ expired: number, paused: number, clientIds: string[] }>}
+ */
+async function expireEndedTerms({ today = studioToday() } = {}) {
+  const { rows } = await pool.query(
+    `UPDATE pt_clients
+        SET status = 'expired', updated_at = NOW()
+      WHERE deleted_at IS NULL
+        AND status = 'active'
+        AND pt_end_date IS NOT NULL
+        AND pt_end_date < $1::date
+      RETURNING id`,
+    [today]
+  );
+  const { rowCount: paused } = await pool.query(
+    `UPDATE workout_assignments a
+        SET status = 'paused', updated_at = NOW()
+       FROM pt_clients c
+      WHERE c.id = a.client_id
+        AND c.deleted_at IS NULL
+        AND c.status = 'expired'
+        AND a.status = 'active'`
+  );
+  return { expired: rows.length, paused, clientIds: rows.map((r) => r.id) };
+}
+
+/**
  * getTodayRoster — THE canonical answer to "who is training today".
  *
  * One rule, one query, two callers: GET /workout-log/today serialises it
@@ -1026,6 +1080,7 @@ async function getTransformations(scope = {}) {
 
 module.exports = {
   syncClientAssignments,
+  expireEndedTerms,
   getTodayRoster,
   getBalanceSheet,
   getActiveClients,

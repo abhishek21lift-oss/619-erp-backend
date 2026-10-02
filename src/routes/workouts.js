@@ -495,9 +495,14 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       orgId: orgIdOf(req),
       userId: req.user.id,
       name: typeof name === 'string' && name.trim() ? name.trim() : null,
+      // Accepting assigns the plan, so it passes the same gate as /assign.
+      gate: (clientId) => checkScreeningGate(req, clientId),
     });
 
     if (!out.ok) {
+      if (out.reason === 'screening_blocked') {
+        return res.status(out.blocked.status).json(out.blocked.body);
+      }
       // 409 for "already accepted" rather than 400: the caller did nothing
       // wrong, the state moved. The existing plan id comes back so the UI can
       // navigate to it instead of showing a failure for work that succeeded.
@@ -545,6 +550,7 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       assigned: out.assigned,
       assignment_id: out.assignment_id,
       other_active_assignments: out.other_active_assignments,
+      screening_warnings: out.screening_warnings,
     });
   } catch (err) {
     next(err);

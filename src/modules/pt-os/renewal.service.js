@@ -24,6 +24,8 @@ const { logActivity } = require('../../lib/activityLog');
 const { tenantScope } = require('../../lib/tenant-db');
 const automation = require('../automation/automation.triggers');
 const { hasPtTerm, termRecordCount } = require('../../lib/ptTerm');
+const logger = require('../../lib/logger');
+const { syncClientAssignments } = require('./pt-os.service');
 
 // The same renewal twice inside this window is a double submit, not a second
 // term: a slow network or a double tap sends the identical request again.
@@ -180,6 +182,12 @@ async function renewClient(req, clientId, d) {
   } finally {
     tx.release();
   }
+
+  // Renewing makes the client active again, so any programme the term-expiry
+  // pass paused comes back (pt-os.service syncClientAssignments). After
+  // COMMIT, and never allowed to fail a renewal that has already been saved.
+  await syncClientAssignments(clientId)
+    .catch((err) => logger.warn({ err: err.message, client_id: clientId }, 'renewal assignment sync failed'));
 
   await logActivity(req, 'client.renew', 'pt_client', clientId, {
     new_start_date: d.pt_start_date, new_end_date: ptEndDate, final_amount: finalAmt, paid_amount: paidNow,

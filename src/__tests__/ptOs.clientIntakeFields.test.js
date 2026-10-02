@@ -17,9 +17,14 @@
 
 const queries = [];
 
-jest.mock('../db/pool', () => ({
+jest.mock('../db/pool', () => {
+  const mockPool = ({
   query: jest.fn(async (sql, params) => {
     queries.push({ sql: String(sql).replace(/\s+/g, ' ').trim(), params });
+    // PATCH /clients/:id locks the client row before it writes anything.
+    if (/SELECT final_amount, paid_amount\b[\s\S]*FROM pt_clients[\s\S]*FOR UPDATE/i.test(String(sql))) {
+      return { rows: [{ final_amount: '0', paid_amount: '0', renewals: 0 }], rowCount: 1 };
+    }
     if (/^INSERT INTO pt_clients/i.test(String(sql).trim())) {
       return { rows: [{ id: 'new-client-id' }], rowCount: 1 };
     }
@@ -32,7 +37,11 @@ jest.mock('../db/pool', () => ({
     return { rows: [], rowCount: 0 };
   }),
   connect: jest.fn(),
-}));
+});
+  // PATCH /clients/:id runs in one transaction; its connection answers like the pool.
+  mockPool.connect = async () => ({ query: (...a) => mockPool.query(...a), release() {} });
+  return mockPool;
+});
 
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 jest.mock('../lib/activityLog', () => ({ logActivity: jest.fn(async () => {}) }));

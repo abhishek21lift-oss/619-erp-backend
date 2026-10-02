@@ -1110,6 +1110,12 @@ async function approve({ orderId, orgId, actor }, db = pool) {
       eventKey: ptPaymentId,
     });
 
+    // An activation makes the member active again, so a programme the
+    // term-expiry pass paused comes back. After COMMIT and never allowed to
+    // fail an approval that has already been saved.
+    await require('../modules/pt-os/pt-os.service').syncClientAssignments(member.id)
+      .catch((err) => logger.warn({ err: err.message, client_id: member.id }, 'upi approval assignment sync failed'));
+
     return {
       order: { ...order, status: ORDER_STATUS.APPROVED },
       submission, activation, member, overpaid,

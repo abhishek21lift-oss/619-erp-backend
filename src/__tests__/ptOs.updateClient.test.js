@@ -20,7 +20,8 @@
 const queries = [];
 let mockExistingRow = { final_amount: '0', paid_amount: '0' };
 
-jest.mock('../db/pool', () => ({
+jest.mock('../db/pool', () => {
+  const mockPool = ({
   query: jest.fn(async (sql, params) => {
     queries.push({ sql: String(sql).replace(/\s+/g, ' ').trim(), params });
     // The pre-check SELECT that reads the current amounts.
@@ -33,7 +34,11 @@ jest.mock('../db/pool', () => ({
     if (/INSERT INTO pt_payments/i.test(sql)) return { rows: [{ id: 'pay-1' }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   }),
-}));
+});
+  // PATCH /clients/:id runs in one transaction; its connection answers like the pool.
+  mockPool.connect = async () => ({ query: (...a) => mockPool.query(...a), release() {} });
+  return mockPool;
+});
 jest.mock('../db/receipts', () => ({ genReceiptNo: jest.fn(async () => 'RCP-20260928-100600') }));
 jest.mock('../modules/automation/automation.triggers', () => ({
   paymentReceived: jest.fn(), memberCreated: jest.fn(), leadCreated: jest.fn(), trialScheduled: jest.fn(),

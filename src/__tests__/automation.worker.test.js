@@ -10,6 +10,8 @@ const mockRunSweep = jest.fn();
 const mockRunRecovery = jest.fn();
 jest.mock('../modules/automation/automation.sweep', () => ({ runSweep: (...a) => mockRunSweep(...a) }));
 jest.mock('../modules/automation/automation.recovery', () => ({ runRecovery: (...a) => mockRunRecovery(...a) }));
+const mockExpire = jest.fn();
+jest.mock('../modules/pt-os/pt-os.service', () => ({ expireEndedTerms: (...a) => mockExpire(...a) }));
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn() }));
 
 const mockUpsert = jest.fn();
@@ -24,8 +26,10 @@ beforeEach(() => {
   mockRunSweep.mockResolvedValue({ orgs: 1 });
   mockRunRecovery.mockResolvedValue({ orgs: 1, requeued: 2 });
   mockUpsert.mockResolvedValue({});
+  mockExpire.mockResolvedValue({ expired: 0, paused: 0, clientIds: [] });
   delete process.env.AUTOMATION_SWEEP_CRON;
   delete process.env.AUTOMATION_RECOVERY_CRON;
+  delete process.env.PT_TERM_EXPIRY_CRON;
 });
 
 describe('job routing', () => {
@@ -53,7 +57,8 @@ describe('cron registration', () => {
     await worker.scheduleAutomationSweep();
 
     const ids = mockUpsert.mock.calls.map(([id]) => id);
-    expect(ids).toEqual([worker.SWEEP_JOB_ID, worker.RECOVERY_JOB_ID]);
+    expect(ids).toEqual([worker.SWEEP_JOB_ID, worker.RECOVERY_JOB_ID, worker.TERM_EXPIRY_JOB_ID]);
+    expect(new Set(ids).size).toBe(3);
     // Distinct ids, or the second upsert would overwrite the first and one of
     // the two passes would simply stop existing.
     expect(worker.SWEEP_JOB_ID).not.toBe(worker.RECOVERY_JOB_ID);
@@ -64,7 +69,7 @@ describe('cron registration', () => {
     // under a name processSweepJob does not handle throws on every fire.
     await worker.scheduleAutomationSweep();
     const names = mockUpsert.mock.calls.map(([, , opts]) => opts.name);
-    expect(names).toEqual(['daily', 'recovery']);
+    expect(names).toEqual(['daily', 'recovery', 'term-expiry']);
     for (const name of names) {
       await expect(worker.processSweepJob({ name })).resolves.toBeDefined();
     }
@@ -98,5 +103,34 @@ describe('cron registration', () => {
     for (const [, , opts] of mockUpsert.mock.calls) {
       expect(opts.opts.attempts).toBe(1);
     }
+  });
+});
+
+// active → expired. Nothing moved a client whose term had ended; this job is
+// the transition (pt-os.service expireEndedTerms), so it has to be both
+// registered and routed, or ended clients stay active forever again.
+describe('PT term expiry', () => {
+  test('the term-expiry job runs the expiry pass and nothing else', async () => {
+    mockExpire.mockResolvedValue({ expired: 2, paused: 1, clientIds: ['a', 'b'] });
+    const out = await worker.processSweepJob({ name: 'term-expiry' });
+    expect(mockExpire).toHaveBeenCalledTimes(1);
+    expect(out.expired).toBe(2);
+    expect(mockRunSweep).not.toHaveBeenCalled();
+    expect(mockRunRecovery).not.toHaveBeenCalled();
+  });
+
+  test('it runs hourly by default, so a missed run is repaired within the hour', async () => {
+    await worker.scheduleAutomationSweep();
+    const call = mockUpsert.mock.calls.find(([id]) => id === worker.TERM_EXPIRY_JOB_ID);
+    expect(call[1].pattern).toBe(worker.DEFAULT_TERM_EXPIRY_CRON);
+    expect(worker.DEFAULT_TERM_EXPIRY_CRON).toMatch(/^\d+ \* \* \* \*$/);
+    expect(call[2].opts.attempts).toBe(1);
+  });
+
+  test('its cron is configurable', async () => {
+    process.env.PT_TERM_EXPIRY_CRON = '10 */2 * * *';
+    await worker.scheduleAutomationSweep();
+    const call = mockUpsert.mock.calls.find(([id]) => id === worker.TERM_EXPIRY_JOB_ID);
+    expect(call[1].pattern).toBe('10 */2 * * *');
   });
 });

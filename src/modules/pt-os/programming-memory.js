@@ -276,8 +276,18 @@ function describeMemory(memory) {
  * The exception is exercises that do not resolve to the library, which are
  * expected rather than exceptional — about one name in eight, measured — and
  * are reported by name and day instead of failing the save.
+ *
+ * ── The safety gate, at accept time ───────────────────────────────────────
+ *
+ * Accepting assigns the plan to the client, so it must pass the same live
+ * PAR-Q / Informed Consent gate as POST /workouts/assign. Checking only when
+ * the plan was GENERATED left a window: a client who was cleared then and is
+ * blocked now (a high-risk PAR-Q, a revoked consent) could still be handed the
+ * programme. `gate(clientId)` is lib/screeningGate's checkScreeningGate, bound
+ * to the request by the route; it runs after the generation is found and
+ * before anything is written, and a block stops the save.
  */
-async function acceptGeneration({ generationId, orgId, userId, name = null } = {}) {
+async function acceptGeneration({ generationId, orgId, userId, name = null, gate = null } = {}) {
   if (!generationId) return { ok: false, reason: 'no_generation' };
 
   const { rows } = await pool.query(
@@ -292,6 +302,13 @@ async function acceptGeneration({ generationId, orgId, userId, name = null } = {
   if (!generation) return { ok: false, reason: 'not_found' };
   if (generation.accepted_plan_id) {
     return { ok: false, reason: 'already_accepted', plan_id: generation.accepted_plan_id };
+  }
+
+  let screeningWarnings = [];
+  if (gate && generation.client_id) {
+    const { blocked, warnings } = await gate(generation.client_id);
+    if (blocked) return { ok: false, reason: 'screening_blocked', blocked };
+    screeningWarnings = warnings || [];
   }
 
   const proposed = generation.proposed_plan || {};
@@ -426,6 +443,7 @@ async function acceptGeneration({ generationId, orgId, userId, name = null } = {
     assignment_id: wasAssigned ? assignmentId : null,
     assigned: wasAssigned,
     other_active_assignments: otherActive,
+    screening_warnings: screeningWarnings,
   };
 }
 
