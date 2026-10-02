@@ -29,6 +29,7 @@ const { recordPtPayment } = require('../../lib/ptPayments');
 const { renewClient } = require('./renewal.service');
 const { genReceiptNo } = require('../../db/receipts');
 const { checkTrainingEligibility, enrolmentScreeningBlock, screeningSummary } = require('../../lib/screeningGate');
+const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
 
 /**
  * Where a client found the studio.
@@ -722,6 +723,19 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
   // number the WhatsApp sender rejects, or "2026-02-30" as an end date all
   // used to be stored. The create schema's rules, applied to the edit.
   const body = req.body;
+  // The same check as the photo upload: an image, by its bytes, under 1 MB.
+  // '' or null removes the photo.
+  if (body.photo_url !== undefined) {
+    if (body.photo_url === '' || body.photo_url === null) body.photo_url = null;
+    else {
+      try {
+        body.photo_url = parseClientPhoto(body.photo_url);
+      } catch (err) {
+        if (!(err instanceof PhotoInputError)) throw err;
+        return res.status(400).json({ error: { code: 'INVALID_PHOTO', field: 'photo_url', message: err.message } });
+      }
+    }
+  }
   for (const key of ['mobile', 'whatsapp', 'emergency_phone']) {
     if (body[key] === '') body[key] = null;
     if (body[key] != null && !INDIAN_MOBILE_RE.test(String(body[key]))) {
@@ -1050,8 +1064,14 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
 
 // ─── Client photo upload ────────────────────────────────────
 router.post('/clients/:id/photo', auth, wrap(async (req, res) => {
-  const { photo } = req.body;
-  if (!photo) return res.status(400).json({ error: { code: 'NO_PHOTO', message: 'No photo data provided' } });
+  if (!req.body.photo) return res.status(400).json({ error: { code: 'NO_PHOTO', message: 'No photo data provided' } });
+  let photo;
+  try {
+    photo = parseClientPhoto(req.body.photo);
+  } catch (err) {
+    if (!(err instanceof PhotoInputError)) throw err;
+    return res.status(400).json({ error: { code: 'INVALID_PHOTO', message: err.message } });
+  }
   const params = [photo, req.params.id];
   const orgClause = orgWhere(req, params);
   const { rows } = await pool.query(
@@ -1234,46 +1254,79 @@ router.delete('/leads/:id', auth, requireTrainer, wrap(async (req, res) => {
 // branch of POST /clients — then hands off to the existing Enroll flow for
 // package/payment details, rather than duplicating that form here.
 router.post('/leads/:id/convert', auth, requireTrainer, wrap(async (req, res) => {
-  const params = [req.params.id];
-  const orgClause = orgWhere(req, params);
-  const { rows: leadRows } = await pool.query(`SELECT * FROM pt_leads WHERE id = $1${orgClause}`, params);
-  if (leadRows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
-  const lead = leadRows[0];
-  if (lead.status === 'converted' && lead.converted_client_id) {
-    return res.status(409).json({
-      error: { code: 'ALREADY_CONVERTED', message: 'This lead has already been converted.' },
-      client_id: lead.converted_client_id,
-    });
+  // One transaction, the lead row locked FOR UPDATE. It used to read the
+  // lead, then insert the client, then mark the lead converted as three
+  // separate statements: two converts of one lead in flight together (a
+  // double tap, a retried request) both saw it unconverted and both created
+  // a client. The second now waits for the first and finds it converted.
+  const tx = await pool.connect();
+  try {
+    await tx.query('BEGIN');
+    const params = [req.params.id];
+    const orgClause = orgWhere(req, params);
+    const { rows: leadRows } = await tx.query(`SELECT * FROM pt_leads WHERE id = $1${orgClause} FOR UPDATE`, params);
+    if (leadRows.length === 0) {
+      await tx.query('ROLLBACK');
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Lead not found' } });
+    }
+    const lead = leadRows[0];
+    if (lead.status === 'converted' && lead.converted_client_id) {
+      await tx.query('ROLLBACK');
+      return res.status(409).json({
+        error: { code: 'ALREADY_CONVERTED', message: 'This lead has already been converted.' },
+        client_id: lead.converted_client_id,
+      });
+    }
+
+    // Same plan-seat check as POST /clients (bare-client branch) — converting a
+    // lead creates a new pt_clients row too, so it must respect the same SaaS
+    // client-limit gate rather than offering a side door around it.
+    const { limit, count, atLimit } = await subscription.clientLimitStatus(orgIdOf(req));
+    if (atLimit) {
+      await tx.query('ROLLBACK');
+      return res.status(403).json({
+        error: {
+          code: 'PLAN_LIMIT_REACHED',
+          message: `You've reached your plan's limit of ${limit} clients. Upgrade your plan to add more.`,
+          limit, count,
+        },
+      });
+    }
+
+    let newClientId;
+    try {
+      const { rows: clientRows } = await tx.query(`
+        INSERT INTO pt_clients
+          (name, mobile, email, status, joining_date, trainer_id, trainer_name, organization_id)
+        VALUES ($1,$2,$3,'pending',CURRENT_DATE,$4,$5,$6)
+        RETURNING id
+      `, [lead.name, lead.mobile, lead.email, lead.trainer_id, lead.trainer_name, orgIdOf(req)]);
+      newClientId = clientRows[0].id;
+    } catch (err) {
+      await tx.query('ROLLBACK');
+      // The studio already has a client on this number (the per-studio unique
+      // index, migration 149). Said in words, and the lead is left as it was.
+      if (err.code === '23505') {
+        return res.status(409).json({ error: {
+          code: 'DUPLICATE_MOBILE',
+          message: 'A client with this mobile number already exists in your studio.',
+        } });
+      }
+      throw err;
+    }
+
+    await tx.query(
+      `UPDATE pt_leads SET status = 'converted', converted_client_id = $2, converted_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [req.params.id, newClientId]
+    );
+    await tx.query('COMMIT');
+    return res.status(201).json({ data: { client_id: newClientId } });
+  } catch (err) {
+    await tx.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    tx.release();
   }
-
-  // Same plan-seat check as POST /clients (bare-client branch) — converting a
-  // lead creates a new pt_clients row too, so it must respect the same SaaS
-  // client-limit gate rather than offering a side door around it.
-  const { limit, count, atLimit } = await subscription.clientLimitStatus(orgIdOf(req));
-  if (atLimit) {
-    return res.status(403).json({
-      error: {
-        code: 'PLAN_LIMIT_REACHED',
-        message: `You've reached your plan's limit of ${limit} clients. Upgrade your plan to add more.`,
-        limit, count,
-      },
-    });
-  }
-
-  const { rows: clientRows } = await pool.query(`
-    INSERT INTO pt_clients
-      (name, mobile, email, status, joining_date, trainer_id, trainer_name, organization_id)
-    VALUES ($1,$2,$3,'pending',CURRENT_DATE,$4,$5,$6)
-    RETURNING id
-  `, [lead.name, lead.mobile, lead.email, lead.trainer_id, lead.trainer_name, orgIdOf(req)]);
-  const newClientId = clientRows[0].id;
-
-  await pool.query(
-    `UPDATE pt_leads SET status = 'converted', converted_client_id = $2, converted_at = NOW(), updated_at = NOW() WHERE id = $1`,
-    [req.params.id, newClientId]
-  );
-
-  res.status(201).json({ data: { client_id: newClientId } });
 }));
 
 // ─── Balance sheet ──────────────────────────────────────────
