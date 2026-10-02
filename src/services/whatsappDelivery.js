@@ -8,6 +8,7 @@
 // channel adapters in notifications.service.js.
 
 const logger = require('../lib/logger');
+const { providerSignal } = require('../lib/providerTimeout');
 
 function twilioWhatsappConfigured(env = process.env) {
   return Boolean(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_WHATSAPP_FROM);
@@ -54,6 +55,7 @@ async function sendText(opts) {
         'Authorization': 'Basic ' + Buffer.from(`${sid}:${token}`).toString('base64'),
       },
       body: params.toString(),
+      signal: providerSignal(),
     });
     const data = await res.json();
     if (!res.ok) {

@@ -15,6 +15,7 @@
 const crypto = require('crypto');
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
+const { providerSignal } = require('../../lib/providerTimeout');
 
 /**
  * A stable idempotency key for one WhatsApp send, derived from the actual
@@ -147,6 +148,7 @@ const channels = {
             'Authorization': 'Basic ' + Buffer.from(`${sid}:${token}`).toString('base64'),
           },
           body: params.toString(),
+          signal: providerSignal(),
         });
         const data = await res.json();
         if (!res.ok) {
@@ -180,6 +182,7 @@ const channels = {
             to: device_token,
             notification: { title, body },
           }),
+          signal: providerSignal(),
         });
         const data = await res.json();
         if (!res.ok || data.failure) {
