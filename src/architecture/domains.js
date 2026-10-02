@@ -258,6 +258,8 @@ const DOMAINS = {
       'body_metrics', 'progress_photos', 'weekly_checkins', 'pt_goals', 'weight_logs',
       // Personal targets the member sets in the member app (migration 212).
       'member_goals',
+      // The Client Interview step of the intake journey (migration 227).
+      'pt_client_interviews',
     ],
   },
 
