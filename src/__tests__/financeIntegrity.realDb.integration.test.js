@@ -121,6 +121,27 @@ describeIf('Finance integrity, against a real database', () => {
     });
   });
 
+  describe('a double-submitted mark-paid books the money once (Phase 4)', () => {
+    it('two concurrent mark-paid requests write one payment and credit the client once', async () => {
+      const { rows: [c] } = await pool.query(
+        `INSERT INTO pt_clients (name, mobile, organization_id, status, final_amount, paid_amount, balance_amount)
+         VALUES ('Twice Client', '9876501299', $1, 'active', 3000, 0, 3000) RETURNING id`, [ORG]);
+      const inv = await newInvoice({ client_id: c.id, items: [{ description: 'PT', unit_price: 3000, quantity: 1 }] });
+
+      const results = await Promise.all([
+        request().post(`/api/invoices/${inv.id}/mark-paid`).send({ payment_method: 'CASH' }),
+        request().post(`/api/invoices/${inv.id}/mark-paid`).send({ payment_method: 'CASH' }),
+      ]);
+      expect(results.map((r) => r.status).sort()).toEqual([200, 404]);
+
+      const { rows: pays } = await pool.query('SELECT amount FROM pt_payments WHERE client_id = $1', [c.id]);
+      expect(pays.map((p) => Number(p.amount))).toEqual([3000]);
+      const { rows: [after] } = await pool.query('SELECT paid_amount, balance_amount FROM pt_clients WHERE id = $1', [c.id]);
+      expect(Number(after.paid_amount)).toBe(3000);
+      expect(Number(after.balance_amount)).toBe(0);
+    });
+  });
+
   describe('structured invoice amounts are parsed strictly', () => {
     it.each([
       ['a negative price', { unit_price: -500, quantity: 1 }],

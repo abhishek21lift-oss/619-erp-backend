@@ -190,7 +190,7 @@ Honestly, so nobody reads this document and concludes the problem is solved:
 | Gap | Why it matters |
 |---|---|
 | **No PITR** | The stopgap's RPO is up to 24 hours. A bad afternoon still loses an afternoon of check-ins, payments and assessments. Only a paid plan fixes this. |
-| **Nothing schedules the script yet** | It is committed, verified, and **not running anywhere**. Until it is scheduled on a real host, the posture in §1 is unchanged. |
-| **No restore drill on real data** | Proven against a seeded throwaway database, not against a production-sized dump. An untested restore is a hypothesis. |
+| **Off-site copy failing (as of 2026-10-02)** | `.github/workflows/backup.yml` runs the script nightly on the VPS. The dump succeeds (7.5 MiB, 235 tables on 2026-10-02) and is kept in `/var/backups/619`, but **every run fails at the upload** — `The specified bucket does not exist` (R2 bucket `db-backups`, or `BACKUP_R2_BUCKET` if set). Until the bucket exists, the only copies are on the same host as the application. Runs #8–#17 all failed. |
+| **No restore drill on real data** | `scripts/restore-drill.js` restores a dump into a new, empty database and requires every `public` table's row count to match the source; `backupRestore.realDb.integration.test.js` runs the nightly script and the drill end to end in CI. It has not yet been run against a production dump — do that on a throwaway database: `node scripts/restore-drill.js <dump> <empty-db-url> --compare <source-url>`. |
 | **R2 backup/versioning unverified** | Uploaded files are outside the dump; their retention has not been confirmed. |
 | **No monitoring of backup success** | A job that stops running needs to page someone. Right now nothing would notice. |

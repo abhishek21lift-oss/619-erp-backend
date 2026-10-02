@@ -53,7 +53,7 @@ async function clearStaleLock(client) {
   }
 }
 
-async function runMigrations() {
+async function runMigrations({ dir = path.join(__dirname, 'migrations') } = {}) {
   const client = await pool.connect();
 
   // Surface what the migrations themselves say.
@@ -106,7 +106,6 @@ async function runMigrations() {
       )
     `);
 
-    const dir   = path.join(__dirname, 'migrations');
     const files = fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort();
 
     for (const file of files) {
