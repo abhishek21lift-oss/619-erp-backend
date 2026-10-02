@@ -35,7 +35,9 @@ router.post('/', async (req, res) => {
   const expBuf = Buffer.from(expected, 'hex');
 
   if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-    logger.warn({ signature }, 'Razorpay webhook signature mismatch');
+    // Never log the presented signature: a near-miss is exactly what an
+    // attacker would want written to a log file.
+    logger.warn({ ip: req.ip }, 'Razorpay webhook signature mismatch');
     return res.status(400).json({ error: 'Invalid signature' });
   }
 

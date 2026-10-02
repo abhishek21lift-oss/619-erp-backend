@@ -2,6 +2,15 @@ const router = require('express').Router();
 const pool = require('../db/pool');
 const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const { parseStrict } = require('../lib/zodNumbers');
+const { logActivity } = require('../lib/activityLog');
+
+/** An expense amount: a real number above zero, or why not. */
+function amountError(raw) {
+  const a = parseStrict(raw);
+  if (!a.ok || a.value <= 0) return 'amount is required and must be a positive number';
+  return null;
+}
 
 // The studio's expenses belong to the studio, and the trainer owns it: every
 // row in the organization, not only the ones this account created. The guard
@@ -92,8 +101,10 @@ router.get('/stats', auth, async (req, res, next) => {
 router.post('/', auth, async (req, res, next) => {
   try {
     const d = req.body;
-    if (!d.amount || d.amount <= 0)
-      return res.status(400).json({ error: 'amount is required and must be positive' });
+    // `d.amount <= 0` let 'lots' through ('lots' <= 0 is false), and the
+    // database then failed the insert as a 500.
+    const amountProblem = amountError(d.amount);
+    if (amountProblem) return res.status(400).json({ error: amountProblem });
     if (!d.description)
       return res.status(400).json({ error: 'description is required' });
 
@@ -114,6 +125,7 @@ router.post('/', auth, async (req, res, next) => {
         orgIdOf(req),
       ]
     );
+    await logActivity(req, 'expense.create', 'expense', rows[0].id, rows[0]);
     res.status(201).json({ message: 'Expense created', expense: rows[0] });
   } catch (err) {
     next(err);
@@ -156,6 +168,10 @@ router.put('/:id', auth, async (req, res, next) => {
     const params = [req.params.id];
     let idx = 2;
     const d = req.body;
+    if (d.amount !== undefined) {
+      const amountProblem = amountError(d.amount);
+      if (amountProblem) return res.status(400).json({ error: amountProblem });
+    }
 
     for (const key of ['category', 'description', 'amount', 'expense_date', 'payment_method', 'receipt_url', 'notes', 'status']) {
       if (d[key] !== undefined) {
@@ -171,6 +187,7 @@ router.put('/:id', auth, async (req, res, next) => {
       `UPDATE expenses SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $1 AND organization_id = $${idx} RETURNING *`,
       params
     );
+    await logActivity(req, 'expense.update', 'expense', req.params.id, rows[0], existing[0]);
     res.json({ message: 'Expense updated', expense: rows[0] });
   } catch (err) {
     next(err);
@@ -190,6 +207,7 @@ router.delete('/:id', auth, async (req, res, next) => {
     if (!existing[0]) return res.status(404).json({ error: 'Expense not found' });
 
     await pool.query('UPDATE expenses SET deleted_at = NOW() WHERE id = $1 AND organization_id = $2', [req.params.id, scope.orgId]);
+    await logActivity(req, 'expense.delete', 'expense', req.params.id, null, existing[0]);
     res.json({ message: 'Expense deleted' });
   } catch (err) {
     next(err);

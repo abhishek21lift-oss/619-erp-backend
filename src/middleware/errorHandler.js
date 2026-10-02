@@ -60,6 +60,12 @@ function errorHandler(err, req, res, next) {
   if (err.code === '23514') return res.status(400).json({ error: 'Value violates a data integrity constraint.' });
   if (err.code === '23503') return res.status(409).json({ error: 'Referenced record does not exist.' });
   if (err.code === '22001') return res.status(400).json({ error: 'Value too long for field.' });
+  // Text Postgres cannot read as the column's type: a number that is not one
+  // (22P02), out of range (22003), or a date/time that is not one (22007,
+  // 22008). The caller's error, not a server fault — and never echoed, since
+  // Postgres quotes the offending value in the message.
+  if (err.code === '22P02' || err.code === '22003') return res.status(400).json({ error: 'A value is not a valid number or identifier.' });
+  if (err.code === '22007' || err.code === '22008') return res.status(400).json({ error: 'A date or time is not valid.' });
 
   logger.error({ err: err.message, stack: err.stack, method: req.method, url: req.originalUrl }, 'Unhandled error');
   // M-01: never leak internal error details to clients in production
