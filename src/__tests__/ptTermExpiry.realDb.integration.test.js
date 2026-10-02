@@ -45,6 +45,7 @@ describeIf('PT term expiry, against a real database', () => {
   let request;
   const clients = [];
   const plans = [];
+  const exercises = [];
   const TODAY = '2026-10-02';
 
   beforeAll(async () => {
@@ -64,7 +65,9 @@ describeIf('PT term expiry, against a real database', () => {
 
   afterAll(async () => {
     await pool.query('DELETE FROM workout_assignments WHERE client_id = ANY($1)', [clients]);
+    await pool.query('DELETE FROM workout_exercises WHERE workout_plan_id = ANY($1)', [plans]);
     await pool.query('DELETE FROM workout_plans WHERE id = ANY($1)', [plans]);
+    await pool.query('DELETE FROM exercises WHERE id = ANY($1)', [exercises]);
     for (const t of ['pt_payments', 'pt_client_renewals', 'pt_client_subscriptions']) {
       await pool.query(`DELETE FROM ${t} WHERE client_id = ANY($1)`, [clients]);
     }
@@ -178,5 +181,39 @@ describeIf('PT term expiry, against a real database', () => {
     expect(res.status).toBe(200);
     expect((await row(id)).status).toBe('active');
     expect(await plansOf(id)).toEqual(['active']);
+  });
+
+  describe('Today roster around the term boundary', () => {
+    // A client on a programme that prescribes every day, so the weekday never
+    // decides; only the term does.
+    async function rostered(end) {
+      const id = await client({ end });
+      const planId = randomUUID();
+      plans.push(planId);
+      await pool.query(`INSERT INTO workout_plans (id, name, organization_id) VALUES ($1, 'Daily', $2)`, [planId, ORG]);
+      const exerciseId = randomUUID();
+      exercises.push(exerciseId);
+      await pool.query(`INSERT INTO exercises (id, name, muscle_group) VALUES ($1, 'Roster Squat', 'Legs')`, [exerciseId]);
+      for (let dow = 1; dow <= 7; dow += 1) {
+        await pool.query(`INSERT INTO workout_exercises (id, workout_plan_id, exercise_id, day_of_week, sort_order)
+                          VALUES ($1, $2, $3, $4, 0)`, [randomUUID(), planId, exerciseId, dow]);
+      }
+      await pool.query(`INSERT INTO workout_assignments (id, workout_plan_id, client_id, status, start_date, organization_id)
+                        VALUES ($1, $2, $3, 'active', '2026-01-01', $4)`, [randomUUID(), planId, id, ORG]);
+      return id;
+    }
+    const onRoster = async (date, id) => (await svc.getTodayRoster({ date, scope: { orgId: ORG } }))
+      .rows.some((r) => (r.client_id ?? r.id) === id);
+
+    it('a client is on the roster on the last day of their term', async () => {
+      const id = await rostered('2026-10-02');
+      expect(await onRoster('2026-10-02', id)).toBe(true);
+    });
+
+    it('the day after, they are off it — even before the expiry pass has run', async () => {
+      const id = await rostered('2026-10-02');
+      expect((await row(id)).status).toBe('active');
+      expect(await onRoster('2026-10-03', id)).toBe(false);
+    });
   });
 });

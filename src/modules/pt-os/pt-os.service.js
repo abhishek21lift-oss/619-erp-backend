@@ -390,6 +390,10 @@ async function getTodayRoster({ date, scope = {} } = {}) {
          JOIN pt_clients wc ON wc.id = wa.client_id
                            AND wc.deleted_at IS NULL
                            AND wc.status = 'active'
+                           -- The term's last day is a training day; the day
+                           -- after is not, even in the hour before the
+                           -- term-expiry pass has moved the client to expired.
+                           AND (wc.pt_end_date IS NULL OR wc.pt_end_date >= $1::date)
         WHERE wa.status = 'active'
           AND wa.start_date <= $1::date
           AND (wa.end_date IS NULL OR wa.end_date >= $1::date)
@@ -404,6 +408,7 @@ async function getTodayRoster({ date, scope = {} } = {}) {
          FROM pt_clients c2
         WHERE c2.deleted_at IS NULL
           AND c2.status = 'active'
+          AND (c2.pt_end_date IS NULL OR c2.pt_end_date >= $1::date)
           AND c2.preferred_training_days IS NOT NULL
           AND $3 = ANY(string_to_array(replace(c2.preferred_training_days, ' ', ''), ','))
           AND c2.organization_id = $4
