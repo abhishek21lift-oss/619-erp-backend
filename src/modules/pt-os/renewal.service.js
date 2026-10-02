@@ -23,6 +23,7 @@ const { trainerForOrg } = require('../../lib/studioTrainer');
 const { logActivity } = require('../../lib/activityLog');
 const { tenantScope } = require('../../lib/tenant-db');
 const automation = require('../automation/automation.triggers');
+const { hasPtTerm, termRecordCount } = require('../../lib/ptTerm');
 
 // The same renewal twice inside this window is a double submit, not a second
 // term: a slow network or a double tap sends the identical request again.
@@ -48,7 +49,7 @@ const round2 = (n) => Math.round(Number(n) * 100) / 100;
  * @param {string} clientId
  * @param {object} d  validated body (see renewSchema in pt-os.routes.js)
  * @returns {Promise<
- *   {notFound: true} | {duplicate: true} | {overpaid: number, owed: number} |
+ *   {notFound: true} | {notEnrolled: true} | {duplicate: true} | {overpaid: number, owed: number} |
  *   {client: object, paymentId: string|null}
  * >}
  */
@@ -80,6 +81,15 @@ async function renewClient(req, clientId, d) {
     );
     client = found[0];
     if (!client) { await tx.query('ROLLBACK'); return { notFound: true }; }
+
+    // A renewal continues a term, so there must be one. A client who was
+    // never enrolled is enrolled, not renewed: renewing them would write a
+    // renewal row, and the enroll screen then refuses them for "having renewed
+    // before" — the trap the old `!!pt_start_date` check led trainers into.
+    if (!hasPtTerm(client, await termRecordCount(tx, clientId))) {
+      await tx.query('ROLLBACK');
+      return { notEnrolled: true };
+    }
 
     // Under the lock, so two concurrent submits cannot both pass this check.
     const { rowCount: dupes } = await tx.query(
