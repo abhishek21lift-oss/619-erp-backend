@@ -35,7 +35,7 @@ jest.mock('../db/pool', () => ({
 }));
 jest.mock('../lib/orgGuard', () => ({ clientInOrg: jest.fn(async () => true) }));
 jest.mock('../lib/screeningGate', () => ({
-  checkScreeningGate: jest.fn(async () => ({ blocked: mockBlocked, warnings: [] })),
+  checkTrainingEligibility: jest.fn(async () => ({ blocked: mockBlocked, warnings: [] })),
 }));
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 jest.mock('../middleware/auth', () => ({

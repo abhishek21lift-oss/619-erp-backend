@@ -64,6 +64,8 @@ jest.mock('../../lib/logger', () => ({
 jest.mock('../../lib/activityLog', () => ({ logActivity: jest.fn(async () => {}) }));
 jest.mock('../../lib/screeningGate', () => ({
   checkScreeningGate: jest.fn(async () => ({ blocked: null, warnings: [] })),
+  checkTrainingEligibility: jest.fn(async () => ({ blocked: null, warnings: [] })),
+  enrolmentScreeningBlock: jest.fn(async () => null),
 }));
 jest.mock('../../modules/automation/automation.engine', () => ({
   memberCreated: jest.fn(async () => {}),
@@ -114,7 +116,7 @@ describe('POST /pt-os/clients — the body client_id is not a key to another stu
 
   test('the update that enrols an existing client is bound to the caller organization', async () => {
     mockAnswers = [
-      [],   // trainer lookup (no trainer_id sent)
+      [{ has_pt_term: true }],  // the term pre-read (asserted org-bound below)
       [],   // the UPDATE: no row in THIS studio with that id
     ];
 
@@ -128,6 +130,10 @@ describe('POST /pt-os/clients — the body client_id is not a key to another stu
     const update = stmt(/UPDATE pt_clients SET/i);
     expect(update).toBeTruthy();
     expect(update.sql).toMatch(/WHERE id = \$1 AND deleted_at IS NULL AND organization_id = \$20/);
+    // The screening pre-read that enrolment now does is bound to the studio too.
+    const termRead = stmt(/AS has_pt_term FROM pt_clients c/i);
+    expect(termRead.sql).toMatch(/c\.organization_id = \$2/);
+    expect(termRead.params).toEqual([FOREIGN, ORG_A]);
     expect(update.params[19]).toBe(ORG_A);
     expect(update.params).not.toContain(ORG_B);
   });

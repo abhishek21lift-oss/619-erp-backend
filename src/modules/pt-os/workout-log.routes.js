@@ -18,7 +18,7 @@ const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { logActivity } = require('../../lib/activityLog');
 const { calc1RM } = require('../progress/fitness-scoring');
-const { checkScreeningGate } = require('../../lib/screeningGate');
+const { checkTrainingEligibility } = require('../../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 // The canonical Today rule. This adapter serialises it; it does not
 // re-implement it — see pt-os.service.getTodayRoster.
@@ -284,11 +284,11 @@ router.post('/workout-log/sessions', auth, requireTrainer, validate(sessionCreat
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
-  // Same PAR-Q + Informed Consent gate as plan assignment — logging a
-  // session is training just as much as following an assigned plan, so it
-  // gets the same clearance rule: explicit medical blocks stop the action,
-  // missing paperwork proceeds with warnings for the UI to surface.
-  const { blocked, warnings } = await checkScreeningGate(req, b.client_id);
+  // Same eligibility as plan assignment — logging a session is training just
+  // as much as following an assigned plan: the client must be enrolled with a
+  // running term, and the medical stops apply. Missing paperwork on an
+  // enrolled client proceeds with warnings for the UI to surface.
+  const { blocked, warnings } = await checkTrainingEligibility(req, b.client_id, { action: 'workout_log' });
   if (blocked) return res.status(blocked.status).json(blocked.body);
 
   // Starting is idempotent, dated in the studio's zone, and links the

@@ -41,7 +41,7 @@ jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
   requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
-jest.mock('../lib/screeningGate', () => ({ checkScreeningGate: jest.fn(async () => ({ blocked: null, warnings: [] })) }));
+jest.mock('../lib/screeningGate', () => ({ checkTrainingEligibility: jest.fn(async () => ({ blocked: null, warnings: [] })) }));
 
 const request = require('supertest');
 const express = require('express');
@@ -315,20 +315,20 @@ describe('the proposal has to actually reach the client', () => {
 // gate as POST /assign. The gate ran only when the plan was generated, so a
 // client blocked since then could still be handed the programme.
 describe('the screening gate, at accept time', () => {
-  const { checkScreeningGate } = require('../lib/screeningGate');
-  afterEach(() => checkScreeningGate.mockImplementation(async () => ({ blocked: null, warnings: [] })));
+  const { checkTrainingEligibility } = require('../lib/screeningGate');
+  afterEach(() => checkTrainingEligibility.mockImplementation(async () => ({ blocked: null, warnings: [] })));
 
   it('checks the generation\'s own client, with this request', async () => {
-    checkScreeningGate.mockClear();
+    checkTrainingEligibility.mockClear();
     await post();
-    expect(checkScreeningGate).toHaveBeenCalledTimes(1);
-    const [req, clientId] = checkScreeningGate.mock.calls[0];
+    expect(checkTrainingEligibility).toHaveBeenCalledTimes(1);
+    const [req, clientId] = checkTrainingEligibility.mock.calls[0];
     expect(clientId).toBe('cl-1');
     expect(req.user).toBe(TRAINER);
   });
 
   it('a blocked client gets the gate\'s 403 and nothing is written', async () => {
-    checkScreeningGate.mockImplementation(async () => ({
+    checkTrainingEligibility.mockImplementation(async () => ({
       blocked: { status: 403, body: { error: 'revoked', code: 'CONSENT_REVOKED' } }, warnings: [],
     }));
     const res = await post();
@@ -341,7 +341,7 @@ describe('the screening gate, at accept time', () => {
   });
 
   it('missing paperwork proceeds, and the warnings come back like /assign\'s', async () => {
-    checkScreeningGate.mockImplementation(async () => ({ blocked: null, warnings: ['No PAR-Q on file.'] }));
+    checkTrainingEligibility.mockImplementation(async () => ({ blocked: null, warnings: ['No PAR-Q on file.'] }));
     const res = await post();
 
     expect(res.status).toBe(201);
@@ -350,10 +350,10 @@ describe('the screening gate, at accept time', () => {
   });
 
   it('runs after the studio check: another studio\'s id never reaches the gate', async () => {
-    checkScreeningGate.mockClear();
+    checkTrainingEligibility.mockClear();
     mockDb({ generation: null });
     const res = await post();
     expect(res.status).toBe(404);
-    expect(checkScreeningGate).not.toHaveBeenCalled();
+    expect(checkTrainingEligibility).not.toHaveBeenCalled();
   });
 });

@@ -43,6 +43,8 @@ jest.mock('../middleware/auth', () => ({
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 
+const { screenClient, unscreenClients } = require('./helpers/screening');
+
 describeIf('Enroll vs Renew, against a real database', () => {
   let pool;
   let request;
@@ -67,6 +69,7 @@ describeIf('Enroll vs Renew, against a real database', () => {
     for (const t of ['pt_payments', 'pt_client_renewals', 'pt_client_subscriptions']) {
       await pool.query(`DELETE FROM ${t} WHERE client_id = ANY($1)`, [ids]);
     }
+    await unscreenClients(pool, ids);
     await pool.query('DELETE FROM activity_log WHERE user_id = $1', [USER]);
     await pool.query('DELETE FROM pt_clients WHERE id = ANY($1)', [ids]);
     await pool.query('DELETE FROM users WHERE id = $1', [USER]);
@@ -80,6 +83,9 @@ describeIf('Enroll vs Renew, against a real database', () => {
     const res = await request().post('/api/pt-os/clients').send({ name: 'Client', mobile, ...body });
     if (res.status !== 201) throw new Error(`create ${res.status}: ${JSON.stringify(res.body)}`);
     made.push(res.body.data.id);
+    // Enrolment needs completed screening (lib/screeningGate); these suites
+    // test enrolment and renewal, so every client they make is screened.
+    await screenClient(pool, { clientId: res.body.data.id, orgId: ORG });
     return res.body.data;
   }
   const profile = async (id) => (await request().get(`/api/pt-os/clients/${id}`)).body.data;
@@ -164,18 +170,25 @@ describeIf('Enroll vs Renew, against a real database', () => {
 
   it('an expired term is still a term: Renew, not Enroll', async () => {
     const c = await create({});
-    await enroll(c.id, { pt_start_date: '2025-01-01', pt_end_date: '2025-04-01' });
+    // A term that has already ended is entered as expired: 'active' with an
+    // end date in the past is refused (TERM_EXPIRED).
+    expect((await enroll(c.id, { pt_start_date: '2025-01-01', pt_end_date: '2025-04-01' })).body.error.code)
+      .toBe('TERM_EXPIRED');
+    await enroll(c.id, { status: 'expired', pt_start_date: '2025-01-01', pt_end_date: '2025-04-01' });
     const p = await profile(c.id);
     expect(p.days_left).toBeLessThan(0);
     expect(p.has_pt_term).toBe(true);
     expect((await renew(c.id, { pt_start_date: '2026-10-02' })).status).toBe(200);
   });
 
-  it('a client created WITH a package is enrolled at creation', async () => {
-    const c = await create({ duration_months: 2, base_amount: 8000 });
-    expect(c.pt_start_date).toBeTruthy();
-    expect(c.pt_end_date).toBeTruthy();
-    expect((await profile(c.id)).has_pt_term).toBe(true);
+  it('a client cannot be created WITH a package: screening comes first', async () => {
+    // Enrolling at creation would skip consent and PAR-Q, which cannot exist
+    // before the client does. Add, screen, then enrol.
+    const res = await request().post('/api/pt-os/clients').send({
+      name: 'Package Client', mobile: `93${String(Date.now()).slice(-8)}`, duration_months: 2, base_amount: 8000,
+    });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('SCREENING_REQUIRED');
   });
 
   it('a legacy client with renewal history but a cleared end date can still be renewed', async () => {

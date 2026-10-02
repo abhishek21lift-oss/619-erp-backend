@@ -5,7 +5,7 @@ const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { tenantScope, orgIdOf, orgWhere } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
-const { checkScreeningGate } = require('../../lib/screeningGate');
+const { checkTrainingEligibility } = require('../../lib/screeningGate');
 const scoring = require('./fitness-scoring');
 const goalScoring = require('./goal-scoring');
 const lifestyleScoring = require('./lifestyle-scoring');
@@ -334,8 +334,11 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
   // Fitness testing includes maximal efforts — a 1RM, a step test, endurance
   // to failure — so the same medical stop that guards assigning a workout
   // guards recording one of these. Missing paperwork is only a warning here
-  // too, returned as screening_warnings.
-  const { blocked, warnings: screeningWarnings } = await checkScreeningGate(req, b.client_id);
+  // too, returned as screening_warnings — except for a NEW client (no PT term
+  // yet), whose screening must be complete before they are tested. Testing
+  // comes before enrolment in the intake journey, so status is not checked.
+  const { blocked, warnings: screeningWarnings } = await checkTrainingEligibility(
+    req, b.client_id, { requireActive: false, action: 'fitness_test' });
   if (blocked) return res.status(blocked.status).json(blocked.body);
 
   const { age, gender } = await demographics(req, b.client_id, b);

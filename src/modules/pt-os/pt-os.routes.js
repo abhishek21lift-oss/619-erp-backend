@@ -28,6 +28,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { recordPtPayment } = require('../../lib/ptPayments');
 const { renewClient } = require('./renewal.service');
 const { genReceiptNo } = require('../../db/receipts');
+const { checkTrainingEligibility, enrolmentScreeningBlock } = require('../../lib/screeningGate');
 
 /**
  * Where a client found the studio.
@@ -441,6 +442,32 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
     // Only ever a trainer profile in this studio — see lib/studioTrainer.js.
     const trainer_id = await resolveTrainerId(pool, orgIdOf(req), req.body.trainer_id);
 
+    // Enrolling here would skip screening. A new client cannot have signed a
+    // consent or answered a PAR-Q before they exist, so a package on create is
+    // refused: add the client, screen them, then enrol (PATCH /clients/:id).
+    // An existing client named by client_id is held to the same rule as
+    // enrolment if they have never had a term.
+    const wantsTerm = Boolean(pt_end_date) || Number(duration_months) > 0 || Boolean(pt_package_id);
+    if (wantsTerm && !client_id) {
+      return res.status(409).json({ error: {
+        code: 'SCREENING_REQUIRED',
+        message: 'Add the client first, complete their Informed Consent and PAR-Q, then enrol them in PT.',
+        missing: ['informed_consent', 'parq'],
+      } });
+    }
+    if (wantsTerm && client_id) {
+      const tParams = [client_id];
+      const tOrg = orgWhere(req, tParams, 'c.organization_id');
+      const { rows: [termRow] } = await pool.query(
+        `SELECT ${hasPtTermSql('c')} AS has_pt_term FROM pt_clients c
+          WHERE c.id = $1 AND c.deleted_at IS NULL${tOrg}`, tParams);
+      if (!termRow) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+      if (!termRow.has_pt_term) {
+        const blocked = await enrolmentScreeningBlock(req, client_id);
+        if (blocked) return res.status(blocked.status).json(eligibilityError(blocked));
+      }
+    }
+
     let cid = client_id;
     if (!cid) {
       // Plan client-limit enforcement (SaaS). Adding a brand-new client to the
@@ -687,6 +714,38 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
     }
   }
 
+  // ── Shape of the edit, before anything is locked ─────────────────────
+  //
+  // This route has no zod schema, so a status nobody can report on, a phone
+  // number the WhatsApp sender rejects, or "2026-02-30" as an end date all
+  // used to be stored. The create schema's rules, applied to the edit.
+  const body = req.body;
+  for (const key of ['mobile', 'whatsapp', 'emergency_phone']) {
+    if (body[key] === '') body[key] = null;
+    if (body[key] != null && !INDIAN_MOBILE_RE.test(String(body[key]))) {
+      return res.status(400).json({ error: { code: 'VALIDATION', field: key, message: `${key} must be a 10-digit Indian mobile number.` } });
+    }
+  }
+  if (body.email === '') body.email = null;
+  if (body.email != null && !EMAIL_RE.test(String(body.email))) {
+    return res.status(400).json({ error: { code: 'VALIDATION', field: 'email', message: 'email is not a valid address.' } });
+  }
+  for (const key of ['dob', 'pt_start_date', 'pt_end_date']) {
+    if (body[key] === '') body[key] = null;
+    if (body[key] != null && !isCalendarDate(String(body[key]).slice(0, 10))) {
+      return res.status(400).json({ error: { code: 'VALIDATION', field: key, message: `${key} must be a real date (YYYY-MM-DD).` } });
+    }
+  }
+  if (body.status !== undefined && !CLIENT_STATUSES.includes(body.status)) {
+    return res.status(400).json({ error: { code: 'VALIDATION', field: 'status', message: `status must be one of: ${CLIENT_STATUSES.join(', ')}` } });
+  }
+  if (body.duration_months != null && body.duration_months !== '') {
+    const m = Number(body.duration_months);
+    if (!Number.isInteger(m) || m < 1 || m > 60) {
+      return res.status(400).json({ error: { code: 'VALIDATION', field: 'duration_months', message: 'duration_months must be a whole number of months between 1 and 60.' } });
+    }
+  }
+
   const wantsFinalAmount = req.body.final_amount !== undefined;
   const wantsPaidAmount  = req.body.paid_amount !== undefined;
 
@@ -725,13 +784,56 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
     const exOrg = orgWhere(req, exParams);
     const { rows: existingRows } = await tx.query(
       `SELECT final_amount, paid_amount,
-              (SELECT COUNT(*) FROM pt_client_renewals r WHERE r.client_id = pt_clients.id)::int AS renewals
+              (SELECT COUNT(*) FROM pt_client_renewals r WHERE r.client_id = pt_clients.id)::int AS renewals,
+              ${hasPtTermSql('pt_clients')} AS has_pt_term,
+              to_char(pt_start_date, 'YYYY-MM-DD') AS start_date,
+              to_char(pt_end_date, 'YYYY-MM-DD') AS end_date,
+              to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today
          FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${exOrg}
           FOR UPDATE`,
       exParams
     );
     if (existingRows.length === 0) return refuse(404, { error: { code: 'NOT_FOUND', message: 'Client not found' } });
     const existing = existingRows[0];
+
+    // ── The term, under the lock ──────────────────────────────────────────
+    //
+    // A renewed client's current term is Renew's to change (its arithmetic
+    // and history live there); this route changing the dates or duration
+    // would rewrite a term with no renewal row behind it.
+    if (existing.renewals > 0 && TERM_FIELDS.some((k) => body[k] !== undefined)) {
+      return refuse(409, { error: {
+        code: 'USE_RENEW',
+        message: 'This client has renewed before. Change their current term with Renew PT.',
+      } });
+    }
+    const effStart = body.pt_start_date !== undefined ? body.pt_start_date && String(body.pt_start_date).slice(0, 10) : existing.start_date;
+    const effEnd = body.pt_end_date !== undefined ? body.pt_end_date && String(body.pt_end_date).slice(0, 10) : existing.end_date;
+    if (effStart && effEnd && effEnd < effStart) {
+      return refuse(400, { error: { code: 'VALIDATION', field: 'pt_end_date', message: 'The PT end date cannot be before the start date.' } });
+    }
+
+    // Enrolling a client who has never had a term needs their screening done:
+    // a completed Informed Consent and a fully answered PAR-Q, and nothing
+    // medically blocking them (lib/screeningGate enrolmentScreeningBlock).
+    const establishingTerm = body.pt_end_date != null || Number(body.duration_months) > 0
+      || (wantsFinalAmount && Number(body.final_amount) > 0);
+    if (establishingTerm && !existing.has_pt_term) {
+      const blocked = await enrolmentScreeningBlock(req, req.params.id);
+      if (blocked) return refuse(blocked.status, eligibilityError(blocked));
+    }
+
+    // 'active' means a running term. Setting it on a client with no term, or
+    // on one whose term has ended without renewing, is the side door around
+    // enrolment and Renew this closes.
+    if (body.status === 'active') {
+      if (!existing.has_pt_term && !establishingTerm) {
+        return refuse(409, { error: { code: 'CLIENT_NOT_ENROLLED', message: 'Enrol this client in PT to make them active.' } });
+      }
+      if (effEnd && effEnd < existing.today) {
+        return refuse(409, { error: { code: 'TERM_EXPIRED', message: 'This client\'s PT term has ended. Renew their PT to make them active.' } });
+      }
+    }
 
     if (wantsFinalAmount || wantsPaidAmount) {
       // Validate the two fields together against whichever value isn't being
@@ -1276,6 +1378,45 @@ function addMinutesToTime(timeStr, minutes) {
 }
 
 // Adds `days` to a 'YYYY-MM-DD' date string, returning 'YYYY-MM-DD'.
+/**
+ * A training-eligibility refusal in this router's error shape. The codes are
+ * lib/screeningGate's, identical on every route that starts training.
+ */
+function eligibilityError(blocked) {
+  const { code, error, missing } = blocked.body;
+  return { error: { code, message: error, ...(missing ? { missing } : {}) } };
+}
+
+/** The client statuses this app reads. 'inactive' is what deletion writes. */
+const CLIENT_STATUSES = ['pending', 'active', 'frozen', 'expired', 'inactive'];
+/** Fields that define a client's current term. */
+const TERM_FIELDS = ['pt_start_date', 'pt_end_date', 'duration_months', 'package_type', 'base_amount', 'discount', 'monthly_pt_amount'];
+const INDIAN_MOBILE_RE = /^[6-9]\d{9}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** PT session states, and where each may move. */
+const SESSION_STATUSES = ['scheduled', 'completed', 'cancelled', 'no_show'];
+/**
+ * A completed session is final: it is what attendance, session balance and
+ * trainer reports count, so it is not re-opened or cancelled after the fact.
+ * A cancelled or no-show session may be put back on the schedule.
+ */
+const SESSION_TRANSITIONS = {
+  scheduled: ['completed', 'cancelled', 'no_show'],
+  cancelled: ['scheduled'],
+  no_show: ['scheduled'],
+  completed: [],
+};
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
+
+/** A real calendar date in YYYY-MM-DD (2026-02-30 is not one). */
+function isCalendarDate(v) {
+  if (typeof v !== 'string' || !DATE_ONLY_RE.test(v)) return false;
+  const d = new Date(`${v}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v;
+}
+
 function addDaysToDate(dateStr, days) {
   const d = new Date(`${dateStr}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);
@@ -1300,6 +1441,28 @@ router.post('/sessions', auth, wrap(async (req, res) => {
   if (cid && !await clientInOrg(req, cid))
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
+  if (!isCalendarDate(date)) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'date must be a real date (YYYY-MM-DD).' } });
+  }
+  if (start_time != null && start_time !== '' && !TIME_RE.test(String(start_time))) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'start_time must be HH:MM.' } });
+  }
+  if (duration_minutes != null && duration_minutes !== '') {
+    const d = Number(duration_minutes);
+    if (!Number.isInteger(d) || d < 5 || d > 600) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'duration_minutes must be a whole number between 5 and 600.' } });
+    }
+  }
+
+  // A PT session is training: the client must be enrolled with a running
+  // term, and the medical stops apply. Checked live, never from the form.
+  let screeningWarnings = [];
+  if (cid) {
+    const { blocked, warnings } = await checkTrainingEligibility(req, cid, { action: 'book_session' });
+    if (blocked) return res.status(blocked.status).json(eligibilityError(blocked));
+    screeningWarnings = warnings;
+  }
+
   const duration = parseInt(duration_minutes, 10) || 60;
   const computedEndTime = end_time || (start_time ? addMinutesToTime(start_time, duration) : null);
 
@@ -1319,7 +1482,7 @@ router.post('/sessions', auth, wrap(async (req, res) => {
     );
     created.push(rows[0]);
   }
-  res.status(201).json({ data: occurrences === 1 ? created[0] : created });
+  res.status(201).json({ data: occurrences === 1 ? created[0] : created, screening_warnings: screeningWarnings });
 }));
 
 // PATCH /sessions/:id
@@ -1329,10 +1492,45 @@ router.patch('/sessions/:id', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
   const guard = ' AND organization_id = $2';
   const { rows: existingRows } = await pool.query(
-    `SELECT start_time, duration_minutes FROM pt_sessions WHERE id = $1 AND deleted_at IS NULL${guard}`,
+    `SELECT start_time, duration_minutes, status, client_id FROM pt_sessions WHERE id = $1 AND deleted_at IS NULL${guard}`,
     [id, scope.orgId]
   );
   if (!existingRows[0]) return res.status(404).json({ error: 'Session not found' });
+  const current = existingRows[0];
+
+  // Status is a closed set with fixed moves (SESSION_TRANSITIONS above), and
+  // marking a session completed is training, so the client's eligibility is
+  // checked live at that moment — not when the session was booked.
+  if (b.status !== undefined && b.status !== current.status) {
+    if (!SESSION_STATUSES.includes(b.status)) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: `status must be one of: ${SESSION_STATUSES.join(', ')}` } });
+    }
+    const from = current.status || 'scheduled';
+    if (!(SESSION_TRANSITIONS[from] || []).includes(b.status)) {
+      return res.status(409).json({ error: {
+        code: 'INVALID_SESSION_TRANSITION',
+        message: from === 'completed'
+          ? 'This session is already completed and cannot be changed.'
+          : `A ${from.replace('_', '-')} session cannot be marked ${b.status.replace('_', '-')}.`,
+      } });
+    }
+    if (b.status === 'completed' && current.client_id) {
+      const { blocked } = await checkTrainingEligibility(req, current.client_id, { action: 'complete_session' });
+      if (blocked) return res.status(blocked.status).json(eligibilityError(blocked));
+    }
+  }
+  if (b.session_date !== undefined && !isCalendarDate(b.session_date)) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'session_date must be a real date (YYYY-MM-DD).' } });
+  }
+  if (b.start_time !== undefined && b.start_time !== null && !TIME_RE.test(String(b.start_time))) {
+    return res.status(400).json({ error: { code: 'VALIDATION', message: 'start_time must be HH:MM.' } });
+  }
+  if (b.duration_minutes !== undefined) {
+    const d = Number(b.duration_minutes);
+    if (!Number.isInteger(d) || d < 5 || d > 600) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'duration_minutes must be a whole number between 5 and 600.' } });
+    }
+  }
 
   const allowed = ['status', 'notes', 'session_date', 'start_time', 'duration_minutes', 'session_type'];
   const sets = [];
