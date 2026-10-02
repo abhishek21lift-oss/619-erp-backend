@@ -78,7 +78,16 @@ const Outcome = Object.freeze({
   DAILY_LIMIT_REACHED: 'daily_limit_reached',
   DUPLICATE_EVENT: 'duplicate_event',
   NOT_ENQUEUED: 'not_enqueued',
+  OPTED_OUT: 'opted_out',
 });
+
+/**
+ * Events a client receives even after opting out of WhatsApp: what they are
+ * owed, not what the studio wants them to hear. Only the payment receipt —
+ * reminders, birthday wishes, follow-ups and offers all stop (studio decision,
+ * Phase 2, 2026-10-02).
+ */
+const TRANSACTIONAL_EVENTS = Object.freeze(['payment_received']);
 
 /**
  * Fill `{{placeholders}}` from the event context.
@@ -177,6 +186,33 @@ async function emit({
     // org-scoped rather than checked afterwards.
     if (!recipient) return done(Outcome.RECIPIENT_NOT_FOUND);
     if (!recipient.phone) return done(Outcome.NO_PHONE);
+
+    // ── Opt-out ─────────────────────────────────────────────────────────────
+    //
+    // The client asked the studio to stop WhatsApp messages. Nothing is
+    // queued, but each rule still writes a 'suppressed' row: the studio can
+    // see the message was stopped on purpose, the dedupe key stops the same
+    // event being weighed again, and it uses none of the daily quota.
+    if (recipient.whatsapp_opt_out === true && !TRANSACTIONAL_EVENTS.includes(event)) {
+      const vars = { ...context, name: context.name || recipient.name };
+      const results = [];
+      for (const rule of rules) {
+        const logId = await repo.insertSuppressed({
+          orgId,
+          recipientType,
+          recipientId: recipient.id,
+          recipientName: recipient.name,
+          recipientPhone: recipient.phone,
+          template: rule.name,
+          message: render(rule.template, vars),
+          reason: 'opted_out',
+          ruleId: rule.id,
+          dedupeKey: dedupeKeyFor(event, rule.id, eventKey || subjectId),
+        });
+        results.push({ ruleId: rule.id, logId, outcome: logId ? Outcome.OPTED_OUT : Outcome.DUPLICATE_EVENT });
+      }
+      return { outcome: Outcome.OPTED_OUT, queued: 0, results };
+    }
 
     // ── Permission ──────────────────────────────────────────────────────────
     //
@@ -288,4 +324,4 @@ async function emit({
   }
 }
 
-module.exports = { emit, render, dedupeKeyFor, TRIGGER_EVENTS, Outcome };
+module.exports = { emit, render, dedupeKeyFor, TRIGGER_EVENTS, TRANSACTIONAL_EVENTS, Outcome };

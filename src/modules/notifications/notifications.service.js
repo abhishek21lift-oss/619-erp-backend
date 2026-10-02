@@ -244,6 +244,15 @@ async function deliverChannel(ch, type, recipient, data) {
   const tpl = templates[type]?.({ ...data, name: recipient.name });
   if (!tpl) throw new Error(`Unknown notification template: ${type}`);
 
+  // A client who opted out of this channel (migration 226) gets nothing on it
+  // but what they are owed. Read fresh here rather than trusted from the
+  // recipient object: a queued job carries the flags from when it was queued.
+  if (!TRANSACTIONAL_NOTIFICATIONS.has(type) && await optedOut(ch, recipient)) {
+    const res = { status: 'suppressed', error: 'opted_out' };
+    await logAttempt(ch, type, recipient, data, res);
+    return res;
+  }
+
   let adapterArgs;
   switch (ch) {
     case 'inapp':    adapterArgs = { user_id: recipient.user_id, title: tpl.title, body: tpl.body, link: data.link }; break;
@@ -270,7 +279,12 @@ async function deliverChannel(ch, type, recipient, data) {
     res = { status: 'failed', error: err.message };
   }
 
-  // Log the attempt
+  await logAttempt(ch, type, recipient, data, res);
+  return res;
+}
+
+/** Write one attempt — sent, failed or suppressed — to notification_log. */
+async function logAttempt(ch, type, recipient, data, res) {
   try {
     await pool.query(
       `INSERT INTO notification_log (recipient_user_id, recipient_member_id, channel, template, payload, status, provider_id, error, sent_at)
@@ -287,7 +301,31 @@ async function deliverChannel(ch, type, recipient, data) {
   } catch {
     logger.warn('notification_log table may not exist yet');
   }
-  return res;
+}
+
+/**
+ * Notifications a client receives even after opting out: about something
+ * they did or are owed (a payment, a booking they made), not reminders or
+ * offers. Studio decision, Phase 2, 2026-10-02.
+ */
+const TRANSACTIONAL_NOTIFICATIONS = new Set(['payment_received', 'payment_failed', 'booking_confirmed', 'waitlist_promoted']);
+
+/** Opt-out flag per channel. Only email and WhatsApp have one. */
+const OPT_OUT_COLUMN = { email: 'email_opt_out', whatsapp: 'whatsapp_opt_out' };
+
+/**
+ * Has this recipient opted out of `ch`? A PT client (recipientFromClient) is
+ * re-read now, scoped to their studio; any other recipient carries no
+ * opt-out record, so this is false for them.
+ */
+async function optedOut(ch, recipient) {
+  const col = OPT_OUT_COLUMN[ch];
+  if (!col || !recipient?.client_id || !recipient.organization_id) return false;
+  const { rows } = await pool.query(
+    `SELECT ${col} AS opted_out FROM pt_clients WHERE id = $1 AND organization_id = $2`,
+    [recipient.client_id, recipient.organization_id]
+  );
+  return rows[0]?.opted_out === true;
 }
 
 /**
@@ -339,6 +377,22 @@ async function processNotificationJob(job) {
   if (!channels[ch]) throw new Error(`Unknown notification channel: ${ch}`);
   if (!templates[type]) throw new Error(`Unknown notification template: ${type}`);
   return deliverChannel(ch, type, recipient, data);
+}
+
+/**
+ * One of this studio's PT clients, as a recipient. Org-scoped: a client of
+ * another studio, or a deleted one, is null — never a fallback lookup.
+ */
+async function recipientFromClient(orgId, clientId) {
+  const { rows } = await pool.query(
+    `SELECT c.id AS client_id, c.id AS member_id, c.name, c.email,
+            COALESCE(NULLIF(c.whatsapp, ''), c.mobile) AS phone, c.organization_id,
+            NULL AS user_id
+       FROM pt_clients c
+      WHERE c.id = $1 AND c.organization_id = $2 AND c.deleted_at IS NULL`,
+    [clientId, orgId]
+  );
+  return rows[0] || null;
 }
 
 /**
@@ -419,4 +473,7 @@ async function markAllRead(userId) {
   );
 }
 
-module.exports = { send, deliverChannel, processNotificationJob, recipientFromMember, inbox, markRead, markAllRead, templates, channels };
+module.exports = {
+  send, deliverChannel, processNotificationJob, recipientFromMember, recipientFromClient, inbox, markRead, markAllRead,
+  templates, channels, TRANSACTIONAL_NOTIFICATIONS,
+};

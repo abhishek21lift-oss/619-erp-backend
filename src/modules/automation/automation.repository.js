@@ -63,6 +63,7 @@ async function sendsToday(orgId) {
        FROM communication_logs
       WHERE organization_id = $1
         AND automation_rule_id IS NOT NULL
+        AND status <> 'suppressed'
         AND created_at >= ${STUDIO_DAY_START}`,
     [orgId, appTimeZone()]
   );
@@ -141,7 +142,8 @@ async function touchRule(orgId, ruleId) {
  */
 async function clientRecipient(orgId, clientId) {
   const { rows } = await pool.query(
-    `SELECT c.id, c.name, COALESCE(NULLIF(c.whatsapp, ''), c.mobile) AS phone, c.trainer_id
+    `SELECT c.id, c.name, COALESCE(NULLIF(c.whatsapp, ''), c.mobile) AS phone, c.trainer_id,
+            c.whatsapp_opt_out
        FROM pt_clients c
       WHERE c.id = $1 AND c.organization_id = $2 AND c.deleted_at IS NULL`,
     [clientId, orgId]
@@ -290,6 +292,8 @@ async function insertQueuedWithinLimit(entry, dailyLimit) {
          FROM communication_logs
         WHERE organization_id = $1
           AND automation_rule_id IS NOT NULL
+          -- A message an opt-out stopped was never sent, so it uses no quota.
+          AND status <> 'suppressed'
           AND created_at >= ${STUDIO_DAY_START}`,
       [entry.orgId, appTimeZone()]
     );
@@ -344,8 +348,8 @@ async function insertQueuedWithinLimit(entry, dailyLimit) {
  */
 async function loadQueued(orgId, logId) {
   const { rows } = await pool.query(
-    `SELECT id, organization_id, recipient_id, recipient_phone, message,
-            status, automation_rule_id, external_id
+    `SELECT id, organization_id, recipient_type, recipient_id, recipient_phone, message,
+            status, automation_rule_id, automation_dedupe_key, external_id
        FROM communication_logs
       WHERE id = $1 AND organization_id = $2`,
     [logId, orgId]
@@ -376,7 +380,7 @@ async function loadQueued(orgId, logId) {
 // `TERMINAL_STATUSES` is the set markSent and markFailed may not overwrite.
 // applyReceipt has its own CASE for the same reason — it has to distinguish
 // delivered from read, which this does not.
-const TERMINAL_STATUSES = "('delivered','read')";
+const TERMINAL_STATUSES = "('delivered','read','suppressed')";
 
 /**
  * Mark a message sent, recording which provider carried it and its id.
@@ -1029,6 +1033,54 @@ async function balancesDueFor(orgId, interval) {
   return rows;
 }
 
+// ── Opt-out ────────────────────────────────────────────────────────────────
+//
+// A client who asked the studio to stop WhatsApp messages (migration 226)
+// gets none of the automated ones except what they are owed — see
+// TRANSACTIONAL_EVENTS in automation.engine. The message that was NOT sent is
+// still recorded, as 'suppressed', so the studio can see it was stopped on
+// purpose and the dedupe key keeps the same event from being weighed again.
+
+/** Write the row for a message an opt-out stopped. Idempotent on the dedupe key. */
+async function insertSuppressed(entry) {
+  const { rows } = await pool.query(
+    `INSERT INTO communication_logs
+       (organization_id, recipient_type, recipient_id, recipient_name, recipient_phone,
+        channel, direction, template, message, status, failure_reason,
+        automation_rule_id, automation_dedupe_key)
+     VALUES ($1,$2,$3,$4,$5,'whatsapp','outgoing',$6,$7,'suppressed',$8,$9,$10)
+     ON CONFLICT (organization_id, automation_dedupe_key)
+       WHERE automation_dedupe_key IS NOT NULL DO NOTHING
+     RETURNING id`,
+    [
+      entry.orgId, entry.recipientType, entry.recipientId, entry.recipientName,
+      entry.recipientPhone, entry.template, entry.message, entry.reason,
+      entry.ruleId, entry.dedupeKey,
+    ]
+  );
+  return rows[0]?.id ?? null;
+}
+
+/** A queued row the opt-out now stops, at send time. Never touches a terminal row. */
+async function markSuppressed(orgId, logId, reason) {
+  const { rowCount } = await pool.query(
+    `UPDATE communication_logs
+        SET status = 'suppressed', failure_reason = $3
+      WHERE id = $1 AND organization_id = $2 AND status = 'queued'`,
+    [logId, orgId, reason]
+  );
+  return rowCount;
+}
+
+/** Has this client opted out of WhatsApp, as of now? Org-scoped. */
+async function clientOptedOutOfWhatsapp(orgId, clientId) {
+  const { rows } = await pool.query(
+    `SELECT whatsapp_opt_out FROM pt_clients WHERE id = $1 AND organization_id = $2`,
+    [clientId, orgId]
+  );
+  return rows[0]?.whatsapp_opt_out === true;
+}
+
 module.exports = {
   settingsFor,
   upsertSettings,
@@ -1039,6 +1091,9 @@ module.exports = {
   leadRecipient,
   insertQueued,
   insertQueuedWithinLimit,
+  insertSuppressed,
+  markSuppressed,
+  clientOptedOutOfWhatsapp,
   loadQueued,
   markSent,
   markFailed,

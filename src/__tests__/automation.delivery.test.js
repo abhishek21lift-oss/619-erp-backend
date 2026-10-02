@@ -119,7 +119,7 @@ describe('the happy path', () => {
     const sent = sentUpdate();
     expect(sent.params).toEqual(['log-1', ORG_A, 'WAMSG1', 'baileys']);
     // And it advances the status rather than asserting it — see FIX 1.
-    expect(sent.sql).toMatch(/status = CASE WHEN status IN \('delivered','read'\)/);
+    expect(sent.sql).toMatch(/status = CASE WHEN status IN \('delivered','read','suppressed'\)/);
   });
 
   test('uses the log row id as the client_message_id, stable across retries', async () => {

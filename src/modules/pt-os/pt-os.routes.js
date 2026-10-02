@@ -682,7 +682,10 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week',
        'workout_experience_level','previous_trainer_experience',
        'agreement_accepted_at','agreement_signature','agreement_text',
-       'payment_method'];
+       'payment_method',
+       // Migration 226. Recorded when the client asks the studio to stop a
+       // channel; the change is stamped below and kept in activity_log.
+       'whatsapp_opt_out','email_opt_out'];
 
   // trainer_id is a foreign key from the request: it must name a trainer
   // profile in THIS studio, or the edit is refused. Normalised in place (the
@@ -750,6 +753,11 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
     if (body[key] === '') body[key] = null;
     if (body[key] != null && !isCalendarDate(String(body[key]).slice(0, 10))) {
       return res.status(400).json({ error: { code: 'VALIDATION', field: key, message: `${key} must be a real date (YYYY-MM-DD).` } });
+    }
+  }
+  for (const key of ['whatsapp_opt_out', 'email_opt_out']) {
+    if (body[key] !== undefined && typeof body[key] !== 'boolean') {
+      return res.status(400).json({ error: { code: 'VALIDATION', field: key, message: `${key} must be true or false.` } });
     }
   }
   if (body.status !== undefined && !CLIENT_STATUSES.includes(body.status)) {
@@ -957,6 +965,12 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
     if (req.body.status === undefined && looksEnrolled) sets.push(`status = 'active'`);
 
     if (sets.length === 0) return refuse(400, { error: { code: 'NO_FIELDS', message: 'No fields to update' } });
+    // Who changed a messaging preference, and when — on the row, for the
+    // profile to show; the full history is the client.update activity log.
+    if (body.whatsapp_opt_out !== undefined || body.email_opt_out !== undefined) {
+      params.push(req.user?.id ?? null);
+      sets.push('comm_prefs_updated_at = NOW()', `comm_prefs_updated_by = $${params.length}`);
+    }
     sets.push('updated_at = NOW()');
 
     const updOrg = orgWhere(req, params);
