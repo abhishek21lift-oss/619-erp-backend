@@ -310,3 +310,50 @@ describe('the proposal has to actually reach the client', () => {
     expect(pool.query).not.toHaveBeenCalled();
   });
 });
+
+// Accepting a proposal ASSIGNS it, so it passes the same live PAR-Q / consent
+// gate as POST /assign. The gate ran only when the plan was generated, so a
+// client blocked since then could still be handed the programme.
+describe('the screening gate, at accept time', () => {
+  const { checkScreeningGate } = require('../lib/screeningGate');
+  afterEach(() => checkScreeningGate.mockImplementation(async () => ({ blocked: null, warnings: [] })));
+
+  it('checks the generation\'s own client, with this request', async () => {
+    checkScreeningGate.mockClear();
+    await post();
+    expect(checkScreeningGate).toHaveBeenCalledTimes(1);
+    const [req, clientId] = checkScreeningGate.mock.calls[0];
+    expect(clientId).toBe('cl-1');
+    expect(req.user).toBe(TRAINER);
+  });
+
+  it('a blocked client gets the gate\'s 403 and nothing is written', async () => {
+    checkScreeningGate.mockImplementation(async () => ({
+      blocked: { status: 403, body: { error: 'revoked', code: 'CONSENT_REVOKED' } }, warnings: [],
+    }));
+    const res = await post();
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('CONSENT_REVOKED');
+    expect(pool.connect).not.toHaveBeenCalled();
+    expect(sqls().some((s) => /INSERT INTO (workout_plans|workout_assignments)/.test(s))).toBe(false);
+    expect(sqls().some((s) => /UPDATE ai_workout_generations/.test(s))).toBe(false);
+  });
+
+  it('missing paperwork proceeds, and the warnings come back like /assign\'s', async () => {
+    checkScreeningGate.mockImplementation(async () => ({ blocked: null, warnings: ['No PAR-Q on file.'] }));
+    const res = await post();
+
+    expect(res.status).toBe(201);
+    expect(res.body.screening_warnings).toEqual(['No PAR-Q on file.']);
+    expect(sqls().some((s) => /INSERT INTO workout_assignments/.test(s))).toBe(true);
+  });
+
+  it('runs after the studio check: another studio\'s id never reaches the gate', async () => {
+    checkScreeningGate.mockClear();
+    mockDb({ generation: null });
+    const res = await post();
+    expect(res.status).toBe(404);
+    expect(checkScreeningGate).not.toHaveBeenCalled();
+  });
+});

@@ -277,6 +277,28 @@ describe('approval', () => {
     expect(result.overpaid).toBe(0);
   });
 
+  // An activation makes the member active again, so a programme the
+  // term-expiry pass paused must come back — after COMMIT, never inside the
+  // approval, and never able to fail an approval that has already been saved.
+  test('resumes the member\'s paused programmes after COMMIT', async () => {
+    scriptHappyApproval();
+    await upi.approve({ orderId: ORDER_ID, orgId: ORG, actor: ACTOR });
+
+    const log = sqlLog();
+    const commitAt = log.indexOf('COMMIT');
+    const syncAt = log.findIndex((s) => /^UPDATE workout_assignments a SET status = CASE/.test(s));
+    expect(syncAt).toBeGreaterThan(commitAt);
+  });
+
+  test('a failed programme sync does not fail the approval', async () => {
+    scriptHappyApproval();
+    onThrow(/^UPDATE workout_assignments a SET status = CASE/, new Error('sync down'));
+    state.handlers.unshift(state.handlers.pop());
+    const result = await upi.approve({ orderId: ORDER_ID, orgId: ORG, actor: ACTOR });
+    expect(result.order.status).toBe(upi.ORDER_STATUS.APPROVED);
+    expect(ranSql(/^ROLLBACK$/)).toBe(false);
+  });
+
   test('guards the status transition so a double approve cannot double-activate', async () => {
     scriptHappyApproval();
     await upi.approve({ orderId: ORDER_ID, orgId: ORG, actor: ACTOR });

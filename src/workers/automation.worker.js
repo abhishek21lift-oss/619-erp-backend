@@ -32,9 +32,11 @@ const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 const { runSweep } = require('../modules/automation/automation.sweep');
 const { runRecovery } = require('../modules/automation/automation.recovery');
+const { expireEndedTerms } = require('../modules/pt-os/pt-os.service');
 
 const SWEEP_JOB_ID = 'automation-daily-sweep';
 const RECOVERY_JOB_ID = 'automation-orphan-recovery';
+const TERM_EXPIRY_JOB_ID = 'pt-term-expiry';
 
 /**
  * When the sweep runs.
@@ -59,9 +61,24 @@ const DEFAULT_SWEEP_CRON = '30 3 * * *';
  */
 const DEFAULT_RECOVERY_CRON = '*/15 * * * *';
 
+/**
+ * How often PT terms that have ended are moved to 'expired'.
+ *
+ * Hourly rather than once at midnight. The pass is one idempotent UPDATE, so
+ * running it again costs nothing, and hourly means a missed run (a deploy, a
+ * Redis blip) is repaired within the hour instead of a day later. A term ends
+ * on the studio's day boundary, so the first run after midnight IST expires it.
+ */
+const DEFAULT_TERM_EXPIRY_CRON = '5 * * * *';
+
 async function processSweepJob(job) {
   if (job.name === 'daily') return runSweep();
   if (job.name === 'recovery') return runRecovery();
+  if (job.name === 'term-expiry') {
+    const out = await expireEndedTerms();
+    logger.info({ expired: out.expired, paused: out.paused }, 'pt term expiry completed');
+    return out;
+  }
   throw new Error(`Unknown automation job: ${job.name}`);
 }
 
@@ -151,10 +168,23 @@ async function scheduleAutomationSweep() {
     }
   ), 5000);
 
-  logger.info({ cron, recoveryCron }, 'automation sweep cron scheduled');
+  const termExpiryCron = process.env.PT_TERM_EXPIRY_CRON || DEFAULT_TERM_EXPIRY_CRON;
+  await withTimeout(automationSweepQueue.upsertJobScheduler(
+    TERM_EXPIRY_JOB_ID,
+    { pattern: termExpiryCron },
+    {
+      name: 'term-expiry',
+      data: {},
+      // Idempotent, so the next hour is the retry.
+      opts: { attempts: 1, removeOnComplete: true, removeOnFail: true },
+    }
+  ), 5000);
+
+  logger.info({ cron, recoveryCron, termExpiryCron }, 'automation sweep cron scheduled');
   return {
     sweep: { jobSchedulerId: SWEEP_JOB_ID },
     recovery: { jobSchedulerId: RECOVERY_JOB_ID },
+    termExpiry: { jobSchedulerId: TERM_EXPIRY_JOB_ID },
     jobSchedulerId: SWEEP_JOB_ID,
   };
 }
@@ -181,6 +211,8 @@ module.exports = {
   processSweepJob,
   SWEEP_JOB_ID,
   RECOVERY_JOB_ID,
+  TERM_EXPIRY_JOB_ID,
   DEFAULT_SWEEP_CRON,
   DEFAULT_RECOVERY_CRON,
+  DEFAULT_TERM_EXPIRY_CRON,
 };

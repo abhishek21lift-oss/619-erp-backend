@@ -693,130 +693,227 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
   let finalAmount = null;
   let paidAmount = null;
   let previousPaid = null;
-  if (wantsFinalAmount || wantsPaidAmount) {
-    // Validate the two fields together against whichever value isn't being
-    // changed in this request — never trust the client to have already
-    // enforced paid <= final; recompute and re-check server-side.
+
+  // ── One transaction, the client row locked ────────────────────────────
+  //
+  // The client update, the first term in pt_client_subscriptions and the
+  // ledger row in pt_payments used to be three separate statements on the
+  // pool, after an unlocked read of paid_amount. Two saves of one enrolment
+  // in flight together — the enroll page retries a save that timed out, and
+  // the first may still be running — both read paid_amount = 0 and both
+  // booked the whole amount as a payment; and a failure between the UPDATE
+  // and the ledger INSERT left paid_amount raised with no payment behind it.
+  //
+  // Now the row is locked FOR UPDATE before anything is read (as Renew and
+  // Record Payment already do), and all three writes commit or none do. A
+  // repeat of the same save waits for the first, then reads the amount it
+  // recorded: paid_amount is absolute, so the repeat books no second payment
+  // and finds the term already written. Side effects (assignment sync, the
+  // payment_received automation, the activity log) run after COMMIT.
+  const tx = await pool.connect();
+  let rows = null;
+  let ledger = null;
+  try {
+    await tx.query('BEGIN');
+    // Every refusal below ends the transaction before answering.
+    const refuse = async (status, body) => {
+      await tx.query('ROLLBACK');
+      return res.status(status).json(body);
+    };
+
     const exParams = [req.params.id];
     const exOrg = orgWhere(req, exParams);
-    const { rows: existingRows } = await pool.query(
+    const { rows: existingRows } = await tx.query(
       `SELECT final_amount, paid_amount,
               (SELECT COUNT(*) FROM pt_client_renewals r WHERE r.client_id = pt_clients.id)::int AS renewals
-         FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${exOrg}`,
+         FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${exOrg}
+          FOR UPDATE`,
       exParams
     );
-    if (existingRows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+    if (existingRows.length === 0) return refuse(404, { error: { code: 'NOT_FOUND', message: 'Client not found' } });
     const existing = existingRows[0];
-    previousPaid = Number(existing.paid_amount) || 0;
 
-    // Payments audit PAY-1. After a renewal, paid_amount is a LIFETIME total
-    // (renewal adds to it) while final_amount is the current term's price —
-    // so the enrolment arithmetic below (balance = final − paid, paid <= final,
-    // book paid − previous paid as the payment) is wrong for that client: it
-    // refused the save outright, or, once "corrected", wiped part of the paid
-    // history and booked only the difference as revenue. A renewed client's
-    // term is changed from Renew and their money from Payments.
-    if (existing.renewals > 0) {
-      return res.status(409).json({ error: {
-        code: 'USE_RENEW',
-        message: 'This client has renewed before. Change their current term with Renew PT, and record money on the Payments tab.',
-      } });
-    }
+    if (wantsFinalAmount || wantsPaidAmount) {
+      // Validate the two fields together against whichever value isn't being
+      // changed in this request — never trust the client to have already
+      // enforced paid <= final; recompute and re-check server-side.
+      previousPaid = Number(existing.paid_amount) || 0;
 
-    if (wantsFinalAmount) {
-      // `>= 0`, not `> 0`. This rejected every save on a client priced at zero
-      // — and the edit form posts the whole form, so a trainer correcting a
-      // phone number re-sent final_amount and got "Final Selling Price must be
-      // greater than zero" for a field they never touched. Two ways in, both
-      // real: a stored 0 posts as 0, and a stored NULL renders as an empty
-      // input and posts as null, which Number() also makes 0.
-      //
-      // A price of zero is legitimate anyway — complimentary, trial, founding
-      // member — so the rule was wrong on its own terms as well as unreachable
-      // to satisfy. "Must be positive" belongs to enrollment, where the amount
-      // is being entered on purpose, not to a PATCH that carries it along.
-      //
-      // Negative and non-numeric are still refused, and paid <= final below is
-      // untouched: that is the rule that actually protects the ledger.
-      finalAmount = Number(req.body.final_amount);
-      if (!Number.isFinite(finalAmount) || finalAmount < 0) {
-        return res.status(400).json({ error: { code: 'VALIDATION', message: 'Final Selling Price cannot be negative.' } });
-      }
-    }
-    if (wantsPaidAmount) {
-      paidAmount = Number(req.body.paid_amount);
-      if (!Number.isFinite(paidAmount) || paidAmount < 0) {
-        return res.status(400).json({ error: { code: 'VALIDATION', message: 'Amount Paid cannot be negative.' } });
-      }
-      // Lowering it here would move the client's total away from the ledger:
-      // money already booked would stay booked while the client showed less
-      // paid. A payment recorded by mistake is deleted from Payments, which
-      // reverses the balance with it.
-      if (paidAmount < previousPaid) {
-        return res.status(400).json({ error: {
-          code: 'VALIDATION',
-          message: `Amount Paid cannot be lowered below the Rs. ${previousPaid} already recorded — delete the payment on the Payments tab instead.`,
+      // Payments audit PAY-1. After a renewal, paid_amount is a LIFETIME total
+      // (renewal adds to it) while final_amount is the current term's price —
+      // so the enrolment arithmetic below (balance = final − paid, paid <= final,
+      // book paid − previous paid as the payment) is wrong for that client: it
+      // refused the save outright, or, once "corrected", wiped part of the paid
+      // history and booked only the difference as revenue. A renewed client's
+      // term is changed from Renew and their money from Payments.
+      if (existing.renewals > 0) {
+        return refuse(409, { error: {
+          code: 'USE_RENEW',
+          message: 'This client has renewed before. Change their current term with Renew PT, and record money on the Payments tab.',
         } });
       }
-    }
-    const effectiveFinal = finalAmount ?? (Number(existing.final_amount) || 0);
-    const effectivePaid  = paidAmount  ?? (Number(existing.paid_amount)  || 0);
-    if (effectivePaid > effectiveFinal) {
-      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Amount Paid cannot exceed Final Selling Price.' } });
-    }
-  }
 
-  const sets = [];
-  const params = [req.params.id];
-  for (const key of allowed) {
-    if (req.body[key] !== undefined) {
-      params.push(req.body[key]);
-      sets.push(`${key} = $${params.length}`);
+      if (wantsFinalAmount) {
+        // `>= 0`, not `> 0`. This rejected every save on a client priced at zero
+        // — and the edit form posts the whole form, so a trainer correcting a
+        // phone number re-sent final_amount and got "Final Selling Price must be
+        // greater than zero" for a field they never touched. Two ways in, both
+        // real: a stored 0 posts as 0, and a stored NULL renders as an empty
+        // input and posts as null, which Number() also makes 0.
+        //
+        // A price of zero is legitimate anyway — complimentary, trial, founding
+        // member — so the rule was wrong on its own terms as well as unreachable
+        // to satisfy. "Must be positive" belongs to enrollment, where the amount
+        // is being entered on purpose, not to a PATCH that carries it along.
+        //
+        // Negative and non-numeric are still refused, and paid <= final below is
+        // untouched: that is the rule that actually protects the ledger.
+        finalAmount = Number(req.body.final_amount);
+        if (!Number.isFinite(finalAmount) || finalAmount < 0) {
+          return refuse(400, { error: { code: 'VALIDATION', message: 'Final Selling Price cannot be negative.' } });
+        }
+      }
+      if (wantsPaidAmount) {
+        paidAmount = Number(req.body.paid_amount);
+        if (!Number.isFinite(paidAmount) || paidAmount < 0) {
+          return refuse(400, { error: { code: 'VALIDATION', message: 'Amount Paid cannot be negative.' } });
+        }
+        // Lowering it here would move the client's total away from the ledger:
+        // money already booked would stay booked while the client showed less
+        // paid. A payment recorded by mistake is deleted from Payments, which
+        // reverses the balance with it.
+        if (paidAmount < previousPaid) {
+          return refuse(400, { error: {
+            code: 'VALIDATION',
+            message: `Amount Paid cannot be lowered below the Rs. ${previousPaid} already recorded — delete the payment on the Payments tab instead.`,
+          } });
+        }
+      }
+      const effectiveFinal = finalAmount ?? (Number(existing.final_amount) || 0);
+      const effectivePaid  = paidAmount  ?? (Number(existing.paid_amount)  || 0);
+      if (effectivePaid > effectiveFinal) {
+        return refuse(400, { error: { code: 'VALIDATION', message: 'Amount Paid cannot exceed Final Selling Price.' } });
+      }
     }
-  }
-  let finalAmountParamIdx = null;
-  let paidAmountParamIdx = null;
-  if (wantsFinalAmount) { params.push(finalAmount); finalAmountParamIdx = params.length; sets.push(`final_amount = $${finalAmountParamIdx}`); }
-  if (wantsPaidAmount)  { params.push(paidAmount);  paidAmountParamIdx = params.length;  sets.push(`paid_amount = $${paidAmountParamIdx}`); }
-  if (wantsFinalAmount || wantsPaidAmount) {
-    // Recompute from whichever of the two just landed in params, falling
-    // back to the column's current value for the one that didn't change.
-    // The two operands need an explicit ::numeric cast: when BOTH final_amount
-    // and paid_amount are being set in the same request (the normal case for
-    // a brand-new enrollment), both sides of the subtraction are bare
-    // parameter placeholders with nothing else to anchor their type, and
-    // Postgres can't resolve "-" between two "unknown"-typed params —
-    // it throws "operator is not unique: unknown - unknown" (a 500, not a
-    // validation error). A column reference (the single-param fallback path)
-    // happens to carry its own type and never hit this.
-    sets.push(
-      `balance_amount = GREATEST(` +
-        `${finalAmountParamIdx ? `$${finalAmountParamIdx}::numeric` : 'final_amount'} - ` +
-        `${paidAmountParamIdx ? `$${paidAmountParamIdx}::numeric` : 'paid_amount'}, 0)`
-    );
-  }
-  // Defense in depth: PATCH only ever touches status when a caller explicitly
-  // sends it, unlike POST /clients (which auto-promotes 'pending' to
-  // 'active' once a package is attached). If this request IS establishing
-  // enrollment — an end date, a real duration, or a real final amount — but
-  // forgot to say so, promote it here too. Without this, a caller that omits
-  // status (as the enroll page did) silently leaves a fully-paid,
-  // fully-scheduled client stuck showing "Not Enrolled" forever.
-  const looksEnrolled =
-    req.body.pt_end_date != null ||
-    Number(req.body.duration_months) > 0 ||
-    (wantsFinalAmount && finalAmount > 0);
-  if (req.body.status === undefined && looksEnrolled) sets.push(`status = 'active'`);
 
-  if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS', message: 'No fields to update' } });
-  sets.push('updated_at = NOW()');
+    const sets = [];
+    const params = [req.params.id];
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) {
+        params.push(req.body[key]);
+        sets.push(`${key} = $${params.length}`);
+      }
+    }
+    let finalAmountParamIdx = null;
+    let paidAmountParamIdx = null;
+    if (wantsFinalAmount) { params.push(finalAmount); finalAmountParamIdx = params.length; sets.push(`final_amount = $${finalAmountParamIdx}`); }
+    if (wantsPaidAmount)  { params.push(paidAmount);  paidAmountParamIdx = params.length;  sets.push(`paid_amount = $${paidAmountParamIdx}`); }
+    if (wantsFinalAmount || wantsPaidAmount) {
+      // Recompute from whichever of the two just landed in params, falling
+      // back to the column's current value for the one that didn't change.
+      // The two operands need an explicit ::numeric cast: when BOTH final_amount
+      // and paid_amount are being set in the same request (the normal case for
+      // a brand-new enrollment), both sides of the subtraction are bare
+      // parameter placeholders with nothing else to anchor their type, and
+      // Postgres can't resolve "-" between two "unknown"-typed params —
+      // it throws "operator is not unique: unknown - unknown" (a 500, not a
+      // validation error). A column reference (the single-param fallback path)
+      // happens to carry its own type and never hit this.
+      sets.push(
+        `balance_amount = GREATEST(` +
+          `${finalAmountParamIdx ? `$${finalAmountParamIdx}::numeric` : 'final_amount'} - ` +
+          `${paidAmountParamIdx ? `$${paidAmountParamIdx}::numeric` : 'paid_amount'}, 0)`
+      );
+    }
+    // Defense in depth: PATCH only ever touches status when a caller explicitly
+    // sends it, unlike POST /clients (which auto-promotes 'pending' to
+    // 'active' once a package is attached). If this request IS establishing
+    // enrollment — an end date, a real duration, or a real final amount — but
+    // forgot to say so, promote it here too. Without this, a caller that omits
+    // status (as the enroll page did) silently leaves a fully-paid,
+    // fully-scheduled client stuck showing "Not Enrolled" forever.
+    const looksEnrolled =
+      req.body.pt_end_date != null ||
+      Number(req.body.duration_months) > 0 ||
+      (wantsFinalAmount && finalAmount > 0);
+    if (req.body.status === undefined && looksEnrolled) sets.push(`status = 'active'`);
 
-  const updOrg = orgWhere(req, params);
-  const { rows } = await pool.query(
-    `UPDATE pt_clients SET ${sets.join(', ')} WHERE id = $1 AND deleted_at IS NULL${updOrg} RETURNING *`,
-    params
-  );
-  if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+    if (sets.length === 0) return refuse(400, { error: { code: 'NO_FIELDS', message: 'No fields to update' } });
+    sets.push('updated_at = NOW()');
+
+    const updOrg = orgWhere(req, params);
+    ({ rows } = await tx.query(
+      `UPDATE pt_clients SET ${sets.join(', ')} WHERE id = $1 AND deleted_at IS NULL${updOrg} RETURNING *`,
+      params
+    ));
+    if (rows.length === 0) { rows = null; return refuse(404, { error: { code: 'NOT_FOUND', message: 'Client not found' } }); }
+
+    // Term history: unlike /clients/:id/renew, this endpoint (the actual
+    // enrollment action — see the enroll page) never wrote a row into
+    // pt_client_subscriptions, so a client's first term never appeared on
+    // the PT Subscription History page even though they were fully active —
+    // only later renewals showed up there. Log the initial term the first
+    // time a client crosses into "enrolled", i.e. only when they don't
+    // already have subscription history (so later plain-field edits through
+    // this same endpoint, e.g. the client-edit page, never add duplicates).
+    if (looksEnrolled) {
+      // Under the row lock, so two saves cannot both see "no term yet". The
+      // partial unique index from migration 225 backs it up.
+      const { rows: existingTerms } = await tx.query(
+        'SELECT 1 FROM pt_client_subscriptions WHERE client_id = $1 LIMIT 1', [req.params.id]
+      );
+      if (existingTerms.length === 0) {
+        await tx.query(`
+          INSERT INTO pt_client_subscriptions
+            (client_id, plan_name, start_date, end_date, duration_months,
+             selling_price, amount_paid, balance_amount, trainer_name, status, source)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','enrollment')
+          ON CONFLICT DO NOTHING
+        `, [
+          req.params.id, rows[0].package_type,
+          rows[0].pt_start_date, rows[0].pt_end_date, rows[0].duration_months,
+          rows[0].final_amount, rows[0].paid_amount, rows[0].balance_amount,
+          rows[0].trainer_name,
+        ]);
+      }
+    }
+
+    // Ledger: an increase in paid_amount is collected money — record it in
+    // pt_payments so revenue reports (which sum the payment ledgers, not
+    // pt_clients.paid_amount) actually see it. Without this, money collected
+    // at enrolment never appeared in any revenue figure.
+    if (wantsPaidAmount && previousPaid !== null && paidAmount > previousPaid) {
+      const delta = paidAmount - previousPaid;
+      let ledgerTrainerId = null;
+      let incentiveRate = 0;
+      if (rows[0].trainer_id) {
+        const tr = await trainerForOrg(tx, rows[0].organization_id, rows[0].trainer_id);
+        if (tr) { ledgerTrainerId = tr.id; incentiveRate = tr.incentive_rate ?? 0.5; }
+      }
+      // A receipt number like every other payment (payments audit PAY-6), and
+      // the amount taken off the balance so a delete restores exactly that: the
+      // whole delta, because paid <= final is enforced above.
+      const { rows: paid } = await tx.query(
+        `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes, organization_id, balance_applied)
+         VALUES ($1,$2,$3,$4,$5,$6,CURRENT_DATE,$7,$8,$9)
+         RETURNING id`,
+        [req.params.id, ledgerTrainerId, delta, Math.round(delta * incentiveRate),
+         String(req.body.payment_method || 'CASH').toUpperCase(), await genReceiptNo(tx),
+         'Collected via client profile / enrolment', orgIdOf(req), delta]
+      );
+
+      ledger = { id: paid[0].id, amount: delta };
+    }
+
+    await tx.query('COMMIT');
+  } catch (err) {
+    await tx.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    tx.release();
+  }
+  // A refusal inside the transaction has already answered.
+  if (!rows) return undefined;
 
   // A client leaving active status retires their programmes; coming back
   // restores them. Before this, nothing ever moved an assignment out of
@@ -828,65 +925,14 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
   // promotion above set one. No-ops when nothing needs moving.
   await svc.syncClientAssignments(rows[0].id);
 
-  // Term history: unlike /clients/:id/renew, this endpoint (the actual
-  // enrollment action — see the enroll page) never wrote a row into
-  // pt_client_subscriptions, so a client's first term never appeared on
-  // the PT Subscription History page even though they were fully active —
-  // only later renewals showed up there. Log the initial term the first
-  // time a client crosses into "enrolled", i.e. only when they don't
-  // already have subscription history (so later plain-field edits through
-  // this same endpoint, e.g. the client-edit page, never add duplicates).
-  if (looksEnrolled) {
-    const { rows: existingTerms } = await pool.query(
-      'SELECT 1 FROM pt_client_subscriptions WHERE client_id = $1 LIMIT 1', [req.params.id]
-    );
-    if (existingTerms.length === 0) {
-      await pool.query(`
-        INSERT INTO pt_client_subscriptions
-          (client_id, plan_name, start_date, end_date, duration_months,
-           selling_price, amount_paid, balance_amount, trainer_name, status, source)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active','enrollment')
-        ON CONFLICT DO NOTHING
-      `, [
-        req.params.id, rows[0].package_type,
-        rows[0].pt_start_date, rows[0].pt_end_date, rows[0].duration_months,
-        rows[0].final_amount, rows[0].paid_amount, rows[0].balance_amount,
-        rows[0].trainer_name,
-      ]);
-    }
-  }
-
-  // Ledger: an increase in paid_amount is collected money — record it in
-  // pt_payments so revenue reports (which sum the payment ledgers, not
-  // pt_clients.paid_amount) actually see it. Without this, money collected
-  // at enrolment never appeared in any revenue figure.
-  if (wantsPaidAmount && previousPaid !== null && paidAmount > previousPaid) {
-    const delta = paidAmount - previousPaid;
-    let ledgerTrainerId = null;
-    let incentiveRate = 0;
-    if (rows[0].trainer_id) {
-      const tr = await trainerForOrg(pool, rows[0].organization_id, rows[0].trainer_id);
-      if (tr) { ledgerTrainerId = tr.id; incentiveRate = tr.incentive_rate ?? 0.5; }
-    }
-    // A receipt number like every other payment (payments audit PAY-6), and
-    // the amount taken off the balance so a delete restores exactly that: the
-    // whole delta, because paid <= final is enforced above.
-    const { rows: paid } = await pool.query(
-      `INSERT INTO pt_payments (client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes, organization_id, balance_applied)
-       VALUES ($1,$2,$3,$4,$5,$6,CURRENT_DATE,$7,$8,$9)
-       RETURNING id`,
-      [req.params.id, ledgerTrainerId, delta, Math.round(delta * incentiveRate),
-       String(req.body.payment_method || 'CASH').toUpperCase(), await genReceiptNo(pool),
-       'Collected via client profile / enrolment', orgIdOf(req), delta]
-    );
-
+  if (ledger) {
     // The payment's own id, for the reasons set out at the renewal path above:
     // the composite key it replaces collapsed two same-amount payments on one
     // day into one event, and took its date from the Node process in UTC.
     await automation.paymentReceived(req, {
       clientId: req.params.id,
-      amount: delta,
-      eventKey: paid[0].id,
+      amount: ledger.amount,
+      eventKey: ledger.id,
     });
   }
 
