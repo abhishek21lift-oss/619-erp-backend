@@ -269,4 +269,55 @@ describeIf('Training eligibility, against a real database', () => {
       expect(res.body.error.code).toBe('CLIENT_NOT_ENROLLED');
     });
   });
+
+  describe('the profile reads screening the way the gate does', () => {
+    const screening = async (id) => (await request().get(`/api/pt-os/clients/${id}`)).body.data.screening;
+
+    it('a newer draft PAR-Q does not hide a submitted high-risk one, and the block reason is given', async () => {
+      const id = await client();
+      await pool.query(`INSERT INTO pt_parq_forms (client_id, organization_id, full_name, status, risk_level, workout_gate_status, assessment_date)
+                        VALUES ($1, $2, 'X', 'submitted', 'high', 'blocked', CURRENT_DATE - 2)`, [id, ORG]);
+      await pool.query(`INSERT INTO pt_parq_forms (client_id, organization_id, full_name, status, assessment_date)
+                        VALUES ($1, $2, 'X', 'draft', CURRENT_DATE)`, [id, ORG]);
+      const s = await screening(id);
+      expect(s.parq.status).toBe('submitted');
+      expect(s.parq.risk_level).toBe('high');
+      expect(s.block.code).toBe('PARQ_BLOCKED');
+      expect(s.block.message).toMatch(/clearance is required/);
+      expect(s.complete).toBe(false);
+    });
+
+    it('a draft consent started after a revocation reads as revoked, not draft', async () => {
+      const id = await client();
+      await pool.query(`INSERT INTO pt_informed_consents (client_id, organization_id, full_name, status, created_at)
+                        VALUES ($1, $2, 'X', 'revoked', NOW() - INTERVAL '1 day')`, [id, ORG]);
+      await pool.query(`INSERT INTO pt_informed_consents (client_id, organization_id, full_name, status)
+                        VALUES ($1, $2, 'X', 'draft')`, [id, ORG]);
+      const s = await screening(id);
+      expect(s.consent.status).toBe('revoked');
+      expect(s.block.code).toBe('CONSENT_REVOKED');
+    });
+
+    it('nothing on file reads as none, with the warnings the gate gives', async () => {
+      const s = await screening(await client());
+      expect(s.consent.status).toBe('none');
+      expect(s.parq.status).toBe('none');
+      expect(s.block).toBeNull();
+      expect(s.warnings.length).toBeGreaterThan(0);
+    });
+
+    it('only drafts read as in progress', async () => {
+      const id = await client({ status: 'pending', term: false });
+      await pool.query(`INSERT INTO pt_parq_forms (client_id, organization_id, full_name, status)
+                        VALUES ($1, $2, 'X', 'draft')`, [id, ORG]);
+      expect((await screening(id)).parq.status).toBe('in_progress');
+    });
+
+    it('a screened client reads as complete', async () => {
+      const id = await client({ status: 'pending', term: false });
+      await screenClient(pool, { clientId: id, orgId: ORG });
+      const s = await screening(id);
+      expect(s).toMatchObject({ complete: true, block: null, consent: { status: 'completed' }, parq: { status: 'submitted', complete: true } });
+    });
+  });
 });

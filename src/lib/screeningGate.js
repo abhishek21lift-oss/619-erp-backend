@@ -338,8 +338,74 @@ async function enrolmentScreeningBlock(req, clientId) {
   return null;
 }
 
+// ── What the profile shows ──────────────────────────────────────────────────
+//
+// The client profile summarised screening from the newest row of each list,
+// drafts included, ordered by assessment date with no tie-break. The gate
+// above reads differently — drafts never count, a revocation stands until a
+// newer consent is completed — so the profile could say "draft" while
+// training was hard-blocked, or "submitted" for a client the PAR-Q blocks.
+// It also never said WHY a client was blocked.
+//
+// screeningSummary is the gate's own reading, plus the in-progress drafts,
+// so the profile and the gate cannot disagree.
+
+/** The newest draft of each, which the gate deliberately ignores. */
+const DRAFTS_SQL = `
+  SELECT
+    (SELECT f.id FROM pt_parq_forms f
+       JOIN pt_clients c ON c.id = f.client_id AND c.organization_id = f.organization_id
+      WHERE f.client_id = $1 AND f.deleted_at IS NULL AND f.status = 'draft'
+      ORDER BY f.updated_at DESC NULLS LAST, f.created_at DESC LIMIT 1) AS parq_draft_id,
+    (SELECT ic.id FROM pt_informed_consents ic
+       JOIN pt_clients c ON c.id = ic.client_id AND c.organization_id = ic.organization_id
+      WHERE ic.client_id = $1 AND ic.status IN ('draft', 'pending_client_signature', 'pending_trainer_signature')
+      ORDER BY ic.created_at DESC LIMIT 1) AS consent_draft_id`;
+
+/**
+ * Screening as the gate sees it.
+ *
+ * @returns {Promise<{
+ *   consent: { status: 'completed'|'revoked'|'expired'|'in_progress'|'none' },
+ *   parq: { status: 'submitted'|'reviewed'|'in_progress'|'none', risk_level: string|null,
+ *           has_valid_clearance: boolean, complete: boolean, stale: boolean },
+ *   block: null | { code: string, message: string },
+ *   warnings: string[],
+ *   complete: boolean,
+ * }>}
+ */
+async function screeningSummary(clientId) {
+  const [{ code, parq, consent }, { rows: [drafts] }] = await Promise.all([
+    evaluate(clientId),
+    pool.query(DRAFTS_SQL, [clientId]),
+  ]);
+  const consentStatus = consent.status
+    ? consent.status
+    : drafts?.consent_draft_id ? 'in_progress' : 'none';
+  const parqStatus = parq
+    ? parq.status || 'submitted'
+    : drafts?.parq_draft_id ? 'in_progress' : 'none';
+  const warnings = code ? [] : [
+    ...parqWarnings(parq),
+    ...(consent.status !== 'completed' ? ['Informed Consent is not completed for this client.'] : []),
+  ];
+  return {
+    consent: { status: consentStatus },
+    parq: {
+      status: parqStatus,
+      risk_level: parq?.risk_level ?? null,
+      has_valid_clearance: Boolean(parq?.has_valid_clearance),
+      complete: Boolean(parq) && Number(parq.answered_count) >= PARQ_QUESTION_COUNT,
+      stale: parq?.is_stale === true,
+    },
+    block: code ? { code, message: BLOCKS[code] } : null,
+    warnings,
+    complete: !code && missingScreening(parq, consent).length === 0,
+  };
+}
+
 module.exports = {
   checkScreeningGate, isTrainingBlocked, parqBlocks, parqWarnings, validClearanceSql,
-  checkTrainingEligibility, enrolmentScreeningBlock, statusBlock, missingScreening,
+  checkTrainingEligibility, enrolmentScreeningBlock, statusBlock, missingScreening, screeningSummary,
   ELIGIBILITY_BLOCKS, PARQ_QUESTION_COUNT,
 };

@@ -28,7 +28,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { recordPtPayment } = require('../../lib/ptPayments');
 const { renewClient } = require('./renewal.service');
 const { genReceiptNo } = require('../../db/receipts');
-const { checkTrainingEligibility, enrolmentScreeningBlock } = require('../../lib/screeningGate');
+const { checkTrainingEligibility, enrolmentScreeningBlock, screeningSummary } = require('../../lib/screeningGate');
 
 /**
  * Where a client found the studio.
@@ -423,7 +423,9 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
     ) t
   `, params);
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-  res.json({ data: rows[0] });
+  // Screening as the training gate reads it (lib/screeningGate), so the
+  // profile shows the same status and the real block reason.
+  res.json({ data: { ...rows[0], screening: await screeningSummary(rows[0].id) } });
 }));
 
 // ─── Create / enroll client in PT ───────────────────────────
