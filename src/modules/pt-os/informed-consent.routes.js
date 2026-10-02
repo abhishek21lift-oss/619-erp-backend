@@ -108,7 +108,8 @@ const SNAPSHOT_FIELDS = [
 
 // Tenant scope: only snapshot a client in the caller's own org, otherwise a
 // consent create with a foreign client_id would copy that client's PII into a
-// new record owned by the caller's org (cross-tenant PII exfiltration).
+// new record owned by the caller's org (cross-tenant PII exfiltration). A
+// deleted client is not a client: no new consent is opened for one.
 async function fetchClientSnapshot(clientId, req) {
   const scope = tenantScope(req);
   const params = [clientId];
@@ -117,7 +118,7 @@ async function fetchClientSnapshot(clientId, req) {
   const { rows } = await pool.query(
     `SELECT name AS full_name, gender, dob, mobile, email, address, occupation,
             emergency_contact, emergency_phone, trainer_id
-       FROM pt_clients WHERE id = $1${orgClause}`,
+       FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${orgClause}`,
     params
   );
   return rows[0] || null;
@@ -401,6 +402,11 @@ router.post('/informed-consent/:id/sign', auth, requireTrainer, validate(signSch
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   if (['completed', 'revoked', 'archived', 'expired'].includes(existing.status)) {
     return res.status(409).json({ error: { code: 'NOT_SIGNABLE', status: existing.status } });
+  }
+  // A consent cannot be completed for a client who has since been deleted
+  // (fetchClientSnapshot reads only live clients of this studio).
+  if (!await fetchClientSnapshot(existing.client_id, req)) {
+    return res.status(409).json({ error: { code: 'CLIENT_DELETED', message: 'This client has been deleted.' } });
   }
 
   const acks = existing.acknowledgements || {};

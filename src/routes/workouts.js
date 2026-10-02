@@ -3,7 +3,7 @@ const router = require('express').Router();
 const { randomUUID } = require('crypto');
 const pool = require('../db/pool');
 const { auth, requireTrainer } = require('../middleware/auth');
-const { checkScreeningGate } = require('../lib/screeningGate');
+const { checkTrainingEligibility } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
 const { markAccepted, acceptGeneration } = require('../modules/pt-os/programming-memory');
@@ -496,7 +496,7 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       userId: req.user.id,
       name: typeof name === 'string' && name.trim() ? name.trim() : null,
       // Accepting assigns the plan, so it passes the same gate as /assign.
-      gate: (clientId) => checkScreeningGate(req, clientId),
+      gate: (clientId) => checkTrainingEligibility(req, clientId, { action: 'accept_plan' }),
     });
 
     if (!out.ok) {
@@ -1247,11 +1247,11 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
     // 404, not 403: a 403 would confirm the client exists.
     if (!mine[0]) return res.status(404).json({ error: 'Client not found' });
 
-    // PAR-Q + Informed Consent gate — shared with Workout Log session
-    // creation (src/lib/screeningGate.js) so both entry points enforce the
-    // exact same clearance rule: explicit medical blocks stop the action,
-    // missing paperwork proceeds with warnings for the UI to surface.
-    const { blocked, warnings } = await checkScreeningGate(req, d.client_id);
+    // Training eligibility — shared with plan acceptance, PT sessions and
+    // Workout Log (src/lib/screeningGate.js): the client must be enrolled
+    // with a running term, and the PAR-Q + Informed Consent medical stops
+    // apply. Missing paperwork on an enrolled client proceeds with warnings.
+    const { blocked, warnings } = await checkTrainingEligibility(req, d.client_id, { action: 'assign_plan' });
     if (blocked) return res.status(blocked.status).json(blocked.body);
 
     const { rows } = await pool.query(`

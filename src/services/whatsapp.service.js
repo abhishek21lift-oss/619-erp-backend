@@ -146,6 +146,18 @@ async function processAutomationJob(job) {
     return { status: 'skipped', reason: 'automation_disabled' };
   }
 
+  // The client may have opted out while this sat in the queue (a rule's delay
+  // can be days). Checked now, against the client as they are; the row
+  // becomes 'suppressed', not failed — it was stopped on purpose. The event
+  // is the first segment of the dedupe key the engine wrote.
+  const { TRANSACTIONAL_EVENTS } = require('../modules/automation/automation.engine');
+  const event = String(row.automation_dedupe_key || '').split(':')[0];
+  if (row.recipient_type === 'client' && !TRANSACTIONAL_EVENTS.includes(event)
+      && await repo.clientOptedOutOfWhatsapp(orgId, row.recipient_id)) {
+    await repo.markSuppressed(orgId, logId, 'opted_out');
+    return { status: 'skipped', reason: 'opted_out' };
+  }
+
   const result = await transport.send({
     orgId,
     to: row.recipient_phone,

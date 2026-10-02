@@ -25,7 +25,7 @@ jest.mock('../middleware/auth', () => ({
   adminManagerOrTrainer: (_req, _res, next) => next(),
 }));
 jest.mock('../lib/screeningGate', () => ({
-  checkScreeningGate: jest.fn(async () => ({ blocked: null, warnings: [] })),
+  checkTrainingEligibility: jest.fn(async () => ({ blocked: null, warnings: [] })),
 }));
 
 const request = require('supertest');

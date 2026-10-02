@@ -21,6 +21,7 @@ const mockTx = {
   }),
   release: jest.fn(),
 };
+let mockClientLive = true;
 jest.mock('../db/pool', () => ({
   query: jest.fn(async (sql, params) => {
     const text = String(sql).replace(/\s+/g, ' ').trim();
@@ -29,7 +30,7 @@ jest.mock('../db/pool', () => ({
     if (/^SELECT \* FROM pt_informed_consents WHERE id = \$1$/.test(text)) return { rows: [mockExisting] };
     if (/^SELECT \* FROM pt_informed_consents WHERE id = \$1 AND organization_id/.test(text)) return { rows: mockExisting ? [mockExisting] : [] };
     if (/^SELECT id, status, version FROM pt_informed_consents/.test(text)) return { rows: mockPrior };
-    if (/^SELECT name AS full_name/.test(text)) return { rows: [{ full_name: 'Mina Rao', trainer_id: null }] };
+    if (/^SELECT name AS full_name/.test(text)) return { rows: mockClientLive ? [{ full_name: 'Mina Rao', trainer_id: null }] : [] };
     if (/^INSERT INTO pt_informed_consents/.test(text)) return { rows: [{ id: 'ic-new', status: 'draft' }] };
     return { rows: [] };
   }),
@@ -64,7 +65,7 @@ const signedDraft = () => ({
 
 const updateSql = () => mockQueries.find((q) => /^UPDATE pt_informed_consents SET/.test(q.sql) && !/archived/.test(q.sql));
 
-beforeEach(() => { mockQueries.length = 0; mockExisting = signedDraft(); mockRevoke = null; mockPrior = []; logActivity.mockClear(); });
+beforeEach(() => { mockQueries.length = 0; mockExisting = signedDraft(); mockRevoke = null; mockPrior = []; mockClientLive = true; logActivity.mockClear(); });
 
 describe('PATCH after a signature', () => {
   test('changing signed content clears every signature', async () => {
@@ -154,5 +155,26 @@ describe('safety audit 2026-09-29', () => {
     const copy = mockQueries.find((q) => /INSERT INTO pt_informed_consents/.test(q.sql));
     expect(copy.sql).toMatch(/medical_clearance_file_url/);
     expect(copy.sql).toMatch(/exercise_consent_text/);
+  });
+});
+
+// A deleted client is not a client (Phase 2): no consent is opened for one,
+// and a draft left behind cannot be signed into a completed consent.
+describe('deleted clients', () => {
+  test('creating a consent for a deleted client is a 404, and nothing is written', async () => {
+    mockClientLive = false;
+    const res = await request(app()).post('/api/pt-os/informed-consent').send({ client_id: 'ptc-gone' });
+    expect(res.status).toBe(404);
+    expect(mockQueries.some((q) => /INSERT INTO pt_informed_consents/.test(q.sql))).toBe(false);
+    const snap = mockQueries.find((q) => /^SELECT name AS full_name/.test(q.sql));
+    expect(snap.sql).toMatch(/deleted_at IS NULL/);
+  });
+
+  test('signing a draft whose client was deleted is refused', async () => {
+    mockClientLive = false;
+    const res = await request(app()).post('/api/pt-os/informed-consent/ic-1/sign')
+      .send({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('CLIENT_DELETED');
   });
 });

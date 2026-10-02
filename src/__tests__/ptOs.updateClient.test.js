@@ -26,7 +26,9 @@ jest.mock('../db/pool', () => {
     queries.push({ sql: String(sql).replace(/\s+/g, ' ').trim(), params });
     // The pre-check SELECT that reads the current amounts.
     if (/SELECT final_amount, paid_amount\b[\s\S]*FROM pt_clients/i.test(sql)) {
-      return { rows: mockExistingRow ? [mockExistingRow] : [], rowCount: mockExistingRow ? 1 : 0 };
+      // These are enrolled clients unless a test says otherwise: enrolling a
+      // client with no term is gated on screening (ptEnrollment.atomic.realDb).
+      return { rows: mockExistingRow ? [{ has_pt_term: true, ...mockExistingRow }] : [], rowCount: mockExistingRow ? 1 : 0 };
     }
     if (/^UPDATE pt_clients/i.test(sql)) {
       return { rows: [{ id: 'c1', name: 'Shailendra Shukla' }], rowCount: 1 };

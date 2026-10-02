@@ -283,7 +283,7 @@ function describeMemory(memory) {
  * PAR-Q / Informed Consent gate as POST /workouts/assign. Checking only when
  * the plan was GENERATED left a window: a client who was cleared then and is
  * blocked now (a high-risk PAR-Q, a revoked consent) could still be handed the
- * programme. `gate(clientId)` is lib/screeningGate's checkScreeningGate, bound
+ * programme. `gate(clientId)` is lib/screeningGate's checkTrainingEligibility, bound
  * to the request by the route; it runs after the generation is found and
  * before anything is written, and a block stops the save.
  */

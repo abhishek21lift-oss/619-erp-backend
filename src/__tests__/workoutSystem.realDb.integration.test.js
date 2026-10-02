@@ -117,10 +117,12 @@ describeIf('workout system against a real database', () => {
               ($2, 'Other Studio', 'workout-int-other')`, [ORG, OTHER_ORG]);
     await pool.query(`INSERT INTO trainers (id, name, organization_id) VALUES ($1, 'Tara', $2)`, [TRAINER, ORG]);
     await pool.query(
-      `INSERT INTO pt_clients (id, name, mobile, organization_id, trainer_id, status)
-       VALUES ($1, 'Asha', '+919000021401', $4, $5, 'active'),
-              ($2, 'Bina', '+919000021402', $4, $5, 'active'),
-              ($3, 'Far',  '+919000021403', $6, NULL, 'active')`,
+      // Enrolled clients with a running term: starting a session is training,
+      // and only an enrolled client may train (lib/screeningGate).
+      `INSERT INTO pt_clients (id, name, mobile, organization_id, trainer_id, status, pt_start_date, pt_end_date, duration_months)
+       VALUES ($1, 'Asha', '+919000021401', $4, $5, 'active', CURRENT_DATE - 30, CURRENT_DATE + 60, 3),
+              ($2, 'Bina', '+919000021402', $4, $5, 'active', CURRENT_DATE - 30, CURRENT_DATE + 60, 3),
+              ($3, 'Far',  '+919000021403', $6, NULL, 'active', CURRENT_DATE - 30, CURRENT_DATE + 60, 3)`,
       [CLIENT, SECOND, FOREIGN, ORG, TRAINER, OTHER_ORG]);
     await pool.query(
       `INSERT INTO users (id, name, email, password, role, organization_id, trainer_id, is_active)

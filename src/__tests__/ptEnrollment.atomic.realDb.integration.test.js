@@ -49,6 +49,8 @@ jest.mock('../middleware/auth', () => ({
   computeAccess: () => ({ allowed: true, state: 'active' }),
 }));
 
+const { screenClient, unscreenClients } = require('./helpers/screening');
+
 describeIf('Atomic enrolment, against a real database', () => {
   let pool;
   let request;
@@ -75,6 +77,7 @@ describeIf('Atomic enrolment, against a real database', () => {
     for (const t of ['pt_payments', 'pt_client_renewals', 'pt_client_subscriptions']) {
       await pool.query(`DELETE FROM ${t} WHERE client_id = ANY($1)`, [ids]);
     }
+    await unscreenClients(pool, ids);
     await pool.query('DELETE FROM activity_log WHERE user_id = $1', [USER]);
     await pool.query('DELETE FROM pt_clients WHERE id = ANY($1)', [ids]);
     await pool.query('DELETE FROM users WHERE id = $1', [USER]);
@@ -89,6 +92,9 @@ describeIf('Atomic enrolment, against a real database', () => {
     const res = await request().post('/api/pt-os/clients').send({ name: 'Atomic Client', mobile });
     if (res.status !== 201) throw new Error(`create ${res.status}: ${JSON.stringify(res.body)}`);
     made.push(res.body.data.id);
+    // Enrolment needs completed screening (lib/screeningGate); these suites
+    // test enrolment and renewal, so every client they make is screened.
+    await screenClient(pool, { clientId: res.body.data.id, orgId: ORG });
     return res.body.data;
   }
   const ENROL = {

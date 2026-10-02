@@ -13,7 +13,7 @@
 const pool = require('../../db/pool');
 const { today, dbDate } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
-const { detectFileType, LOGO_IMAGES } = require('../../lib/fileSignatures');
+const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
 const { programmeWeek, resolveWeek } = require('../pt-os/progression');
 
 const MOODS = ['great', 'good', 'okay', 'tired', 'stressed'];
@@ -484,18 +484,14 @@ async function updateMyContact(clientId, orgId, body) {
 // only a JPEG, PNG or WebP (by signature, not by the claimed type) under the
 // size cap is accepted. The app crops and downscales to 800 px first, which
 // comes in well under it.
-const PHOTO_MAX_BYTES = 1024 * 1024;
-const DATA_URL_RE = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/;
-
+// The same rule as the trainer's upload: lib/clientPhoto.js.
 function parseMyPhoto(raw) {
-  const m = typeof raw === 'string' ? DATA_URL_RE.exec(raw) : null;
-  if (!m) throw new PortalInputError('Use a JPG, PNG or WebP photo.');
-  const bytes = Buffer.from(m[2], 'base64');
-  if (bytes.length === 0) throw new PortalInputError('The photo is empty.');
-  if (bytes.length > PHOTO_MAX_BYTES) throw new PortalInputError('The photo is too large — pick a smaller one.');
-  const detected = detectFileType(bytes, LOGO_IMAGES);
-  if (!detected) throw new PortalInputError('That file is not a JPG, PNG or WebP image.');
-  return `data:${detected.mime};base64,${m[2]}`;
+  try {
+    return parseClientPhoto(raw);
+  } catch (err) {
+    if (err instanceof PhotoInputError) throw new PortalInputError(err.message);
+    throw err;
+  }
 }
 
 async function setMyPhoto(clientId, orgId, raw) {

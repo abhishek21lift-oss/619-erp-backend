@@ -195,7 +195,217 @@ async function isTrainingBlocked(clientId) {
   return code !== null;
 }
 
+// ── Training eligibility ────────────────────────────────────────────────────
+//
+// checkScreeningGate answers "is this person medically allowed to train". It
+// never asked whether they are a client who SHOULD be training: a pending
+// client nobody has enrolled, an expired one whose term ran out, a frozen one.
+// Workout assignment, accepting a generated plan, booking or completing a PT
+// session and logging a workout all went through on any of those.
+//
+// checkTrainingEligibility is that question, asked live of the database on
+// every call (never of anything the browser sent), with one set of codes for
+// every route:
+//
+//   404 NOT_FOUND           not a live client of this studio
+//   409 CLIENT_NOT_ENROLLED no PT term yet — enrol them first
+//   409 TERM_EXPIRED        their term has ended — renew first
+//   409 CLIENT_FROZEN       membership is frozen
+//   409 CLIENT_NOT_ACTIVE   any other non-active status
+//   403 PARQ_BLOCKED / CONSENT_REVOKED / PHYSICIAN_ADVISED_AGAINST
+//                           the medical hard stops, unchanged
+//
+// The term's end date is its LAST valid day, compared in the database's own
+// session time zone (the studio's — see db/pool.js), so the final day is valid
+// for the whole local day.
+//
+// Strict screening for NEW clients. A client who has never had a PT term must
+// have a COMPLETED Informed Consent and a SUBMITTED, fully answered PAR-Q
+// before anything that starts their training: enrolment and fitness testing
+// (403 SCREENING_REQUIRED, with what is missing). Clients already enrolled or
+// renewed keep the warn-only behaviour above — the studio decided not to lock
+// out people who are training today (Phase 2, 2026-10-02).
+
+const ELIGIBILITY_BLOCKS = {
+  CLIENT_NOT_ENROLLED: 'This client is not enrolled in PT yet. Enrol them before assigning or starting training.',
+  TERM_EXPIRED: 'This client\'s PT term has ended. Renew their PT before assigning or starting training.',
+  CLIENT_FROZEN: 'This client\'s membership is frozen. Unfreeze it before assigning or starting training.',
+  CLIENT_NOT_ACTIVE: 'This client is not active. Reactivate them before assigning or starting training.',
+};
+
+const SCREENING_REQUIRED_MESSAGE = 'Complete this client\'s screening first: a new client needs a completed '
+  + 'Informed Consent and a fully answered PAR-Q before they can be enrolled or tested.';
+
+/**
+ * The client facts eligibility depends on, org-scoped and live.
+ * `ended` is computed in SQL so "today" is the database session's — the
+ * studio's — today, not the Node process's.
+ */
+async function loadClientFacts(orgId, clientId) {
+  const { hasPtTermSql } = require('./ptTerm');
+  const { rows } = await pool.query(
+    `SELECT c.id, c.status,
+            (c.pt_end_date IS NOT NULL AND c.pt_end_date < CURRENT_DATE) AS ended,
+            ${hasPtTermSql('c')} AS has_pt_term
+       FROM pt_clients c
+      WHERE c.id = $1 AND c.organization_id = $2 AND c.deleted_at IS NULL`,
+    [clientId, orgId],
+  );
+  return rows[0] || null;
+}
+
+/** Which status block applies, or null when the client may train. */
+function statusBlock(facts) {
+  if (!facts.has_pt_term || facts.status === 'pending') return 'CLIENT_NOT_ENROLLED';
+  if (facts.status === 'expired' || (facts.status === 'active' && facts.ended)) return 'TERM_EXPIRED';
+  if (facts.status === 'frozen') return 'CLIENT_FROZEN';
+  if (facts.status !== 'active') return 'CLIENT_NOT_ACTIVE';
+  return null;
+}
+
+/** What a new client's screening is missing, in the order they are done. */
+function missingScreening(parq, consent) {
+  const missing = [];
+  if (consent.status !== 'completed') missing.push('informed_consent');
+  const answered = Number(parq?.answered_count);
+  if (!parq || !(answered >= PARQ_QUESTION_COUNT)) missing.push('parq');
+  return missing;
+}
+
+/**
+ * May this client be trained right now?
+ *
+ * @param {object} req       for the org and the audit row
+ * @param {string} clientId
+ * @param {object} [opts]
+ * @param {boolean} [opts.requireActive=true]  false for fitness testing, which
+ *        happens BEFORE enrolment in the intake journey
+ * @param {string} [opts.action]  audit label
+ * @returns {Promise<{ blocked: null | { status, body }, warnings: string[], facts: object|null }>}
+ */
+async function checkTrainingEligibility(req, clientId, { requireActive = true, action = 'training' } = {}) {
+  const facts = await loadClientFacts(require('./tenant-db').orgIdOf(req), clientId);
+  if (!facts) {
+    return { blocked: { status: 404, body: { error: 'Client not found', code: 'NOT_FOUND' } }, warnings: [], facts: null };
+  }
+
+  if (requireActive) {
+    const code = statusBlock(facts);
+    if (code) {
+      await logActivity(req, 'training.blocked', 'pt_client', clientId, { reason: code.toLowerCase(), action });
+      return { blocked: { status: 409, body: { error: ELIGIBILITY_BLOCKS[code], code } }, warnings: [], facts };
+    }
+  }
+
+  // Strict screening for a client who has never been enrolled. The medical
+  // hard stops are checked first and win, because they say what to fix.
+  if (!facts.has_pt_term) {
+    const { code, parq, consent } = await evaluate(clientId);
+    if (!code) {
+      const missing = missingScreening(parq, consent);
+      if (missing.length) {
+        await logActivity(req, 'training.blocked', 'pt_client', clientId, { reason: 'screening_required', missing, action });
+        return {
+          blocked: { status: 403, body: { error: SCREENING_REQUIRED_MESSAGE, code: 'SCREENING_REQUIRED', missing } },
+          warnings: [], facts,
+        };
+      }
+    }
+  }
+
+  const { blocked, warnings } = await checkScreeningGate(req, clientId);
+  return { blocked, warnings, facts };
+}
+
+/**
+ * Enrolment's half: a client with no PT term may only be enrolled once their
+ * screening is complete and nothing medically blocks them. Clients who
+ * already have a term (renewals, edits) are not re-gated here.
+ *
+ * @returns {Promise<null | { status, body }>}
+ */
+async function enrolmentScreeningBlock(req, clientId) {
+  const { code, parq, consent } = await evaluate(clientId);
+  if (code) {
+    await logActivity(req, 'enrolment.blocked', 'pt_client', clientId, { reason: code.toLowerCase() });
+    return { status: 403, body: { error: BLOCKS[code], code } };
+  }
+  const missing = missingScreening(parq, consent);
+  if (missing.length) {
+    await logActivity(req, 'enrolment.blocked', 'pt_client', clientId, { reason: 'screening_required', missing });
+    return { status: 403, body: { error: SCREENING_REQUIRED_MESSAGE, code: 'SCREENING_REQUIRED', missing } };
+  }
+  return null;
+}
+
+// ── What the profile shows ──────────────────────────────────────────────────
+//
+// The client profile summarised screening from the newest row of each list,
+// drafts included, ordered by assessment date with no tie-break. The gate
+// above reads differently — drafts never count, a revocation stands until a
+// newer consent is completed — so the profile could say "draft" while
+// training was hard-blocked, or "submitted" for a client the PAR-Q blocks.
+// It also never said WHY a client was blocked.
+//
+// screeningSummary is the gate's own reading, plus the in-progress drafts,
+// so the profile and the gate cannot disagree.
+
+/** The newest draft of each, which the gate deliberately ignores. */
+const DRAFTS_SQL = `
+  SELECT
+    (SELECT f.id FROM pt_parq_forms f
+       JOIN pt_clients c ON c.id = f.client_id AND c.organization_id = f.organization_id
+      WHERE f.client_id = $1 AND f.deleted_at IS NULL AND f.status = 'draft'
+      ORDER BY f.updated_at DESC NULLS LAST, f.created_at DESC LIMIT 1) AS parq_draft_id,
+    (SELECT ic.id FROM pt_informed_consents ic
+       JOIN pt_clients c ON c.id = ic.client_id AND c.organization_id = ic.organization_id
+      WHERE ic.client_id = $1 AND ic.status IN ('draft', 'pending_client_signature', 'pending_trainer_signature')
+      ORDER BY ic.created_at DESC LIMIT 1) AS consent_draft_id`;
+
+/**
+ * Screening as the gate sees it.
+ *
+ * @returns {Promise<{
+ *   consent: { status: 'completed'|'revoked'|'expired'|'in_progress'|'none' },
+ *   parq: { status: 'submitted'|'reviewed'|'in_progress'|'none', risk_level: string|null,
+ *           has_valid_clearance: boolean, complete: boolean, stale: boolean },
+ *   block: null | { code: string, message: string },
+ *   warnings: string[],
+ *   complete: boolean,
+ * }>}
+ */
+async function screeningSummary(clientId) {
+  const [{ code, parq, consent }, { rows: [drafts] }] = await Promise.all([
+    evaluate(clientId),
+    pool.query(DRAFTS_SQL, [clientId]),
+  ]);
+  const consentStatus = consent.status
+    ? consent.status
+    : drafts?.consent_draft_id ? 'in_progress' : 'none';
+  const parqStatus = parq
+    ? parq.status || 'submitted'
+    : drafts?.parq_draft_id ? 'in_progress' : 'none';
+  const warnings = code ? [] : [
+    ...parqWarnings(parq),
+    ...(consent.status !== 'completed' ? ['Informed Consent is not completed for this client.'] : []),
+  ];
+  return {
+    consent: { status: consentStatus },
+    parq: {
+      status: parqStatus,
+      risk_level: parq?.risk_level ?? null,
+      has_valid_clearance: Boolean(parq?.has_valid_clearance),
+      complete: Boolean(parq) && Number(parq.answered_count) >= PARQ_QUESTION_COUNT,
+      stale: parq?.is_stale === true,
+    },
+    block: code ? { code, message: BLOCKS[code] } : null,
+    warnings,
+    complete: !code && missingScreening(parq, consent).length === 0,
+  };
+}
+
 module.exports = {
   checkScreeningGate, isTrainingBlocked, parqBlocks, parqWarnings, validClearanceSql,
-  PARQ_QUESTION_COUNT,
+  checkTrainingEligibility, enrolmentScreeningBlock, statusBlock, missingScreening, screeningSummary,
+  ELIGIBILITY_BLOCKS, PARQ_QUESTION_COUNT,
 };
