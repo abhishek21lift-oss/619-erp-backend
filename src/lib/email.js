@@ -58,6 +58,59 @@ function isTransient(err) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * An SMTP failure as data, not as prose.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ *
+ * Production recorded `last_error = "Connection timeout"` and stopped there.
+ * That string does mean something precise — it is nodemailer's stage-'CONN'
+ * marker, raised at smtp-connection/index.js:350 as `_onConnectionError(
+ * 'Connection timeout', 'ETIMEDOUT')` when net.connect() never completes — but
+ * only to somebody who already knows that mapping. Everyone else reading the
+ * Command Centre saw four words and could not tell a firewall drop from a wrong
+ * password from a rejected recipient.
+ *
+ * The fields that DO distinguish them were on the error object the whole time
+ * and were thrown away at every boundary: `isTransient()` branches on
+ * `responseCode`, `diagnose()` branches on `code` and `response`, and neither
+ * ever had them reach a log line or the database. So the file contained a
+ * careful diagnostic engine feeding on data no caller could see.
+ *
+ * `stage` is the one that earns its place. It is the SMTP transaction phase:
+ *
+ *   CONN   the TCP connection never opened. No TLS, no AUTH, no DATA. Retrying
+ *          is free and nothing was submitted.
+ *   TLS    the socket opened and the TLS handshake failed. A certificate or
+ *          cipher problem — not a credentials problem.
+ *   AUTH   connected and presented itself; the server refused the login.
+ *   DATA   the message body was (or may have been) submitted and the final
+ *          response was lost. THE SERVER MAY ALREADY HAVE ACCEPTED IT, so a
+ *          blind retry here risks delivering twice.
+ *
+ * ── What is deliberately NOT copied ──────────────────────────────────────────
+ *
+ * `err.auth` (nodemailer hands back the transport's own credentials on some
+ * paths), `err.config`, and the `command` value when it is a raw AUTH exchange.
+ * An allowlist, not a denylist: a field that is not named here is not logged,
+ * so a future nodemailer version adding `err.credentials` cannot leak by
+ * default. SMTP_PASS must never appear in a log line or in `admin_invitations`.
+ */
+function describeError(err) {
+  if (!err || typeof err !== 'object') {
+    return { message: err == null ? 'unknown error' : String(err) };
+  }
+  const out = { message: err.message || 'unknown error' };
+  // Only these four, and only when present and primitive. `command` is a short
+  // protocol verb (`EHLO`, `MAIL FROM`, `DATA`) — never an argument list.
+  for (const key of ['code', 'stage', 'command']) {
+    if (typeof err[key] === 'string' && err[key]) out[key] = err[key];
+  }
+  if (typeof err.responseCode === 'number') out.responseCode = err.responseCode;
+  if (typeof err.response === 'string' && err.response) out.response = err.response;
+  return out;
+}
+
+/**
  * Send with bounded retry and exponential backoff. Throws the final error so
  * the caller can record WHY delivery failed rather than only that it did.
  */
@@ -72,11 +125,11 @@ async function sendWithRetry(message, ctx = {}) {
       lastErr = err;
       if (!isTransient(err) || attempt === SEND_ATTEMPTS) break;
       const backoffMs = 500 * 2 ** (attempt - 1);
-      logger.warn({ ...ctx, attempt, err: err.message, backoffMs }, 'email send failed — retrying');
+      logger.warn({ ...ctx, attempt, ...describeError(err), backoffMs }, 'email send failed — retrying');
       await sleep(backoffMs);
     }
   }
-  logger.error({ ...ctx, err: lastErr?.message }, 'email send failed permanently');
+  logger.error({ ...ctx, ...describeError(lastErr) }, 'email send failed permanently');
   throw lastErr;
 }
 
@@ -423,6 +476,28 @@ function diagnose(err) {
         + 'credentials, TLS or the port pairing.';
   }
   if (code === 'ETIMEDOUT' || code === 'ESOCKET' || code === 'ECONNREFUSED') {
+    // ── The stage decides which of these it is ─────────────────────────────
+    //
+    // All three codes arrive from three different places in the SMTP
+    // transaction, and they call for three different fixes. Folding them into
+    // one sentence is what sent the last investigation after the port: the
+    // production failure was stage CONN, where the port pairing is irrelevant
+    // because no byte ever reached the server.
+    if (err?.stage === 'CONN') {
+      return `The TCP connection to ${SMTP_HOST}:${SMTP_PORT} never opened — nothing was `
+        + 'sent and no credentials were presented, so this is a network path problem, not a '
+        + 'credentials or port-pairing one. In order of likelihood: outbound '
+        + `${SMTP_PORT} is blocked from this host (firewall or provider egress policy); the `
+        + 'resolved address is unroutable from here; or the provider is refusing this source IP. '
+        + 'Run scripts/verify-smtp.js FROM THIS HOST — a laptop that connects proves nothing '
+        + 'about the deploy.';
+    }
+    if (err?.stage === 'DATA' || err?.stage === 'RCPT TO') {
+      return `The connection was established and the server may already have accepted the `
+        + 'message, but the final response was lost before it arrived. This is the one SMTP '
+        + 'failure where retrying can deliver twice: check the recipient\'s inbox before '
+        + 'resending, and prefer the operator-visible Resend over an automatic retry.';
+    }
     return `Could not establish a session on port ${SMTP_PORT}. 465 is implicit TLS and 587 is `
       + 'STARTTLS, and those are the only two correct pairings. If the address in the error '
       + 'contains colons it is IPv6 and the port is a red herring — see the family: 4 note in '
@@ -460,9 +535,10 @@ async function verifyConnection() {
   } catch (err) {
     return {
       ok: false,
+      // The structured fields, spread rather than nested, so a caller logging
+      // this whole object gets code/stage/responseCode as top-level keys.
+      ...describeError(err),
       reason: err.code || 'ERROR',
-      message: err.message,
-      response: err.response,
       diagnosis: diagnose(err),
       host: SMTP_HOST, port: SMTP_PORT, user: SMTP_USER, from: FROM_ADDR,
     };
@@ -553,6 +629,6 @@ module.exports = {
   sendWelcome, sendPasswordReset, sendAdminResetOtp, sendAdminInvitation, sendRaw,
   sendClientActivation,
   sendWelcomeInline, sendPasswordResetInline, sendAdminResetOtpInline,
-  verifyConnection, diagnose,
+  verifyConnection, diagnose, describeError,
   isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,
 };
