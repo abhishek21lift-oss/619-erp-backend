@@ -24,7 +24,9 @@ const { saveFile } = require('../../../lib/fileStorage');
 const { invalidateUserCache } = require('../../../middleware/auth');
 const subscription = require('../../../lib/subscription');
 const invitations = require('../../../lib/invitations');
-const { sendAdminInvitation, sendPasswordReset, isConfigured: smtpConfigured } = require('../../../lib/email');
+const {
+  sendAdminInvitation, sendPasswordReset, isConfigured: smtpConfigured, describeError,
+} = require('../../../lib/email');
 const { frontendUrl } = require('../../../lib/frontendUrl');
 const { apiUrl } = require('../../../lib/apiUrl');
 const { TRIAL_DAYS } = subscription;
@@ -149,8 +151,22 @@ function csvCell(v) {
  *
  * Never throws. The caller has already committed a studio; a failed email is
  * something to report and retry, not something to unwind an account over.
+ *
+ * ── Why the recorded error carries more than err.message ────────────────────
+ *
+ * `admin_invitations.last_error` is the only durable record of why outbound
+ * mail failed, and it is what the Command Centre's SMTP card reads back. It
+ * stored `err.message` alone, which is why this platform's history says
+ * "Connection timeout" and nothing else — four words that identify the fault
+ * only to somebody who already knows nodemailer emits that exact string at
+ * stage CONN. `code` and `stage` were on the error object and were dropped.
+ *
+ * Composed into the existing single TEXT column rather than a new one: no
+ * migration, no schema change, and older bare-message rows stay readable.
+ * describeError() is an allowlist, so SMTP_PASS cannot reach this column.
  */
 async function deliverInvitation(invitation, rawToken) {
+  let sendErr = null;
   try {
     await sendAdminInvitation({
       to: invitation.email,
@@ -162,13 +178,47 @@ async function deliverInvitation(invitation, rawToken) {
       pixelUrl: apiUrl(`/api/invitations/track/${invitation.track_id}.gif`) || undefined,
       expiryHours: invitations.EXPIRY_HOURS,
     });
-    await invitations.markSent(invitation.id);
-    return { sent: true, error: null };
   } catch (err) {
-    await invitations.markSendFailed(invitation.id, err.message).catch(() => {});
-    logger.error({ err: err.message, invitation: invitation.id }, 'invitation email failed');
-    return { sent: false, error: err.message };
+    // ONLY the send lands here. See the note below for why the status write is
+    // deliberately not inside this try.
+    sendErr = err;
   }
+
+  if (!sendErr) {
+    try {
+      await invitations.markSent(invitation.id);
+      return { sent: true, error: null };
+    } catch (err) {
+      // The email WAS delivered — the SMTP server accepted it and said so. Only
+      // the bookkeeping failed, and the two must not be reported as one thing:
+      // writing a send-failure here would put a `last_error` on a delivered
+      // invitation, which is exactly the state the SMTP card grades CRITICAL and
+      // the console answers with a Resend button. The operator would then resend
+      // a link that was already delivered, and the studio owner gets two.
+      //
+      // So this is logged loudly and the send is reported as the success it was.
+      // The row stays `pending` and effectiveStatus() still lets it be resent,
+      // which is the correct recoverable state — `pending` means "we do not know",
+      // and the operator's Resend is idempotent because supersedeOpen() retires
+      // the stale token rather than leaving two live ones.
+      logger.error({ err: err.message, invitation: invitation.id, delivered: true },
+        'invitation email DELIVERED but markSent failed — row left pending; resend is safe');
+      return { sent: true, error: null };
+    }
+  }
+
+  // "Connection timeout (ETIMEDOUT, stage=CONN)" — the same information the log
+  // line carries, in the column the health card reads back.
+  const { message, code, stage, responseCode } = describeError(sendErr);
+  const recorded = [
+    message,
+    code && code !== message ? `(${code}${stage ? `, stage=${stage}` : ''})` : '',
+    responseCode ? `[${responseCode}]` : '',
+  ].join(' ').trim();
+  await invitations.markSendFailed(invitation.id, recorded).catch(() => {});
+  logger.error({ err: message, code, stage, responseCode, invitation: invitation.id },
+    'invitation email failed');
+  return { sent: false, error: recorded };
 }
 
 // Only what a domain router actually imports. LOGO_MAX_BYTES, LOGO_SIGNATURES,
