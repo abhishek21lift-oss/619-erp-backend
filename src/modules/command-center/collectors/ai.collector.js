@@ -117,7 +117,23 @@ async function collect() {
   let reason = null;
 
   if (!routing || (!routing.primary && !routing.fallback)) {
-    return unavailable(NAME, 'No AI routing configured in platform_ai_settings');
+    // `expected: true` — this probe did NOT fail, it answered. It read
+    // platform_ai_settings, got a row back, and found no provider configured.
+    //
+    // Marked expected because observabilityOf() keeps two different things in
+    // different buckets: `unexpected` is "a probe that should have run and did
+    // not" — the blind spot — and `expected` is "a capability this deployment
+    // has deliberately not wired up". Reporting an unconfigured provider as the
+    // former filed a working probe under blind, which is what put "blind: 1"
+    // and "coverage: 88%" on a snapshot where all eight probes had answered.
+    // snapshot.service.js states the rule outright ("a capability that does not
+    // exist here is not something we failed to see"), and MissionControl's
+    // coverage tooltip states it from the other side.
+    //
+    // Still UNAVAILABLE and still shown: no AI routing is a real gap in what
+    // this platform can do, and an operator should not have to open the card to
+    // discover it.
+    return unavailable(NAME, 'No AI routing configured in platform_ai_settings', true);
   }
   if (hourRequests === 0) {
     // Idle is not unhealthy. Overnight there is simply no traffic, and an
