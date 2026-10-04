@@ -6,7 +6,8 @@
 // request it cannot yet attribute to a user, i.e. all of them. This one is
 // mounted AFTER authentication, keyed on the user, and counts only requests
 // that start a model call (GETs — conversation lists, usage, health — are
-// free). Twenty a minute is well above a trainer working normally and well
+// free, with one exception: knowledge search embeds the query on every call,
+// so it is the one expensive GET this limiter counts). Twenty a minute is well above a trainer working normally and well
 // below a loop.
 
 const rateLimit = require('express-rate-limit');
@@ -24,7 +25,11 @@ const aiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => req.user?.id ?? req.ip,
-  skip: (req) => req.method === 'GET' || req.method === 'HEAD',
+  // GETs are skipped as free — except knowledge search, which embeds the
+  // query on every call and is the one expensive GET behind this limiter.
+  skip: (req) =>
+    (req.method === 'GET' || req.method === 'HEAD') &&
+    !(req.baseUrl === '/api/ai/knowledge' && req.path === '/search'),
   message: {
     error: {
       code: 'AI_RATE_LIMITED',

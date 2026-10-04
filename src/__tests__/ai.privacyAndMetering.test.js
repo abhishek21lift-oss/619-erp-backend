@@ -135,6 +135,24 @@ describe('AI-3: per-user AI rate limit', () => {
     expect((await request(app).get('/x')).status).toBe(200);
   });
 
+  test('knowledge search is the one GET that counts', async () => {
+    const { aiLimiter, AI_REQUESTS_PER_MINUTE } = require('../middleware/aiRateLimit');
+    const express = require('express');
+    const request = require('supertest');
+    const app = express();
+    app.use((req, _res, next) => { req.user = { id: 'u-search' }; next(); });
+    app.use('/api/ai/knowledge', aiLimiter);
+    app.get('/api/ai/knowledge/search', (_req, res) => res.json({ ok: true }));
+    app.get('/api/ai/knowledge', (_req, res) => res.json({ ok: true }));
+
+    for (let i = 0; i < AI_REQUESTS_PER_MINUTE; i++) {
+      expect((await request(app).get('/api/ai/knowledge/search')).status).toBe(200);
+    }
+    expect((await request(app).get('/api/ai/knowledge/search')).status).toBe(429);
+    // The plain list GET on the same mount stays free.
+    expect((await request(app).get('/api/ai/knowledge')).status).toBe(200);
+  });
+
   test('it is mounted after authentication on every AI surface', () => {
     const server = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
     expect(server).toMatch(/app\.use\('\/api\/ai',\s+\.\.\.studioGate\('ai_suite'\), aiLimiter, requireAiQuota\(\)/);

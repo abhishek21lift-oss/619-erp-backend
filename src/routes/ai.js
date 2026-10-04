@@ -1818,10 +1818,13 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
     if (!assessment) return res.status(404).json({ error: 'Assessment not found' });
 
     const [clientRes, previousRes] = await Promise.all([
-      pool.query('SELECT name, dob, gender FROM pt_clients WHERE id=$1 AND deleted_at IS NULL', [assessment.client_id]),
+      // Org-gated like the assessment above it: the client and the previous
+      // assessment are reached through an org-checked row, but the predicates
+      // below are what actually enforce the boundary on THESE reads.
+      pool.query('SELECT name, dob, gender FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2', [assessment.client_id, org]),
       pool.query(
-        'SELECT * FROM pt_assessments WHERE client_id=$1 AND assessment_date < $2 ORDER BY assessment_date DESC LIMIT 1',
-        [assessment.client_id, assessment.assessment_date]
+        'SELECT * FROM pt_assessments WHERE client_id=$1 AND assessment_date < $2 AND organization_id = $3 ORDER BY assessment_date DESC LIMIT 1',
+        [assessment.client_id, assessment.assessment_date, org]
       ),
     ]);
 
