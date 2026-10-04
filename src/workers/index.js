@@ -7,6 +7,30 @@
 //
 // Standalone:   node src/workers/index.js
 
+// Error monitoring, BEFORE anything else, for the same reason server.js does it
+// first: the SDK has to be initialised before the code it instruments runs.
+//
+// This line was missing, and the gap was invisible from inside the worker.
+// docker-compose.yml hands SENTRY_DSN to this service explicitly (line 189,
+// alongside the api's on line 119) because Compose only passes through variables
+// an `environment:` line names — so the variable arrived, was correct, and was
+// read by nobody: src/instrument.js is the only thing in the backend that calls
+// Sentry.init().
+//
+// It is not cosmetic here, because of the topology. The api runs with
+// RUN_WORKERS=0 and this file runs as its own container, so these are separate
+// processes — this is not the single-process case where server.js's own
+// require would have covered the workers incidentally. What runs in here owns
+// the AI queue, email delivery, WhatsApp, notifications and renewal billing, so
+// an unhandled throw in any of them was invisible to Sentry while looking, from
+// the compose file, fully configured.
+//
+// At module scope rather than inside startWorkers(): Node's module cache means
+// that when server.js has already required ./instrument (RUN_WORKERS=1), this
+// require hands back that same instance and init() runs once, not twice.
+// src/instrument.js stays the single place that decides whether to initialise.
+require('../instrument');
+
 const logger = require('../lib/logger');
 
 let activeWorkers = [];
