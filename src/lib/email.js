@@ -178,6 +178,67 @@ let transportPromise = null;
  * Never throws: a DNS failure must degrade to the previous behaviour, not take
  * outgoing mail down with it.
  */
+// ── Bounded SMTP timeouts ────────────────────────────────────────────────────
+//
+// Nothing here sets a timeout, so nodemailer's defaults applied
+// (smtp-connection/index.js:49-51): connect 2 MINUTES, greeting 30s, socket
+// 10 MINUTES.
+//
+// That default is survivable when a connection is REFUSED — ECONNREFUSED comes
+// back instantly. It is not survivable when the port is blackholed, which is
+// exactly what production recorded: `Connection timeout` is nodemailer's
+// stage-CONN marker (`:350`), raised when net.connect() never completes, i.e.
+// the SYN went unanswered. Only a timeout can end that wait.
+//
+// With SMTP_SEND_ATTEMPTS=3 and the 500ms/1s backoff, one send against a
+// blackholed port therefore blocks the caller for roughly 3 x 120s = 6 minutes.
+// deliverInvitation() runs sendWithRetry() inline rather than through the
+// BullMQ dispatcher, so that is six minutes of a pinned request thread on
+// studio creation and on every Resend.
+//
+// Measured from the public internet against the same host: TCP connect in 90ms,
+// TLS handshake in 801ms. The bounds below are generous by two orders of
+// magnitude against a healthy path, and cut the pathological one from minutes to
+// seconds — so the failure is reported while it is still happening instead of
+// after a coffee. They do NOT make mail deliver; if egress is blocked, mail
+// still does not send. That is a network change, not a code change.
+//
+// Overridable per value, and clamped rather than trusted: a `0` or a negative
+// number is the usual way a timeout gets accidentally removed, and nodemailer
+// reads those as falsy and falls back to its own. Same shape as
+// openrouter.js's defaultTimeoutMs().
+const SMTP_TIMEOUT_DEFAULTS = Object.freeze({
+  connectionTimeout: 20_000,
+  greetingTimeout: 15_000,
+  socketTimeout: 60_000,
+});
+// Ceilings keep a fat-fingered value from reinstating the hang this removes.
+const SMTP_TIMEOUT_MAX = Object.freeze({
+  connectionTimeout: 60_000,
+  greetingTimeout: 30_000,
+  socketTimeout: 120_000,
+});
+
+function smtpTimeout(kind) {
+  const def = SMTP_TIMEOUT_DEFAULTS[kind];
+  const max = SMTP_TIMEOUT_MAX[kind];
+  const raw = process.env[`SMTP_${kind.replace(/[A-Z]/g, (c) => '_' + c)}_MS`.toUpperCase()];
+  const n = Number(raw);
+  if (raw && Number.isFinite(n) && n >= 1_000 && n <= max) return n;
+  if (raw) {
+    logger.warn({ value: raw, kind, fallback: def }, 'ai_smtp_timeout_invalid');
+  }
+  return def;
+}
+
+function smtpTimeouts() {
+  return {
+    connectionTimeout: smtpTimeout('connectionTimeout'),
+    greetingTimeout: smtpTimeout('greetingTimeout'),
+    socketTimeout: smtpTimeout('socketTimeout'),
+  };
+}
+
 async function resolveIpv4() {
   // An address configured directly needs no lookup, and resolve4() on a
   // literal does not do what the name suggests.
@@ -249,6 +310,10 @@ async function buildTransport() {
     port: SMTP_PORT,
     secure: SMTP_PORT === 465,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
+    // Bounded, so a blackholed port fails in seconds rather than holding the
+    // caller for nodemailer's 120s default times every attempt. See the block
+    // comment above the defaults.
+    ...smtpTimeouts(),
     // Always the hostname, never the address. See the note above — this is
     // what keeps TLS validating against the certificate's real subject.
     servername: SMTP_HOST,
@@ -629,6 +694,6 @@ module.exports = {
   sendWelcome, sendPasswordReset, sendAdminResetOtp, sendAdminInvitation, sendRaw,
   sendClientActivation,
   sendWelcomeInline, sendPasswordResetInline, sendAdminResetOtpInline,
-  verifyConnection, diagnose, describeError,
+  verifyConnection, diagnose, describeError, smtpTimeouts, SMTP_TIMEOUT_DEFAULTS,
   isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,
 };
