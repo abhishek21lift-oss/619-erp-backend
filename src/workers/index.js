@@ -7,7 +7,99 @@
 //
 // Standalone:   node src/workers/index.js
 
+// Error monitoring, BEFORE anything else, for the same reason server.js does it
+// first: the SDK has to be initialised before the code it instruments runs.
+//
+// This line was missing, and the gap was invisible from inside the worker.
+// docker-compose.yml hands SENTRY_DSN to this service explicitly (line 189,
+// alongside the api's on line 119) because Compose only passes through variables
+// an `environment:` line names — so the variable arrived, was correct, and was
+// read by nobody: src/instrument.js is the only thing in the backend that calls
+// Sentry.init().
+//
+// It is not cosmetic here, because of the topology. The api runs with
+// RUN_WORKERS=0 and this file runs as its own container, so these are separate
+// processes — this is not the single-process case where server.js's own
+// require would have covered the workers incidentally. What runs in here owns
+// the AI queue, email delivery, WhatsApp, notifications and renewal billing, so
+// an unhandled throw in any of them was invisible to Sentry while looking, from
+// the compose file, fully configured.
+//
+// At module scope rather than inside startWorkers(): Node's module cache means
+// that when server.js has already required ./instrument (RUN_WORKERS=1), this
+// require hands back that same instance and init() runs once, not twice.
+// src/instrument.js stays the single place that decides whether to initialise.
+const Sentry = require('../instrument');
+
 const logger = require('../lib/logger');
+
+// ── Error semantics ──────────────────────────────────────────────────────────
+//
+// Deliberate, because #212 made them accidental.
+//
+// Sentry's global integration installs `process.onunhandledrejection` and
+// returns true from it — which tells Node the rejection is handled, against a
+// default policy of `throw`. Measured on this repo's own @sentry/node 10.65.0
+// (RFC 2606 `.invalid` DSN, so nothing left the machine):
+//
+//   unhandled rejection   no SDK         -> exit 1
+//   unhandled rejection   Sentry.init()  -> exit 0   ← changed by #212
+//   uncaught exception    Sentry.init()  -> exit 1   (unchanged)
+//
+// That moved the worker toward the API, which has always logged and continued
+// (server.js:1376) — the right direction, but by way of an SDK internal, and
+// with nothing in this process's own logs. So the semantics are now written
+// down here instead of inherited:
+//
+//   unhandledRejection  log, keep serving. Matches the API. One rejection is
+//                       one Sentry event: the SDK's hook reports it, so this
+//                       handler must NOT call captureException, or it becomes
+//                       two events for one failure.
+//   uncaughtException   log fatal, flush, exit 1. The flush is not decoration:
+//                       the capture pipeline is async, so exiting synchronously
+//                       DISCARDS the event. Probed here — immediate exit(1)
+//                       captured 0 events, flush-then-exit captured 1.
+//
+// FLUSH_MS is a hardcoded constant rather than an env var deliberately: a new
+// variable would need a docker-compose `environment:` line to reach this
+// container at all (Compose only forwards named variables), and this is not a
+// knob worth a production config change. It bounds how long a dying worker
+// takes to die; the SDK resolves flush() in single-digit ms when no DSN is set.
+const FLUSH_MS = 2000;
+
+// A registry symbol, so the guard is shared across module instances in this
+// process rather than being a property a reload could shadow.
+//
+// server.js installs its OWN pair at :1376/:1394 and requires THIS module to
+// start workers, so in RUN_WORKERS=1 mode both pairs would otherwise be live at
+// once: every rejection logged twice, every fatal exit attempted twice.
+const ERROR_HANDLERS = Symbol.for('myptstudio.workerErrorHandlers');
+
+if (!process[ERROR_HANDLERS]) {
+  process[ERROR_HANDLERS] = true;
+
+  // Log ONLY. The SDK already reports this event; reporting it here too is the
+  // duplicate the `captureException` test below exists to prevent.
+  process.on('unhandledRejection', (reason) => {
+    // `{ err }`, not `{ reason }`, for the reason server.js:1378 documents:
+    // pino serializes by key and an Error's message/stack are non-enumerable,
+    // so a `reason` key logs as `{}`.
+    logger.error({ err: reason }, 'unhandledRejection');
+  });
+
+  process.on('uncaughtException', (err) => {
+    logger.fatal({ err }, 'uncaughtException — flushing error report, then exiting');
+    // Both arms exit. A rejected or absent flush must not leave a half-dead
+    // worker holding its BullMQ connections; `restart: unless-stopped` is what
+    // brings it back, and it cannot do that if the process lingers.
+    const die = () => process.exit(1);
+    try {
+      Promise.resolve(Sentry.flush(FLUSH_MS)).then(die, die);
+    } catch {
+      die();
+    }
+  });
+}
 
 let activeWorkers = [];
 
