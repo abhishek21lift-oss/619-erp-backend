@@ -81,13 +81,68 @@ function makeStore(prefix) {
   // shared client queues commands during an outage instead of rejecting them,
   // so `passOnStoreError` could never fire and every limited route hung.
   const client = redis.getFailFastClient();
+  const keyPrefix = `rl:${prefix}:`;
 
-  return new RedisStore({
-    prefix: `rl:${prefix}:`,
-    // ioredis speaks `call(command, ...args)`. rate-limit-redis hands us the
-    // command and its arguments already split, so this is a straight forward.
-    sendCommand: (...args) => client.call(...args),
-  });
+  // ── Why this returns a proxy instead of a RedisStore ──────────────────────
+  //
+  // `new RedisStore()` cannot be called here. rate-limit-redis@4.3.1 issues two
+  // commands from its CONSTRUCTOR — `SCRIPT LOAD` for the increment script and
+  // for the get script (dist/index.cjs:95-96) — and neither promise is awaited
+  // nor caught. makeStore() runs at module load, and getFailFastClient() is
+  // built with `lazyConnect: true` and `enableOfflineQueue: false`, so at that
+  // moment the client is in `wait`: not connected, and refusing to queue.
+  //
+  // ioredis rejects a command issued while merely CONNECTING, not only while
+  // down, so this was guaranteed rather than conditional — thirty unhandled
+  // rejections on every deploy (fifteen stores x two), from a healthy Redis.
+  // Measured against a live server: `wait` at construction, immediate
+  // "Stream isn't writeable and enableOfflineQueue options is false", then
+  // PONG on the same client two seconds later. That is the whole reason the
+  // errors appeared in a burst at deploy and never again, with Redis up.
+  //
+  // Gating on `redis.isReady()` would be worse, not better: it reads the
+  // SHARED client, which is also lazy, so it is `wait` at boot on a perfectly
+  // healthy Redis — every limiter would fall back to per-process counters for
+  // the life of the process. That is exactly the H-4 finding this file exists
+  // to fix, reintroduced silently.
+  //
+  // So the store is built on FIRST USE, by which point Redis is ready. If it
+  // genuinely is not, the failure now lands inside increment() — which
+  // express-rate-limit already handles via `passOnStoreError: true` — instead
+  // of escaping as an unhandled rejection at import time.
+  //
+  // Every limit, key and policy is untouched: this changes WHEN the client is
+  // first spoken to, not what is sent. `prefix` is exposed because two limiters
+  // sharing a key space share a budget, and callers read it.
+  let limiterOptions = null;
+  let store = null;
+
+  const real = () => {
+    if (!store) {
+      store = new RedisStore({
+        prefix: keyPrefix,
+        // ioredis speaks `call(command, ...args)`. rate-limit-redis hands us the
+        // command and its arguments already split, so this is a straight forward.
+        sendCommand: (...args) => client.call(...args),
+      });
+      // RedisStore.init() is the only thing that sets `windowMs`, and its own
+      // increment() reads it — so this must happen before the first call, or
+      // the Lua script receives `undefined` and the limiter breaks silently.
+      if (limiterOptions) store.init(limiterOptions);
+    }
+    return store;
+  };
+
+  return {
+    prefix: keyPrefix,
+    // Called by express-rate-limit once, at limiter creation — which is module
+    // load, and therefore still too early to build anything.
+    init(options) { limiterOptions = options; },
+    get: (key) => real().get(key),
+    increment: (key) => real().increment(key),
+    decrement: (key) => real().decrement(key),
+    resetKey: (key) => real().resetKey(key),
+  };
 }
 
 module.exports = { makeStore };
