@@ -26,7 +26,7 @@ const { requireAiQuota } = require('../../lib/aiQuota');
 const { aiLimiter } = require('../../middleware/aiRateLimit');
 const { logActivity } = require('../../lib/activityLog');
 const { recordPtPayment } = require('../../lib/ptPayments');
-const { renewClient } = require('./renewal.service');
+const { renewClient, addMonthsIso } = require('./renewal.service');
 const { genReceiptNo } = require('../../db/receipts');
 const { checkTrainingEligibility, enrolmentScreeningBlock, screeningSummary } = require('../../lib/screeningGate');
 const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
@@ -541,9 +541,10 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
     const startDate = creatingTerm ? (pt_start_date || studioToday()) : (pt_start_date || null);
     let endDate = pt_end_date || null;
     if (!endDate && resolvedDurationMonths && resolvedDurationMonths > 0) {
-      const d = new Date(startDate);
-      d.setMonth(d.getMonth() + Number(resolvedDurationMonths));
-      endDate = d.toISOString().slice(0, 10);
+      // UTC-clamped month arithmetic, same as renewals (addMonthsIso):
+      // local-tz setMonth() overflowed (Jan 31 + 1mo → Mar 3) and shifted a
+      // day in IST, so the same input produced different end dates by route.
+      endDate = addMonthsIso(startDate, Number(resolvedDurationMonths));
     }
 
     const { rows } = await pool.query(`
@@ -647,7 +648,9 @@ const money = () => z.coerce.number().min(0).max(MAX_MONEY).optional().nullable(
 const renewSchema = {
   body: z.object({
     pt_start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}/, 'pt_start_date must be YYYY-MM-DD')
-      .refine((v) => !Number.isNaN(Date.parse(v.slice(0, 10))), 'pt_start_date is not a valid date'),
+      // Real calendar check, same as PATCH: Date.parse rolls 2026-02-30 into
+      // March, so the regex alone accepted impossible dates.
+      .refine((v) => isCalendarDate(v.slice(0, 10)), 'pt_start_date is not a valid date'),
     duration_months: z.coerce.number().int().min(1).max(60),
     base_amount: money(),
     discount: money(),
@@ -676,6 +679,12 @@ router.post('/clients/:id/renew', auth, requireTrainer, validate(renewSchema), w
   }
   if (result.duplicate) {
     return res.status(409).json({ error: { code: 'DUPLICATE_RENEWAL', message: 'This renewal was just recorded — it has not been added twice.' } });
+  }
+  if (result.overlap) {
+    return res.status(400).json({ error: {
+      code: 'OVERLAPPING_TERM',
+      message: `The new term starts before the current one ends (${result.currentEnd}). Start the renewal on or after that date.`,
+    } });
   }
   if (result.overpaid != null) {
     return res.status(400).json({ error: {
