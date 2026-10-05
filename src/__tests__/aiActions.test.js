@@ -53,8 +53,9 @@ describe('who may run an action', () => {
 
   test('the studio trainer is', () => {
     expect(listFor(admin).map((a) => a.id).sort())
-      .toEqual(['dues_reminders', 'renewal_reminders']);
+      .toEqual(['dues_reminders', 'lead_followup', 'renewal_reminders']);
     expect(canRun(findAction('renewal_reminders'), admin)).toBe(true);
+    expect(canRun(findAction('lead_followup'), admin)).toBe(true);
   });
 
   test('every offered action declares that it leaves the building', () => {
@@ -116,6 +117,28 @@ describe('recipients come from the server, scoped to the org', () => {
     mockQuery.mockResolvedValue({ rows: [] });
     await findAction('renewal_reminders').resolve(reqAs(admin), { days: 7 });
     expect(mockQuery.mock.calls[0][0]).toMatch(new RegExp(`LIMIT ${MAX_RECIPIENTS}\\b`));
+  });
+
+  test('lead follow-ups resolve due new/contacted leads, org-scoped', async () => {
+    mockQuery.mockResolvedValue({ rows: [] });
+    await findAction('lead_followup').resolve(reqAs(admin), {});
+    const [sql, values] = mockQuery.mock.calls[0];
+    expect(sql).toMatch(/FROM pt_leads/);
+    expect(sql).toMatch(/status IN \('new', 'contacted'\)/);
+    expect(sql).toMatch(/organization_id = \$1/);
+    expect(values).toEqual(['org-1']);
+  });
+
+  test('lead follow-ups draft a body per reachable lead', async () => {
+    mockQuery.mockResolvedValue({ rows: [
+      { id: 'l1', name: 'Asha', mobile: '999', follow_up_date: '2026-10-01' },
+      { id: 'l2', name: 'NoPhone', mobile: null, follow_up_date: null },
+    ] });
+    const out = await findAction('lead_followup').resolve(reqAs(admin), {});
+    expect(out.recipients).toHaveLength(1);
+    expect(out.recipients[0]).toMatchObject({ id: 'l1', mobile: '999' });
+    expect(out.recipients[0].body).toContain('Asha');
+    expect(out.warnings.join(' ')).toMatch(/no mobile number/);
   });
 });
 

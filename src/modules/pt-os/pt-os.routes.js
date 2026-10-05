@@ -91,7 +91,8 @@ const ptClientCreateSchema = {
     // NULL below, because "not answered" is a real state and an enum that
     // rejects '' makes the form unsubmittable when the operator skips it.
     client_source: z.enum(CLIENT_SOURCES).or(z.literal('')).optional().nullable(),
-  }),
+  }).refine((b) => b.discount == null || b.base_amount == null || b.discount <= b.base_amount,
+    { message: 'discount cannot exceed base_amount', path: ['discount'] }),
 };
 
 const automation = require('../automation/automation.triggers');
@@ -566,6 +567,20 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
         health_conditions = COALESCE($17, health_conditions),
         injuries          = COALESCE($18, injuries),
         frequency         = COALESCE($19, frequency),
+        -- Contact/identity fields used to be validated and then discarded on
+        -- this path (only the INSERT stored them): a corrected phone number
+        -- on an enrol-existing-client call 201'd into nothing.
+        mobile            = COALESCE($20, mobile),
+        email             = COALESCE($21, email),
+        gender            = COALESCE($22, gender),
+        dob               = COALESCE($23, dob),
+        whatsapp          = COALESCE($24, whatsapp),
+        occupation        = COALESCE($25, occupation),
+        emergency_contact = COALESCE($26, emergency_contact),
+        emergency_phone   = COALESCE($27, emergency_phone),
+        emergency_contact_relationship = COALESCE($28, emergency_contact_relationship),
+        address           = COALESCE($29, address),
+        client_source     = COALESCE($30, client_source),
         -- Promote to 'active' only once the client is actually enrolled in a
         -- package (has an end date, a charged amount, or a duration). A name-only
         -- add stays 'pending' so it never shows in the active-clients list/counts.
@@ -579,7 +594,7 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
           ELSE status
         END,
         updated_at = NOW()
-      WHERE id = $1 AND deleted_at IS NULL AND organization_id = $20
+      WHERE id = $1 AND deleted_at IS NULL AND organization_id = $31
       RETURNING *
     `, [
       cid,
@@ -590,6 +605,10 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
       goal || null, height != null ? Number(height) : null,
       body_fat != null ? Number(body_fat) : null,
       health_conditions || null, injuries || null, frequency || null,
+      mobile || null, email || null, gender || null, dob || null,
+      whatsapp || null, occupation || null, emergency_contact || null,
+      emergency_phone || null, emergency_contact_relationship || null,
+      address || null, client_source || null,
       orgIdOf(req),
     ]);
     // A client_id from the body that is not a live client of THIS studio

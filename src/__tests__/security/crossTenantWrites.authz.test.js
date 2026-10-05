@@ -129,12 +129,15 @@ describe('POST /pt-os/clients — the body client_id is not a key to another stu
 
     const update = stmt(/UPDATE pt_clients SET/i);
     expect(update).toBeTruthy();
-    expect(update.sql).toMatch(/WHERE id = \$1 AND deleted_at IS NULL AND organization_id = \$20/);
+    // $31, not $20: the contact-field columns added later shifted the org
+    // placeholder. What this pins is that the org binds the caller's studio,
+    // whatever its position.
+    expect(update.sql).toMatch(/WHERE id = \$1 AND deleted_at IS NULL AND organization_id = \$31/);
     // The screening pre-read that enrolment now does is bound to the studio too.
     const termRead = stmt(/AS has_pt_term FROM pt_clients c/i);
     expect(termRead.sql).toMatch(/c\.organization_id = \$2/);
     expect(termRead.params).toEqual([FOREIGN, ORG_A]);
-    expect(update.params[19]).toBe(ORG_A);
+    expect(update.params[30]).toBe(ORG_A);
     expect(update.params).not.toContain(ORG_B);
   });
 
