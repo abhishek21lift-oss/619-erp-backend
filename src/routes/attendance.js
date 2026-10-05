@@ -67,6 +67,40 @@ async function subjectInOrg(orgId, type, refId) {
   return rowCount > 0;
 }
 
+// GET /api/attendance/leaderboard?from=&to=&type=client — server-side rank
+// aggregation. The legacy list branch below caps at 500 rows, which silently
+// corrupts ranks for any studio with more check-ins than that in the window
+// (the oldest days vanish, no total is returned, the UI cannot warn). Counting
+// per member in SQL removes the cap class entirely: one request, exact ranks.
+// Statuses mirror frontend CHECKED_IN_STATUSES (present + late).
+router.get('/leaderboard', auth, async (req, res, next) => {
+  try {
+    const { from, to, type = 'client' } = req.query;
+    const scope = tenantScope(req);
+    const conditions = ['a.organization_id = $1', 'a.ref_type = $2'];
+    const params = [scope.orgId, type];
+    let p = 3;
+    if (from) { conditions.push(`a.date >= $${p++}`); params.push(from); }
+    if (to)   { conditions.push(`a.date <= $${p++}`); params.push(to); }
+
+    const { rows } = await pool.query(
+      `SELECT a.ref_id,
+              (ARRAY_AGG(a.ref_name ORDER BY a.date DESC, a.created_at DESC))[1] AS ref_name,
+              COUNT(*) FILTER (WHERE a.status IN ('present', 'late'))::int AS checkins
+         FROM attendance_logs a
+        WHERE ${conditions.join(' AND ')}
+        GROUP BY a.ref_id
+       HAVING COUNT(*) FILTER (WHERE a.status IN ('present', 'late')) > 0
+        ORDER BY checkins DESC, ref_name ASC
+        LIMIT 5000`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/attendance?date=YYYY-MM-DD&type=client&page=1&limit=100
 router.get('/', auth, async (req, res, next) => {
   try {

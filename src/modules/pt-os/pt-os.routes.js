@@ -1093,6 +1093,8 @@ router.post('/clients/:id/photo', auth, wrap(async (req, res) => {
     params
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  // The bytes never enter the trail — only the fact of the change.
+  await logActivity(req, 'client.photo.update', 'pt_client', req.params.id, { photo_updated: true });
   res.json({ data: rows[0] });
 }));
 
@@ -1102,11 +1104,18 @@ router.put('/clients/:id/notes', auth, wrap(async (req, res) => {
   if (notes === undefined) return res.status(400).json({ error: { code: 'NO_NOTES', message: 'Missing notes' } });
   const params = [notes, req.params.id];
   const orgClause = orgWhere(req, params);
+  const beforeParams = [req.params.id];
+  const beforeOrgClause = orgWhere(req, beforeParams);
+  const before = await pool.query(
+    `SELECT notes FROM pt_clients WHERE id = $1 AND deleted_at IS NULL${beforeOrgClause}`,
+    beforeParams
+  );
   const { rows } = await pool.query(
     `UPDATE pt_clients SET notes = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL${orgClause} RETURNING id, notes`,
     params
   );
   if (rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  await logActivity(req, 'client.notes.update', 'pt_client', req.params.id, { notes }, { notes: before.rows[0]?.notes ?? null });
   res.json({ data: rows[0] });
 }));
 
@@ -2004,11 +2013,14 @@ router.get('/activity-log', auth, requireTrainer, wrap(async (req, res) => {
 
   const [rowsRes, countRes] = await Promise.all([
     pool.query(
+      // id tiebreak: same-transaction rows share created_at, so timestamp
+      // order alone is nondeterministic — and nondeterministic order with
+      // offset pagination is duplicates one way, skipped rows the other.
       `SELECT a.id, a.user_id, a.user_name, a.action, a.entity_type, a.entity_id,
               a.old_data, a.new_data, a.created_at
          FROM activity_log a
         ${whereSql}
-        ORDER BY a.created_at DESC
+        ORDER BY a.created_at DESC, a.id DESC
         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
       [...params, limit, offset]
     ),
