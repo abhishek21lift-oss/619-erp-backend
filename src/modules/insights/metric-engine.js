@@ -35,7 +35,7 @@ function defaultRange(from, to) {
 
 async function getRevenue({ from, to, orgId = null } = {}) {
   const { from: f, to: t } = defaultRange(from, to);
-  const conds = ['p.deleted_at IS NULL', 'p.date >= $1', 'p.date <= $2', 'p.organization_id = $3'];
+  const conds = ['p.deleted_at IS NULL', "p.status = 'completed'", 'p.date >= $1', 'p.date <= $2', 'p.organization_id = $3'];
   const params = [f, t, orgId];
   const { rows } = await pool.query(
     `SELECT COUNT(*)::int AS count,
@@ -70,6 +70,7 @@ async function getMonthlyRevenue({ year = new Date().getFullYear(), orgId = null
            FROM pt_payments p
           WHERE EXTRACT(YEAR FROM p.date::date) = $1
             AND p.deleted_at IS NULL
+            AND p.status = 'completed'
             AND p.organization_id = $${orgIdx}
        ) combined
       GROUP BY month_num, month_name ORDER BY month_num`,
@@ -262,8 +263,8 @@ async function getRenewals({ from, to, orgId = null } = {}) {
      snapshot AS (
        SELECT COUNT(*) FILTER (WHERE status='active')::int AS active,
               COUNT(*) FILTER (WHERE status='expired')::int AS expired,
-              COUNT(*) FILTER (WHERE status='active' AND pt_end_date::date BETWEEN CURRENT_DATE AND CURRENT_DATE + 7)::int AS expiring_7d,
-              COUNT(*) FILTER (WHERE status='active' AND pt_end_date::date BETWEEN CURRENT_DATE AND CURRENT_DATE + 30)::int AS expiring_30d
+              COUNT(*) FILTER (WHERE status='active' AND pt_end_date::date BETWEEN CURRENT_DATE AND CURRENT_DATE + 6)::int AS expiring_7d,
+              COUNT(*) FILTER (WHERE status='active' AND pt_end_date::date BETWEEN CURRENT_DATE AND CURRENT_DATE + 29)::int AS expiring_30d
          FROM pt_clients c
         WHERE c.deleted_at IS NULL
           AND c.organization_id = $3
