@@ -930,7 +930,7 @@ async function approve({ orderId, orgId, actor }, db = pool) {
            (client_id, client_name, trainer_name, old_package, new_package,
             old_end_date, new_start_date, new_end_date, duration_months,
             base_amount, discount, final_amount, paid_amount, balance_amount, notes, organization_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$10,$11,0,$12,$13)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$11,$11,0,$12,$13)`,
         [member.id, member.name, member.trainer_name, member.package_type, order.plan_name,
          member.pt_end_date, window.activated_from, window.activated_to, order.duration_months,
          order.base_amount, order.total_amount, `Paid online · ${order.order_no}`, orgId]
