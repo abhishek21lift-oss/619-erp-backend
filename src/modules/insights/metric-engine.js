@@ -221,9 +221,10 @@ async function getAttendanceToday({ orgId = null } = {}) {
 // ── Renewal — TRUE conversion ────────────────────────────────────────────────
 /**
  * TRUE renewal conversion for [from,to]:
- *   expired_cohort     = distinct clients whose pt_end_date falls in window
- *   renewed_of_cohort  = distinct renewals in window tied to that cohort
- *                        (old_end_date in window OR client in cohort)
+ *   expired_cohort     = distinct clients whose end date fell in window
+ *                        (live row UNION renewal history, so renewed clients
+ *                        don't vanish from the denominator)
+ *   renewed_of_cohort  = cohort clients renewed in the strict window
  *   renewal_rate       = renewed_of_cohort / expired_cohort * 100 (null if cohort 0)
  *
  * Also returns active_share_pct (active/(active+expired)) explicitly labelled
@@ -234,10 +235,21 @@ async function getRenewals({ from, to, orgId = null } = {}) {
   const params = [f, t, orgId];
   const { rows } = await pool.query(
     `WITH cohort AS (
+       -- Expiries in the window from BOTH the live row and immutable history.
+       -- A client who expired in-window and renewed gets pt_end_date pushed
+       -- forward and leaves the live-row cohort (survivorship bias: the
+       -- denominator kept only the not-yet-renewed). Renewal rows record the
+       -- old end date forever, so UNION them back in.
        SELECT DISTINCT c.id
          FROM pt_clients c
         WHERE c.deleted_at IS NULL
           AND c.pt_end_date::date BETWEEN $1::date AND $2::date
+          AND c.organization_id = $3
+       UNION
+       SELECT DISTINCT r.client_id
+         FROM pt_client_renewals r
+         LEFT JOIN pt_clients c ON c.id = r.client_id
+        WHERE r.old_end_date::date BETWEEN $1::date AND $2::date
           AND c.organization_id = $3
      ),
      renewed AS (
@@ -253,11 +265,14 @@ async function getRenewals({ from, to, orgId = null } = {}) {
           )
      ),
      renewed_of_cohort AS (
+       -- Strict window per the canonical definition: renewed in [from, to].
+       -- The old +30-day grace inflated the numerator past the documented
+       -- formula and past renewed_in_period's strict window.
        SELECT DISTINCT r.client_id
          FROM pt_client_renewals r
          LEFT JOIN pt_clients c ON c.id = r.client_id
         WHERE r.client_id IN (SELECT id FROM cohort)
-          AND r.renewed_at::date BETWEEN $1::date AND ($2::date + INTERVAL '30 days')::date
+          AND r.renewed_at::date BETWEEN $1::date AND $2::date
           AND c.organization_id = $3
      ),
      snapshot AS (

@@ -115,4 +115,11 @@ describe('GET /activity-log — the studio-facing read of the trail', () => {
     expect(body).toContain('OFFSET $');
     expect(body).toMatch(/Math\.min\(Math\.max\(parseInt\(req\.query\.limit/);
   });
+
+  it('orders deterministically so pages neither duplicate nor skip rows', () => {
+    // Same-transaction rows share created_at; timestamp order alone is
+    // nondeterministic, and offset pagination over a nondeterministic order
+    // duplicates one way and skips rows the other.
+    expect(body).toContain('ORDER BY a.created_at DESC, a.id DESC');
+  });
 });
