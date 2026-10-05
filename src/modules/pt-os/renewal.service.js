@@ -93,6 +93,17 @@ async function renewClient(req, clientId, d) {
       return { notEnrolled: true };
     }
 
+    // A new term starting before the current one ends would silently discard
+    // the remaining old term (dates are overwritten below). Refuse with the
+    // overlapping dates named so the operator picks a start on/after the end.
+    const currentEnd = client.pt_end_date instanceof Date
+      ? client.pt_end_date.toISOString().slice(0, 10)
+      : String(client.pt_end_date || '').slice(0, 10);
+    if (currentEnd && d.pt_start_date < currentEnd) {
+      await tx.query('ROLLBACK');
+      return { overlap: true, currentEnd };
+    }
+
     // Under the lock, so two concurrent submits cannot both pass this check.
     const { rowCount: dupes } = await tx.query(
       `SELECT 1 FROM pt_client_renewals
