@@ -1662,7 +1662,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
    4. PROGRESS ANALYSER
    POST /api/ai/progress/analyze
    ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
+router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async (req, res) => {
   const { client_id } = req.body || {};
   if (!client_id) return res.status(400).json({ error: 'client_id is required' });
 
@@ -1677,9 +1677,17 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
     // parent row → 404 below, and the child queries (keyed by client_id) are
     // never surfaced.
     const org = orgParam(req);
+    // Parent first, children after. The previous Promise.all read other-tenant
+    // rows into server memory on a cross-tenant probe before the 404 below
+    // could fire — the response never surfaced them, but the guarantee rested
+    // on ordering luck rather than sequence. A wrong-org client_id now stops
+    // here, before any progress row is read.
+    const clientRes = await pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2', [client_id, org]);
+    const client = clientRes.rows[0];
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+
     // Fetch all progress data for this client
-    const [clientRes, assessRes, goalsRes, checkinsRes, strengthRes, attRes, photosRes] = await Promise.all([
-      pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2', [client_id, org]),
+    const [assessRes, goalsRes, checkinsRes, strengthRes, attRes, photosRes] = await Promise.all([
       // Historical datasets are bounded at the DATABASE (audit P2-1):
       // newest-first with LIMIT so the prompt cannot grow with the client's
       // entire history; the rows are reversed below to restore the
@@ -1691,9 +1699,6 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
       pool.query(`SELECT COUNT(*) AS total_sessions, COUNT(*) FILTER (WHERE created_at >= NOW()-INTERVAL '30 days') AS sessions_30d FROM pt_sessions WHERE client_id=$1`, [client_id]),
       pool.query('SELECT COUNT(*) AS total_photos FROM progress_photos WHERE client_id=$1', [client_id]),
     ]);
-
-    const client = clientRes.rows[0];
-    if (!client) return res.status(404).json({ error: 'Client not found' });
 
     const age = client.dob ? Math.floor((Date.now() - new Date(client.dob).getTime()) / 31557600000) : null;
     const daysSinceStart = client.pt_start_date ? Math.floor((Date.now() - new Date(client.pt_start_date).getTime()) / 86400000) : null;
@@ -1715,6 +1720,27 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
       attendance:   attRes.rows[0],
       progress_photos: { total: photosRes.rows[0]?.total_photos || 0 },
     };
+
+    // Grounded companions to the model's prose, sent alongside it: how many
+    // rows each claim rests on, and the one real time series in this payload
+    // (assessment weights, oldest → newest, pg numerics coerced — COUNT(*)
+    // and numeric columns arrive as strings). The client renders the chart
+    // and the provenance strip from these, never from model-emitted numbers.
+    const dataCounts = {
+      assessments: assessRes.rows.length,
+      checkins: checkinsRes.rows.length,
+      strength_logs: strengthRes.rows.length,
+      goals: goalsRes.rows.length,
+    };
+    // A null weight is "no reading", not 0 kg — Number(null) is 0, which
+    // would plant a false zero on the chart. Drop nulls before coercing.
+    const weightHistory = assessRes.rows
+      .filter((r) => r.weight !== null && r.weight !== undefined && r.weight !== '')
+      .map((r) => ({
+        date: r.created_at instanceof Date ? r.created_at.toISOString().slice(0, 10) : String(r.created_at).slice(0, 10),
+        weight_kg: Number(r.weight),
+      }))
+      .filter((p) => p.date && Number.isFinite(p.weight_kg));
 
     const userPrompt = `Analyse the following client progress data and generate a comprehensive report:\n\n${JSON.stringify(contextData, null, 2)}`;
 
@@ -1778,7 +1804,7 @@ router.post('/progress/analyze', auth, requireConfigured, async (req, res) => {
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
-    send({ type: 'done', data: analysis, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
+    send({ type: 'done', data: analysis, data_counts: dataCounts, weight_history: weightHistory, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_progress_analyze_error');
     // Headers may or may not have been sent yet depending on where the error occurred
@@ -1926,6 +1952,19 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
   const { from, to } = req.body || {};
   const fromDate = from ? new Date(from) : new Date(Date.now() - 30 * 86400000);
   const toDate   = to   ? new Date(to)   : new Date();
+  // Unchecked dates used to reach the queries: garbage became Invalid Date
+  // (RangeError → generic 503), and from > to matched nothing — zeros fed to
+  // the model, which still had to fill every schema field. Refuse both up
+  // front, and cap the window: the pills max out at a year.
+  if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+    return res.status(400).json({ error: 'Invalid date range: from and to must be YYYY-MM-DD dates.' });
+  }
+  if (fromDate > toDate) {
+    return res.status(400).json({ error: 'Invalid date range: from must not be after to.' });
+  }
+  if (toDate.getTime() - fromDate.getTime() > 366 * 86400000) {
+    return res.status(400).json({ error: 'Date range is capped at 366 days.' });
+  }
 
   try {
     // Canonical business data: ONE source of truth via the Metric Engine.
@@ -1935,13 +1974,14 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
     const org = orgParam(req);
     const engine = require('../modules/insights/metric-engine');
     const { buildBusinessInsights } = require('../modules/insights/insights-engine');
-    const [rev, renew, dues, trainers, overview] = await Promise.all([
-      engine.getRevenue({ from: fromDate, to: toDate, orgId: org }),
-      engine.getRenewals({ from: fromDate, to: toDate, orgId: org }),
-      engine.getDuesSummary({ orgId: org }),
-      engine.getTrainerSummary({ orgId: org }),
-      engine.getOverview({ from: fromDate, to: toDate, orgId: org }),
-    ]);
+    // One canonical dataset. getOverview already runs revenue, dues,
+    // renewals, utilisation, monthly and trainers for this window — firing
+    // those four again alongside it computed every number twice per click.
+    const overview = await engine.getOverview({ from: fromDate, to: toDate, orgId: org });
+    const rev = overview.revenue;
+    const renew = overview.renewals;
+    const dues = overview.dues;
+    const trainers = overview.trainers;
     const membersRes = await pool.query(
         `SELECT
            COUNT(*) FILTER (WHERE status='active')   AS active_members,
@@ -1959,12 +1999,34 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
         [fromDate, toDate, org]
       );
 
+    // pg COUNT(*) arrives as a string ("12", not 12) — coerce before it
+    // reaches the prompt, so the model sees numbers, not quoted text.
+    const m = membersRes.rows[0] || {};
+    const s = sessionsRes.rows[0] || {};
+    const members = {
+      active_members: Number(m.active_members) || 0,
+      inactive_members: Number(m.inactive_members) || 0,
+      new_members_period: Number(m.new_members_period) || 0,
+    };
+    const sessions = {
+      total_sessions: Number(s.total_sessions) || 0,
+      active_clients: Number(s.active_clients) || 0,
+    };
+    // Grounded derivations the prompt must quote, not compute: per-trainer
+    // revenue (total over the window divided by the trainer count the query
+    // returned) and this-month utilisation. A null here is the model being
+    // told "no basis" instead of an undisclosed divisor.
+    const revenuePerTrainer = trainers.length > 0
+      ? Math.round((rev.total / trainers.length) * 10) / 10
+      : null;
+    const utilisationPct = overview.utilisation ? overview.utilisation.utilisation_pct : null;
+
     const bizData = {
       period: { from: fromDate.toISOString().slice(0,10), to: toDate.toISOString().slice(0,10) },
       revenue:  { total_revenue: rev.total, total_payments: rev.count },
-      members:  membersRes.rows[0],
-      sessions: sessionsRes.rows[0],
-      trainers: trainers.map((tr) => ({ trainer_name: tr.name, sessions: null, revenue: tr.total_revenue })),
+      members,
+      sessions,
+      trainers: trainers.map((tr) => ({ trainer_name: tr.name, active_clients: tr.active_clients, month_revenue: tr.month_revenue, total_revenue: tr.total_revenue })),
       renewals: {
         total_renewals: renew.renewal_transactions,
         renewal_revenue: renew.renewal_revenue,
@@ -1975,6 +2037,11 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
         active_share_pct: renew.active_share_pct,
       },
       outstanding_dues: { clients_with_dues: dues.debtor_count, total_dues: dues.total_outstanding },
+      // Supplied canonicals for the KPI block: the model quotes these.
+      revenue_per_trainer: revenuePerTrainer,
+      utilisation_pct: utilisationPct,
+      // Real monthly series for the revenue chart — actuals, not estimates.
+      monthly_revenue: overview.monthly,
       // Deterministic engine output: the LLM must quote these, not invent KPIs
       // (previously it was asked for retention_rate_pct with no SQL behind it).
       deterministic_insights: buildBusinessInsights(overview),
