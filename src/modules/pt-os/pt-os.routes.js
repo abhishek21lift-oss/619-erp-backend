@@ -680,12 +680,6 @@ router.post('/clients/:id/renew', auth, requireTrainer, validate(renewSchema), w
   if (result.duplicate) {
     return res.status(409).json({ error: { code: 'DUPLICATE_RENEWAL', message: 'This renewal was just recorded — it has not been added twice.' } });
   }
-  if (result.overlap) {
-    return res.status(400).json({ error: {
-      code: 'OVERLAPPING_TERM',
-      message: `The new term starts before the current one ends (${result.currentEnd}). Start the renewal on or after that date.`,
-    } });
-  }
   if (result.overpaid != null) {
     return res.status(400).json({ error: {
       code: 'OVERPAID',
