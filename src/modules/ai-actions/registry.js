@@ -168,6 +168,50 @@ const ACTIONS = [
       };
     },
   },
+
+  {
+    id: 'lead_followup',
+    title: 'Send lead follow-ups',
+    outward: true,
+    roles: ['trainer'],
+    describe: () => 'WhatsApp every new or contacted lead whose follow-up is due',
+    normalize: () => ({}),
+
+    async resolve(req) {
+      const scope = tenantScope(req);
+      const { rows } = await pool.query(
+        // No deleted_at on pt_leads (deletes are hard) — nothing to exclude.
+        `SELECT id, name, mobile, follow_up_date::TEXT AS follow_up_date
+           FROM pt_leads
+          WHERE status IN ('new', 'contacted')
+            AND (follow_up_date IS NULL OR follow_up_date <= CURRENT_DATE)
+            AND organization_id = $1
+          ORDER BY follow_up_date NULLS LAST, created_at ASC, id ASC
+          LIMIT ${MAX_RECIPIENTS}`,
+        [scope.orgId],
+      );
+
+      const { reachable, unreachable } = toRecipients(rows);
+      const warnings = [];
+      if (!(await transport.resolveInstance(tenantScope(req).orgId)).ok) {
+        warnings.push('This studio has not connected WhatsApp — nothing will be delivered. Connect it in Settings → Integrations.');
+      }
+      if (unreachable.length) {
+        warnings.push(`${unreachable.length} matching lead${unreachable.length === 1 ? ' has' : 's have'} no mobile number and will be skipped.`);
+      }
+
+      return {
+        recipients: reachable.map((r) => ({
+          id: r.id,
+          name: r.name,
+          mobile: r.mobile,
+          detail: r.follow_up_date ? `due ${r.follow_up_date}` : 'no date set',
+          body: `Hi ${r.name}, just following up on your enquiry with us. Would you like to book a trial session this week? Reply here and we will set it up.`,
+        })),
+        warnings,
+      };
+    },
+  },
 ];
 
 /**

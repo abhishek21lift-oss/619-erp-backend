@@ -91,7 +91,8 @@ const ptClientCreateSchema = {
     // NULL below, because "not answered" is a real state and an enum that
     // rejects '' makes the form unsubmittable when the operator skips it.
     client_source: z.enum(CLIENT_SOURCES).or(z.literal('')).optional().nullable(),
-  }),
+  }).refine((b) => b.discount == null || b.base_amount == null || b.discount <= b.base_amount,
+    { message: 'discount cannot exceed base_amount', path: ['discount'] }),
 };
 
 const automation = require('../automation/automation.triggers');

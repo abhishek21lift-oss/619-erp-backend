@@ -80,6 +80,11 @@ async function getActiveClients(scope = {}, opts = {}) {
            c.package_type, c.base_amount, c.discount, c.final_amount,
            c.paid_amount, c.balance_amount, c.joining_date,
            c.duration_months, c.pt_start_date, c.pt_end_date,
+           -- Term-aware balance, same definition as GET /clients/:id (see the
+           -- canonical comment there): fee is current-term, paid is lifetime
+           -- minus closed terms. Stored balance_amount mixes the two and
+           -- understates renewed clients — the list must not read it.
+           GREATEST(COALESCE(c.final_amount, 0) - GREATEST(COALESCE(c.paid_amount, 0) - COALESCE(prior.paid, 0), 0), 0) AS current_term_balance,
            CASE
              WHEN c.pt_end_date IS NOT NULL AND c.pt_end_date::TEXT != ''
              THEN c.pt_end_date::DATE - CURRENT_DATE
@@ -94,6 +99,14 @@ async function getActiveClients(scope = {}, opts = {}) {
       WHERE deleted_at IS NULL
       GROUP BY client_id
     ) pp ON pp.client_id = c.id
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(SUM(s.amount_paid), 0) AS paid
+      FROM pt_client_subscriptions s
+      WHERE s.client_id = c.id
+        AND s.start_date IS NOT NULL
+        AND c.pt_start_date IS NOT NULL
+        AND s.start_date < c.pt_start_date
+    ) prior ON TRUE
     WHERE ${where.join(' AND ')}
     ORDER BY c.name${page.sql}
   `, [...params, ...page.params]);

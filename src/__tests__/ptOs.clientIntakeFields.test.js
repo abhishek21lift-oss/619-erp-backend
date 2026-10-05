@@ -144,6 +144,16 @@ describe('POST /pt-os/clients stores the new intake fields', () => {
     expect(insert()).toBeUndefined();
   });
 
+  test('a discount above the base is refused like the renew schema refuses it', async () => {
+    // POST /clients computed finalAmt = base - discount with no cross-check,
+    // so discount > base wrote a negative final_amount that GREATEST hid as 0.
+    const res = await request(app())
+      .post('/api/pt-os/clients')
+      .send(intake({ base_amount: 10000, discount: 12000 }));
+    expect(res.status).toBe(400);
+    expect(insert()).toBeUndefined();
+  });
+
   test('every option the form offers is accepted', async () => {
     // The form's dropdown and the server's enum are two lists that have to
     // agree; this is the half of that pair the server owns.
