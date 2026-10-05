@@ -102,15 +102,6 @@ test('another studio\'s client is not found', async () => {
   expect(await renewClient(req, 'c1', body())).toEqual({ notFound: true });
 });
 
-test('a term starting before the current one ends is refused, not overwritten', async () => {
-  // mockClient ends 2026-09-30; starting 2026-09-15 would silently discard
-  // the remaining old term.
-  const out = await renewClient(req, 'c1', body({ pt_start_date: '2026-09-15' }));
-  expect(out).toEqual({ overlap: true, currentEnd: '2026-09-30' });
-  expect(verbs()).toEqual(['BEGIN', 'ROLLBACK']);
-  expect(at(/^UPDATE pt_clients/).length).toBe(0);
-});
-
 test.each([
   ['2026-01-31', 1, '2026-02-28'],
   ['2028-01-31', 1, '2028-02-29'],

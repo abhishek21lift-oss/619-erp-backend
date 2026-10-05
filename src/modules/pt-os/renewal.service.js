@@ -94,9 +94,11 @@ async function renewClient(req, clientId, d) {
     }
 
     // Under the lock, so two concurrent submits cannot both pass this check.
-    // Runs BEFORE the overlap guard below: an identical double-submit is a
-    // duplicate (409), not an overlap — the overlap refusal is for a
-    // genuinely different term starting inside the current one.
+    // Deliberately no overlap guard here: renewing before the current term
+    // ends is the normal flow (balance carries forward by design), and a
+    // refusal broke the renewal E2E. An overlap guard was added and reverted
+    // for exactly this reason — do not re-add one without changing the
+    // product semantics first.
     const { rowCount: dupes } = await tx.query(
       `SELECT 1 FROM pt_client_renewals
         WHERE client_id = $1 AND new_start_date = $2 AND duration_months = $3 AND final_amount = $4
@@ -105,17 +107,6 @@ async function renewClient(req, clientId, d) {
       [clientId, d.pt_start_date, d.duration_months, finalAmt, DUPLICATE_WINDOW_MINUTES]
     );
     if (dupes) { await tx.query('ROLLBACK'); return { duplicate: true }; }
-
-    // A new term starting before the current one ends would silently discard
-    // the remaining old term (dates are overwritten below). Refuse with the
-    // overlapping dates named so the operator picks a start on/after the end.
-    const currentEnd = client.pt_end_date instanceof Date
-      ? client.pt_end_date.toISOString().slice(0, 10)
-      : String(client.pt_end_date || '').slice(0, 10);
-    if (currentEnd && d.pt_start_date < currentEnd) {
-      await tx.query('ROLLBACK');
-      return { overlap: true, currentEnd };
-    }
 
     // What they owe once this term is added. Paying more than that used to be
     // swallowed by GREATEST(…, 0) — money taken with nowhere recorded.
