@@ -133,6 +133,12 @@ const MEMBER_REACHABLE = {
 const MEMBER_REACHABLE_ROUTES = {
   '/api/payments/upi/history':
     'A member reading their OWN payment history. The handler has an explicit `role === member` branch that narrows to req.user.pt_client_id and ignores any client_id in the query — the correct shape, and the opposite of the trainer fall-through: it narrows for the untrusted role rather than widening for it.',
+  '/api/profile/activity':
+    'A member reading their OWN security activity audit trail. The handler is strictly scoped to WHERE user_id = req.user.id.',
+  '/api/profile/devices':
+    'A member listing their OWN registered devices and browser sessions. Scoped strictly to WHERE user_id = req.user.id.',
+  '/api/profile/sessions':
+    'A member listing their OWN active login sessions. Scoped strictly to WHERE user_id = req.user.id.',
 };
 
 /**

@@ -91,6 +91,10 @@ const MEMBER_MAY = {
   'GET /api/me/measurements': "The member's own recorded measurements, keyed from the session's client id only.",
 
   // ── The member's own credentials and inbox. ──────────────────────────────
+  'GET /api/auth/me': "Returns the authenticated caller's OWN user account details and profile; scoped to the active session req.user.id.",
+  'GET /api/v1/auth/me': "Versioned alias returning the authenticated caller's OWN user account details and profile; scoped to req.user.id.",
+  'POST /api/auth/logout': "Terminates the caller's OWN session and clears authentication cookies; standard self-service account logout.",
+  'POST /api/v1/auth/logout': "Versioned alias terminating the caller's OWN session and clearing cookies; standard self-service account logout.",
   'GET /api/auth/webauthn/credentials': "Lists the caller's OWN passkeys, keyed WHERE user_id = req.user.id.",
   'POST /api/auth/webauthn/register/options': 'Begins enrolling a passkey for the caller themselves; the challenge is bound to their own user id.',
   'POST /api/auth/webauthn/login/options': 'Pre-session ceremony start. Reached before any role exists, so there is no role to check against.',
@@ -100,6 +104,18 @@ const MEMBER_MAY = {
   'GET /api/v1/notifications/': 'svc.inbox(req.user.id) — the caller\'s own notification inbox, keyed by their user id.',
   'PATCH /api/v1/notifications/1/read': "Marks one of the caller's OWN notifications read; the update is keyed by user id as well as notification id.",
   'PATCH /api/v1/notifications/read-all': "Marks the caller's OWN inbox read; scoped to req.user.id.",
+
+  // ── The member's own security, profile preferences, and session controls. ─
+  'GET /api/profile/activity': "Retrieves the caller's OWN security and audit activity logs; query is strictly filtered WHERE user_id = req.user.id.",
+  'GET /api/profile/devices': "Lists registered devices and browser sessions belonging to the caller themselves; filtered WHERE user_id = req.user.id.",
+  'DELETE /api/profile/devices/1': "Terminates one of the caller's OWN remembered device sessions; the operation is strictly scoped WHERE user_id = req.user.id.",
+  'GET /api/profile/sessions': "Lists active login sessions belonging to the caller themselves; query is strictly filtered WHERE user_id = req.user.id.",
+  'DELETE /api/profile/sessions/1': "Revokes a single active login session belonging to the caller themselves; strictly scoped to req.user.id.",
+  'POST /api/profile/sessions/revoke-all': "Revokes all other active sessions belonging to the caller themselves; mutation is strictly scoped to req.user.id.",
+  'POST /api/profile/mfa/setup': "Initiates multi-factor authentication setup for the caller's OWN account, generating a TOTP secret bound to req.user.id.",
+  'DELETE /api/profile/mfa': "Disables multi-factor authentication for the caller's OWN account; the operation is strictly scoped to req.user.id.",
+  'PUT /api/profile/notifications': "Updates notification preferences for the caller's OWN user account; mutation is strictly scoped to req.user.id.",
+  'PUT /api/profile/preferences': "Updates UI display preferences (theme, timezone, locale) for the caller's OWN account; strictly scoped to req.user.id.",
 
   // ── The member's own bookings and check-ins. ─────────────────────────────
   'GET /api/bookings/': "A member listing their OWN bookings: the handler overrides member_id with the session's own when role === member, so the query string cannot widen it.",

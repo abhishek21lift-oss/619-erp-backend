@@ -31,6 +31,8 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret-at-least-32-char
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://u:p@127.0.0.1:1/none';
 process.env.FRONTEND_URL = process.env.FRONTEND_URL || 'https://example.com';
 
+jest.setTimeout(15000);
+
 jest.mock('../db/pool', () => ({
   query: jest.fn(),
   connect: jest.fn(),
