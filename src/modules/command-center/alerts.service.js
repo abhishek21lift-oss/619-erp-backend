@@ -90,6 +90,7 @@ const TITLES = {
   queues: 'Job queue problem',
   http: 'API requests degraded',
   ai: 'AI routing problem',
+  freellmapi: 'FreeLLMAPI gateway problem',
   security: 'Security posture problem',
   smtp: 'Email delivery problem',
 };

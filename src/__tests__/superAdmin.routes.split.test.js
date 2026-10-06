@@ -114,6 +114,8 @@ describe('super-admin API — the H-03 split', () => {
     // standing up a second door to guard. That inheritance is the whole reason
     // the POST is allowed to exist: it pauses queues and deletes failed jobs,
     // so it must sit behind the strictest chain in the app.
+    // AI Operations: the full model inventory, read on demand.
+    'GET /command-center/ai/models',
     'GET /command-center/alerts',
     'GET /command-center/cards',
     'GET /command-center/commands',

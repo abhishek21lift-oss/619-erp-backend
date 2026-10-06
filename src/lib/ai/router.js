@@ -26,7 +26,12 @@ function buildAllModelsFailed(primaryErr, attempts) {
   final.code = 'ALL_MODELS_FAILED';
   final.primary_error = primaryErr.message;
   final.fallback_error = attempts[attempts.length - 1]?.err?.message;
-  final.errors = attempts.map((a) => ({ model: a.model, tier: a.tier, error: a.err.message }));
+  // `status`/`code`/`cause` are additive: they let a diagnostic classify each
+  // attempt (auth, rate limit, timeout, unreachable) without parsing messages.
+  final.errors = attempts.map((a) => ({
+    model: a.model, tier: a.tier, error: a.err.message,
+    status: a.err.status ?? null, code: a.err.code ?? null, cause: a.err.cause?.code ?? null,
+  }));
   return final;
 }
 
@@ -106,6 +111,8 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
       // stream took — what the usage log and the quota count.
       usage: meta?.usage ?? null,
       latency_ms: meta?.latency_ms ?? null,
+      // Which upstream the gateway says answered (FreeLLMAPI's X-Routed-Via).
+      routed_via: meta?.routed_via ?? null,
     };
   } catch (primaryErr) {
     logger.warn({ model, tier, intent, err: primaryErr.message }, 'ai_stream_primary_failed');
@@ -124,6 +131,7 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
           tier: step.tier, intent, used_fallback: true,
           usage: meta?.usage ?? null,
           latency_ms: meta?.latency_ms ?? null,
+          routed_via: meta?.routed_via ?? null,
         };
       } catch (fbErr) {
         attempts.push({ model: step.model, tier: step.tier, err: fbErr });

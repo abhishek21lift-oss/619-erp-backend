@@ -30,6 +30,7 @@ const redisCollector = require('./collectors/redis.collector');
 const queueCollector = require('./collectors/queue.collector');
 const databaseCollector = require('./collectors/database.collector');
 const aiCollector = require('./collectors/ai.collector');
+const freellmapiCollector = require('./collectors/freellmapi.collector');
 const smtpCollector = require('./collectors/smtp.collector');
 const securityCollector = require('./collectors/security.collector');
 const httpCollector = require('./collectors/http.collector');
@@ -54,6 +55,13 @@ function registerCollectors() {
   // ai/security aggregate over log tables; 10s is well inside a useful window
   // and keeps the console off the product's own database load.
   registry.register(aiCollector.NAME, aiCollector.collect, { timeoutMs: 5000, ttlMs: 10_000 });
+  // The AI gateway. Four HTTP reads against FreeLLMAPI on the compose network,
+  // coalesced with the ai card's own read (lib/ai/gateway.js). 15s because
+  // provider and catalog state move on the scale of cooldowns, not seconds,
+  // and every tick must not become four requests to the gateway. 5s like the
+  // other platform cards: /livez then the other three in parallel, each capped
+  // at 2.5s (lib/ai/gateway.js PROBE_TIMEOUT_MS).
+  registry.register(freellmapiCollector.NAME, freellmapiCollector.collect, { timeoutMs: 5000, ttlMs: 15_000 });
   registry.register(securityCollector.NAME, securityCollector.collect, { timeoutMs: 5000, ttlMs: 10_000 });
   // smtp's default probe is config + delivery history, no handshake; 30s
   // because none of that changes second to second.

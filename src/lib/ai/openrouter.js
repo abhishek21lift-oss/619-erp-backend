@@ -1,6 +1,7 @@
 'use strict';
 const logger = require('../logger');
 const aiConfig = require('./config');
+const observations = require('./observations');
 
 const BASE_URL     = process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1';
 const SITE_URL     = process.env.FRONTEND_URL || 'https://619fitness.app';
@@ -106,9 +107,18 @@ async function chatCompletion({ model, messages, temperature = 0.7, max_tokens =
     const content  = data.choices?.[0]?.message?.content ?? '';
     const usage    = data.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     const latency  = Date.now() - start;
+    // Which upstream answered, when the gateway says (FreeLLMAPI's
+    // X-Routed-Via). Additive: callers that never read it are unaffected.
+    const routing  = observations.routingHeaders(res.headers);
 
     logger.info({ model, latency_ms: latency, tokens: usage.total_tokens }, 'ai_completion_ok');
-    return { content, usage, model: data.model || model, latency_ms: latency };
+    observations.recordSuccess({
+      requested_model: model, served_model: data.model || model, latency_ms: latency, ...routing,
+    });
+    return {
+      content, usage, model: data.model || model, latency_ms: latency,
+      routed_via: routing.routed_via, gateway_fallback_attempts: routing.gateway_fallback_attempts,
+    };
   } catch (err) {
     clearTimeout(timer);
     if (err.name === 'AbortError' || err.message === 'This operation was aborted.' ||
@@ -117,8 +127,12 @@ async function chatCompletion({ model, messages, temperature = 0.7, max_tokens =
       logger.warn({ model, timeout_ms: timeout, latency_ms: elapsed }, 'ai_completion_timeout');
       const t = new Error(`OpenRouter request timed out after ${elapsed}ms`);
       t.code = 'TIMEOUT';
+      observations.recordFailure({ requested_model: model, err: t, latency_ms: elapsed, secrets: [aiConfig.apiKey()] });
       throw t;
     }
+    observations.recordFailure({
+      requested_model: model, err, latency_ms: Date.now() - start, secrets: [aiConfig.apiKey()],
+    });
     throw err;
   }
 }
@@ -146,8 +160,14 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
       logger.warn({ model, timeout_ms: timeout, latency_ms: Date.now() - start }, 'ai_stream_timeout');
       const t = new Error(`Stream timed out after ${timeout}ms`);
       t.code = 'TIMEOUT';
+      observations.recordFailure({
+        requested_model: model, err: t, latency_ms: Date.now() - start, stream: true, secrets: [aiConfig.apiKey()],
+      });
       throw t;
     }
+    observations.recordFailure({
+      requested_model: model, err, latency_ms: Date.now() - start, stream: true, secrets: [aiConfig.apiKey()],
+    });
     throw err;
   }
 
@@ -156,8 +176,12 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
     const text = await res.text().catch(() => '');
     const err  = new Error(`OpenRouter stream ${res.status}: ${text.slice(0, 300)}`);
     err.status = res.status;
+    observations.recordFailure({
+      requested_model: model, err, latency_ms: Date.now() - start, stream: true, secrets: [aiConfig.apiKey()],
+    });
     throw err;
   }
+  const routing = observations.routingHeaders(res.headers);
 
   const reader  = res.body.getReader();
   const decoder = new TextDecoder();
@@ -210,8 +234,14 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
       logger.warn({ model, timeout_ms: timeout, latency_ms: Date.now() - start }, 'ai_stream_timeout');
       const t = new Error(`OpenRouter stream timed out after ${timeout}ms`);
       t.code = 'TIMEOUT';
+      observations.recordFailure({
+        requested_model: model, err: t, latency_ms: Date.now() - start, stream: true, secrets: [aiConfig.apiKey()],
+      });
       throw t;
     }
+    observations.recordFailure({
+      requested_model: model, err, latency_ms: Date.now() - start, stream: true, secrets: [aiConfig.apiKey()],
+    });
     throw err;
   } finally {
     clearTimeout(timer);
@@ -226,7 +256,14 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
   // an object before too; `served_model` is additive and `model` names what
   // was REQUESTED, so a caller can report "asked for auto, got X" rather than
   // having to choose between the two facts.
-  return { usage, model: servedModel || model, requested_model: model, latency_ms: Date.now() - start };
+  const latency = Date.now() - start;
+  observations.recordSuccess({
+    requested_model: model, served_model: servedModel || model, latency_ms: latency, stream: true, ...routing,
+  });
+  return {
+    usage, model: servedModel || model, requested_model: model, latency_ms: latency,
+    routed_via: routing.routed_via, gateway_fallback_attempts: routing.gateway_fallback_attempts,
+  };
 }
 
 /**

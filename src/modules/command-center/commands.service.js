@@ -37,6 +37,63 @@ const dockerRecovery = require('./container-recovery');
 const restartVerification = require('./restart-verification');
 const coordination = require('./coordination');
 const queueCollector = require('./collectors/queue.collector');
+const aiConfig = require('../../lib/ai/config');
+const aiGateway = require('../../lib/ai/gateway');
+const aiObservations = require('../../lib/ai/observations');
+const { scrubBounded } = require('../../lib/secretScrub');
+
+/**
+ * Why `ai.test` failed, in terms an operator can act on — and nothing secret.
+ *
+ * The router throws ALL_MODELS_FAILED with one entry per attempted model. Each
+ * is classified (auth rejected, rate limited, model not found, timeout,
+ * unreachable, upstream error) from its status and code, and its message is
+ * scrubbed and bounded. The gateway is then asked about itself, fresh, because
+ * "every model failed" and "the gateway is down" call for different fixes.
+ */
+async function diagnoseAiFailure(err, { asked, gatewayInfo, latencyMs }) {
+  const secrets = [aiConfig.apiKey()];
+  const raw = Array.isArray(err?.errors) && err.errors.length
+    ? err.errors
+    : [{ model: asked.model, tier: asked.tier, error: err?.message, status: err?.status, code: err?.code, cause: err?.cause?.code }];
+  const attempts = raw.map((a) => {
+    const { error_class, http_status } = aiObservations.classify({
+      status: a.status, code: a.code, cause: a.cause ? { code: a.cause } : undefined,
+    });
+    return {
+      model: a.model ?? null,
+      tier: a.tier ?? null,
+      error_class,
+      http_status,
+      error: scrubBounded(a.error ?? 'unknown error', { secrets, max: 200 }),
+    };
+  });
+
+  let gatewayState = null;
+  try {
+    const p = await aiGateway.probe({ fresh: true });
+    const v = aiGateway.grade(p);
+    gatewayState = { kind: p.kind, status: v.status, reason: v.reason };
+  } catch {
+    gatewayState = { kind: null, status: 'unavailable', reason: 'The gateway could not be probed' };
+  }
+
+  const classes = [...new Set(attempts.map((a) => a.error_class))];
+  const gatewayDown = gatewayState.status === 'critical';
+  const summary = gatewayDown
+    ? `AI test failed: the gateway is not serving — ${gatewayState.reason}`
+    : `AI test failed: ${attempts.length} model${attempts.length === 1 ? '' : 's'} tried, all failed (${classes.join(', ')})`;
+
+  return {
+    ok: false,
+    latency_ms: latencyMs,
+    requested_model: asked.model,
+    requested_tier: asked.tier,
+    gateway: { ...gatewayInfo, ...gatewayState },
+    attempts,
+    summary,
+  };
+}
 
 /**
  * Rungs 4 and 5 of the recovery ladder.
@@ -294,25 +351,92 @@ const COMMANDS = {
 
   'ai.test': {
     label: 'Test AI',
-    description: 'Sends a minimal prompt through the configured routing and reports the model that answered.',
+    description:
+      'Sends a minimal prompt through the real configured routing and gateway, and reports the model '
+      + 'that was asked for, the model and provider that actually answered, and how long it took.',
     blastRadius: 'One AI request. Consumes a small number of tokens and costs money.',
     cooldownMs: 15_000,
+    // Checked before the cooldown is claimed, so pressing it on a box with no
+    // key is a clear 503 rather than a failed request that locks the button.
+    get unavailable() {
+      return aiConfig.isConfigured() ? null : aiConfig.configurationProblem();
+    },
     async run() {
       // Required lazily: the AI stack pulls a large dependency tree, and a
       // console that never presses this button should not pay for it at boot.
       const { routedChat } = require('../../lib/ai/router');
+      const { resolveModel } = require('../../lib/ai/models');
+      // What routing asks for. The production path, unchanged: same intent
+      // table, same tiers, same fallback chain, same gateway, same key.
+      const asked = resolveModel('chat');
+      const base = aiGateway.describeBase();
+      const gatewayInfo = { endpoint: base.ok ? base.endpoint : null, openrouter: base.ok ? base.isOpenRouter : null };
       const t0 = Date.now();
-      const res = await routedChat({
-        intent: 'chat',
-        messages: [{ role: 'user', content: 'Reply with the single word: ready' }],
-        max_tokens: 10,
-      });
+      try {
+        const res = await routedChat({
+          intent: 'chat',
+          messages: [{ role: 'user', content: 'Reply with the single word: ready' }],
+          max_tokens: 10,
+        });
+        return {
+          ok: true,
+          latency_ms: Date.now() - t0,
+          requested_model: asked.model,
+          requested_tier: asked.tier,
+          // `model` kept for older consoles: it has always meant the model that ANSWERED.
+          model: res?.model ?? null,
+          served_tier: res?.tier ?? null,
+          provider: res?.routed_via?.provider ?? null,
+          provider_source: res?.routed_via ? 'X-Routed-Via header' : 'not reported by the gateway',
+          used_fallback: res?.used_fallback ?? null,
+          gateway_fallback_attempts: res?.gateway_fallback_attempts ?? null,
+          gateway: gatewayInfo,
+          reply: typeof res?.content === 'string' ? res.content.slice(0, 100) : null,
+        };
+      } catch (err) {
+        // The operator gets a precise, SAFE diagnosis: each attempt's class and
+        // status, and what the gateway says about itself right now. Error text
+        // is scrubbed; the audit row records only the summary line.
+        const diagnosis = await diagnoseAiFailure(err, { asked, gatewayInfo, latencyMs: Date.now() - t0 });
+        const e = new Error(diagnosis.summary);
+        e.output = diagnosis;
+        throw e;
+      }
+    },
+  },
+
+  'ai.gateway.check': {
+    label: 'Check FreeLLMAPI',
+    description:
+      'Re-reads FreeLLMAPI\'s /livez, /readyz, /v1/providers and /v1/models now, bypassing the cache, '
+      + 'and refreshes the AI cards. Covers service, provider, model-catalog and key-count health.',
+    blastRadius: 'Read-only. Four GET requests to the internal gateway. No AI request, no tokens.',
+    cooldownMs: 10_000,
+    get unavailable() {
+      if (!aiConfig.isConfigured()) return aiConfig.configurationProblem();
+      const base = aiGateway.describeBase();
+      if (!base.ok) return base.reason;
+      if (base.isOpenRouter) return 'AI_BASE_URL points at OpenRouter; there is no FreeLLMAPI to check.';
+      return null;
+    },
+    async run() {
+      const p = await aiGateway.probe({ fresh: true });
+      // The next snapshot re-reads both AI cards rather than serving a value
+      // that predates this check.
+      snapshot.invalidate('freellmapi');
+      snapshot.invalidate('ai');
+      const verdict = aiGateway.grade(p);
+      const { buildData } = require('./collectors/freellmapi.collector');
+      const d = buildData(p);
       return {
-        ok: true,
-        latency_ms: Date.now() - t0,
-        model: res?.model ?? null,
-        used_fallback: res?.used_fallback ?? null,
-        reply: typeof res?.content === 'string' ? res.content.slice(0, 100) : null,
+        status: verdict.status,
+        reason: verdict.reason,
+        gateway: d.gateway,
+        service: d.service,
+        readiness: d.readiness,
+        providers: d.providers,
+        models: d.models,
+        keys: d.keys,
       };
     },
   },

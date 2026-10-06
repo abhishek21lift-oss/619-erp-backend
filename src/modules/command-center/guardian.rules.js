@@ -445,8 +445,111 @@ const RULES = [
           return aiQ ? (aiQ.waiting ?? 0) > 0 : null;
         },
       },
+      {
+        // The gateway's own account of its upstreams. Separates "our primary
+        // model is struggling" from "the free-tier providers behind FreeLLMAPI
+        // are rate-limiting or rejecting keys", which is fixed somewhere else.
+        key: 'gateway_upstreams_struggling',
+        weight: 2,
+        describe: (c) => `FreeLLMAPI reports ${num(val(c, 'freellmapi', 'providers.rate_limited')) ?? 0} rate-limited and ${num(val(c, 'freellmapi', 'providers.invalid')) ?? 0} failing provider(s)`,
+        test: (c) => {
+          const limited = num(val(c, 'freellmapi', 'providers.rate_limited'));
+          const invalid = num(val(c, 'freellmapi', 'providers.invalid'));
+          if (limited === null && invalid === null) return null;
+          return (limited ?? 0) + (invalid ?? 0) > 0;
+        },
+      },
     ],
-    recommend: ['ai.test'],
+    recommend: ['ai.test', 'ai.gateway.check'],
+  },
+
+  {
+    id: 'ai.gateway_down',
+    title: 'The AI gateway is not serving, so AI is down whichever model is configured',
+    severity: 'critical',
+    // The misdiagnosis this prevents: AI is failing, so somebody changes the
+    // model routing. Every request goes through the one gateway; if it is not
+    // serving, no routing change can help.
+    conclusion:
+      'FreeLLMAPI itself is unreachable, not live, or has no serviceable upstream, and AI requests '
+      + 'from this platform are failing with it. The problem is the gateway (its container, its '
+      + 'provider keys, or the network to it), not the model choice — changing routing will not help.',
+    triggers: [
+      {
+        key: 'gateway_critical',
+        describe: (c) => `FreeLLMAPI is critical: ${c.freellmapi?.reason ?? 'no reason given'}`,
+        test: (c) => statusIs(c, 'freellmapi', 'critical'),
+      },
+      {
+        key: 'ai_affected',
+        describe: () => 'the AI card independently reports a runtime failure',
+        test: (c) => {
+          const state = val(c, 'ai', 'reconciliation.state');
+          return state === null ? null : state === 'runtime_failure';
+        },
+      },
+    ],
+    corroborating: [
+      {
+        key: 'calls_failing',
+        weight: 3,
+        describe: (c) => `${val(c, 'ai', 'observed.consecutive_failures')} consecutive AI calls from this process failed`,
+        test: (c) => {
+          const n = num(val(c, 'ai', 'observed.consecutive_failures'));
+          return n === null ? null : n >= 1;
+        },
+      },
+      {
+        key: 'platform_otherwise_up',
+        weight: 1,
+        describe: () => 'the database is answering, so this is not a platform-wide outage',
+        test: (c) => statusIs(c, 'database', 'healthy', 'warning'),
+      },
+    ],
+    recommend: ['ai.gateway.check', 'ai.test'],
+  },
+
+  {
+    id: 'ai.configured_model_unavailable',
+    title: 'A model the routing depends on cannot be served by the gateway',
+    severity: 'warning',
+    conclusion:
+      'FreeLLMAPI is serving, but a model named by the primary, secondary or fallback tier is '
+      + 'missing from its catalog or marked unavailable. Requests for that tier will fall back or '
+      + 'fail. Fix the routing (Control Centre → AI routing) or that model\'s provider key in '
+      + 'FreeLLMAPI; restarting anything will not help.',
+    triggers: [
+      {
+        key: 'configured_model_unservable',
+        describe: (c) => {
+          const f = (val(c, 'ai', 'reconciliation.findings') ?? [])
+            .find((x) => x.code === 'configured_model_missing' || x.code === 'configured_model_unavailable');
+          return f ? f.message : 'a configured model is not servable';
+        },
+        test: (c) => {
+          const findings = val(c, 'ai', 'reconciliation.findings');
+          if (!Array.isArray(findings)) return null;
+          return findings.some((x) => x.code === 'configured_model_missing' || x.code === 'configured_model_unavailable');
+        },
+      },
+      {
+        key: 'gateway_serving',
+        describe: () => 'FreeLLMAPI itself is up, so the gateway is not the cause',
+        test: (c) => statusIs(c, 'freellmapi', 'healthy', 'degraded', 'warning'),
+      },
+    ],
+    corroborating: [
+      {
+        key: 'already_falling_back',
+        weight: 2,
+        describe: (c) => `${Math.round((num(val(c, 'ai', 'last_hour.fallback_rate')) ?? 0) * 100)}% of the last hour fell back`,
+        test: (c) => {
+          const r = num(val(c, 'ai', 'last_hour.fallback_rate'));
+          return r === null ? null : r > 0;
+        },
+      },
+    ],
+    recommend: ['ai.gateway.check', 'ai.test'],
   },
 ];
 

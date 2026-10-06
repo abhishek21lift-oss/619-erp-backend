@@ -70,7 +70,20 @@ const CONTRACT = {
   },
   ai: {
     scope: 'platform',
-    required: ['active_model', 'last_request_at', 'routing', 'today', 'last_hour'],
+    required: ['active_model', 'last_request_at', 'routing', 'today', 'last_hour',
+      'gateway', 'reconciliation'],
+    nested: {
+      routing: ['primary', 'secondary', 'fallback', 'sources'],
+      reconciliation: ['state', 'findings', 'verified'],
+    },
+  },
+  freellmapi: {
+    scope: 'platform',
+    required: ['gateway', 'service', 'readiness', 'providers', 'models', 'keys', 'traffic'],
+    nested: {
+      gateway: ['kind', 'endpoint', 'checked_at'],
+      keys: ['total', 'healthy', 'healthy_unavailable_reason', 'per_key'],
+    },
   },
   security: {
     scope: 'platform',
