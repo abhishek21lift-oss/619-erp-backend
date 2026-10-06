@@ -65,27 +65,10 @@ const OWN_FIELDS = new Set(['level', 'time', 'msg', 'pid', 'hostname', 'v']);
  * changes the exposure of those: a line that used to go to a VPS's stdout is
  * now stored in a table and rendered in a web page.
  *
- * So: connection strings lose their credentials, and bearer tokens and long
- * opaque keys are masked. Deliberately conservative — over-masking a log line
- * costs an operator one ssh; under-masking puts a live credential in a
- * database row and a browser tab.
+ * The pattern list lives in lib/secretScrub.js, shared with the AI gateway
+ * probe, so there is one definition of "looks like a credential".
  */
-const SCRUBBERS = [
-  // postgres://user:pass@host  →  postgres://user:[REDACTED]@host
-  [/\b([a-z+]+:\/\/[^:\s/@]+):[^@\s]+@/gi, '$1:[REDACTED]@'],
-  // Bearer tokens and JWTs.
-  [/\bBearer\s+[\w-]+\.[\w-]+\.[\w-]+/gi, 'Bearer [REDACTED]'],
-  [/\beyJ[\w-]{10,}\.[\w-]+\.[\w-]+/g, '[REDACTED_JWT]'],
-  // Provider keys that announce themselves by prefix.
-  [/\b(sk|rk|re|whsec)_[A-Za-z0-9]{12,}/g, '$1_[REDACTED]'],
-];
-
-function scrub(text) {
-  if (typeof text !== 'string' || !text) return text;
-  let out = text;
-  for (const [re, replacement] of SCRUBBERS) out = out.replace(re, replacement);
-  return out;
-}
+const { scrub } = require('../../lib/secretScrub');
 
 /** Scrub strings inside a shallow-ish context object without deep recursion cost. */
 function scrubContext(value, depth = 0) {

@@ -144,6 +144,22 @@ router.get('/command-center/commands', wrap(async (_req, res) => {
 }));
 
 /**
+ * GET /api/super-admin/command-center/ai/models
+ *   ?fresh=1   re-read the gateway instead of the 10s memo
+ *
+ * The full model inventory, which is too large to ride the 1s snapshot tick:
+ * every model FreeLLMAPI's catalog returns, each joined to the routing tier(s)
+ * that name it and to when ai_usage_log last saw it serve a request.
+ *
+ * Takes no other input. Nothing here can choose a host, a path, a provider or
+ * a model — it reads the configured gateway's catalog and this database.
+ */
+router.get('/command-center/ai/models', wrap(async (req, res) => {
+  const { modelInventory } = require('./ai-inventory.service');
+  res.json({ data: await modelInventory({ fresh: req.query.fresh === '1' }) });
+}));
+
+/**
  * POST /api/super-admin/command-center/commands/:name
  * body: { queue?, confirm?, dryRun? }
  *

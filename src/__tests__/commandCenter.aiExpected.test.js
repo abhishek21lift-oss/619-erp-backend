@@ -18,6 +18,17 @@
 // is excluded from the denominator — a capability that does not exist here is
 // not something we failed to see." The frontend states it in the coverage
 // chip's tooltip. The collector was the only thing disagreeing.
+//
+// ── What "unconfigured" means now ───────────────────────────────────────────
+//
+// This card used to call AI unconfigured whenever platform_ai_settings held no
+// override. But an empty override is the NORMAL state: every tier then routes
+// on AI_*_MODEL or the built-in default (lib/ai/models.js), and AI works. The
+// card was reporting "No AI routing configured" on a platform serving AI.
+//
+// Routing always resolves to something. What can genuinely be absent is the
+// provider KEY — without it no request can be made — so that is now the
+// expected-unavailable condition, and an empty override row is not.
 'use strict';
 
 jest.mock('../lib/logger', () => ({
@@ -27,9 +38,11 @@ jest.mock('../lib/logger', () => ({
 const { STATUS } = require('../modules/command-center/registry');
 const { observabilityOf } = require('../modules/command-center/snapshot.service');
 
-/** The AI collector against a database with no routing configured. */
+/** The AI collector with NO provider key, against a working database. */
 function loadUnconfigured() {
   jest.resetModules();
+  delete process.env.AI_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
   jest.doMock('../db/pool', () => ({
     // Every query resolves; the routing one comes back empty. That is the
     // whole point — the probe WORKED.
@@ -48,7 +61,7 @@ describe('ai collector — unconfigured routing', () => {
     const card = await loadUnconfigured().collect();
 
     expect(card.status).toBe(STATUS.UNAVAILABLE);
-    expect(card.reason).toMatch(/No AI routing configured/);
+    expect(card.reason).toMatch(/No AI provider is configured/);
     // The whole finding: this is a deployment choice, not a gap in observation.
     expect(card.expected).toBe(true);
   });
@@ -67,8 +80,43 @@ describe('ai collector — unconfigured routing', () => {
     expect(obs.coverage).toBe(1);
   });
 
-  test('the reason still names the table, so the operator knows what to configure', async () => {
+  test('the reason names both key variables, so the operator knows what to set', async () => {
     const card = await loadUnconfigured().collect();
-    expect(card.reason).toContain('platform_ai_settings');
+    expect(card.reason).toContain('AI_API_KEY');
+    expect(card.reason).toContain('OPENROUTER_API_KEY');
+  });
+});
+
+describe('ai collector — an empty override is not "unconfigured"', () => {
+  const saved = { ...process.env };
+  afterEach(() => {
+    process.env = { ...saved };
+    jest.resetModules();
+    jest.dontMock('../db/pool');
+    jest.dontMock('../lib/ai/gateway');
+  });
+
+  test('with a key and no override row, it reports the EFFECTIVE routing and is not unavailable', async () => {
+    jest.resetModules();
+    process.env.AI_API_KEY = 'test-key-not-real-0000';
+    process.env.AI_PRIMARY_MODEL = 'vendor/primary-from-env';
+    jest.doMock('../db/pool', () => ({
+      query: jest.fn(async (sql) => {
+        if (/platform_ai_settings/.test(sql)) return { rows: [] };
+        if (/ORDER BY created_at DESC LIMIT 1/.test(sql)) return { rows: [] };
+        if (/GROUP BY model/.test(sql)) return { rows: [] };
+        return { rows: [{ requests: 0, fallbacks: 0, tokens: 0, models_used: 0, cost_inr: 0, unpriced_models: 0 }] };
+      }),
+    }));
+    jest.doMock('../lib/ai/gateway', () => ({
+      ...jest.requireActual('../lib/ai/gateway'),
+      probe: jest.fn(async () => ({ kind: 'openrouter', checked_at: new Date().toISOString(), endpoint: 'https://openrouter.ai/api/v1' })),
+    }));
+    const card = await require('../modules/command-center/collectors/ai.collector').collect();
+
+    expect(card.status).not.toBe(STATUS.UNAVAILABLE);
+    expect(card.data.routing.primary).toBe('vendor/primary-from-env');
+    expect(card.data.routing.sources.primary).toBe('env');
+    expect(card.data.routing.sources.secondary).toMatch(/^(env|default)$/);
   });
 });
