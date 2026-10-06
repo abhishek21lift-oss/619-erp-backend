@@ -329,7 +329,7 @@ router.post('/tenancy/run-isolation-tests', async (req, res, next) => {
     const org_a = orgARow.id;
     const org_b = orgBRow.id;
 
-    // The runner: 4 tests, each in its own savepoint so a single failure
+    // The runner: 5 tests (4 predicate + 1 RLS), each in its own savepoint so a single failure
     // does not poison the rest. The result is a small array of
     // { name, passed, detail } and a top-level rollup.
     const results = [];
@@ -416,7 +416,38 @@ router.post('/tenancy/run-isolation-tests', async (req, res, next) => {
           results.push({ name: 'delete_under_org_B_does_not_remove_org_A', passed: false, detail: { err: err.message } });
         }
 
-        // 5) Cleanup: delete the probe row under org_A
+        // 5) RLS hides org_A's row from app_tenant scoped to org_B — and shows
+        // it scoped to org_A. Tests 2-4 prove the app's own predicates; this
+        // one proves the database layer underneath them, as the tenant role
+        // with only the org context (no predicate in the query). The positive
+        // control matters: deny-everything misconfiguration would also pass
+        // the negative check, so both directions are asserted.
+        // Own BEGIN/COMMIT: the SAVEPOINT below is only legal inside a
+        // transaction, and nothing here writes, so the block always rolls
+        // back (which also restores the session role).
+        try {
+          await probeClient.query('BEGIN');
+          await probeClient.query('SET LOCAL ROLE app_tenant');
+          await probeClient.query(`SELECT set_config('app.org_id', $1, true)`, [org_b]);
+          const hidden = await probeClient.query(`SELECT id FROM trainers WHERE id = $1`, [insertedId]);
+          await probeClient.query(`SELECT set_config('app.org_id', $1, true)`, [org_a]);
+          const visible = await probeClient.query(`SELECT id FROM trainers WHERE id = $1`, [insertedId]);
+          await probeClient.query('ROLLBACK');
+          const passed = hidden.rows.length === 0 && visible.rows.length === 1;
+          results.push({
+            name: 'rls_hides_foreign_row_from_tenant_role',
+            passed,
+            detail: passed ? null : { hidden_rows: hidden.rows.length, visible_rows: visible.rows.length },
+          });
+        } catch (err) {
+          try { await probeClient.query('ROLLBACK'); } catch { /* already out of txn */ }
+          // No app_tenant role, no RLS, or no SET ROLE privilege: the RLS
+          // layer cannot be probed here. Red, with the reason named — a
+          // missing second layer must not read as proven isolation.
+          results.push({ name: 'rls_hides_foreign_row_from_tenant_role', passed: false, detail: { err: err.message } });
+        }
+
+        // 6) Cleanup: delete the probe row under org_A
         try {
           await probeClient.query('BEGIN');
           await probeClient.query(
@@ -430,7 +461,10 @@ router.post('/tenancy/run-isolation-tests', async (req, res, next) => {
         }
       } catch (err) {
         await probeClient.query('ROLLBACK');
-        results.push({ name: 'insert_under_org_A_succeeds', passed: false, detail: { err: err.message } });
+        // Generic name on purpose: this catches anything the per-test blocks
+        // above did not already classify. Naming it after test 1 once
+        // misattributed an RLS-probe failure to the insert step.
+        results.push({ name: 'isolation_probe_unexpected_error', passed: false, detail: { err: err.message } });
       }
     } finally {
       probeClient.release();
@@ -469,7 +503,7 @@ router.post('/tenancy/run-isolation-tests', async (req, res, next) => {
     }
 
     // Write the row. The result blob is the whole array; an admin reading
-    // a 6-month-old run should see exactly the four tests we ran today.
+    // a 6-month-old run should see exactly the five tests we ran today.
     const { rows: [run] } = await pool.query(`
       INSERT INTO tenancy_isolation_runs
         (by_user_id, by_user_name, duration_ms, passed, total_tests, failed_tests, result)

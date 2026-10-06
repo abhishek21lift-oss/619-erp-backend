@@ -31,6 +31,8 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret-at-least-32-char
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://u:p@127.0.0.1:1/none';
 process.env.FRONTEND_URL = process.env.FRONTEND_URL || 'https://example.com';
 
+jest.setTimeout(15000);
+
 jest.mock('../db/pool', () => ({
   query: jest.fn(),
   connect: jest.fn(),
@@ -306,6 +308,8 @@ describe('POST /api/platform/tenancy/run-isolation-tests — 5-minute per-user c
     pool.query
       .mockResolvedValueOnce({ rows: [{ id: 'org-1' }] })
       .mockResolvedValueOnce({ rows: [{ id: 'org-2' }] });
+    // RLS context tracked across the probe client's calls (see below).
+    let ctxOrg = null;
     // 2) probe client connect — the runner fires several queries in
     // sequence: INSERT, SELECT, UPDATE+SELECT, DELETE+SELECT, DELETE.
     // We model the contract for each: the probe row exists in org_A
@@ -320,6 +324,16 @@ describe('POST /api/platform/tenancy/run-isolation-tests — 5-minute per-user c
       query: jest.fn().mockImplementation((sql, params) => {
         if (/INSERT INTO trainers[\s\S]*RETURNING id/i.test(sql)) {
           return Promise.resolve({ rows: [{ id: 99 }] });
+        }
+        // RLS probe (test 5): bare SELECTs with no org predicate — visibility
+        // comes from the app.org_id context the runner set just before. Track
+        // it so the hidden/visible directions resolve like the real policies.
+        if (/SELECT set_config\('app\.org_id', \$1, true\)/i.test(sql)) {
+          ctxOrg = params && params[0];
+          return Promise.resolve({ rows: [{ set_config: ctxOrg }] });
+        }
+        if (/SELECT id FROM trainers WHERE id = \$1\s*$/i.test(String(sql).trim())) {
+          return Promise.resolve({ rows: ctxOrg === 'org-1' ? [{ id: 99 }] : [] });
         }
         // SELECT name (test 3 read-back) — runner verifies the row's
         // name is unchanged after the org_B UPDATE. Mock returns the

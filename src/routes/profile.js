@@ -472,7 +472,7 @@ const coverUpload = multer({
   },
 });
 
-router.post('/cover', coverUpload.single('cover'), async (req, res, next) => {
+router.post('/cover', requireTrainer, coverUpload.single('cover'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Cover image is required' });
     await ensureSchema();
@@ -493,7 +493,7 @@ router.post('/cover', coverUpload.single('cover'), async (req, res, next) => {
 // unlike an avatar, which always falls back to initials, a banner they dislike
 // would otherwise be permanent. Column cleared first, object second, matching
 // the portfolio delete: a broken image is worse than a stale object.
-router.delete('/cover', async (req, res, next) => {
+router.delete('/cover', requireTrainer, async (req, res, next) => {
   try {
     await ensureSchema();
     // Read then write, rather than one statement with a subquery in RETURNING:
@@ -566,13 +566,13 @@ async function saveImage(req, buffer, limitBytes) {
   return { value: { key, url, mime: detected.mime, bytes: buffer.length } };
 }
 
-router.get('/portfolio', async (req, res, next) => {
+router.get('/portfolio', requireTrainer, async (req, res, next) => {
   try {
     res.json((await portfolioRows(req.user.id)).map(portfolio.present));
   } catch (err) { next(err); }
 });
 
-router.post('/portfolio', portfolioUpload.fields([
+router.post('/portfolio', requireTrainer, portfolioUpload.fields([
   { name: 'file', maxCount: 1 }, { name: 'after', maxCount: 1 },
 ]), async (req, res, next) => {
   const written = [];
@@ -639,7 +639,7 @@ router.post('/portfolio', portfolioUpload.fields([
   }
 });
 
-router.patch('/portfolio/:id', async (req, res, next) => {
+router.patch('/portfolio/:id', requireTrainer, async (req, res, next) => {
   try {
     const { rows: found } = await pool.query(
       'SELECT * FROM user_portfolio_items WHERE id = $1 AND user_id = $2',
@@ -679,7 +679,7 @@ router.patch('/portfolio/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.delete('/portfolio/:id', async (req, res, next) => {
+router.delete('/portfolio/:id', requireTrainer, async (req, res, next) => {
   try {
     // DELETE ... RETURNING: one statement that both removes the row and hands
     // back the keys, so two concurrent deletes cannot both try to remove the
@@ -699,7 +699,7 @@ router.delete('/portfolio/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.put('/portfolio/order', async (req, res, next) => {
+router.put('/portfolio/order', requireTrainer, async (req, res, next) => {
   try {
     const existing = await portfolioRows(req.user.id);
     const check = portfolio.validateOrder(req.body.ids, existing.map((r) => r.id));

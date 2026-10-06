@@ -41,11 +41,17 @@ const mockScratch = { url: null };
 jest.mock('../db/pool', () => {
   const { Pool } = jest.requireActual('pg');
   let pool = null;
-  const get = () => (pool ||= new Pool({ connectionString: mockScratch.url, max: 4 }));
+  const get = () => {
+    if (!pool) {
+      pool = new Pool({ connectionString: mockScratch.url, max: 4 });
+      pool.on('error', () => {});
+    }
+    return pool;
+  };
   return {
     connect: (...a) => get().connect(...a),
     query: (...a) => get().query(...a),
-    end: () => (pool ? pool.end() : Promise.resolve()),
+    end: () => (pool ? pool.end().catch(() => {}) : Promise.resolve()),
   };
 });
 
@@ -80,9 +86,11 @@ describeIf('Migration recovery, against a real database', () => {
   afterEach(() => jest.restoreAllMocks());
 
   afterAll(async () => {
-    await pool.end();
-    await admin.query(`DROP DATABASE IF EXISTS ${SCRATCH_DB} WITH (FORCE)`);
-    await admin.end();
+    if (pool) await pool.end().catch(() => {});
+    if (admin) {
+      await admin.query(`DROP DATABASE IF EXISTS ${SCRATCH_DB} WITH (FORCE)`).catch(() => {});
+      await admin.end().catch(() => {});
+    }
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
