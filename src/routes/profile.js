@@ -19,6 +19,8 @@ const studioBranding = require('../lib/studioBranding');
 const { logActivity } = require('../lib/activityLog');
 const recovery = require('../lib/mfaRecoveryCodes');
 const logger = require('../lib/logger');
+const { sendEmailChangedNotice } = require('../lib/email');
+const emailChange = require('../lib/emailChange');
 const { saveFile, deleteFile } = require('../lib/fileStorage');
 const credentials = require('../lib/credentials');
 const profileFields = require('../lib/profileFields');
@@ -281,7 +283,31 @@ const PROFILE_FIELDS = [
   { body: 'working_hours',    col: 'working_hours',    parse: profileFields.validateWorkingHours,   json: true },
 ];
 
-router.put('/me', async (req, res, next) => {
+// ── Changing the sign-in email ───────────────────────────────────────────────
+//
+// A CHANGE of email (not a save that resends the same one, which this form
+// does on every save) needs the current password, is refused under
+// impersonation, and tells the old address it happened. Why: lib/emailChange.js.
+//
+// Refusals are 403 with a code, never 401: the client treats 401 as an expired
+// session and would sign the user out over a mistyped password.
+
+// Only requests that carry a password are counted, so ordinary profile saves
+// are never throttled. Keyed by account, not IP: the attacker this guards
+// against already holds the session, and could otherwise rotate addresses.
+const emailChangeLimiter = rateLimit({
+  store: makeStore('email-change'),
+  passOnStoreError: true,
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => `user:${req.user.id}`,
+  skip: (req) => !req.body || typeof req.body.currentPassword !== 'string' || !req.body.currentPassword,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: { code: 'REAUTH_RATE_LIMITED', message: 'Too many password attempts. Please wait 15 minutes and try again.' } },
+});
+
+router.put('/me', emailChangeLimiter, async (req, res, next) => {
   try {
     await ensureSchema();
     // name and email stay outside the table: they live on `users`, they are
@@ -294,11 +320,21 @@ router.put('/me', async (req, res, next) => {
       return res.status(400).json({ error: 'Valid email is required' });
     }
 
-    const existing = await pool.query(
-      'SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id <> $2 AND deleted_at IS NULL',
-      [email, req.user.id]
-    );
-    if (existing.rows.length) return res.status(409).json({ error: 'Email already registered' });
+    const account = await emailChange.loadAccount(req.user.id);
+    if (!account) return res.status(404).json({ error: 'User not found' });
+    const previousEmail = account.email;
+    const emailChanged = email !== previousEmail;
+
+    if (emailChanged) {
+      // Re-authenticate BEFORE the uniqueness check, so a session without the
+      // password cannot use the 409 to probe which addresses have accounts.
+      const supplied = typeof req.body.currentPassword === 'string' ? req.body.currentPassword : '';
+      const refusal = await emailChange.refusal(req, supplied, account.passwordHash);
+      if (refusal) return res.status(403).json({ error: refusal });
+      if (await emailChange.emailTaken(email, req.user.id)) {
+        return res.status(409).json({ error: 'Email already registered' });
+      }
+    }
 
     // Validate everything BEFORE writing anything, so a bad certification
     // cannot leave the name and email already updated.
@@ -333,6 +369,13 @@ router.put('/me', async (req, res, next) => {
 
     invalidateUserCache(req.user.id);
     await logActivity(req, 'profile.update', 'user', req.user.id, { name, email });
+    if (emailChanged) {
+      await logActivity(req, 'profile.email.change', 'user', req.user.id, { from: previousEmail, to: email });
+      // Fire-and-forget: the change is committed, and a mail outage must not
+      // turn it into an error the user would retry.
+      Promise.resolve(sendEmailChangedNotice({ to: previousEmail, name, newEmail: email }))
+        .catch((err) => logger.warn({ err: err.message, userId: req.user.id }, 'email change notice failed'));
+    }
     const row = await profileFor(req.user.id);
     res.json(shapeProfile(row));
   } catch (err) {

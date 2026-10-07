@@ -690,9 +690,69 @@ async function sendWelcomeInline({ to, name, studioName, trialDays }) {
   return sendRaw({ to, subject, html, text }, { kind: 'welcome' });
 }
 
+/**
+ * Mask an address for display to someone who may not own it: the first
+ * character of the local part and the full domain. Enough for the owner to
+ * recognise (or not recognise) the address, without broadcasting it whole.
+ */
+function maskEmail(address) {
+  const [local, domain] = String(address || '').split('@');
+  if (!local || !domain) return '';
+  return `${local[0]}${'•'.repeat(Math.min(Math.max(local.length - 1, 1), 6))}@${domain}`;
+}
+
+/**
+ * Tell the PREVIOUS address that the account's sign-in email was changed.
+ *
+ * This is the owner's only warning: once the email changes, password reset
+ * and Google sign-in both follow the new address, so a takeover that got this
+ * far is invisible to the owner unless the old inbox hears about it. There is
+ * deliberately no "reset your password" link — a reset would now be sent to
+ * the new address — so the message points at a human instead.
+ */
+async function sendEmailChangedNotice({ to, name, newEmail }) {
+  return dispatchEmail('email_changed', { to, name, newEmail }, () =>
+    sendEmailChangedNoticeInline({ to, name, newEmail })
+  );
+}
+
+/** Inline send for the worker and the fallback. Never throws (sendRaw's shape). */
+async function sendEmailChangedNoticeInline({ to, name, newEmail }) {
+  const masked = maskEmail(newEmail);
+  const subject = 'Your MY PT STUDIO sign-in email was changed';
+
+  const html = `
+    <div style="font-family:system-ui,-apple-system,sans-serif;max-width:520px;margin:0 auto;color:#0F172A">
+      <h1 style="font-size:20px;margin:0 0 12px">Your sign-in email was changed</h1>
+      <p style="font-size:14px;line-height:1.6;color:#334155;margin:0 0 12px">
+        Hi${name ? ` ${escapeHtml(name)}` : ''}, the email address used to sign in to your
+        MY PT STUDIO account was just changed${masked ? ` to <strong>${escapeHtml(masked)}</strong>` : ''}.
+        This address will no longer receive sign-in or password-reset emails.
+      </p>
+      <p style="font-size:14px;line-height:1.6;color:#334155;margin:0 0 12px">
+        If you made this change, no action is needed.
+      </p>
+      <p style="font-size:14px;line-height:1.6;color:#B91C1C;margin:0">
+        <strong>If this wasn't you,</strong> contact your studio or
+        <a href="mailto:support@myptstudio.com" style="color:#0067E0">support@myptstudio.com</a>
+        immediately so the account can be secured.
+      </p>
+    </div>`;
+
+  const text = [
+    'Your sign-in email was changed.',
+    `The email address used to sign in to your MY PT STUDIO account was just changed${masked ? ` to ${masked}` : ''}. `
+      + 'This address will no longer receive sign-in or password-reset emails.',
+    'If you made this change, no action is needed.',
+    "If this wasn't you, contact your studio or support@myptstudio.com immediately so the account can be secured.",
+  ].join('\n\n');
+
+  return sendRaw({ to, subject, html, text }, { kind: 'email_changed' });
+}
+
 module.exports = {
   sendWelcome, sendPasswordReset, sendAdminResetOtp, sendAdminInvitation, sendRaw,
-  sendClientActivation,
+  sendClientActivation, sendEmailChangedNotice, sendEmailChangedNoticeInline, maskEmail,
   sendWelcomeInline, sendPasswordResetInline, sendAdminResetOtpInline,
   verifyConnection, diagnose, describeError, smtpTimeouts, SMTP_TIMEOUT_DEFAULTS,
   isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,

@@ -111,7 +111,7 @@ const BUDGETS = {
   'routes/workouts.js': 40,
   'routes/ai.js': 42,
   'modules/progress/progress.routes.js': 33,
-  'routes/profile.js': 29,
+  'routes/profile.js': 28,
   'modules/pt-os/parq.routes.js': 28,
   'routes/auth-webauthn.js': 26,
   'routes/auth.js': 24,
@@ -224,8 +224,9 @@ describe('the migration has a number attached to it', () => {
     // to workout-log.service, where the member app's self-logging reuses them. 699 once
     // starting a session moved there too, and workouts.js was re-measured. 675 once both manual-payment endpoints
     // moved their write to lib/ptPayments.js and those two files were re-measured; 675 → 661 when routes/admin-reset.js (14) was deleted
-    // (Command Center audit CC-2). Lower it with each extraction — the number only means
+    // (Command Center audit CC-2). 661 → 660 when the email-change re-auth moved
+    // profile.js's uniqueness check to lib/emailChange.js. Lower it with each extraction — the number only means
     // something if it tracks reality.
-    expect(ceiling).toBe(661);
+    expect(ceiling).toBe(660);
   });
 });
