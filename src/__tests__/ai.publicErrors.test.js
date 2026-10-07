@@ -22,6 +22,12 @@ jest.mock('../middleware/auth', () => ({
   requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../lib/ai/router', () => ({ routedChat: jest.fn(), routedStream: jest.fn() }));
+// /chat calls retrieveContext() on every message. Unmocked, it runs the real
+// embedding model (@xenova/transformers) — a model load, and on a runner with
+// network a download — which under a parallel CI run exceeded the 5s test
+// timeout and failed `main` intermittently. The chat-stream siblings
+// (ai.chat.heartbeat/history/clientContext) mock it the same way.
+jest.mock('../lib/ai/knowledgeBase', () => ({ retrieveContext: jest.fn().mockResolvedValue([]) }));
 jest.mock('../lib/ai/usage', () => ({
   logUsage: jest.fn().mockResolvedValue(undefined), getUserUsage: jest.fn(), getModelStats: jest.fn(),
 }));
