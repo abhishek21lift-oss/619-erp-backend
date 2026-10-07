@@ -15,6 +15,7 @@ const EMAIL_TYPES = new Set([
   'admin_otp',
   'admin_invitation',
   'welcome',
+  'email_changed',
   'notification',
 ]);
 
@@ -72,6 +73,10 @@ async function processEmailJob(job) {
     case 'welcome': {
       const email = require('../lib/email');
       return email.sendWelcomeInline(job.data);
+    }
+    case 'email_changed': {
+      const email = require('../lib/email');
+      return email.sendEmailChangedNoticeInline(job.data);
     }
     default:
       throw new Error(`Unknown email job type: ${type}`);
