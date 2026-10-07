@@ -165,17 +165,82 @@ describe('smtp collector', () => {
     expect(card.reason).toMatch(/silently discarded/i);
   });
 
-  test('configured but nothing ever delivered is CRITICAL and quotes the error', async () => {
-    // This is the platform's actual state: 2 invitations, 0 sent.
-    withEmail(
-      { isConfigured: () => true, describeConfig: () => ({ host: 'smtp.x', port: 587, from: 'a@b.c', missing: [] }) },
-      { total: 2, sent: 0, errored: 1, attempted_never_sent: 1, last_sent_at: null, last_error: 'Connection timeout' },
-    );
+  const CONFIGURED = { isConfigured: () => true, describeConfig: () => ({ host: 'smtp.x', port: 587, from: 'a@b.c', missing: [] }) };
+  const NO_RECENT = {
+    total: 0, sent: 0, errored: 0, attempted_never_sent: 0, last_sent_at: null, last_error: null,
+    latest_at: null, latest_ok: null, latest_error: null,
+  };
+
+  test('a failed LATEST send in the window is CRITICAL and quotes the error', async () => {
+    withEmail(CONFIGURED, {
+      ...NO_RECENT, total: 1, errored: 1, attempted_never_sent: 1, last_error: 'Connection timeout',
+      latest_at: new Date().toISOString(), latest_ok: false, latest_error: 'Connection timeout',
+      history_total: 1, history_last_sent_at: null,
+    });
     const card = await load().collect();
 
     expect(card.status).toBe(STATUS.CRITICAL);
-    expect(card.reason).toMatch(/none delivered/i);
+    expect(card.reason).toMatch(/Latest invitation email failed/i);
     expect(card.reason).toMatch(/Connection timeout/);
+  });
+
+  test('old failures outside the window do not hold the card red (the August regression)', async () => {
+    // Production on 2026-10-07: two invitations from August — one cancelled
+    // after a "Connection timeout", one activated by copied link — and no send
+    // since. SMTP had been fixed and a live send was accepted, yet the card
+    // counted all-time rows and sat at Critical with no way to recover.
+    withEmail(CONFIGURED, { ...NO_RECENT, history_total: 2, history_last_sent_at: null });
+    const card = await load().collect();
+
+    expect(card.status).toBe(STATUS.HEALTHY);
+    expect(card.data.history.invitations_total).toBe(2);
+    expect(card.data.delivery.window_days).toBe(load().DELIVERY_WINDOW_DAYS);
+  });
+
+  test('a recent failure followed by a successful resend is HEALTHY', async () => {
+    // The latest attempt is the truth about mail now; the earlier failure stays in the counts.
+    withEmail(CONFIGURED, {
+      ...NO_RECENT, total: 2, sent: 1, errored: 1, attempted_never_sent: 1, last_error: 'Connection timeout',
+      last_sent_at: new Date().toISOString(),
+      latest_at: new Date().toISOString(), latest_ok: true, latest_error: null,
+    });
+    const card = await load().collect();
+
+    expect(card.status).toBe(STATUS.HEALTHY);
+    expect(card.data.delivery.invitations_errored).toBe(1);
+  });
+
+  test('an attempted send with no outcome is a WARNING', async () => {
+    withEmail(CONFIGURED, {
+      ...NO_RECENT, total: 1, attempted_never_sent: 1,
+      latest_at: new Date().toISOString(), latest_ok: false, latest_error: null,
+    });
+    const card = await load().collect();
+
+    expect(card.status).toBe(STATUS.WARNING);
+  });
+
+  test('a successful explicit probe is HEALTHY even after a recent failed send', async () => {
+    const verify = jest.fn(async () => ({ ok: true }));
+    withEmail({ ...CONFIGURED, verifyConnection: verify }, {
+      ...NO_RECENT, total: 1, errored: 1, last_error: 'Connection timeout',
+      latest_at: new Date().toISOString(), latest_ok: false, latest_error: 'Connection timeout',
+    });
+    const card = await load().collect({ probe: true });
+
+    expect(verify).toHaveBeenCalled();
+    expect(card.status).toBe(STATUS.HEALTHY);
+  });
+
+  test('the query is bounded by the delivery window', async () => {
+    const query = jest.fn(async () => ({ rows: [NO_RECENT] }));
+    jest.doMock('../lib/email', () => CONFIGURED);
+    jest.doMock('../db/pool', () => ({ query }));
+    jest.doMock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
+    await load().collect();
+
+    expect(query.mock.calls[0][0]).toMatch(/make_interval\(days => \$1\)/);
+    expect(query.mock.calls[0][1]).toEqual([load().DELIVERY_WINDOW_DAYS]);
   });
 
   test('the default probe does NOT open an SMTP connection', async () => {
