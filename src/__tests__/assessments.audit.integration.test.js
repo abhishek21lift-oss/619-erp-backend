@@ -195,7 +195,7 @@ describeIf('assessment audit, against a real database', () => {
   test('the PAR-Q signature attests the answers are true, and nothing else is required', async () => {
     const { rows } = await pool.query('SELECT id FROM pt_parq_forms WHERE client_id = $1 LIMIT 1', [CID]);
     const r = await request().post(`/api/pt-os/parq/forms/${rows[0].id}/consent`)
-      .send({ consent_checkboxes: { info_true: true }, client_signature: 'data:image/png;base64,AAA' });
+      .send({ consent_checkboxes: { info_true: true }, client_signature: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' });
     expect(r.status).toBe(201);
     const unsigned = await request().post(`/api/pt-os/parq/forms/${rows[0].id}/consent`)
       .send({ consent_checkboxes: { info_true: true } });

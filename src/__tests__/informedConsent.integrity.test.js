@@ -65,7 +65,7 @@ const signedDraft = () => ({
   id: 'ic-1', status: 'draft', full_name: 'Mina Rao', dob: new Date(1990, 4, 17), mobile: '9000000000',
   acknowledgements: { final_declaration: true, understands_confidentiality: true, voluntary_participation: true },
   physician_advised_against: false, medical_condition: null, exercise_consent_checked: true,
-  client_signature: 'data:image/png;base64,AAA', trainer_signature: null, witness_signature: null,
+  client_signature: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', trainer_signature: null, witness_signature: null,
 });
 
 const updateSql = () => mockQueries.find((q) => /^UPDATE pt_informed_consents SET/.test(q.sql) && !/archived/.test(q.sql));
@@ -130,7 +130,7 @@ describe('safety audit 2026-09-29', () => {
   test('signing needs the exercise programme consent accepted', async () => {
     mockExisting = { ...signedDraft(), exercise_consent_checked: false };
     const res = await request(app()).post('/api/pt-os/informed-consent/ic-1/sign')
-      .send({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
+      .send({ signer: 'trainer', signature: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' });
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe('EXERCISE_CONSENT_REQUIRED');
   });
@@ -178,7 +178,7 @@ describe('deleted clients', () => {
   test('signing a draft whose client was deleted is refused', async () => {
     mockClientLive = false;
     const res = await request(app()).post('/api/pt-os/informed-consent/ic-1/sign')
-      .send({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
+      .send({ signer: 'trainer', signature: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' });
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('CLIENT_DELETED');
   });
@@ -186,7 +186,7 @@ describe('deleted clients', () => {
 
 describe('signing (screening audit 2026-10-08)', () => {
   const sign = (body) => request(app()).post('/api/pt-os/informed-consent/ic-1/sign').send(body);
-  const bothSigned = () => ({ ...signedDraft(), trainer_signature: 'data:image/png;base64,BBB' });
+  const bothSigned = () => ({ ...signedDraft(), trainer_signature: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' });
 
   test('a signature that is not a PNG from the pad is refused before anything is written', async () => {
     const res = await sign({ signer: 'trainer', signature: 'Mina Rao' });
@@ -196,7 +196,7 @@ describe('signing (screening audit 2026-10-08)', () => {
 
   test('a record completed between the read and the write takes no signature', async () => {
     mockSigned = null;
-    const res = await sign({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
+    const res = await sign({ signer: 'trainer', signature: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' });
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('NOT_SIGNABLE');
     expect(mockQueries.find((q) => /SET trainer_signature = \$2/.test(q.sql)).sql)
@@ -206,7 +206,7 @@ describe('signing (screening audit 2026-10-08)', () => {
   test('the signer who completes the record generates the one PDF and logs the one completion', async () => {
     mockSigned = bothSigned();
     mockCompleted = { ...bothSigned(), status: 'completed' };
-    const res = await sign({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
+    const res = await sign({ signer: 'trainer', signature: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' });
     expect(res.status).toBe(200);
     expect(generateInformedConsentPdf).toHaveBeenCalledTimes(1);
     expect(logActivity).toHaveBeenCalledWith(expect.anything(), 'informed_consent.completed', 'pt_informed_consents', 'ic-1', {});
@@ -215,7 +215,7 @@ describe('signing (screening audit 2026-10-08)', () => {
   test('the signer who loses the completion race gets the record, not a second PDF', async () => {
     mockSigned = bothSigned();
     mockCompleted = null; // the other signer completed it first
-    const res = await sign({ signer: 'client', signature: 'data:image/png;base64,AAA' });
+    const res = await sign({ signer: 'client', signature: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' });
     expect(res.status).toBe(200);
     expect(generateInformedConsentPdf).not.toHaveBeenCalled();
     expect(logActivity).not.toHaveBeenCalledWith(expect.anything(), 'informed_consent.completed', expect.anything(), expect.anything(), expect.anything());
@@ -227,7 +227,7 @@ describe('signing (screening audit 2026-10-08)', () => {
     mockCompleted = { ...bothSigned(), status: 'completed' };
     await request(app()).post('/api/pt-os/informed-consent/ic-1/sign')
       .set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/129.0 Safari/537.36 Edg/129.0')
-      .send({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
+      .send({ signer: 'trainer', signature: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' });
     expect(mockQueries.find((q) => /SET status = 'completed'/.test(q.sql)).params.slice(2)).toEqual(['desktop', 'Edge']);
   });
 });

@@ -81,6 +81,21 @@ router.post('/google-login', async (req, res) => {
       });
     }
 
+    // The platform operator signs in with password and authenticator only.
+    // This door never asks for the second factor, and the session it opens
+    // could reach /api/profile — enough to replace the operator's TOTP
+    // (security audit 2026-10-08). Refused outright, before any session.
+    if (user.role === 'super_admin') {
+      loginEvents.record(req, {
+        outcome: loginEvents.OUTCOMES.WRONG_PORTAL, method: 'google', email,
+        userId: user.id, orgId: user.organization_id,
+      });
+      return res.status(403).json({
+        error: 'Operator accounts sign in with password and authenticator code.',
+        code: 'OPERATOR_PASSWORD_ONLY',
+      });
+    }
+
     // Update last login (non-critical)
     pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id])
       .catch(err => logger.warn({ err: err.message }, 'last_login update failed (non-critical)'));

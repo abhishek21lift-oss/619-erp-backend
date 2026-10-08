@@ -447,6 +447,12 @@ async function logEvent(req, action, detail) {
 
 // POST /register/options
 router.post('/register/options', auth, withConfigCheck(async (req, res, next) => {
+  // A full impersonation could otherwise enrol the operator's own passkey on
+  // the studio account and log in later with no imp claim, no time limit
+  // and no impersonation audit (security audit 2026-10-08).
+  if (req.impersonation) {
+    return res.status(403).json({ error: 'Passkeys cannot be changed while impersonating an account.', code: 'IMPERSONATION_FORBIDDEN' });
+  }
   try {
     const user = req.user;
     const rpId = getEffectiveRpId(req);
@@ -494,6 +500,9 @@ router.post('/register/options', auth, withConfigCheck(async (req, res, next) =>
 
 // POST /register/verify
 router.post('/register/verify', auth, withConfigCheck(async (req, res, next) => {
+  if (req.impersonation) {
+    return res.status(403).json({ error: 'Passkeys cannot be changed while impersonating an account.', code: 'IMPERSONATION_FORBIDDEN' });
+  }
   try {
     const user = req.user;
     const { registration, deviceName, deviceType: clientDeviceType } = req.body;
@@ -687,6 +696,15 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
     }
     const user = users[0];
 
+    // The platform operator signs in with password and authenticator only —
+    // a passkey session never passed TOTP (security audit 2026-10-08).
+    if (user.role === 'super_admin') {
+      return res.status(403).json({
+        error: 'Operator accounts sign in with password and authenticator code.',
+        code: 'OPERATOR_PASSWORD_ONLY',
+      });
+    }
+
     // Tenant audience — the passkey door is the studio door. See the same
     // note in routes/auth-google.js and middleware/platformAuth.js.
     const token = jwt.sign(
@@ -833,6 +851,9 @@ router.get('/credentials', auth, async (req, res, next) => {
 
 // DELETE /credentials/:id
 router.delete('/credentials/:id', auth, async (req, res, next) => {
+  if (req.impersonation) {
+    return res.status(403).json({ error: 'Passkeys cannot be changed while impersonating an account.', code: 'IMPERSONATION_FORBIDDEN' });
+  }
   try {
     const { rows } = await pool.query(
       `UPDATE user_webauthn_credentials
@@ -849,6 +870,9 @@ router.delete('/credentials/:id', auth, async (req, res, next) => {
 
 // PATCH /credentials/:id — rename device
 router.patch('/credentials/:id', auth, async (req, res, next) => {
+  if (req.impersonation) {
+    return res.status(403).json({ error: 'Passkeys cannot be changed while impersonating an account.', code: 'IMPERSONATION_FORBIDDEN' });
+  }
   try {
     const { deviceName } = req.body;
     if (!deviceName?.trim()) return res.status(400).json({ error: 'deviceName is required' });

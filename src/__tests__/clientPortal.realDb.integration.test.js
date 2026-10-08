@@ -336,8 +336,8 @@ describeIf('/api/me against a real database', () => {
     test('a member cannot delete a photo the trainer took, or another client\'s', async () => {
       await pool.query(
         `INSERT INTO progress_photos (id, client_id, photo_url, photo_type, uploaded_by, organization_id)
-         VALUES ('me-int-photo-trainer', $1, 'data:image/png;base64,AAAA', 'front', $2, $3),
-                ('me-int-photo-other', $4, 'data:image/png;base64,AAAA', 'front', NULL, $3)
+         VALUES ('me-int-photo-trainer', $1, 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==A', 'front', $2, $3),
+                ('me-int-photo-other', $4, 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==A', 'front', NULL, $3)
          ON CONFLICT (id) DO NOTHING`, [CLIENT, TRAINER_USER, ORG, CLIENT_2]);
       expect((await request().delete('/api/me/progress-photos/me-int-photo-trainer')).status).toBe(404);
       expect((await request().delete('/api/me/progress-photos/me-int-photo-other')).status).toBe(404);

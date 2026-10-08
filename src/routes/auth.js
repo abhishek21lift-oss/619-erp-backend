@@ -97,15 +97,28 @@ async function issueRefreshToken(res, userId, audience = null) {
   // not covering it is that nobody can sign in during those seconds.
   try {
     await pool.query(
-      'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, audience) VALUES ($1, $2, $3, $4)',
+      // token_version is stamped from the user row, so a token issued after a
+      // bump carries the new version (migration 228).
+      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, audience, token_version)
+       VALUES ($1, $2, $3, $4, (SELECT token_version FROM users WHERE id = $1))`,
       [userId, tokenHash, expiresAt, audience]
     );
   } catch (err) {
     if (err && err.code === '42703') {
-      await pool.query(
-        'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
-        [userId, tokenHash, expiresAt]
-      );
+      // An older schema: without token_version (pre-228), and before that
+      // without audience. Keep the audience whenever the column exists.
+      try {
+        await pool.query(
+          'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, audience) VALUES ($1, $2, $3, $4)',
+          [userId, tokenHash, expiresAt, audience]
+        );
+      } catch (err2) {
+        if (!(err2 && err2.code === '42703')) throw err2;
+        await pool.query(
+          'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+          [userId, tokenHash, expiresAt]
+        );
+      }
     } else {
       throw err;
     }
@@ -472,7 +485,8 @@ router.post('/refresh', async (req, res) => {
     let rows;
     try {
       ({ rows } = await pool.query(
-        `SELECT rt.user_id, rt.audience, u.token_version, u.is_active, u.deleted_at
+        `SELECT rt.user_id, rt.audience, rt.token_version AS issued_version,
+                u.token_version, u.is_active, u.deleted_at
            FROM refresh_tokens rt
            JOIN users u ON u.id = rt.user_id
           WHERE rt.token_hash = $1
@@ -498,7 +512,21 @@ router.post('/refresh', async (req, res) => {
       }
     }
 
-    if (!rows[0] || !rows[0].is_active || rows[0].deleted_at) {
+    // A refresh token belongs to the token_version it was issued under. Every
+    // "end all sessions" (sign out everywhere, deactivation, suspension, an
+    // operator password reset) bumps the version; without this comparison a
+    // stolen refresh token outlived all of them. `undefined` is the pre-228
+    // fallback query, which has no column to compare.
+    const staleVersion = rows[0]
+      && rows[0].issued_version !== undefined
+      // NULL: issued by the previous release during the seconds of a deploy
+      // after migration 228's backfill ran. Nothing to compare against.
+      && rows[0].issued_version !== null
+      && rows[0].issued_version !== rows[0].token_version;
+    if (staleVersion) {
+      await pool.query('UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL', [tokenHash]);
+    }
+    if (!rows[0] || !rows[0].is_active || rows[0].deleted_at || staleVersion) {
       res.clearCookie('refresh_token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/api/auth' });
       return res.status(401).json({ error: 'Invalid or expired refresh token' });
     }

@@ -12,6 +12,7 @@ const { makeStore } = require('../lib/rateLimitStore');
 // what v12's `{ window: 1 }` meant.
 const { generateSecret, verifySync } = require('otplib');
 const pool = require('../db/pool');
+const { mfaStateFor } = require('../lib/mfaState');
 const { syncTrainerName } = require('../lib/memberTrainer');
 const { detectFileType, PROFILE_IMAGES, LOGO_IMAGES } = require('../lib/fileSignatures');
 const { auth, requireTrainer, invalidateUserCache } = require('../middleware/auth');
@@ -811,9 +812,35 @@ router.put('/password', async (req, res, next) => {
   }
 });
 
+// The second factor protects the account; changing it must not be possible
+// with only the first. Security audit 2026-10-08: setup overwrote a live
+// secret and DELETE turned MFA off from any session — including one opened
+// by Google or passkey login, which never asks for TOTP — so whoever held the
+// mailbox could replace the operator's authenticator with their own.
+//
+//   · never while impersonating (an operator acting as a studio must not be
+//     able to change that studio's credentials — same rule as email change);
+//   · enrolling again while MFA is on is refused: turn it off first;
+//   · turning it off needs a current code from the existing authenticator.
+function mfaChangeRefusal(req) {
+  if (req.impersonation) {
+    return { status: 403, error: 'Two-factor settings cannot be changed while impersonating an account.', code: 'IMPERSONATION_FORBIDDEN' };
+  }
+  return null;
+}
+
 router.post('/mfa/setup', async (req, res, next) => {
   try {
+    const refused = mfaChangeRefusal(req);
+    if (refused) return res.status(refused.status).json({ error: refused.error, code: refused.code });
     await ensureSchema();
+    const current = await mfaStateFor(req.user.id);
+    if (current && current.mfa_enabled) {
+      return res.status(409).json({
+        error: 'Two-factor authentication is already on. Turn it off with a current code before setting up a new authenticator.',
+        code: 'MFA_ALREADY_ENABLED',
+      });
+    }
     const secret = generateSecret();
     await pool.query(
       `INSERT INTO user_profiles (user_id, mfa_secret, updated_at)
@@ -845,6 +872,8 @@ const mfaVerifyLimiter = rateLimit({
 
 router.post('/mfa/verify', mfaVerifyLimiter, async (req, res, next) => {
   try {
+    const refused = mfaChangeRefusal(req);
+    if (refused) return res.status(refused.status).json({ error: refused.error, code: refused.code });
     const code = String(req.body.code || '').trim();
     if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Valid MFA code is required' });
     await ensureSchema();
@@ -881,9 +910,20 @@ router.post('/mfa/verify', mfaVerifyLimiter, async (req, res, next) => {
   }
 });
 
-router.delete('/mfa', async (req, res, next) => {
+router.delete('/mfa', mfaVerifyLimiter, async (req, res, next) => {
   try {
+    const refused = mfaChangeRefusal(req);
+    if (refused) return res.status(refused.status).json({ error: refused.error, code: refused.code });
     await ensureSchema();
+    const current = await mfaStateFor(req.user.id);
+    if (current && current.mfa_enabled && current.mfa_secret) {
+      const code = String((req.body && req.body.code) || '').trim();
+      if (!/^\d{6}$/.test(code)) {
+        return res.status(400).json({ error: 'Enter the 6-digit code from your authenticator app to turn two-factor off.', code: 'MFA_CODE_REQUIRED' });
+      }
+      const valid = verifySync({ secret: current.mfa_secret, token: code, strategy: 'totp', epochTolerance: 30 }).valid;
+      if (!valid) return res.status(400).json({ error: 'Invalid MFA code', code: 'MFA_CODE_INVALID' });
+    }
     await pool.query('UPDATE user_profiles SET mfa_enabled = FALSE, mfa_secret = NULL, updated_at = NOW() WHERE user_id = $1', [req.user.id]);
     // Codes outlive nothing. Leaving them behind would mean a re-enrolment
     // later silently inherits credentials issued against a secret that no

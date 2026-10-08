@@ -3,6 +3,8 @@
 // (parqPdf.js, informedConsentPdf.js) so the header/section/signature
 // layout stays visually consistent without copy-pasting per generator.
 
+const { isRenderableSignaturePng, signatureBuffer } = require('./signing');
+
 function fmtDate(d) {
   if (!d) return '—';
   try { return new Date(d).toISOString().split('T')[0]; } catch { return String(d); }
@@ -27,7 +29,11 @@ function embedSignature(doc, label, base64) {
   doc.fontSize(10).fillColor('#6B7280').text(label);
   if (base64 && typeof base64 === 'string' && base64.includes(',')) {
     try {
-      const buf = Buffer.from(base64.split(',')[1], 'base64');
+      const buf = signatureBuffer(base64);
+      // Checked synchronously first: pdfkit's PNG decoder fails ASYNC, outside
+      // this try/catch, and that exits the process (security audit
+      // 2026-10-08). Also guards signatures stored before validation existed.
+      if (!isRenderableSignaturePng(buf)) throw new Error('unrenderable signature');
       doc.image(buf, { fit: [220, 80] });
     } catch {
       doc.fontSize(9).fillColor('#DC2626').text('(signature image could not be rendered)');

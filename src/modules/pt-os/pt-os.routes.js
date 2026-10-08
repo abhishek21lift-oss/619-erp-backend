@@ -28,6 +28,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { recordPtPayment } = require('../../lib/ptPayments');
 const { renewClient, addMonthsIso } = require('./renewal.service');
 const { genReceiptNo } = require('../../db/receipts');
+const { signatureDataUrl } = require('../../lib/signing');
 const { checkTrainingEligibility, enrolmentScreeningBlock, screeningSummary, screeningGaps } = require('../../lib/screeningGate');
 const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
 
@@ -715,6 +716,13 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
   // value and nothing else.
   if (req.body.trainer_id !== undefined) {
     req.body.trainer_id = await resolveTrainerId(pool, orgIdOf(req), req.body.trainer_id);
+  }
+
+  // The enrolment agreement's signature is embedded in the enrolment PDF; it
+  // takes the same check as every other signature (security audit
+  // 2026-10-08 — it had none, and an unreadable image crashed the PDF render).
+  if (req.body.agreement_signature != null && !signatureDataUrl.safeParse(req.body.agreement_signature).success) {
+    return res.status(400).json({ error: 'Signature must be a PNG image from the signature pad', code: 'INVALID_SIGNATURE' });
   }
 
   // A free-text payment method is a reporting column nobody can group by.
