@@ -85,6 +85,15 @@ const CONTRACT = {
       keys: ['total', 'healthy', 'healthy_unavailable_reason', 'per_key'],
     },
   },
+  host: {
+    scope: 'platform',
+    required: ['cpu', 'memory', 'swap', 'load', 'load_per_core', 'uptime_seconds', 'disk'],
+    nested: {
+      cpu: ['cores', 'busy_ratio', 'steal_ratio'],
+      memory: ['total_bytes', 'available_bytes', 'used_bytes', 'used_ratio'],
+      load: ['one', 'five', 'fifteen'],
+    },
+  },
   security: {
     scope: 'platform',
     required: ['auth', 'posture'],

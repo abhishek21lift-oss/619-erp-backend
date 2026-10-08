@@ -200,6 +200,6 @@ describe('a card says whose state it describes', () => {
     expect(byScope.process.sort()).toEqual(['http', 'runtime']);
     expect(byScope.platform.sort())
       // freellmapi is the AI gateway: shared by every process, so platform.
-      .toEqual(['ai', 'database', 'freellmapi', 'queues', 'redis', 'security', 'smtp']);
+      .toEqual(['ai', 'database', 'freellmapi', 'host', 'queues', 'redis', 'security', 'smtp']);
   });
 });
