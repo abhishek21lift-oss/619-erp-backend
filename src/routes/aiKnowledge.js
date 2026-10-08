@@ -21,6 +21,7 @@ const { saveFile } = require('../lib/fileStorage');
 const { SUPPORTED_MIME_TYPES } = require('../lib/ai/textExtract');
 const { ingestDocument, deleteDocument, retrieveContext } = require('../lib/ai/knowledgeBase');
 const logger = require('../lib/logger');
+const { invalidFileType } = require('../middleware/errorHandler');
 
 const router = express.Router();
 
@@ -31,7 +32,7 @@ const upload = multer({
   limits: { fileSize: 15 * 1024 * 1024 }, // 15 MB — generous for a text-heavy SOP/policy PDF
   fileFilter(_req, file, cb) {
     if (!SUPPORTED_MIME_TYPES.includes(file.mimetype)) {
-      return cb(new Error(`Unsupported file type. Allowed: ${SUPPORTED_MIME_TYPES.join(', ')}`));
+      return cb(invalidFileType(`Unsupported file type. Allowed: ${SUPPORTED_MIME_TYPES.join(', ')}`));
     }
     cb(null, true);
   },

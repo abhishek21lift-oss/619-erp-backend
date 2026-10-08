@@ -19,7 +19,9 @@ const { logActivity } = require('../../lib/activityLog');
 const { generateInformedConsentPdf } = require('../../lib/informedConsentPdf');
 const { saveFile } = require('../../lib/fileStorage');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
-const { consentVersions } = require('./informed-consent.repository');
+const { consentVersions, completeConsent } = require('./informed-consent.repository');
+const { invalidFileType } = require('../../middleware/errorHandler');
+const { signatureDataUrl, describeAgent } = require('../../lib/signing');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -84,14 +86,14 @@ const updateSchema = {
         && Date.parse(v) >= Date.now() - 8 * 86400000),
       { message: 'Consent date must be within the last 7 days and not in the future' }
     ),
-    exercise_consent_signature: z.string().optional().nullable(),
+    exercise_consent_signature: signatureDataUrl.optional().nullable(),
   }),
 };
 
 const signSchema = {
   body: z.object({
     signer: z.enum(['client', 'trainer', 'witness']),
-    signature: z.string().min(1),
+    signature: signatureDataUrl,
     witness_name: z.string().max(255).optional().nullable(),
   }).refine((b) => b.signer !== 'witness' || (b.witness_name && b.witness_name.trim()), {
     // A witness signature with no name identifies nobody.
@@ -430,30 +432,27 @@ router.post('/informed-consent/:id/sign', auth, requireTrainer, validate(signSch
   const params = [id, signature];
   if (signer === 'witness' && witness_name) { params.push(witness_name); sets.push(`witness_name = $${params.length}`); }
 
+  // Guarded on status: a record completed, revoked or archived between the
+  // read above and this write must not take another signature.
   const { rows } = await pool.query(
-    `UPDATE pt_informed_consents SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params
+    `UPDATE pt_informed_consents SET ${sets.join(', ')}
+      WHERE id = $1 AND status NOT IN ('completed', 'revoked', 'archived', 'expired')
+      RETURNING *`, params
   );
+  if (!rows[0]) return res.status(409).json({ error: { code: 'NOT_SIGNABLE' } });
   let record = rows[0];
 
   await logActivity(req, `informed_consent.sign.${signer}`, 'pt_informed_consents', id, {});
 
   const bothSigned = Boolean(record.client_signature) && Boolean(record.trainer_signature);
   if (bothSigned && record.status !== 'completed') {
-    const ua = String(req.headers['user-agent'] || '');
-    const device = /Mobile|Android|iPhone/i.test(ua) ? 'mobile' : /iPad|Tablet/i.test(ua) ? 'tablet' : 'desktop';
-    const browser = /Chrome/i.test(ua) ? 'Chrome'
-      : /Firefox/i.test(ua) ? 'Firefox'
-      : /Safari/i.test(ua) ? 'Safari'
-      : /Edge/i.test(ua) ? 'Edge'
-      : 'Browser';
+    const { device, browser } = describeAgent(req.headers['user-agent']);
 
-    const { rows: completedRows } = await pool.query(
-      `UPDATE pt_informed_consents
-          SET status = 'completed', completed_at = NOW(), ip_address = $2, device = $3, browser = $4, updated_at = NOW()
-        WHERE id = $1 RETURNING *`,
-      [id, req.ip || null, device, browser]
-    );
-    record = completedRows[0];
+    // Exactly one completion: a signer who loses the race to the other
+    // gets the record as it stands, with no second PDF or completion log.
+    const completion = await completeConsent(id, { ip: req.ip || null, device, browser });
+    if (!completion.completed) return res.json({ data: completion.record });
+    record = completion.record;
 
     // PDF generation failure shouldn't fail the signed record itself — it's
     // already durably stored and the PDF can be regenerated later.
@@ -520,7 +519,7 @@ const clearanceUpload = multer({
   limits: { fileSize: IC_MAX_UPLOAD_BYTES },
   fileFilter(_req, file, cb) {
     if (!/^image\/(png|jpe?g)$|^application\/pdf$/i.test(file.mimetype || '')) {
-      return cb(new Error('Only PNG, JPG, or PDF files are allowed'));
+      return cb(invalidFileType('Only PNG, JPG, or PDF files are allowed'));
     }
     cb(null, true);
   },

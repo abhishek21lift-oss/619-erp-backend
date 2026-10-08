@@ -38,6 +38,7 @@ const { logActivity } = require('../lib/activityLog');
 const logger = require('../lib/logger');
 const upi = require('../lib/upiPayments');
 const { generateUpiReceiptPdf } = require('../lib/upiReceiptPdf');
+const { invalidFileType } = require('../middleware/errorHandler');
 
 // ── Upload constraints ──────────────────────────────────────────────────────
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB, per spec
@@ -51,7 +52,7 @@ const screenshotUpload = multer({
   limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
   fileFilter(_req, file, cb) {
     if (!/^image\/(png|jpe?g)$|^application\/pdf$/i.test(file.mimetype || '')) {
-      return cb(new Error('Only JPG, PNG or PDF files are allowed'));
+      return cb(invalidFileType('Only JPG, PNG or PDF files are allowed'));
     }
     cb(null, true);
   },

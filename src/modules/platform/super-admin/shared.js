@@ -35,6 +35,7 @@ const { TRIAL_DAYS } = subscription;
 // 'super_admin' — that is platform-only and cannot be created, edited, or
 // impersonated through this portal. One definition, owned by rbac.js.
 const { TENANT_ROLES } = require('../../../middleware/rbac');
+const { invalidFileType } = require('../../../middleware/errorHandler');
 // How long an impersonation session stays valid before the operator must
 // re-enter the studio. Short by design — impersonation is a spot check.
 //
@@ -80,7 +81,7 @@ const logoUpload = multer({
   limits: { fileSize: LOGO_MAX_BYTES },
   fileFilter(_req, file, cb) {
     if (!/^image\/(png|jpe?g|webp)$/i.test(file.mimetype || '')) {
-      return cb(new Error('Only PNG, JPG, or WEBP images are allowed'));
+      return cb(invalidFileType('Only PNG, JPG, or WEBP images are allowed'));
     }
     cb(null, true);
   },

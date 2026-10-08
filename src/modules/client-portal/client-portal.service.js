@@ -11,7 +11,7 @@
 // authorship, pricing) are never selected.
 
 const pool = require('../../db/pool');
-const { today, dbDate } = require('../../lib/appTime');
+const { today, dbDate, mondayOf } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
 const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
 const { programmeWeek, resolveWeek } = require('../pt-os/progression');
@@ -40,12 +40,7 @@ function timedTargets(config) {
   };
 }
 
-function mondayOf(ymd) {
-  const d = new Date(`${ymd}T00:00:00Z`);
-  const dow = d.getUTCDay(); // 0 Sun … 6 Sat
-  d.setUTCDate(d.getUTCDate() - ((dow + 6) % 7));
-  return d.toISOString().slice(0, 10);
-}
+// mondayOf lives in lib/appTime (shared with the trainer's check-in route).
 
 /**
  * Whole weeks since `start` (1-based), for picking a programme's current week.

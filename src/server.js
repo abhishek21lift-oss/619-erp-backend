@@ -493,15 +493,26 @@ app.use('/api/webhooks/whatsapp', require('./routes/whatsapp-webhook'));
 //
 // Raised only for these paths, matched exactly. Everything else keeps 100kb.
 const imageJson = express.json({ limit: '4mb' });
+//
+// Signatures too. A signature pad exports at the screen's pixel density, and
+// production holds signatures up to 53 KB each. The PAR-Q consent POST
+// carries two (84 KB combined on record, against a 100 KB limit), and every
+// Informed Consent wizard step PATCHes the client's signature: both were one
+// longer signature away from a 413 on a legal record.
+//
+// Each entry names its method: a PATCH to a consent is not a licence for a
+// 4mb POST to the same path.
 const IMAGE_JSON_PATHS = [
-  /^\/api\/pt-os\/clients\/[^/]+\/photo$/,
-  /^\/api\/progress\/progress-photos$/,
-  /^\/api\/pt-os\/informed-consent\/[^/]+\/sign$/,
+  ['POST', /^\/api\/pt-os\/clients\/[^/]+\/photo$/],
+  ['POST', /^\/api\/progress\/progress-photos$/],
+  ['POST', /^\/api\/pt-os\/informed-consent\/[^/]+\/sign$/],
+  ['PATCH', /^\/api\/pt-os\/informed-consent\/[^/]+$/],
+  ['POST', /^\/api\/pt-os\/parq\/forms\/[^/]+\/consent$/],
   // The member's own profile photo (client-portal.routes.js).
-  /^\/api\/me\/photo$/,
+  ['POST', /^\/api\/me\/photo$/],
 ];
 app.use((req, res, next) => (
-  req.method === 'POST' && IMAGE_JSON_PATHS.some((re) => re.test(req.path))
+  IMAGE_JSON_PATHS.some(([method, re]) => req.method === method && re.test(req.path))
     ? imageJson(req, res, next)
     : next()
 ));

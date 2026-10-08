@@ -117,3 +117,51 @@ describe('screening that is on file but cannot be relied on (safety audit 2026-0
     expect(sql).toMatch(/ORDER BY COALESCE\(mc\.reviewed_at/);
   });
 });
+
+describe('screeningGaps — the dashboard list of clients not cleared to train', () => {
+  const row = (extra) => ({
+    client_id: 'c1', client_name: 'Mina Rao', client_photo: null,
+    risk_level: 'low', workout_gate_status: 'cleared', has_valid_clearance: false, answered_count: 10,
+    consent_status: 'completed', physician_block: false, ...extra,
+  });
+  const { screeningGaps } = require('../lib/screeningGate');
+  const pool = require('../db/pool');
+  const gapsFor = async (rows) => {
+    pool.query.mockResolvedValueOnce({ rows });
+    return screeningGaps('org-a');
+  };
+
+  test('is scoped to the studio and to active, live clients', async () => {
+    await gapsFor([]);
+    const [sql, params] = pool.query.mock.calls.at(-1);
+    expect(params).toEqual(['org-a']);
+    expect(sql).toMatch(/c\.organization_id = \$1 AND c\.deleted_at IS NULL AND c\.status = 'active'/);
+  });
+
+  test('a fully screened client is not listed', async () => {
+    expect(await gapsFor([row()])).toEqual([]);
+  });
+
+  test('names what is missing', async () => {
+    const out = await gapsFor([
+      row({ client_id: 'none', consent_status: null, answered_count: null, risk_level: null }),
+      row({ client_id: 'partial', answered_count: 6 }),
+    ]);
+    expect(out).toEqual([
+      expect.objectContaining({ client_id: 'none', missing: ['informed_consent', 'parq'], block: null }),
+      expect.objectContaining({ client_id: 'partial', missing: ['parq'], block: null }),
+    ]);
+  });
+
+  test('names the hard stop, most serious first', async () => {
+    const out = await gapsFor([
+      row({ client_id: 'risk', risk_level: 'high' }),
+      row({ client_id: 'cleared', risk_level: 'high', has_valid_clearance: true }),
+      row({ client_id: 'revoked', consent_status: 'revoked' }),
+      row({ client_id: 'doctor', physician_block: true }),
+    ]);
+    expect(out.map((g) => [g.client_id, g.block])).toEqual([
+      ['risk', 'PARQ_BLOCKED'], ['revoked', 'CONSENT_REVOKED'], ['doctor', 'PHYSICIAN_ADVISED_AGAINST'],
+    ]);
+  });
+});

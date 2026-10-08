@@ -116,7 +116,7 @@ const BUDGETS = {
   'routes/auth-webauthn.js': 26,
   'routes/auth.js': 24,
   'routes/upi-payments.js': 21,
-  'modules/pt-os/informed-consent.routes.js': 18,
+  'modules/pt-os/informed-consent.routes.js': 17,
   'routes/attendance.js': 18,
   'routes/settings.js': 18,
   'routes/subscription.js': 18,
@@ -225,8 +225,9 @@ describe('the migration has a number attached to it', () => {
     // starting a session moved there too, and workouts.js was re-measured. 675 once both manual-payment endpoints
     // moved their write to lib/ptPayments.js and those two files were re-measured; 675 → 661 when routes/admin-reset.js (14) was deleted
     // (Command Center audit CC-2). 661 → 660 when the email-change re-auth moved
-    // profile.js's uniqueness check to lib/emailChange.js. Lower it with each extraction — the number only means
+    // profile.js's uniqueness check to lib/emailChange.js. 660 → 659 when consent completion moved to
+    // informed-consent.repository (screening audit 2026-10-08). Lower it with each extraction — the number only means
     // something if it tracks reality.
-    expect(ceiling).toBe(660);
+    expect(ceiling).toBe(659);
   });
 });

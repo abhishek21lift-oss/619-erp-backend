@@ -22,6 +22,8 @@ const mockTx = {
   release: jest.fn(),
 };
 let mockClientLive = true;
+let mockSigned = null;    // the row the signature UPDATE returns
+let mockCompleted = null; // the row the completion UPDATE returns
 jest.mock('../db/pool', () => ({
   query: jest.fn(async (sql, params) => {
     const text = String(sql).replace(/\s+/g, ' ').trim();
@@ -32,6 +34,8 @@ jest.mock('../db/pool', () => ({
     if (/^SELECT id, status, version FROM pt_informed_consents/.test(text)) return { rows: mockPrior };
     if (/^SELECT name AS full_name/.test(text)) return { rows: mockClientLive ? [{ full_name: 'Mina Rao', trainer_id: null }] : [] };
     if (/^INSERT INTO pt_informed_consents/.test(text)) return { rows: [{ id: 'ic-new', status: 'draft' }] };
+    if (/^UPDATE pt_informed_consents SET \w+_signature = \$2/.test(text)) return { rows: mockSigned ? [mockSigned] : [] };
+    if (/^UPDATE pt_informed_consents SET status = 'completed'/.test(text)) return { rows: mockCompleted ? [mockCompleted] : [] };
     return { rows: [] };
   }),
   connect: jest.fn(async () => mockTx),
@@ -48,6 +52,7 @@ jest.mock('../middleware/auth', () => ({
 const express = require('express');
 const request = require('supertest');
 const { logActivity } = require('../lib/activityLog');
+const { generateInformedConsentPdf } = require('../lib/informedConsentPdf');
 
 function app() {
   const a = express();
@@ -65,7 +70,7 @@ const signedDraft = () => ({
 
 const updateSql = () => mockQueries.find((q) => /^UPDATE pt_informed_consents SET/.test(q.sql) && !/archived/.test(q.sql));
 
-beforeEach(() => { mockQueries.length = 0; mockExisting = signedDraft(); mockRevoke = null; mockPrior = []; mockClientLive = true; logActivity.mockClear(); });
+beforeEach(() => { mockQueries.length = 0; mockExisting = signedDraft(); mockRevoke = null; mockPrior = []; mockClientLive = true; mockSigned = null; mockCompleted = null; logActivity.mockClear(); generateInformedConsentPdf.mockClear(); });
 
 describe('PATCH after a signature', () => {
   test('changing signed content clears every signature', async () => {
@@ -176,5 +181,53 @@ describe('deleted clients', () => {
       .send({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('CLIENT_DELETED');
+  });
+});
+
+describe('signing (screening audit 2026-10-08)', () => {
+  const sign = (body) => request(app()).post('/api/pt-os/informed-consent/ic-1/sign').send(body);
+  const bothSigned = () => ({ ...signedDraft(), trainer_signature: 'data:image/png;base64,BBB' });
+
+  test('a signature that is not a PNG from the pad is refused before anything is written', async () => {
+    const res = await sign({ signer: 'trainer', signature: 'Mina Rao' });
+    expect(res.status).toBe(400);
+    expect(mockQueries.some((q) => /^UPDATE/.test(q.sql))).toBe(false);
+  });
+
+  test('a record completed between the read and the write takes no signature', async () => {
+    mockSigned = null;
+    const res = await sign({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('NOT_SIGNABLE');
+    expect(mockQueries.find((q) => /SET trainer_signature = \$2/.test(q.sql)).sql)
+      .toMatch(/status NOT IN \('completed', 'revoked', 'archived', 'expired'\)/);
+  });
+
+  test('the signer who completes the record generates the one PDF and logs the one completion', async () => {
+    mockSigned = bothSigned();
+    mockCompleted = { ...bothSigned(), status: 'completed' };
+    const res = await sign({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
+    expect(res.status).toBe(200);
+    expect(generateInformedConsentPdf).toHaveBeenCalledTimes(1);
+    expect(logActivity).toHaveBeenCalledWith(expect.anything(), 'informed_consent.completed', 'pt_informed_consents', 'ic-1', {});
+  });
+
+  test('the signer who loses the completion race gets the record, not a second PDF', async () => {
+    mockSigned = bothSigned();
+    mockCompleted = null; // the other signer completed it first
+    const res = await sign({ signer: 'client', signature: 'data:image/png;base64,AAA' });
+    expect(res.status).toBe(200);
+    expect(generateInformedConsentPdf).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalledWith(expect.anything(), 'informed_consent.completed', expect.anything(), expect.anything(), expect.anything());
+    expect(mockQueries.find((q) => /SET status = 'completed'/.test(q.sql)).sql).toMatch(/status <> 'completed'/);
+  });
+
+  test('Edge is recorded as Edge on the completed record', async () => {
+    mockSigned = bothSigned();
+    mockCompleted = { ...bothSigned(), status: 'completed' };
+    await request(app()).post('/api/pt-os/informed-consent/ic-1/sign')
+      .set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/129.0 Safari/537.36 Edg/129.0')
+      .send({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
+    expect(mockQueries.find((q) => /SET status = 'completed'/.test(q.sql)).params.slice(2)).toEqual(['desktop', 'Edge']);
   });
 });

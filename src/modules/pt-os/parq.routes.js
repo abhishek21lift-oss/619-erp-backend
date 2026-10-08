@@ -22,6 +22,8 @@ const { clientInOrg } = require('../../lib/orgGuard');
 const { computeParqAnalysis } = require('./parq-scoring');
 const { clearanceApprovalProblem } = require('./parq-clearance');
 const { validClearanceSql, PARQ_QUESTION_COUNT } = require('../../lib/screeningGate');
+const { invalidFileType } = require('../../middleware/errorHandler');
+const { signatureDataUrl, describeAgent } = require('../../lib/signing');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -252,8 +254,8 @@ const CONSENT_KEYS = ['info_true'];
 const consentCreateSchema = {
   body: z.object({
     consent_checkboxes: z.record(z.string(), z.boolean()),
-    client_signature: z.string().min(1),
-    trainer_signature: z.string().min(1).optional().nullable(),
+    client_signature: signatureDataUrl,
+    trainer_signature: signatureDataUrl.optional().nullable(),
     location: z.string().max(500).optional().nullable(),
   }),
 };
@@ -347,6 +349,11 @@ router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema),
   let formId;
   try {
     await tx.query('BEGIN');
+    // assessment_number is "this client's Nth PAR-Q". Serialise per client so
+    // two submits at once cannot both read the same max, and number from the
+    // live forms: COUNT(*)+1 counted soft-deleted forms and repeated a number
+    // once a middle form was deleted.
+    await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`parq:${b.client_id}`]);
     const { rows } = await tx.query(
       `INSERT INTO pt_parq_forms (
          client_id, assessment_date, assessment_number,
@@ -359,7 +366,7 @@ router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema),
          status, workout_gate_status,
          created_by, organization_id
        ) VALUES (
-         $1, COALESCE($2, CURRENT_DATE), (SELECT COUNT(*)+1 FROM pt_parq_forms WHERE client_id = $1),
+         $1, COALESCE($2, CURRENT_DATE), (SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_parq_forms WHERE client_id = $1 AND deleted_at IS NULL),
          $3,$4,$5,$6,$7,$8,$9,$10,
          $11,$12,$13,$14,
          $15::jsonb,$16::jsonb,
@@ -648,13 +655,7 @@ router.post('/parq/forms/:formId/consent', auth, requireTrainer, validate(consen
     return res.status(400).json({ error: { code: 'CONSENT_REQUIRED', message: 'The client must confirm their answers are true' } });
   }
 
-  const ua = String(req.headers['user-agent'] || '');
-  const device = /Mobile|Android|iPhone/i.test(ua) ? 'mobile' : /iPad|Tablet/i.test(ua) ? 'tablet' : 'desktop';
-  const browser = /Chrome/i.test(ua) ? 'Chrome'
-    : /Firefox/i.test(ua) ? 'Firefox'
-    : /Safari/i.test(ua) ? 'Safari'
-    : /Edge/i.test(ua) ? 'Edge'
-    : 'Browser';
+  const { device, browser } = describeAgent(req.headers['user-agent']);
 
   const { rows } = await pool.query(
     `INSERT INTO pt_consent_records (
@@ -701,7 +702,7 @@ const docUpload = multer({
   limits: { fileSize: PARQ_MAX_UPLOAD_BYTES },
   fileFilter(_req, file, cb) {
     if (!/^image\/(png|jpe?g)$|^application\/pdf$/i.test(file.mimetype || '')) {
-      return cb(new Error('Only PNG, JPG, or PDF files are allowed'));
+      return cb(invalidFileType('Only PNG, JPG, or PDF files are allowed'));
     }
     cb(null, true);
   },

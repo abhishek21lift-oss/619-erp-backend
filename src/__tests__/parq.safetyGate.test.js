@@ -120,6 +120,18 @@ describe('POST /parq/forms', () => {
     expect(insert.params).toContain('high');
     expect(insert.params).toContain('blocked');
   });
+
+  test('numbers the assessment after the client\'s live ones, serialised per client', async () => {
+    // Two PAR-Qs saved at once used to read the same count and share a
+    // number; a deleted form also lowered the count and so reused one.
+    await request(app()).post('/api/pt-os/parq/forms').send(body);
+    const lock = mockQueries.findIndex((q) => /pg_advisory_xact_lock/.test(q.sql));
+    const insert = mockQueries.findIndex((q) => /^INSERT INTO pt_parq_forms/i.test(q.sql));
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(lock).toBeLessThan(insert);
+    expect(mockQueries[lock].params[0]).toBe(`parq:${body.client_id}`);
+    expect(mockQueries[insert].sql).toMatch(/COALESCE\(MAX\(assessment_number\), 0\) \+ 1 FROM pt_parq_forms WHERE client_id = \$1 AND deleted_at IS NULL/);
+  });
 });
 
 describe('PATCH /parq/forms/:id', () => {

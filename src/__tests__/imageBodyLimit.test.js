@@ -30,13 +30,26 @@ function loadPatterns() {
 }
 
 const PATTERNS = loadPatterns();
-const matches = (p) => PATTERNS.some((re) => re.test(p));
+/** Entries are [method, regex]; a bare path is checked as a POST. */
+const matches = (p, method = 'POST') => PATTERNS.some(([m, re]) => m === method && re.test(p));
 
-describe('image bodies are allowed on exactly three paths', () => {
-  test('the three that carry a base64 image', () => {
+describe('image bodies are allowed on exactly the paths that carry one', () => {
+  test('the paths that carry a base64 image or signature', () => {
     expect(matches('/api/pt-os/clients/abc-123/photo')).toBe(true);
     expect(matches('/api/progress/progress-photos')).toBe(true);
     expect(matches('/api/pt-os/informed-consent/xyz-9/sign')).toBe(true);
+    expect(matches('/api/me/photo')).toBe(true);
+    // Signatures: the PAR-Q consent posts two; every consent-wizard step
+    // PATCHes the client's.
+    expect(matches('/api/pt-os/parq/forms/f-1/consent')).toBe(true);
+    expect(matches('/api/pt-os/informed-consent/xyz-9', 'PATCH')).toBe(true);
+  });
+
+  test('the method is part of the match', () => {
+    // PATCHing a consent may carry a signature; nothing else on that path may.
+    expect(matches('/api/pt-os/informed-consent/xyz-9', 'POST')).toBe(false);
+    expect(matches('/api/pt-os/informed-consent/xyz-9', 'PUT')).toBe(false);
+    expect(matches('/api/pt-os/clients/abc-123/photo', 'PATCH')).toBe(false);
   });
 
   test('nothing else, however close it looks', () => {
@@ -50,6 +63,8 @@ describe('image bodies are allowed on exactly three paths', () => {
       '/api/pt-os/clients/abc-123/photo/extra',
       '/api/progress/progress-photos/abc-123',
       '/api/pt-os/informed-consent/xyz-9',
+      '/api/pt-os/parq/forms/f-1',
+      '/api/pt-os/parq/forms/f-1/consent/extra',
       '/api/auth/login',
       '/api/clients/abc-123/photo',           // the deleted legacy route
     ].filter(matches);
