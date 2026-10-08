@@ -404,8 +404,82 @@ async function screeningSummary(clientId) {
   };
 }
 
+/**
+ * Active clients whose screening is incomplete or blocking — the studio-wide
+ * list behind the dashboard's "Screening gaps" alert.
+ *
+ * Why it exists: the gate only BLOCKS a client who has never had a PT term.
+ * Clients enrolled before screening was enforced are let through with a
+ * warning on each workout, and on 2026-10-08 that was 4 of 9 active clients
+ * with no PAR-Q and 3 with no completed consent — invisible unless someone
+ * opened each profile. This names them, flag-only: nothing here blocks.
+ *
+ * Set-based twin of evaluate() + missingScreening(), built from the same
+ * fragments (latest non-draft PAR-Q, validClearanceSql, latest deciding
+ * consent, unresolved physician advice), so the list and the gate cannot
+ * disagree about who is missing what.
+ *
+ * @returns {Promise<Array<{ client_id, client_name, client_photo, missing: string[], block: string|null }>>}
+ */
+async function screeningGaps(orgId) {
+  const { rows } = await pool.query(`
+    SELECT c.id AS client_id, c.name AS client_name, c.photo_url AS client_photo,
+           p.risk_level, p.workout_gate_status, p.has_valid_clearance, p.answered_count,
+           k.status AS consent_status,
+           EXISTS (
+             SELECT 1 FROM pt_informed_consents ic
+              WHERE ic.client_id = c.id AND ic.organization_id = c.organization_id
+                AND ic.status <> 'archived'
+                AND ic.physician_advised_against IS TRUE
+                AND ic.medical_clearance_file_url IS NULL
+                AND (k.created_at IS NULL OR ic.created_at >= k.created_at)
+           ) AS physician_block
+      FROM pt_clients c
+      LEFT JOIN LATERAL (
+        SELECT f.risk_level, f.workout_gate_status,
+               ${validClearanceSql('f.id')} AS has_valid_clearance,
+               (SELECT COUNT(DISTINCT a->>'question_id')
+                  FROM jsonb_array_elements(
+                         CASE WHEN jsonb_typeof(f.parq_answers) = 'array' THEN f.parq_answers ELSE '[]'::jsonb END
+                       ) a
+                 WHERE a->>'answer' IN ('yes', 'no'))::int AS answered_count
+          FROM pt_parq_forms f
+         WHERE f.client_id = c.id AND f.organization_id = c.organization_id
+           AND f.deleted_at IS NULL AND COALESCE(f.status, 'submitted') <> 'draft'
+         ORDER BY f.assessment_date DESC NULLS LAST, f.created_at DESC
+         LIMIT 1
+      ) p ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT ic.status, ic.created_at
+          FROM pt_informed_consents ic
+         WHERE ic.client_id = c.id AND ic.organization_id = c.organization_id
+           AND ic.status IN ('completed', 'revoked', 'expired')
+         ORDER BY ic.created_at DESC
+         LIMIT 1
+      ) k ON TRUE
+     WHERE c.organization_id = $1 AND c.deleted_at IS NULL AND c.status = 'active'
+     ORDER BY c.name`, [orgId]);
+
+  const out = [];
+  for (const r of rows) {
+    const parq = r.answered_count == null ? null : r;
+    let block = null;
+    if (parqBlocks(parq)) block = 'PARQ_BLOCKED';
+    else if (r.consent_status === 'revoked') block = 'CONSENT_REVOKED';
+    else if (r.physician_block === true) block = 'PHYSICIAN_ADVISED_AGAINST';
+    const missing = missingScreening(parq, { status: r.consent_status });
+    if (block || missing.length) {
+      out.push({
+        client_id: r.client_id, client_name: r.client_name, client_photo: r.client_photo,
+        missing, block,
+      });
+    }
+  }
+  return out;
+}
+
 module.exports = {
   checkScreeningGate, isTrainingBlocked, parqBlocks, parqWarnings, validClearanceSql,
   checkTrainingEligibility, enrolmentScreeningBlock, statusBlock, missingScreening, screeningSummary,
-  ELIGIBILITY_BLOCKS, PARQ_QUESTION_COUNT,
+  screeningGaps, ELIGIBILITY_BLOCKS, PARQ_QUESTION_COUNT,
 };

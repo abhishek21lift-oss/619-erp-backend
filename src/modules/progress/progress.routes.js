@@ -14,7 +14,8 @@ const mobilityScoring = require('./mobility-scoring');
 const postureScoring = require('./posture-scoring');
 const strengthLogs = require('./strength-logs.repo');
 const assessmentsRepo = require('./assessments.repo');
-const { today: studioToday } = require('../../lib/appTime');
+const { today: studioToday, mondayOf } = require('../../lib/appTime');
+const { optionalNumber } = require('../../lib/zodNumbers');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -159,25 +160,25 @@ function assessmentAsBody(row) {
 }
 
 async function demographics(req, clientId, b) {
-  // Age/gender: prefer what the frontend sent (it already has the client
-  // record loaded); fall back to a DB lookup so BMR/VO2max/norms still work
-  // if the caller omits them.
-  let age = b.age ?? null;
-  let gender = b.gender ?? null;
-  if (age == null || gender == null) {
-    const dScope = tenantScope(req);
-    const { rows: cRows } = await pool.query('SELECT dob, gender FROM pt_clients WHERE id = $1 AND organization_id = $2', [clientId, dScope.orgId]);
-    const c = cRows[0];
-    if (c) {
-      if (age == null && c.dob) {
-        const dob = new Date(c.dob);
-        const today = new Date();
-        age = today.getFullYear() - dob.getFullYear() - (today < new Date(today.getFullYear(), dob.getMonth(), dob.getDate()) ? 1 : 0);
-      }
-      if (gender == null) gender = c.gender;
-    }
+  // Age and gender pick the norm band every result is graded against, so the
+  // client record decides them. They used to come from the request first,
+  // which let a stale or wrong value on the page grade a 45-year-old woman
+  // against 25-year-old male norms. The request is only a fallback for a
+  // record that has no date of birth or gender yet.
+  const { rows: [c] } = await pool.query(
+    'SELECT dob, gender FROM pt_clients WHERE id = $1 AND organization_id = $2',
+    [clientId, tenantScope(req).orgId],
+  );
+  let age = null;
+  if (c && c.dob) {
+    const dob = new Date(c.dob);
+    const today = new Date();
+    age = today.getFullYear() - dob.getFullYear() - (today < new Date(today.getFullYear(), dob.getMonth(), dob.getDate()) ? 1 : 0);
   }
-  return { age, gender };
+  return {
+    age: age ?? b.age ?? null,
+    gender: (c && c.gender) || b.gender || null,
+  };
 }
 
 /**
@@ -578,33 +579,65 @@ router.get('/weekly-checkins', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
-router.post('/weekly-checkins', auth, wrap(async (req, res) => {
-  const { client_id, week_start_date, weight, mood, sleep_hours, water_glasses, workout_count, calories_avg, adherence_pct, trainer_notes, client_notes, stress_level, energy_level, soreness_level } = req.body;
-  if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+// ── Weekly check-ins (trainer side) ──
+//
+// One row per client per week, shared with the member app (/api/me), which
+// writes the member's own sleep, stress, energy, soreness, mood, weight and
+// notes into the same row. So this route:
+//   · snaps the date to that week's Monday, as the member app does — the
+//     trainer page used to default to Sunday, splitting one week into two rows;
+//   · never writes client_notes (they are the member's words);
+//   · keeps a member-reported value when the trainer leaves that field blank,
+//     instead of overwriting it with null.
+// Ranges match the member app's (client-portal.service normaliseCheckin).
+const scale10 = (label) => optionalNumber({ label, min: 1, max: 10, int: true });
+const weeklyCheckinSchema = {
+  body: z.object({
+    // Shape only, not version: a malformed id would otherwise reach Postgres
+    // as a uuid cast error and answer 500.
+    client_id: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, 'Invalid client id'),
+    week_start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'week_start_date must be YYYY-MM-DD')
+      .refine((v) => { const t = Date.parse(`${v}T00:00:00Z`); return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === v; }, 'week_start_date is not a valid date'),
+    weight: optionalNumber({ label: 'weight', min: 20, max: 400 }),
+    mood: z.enum(['great', 'good', 'okay', 'tired', 'stressed']).optional().nullable(),
+    sleep_hours: optionalNumber({ label: 'sleep_hours', min: 0, max: 24 }),
+    water_glasses: optionalNumber({ label: 'water_glasses', min: 0, max: 40, int: true }),
+    workout_count: optionalNumber({ label: 'workout_count', min: 0, max: 21, int: true }),
+    calories_avg: optionalNumber({ label: 'calories_avg', min: 0, max: 10000 }),
+    adherence_pct: optionalNumber({ label: 'adherence_pct', min: 0, max: 100 }),
+    trainer_notes: z.string().max(2000).optional().nullable(),
+    stress_level: scale10('stress_level'),
+    energy_level: scale10('energy_level'),
+    soreness_level: scale10('soreness_level'),
+  }),
+};
 
-  // Stress, energy and soreness are the three readings the readiness score
-  // needs, and all three are optional — a thirty-second check-in at the door
-  // should record what the client said and leave the rest blank. Out-of-scale
-  // values are stored as NULL rather than rejected: a mistyped 75 must not
-  // fail the whole check-in, and it must not drag the score either. The column
-  // CHECKs are the backstop; this is the polite version.
-  const scale10 = (v) => {
-    const n = num(v, null);
-    return n !== null && n >= 1 && n <= 10 ? Math.round(n) : null;
-  };
+router.post('/weekly-checkins', auth, validate(weeklyCheckinSchema), wrap(async (req, res) => {
+  const b = req.body;
+  if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  const week = mondayOf(b.week_start_date);
+  const val = (v) => (v === undefined ? null : v);
 
   const { rows } = await pool.query(
     `INSERT INTO weekly_checkins (client_id, week_start_date, weight, mood, sleep_hours, water_glasses,
-      workout_count, calories_avg, adherence_pct, trainer_notes, client_notes, created_by, organization_id,
+      workout_count, calories_avg, adherence_pct, trainer_notes, created_by, organization_id,
       stress_level, energy_level, soreness_level)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
      ON CONFLICT (client_id, week_start_date) DO UPDATE SET
-       weight = EXCLUDED.weight, mood = EXCLUDED.mood, sleep_hours = EXCLUDED.sleep_hours,
-       water_glasses = EXCLUDED.water_glasses, workout_count = EXCLUDED.workout_count,
-       calories_avg = EXCLUDED.calories_avg, adherence_pct = EXCLUDED.adherence_pct,
-       trainer_notes = EXCLUDED.trainer_notes, client_notes = EXCLUDED.client_notes,
-       stress_level = EXCLUDED.stress_level, energy_level = EXCLUDED.energy_level,
-       soreness_level = EXCLUDED.soreness_level,
+       -- What the member also reports: the trainer's value wins when given,
+       -- the member's stays when the trainer left the field blank.
+       weight = COALESCE(EXCLUDED.weight, weekly_checkins.weight),
+       mood = COALESCE(EXCLUDED.mood, weekly_checkins.mood),
+       sleep_hours = COALESCE(EXCLUDED.sleep_hours, weekly_checkins.sleep_hours),
+       water_glasses = COALESCE(EXCLUDED.water_glasses, weekly_checkins.water_glasses),
+       stress_level = COALESCE(EXCLUDED.stress_level, weekly_checkins.stress_level),
+       energy_level = COALESCE(EXCLUDED.energy_level, weekly_checkins.energy_level),
+       soreness_level = COALESCE(EXCLUDED.soreness_level, weekly_checkins.soreness_level),
+       -- The trainer's own fields.
+       workout_count = EXCLUDED.workout_count,
+       calories_avg = EXCLUDED.calories_avg,
+       adherence_pct = EXCLUDED.adherence_pct,
+       trainer_notes = EXCLUDED.trainer_notes,
        updated_at = NOW()
      -- (client_id, week_start_date) says nothing about the studio. The client
      -- was verified in the caller's organization above, so this can only ever
@@ -612,10 +645,10 @@ router.post('/weekly-checkins', auth, wrap(async (req, res) => {
      WHERE weekly_checkins.organization_id IS NULL
         OR weekly_checkins.organization_id = EXCLUDED.organization_id
      RETURNING *`,
-    [client_id, week_start_date, num(weight, null), mood || null, num(sleep_hours, null),
-     num(water_glasses, null), num(workout_count, 0), num(calories_avg, null),
-     num(adherence_pct, null), trainer_notes || null, client_notes || null, req.user.id, orgIdOf(req),
-     scale10(stress_level), scale10(energy_level), scale10(soreness_level)]
+    [b.client_id, week, val(b.weight), val(b.mood), val(b.sleep_hours), val(b.water_glasses),
+     b.workout_count ?? 0, val(b.calories_avg), val(b.adherence_pct), b.trainer_notes || null,
+     req.user.id, orgIdOf(req),
+     val(b.stress_level), val(b.energy_level), val(b.soreness_level)]
   );
   res.status(201).json({ data: rows[0] });
 }));

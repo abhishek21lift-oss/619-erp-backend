@@ -26,6 +26,7 @@ const credentials = require('../lib/credentials');
 const profileFields = require('../lib/profileFields');
 const { profileCompletion } = require('../lib/profileCompletion');
 const portfolio = require('../lib/portfolio');
+const { invalidFileType } = require('../middleware/errorHandler');
 
 // 5 MB, matching the app's AVATAR_RULES. It was 2 MB, so a photo straight off
 // a phone camera passed the browser's check and was refused here.
@@ -34,7 +35,7 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter(_req, file, cb) {
     if (!/^image\/(png|jpe?g|webp|gif)$/i.test(file.mimetype || '')) {
-      return cb(new Error('Only PNG, JPG, WEBP, or GIF images are allowed'));
+      return cb(invalidFileType('Only PNG, JPG, WEBP, or GIF images are allowed'));
     }
     cb(null, true);
   },
@@ -45,7 +46,7 @@ const logoUpload = multer({
   limits: { fileSize: 2 * 1024 * 1024 },
   fileFilter(_req, file, cb) {
     if (!/^image\/(png|jpe?g|webp)$/i.test(file.mimetype || '')) {
-      return cb(new Error('Only PNG, JPG or WEBP images are allowed'));
+      return cb(invalidFileType('Only PNG, JPG or WEBP images are allowed'));
     }
     cb(null, true);
   },
@@ -509,7 +510,7 @@ const coverUpload = multer({
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter(_req, file, cb) {
     if (!/^image\/(png|jpe?g|webp|gif)$/i.test(file.mimetype || '')) {
-      return cb(new Error('Only PNG, JPG, WEBP, or GIF images are allowed'));
+      return cb(invalidFileType('Only PNG, JPG, WEBP, or GIF images are allowed'));
     }
     cb(null, true);
   },

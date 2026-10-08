@@ -28,7 +28,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { recordPtPayment } = require('../../lib/ptPayments');
 const { renewClient, addMonthsIso } = require('./renewal.service');
 const { genReceiptNo } = require('../../db/receipts');
-const { checkTrainingEligibility, enrolmentScreeningBlock, screeningSummary } = require('../../lib/screeningGate');
+const { checkTrainingEligibility, enrolmentScreeningBlock, screeningSummary, screeningGaps } = require('../../lib/screeningGate');
 const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
 
 /**
@@ -1746,6 +1746,13 @@ router.post('/payments', auth, wrap(async (req, res) => {
 }));
 
 // ─── Operations Summary (today's sessions, renewals, dues) ──────────────────
+// GET /screening-gaps — active clients whose screening is incomplete or
+// blocking, for the dashboard alert. Flag-only: see lib/screeningGate.
+router.get('/screening-gaps', auth, wrap(async (req, res) => {
+  const data = await screeningGaps(orgIdOf(req));
+  res.json({ data, total: data.length });
+}));
+
 router.get('/dashboard/ops', auth, wrap(async (req, res) => {
   // The studio's whole day: the programme panel is derived from the same
   // canonical Today rule /pt-os/today uses, scoped to the trainer's studio.

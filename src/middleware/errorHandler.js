@@ -34,8 +34,52 @@ function duplicateMessage(constraint) {
   return 'Duplicate entry — this record already exists.';
 }
 
+/**
+ * A multer fileFilter rejection. Thrown through cb(), so without a status it
+ * reached the generic branch below and every "wrong file type" became a 500
+ * "An internal error occurred".
+ */
+function invalidFileType(message) {
+  return new HttpError(400, 'INVALID_FILE_TYPE', message);
+}
+
+const MULTER_MESSAGES = {
+  LIMIT_FILE_SIZE: 'The file is too large.',
+  LIMIT_FILE_COUNT: 'Too many files.',
+  LIMIT_UNEXPECTED_FILE: 'Unexpected file field.',
+  LIMIT_FIELD_VALUE: 'A form field is too long.',
+};
+
+/**
+ * Client errors raised by middleware BEFORE any route runs — the JSON body
+ * parser and multer. They carry their own status, and used to be ignored: a
+ * body over the size limit (413), malformed JSON (400) and an oversized upload
+ * all answered 500 "An internal error occurred" and were logged as server
+ * faults. A trainer whose signed PAR-Q consent went over the body limit could
+ * retry forever without learning why.
+ *
+ * @returns {{ status: number, body: object } | null}
+ */
+function clientError(err) {
+  if (err && err.name === 'MulterError') {
+    return {
+      status: err.code === 'LIMIT_FILE_SIZE' ? 413 : 400,
+      body: { error: MULTER_MESSAGES[err.code] || 'The upload was rejected.', code: err.code },
+    };
+  }
+  if (err && err.type === 'entity.too.large') {
+    return { status: 413, body: { error: 'The request is too large.', code: 'PAYLOAD_TOO_LARGE' } };
+  }
+  if (err && err.type === 'entity.parse.failed') {
+    return { status: 400, body: { error: 'The request body is not valid JSON.', code: 'INVALID_JSON' } };
+  }
+  return null;
+}
+
 // eslint-disable-next-line no-unused-vars
 function errorHandler(err, req, res, next) {
+  const client = clientError(err);
+  if (client) return res.status(client.status).json(client.body);
   if (err instanceof HttpError) {
     return res.status(err.status).json({
       error: err.message,
@@ -75,4 +119,4 @@ function errorHandler(err, req, res, next) {
   res.status(500).json({ error: message });
 }
 
-module.exports = { HttpError, notFound, errorHandler };
+module.exports = { HttpError, notFound, errorHandler, invalidFileType };

@@ -161,4 +161,18 @@ function studioInstant(ymd, hhmm, timeZone = appTimeZone()) {
   return new Date(instant).toISOString();
 }
 
-module.exports = { DEFAULT_TIME_ZONE, appTimeZone, todayIn, today, todayShortDay, dbDate, studioInstant };
+/**
+ * The Monday that starts the ISO week containing `ymd` (YYYY-MM-DD).
+ *
+ * The one definition of "a week" for weekly check-ins. The member app used
+ * Monday while the trainer page defaulted to Sunday, so a single week became
+ * two check-in rows; both now go through this.
+ */
+function mondayOf(ymd) {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  const dow = d.getUTCDay(); // 0 Sun … 6 Sat
+  d.setUTCDate(d.getUTCDate() - ((dow + 6) % 7));
+  return d.toISOString().slice(0, 10);
+}
+
+module.exports = { DEFAULT_TIME_ZONE, appTimeZone, todayIn, today, todayShortDay, dbDate, studioInstant, mondayOf };
