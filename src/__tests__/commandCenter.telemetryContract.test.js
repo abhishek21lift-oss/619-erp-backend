@@ -82,9 +82,10 @@ describe('violations() holds a graded card to its shape', () => {
 });
 
 describe('the real collectors still honour the contract', () => {
-  // runtime and http need no doubles: they read this process. Running them for
-  // real is the strongest version of this check available without a database.
-  it.each(['runtime', 'http'])('%s', async (name) => {
+  // runtime and http need no doubles: they read this process; host reads this
+  // machine's /proc. Running them for real is the strongest version of this
+  // check available without a database.
+  it.each(['runtime', 'http', 'host'])('%s', async (name) => {
     const collector = require(`../modules/command-center/collectors/${name}.collector`);
     const raw = await collector.collect({ signal: new AbortController().signal });
     const card = raw && typeof raw === 'object' && 'status' in raw

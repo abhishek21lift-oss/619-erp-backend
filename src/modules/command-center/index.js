@@ -34,6 +34,7 @@ const freellmapiCollector = require('./collectors/freellmapi.collector');
 const smtpCollector = require('./collectors/smtp.collector');
 const securityCollector = require('./collectors/security.collector');
 const httpCollector = require('./collectors/http.collector');
+const hostCollector = require('./collectors/host.collector');
 
 let registered = false;
 
@@ -66,6 +67,9 @@ function registerCollectors() {
   // smtp's default probe is config + delivery history, no handshake; 30s
   // because none of that changes second to second.
   registry.register(smtpCollector.NAME, smtpCollector.collect, { timeoutMs: 5000, ttlMs: 30_000 });
+  // The VPS every container shares, so platform scope. A 5s TTL keeps the
+  // CPU delta meaningful without re-reading /proc on every console tick.
+  registry.register(hostCollector.NAME, hostCollector.collect, { timeoutMs: 2000, ttlMs: 5000 });
   registered = true;
 }
 
