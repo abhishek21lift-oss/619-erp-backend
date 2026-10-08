@@ -117,14 +117,38 @@ function makeStore(prefix) {
   let limiterOptions = null;
   let store = null;
 
+  // ── Why first use waits for `ready` ───────────────────────────────────────
+  //
+  // Deferring construction to first use was not enough on its own (Sentry
+  // 619-ERP-BACKEND-1, 49 events). The fail-fast client is lazy, and nothing
+  // ever told it to connect: at the first request after a deploy it was still
+  // in `wait`, so the constructor's SCRIPT LOADs were rejected exactly as
+  // before — and the get-script one, which nothing awaits until a get(),
+  // escaped as an unhandled rejection on every deploy.
+  //
+  // So the store is built only once the client is `ready`. Until then the
+  // first call starts the connection and fails as an ordinary store error,
+  // which `passOnStoreError: true` turns into "let this request through" —
+  // the same fail-open trade as an outage, for the second or so it takes to
+  // connect.
   const real = () => {
     if (!store) {
+      if (client.status !== 'ready') {
+        if (client.status === 'wait') client.connect().catch(() => {});
+        throw new Error(`rate limit store ${keyPrefix}: redis not ready (${client.status})`);
+      }
       store = new RedisStore({
         prefix: keyPrefix,
         // ioredis speaks `call(command, ...args)`. rate-limit-redis hands us the
         // command and its arguments already split, so this is a straight forward.
         sendCommand: (...args) => client.call(...args),
       });
+      // The constructor's two SCRIPT LOADs are floating promises. A failure is
+      // recovered by the store itself — get() and increment() reload the
+      // script when EVALSHA fails — so a rejection here is not lost work,
+      // only noise that would otherwise surface as an unhandled rejection.
+      store.incrementScriptSha.catch(() => {});
+      store.getScriptSha.catch(() => {});
       // RedisStore.init() is the only thing that sets `windowMs`, and its own
       // increment() reads it — so this must happen before the first call, or
       // the Lua script receives `undefined` and the limiter breaks silently.
@@ -138,10 +162,12 @@ function makeStore(prefix) {
     // Called by express-rate-limit once, at limiter creation — which is module
     // load, and therefore still too early to build anything.
     init(options) { limiterOptions = options; },
-    get: (key) => real().get(key),
-    increment: (key) => real().increment(key),
-    decrement: (key) => real().decrement(key),
-    resetKey: (key) => real().resetKey(key),
+    // async so a not-ready store rejects rather than throws synchronously:
+    // express-rate-limit handles a rejected store call, whatever its caller.
+    get: async (key) => real().get(key),
+    increment: async (key) => real().increment(key),
+    decrement: async (key) => real().decrement(key),
+    resetKey: async (key) => real().resetKey(key),
   };
 }
 

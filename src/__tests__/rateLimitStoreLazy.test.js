@@ -31,7 +31,13 @@
 'use strict';
 
 const mockRedisState = { configured: true };
-const mockClient = { call: jest.fn() };
+// `status` mirrors ioredis: `wait` until something calls connect(), then
+// `connecting`, then `ready`. Most tests run against a ready client.
+const mockClient = {
+  call: jest.fn(),
+  status: 'ready',
+  connect: jest.fn(async () => { mockClient.status = 'ready'; }),
+};
 
 jest.mock('../lib/redis', () => ({
   isConfigured: () => mockRedisState.configured,
@@ -92,6 +98,9 @@ function loadStore() {
 beforeEach(() => {
   mockRedisState.configured = true;
   mockClient.call.mockReset();
+  mockClient.connect.mockReset();
+  mockClient.connect.mockImplementation(async () => { mockClient.status = 'ready'; });
+  mockClient.status = 'ready';
   healthyReplies();
 });
 
@@ -334,5 +343,78 @@ describe('makeStore — outage behaviour is unchanged', () => {
 
     expect(log.warn).toHaveBeenCalledTimes(1);
     expect(log.warn.mock.calls[0][0]).toMatch(/per-process/i);
+  });
+});
+
+describe('makeStore — the first request after a deploy (Sentry 619-ERP-BACKEND-1)', () => {
+  // The fail-fast client is lazy and nothing else connects it, so the first
+  // limited request after a deploy found it in `wait`. Building the store then
+  // fired two SCRIPT LOADs that ioredis rejected, one of them unhandled.
+
+  // The suite above doMocks redis as unconfigured; that outlives its test.
+  beforeEach(() => {
+    jest.doMock('../lib/redis', () => ({
+      isConfigured: () => mockRedisState.configured,
+      getFailFastClient: () => mockClient,
+    }));
+  });
+
+  it('does not build the store, or send anything, while the client is still in wait', async () => {
+    mockClient.status = 'wait';
+    mockClient.connect.mockImplementation(async () => {}); // still connecting
+    const { makeStore } = loadStore();
+    const store = makeStore('login');
+    store.init({ windowMs: 60000 });
+
+    await expect(store.increment('key-1')).rejects.toThrow(/redis not ready \(wait\)/);
+    expect(mockClient.call).not.toHaveBeenCalled();
+    // ...and it starts the connection, so the next request finds it ready.
+    expect(mockClient.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts normally once the connection it started is ready', async () => {
+    mockClient.status = 'wait';
+    const { makeStore } = loadStore();
+    const store = makeStore('login');
+    store.init({ windowMs: 60000 });
+
+    await expect(store.increment('key-1')).rejects.toThrow(/not ready/);
+    // connect() resolved and flipped the status, as ioredis does.
+    await expect(store.increment('key-1')).resolves.toEqual(expect.objectContaining({ totalHits: 1 }));
+  });
+
+  it('a not-ready store is a store error express-rate-limit lets through, not a crash', async () => {
+    mockClient.status = 'wait';
+    mockClient.connect.mockImplementation(async () => {});
+    const express = require('express');
+    const request = require('supertest');
+    const { rateLimit } = require('express-rate-limit');
+    const { makeStore } = loadStore();
+    const app = express();
+    app.use(rateLimit({ windowMs: 60000, limit: 5, store: makeStore('boot'), passOnStoreError: true }));
+    app.get('/x', (_req, res) => res.json({ ok: true }));
+
+    const res = await request(app).get('/x');
+    expect(res.status).toBe(200);
+  });
+
+  it('a failed script load after connecting never surfaces as an unhandled rejection', async () => {
+    deadReplies();
+    const seen = [];
+    const onRejection = (r) => seen.push(r);
+    process.on('unhandledRejection', onRejection);
+    try {
+      const { makeStore } = loadStore();
+      const store = makeStore('login');
+      store.init({ windowMs: 60000 });
+      // A store that has never served get(): its get-script load is the
+      // promise nothing awaits.
+      await expect(store.increment('key-1')).rejects.toThrow();
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+      expect(seen).toEqual([]);
+    } finally {
+      process.removeListener('unhandledRejection', onRejection);
+    }
   });
 });
