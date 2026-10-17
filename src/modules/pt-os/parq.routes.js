@@ -685,8 +685,8 @@ router.post('/parq/forms/:formId/consent', auth, requireTrainer, validate(consen
        parq_form_id, client_id, consent_checkboxes, client_signature, trainer_signature,
        client_signed_at, trainer_signed_at, ip_address, device, browser, location, organization_id
      ) VALUES ($1,$2,$3::jsonb,$4,$5,
-       CASE WHEN $4 IS NOT NULL THEN NOW() END,
-       CASE WHEN $5 IS NOT NULL THEN NOW() END,
+       CASE WHEN $4::text IS NOT NULL THEN NOW() END,
+       CASE WHEN $5::text IS NOT NULL THEN NOW() END,
        $6,$7,$8,$9,$10) RETURNING *`,
     [
       formId, form.client_id, JSON.stringify(checkboxes), b.client_signature || null, b.trainer_signature || null,

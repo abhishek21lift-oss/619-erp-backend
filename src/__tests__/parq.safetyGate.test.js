@@ -308,8 +308,8 @@ describe('POST /parq/forms/:id/consent', () => {
     // name with a signing time beside it, on the record the PDF reads.
     await request(app()).post(`/api/pt-os/parq/forms/${FORM_ID}/consent`).send(body).expect(201);
     const insert = mockQueries.find((q) => /^INSERT INTO pt_consent_records/i.test(q.sql));
-    expect(insert.sql).toMatch(/CASE WHEN \$4 IS NOT NULL THEN NOW\(\) END/);
-    expect(insert.sql).toMatch(/CASE WHEN \$5 IS NOT NULL THEN NOW\(\) END/);
+    expect(insert.sql).toMatch(/CASE WHEN \$4::text IS NOT NULL THEN NOW\(\) END/);
+    expect(insert.sql).toMatch(/CASE WHEN \$5::text IS NOT NULL THEN NOW\(\) END/);
   });
 
   test('resending the same signatures returns the stored record, not a duplicate', async () => {
