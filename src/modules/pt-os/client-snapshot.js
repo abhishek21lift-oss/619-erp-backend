@@ -23,7 +23,7 @@
 // acted on. A trainer told "weight loss is slowing" for a client nobody has
 // measured will change a programme that was working.
 
-const { today: studioToday } = require('../../lib/appTime');
+const { today: studioToday, dbDate } = require('../../lib/appTime');
 
 /** Alerts, worst first. Ordering is a claim about what to look at, so it is fixed. */
 const SEVERITY_RANK = { critical: 0, warning: 1, info: 2 };
@@ -34,11 +34,7 @@ const num = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
-const day = (v) => {
-  if (!v) return null;
-  const s = typeof v === 'string' ? v : v.toISOString?.();
-  return s ? String(s).slice(0, 10) : null;
-};
+const day = (v) => (v ? dbDate(v) : null);
 
 /** Whole days from `from` to `to`, or null if either is unusable. */
 function daysBetween(from, to) {

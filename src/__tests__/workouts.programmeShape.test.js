@@ -165,4 +165,16 @@ describe('shapeError', () => {
     expect(shapeError({ duration_weeks: 105 })).toMatch(/duration_weeks/);
     expect(shapeError({ duration_weeks: '12' })).toBeNull();
   });
+
+  it('refuses a progression amount that is not a positive number', () => {
+    // The amount multiplies a step: zero is a rule that does nothing, a
+    // negative one walks the prescription backwards every week, and "abc" is
+    // NaN in the arithmetic. All three stored without complaint.
+    expect(shapeError({ progression_amount: 0 })).toMatch(/progression_amount/);
+    expect(shapeError({ progression_amount: -2.5 })).toMatch(/progression_amount/);
+    expect(shapeError({ progression_amount: 'abc' })).toMatch(/progression_amount/);
+    expect(shapeError({ progression_amount: 2.5 })).toBeNull();
+    expect(shapeError({ progression_amount: '2.5' })).toBeNull();
+    expect(shapeError({ progression_amount: null })).toBeNull();
+  });
 });

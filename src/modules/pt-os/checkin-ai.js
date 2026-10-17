@@ -26,6 +26,7 @@
 // the answer is "nothing".
 
 const crypto = require('crypto');
+const { dbDate } = require('../../lib/appTime');
 
 /** Below this many check-ins there is no trend to describe, only readings. */
 const MIN_CHECKINS = 2;
@@ -87,7 +88,7 @@ function buildFacts(checkins) {
     push('energy', c.energy_level, '/10');
     push('soreness', c.soreness_level, '/10');
 
-    const week = String(c.week_start_date).slice(0, 10);
+    const week = dbDate(c.week_start_date);
     L.push(`- week of ${week}: ${parts.length ? parts.join(', ') : 'no metrics recorded'}`);
 
     // Notes carry the things no column has. Truncated because a trainer who

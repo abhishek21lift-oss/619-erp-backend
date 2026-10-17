@@ -43,6 +43,7 @@
 // could not check.
 
 const { MIN_SESSIONS_FOR_TREND } = require('./training-history');
+const { dbDate } = require('../../lib/appTime');
 
 /**
  * Days of silence before it is worth a word.
@@ -62,11 +63,7 @@ const NEVER_STARTED_DAYS = 14;
 const SEVERITY = Object.freeze({ CRITICAL: 'critical', WARNING: 'warning', INFO: 'info' });
 const RANK = Object.freeze({ critical: 0, warning: 1, info: 2 });
 
-const day = (v) => {
-  if (!v) return null;
-  const s = typeof v === 'string' ? v : v.toISOString?.();
-  return s ? String(s).slice(0, 10) : null;
-};
+const day = (v) => (v ? dbDate(v) : null);
 
 function daysBetween(from, to) {
   const a = new Date(`${day(from)}T00:00:00Z`).getTime();

@@ -25,6 +25,8 @@
 // of the score is to notice a client trending down over five weeks, which eyes
 // are bad at, not to overrule a coach who is standing in front of them.
 
+const { dbDate } = require('../../lib/appTime');
+
 /** Each input is a quarter. Equal weights, because nothing here justifies more. */
 const WEIGHTS = { sleep: 0.25, stress: 0.25, energy: 0.25, soreness: 0.25 };
 
@@ -120,7 +122,7 @@ function readinessBand(score) {
 function buildRecovery(checkins = []) {
   const rows = (Array.isArray(checkins) ? checkins : [])
     .map((c) => ({
-      week: c.week_start_date ? String(c.week_start_date).slice(0, 10) : null,
+      week: dbDate(c.week_start_date),
       mood: c.mood ?? null,
       sleep_hours: num(c.sleep_hours),
       water_glasses: num(c.water_glasses),

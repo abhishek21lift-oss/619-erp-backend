@@ -104,6 +104,22 @@ describe('POST /workout-log/exercises/:id/sets — cardio actuals', () => {
       .expect(400);
     expect(insertCall()).toBeUndefined();
   });
+
+  it('refuses a set number the exercise already has', async () => {
+    // A retry — a double-tap, a resend after a timeout — used to file the
+    // same set twice: duplicate rows in the session detail and double-counted
+    // volume everywhere the log is read. The INSERT matches no rows when the
+    // (exercise, set_number) pair already exists, and the route says so.
+    pool.query
+      .mockResolvedValueOnce(EX_ROW)
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app())
+      .post('/api/pt-os/workout-log/exercises/wse-1/sets')
+      .send({ set_number: 2, weight_kg: 80, reps: 5 })
+      .expect(409);
+    expect(res.body.error.code).toBe('DUPLICATE_SET_NUMBER');
+  });
 });
 
 describe('PATCH /workout-log/sets/:id — cardio fields', () => {
@@ -149,6 +165,26 @@ describe('PATCH /workout-log/sets/:id — cardio fields', () => {
     const [sql] = updateCall();
     expect(sql).toContain('duration_seconds =');
     expect(sql).not.toContain('weight_kg =');
+  });
+
+  it('clears stale PR flags when a number it stood on is removed', async () => {
+    // The set stays completed, but its weight is gone. It can no longer
+    // support any PR claim, and the flags set when it could were surviving
+    // the edit — the UI kept showing a personal best for a set with no
+    // weight. Anything not eligible for a recompute must clear.
+    pool.query
+      .mockResolvedValueOnce({
+        rows: [{ ...EXISTING.rows[0], completed: true, weight_kg: 80, reps: 5, is_pr_weight: true }],
+      })
+      .mockResolvedValueOnce({ rows: [{ id: 'set-1' }] });
+
+    await request(app())
+      .patch('/api/pt-os/workout-log/sets/set-1')
+      .send({ weight_kg: null })
+      .expect(200);
+
+    const [, params] = updateCall();
+    expect(params.slice(-3)).toEqual([false, false, false]);
   });
 });
 

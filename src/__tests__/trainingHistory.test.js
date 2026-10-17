@@ -109,6 +109,19 @@ describe('one exercise\'s direction', () => {
     expect(t.best_e1rm_kg).toBeNull();
     expect(t.trend).toBeNull();
   });
+
+  it('reads a session_date that arrived as a pg Date, not as "Mon Aug 24"', () => {
+    // node-postgres returns DATE columns as JS Dates, and String(Date).slice(0, 10)
+    // is a weekday name — so the points compared as "Fri Sep 04" vs "Mon Aug 24"
+    // and the trend was read from the wrong first and last point.
+    const t = exerciseTrend([
+      set({ session_date: new Date('2026-08-24T00:00:00Z'), weight_kg: 60 }),
+      set({ session_date: new Date('2026-09-04T00:00:00Z'), weight_kg: 70 }),
+      set({ session_date: new Date('2026-09-11T00:00:00Z'), weight_kg: 80 }),
+    ]);
+    expect(t.points.map((p) => p.date)).toEqual(['2026-08-24', '2026-09-04', '2026-09-11']);
+    expect(t.trend).toBe('progressing');
+  });
 });
 
 describe('prescribed work is not completed work', () => {

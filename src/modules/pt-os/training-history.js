@@ -32,6 +32,8 @@
 // and anything under its minimum returns null — never a default, never a zero
 // standing in for "we do not know".
 
+const { dbDate } = require('../../lib/appTime');
+
 /** A lift needs this many separate sessions before its direction is a trend. */
 const MIN_SESSIONS_FOR_TREND = 3;
 
@@ -69,7 +71,7 @@ const scale10 = (v) => {
   return n !== null && n >= 1 && n <= 10 ? n : null;
 };
 
-const isoDay = (d) => (d ? String(d).slice(0, 10) : null);
+const isoDay = (d) => (d ? dbDate(d) : null);
 
 /**
  * Estimated one-rep max, Epley.

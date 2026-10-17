@@ -455,12 +455,20 @@ router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireTrain
   }
 
   const { rows } = await pool.query(
+    // INSERT..SELECT so the pair's absence is part of the write: a retry that
+    // arrives after a timeout used to file the same set twice, and the unique
+    // index added in migration 228 is what catches two racing requests.
     `INSERT INTO workout_sets (
        session_exercise_id, set_number, weight_kg, reps, rpe, rir, tempo, rest_seconds, completed, notes,
        duration_seconds, distance, distance_unit, average_speed, speed_unit,
        calories_burned, average_heart_rate, cadence, steps_completed, floors_completed, rounds_completed,
        is_pr_weight, is_pr_reps, is_pr_volume
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+     )
+     SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24
+      WHERE NOT EXISTS (
+        SELECT 1 FROM workout_sets
+         WHERE session_exercise_id = $1 AND set_number = $2
+      )
      RETURNING *`,
     [
       sessionExerciseId, b.set_number, b.weight_kg ?? null, b.reps ?? null, b.rpe ?? null, b.rir ?? null,
@@ -469,6 +477,11 @@ router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireTrain
       prFlags.is_pr_weight, prFlags.is_pr_reps, prFlags.is_pr_volume,
     ]
   );
+  if (!rows[0]) {
+    return res.status(409).json({
+      error: { code: 'DUPLICATE_SET_NUMBER', message: `Set ${b.set_number} already exists for this exercise.` },
+    });
+  }
   res.status(201).json({ data: rows[0] });
 }));
 
@@ -503,7 +516,9 @@ router.patch('/workout-log/sets/:id', auth, requireTrainer, validate(setUpdateSc
       exerciseName: existing.exercise_name, weight: merged.weight_kg, reps: merged.reps, excludeSetId: id,
       sessionId: existing.session_id,
     });
-  } else if (!merged.completed) {
+  } else {
+    // Completed but missing a number, or not completed — either way nothing
+    // this set previously claimed can stand, so the flags clear with it.
     prFlags = { is_pr_weight: false, is_pr_reps: false, is_pr_volume: false };
   }
 
@@ -775,8 +790,16 @@ router.get('/workout-log/analytics', auth, wrap(async (req, res) => {
   }
 
   const weeks = Math.min(Math.max(parseInt(req.query.weeks, 10) || 12, 1), 52);
-  const asOf = (req.query.as_of && /^\d{4}-\d{2}-\d{2}$/.test(req.query.as_of))
-    ? req.query.as_of
+  // Shape alone is not enough: '2026-02-30' passes it and Date rolls it
+  // forward to March 2 — silently analysing the wrong week — while '2026-13-01'
+  // is Invalid, reaches a null weekStart and 500s two lines down. Round-trip
+  // the date; anything the calendar rejects falls back like a malformed value.
+  const asOfRaw = typeof req.query.as_of === 'string' ? req.query.as_of : '';
+  const asOfDay = new Date(`${asOfRaw}T00:00:00Z`);
+  const asOf = /^\d{4}-\d{2}-\d{2}$/.test(asOfRaw)
+    && !Number.isNaN(asOfDay.getTime())
+    && asOfDay.toISOString().slice(0, 10) === asOfRaw
+    ? asOfRaw
     : studioToday();
 
   const scope = tenantScope(req);

@@ -48,6 +48,7 @@
 
 const { exerciseTrend, MIN_SESSIONS_FOR_TREND } = require('./training-history');
 const { normaliseName } = require('./plan-critic');
+const { dbDate } = require('../../lib/appTime');
 
 /**
  * Days a plan must have been live before its outcome means anything.
@@ -69,11 +70,7 @@ const VERDICTS = Object.freeze({
   FLAT: 'flat',
 });
 
-const day = (v) => {
-  if (!v) return null;
-  const s = typeof v === 'string' ? v : v.toISOString?.();
-  return s ? String(s).slice(0, 10) : null;
-};
+const day = (v) => (v ? dbDate(v) : null);
 
 function daysBetween(from, to) {
   const a = new Date(`${day(from)}T00:00:00Z`).getTime();
@@ -138,6 +135,9 @@ function outcomeOf({ generation, sessions = [], sets = [], today } = {}) {
     const key = normaliseName(s?.exercise_name);
     if (!key) continue;
     if (!prescribed.has(key)) { offPlanSets += 1; continue; }
+    // A prescription row is not a lift done. buildTrainingHistory makes the
+    // same split; a trend read from these would credit work nobody did.
+    if (s?.completed !== true) continue;
     if (!byLift.has(key)) byLift.set(key, { name: s.exercise_name, rows: [] });
     byLift.get(key).rows.push(s);
   }
@@ -199,9 +199,14 @@ function outcomeOf({ generation, sessions = [], sets = [], today } = {}) {
     because = `${completed} session${completed === 1 ? '' : 's'} completed`
       + `${adherencePct === null ? '' : ` (${adherencePct}% of the ${expected} the plan asks for)`}`
       + `, but no prescribed lift has ${MIN_SESSIONS_FOR_TREND} sessions yet`;
-  } else if (regressing.length > progressing.length) {
+  } else if (regressing.length) {
+    // Any regression sinks the verdict. "Progressing" over a programme that
+    // is costing the client a lift is the one answer a trainer cannot act on
+    // — and with equal counts it used to win by construction.
     verdict = VERDICTS.REGRESSING;
-    because = `going backwards on ${regressing.join(', ')} over ${completed} completed sessions`;
+    because = `going backwards on ${regressing.join(', ')}`
+      + `${progressing.length ? ` while up on ${progressing.join(', ')}` : ''}`
+      + ` over ${completed} completed sessions`;
   } else if (progressing.length) {
     verdict = VERDICTS.PROGRESSING;
     because = `up on ${progressing.join(', ')} over ${completed} completed sessions`;

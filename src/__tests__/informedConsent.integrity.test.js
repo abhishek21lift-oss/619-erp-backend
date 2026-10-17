@@ -194,13 +194,27 @@ describe('signing (screening audit 2026-10-08)', () => {
     expect(mockQueries.some((q) => /^UPDATE/.test(q.sql))).toBe(false);
   });
 
+  test('a role that has already signed cannot sign again', async () => {
+    // Re-signing overwrote the original signature and stamped a new time,
+    // silently changing what the PDF attests and when. Changing the content
+    // is the route to a new signature: that path clears every signature, so
+    // a second signing here is a replay or a client bug, not an edit.
+    const res = await sign({ signer: 'client', signature: 'data:image/png;base64,CCC' });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('ALREADY_SIGNED');
+    expect(mockQueries.some((q) => /^UPDATE/.test(q.sql))).toBe(false);
+  });
+
   test('a record completed between the read and the write takes no signature', async () => {
     mockSigned = null;
     const res = await sign({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('NOT_SIGNABLE');
-    expect(mockQueries.find((q) => /SET trainer_signature = \$2/.test(q.sql)).sql)
-      .toMatch(/status NOT IN \('completed', 'revoked', 'archived', 'expired'\)/);
+    const update = mockQueries.find((q) => /SET trainer_signature = \$2/.test(q.sql)).sql;
+    expect(update).toMatch(/status NOT IN \('completed', 'revoked', 'archived', 'expired'\)/);
+    // The race guard beside the status one: a second signing by the same role
+    // matches no row once the first has landed, rather than overwriting it.
+    expect(update).toMatch(/trainer_signature IS NULL/);
   });
 
   test('the signer who completes the record generates the one PDF and logs the one completion', async () => {
@@ -214,8 +228,8 @@ describe('signing (screening audit 2026-10-08)', () => {
 
   test('the signer who loses the completion race gets the record, not a second PDF', async () => {
     mockSigned = bothSigned();
-    mockCompleted = null; // the other signer completed it first
-    const res = await sign({ signer: 'client', signature: 'data:image/png;base64,AAA' });
+    mockCompleted = null; // the client's signature completed it first
+    const res = await sign({ signer: 'trainer', signature: 'data:image/png;base64,BBB' });
     expect(res.status).toBe(200);
     expect(generateInformedConsentPdf).not.toHaveBeenCalled();
     expect(logActivity).not.toHaveBeenCalledWith(expect.anything(), 'informed_consent.completed', expect.anything(), expect.anything(), expect.anything());

@@ -173,6 +173,24 @@ describe('outcomeOf — did the prescribed lifts move', () => {
     expect(out.regressing).toEqual(['Bench Press']);
   });
 
+  test('one lift rising is not allowed to hide another falling', () => {
+    // Equal counts — one up, one down — used to fall through to
+    // "progressing". A plan costing the client a lift is not progress, and a
+    // trainer reads the verdict, not the lists underneath it.
+    const out = outcomeOf({
+      generation: generation(),
+      sessions: trained,
+      sets: [
+        ...progression('Bench Press', { from: 60, step: 5 }),
+        ...progression('Back Squat', { from: 100, step: -10 }),
+      ],
+      today: TODAY,
+    });
+    expect(out.verdict).toBe(VERDICTS.REGRESSING);
+    expect(out.regressing).toEqual(['Back Squat']);
+    expect(out.progressing).toEqual(['Bench Press']);
+  });
+
   test('measured and unmoved is flat, which is not the same as untrained', () => {
     const out = outcomeOf({
       generation: generation(),
@@ -196,6 +214,20 @@ describe('outcomeOf — did the prescribed lifts move', () => {
       what: 'progression',
       reason: `no prescribed lift has ${MIN_SESSIONS_FOR_TREND} logged sessions yet`,
     });
+  });
+
+  test('a prescribed lift with only un-completed rows has no trend to read', () => {
+    // workout_sets holds the prescription rows beside the done ones. A trend
+    // built from them would credit the plan with work nobody did.
+    const out = outcomeOf({
+      generation: generation(),
+      sessions: trained,
+      sets: progression('Bench Press', { from: 60, step: 5 })
+        .map((r) => ({ ...r, completed: false })),
+      today: TODAY,
+    });
+    expect(out.lifts).toEqual([]);
+    expect(out.verdict).toBe(VERDICTS.NO_TREND_YET);
   });
 
   test('credits the plan only with the lifts it actually prescribed', () => {

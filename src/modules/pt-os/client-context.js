@@ -53,7 +53,7 @@ const { normaliseName } = require('./plan-critic');
 const { volumeLandmarks, deloadTriggers } = require('./programming-rules');
 const { detectSignals, summariseRoster } = require('./training-signals');
 const { weekOf } = require('./progression');
-const { today: studioToday } = require('../../lib/appTime');
+const { today: studioToday, dbDate } = require('../../lib/appTime');
 
 /** How far back the training history looks, in weeks. */
 const DEFAULT_WINDOW_WEEKS = 12;
@@ -87,13 +87,12 @@ const MAX_SETS = 2000;
  * A date column as 'YYYY-MM-DD', whatever the driver handed us.
  *
  * node-postgres parses DATE into a JS Date and leaves TEXT as a string, and
- * this table has been both over its life. Mirrors dateOf() in
- * training-brief.js rather than inventing a second convention.
+ * this table has been both over its life. Delegates to appTime's dbDate —
+ * the one convention for reading a date back out of the database — so both
+ * shapes read as the same day.
  */
 function isoDay(v) {
-  if (!v) return null;
-  const s = typeof v === 'string' ? v : v.toISOString?.();
-  return s ? String(s).slice(0, 10) : null;
+  return v ? dbDate(v) : null;
 }
 
 /**
@@ -283,7 +282,8 @@ function adherenceInputs(assignment, sessions = [], windowWeeks = DEFAULT_WINDOW
   // The cost of flooring is that adherence is unanswerable for the first week
   // of a plan, which adherence() already reports as null rather than 0%.
   const started = assignment.start_date ? new Date(assignment.start_date) : null;
-  const elapsed = started && !Number.isNaN(started.getTime())
+  const startedValid = Boolean(started && !Number.isNaN(started.getTime()));
+  const elapsed = startedValid
     ? Math.floor((Date.now() - started.getTime()) / (7 * 86400000))
     : windowWeeks;
 
@@ -294,9 +294,20 @@ function adherenceInputs(assignment, sessions = [], windowWeeks = DEFAULT_WINDOW
     Number.isFinite(planWeeks) && planWeeks > 0 ? planWeeks : Infinity,
   ));
 
+  // Completed only SINCE the plan began. The history query spans the whole
+  // window, so sessions logged before this plan existed were counted against
+  // its prescription — adherence above what the plan ever asked for, and a
+  // client who had stopped turning up reading as caught up. A session with no
+  // date cannot be placed inside the plan, so it is not evidence for it.
+  const inPlan = (s) => {
+    if (!startedValid) return true;
+    const d = s?.session_date ? new Date(s.session_date) : null;
+    return Boolean(d && !Number.isNaN(d.getTime()) && d >= started);
+  };
+
   return {
     prescribed: Math.round(weeks * perWeek),
-    completed: sessions.filter((s) => s.status === 'completed').length,
+    completed: sessions.filter((s) => s.status === 'completed' && inPlan(s)).length,
   };
 }
 
@@ -667,7 +678,7 @@ async function sweepRoster(orgId, { trainerId = null, windowWeeks = DEFAULT_WIND
     byClient.get(row.client_id).push(row);
   }
 
-  const asOf = today || new Date().toISOString().slice(0, 10);
+  const asOf = today || studioToday();
   const rows = clients.map((client) => {
     const clientSets = byClient.get(client.id) || [];
     // No assignment is passed, so adherence answers null rather than scoring
@@ -678,7 +689,7 @@ async function sweepRoster(orgId, { trainerId = null, windowWeeks = DEFAULT_WIND
     return detectSignals({
       client,
       today: asOf,
-      lastSession: client.last_session ? String(client.last_session).slice(0, 10) : null,
+      lastSession: isoDay(client.last_session),
       history,
       volume,
       deload: deloadTriggers({ history, volume }),

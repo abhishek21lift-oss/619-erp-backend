@@ -24,6 +24,7 @@ const { clearanceApprovalProblem } = require('./parq-clearance');
 const { validClearanceSql, PARQ_QUESTION_COUNT } = require('../../lib/screeningGate');
 const { invalidFileType } = require('../../middleware/errorHandler');
 const { signatureDataUrl, describeAgent } = require('../../lib/signing');
+const { latestConsent } = require('./parq.repository');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -320,13 +321,19 @@ router.get('/parq/forms/:id', auth, wrap(async (req, res) => {
 // before showing the workout Assign button.
 router.get('/parq/forms/:id/gate-status', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  const gsGuard = ' AND organization_id = $2';
+  // Tenant first, on its own read: nothing may be recomputed against another
+  // studio's form.
   const { rows } = await pool.query(
-    `SELECT workout_gate_status, risk_level FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL${gsGuard}`,
+    `SELECT id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL AND organization_id = $2`,
     [req.params.id, scope.orgId]
   );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-  res.json({ data: rows[0] });
+  // Recomputed, not read from the stored column: a clearance approved through
+  // a path that forgot to re-derive it left the read answering a stale gate,
+  // and the Assign button stayed disabled for a client just cleared.
+  const gate = await recomputeGateStatus(pool, req.params.id);
+  if (!gate) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  res.json({ data: gate });
 }));
 
 // POST /parq/forms
@@ -655,13 +662,32 @@ router.post('/parq/forms/:formId/consent', auth, requireTrainer, validate(consen
     return res.status(400).json({ error: { code: 'CONSENT_REQUIRED', message: 'The client must confirm their answers are true' } });
   }
 
+  // A retry is not a second signing. The wizard resends the whole form after
+  // a timeout, and the same two signatures mean the same act — the record
+  // that already exists is returned. A DIFFERENT signature is a new signing
+  // (what the re-sign flow produces after a signature is cleared) and gets
+  // its own row below. (The read lives in ./parq.repository — the adapter
+  // holds no new SQL.)
+  const prev = await latestConsent(formId, scope.orgId);
+  if (prev
+      && prev.client_signature === (b.client_signature || null)
+      && prev.trainer_signature === (b.trainer_signature || null)) {
+    return res.json({ data: prev });
+  }
+
   const { device, browser } = describeAgent(req.headers['user-agent']);
 
   const { rows } = await pool.query(
+    // Each signed_at is stamped only when its signature is present: a blank
+    // trainer name with a signing time beside it reads as a person who signed
+    // the document when nobody did.
     `INSERT INTO pt_consent_records (
        parq_form_id, client_id, consent_checkboxes, client_signature, trainer_signature,
        client_signed_at, trainer_signed_at, ip_address, device, browser, location, organization_id
-     ) VALUES ($1,$2,$3::jsonb,$4,$5,NOW(),NOW(),$6,$7,$8,$9,$10) RETURNING *`,
+     ) VALUES ($1,$2,$3::jsonb,$4,$5,
+       CASE WHEN $4 IS NOT NULL THEN NOW() END,
+       CASE WHEN $5 IS NOT NULL THEN NOW() END,
+       $6,$7,$8,$9,$10) RETURNING *`,
     [
       formId, form.client_id, JSON.stringify(checkboxes), b.client_signature || null, b.trainer_signature || null,
       req.ip || null, device, browser, b.location || null, form.organization_id,
