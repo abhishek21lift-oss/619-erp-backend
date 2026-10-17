@@ -1,5 +1,8 @@
 // src/db/pool.js
-require('dotenv').config();
+// Load .env for standalone callers (workers, scripts). Skip under Jest so tests
+// that delete DATABASE_URL to simulate a missing env are not silently rescued
+// by a .env file present in the working tree.
+if (!process.env.JEST_WORKER_ID) require('dotenv').config();
 const fs = require('fs');
 const { Pool } = require('pg');
 const logger = require('../lib/logger');

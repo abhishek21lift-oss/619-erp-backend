@@ -333,7 +333,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerci
 
   const [
     profileRes, goalsRes, assessRes, checkinsRes,
-    lifestyleRes, nutritionRes, workoutAssignRes, dietAssignRes, equipmentRes,
+    lifestyleRes, interviewLifestyleRes, nutritionRes, workoutAssignRes, dietAssignRes, equipmentRes,
     ragChunks = [], exercises = [],
   ] = await Promise.all([
     pool.query(
@@ -351,6 +351,11 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerci
               stress_level, food_preferences
        FROM pt_lifestyle_assessments WHERE client_id=$1
        ORDER BY assessment_date DESC, created_at DESC LIMIT 1`, [client_id]),
+    pool.query(
+      `SELECT lifestyle_occupation, lifestyle_screen_time, lifestyle_sleep_hours,
+              lifestyle_meal_regularity, lifestyle_smoking, lifestyle_alcohol, lifestyle_training_days
+       FROM pt_client_interviews WHERE client_id=$1
+       ORDER BY (status = 'completed') DESC, created_at DESC LIMIT 1`, [client_id]),
     pool.query(
       `SELECT diet_preferences, food_allergies, foods_to_avoid, meals_per_day,
               nutrition_budget, medical_conditions, medical_notes
@@ -393,6 +398,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerci
     latestAssessment: assessRes.rows[0]    || null,
     latestCheckin:    checkinsRes.rows[0]  || null,
     lifestyle:        lifestyleRes.rows[0] || null,
+    interviewLifestyle: interviewLifestyleRes?.rows?.[0] || null,
     nutrition:        nutritionRes.rows[0] || null,
     workoutAssignments: workoutAssignRes.rows,
     dietAssignments:  dietAssignRes.rows,
