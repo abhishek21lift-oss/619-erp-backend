@@ -100,6 +100,8 @@ const NO_TENANT_COLUMN_BY_DESIGN = {
   admin_reset_intents: 'Break-glass reset intents, reachable only behind the platform guard.',
   tenancy_known_gaps: 'Command Centre Tenancy Health card — mirrors this very list. Deny-all RLS, read via the owner connection, mounted behind requirePlatformOwner.',
   tenancy_isolation_runs: 'Command Centre "Run isolation tests" log — who clicked, when, per-tenant results. Deny-all RLS, read via the owner connection, mounted behind requirePlatformOwner.',
+  platform_hostinger_credentials: 'The Hostinger API token, AES-256-GCM encrypted. A platform secret: no studio can own it, and deny-all RLS (migration 229, ENABLE + FORCE) is what stops app_tenant reaching the ciphertext even if a grant is added by accident.',
+  platform_hostinger_approvals: 'Approved Hostinger operations (plan → confirm → execute). Carries the exact parameters an operator authorised for a destructive server action. Deny-all RLS + FORCE, migration 229; read and written only over the owner connection behind requirePlatformOwner.',
 
   // ── 3. Reference libraries — platform-global content every studio draws on ─
   muscles: 'Anatomical reference data shared by every studio\'s exercise library.',

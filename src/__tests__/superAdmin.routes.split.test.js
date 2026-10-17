@@ -88,6 +88,7 @@ describe('super-admin API — the H-03 split', () => {
     const EXPECTED = [
     'DELETE /announcements/:id',
     'DELETE /coupons/:id',
+    'DELETE /hostinger/credential',
     'DELETE /organizations/:id/ai-limit',
     'DELETE /organizations/:id/features/:key',
     'DELETE /organizations/:id/subscription/scheduled-change',
@@ -128,6 +129,20 @@ describe('super-admin API — the H-03 split', () => {
     'GET /coupons/:id/redemptions',
     'GET /features',
     'GET /features/:key/overrides',
+    // Hostinger super-admin console (super-admin/hostinger.js). Deliberate
+    // additions, mounted on this boundary so the module inherits the same
+    // PLATFORM_GUARD rather than standing up a second door: a tenant session
+    // has no path to it, and the only reachable upstream calls are the 61
+    // operations allow-listed in lib/hostinger/catalog.js.
+    'GET /hostinger/approvals',
+    'GET /hostinger/catalogue',
+    'GET /hostinger/credential/history',
+    'GET /hostinger/dashboard',
+    'GET /hostinger/history',
+    'GET /hostinger/status',
+    'GET /hostinger/vps/:virtualMachineId',
+    'GET /hostinger/vps/:virtualMachineId/docker/:projectName',
+    'GET /hostinger/websites/:username/:domain/files',
     'GET /invitations',
     'GET /invitations/:id/events',
     'GET /mail/status',
@@ -203,6 +218,14 @@ describe('super-admin API — the H-03 split', () => {
     'POST /command-center/guardian/:id/explain',
     'POST /command-center/stream-ticket',
     'POST /coupons',
+    'POST /hostinger/approvals/:id/deny',
+    'POST /hostinger/assistant',
+    'POST /hostinger/credential',
+    'POST /hostinger/credential/rotate',
+    'POST /hostinger/credential/verify',
+    'POST /hostinger/operations/execute',
+    'POST /hostinger/operations/plan',
+    'POST /hostinger/operations/read',
     'POST /invitations/:id/cancel',
     'POST /invitations/:id/link',
     'POST /invitations/:id/resend',

@@ -98,6 +98,11 @@ router.use(require('./super-admin/support'));
 router.use(require('./super-admin/storage'));
 router.use(require('./super-admin/registrations'));
 router.use(require('./super-admin/mail'));
+// Hostinger: the hosting/domains/DNS/VPS console, its encrypted credential and
+// its approval gate. Inherits the same guard chain as everything else on this
+// mount, so a tenant session has no path to it at all — the only callable
+// surface is the 61-operation allow-list in lib/hostinger/catalog.js.
+router.use(require('./super-admin/hostinger'));
 // Command Center. Mounted here rather than on its own /api path so it inherits
 // this mount's auth -> requireSuperAdmin -> requireSuperAdminMfa chain. The
 // console grows container-restart buttons in a later phase and must not have a
