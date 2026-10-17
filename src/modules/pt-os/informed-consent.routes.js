@@ -428,6 +428,15 @@ router.post('/informed-consent/:id/sign', auth, requireTrainer, validate(signSch
   const col = signer === 'client' ? 'client_signature' : signer === 'trainer' ? 'trainer_signature' : 'witness_signature';
   const atCol = signer === 'client' ? 'client_signed_at' : signer === 'trainer' ? 'trainer_signed_at' : 'witness_signed_at';
 
+  // One signature per role. A second signing by the same role used to
+  // overwrite the first and stamp a new date — changing what the PDF says was
+  // agreed, and when, with the original ink gone. An edit is the route to a
+  // new signature: PATCH clears every signature first, so this is only
+  // reached with one still in place.
+  if (existing[col]) {
+    return res.status(409).json({ error: { code: 'ALREADY_SIGNED' } });
+  }
+
   const sets = [`${col} = $2`, `${atCol} = NOW()`, 'updated_at = NOW()'];
   const params = [id, signature];
   if (signer === 'witness' && witness_name) { params.push(witness_name); sets.push(`witness_name = $${params.length}`); }
@@ -436,7 +445,8 @@ router.post('/informed-consent/:id/sign', auth, requireTrainer, validate(signSch
   // read above and this write must not take another signature.
   const { rows } = await pool.query(
     `UPDATE pt_informed_consents SET ${sets.join(', ')}
-      WHERE id = $1 AND status NOT IN ('completed', 'revoked', 'archived', 'expired')
+      WHERE id = $1 AND ${col} IS NULL
+        AND status NOT IN ('completed', 'revoked', 'archived', 'expired')
       RETURNING *`, params
   );
   if (!rows[0]) return res.status(409).json({ error: { code: 'NOT_SIGNABLE' } });

@@ -38,6 +38,14 @@ function shapeError(d) {
       return `duration_weeks must be a whole number from ${WEEKS_MIN} to ${WEEKS_MAX}`;
     }
   }
+  if (d.progression_amount != null && d.progression_amount !== '') {
+    // The engine multiplies this per step, so zero is a rule that does
+    // nothing, a negative walks the prescription backwards, and "abc" is NaN
+    // in the arithmetic. The pair's CHECK constraint guards type and amount
+    // together; it cannot see the sign.
+    const a = Number(d.progression_amount);
+    if (!Number.isFinite(a) || a <= 0) return 'progression_amount must be a positive number';
+  }
   return null;
 }
 

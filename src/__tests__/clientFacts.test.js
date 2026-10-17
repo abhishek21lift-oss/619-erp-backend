@@ -96,6 +96,19 @@ describe('precedence', () => {
     expect(dq.completeness_pct).toBe(0);
   });
 
+  test('an over-long statement is not a statement', () => {
+    // A wall of pasted text in a stated field would print under CLIENT
+    // AUTHORITATIVE DATA. The numeric path refuses impossible values; text
+    // gets the same rule rather than passing through unbounded.
+    const { facts, data_quality: dq } = resolveClientFacts(bare(), {
+      goal: 'g'.repeat(201),
+      gender: 'x'.repeat(5000),
+    });
+    expect(facts.goal.origin).toBe('missing');
+    expect(facts.gender.origin).toBe('missing');
+    expect(dq.stated).toEqual([]);
+  });
+
   test('the latest assessment weight beats the enrolment weight beats the check-in', () => {
     const ctx = bare({ weight: 80 });
     ctx.latestAssessment = { weight: 78 };

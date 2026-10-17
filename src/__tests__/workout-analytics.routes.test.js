@@ -90,6 +90,18 @@ describe('GET /workout-log/analytics', () => {
     expect(res.body.data.as_of).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 
+  it('falls back when as_of is a date the calendar does not have', async () => {
+    // '2026-02-30' passes the shape check and Date rolls it forward to
+    // March 2, silently moving the window; '2026-13-01' is Invalid and used
+    // to reach a null weekStart as a 500. Both fall back like malformed input.
+    for (const bad of ['2026-02-30', '2026-13-01']) {
+      const res = await request(app())
+        .get(`/api/pt-os/workout-log/analytics?client_id=c-1&as_of=${bad}`).expect(200);
+      expect(res.body.data.as_of).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect(res.body.data.as_of).not.toBe(bad);
+    }
+  });
+
   it('clamps an absurd window rather than scanning everything', async () => {
     const res = await request(app())
       .get('/api/pt-os/workout-log/analytics?client_id=c-1&weeks=99999').expect(200);

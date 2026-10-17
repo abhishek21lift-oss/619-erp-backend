@@ -42,6 +42,12 @@ jest.mock('../middleware/auth', () => ({
   requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
 }));
 jest.mock('../lib/screeningGate', () => ({ checkTrainingEligibility: jest.fn(async () => ({ blocked: null, warnings: [] })) }));
+// The accept path dates the assignment in STUDIO days. Pinned below a known
+// instant so the test can name the date it expects to see.
+jest.mock('../lib/appTime', () => ({
+  ...jest.requireActual('../lib/appTime'),
+  today: jest.fn(() => '2026-10-16'),
+}));
 
 const request = require('supertest');
 const express = require('express');
@@ -257,6 +263,21 @@ describe('the proposal has to actually reach the client', () => {
     // system deciding for them.
     expect(all.some((s) => /UPDATE workout_assignments/.test(s))).toBe(false);
     expect(all.some((s) => /DELETE FROM workout_assignments/.test(s))).toBe(false);
+  });
+
+  it('ends the programme when its weeks run out, in studio days', async () => {
+    // No end date meant a finished block stayed "active" — on the Today
+    // roster, in the active-plan read — for as long as nobody retired it by
+    // hand. The date is the programme's own length, start + weeks − 1 day,
+    // the same rule POST /assign applies; and the start is the STUDIO's day,
+    // not CURRENT_DATE's, which is the database's and rolls over at 05:30 IST.
+    await post();
+    const [sql, params] = pool.query.mock.calls
+      .find(([s]) => /INSERT INTO workout_assignments/.test(String(s)));
+
+    expect(sql).not.toContain('CURRENT_DATE');
+    expect(params[3]).toBe('2026-10-16');   // studio today
+    expect(params[4]).toBe('2026-12-10');   // + 8 weeks − 1 day
   });
 
   it('tells the trainer what else the client is already on', async () => {

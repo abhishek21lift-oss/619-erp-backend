@@ -165,14 +165,40 @@ describe('adherence inputs', () => {
 
   it('prescribes only across the weeks the plan has actually run', () => {
     const twoWeeksAgo = new Date(Date.now() - 15 * 86400000).toISOString().slice(0, 10);
+    const eightDaysAgo = new Date(Date.now() - 8 * 86400000).toISOString().slice(0, 10);
     const out = adherenceInputs(
       { planned_days_count: 3, duration_weeks: 12, start_date: twoWeeksAgo },
-      [{ status: 'completed' }, { status: 'completed' }, { status: 'skipped' }],
+      [
+        { status: 'completed', session_date: eightDaysAgo },
+        { status: 'completed', session_date: eightDaysAgo },
+        { status: 'skipped', session_date: eightDaysAgo },
+      ],
       12,
     );
     // A plan that began a fortnight ago has prescribed 6 sessions, not 36.
     // Charging it the whole window would invent a missed-session problem.
     expect(out).toEqual({ prescribed: 6, completed: 2 });
+  });
+
+  it('counts only the sessions logged since the plan began', () => {
+    // The history query spans the whole window; this plan is a fortnight old.
+    // Two sessions logged BEFORE it started were counted against its
+    // prescription, letting adherence climb past what the plan could have
+    // asked for and reporting a client who stopped turning up as caught up.
+    const twoWeeksAgo = new Date(Date.now() - 15 * 86400000).toISOString().slice(0, 10);
+    const beforePlan = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+    const inPlan = new Date(Date.now() - 8 * 86400000).toISOString().slice(0, 10);
+    const out = adherenceInputs(
+      { planned_days_count: 3, duration_weeks: 12, start_date: twoWeeksAgo },
+      [
+        { status: 'completed', session_date: beforePlan },
+        { status: 'completed', session_date: beforePlan },
+        { status: 'completed', session_date: inPlan },
+        { status: 'skipped', session_date: inPlan },
+      ],
+      12,
+    );
+    expect(out.completed).toBe(1);
   });
 
   it('counts complete weeks only, so a week in progress is not yet owed', () => {

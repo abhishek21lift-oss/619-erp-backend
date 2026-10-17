@@ -101,8 +101,8 @@ function buildWorkoutSystemPrompt(trainerName) {
     JSON.stringify({
       name: 'string',
       description: 'string',
-      goal: 'string',
-      level: 'string',
+      goal: 'string — one of: weight_loss, muscle_gain, strength, endurance, general_fitness, recovery',
+      level: 'string — one of: beginner, intermediate, advanced',
       weeks: 'number',
       days_per_week: 'number',
       equipment: ['string'],

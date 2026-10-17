@@ -37,6 +37,7 @@ const { planExercises, normaliseName } = require('./plan-critic');
 const { materialise } = require('./plan-materialise');
 const { resolveExerciseNames } = require('./client-context');
 const { outcomeOf, summariseOutcomes } = require('./plan-outcomes');
+const { dbDate, today: studioToday } = require('../../lib/appTime');
 
 /** Times a trainer must do the same thing before it reads as a preference. */
 const MIN_REPEATS_FOR_PATTERN = 2;
@@ -381,12 +382,22 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
     // is active comes back in the result for the trainer to act on instead.
     let assigned = false;
     if (orgId) {
+      // The programme's own length, start + weeks − 1 day — the same rule
+      // POST /assign applies. Without an end date a finished block stayed
+      // "active" on the Today roster for as long as nobody retired it by
+      // hand; and the start is the STUDIO's day, not CURRENT_DATE's, which is
+      // the database's and rolls over at 05:30 IST.
+      const startedOn = studioToday();
+      const planWeeks = Number(built.plan.duration_weeks);
+      const endOn = Number.isFinite(planWeeks) && planWeeks > 0
+        ? new Date(Date.parse(startedOn) + (planWeeks * 7 - 1) * 86400000).toISOString().slice(0, 10)
+        : null;
       await client.query(
         `INSERT INTO workout_assignments
-           (id, workout_plan_id, client_id, trainer_id, start_date, status, organization_id)
+           (id, workout_plan_id, client_id, trainer_id, start_date, end_date, status, organization_id)
          VALUES ($1, $2, $3, (SELECT trainer_id FROM pt_clients WHERE id = $3),
-                 CURRENT_DATE, 'active', $4)`,
-        [assignmentId, planId, generation.client_id, orgId],
+                 $4, $5, 'active', $6)`,
+        [assignmentId, planId, generation.client_id, startedOn, endOn, orgId],
       );
       assigned = true;
     }
@@ -519,10 +530,10 @@ async function planOutcomes(clientId, orgId, { today, limit = MEMORY_WINDOW } = 
     }
   }
 
-  const asOf = today || new Date().toISOString().slice(0, 10);
+  const asOf = today || studioToday();
   const onOrAfter = (rowDate, acceptedAt) => {
-    const d = rowDate ? String(rowDate).slice(0, 10) : null;
-    const a = acceptedAt ? String(acceptedAt).slice(0, 10) : null;
+    const d = dbDate(rowDate);
+    const a = dbDate(acceptedAt);
     return Boolean(d && a && d >= a);
   };
 

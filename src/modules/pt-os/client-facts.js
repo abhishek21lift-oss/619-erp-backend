@@ -147,10 +147,16 @@ function numInRange(v, field) {
   return n >= range[0] && n <= range[1] ? n : null;
 }
 
-function text(v) {
+// The trainer-stated text fields (gender, goal, experience, equipment) are
+// answers, not documents. A wall of pasted text is not one, so it reads as
+// missing — the same rule an out-of-range number gets.
+const STATED_TEXT_MAX = 200;
+
+function text(v, maxLength) {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
-  return s ? s : null;
+  if (!s) return null;
+  return maxLength && s.length > maxLength ? null : s;
 }
 
 /**
@@ -303,7 +309,7 @@ function resolveClientFacts(ctx, stated = {}) {
 
   for (const field of FIELDS) {
     const supersedable = STATED_SUPERSEDES.includes(field)
-      && text(stated[field]) !== null;
+      && text(stated[field], STATED_TEXT_MAX) !== null;
     const hit = supersedable ? null : resolved[field];
     if (hit) {
       facts[field] = hit;
@@ -319,7 +325,7 @@ function resolveClientFacts(ctx, stated = {}) {
     }
     const given = Object.prototype.hasOwnProperty.call(STATED_RANGE, field)
       ? numInRange(stated[field], field)
-      : text(stated[field]);
+      : text(stated[field], STATED_TEXT_MAX);
     if (given !== null) {
       facts[field] = { value: given, source: 'trainer', origin: 'stated' };
       statedFields.push({ field });

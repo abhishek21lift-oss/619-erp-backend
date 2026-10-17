@@ -53,6 +53,8 @@
 // client and an empty one from a fully-assessed client are different facts,
 // and the layer above must be able to tell them apart.
 
+const { dbDate } = require('../../lib/appTime');
+
 /** Severities, worst first. A rule may raise a verdict, never lower one. */
 const VERDICTS = Object.freeze({ BLOCK: 'block', CAUTION: 'caution', ALLOW: 'allow' });
 const RANK = Object.freeze({ block: 2, caution: 1, allow: 0 });
@@ -495,7 +497,7 @@ function buildConstraints({
       status: parq ? (str(parq.workout_gate_status) || 'unknown') : 'unknown',
       cleared: Boolean(parq) && str(parq.workout_gate_status) === 'cleared',
       risk_level: parq ? (str(parq.risk_level) || null) : null,
-      assessed_on: parq?.assessment_date ? String(parq.assessment_date).slice(0, 10) : null,
+      assessed_on: parq?.assessment_date ? dbDate(parq.assessment_date) : null,
     },
     constraints,
     referrals,

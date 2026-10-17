@@ -19,6 +19,8 @@ let mockClientInOrg = true;
 let mockDocs = [];
 let mockExistingForm = null;
 let mockExistingClearance = null;
+let mockGateForm = { id: FORM_ID };
+let mockLastConsent = null;
 const mockQueries = [];
 
 function mockResult(rows) { return { rows, rowCount: rows.length }; }
@@ -30,6 +32,13 @@ function mockRoute(sql, params) {
   if (/^UPDATE pt_medical_clearances/i.test(text)) return mockResult([{ ...mockExistingClearance, ...{ approval_status: 'approved' } }]);
   if (/^INSERT INTO pt_medical_clearances/i.test(text)) return mockResult([{ id: 'mc-1', parq_form_id: FORM_ID }]);
   if (/SELECT client_id, organization_id FROM pt_parq_forms/i.test(text)) return mockResult([{ client_id: 'c1', organization_id: ORG_A }]);
+  if (/^SELECT id FROM pt_parq_forms/i.test(text)) return mockResult(mockGateForm ? [mockGateForm] : []);
+  // The snapshot read the gate-status route used to answer from. It returns a
+  // gate that disagrees with the recompute, so a test can tell the two apart.
+  if (/^SELECT workout_gate_status, risk_level FROM pt_parq_forms/i.test(text)) return mockResult([{ workout_gate_status: 'cleared', risk_level: 'low' }]);
+  if (/^SELECT \* FROM pt_consent_records WHERE parq_form_id = \$1/i.test(text)) return mockResult(mockLastConsent ? [mockLastConsent] : []);
+  if (/^INSERT INTO pt_consent_records/i.test(text)) return mockResult([{ id: 'consent-1', parq_form_id: FORM_ID, client_signature: 'data:image/png;base64,AAA', trainer_signature: null }]);
+  if (/^UPDATE pt_consent_records SET pdf_url/i.test(text)) return mockResult([{ id: 'consent-1', pdf_url: 'https://example.test/c.pdf' }]);
   if (/FOR UPDATE/i.test(text)) return mockResult(mockExistingForm ? [mockExistingForm] : []);
   if (/^INSERT INTO pt_parq_forms/i.test(text)) return mockResult([{ id: FORM_ID }]);
   if (/SELECT risk_level FROM pt_parq_forms/i.test(text)) return mockResult([{ risk_level: 'high' }]);
@@ -71,6 +80,8 @@ beforeEach(() => {
   mockDocs = [];
   mockExistingForm = null;
   mockExistingClearance = null;
+  mockGateForm = { id: FORM_ID };
+  mockLastConsent = null;
   mockQueries.length = 0;
 });
 
@@ -199,6 +210,26 @@ describe('medical clearance approval needs evidence', () => {
   });
 });
 
+describe('GET /parq/forms/:id/gate-status', () => {
+  test('answers with a recomputed gate, not the stored snapshot', async () => {
+    // The snapshot is written when the form is saved and when a clearance is
+    // approved. A read that answered from it served a stale gate — the Assign
+    // button stayed disabled for a client a clearance had just cleared. The
+    // read now recomputes with the same rule the writes use.
+    const res = await request(app()).get(`/api/pt-os/parq/forms/${FORM_ID}/gate-status`);
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual({ workout_gate_status: 'blocked', risk_level: 'high' });
+    expect(mockQueries.some((q) => /^UPDATE pt_parq_forms SET workout_gate_status/i.test(q.sql))).toBe(true);
+  });
+
+  test('another studio\'s form is a 404 and nothing is recomputed against it', async () => {
+    mockGateForm = null;
+    const res = await request(app()).get(`/api/pt-os/parq/forms/${FORM_ID}/gate-status`);
+    expect(res.status).toBe(404);
+    expect(mockQueries.some((q) => /^UPDATE pt_parq_forms SET workout_gate_status/i.test(q.sql))).toBe(false);
+  });
+});
+
 describe('a PAR-Q is only screened when every question is answered (safety audit 2026-09-29)', () => {
   const { logActivity } = require('../lib/activityLog');
   beforeEach(() => logActivity.mockClear());
@@ -262,5 +293,41 @@ describe('a PAR-Q is only screened when every question is answered (safety audit
     await request(app()).patch(`/api/pt-os/parq/forms/${FORM_ID}`).send({ status: 'reviewed', parq_answers: answers(2, 6) });
     const update = mockQueries.find((q) => /^UPDATE pt_parq_forms SET (?!workout_gate_status)/i.test(q.sql));
     expect(update.params).toContain('submitted');
+  });
+});
+
+describe('POST /parq/forms/:id/consent', () => {
+  const body = {
+    consent_checkboxes: { info_true: true },
+    client_signature: 'data:image/png;base64,AAA',
+  };
+
+  test('a signature that was not given is not stamped as given', async () => {
+    // Both timestamps were written NOW() whatever the body carried, so a
+    // consent signed only by the client held a trainer_signed_at — a blank
+    // name with a signing time beside it, on the record the PDF reads.
+    await request(app()).post(`/api/pt-os/parq/forms/${FORM_ID}/consent`).send(body).expect(201);
+    const insert = mockQueries.find((q) => /^INSERT INTO pt_consent_records/i.test(q.sql));
+    expect(insert.sql).toMatch(/CASE WHEN \$4::text IS NOT NULL THEN NOW\(\) END/);
+    expect(insert.sql).toMatch(/CASE WHEN \$5::text IS NOT NULL THEN NOW\(\) END/);
+  });
+
+  test('resending the same signatures returns the stored record, not a duplicate', async () => {
+    // The wizard resends the whole form. A retry after a timeout looked like
+    // a second signing: a duplicate row with a later signing time, which is
+    // what the PDF and the audit both read.
+    mockLastConsent = { id: 'consent-0', client_signature: body.client_signature, trainer_signature: null };
+    const res = await request(app()).post(`/api/pt-os/parq/forms/${FORM_ID}/consent`).send(body);
+    expect(res.status).toBe(200);
+    expect(res.body.data.id).toBe('consent-0');
+    expect(mockQueries.some((q) => /^INSERT INTO pt_consent_records/i.test(q.sql))).toBe(false);
+  });
+
+  test('a different signature is a new signing, not a retry', async () => {
+    mockLastConsent = { id: 'consent-0', client_signature: 'data:image/png;base64,OLD', trainer_signature: null };
+    const res = await request(app()).post(`/api/pt-os/parq/forms/${FORM_ID}/consent`)
+      .send({ ...body, trainer_signature: 'data:image/png;base64,BBB' });
+    expect(res.status).toBe(201);
+    expect(mockQueries.some((q) => /^INSERT INTO pt_consent_records/i.test(q.sql))).toBe(true);
   });
 });

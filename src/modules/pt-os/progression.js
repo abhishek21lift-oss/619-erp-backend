@@ -93,15 +93,18 @@ function applyProgression(exercise, plan, week, fromWeek = 1) {
     - stepsFor(fromWeek, plan?.progression_every_weeks);
 
   const out = { ...exercise, week_number: week, progression_steps: steps };
-  if (type === 'none' || !Number.isFinite(amount) || steps <= 0) return out;
+  // A rule needs a positive amount to be a rule: zero does nothing and a
+  // negative one walks the prescription backwards every week.
+  if (type === 'none' || !Number.isFinite(amount) || amount <= 0 || steps <= 0) return out;
 
   const delta = amount * steps;
 
   if (type === 'weight') {
     if (exercise.target_weight == null) return out;
     // Round to 0.25 kg: the arithmetic produces 62.50000000000001 and a
-    // trainer reads a prescription, not a float.
-    out.target_weight = Math.round((Number(exercise.target_weight) + delta) * 4) / 4;
+    // trainer reads a prescription, not a float. Never below zero — a
+    // negative load is not a lighter lift.
+    out.target_weight = Math.max(0, Math.round((Number(exercise.target_weight) + delta) * 4) / 4);
   } else if (type === 'reps') {
     if (exercise.reps == null) return out;
     // Reps are whole. Rounding rather than flooring keeps +0.5/week honest
@@ -109,9 +112,10 @@ function applyProgression(exercise, plan, week, fromWeek = 1) {
     out.reps = Math.max(1, Math.round(Number(exercise.reps) + delta));
   } else if (type === 'rpe') {
     if (exercise.rpe == null) return out;
-    // RPE is a 1-10 scale; past 10 there is nothing left to give, so it caps
-    // rather than reporting an 11 that cannot be performed.
-    out.rpe = Math.min(10, Math.round((Number(exercise.rpe) + delta) * 10) / 10);
+    // RPE is a 1-10 scale; past 10 there is nothing left to give and past 1
+    // nothing left to take, so it clamps rather than reporting an 11 or a 0.5
+    // that cannot be performed.
+    out.rpe = Math.max(1, Math.min(10, Math.round((Number(exercise.rpe) + delta) * 10) / 10));
   }
 
   return out;

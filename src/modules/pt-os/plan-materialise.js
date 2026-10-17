@@ -73,6 +73,21 @@ const num = (v) => {
 
 const text = (v) => (typeof v === 'string' ? v.trim() : '');
 
+/** The values the goal and difficulty columns accept (migration 219). */
+const GOALS = Object.freeze(['weight_loss', 'muscle_gain', 'strength', 'endurance', 'general_fitness', 'recovery']);
+const LEVELS = Object.freeze(['beginner', 'intermediate', 'advanced']);
+
+/**
+ * The generator writes labels ("Weight Loss"); these columns are enums with
+ * CHECK constraints. Case and spacing are normalised, and anything still
+ * unrecognised is dropped to NULL rather than failing the whole save on the
+ * constraint — a missing goal is cosmetic, a lost programme is not.
+ */
+const enumText = (v, allowed) => {
+  const k = text(v).toLowerCase().replace(/[\s-]+/g, '_');
+  return allowed.includes(k) ? k : null;
+};
+
 /**
  * The day number a schedule key means.
  *
@@ -188,8 +203,8 @@ function materialise(plan, resolver = new Map()) {
   return {
     plan: {
       name: text(plan?.name) || 'AI programme',
-      goal: text(plan?.goal) || null,
-      difficulty: text(plan?.level) || null,
+      goal: enumText(plan?.goal, GOALS),
+      difficulty: enumText(plan?.level, LEVELS),
       duration_weeks: num(plan?.weeks),
       sessions_per_week: num(plan?.days_per_week) ?? new Set(rows.map((r) => r.day_of_week)).size,
     },

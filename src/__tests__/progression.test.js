@@ -86,6 +86,22 @@ describe('applyProgression', () => {
     expect(applyProgression(SQUAT, plan, 12).rpe).toBe(10);
   });
 
+  it('treats a rule with no positive amount as no rule', () => {
+    // A stored negative amount walked the prescription DOWN every week, and
+    // zero is a rule that does nothing wearing a rule's row. Neither was
+    // refused when the plan was saved.
+    const down = { progression_type: 'weight', progression_amount: -5, progression_every_weeks: 1 };
+    expect(applyProgression(SQUAT, down, 3).target_weight).toBe(60);
+    expect(applyProgression(SQUAT, { ...down, progression_amount: 0 }, 3).target_weight).toBe(60);
+  });
+
+  it('never prescribes an RPE below 1 — the bottom of the scale', () => {
+    // The top was capped; the bottom was not, so a base of 0 stepped by 0.5
+    // prescribed an RPE that cannot be reported.
+    const plan = { progression_type: 'rpe', progression_amount: 0.5, progression_every_weeks: 1 };
+    expect(applyProgression({ ...SQUAT, rpe: 0 }, plan, 2).rpe).toBe(1);
+  });
+
   it('changes nothing when the rule is none', () => {
     const out = applyProgression(SQUAT, PLAN_NONE, 9);
     expect(out.target_weight).toBe(60);

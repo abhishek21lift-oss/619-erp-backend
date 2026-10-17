@@ -190,6 +190,27 @@ describe('the plan itself', () => {
     });
   });
 
+  it('normalises a goal and level the columns only accept in enum form', () => {
+    // The generator writes labels ("Weight Loss"); the columns take
+    // 'weight_loss' and reject the rest — which used to fail the whole accept
+    // on the CHECK constraint.
+    const out = materialise(
+      plan({ Monday: [ex()] }, { goal: 'Weight Loss', level: 'Advanced' }),
+      resolver(['Barbell Squat']),
+    );
+    expect(out.plan.goal).toBe('weight_loss');
+    expect(out.plan.difficulty).toBe('advanced');
+  });
+
+  it('drops a goal or level the columns would reject instead of failing the save', () => {
+    const out = materialise(
+      plan({ Monday: [ex()] }, { goal: 'powerbuilding', level: 'elite' }),
+      resolver(['Barbell Squat']),
+    );
+    expect(out.plan.goal).toBeNull();
+    expect(out.plan.difficulty).toBeNull();
+  });
+
   it('counts the days itself when the plan does not say', () => {
     const p = plan({ Monday: [ex()], Thursday: [ex()] });
     delete p.days_per_week;
