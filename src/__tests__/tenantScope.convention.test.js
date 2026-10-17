@@ -138,6 +138,19 @@ const REVIEWED_EXCEPTIONS = {
     'organisation to filter by the way a business write does. Same shape as ' +
     'the Command Centre alerting exception above. Mounted under ' +
     '/api/super-admin behind requireSuperAdmin.',
+  'modules/platform/hostinger/credentials.service.js':
+    'Platform-operator credential history. The two users joins resolve an ' +
+    'operator NAME for a platform_hostinger_credentials row the surrounding ' +
+    'query already selected by its own id — join on a specific FK, and nothing ' +
+    'from the users row is returned except the name. The table is FORCE-RLS ' +
+    'deny-all and reached only from /api/super-admin (PLATFORM_GUARD), so a ' +
+    'tenant request has no path here at all.',
+  'modules/platform/hostinger/operations.service.js':
+    "Reads its own activity_log rows — action LIKE 'hostinger.%', a prefix only " +
+    'this module writes, from the super-admin mount — for the console\'s ' +
+    'operation history. Platform-operator audit rows with no owning ' +
+    'organisation, under runAsPlatform. Same shape as ' +
+    'restart-verification.js above.',
 };
 
 /** Every route/module source file. */

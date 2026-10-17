@@ -41,6 +41,27 @@ if (missingRecommended.length) {
   logger.warn({ missing: missingRecommended }, 'Recommended env vars not set — some features may be degraded');
 }
 
+// ── Hostinger credential key ────────────────────────────────────────────────
+// HOSTINGER_TOKEN_KEY encrypts the Hostinger API token at rest. Unset is a
+// supported state: the hosting console reports `not_configured` and offers a
+// connect prompt, and nothing else in the app is affected.
+//
+// SET BUT MALFORMED is a different thing entirely, and it is why this is not
+// folded into the list above. A key that is present and wrong means rows
+// written under the real key become undecryptable, the console says
+// "unreadable", and the operator's instinct is to look for a bug rather than a
+// typo. Refusing to boot in production turns that into a message that names the
+// variable, at the moment it can still be fixed. In development it warns,
+// because a half-configured laptop should still start.
+const hostingerKeyProblem = require('./lib/hostinger/crypto').keyProblem();
+if (hostingerKeyProblem) {
+  if (process.env.NODE_ENV === 'production') {
+    logger.fatal({ problem: hostingerKeyProblem }, 'HOSTINGER_TOKEN_KEY is set but unusable — refusing to start');
+    process.exit(1);
+  }
+  logger.warn({ problem: hostingerKeyProblem }, 'HOSTINGER_TOKEN_KEY is set but unusable — the hosting console will report not_configured');
+}
+
 // ── RLS cutover validation ───────────────────────────────────────────────────
 // When TENANT_RLS_ENFORCE is on (default in production), the app_tenant role
 // must be used for tenant requests, and a separate owner connection (ADMIN_DATABASE_URL)

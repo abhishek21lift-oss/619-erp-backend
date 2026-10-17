@@ -436,6 +436,11 @@ const DOMAINS = {
       // owner connection, which is how platform reads of tenant tables always
       // work.
       'tenancy_known_gaps', 'tenancy_isolation_runs', 'admin_reset_intents',
+      // The Hostinger control surface: the encrypted API credential and the
+      // store of approved operations. Both deny-all RLS + FORCE (migration
+      // 229) for the same reason platform_owners is: a table of credentials is
+      // not something app_tenant may ever read, even by accident.
+      'platform_hostinger_credentials', 'platform_hostinger_approvals',
     ],
   },
 
