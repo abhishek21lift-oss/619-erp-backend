@@ -19,19 +19,59 @@ const { hasPtTermSql } = require('../../lib/ptTerm');
 const INTERVIEW_FIELDS = Object.freeze([
   'training_history', 'pain_and_injuries', 'lifestyle', 'motivation',
   'availability', 'preferences', 'notes',
+  'lifestyle_occupation', 'lifestyle_sitting_hours', 'lifestyle_screen_time',
+  'lifestyle_sleep_hours', 'lifestyle_meal_regularity', 'lifestyle_smoking',
+  'lifestyle_alcohol', 'lifestyle_training_days',
 ]);
-const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000 });
+const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifestyle_occupation: 50, lifestyle_screen_time: 10, lifestyle_meal_regularity: 20, lifestyle_smoking: 20, lifestyle_alcohol: 20 });
 
 class InterviewInputError extends Error {
   constructor(message, status = 400) { super(message); this.status = status; }
 }
 
-/** The fields of an interview body, trimmed and bounded. Unknown keys are ignored. */
+/** The fields of an interview body, trimmed and bounded. Structured lifestyle fields accept numbers/enums; text fields stay text. Unknown keys are ignored. */
 function interviewFields(body = {}) {
   const out = {};
+  const STRUCTURED = new Set(['lifestyle_occupation','lifestyle_sitting_hours','lifestyle_screen_time','lifestyle_sleep_hours','lifestyle_meal_regularity','lifestyle_smoking','lifestyle_alcohol','lifestyle_training_days']);
   for (const key of INTERVIEW_FIELDS) {
     if (body[key] === undefined) continue;
     if (body[key] === null || body[key] === '') { out[key] = null; continue; }
+    if (STRUCTURED.has(key)) {
+      // Structured fields: preserve value with light validation
+      const v = body[key];
+      if (key === 'lifestyle_sitting_hours' || key === 'lifestyle_sleep_hours') {
+        const n = Number(v);
+        if (isNaN(n) || n < 0 || n > 24) throw new InterviewInputError(`${key} must be between 0 and 24.`);
+        out[key] = n;
+      } else if (key === 'lifestyle_training_days') {
+        const n = Number(v);
+        if (!Number.isInteger(n) || n < 3 || n > 6) throw new InterviewInputError(`${key} must be 3-6.`);
+        out[key] = n;
+      } else if (key === 'lifestyle_occupation') {
+        const allowed = ['desk_job','active_job','physical_labor','student','homemaker','driver','healthcare','police','fitness_professional','retired','other'];
+        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
+        out[key] = v || null;
+      } else if (key === 'lifestyle_screen_time') {
+        const allowed = ['<2','2_4','4_6','6_8','8_plus'];
+        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
+        out[key] = v || null;
+      } else if (key === 'lifestyle_meal_regularity') {
+        const allowed = ['regular','irregular','inconsistent'];
+        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
+        out[key] = v || null;
+      } else if (key === 'lifestyle_smoking') {
+        const allowed = ['never','occasionally','daily','former'];
+        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
+        out[key] = v || null;
+      } else if (key === 'lifestyle_alcohol') {
+        const allowed = ['never','occasionally','weekly','frequently'];
+        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
+        out[key] = v || null;
+      } else {
+        out[key] = v || null;
+      }
+      continue;
+    }
     if (typeof body[key] !== 'string') throw new InterviewInputError(`${key} must be text.`);
     const v = body[key].trim();
     if (v.length > (FIELD_MAX[key] || 2000)) throw new InterviewInputError(`${key} is too long.`);
@@ -48,11 +88,12 @@ function statusOf(body) {
   return body.status;
 }
 
-/** A completed interview has to say something. */
+/** A completed interview has to say something (text or structured lifestyle answers count). */
 function assertCompletable(row) {
-  if (!INTERVIEW_FIELDS.some((k) => row[k] && String(row[k]).trim())) {
-    throw new InterviewInputError('Write down at least one answer before completing the interview.');
-  }
+  const lifestyleKeys = ['lifestyle_occupation','lifestyle_sitting_hours','lifestyle_screen_time','lifestyle_sleep_hours','lifestyle_meal_regularity','lifestyle_smoking','lifestyle_alcohol','lifestyle_training_days'];
+  const hasText = INTERVIEW_FIELDS.some((k) => row[k] && String(row[k]).trim() && !lifestyleKeys.includes(k));
+  const hasLifestyle = lifestyleKeys.some((k) => row[k] != null && (typeof row[k] === 'number' ? true : String(row[k]).trim() !== ''));
+  if (!hasText && !hasLifestyle) throw new InterviewInputError('Write down at least one answer before completing the interview.');
 }
 
 async function clientExists(orgId, clientId) {
