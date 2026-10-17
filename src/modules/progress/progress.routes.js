@@ -406,6 +406,15 @@ const goalFields = {
   lifestyle_readiness: z.record(z.string().max(60), z.boolean()).optional().nullable(),
   starting_weight: numIn(25, 350), starting_body_fat_pct: numIn(2, 75),
   notes: text(2000),
+  status: z.enum(['active','paused','completed','archived']).optional(),
+  training_days_per_week: intIn(1, 7).optional().nullable(),
+  preferred_training_days: textList(20, 7).optional().nullable(),
+  training_split: text(100).optional().nullable(),
+  routine_blueprint: z.any().optional().nullable(),
+  milestones: z.any().optional().nullable(),
+  review_date: futureDate().optional().nullable(),
+  short_term_weeks: intIn(1, 52).optional().nullable(),
+  medium_term_weeks: intIn(1, 52).optional().nullable(),
 };
 
 const goalCreateSchema = {
@@ -483,6 +492,7 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
        starting_weight, starting_body_fat_pct,
        goal_difficulty, estimated_duration_weeks, recommended_pt_duration_months,
        estimated_weekly_rate_kg, safe_weekly_rate_kg, risk_factors,
+       status, training_days_per_week, preferred_training_days, training_split, routine_blueprint, milestones, review_date, short_term_weeks, medium_term_weeks,
        created_by, organization_id
      ) VALUES (
        $1,$2,$3,$4,$5,$6,$7,$8,
@@ -491,7 +501,8 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
        $16,$17,
        $18,$19,$20,
        $21,$22,$23,
-       $24,$25
+       $24,$25,$26,$27::text[],$28,$29::jsonb,$30::jsonb,$31,$32,$33,
+       $34,$35
      ) RETURNING *`,
     [
       b.client_id, b.goal_type, b.goal_other || null, b.goal_description || null,
@@ -502,11 +513,26 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
       startingWeight, startingBodyFat,
       analysis.difficulty, analysis.estimatedWeeks, analysis.recommendedMonths,
       analysis.requiredRate, analysis.safeRate, analysis.riskFactors.length ? analysis.riskFactors : null,
+      b.status || 'active',
+      b.training_days_per_week ?? null,
+      b.preferred_training_days && b.preferred_training_days.length ? b.preferred_training_days : null,
+      b.training_split || null,
+      b.routine_blueprint ? JSON.stringify(b.routine_blueprint) : null,
+      b.milestones ? JSON.stringify(b.milestones) : null,
+      b.review_date || null,
+      b.short_term_weeks ?? 8,
+      b.medium_term_weeks ?? 12,
       req.user.id, orgIdOf(req),
     ]
   );
-  // The new goal replaces the old one. Goals used to pile up, all active.
-  await assessmentsRepo.deactivateOtherGoals(b.client_id, rows[0].organization_id, rows[0].id);
+  // Keep is_active in sync with status for backward compat.
+  const newStatus = rows[0].status || 'active';
+  if (newStatus !== 'active') {
+    await pool.query('UPDATE pt_goals SET is_active = false WHERE id = $1', [rows[0].id]);
+    rows[0].is_active = false;
+  }
+  // The new goal replaces the old one only when active.
+  if (newStatus === 'active') await assessmentsRepo.deactivateOtherGoals(b.client_id, rows[0].organization_id, rows[0].id);
   res.status(201).json({ data: rows[0] });
 }));
 
@@ -515,6 +541,8 @@ router.patch('/goals/:id', auth, validate(goalUpdateSchema), wrap(async (req, re
     'goal_type', 'goal_other', 'goal_description', 'target_weight', 'target_body_fat', 'target_date', 'notes', 'is_active',
     'motivation_reason', 'priority_goal', 'motivation_level', 'commitment_level', 'biggest_challenges',
     'lifestyle_readiness', 'starting_weight', 'starting_body_fat_pct',
+    'status', 'training_days_per_week', 'preferred_training_days', 'training_split', 'routine_blueprint',
+    'milestones', 'review_date', 'short_term_weeks', 'medium_term_weeks',
   ];
 
   const scope = tenantScope(req);
@@ -529,7 +557,8 @@ router.patch('/goals/:id', auth, validate(goalUpdateSchema), wrap(async (req, re
   const sets = []; const params = [req.params.id];
   for (const key of allowed) {
     if (req.body[key] !== undefined) {
-      const val = key === 'lifestyle_readiness' && req.body[key] != null ? JSON.stringify(req.body[key]) : req.body[key];
+      let val = req.body[key];
+      if ((key === 'lifestyle_readiness' || key === 'routine_blueprint' || key === 'milestones') && val != null) val = JSON.stringify(val);
       params.push(val); sets.push(`${key} = $${params.length}`);
     }
   }
@@ -559,9 +588,37 @@ router.patch('/goals/:id', auth, validate(goalUpdateSchema), wrap(async (req, re
 
   sets.push('updated_at = NOW()');
   const { rows } = await pool.query(`UPDATE pt_goals SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  // Keep is_active in sync with status.
+  if (req.body.status !== undefined) {
+    const isActive = req.body.status === 'active';
+    await pool.query('UPDATE pt_goals SET is_active = $2 WHERE id = $1', [rows[0].id, isActive]);
+    rows[0].is_active = isActive;
+  }
   // Re-opening an archived goal makes it THE goal again.
-  if (req.body.is_active === true) await assessmentsRepo.deactivateOtherGoals(rows[0].client_id, rows[0].organization_id, rows[0].id);
+  if (req.body.is_active === true || req.body.status === 'active') await assessmentsRepo.deactivateOtherGoals(rows[0].client_id, rows[0].organization_id, rows[0].id);
   res.json({ data: rows[0] });
+}));
+
+// Schedule recommendation endpoint (SMART Goal Builder).
+router.post('/goals/recommend-schedule', auth, wrap(async (req, res) => {
+  const sched = require('./goal-scheduling');
+  const { training_days, goal_type, experience_level } = req.body || {};
+  const result = sched.recommendTrainingSplit(training_days, { goal: goal_type || '', experience: experience_level || 'beginner' });
+  res.json({ data: result });
+}));
+
+router.post('/goals/routine-blueprint', auth, wrap(async (req, res) => {
+  const sched = require('./goal-scheduling');
+  const b = req.body || {};
+  const blueprint = sched.buildRoutineBlueprint({
+    goal: b.goal_type || b.goal || '',
+    experience: b.experience_level || b.experience || 'beginner',
+    equipment: b.equipment || 'full_gym',
+    trainingDays: b.training_days || b.training_days_per_week || 3,
+    split: b.training_split || undefined,
+  });
+  const milestones = sched.generateMilestones(b.start_date || null, b.target_date || null, b.short_term_weeks || 8, b.medium_term_weeks || 12);
+  res.json({ data: { blueprint, milestones } });
 }));
 
 router.get('/weekly-checkins', auth, wrap(async (req, res) => {
