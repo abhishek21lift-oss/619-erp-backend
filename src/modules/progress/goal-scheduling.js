@@ -79,7 +79,7 @@ function recommendTrainingSplit(trainingDays, opts = {}) {
   return { trainingDays: days, split, label, notes, calendar };
 }
 
-function buildSessions(split, days, goal, experience) {
+function buildSessions(split, days, goal, _experience) {
   if (split === 'full_body' || split === 'full_body_minimal') {
     const n = split === 'full_body_minimal' ? days : 3;
     return Array.from({ length: n }, (_, i) => ({ name: `Full-Body ${i+1}`, focus: 'Compound strength + core' }));
