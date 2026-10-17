@@ -88,7 +88,7 @@ function statusOf(body) {
   return body.status;
 }
 
-/** A completed interview has to say something (text or structured lifestyle answers count). */
+/** A completed interview has to say something (text or structured answers count, text only is sufficient). */
 function assertCompletable(row) {
   const lifestyleKeys = ['lifestyle_occupation','lifestyle_sitting_hours','lifestyle_screen_time','lifestyle_sleep_hours','lifestyle_meal_regularity','lifestyle_smoking','lifestyle_alcohol','lifestyle_training_days'];
   const hasText = INTERVIEW_FIELDS.some((k) => row[k] && String(row[k]).trim() && !lifestyleKeys.includes(k));
