@@ -37,39 +37,7 @@ function interviewFields(body = {}) {
     if (body[key] === undefined) continue;
     if (body[key] === null || body[key] === '') { out[key] = null; continue; }
     if (STRUCTURED.has(key)) {
-      // Structured fields: preserve value with light validation
-      const v = body[key];
-      if (key === 'lifestyle_sitting_hours' || key === 'lifestyle_sleep_hours') {
-        const n = Number(v);
-        if (isNaN(n) || n < 0 || n > 24) throw new InterviewInputError(`${key} must be between 0 and 24.`);
-        out[key] = n;
-      } else if (key === 'lifestyle_training_days') {
-        const n = Number(v);
-        if (!Number.isInteger(n) || n < 3 || n > 6) throw new InterviewInputError(`${key} must be 3-6.`);
-        out[key] = n;
-      } else if (key === 'lifestyle_occupation') {
-        const allowed = ['desk_job','active_job','physical_labor','student','homemaker','driver','healthcare','police','fitness_professional','retired','other'];
-        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
-        out[key] = v || null;
-      } else if (key === 'lifestyle_screen_time') {
-        const allowed = ['<2','2_4','4_6','6_8','8_plus'];
-        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
-        out[key] = v || null;
-      } else if (key === 'lifestyle_meal_regularity') {
-        const allowed = ['regular','irregular','inconsistent'];
-        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
-        out[key] = v || null;
-      } else if (key === 'lifestyle_smoking') {
-        const allowed = ['never','occasionally','daily','former'];
-        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
-        out[key] = v || null;
-      } else if (key === 'lifestyle_alcohol') {
-        const allowed = ['never','occasionally','weekly','frequently'];
-        if (typeof v === 'string' && !allowed.includes(v)) throw new InterviewInputError(`${key} invalid value.`);
-        out[key] = v || null;
-      } else {
-        out[key] = v || null;
-      }
+      out[key] = (body[key] === null || body[key] === '') ? null : body[key];
       continue;
     }
     if (typeof body[key] !== 'string') throw new InterviewInputError(`${key} must be text.`);
