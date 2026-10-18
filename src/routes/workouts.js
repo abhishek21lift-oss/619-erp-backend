@@ -112,9 +112,13 @@ function exerciseParams(ex) {
  * right numbers. Time and distance targets live in `config`
  * (duration_seconds, distance, distance_unit), as migration 136 planned.
  */
+// movement_pattern and mechanic are the library metadata the builder's
+// auto-sequence orders by; they ride the same projection as every other field
+// the plan card renders, so one refetch is still enough.
 const EXERCISE_SELECT = `
   we.id, we.exercise_id, e.name, e.muscle_group, e.video_url, e.gif_url,
   e.exercise_type, e.prescription_mode_primary, e.prescription_mode_allowed,
+  e.movement_pattern, e.mechanic,
   we.day_of_week, we.week_number, we.sort_order, we.sets, we.reps, we.rest_seconds, we.notes,
   we.target_weight, we.tempo, we.rpe, we.warmup_sets, we.superset_group, we.config`;
 

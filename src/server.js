@@ -972,6 +972,8 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/workout-log.routes'));
 // The intake journey and the Client Interview (migration 227).
 app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/client-journey.routes'));
+// Workout generation: a reviewable draft, never a write.
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/workout-generator.routes'));
 
 // The client's own surfaces. Mirror image of the block above: requireClient
 // refuses anyone who is not a `member` linked to a client record, and every
