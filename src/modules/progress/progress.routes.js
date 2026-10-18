@@ -501,7 +501,7 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
        $16,$17,
        $18,$19,$20,
        $21,$22,$23,
-       $24,$25,$26,$27::text[],$28,$29::jsonb,$30::jsonb,$31,$32,
+       $24,$25,$26::text[],$27,$28::jsonb,$29::jsonb,$30,$31,$32,
        $33,$34
      ) RETURNING *`,
     [
