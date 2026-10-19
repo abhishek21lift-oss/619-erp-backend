@@ -8,8 +8,10 @@ const ORG_A = '11111111-1111-1111-1111-111111111111';
 let mockQueries = [];
 let mockExistingAssessment = null;
 
-jest.mock('../db/pool', () => ({
-  query: jest.fn(async (sql, params) => {
+jest.mock('../db/pool', () => {
+  // One handler for the pool and for transaction clients: the same statements
+  // run through both.
+  const run = async (sql, params) => {
     const text = String(sql).replace(/\s+/g, ' ').trim();
     mockQueries.push({ sql: text, params });
     if (/^SELECT dob, gender FROM pt_clients/i.test(text)) {
@@ -18,27 +20,23 @@ jest.mock('../db/pool', () => ({
     if (/^SELECT \* FROM pt_assessments/i.test(text)) {
       return { rows: mockExistingAssessment ? [mockExistingAssessment] : [], rowCount: mockExistingAssessment ? 1 : 0 };
     }
+    if (/^SELECT COALESCE\(MAX\(assessment_number\)/i.test(text)) return { rows: [{ n: 1 }], rowCount: 1 };
     if (/^UPDATE pt_assessments/i.test(text)) {
       return { rows: [{ ...(mockExistingAssessment || { id: 'a1' }), id: 'a1' }], rowCount: 1 };
     }
+    const keys = text.match(/^INSERT INTO pt_assessments \((.*?)\) VALUES/);
+    if (keys) {
+      const row = { id: 'a1', organization_id: ORG_A };
+      keys[1].split(', ').forEach((k, i) => { row[k] = params[i]; });
+      return { rows: [row], rowCount: 1 };
+    }
     return { rows: [], rowCount: 0 };
-  }),
-  connect: jest.fn(async () => ({
-    query: jest.fn(async (sql, params) => {
-      const text = String(sql).replace(/\s+/g, ' ').trim();
-      mockQueries.push({ sql: text, params });
-      if (/^SELECT COUNT\(\*\)/i.test(text)) return { rows: [{ n: 1 }], rowCount: 1 };
-      const keys = text.match(/^INSERT INTO pt_assessments \((.*?)\) VALUES/);
-      if (keys) {
-        const row = { id: 'a1', organization_id: ORG_A };
-        keys[1].split(', ').forEach((k, i) => { row[k] = params[i]; });
-        return { rows: [row], rowCount: 1 };
-      }
-      return { rows: [], rowCount: 0 };
-    }),
-    release: jest.fn(),
-  })),
-}));
+  };
+  return {
+    query: jest.fn(run),
+    connect: jest.fn(async () => ({ query: jest.fn(run), release: jest.fn() })),
+  };
+});
 jest.mock('../lib/orgGuard', () => ({ clientInOrg: jest.fn(async () => true) }));
 jest.mock('../lib/screeningGate', () => ({
   checkTrainingEligibility: jest.fn(async () => ({ blocked: null, warnings: [] })),
