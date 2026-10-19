@@ -57,7 +57,12 @@ function app() {
   const a = express();
   a.use(express.json());
   a.use('/api/progress', require('../modules/progress/progress.routes'));
-  a.use((err, _req, res, _next) => res.status(err.status || 500).json({ error: err.message }));
+  a.use((err, _req, res, _next) => {
+    // A 500 is a route bug, not a response under test. The status assertion
+    // only says "500"; printing the stack says why, in the same log.
+    if (!err.status || err.status >= 500) console.error(err.stack || err);
+    return res.status(err.status || 500).json({ error: err.message });
+  });
   return a;
 }
 
@@ -187,7 +192,9 @@ describe('PATCH /progress/assessments/:id — v3 payload', () => {
   /** The row as it comes back from a first save, plus the canonical stored string. */
   async function storedRow() {
     await post({ flexibility_test_data: battery() });
-    const stored = JSON.parse(insertCols().flexibility_test_data);
+    const cols = insertCols();
+    expect(cols).not.toBeNull();
+    const stored = JSON.parse(cols.flexibility_test_data);
     mockExistingAssessment = {
       id: 'a1', client_id: 'c1', organization_id: ORG_A, assessment_type: 'initial',
       assessment_date: '2026-01-10', weight: '80', height_cm: '180', bmi: '24.7',
