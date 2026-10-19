@@ -221,6 +221,30 @@ const templates = {
     },
     whatsapp: { template: 'membership_expiring', variables: [name, String(days), plan] },
   }),
+  assessment_reminder: ({ name, scheduled_date, days }) => ({
+    title: `Fitness re-test in ${days} days`,
+    body: `Hi ${name}, your next fitness assessment is due on ${scheduled_date}. Reply to your trainer if you need to move it.`,
+    email: {
+      subject: `Fitness re-test in ${days} days`,
+      html: `<p>Hi ${name},</p><p>Your next fitness assessment is due on <b>${scheduled_date}</b>.</p><p>Reply to your trainer if you need to move it.</p>`,
+    },
+  }),
+  assessment_due: ({ name, scheduled_date }) => ({
+    title: 'Fitness re-test due today',
+    body: `Hi ${name}, your fitness assessment is due today (${scheduled_date}). Your trainer will confirm the time.`,
+    email: {
+      subject: 'Fitness re-test due today',
+      html: `<p>Hi ${name},</p><p>Your fitness assessment is due today, <b>${scheduled_date}</b>.</p><p>Your trainer will confirm the time.</p>`,
+    },
+  }),
+  assessment_overdue: ({ name, scheduled_date, days }) => ({
+    title: 'Fitness re-test is overdue',
+    body: `Hi ${name}, your fitness assessment was due on ${scheduled_date} (${days} days ago). Your trainer can help you rebook.`,
+    email: {
+      subject: 'Fitness re-test is overdue',
+      html: `<p>Hi ${name},</p><p>Your fitness assessment was due on <b>${scheduled_date}</b> (${days} days ago).</p><p>Your trainer can help you rebook.</p>`,
+    },
+  }),
   class_reminder: ({ name, class_name, time }) => ({
     title: `${class_name} starts soon`,
     body: `Hi ${name}, reminder: ${class_name} at ${time}.`,
@@ -390,9 +414,16 @@ async function recipientFromClient(orgId, clientId) {
   const { rows } = await pool.query(
     `SELECT c.id AS client_id, c.id AS member_id, c.name, c.email,
             COALESCE(NULLIF(c.whatsapp, ''), c.mobile) AS phone, c.organization_id,
-            NULL AS user_id
+            u.id AS user_id
        FROM pt_clients c
-      WHERE c.id = $1 AND c.organization_id = $2 AND c.deleted_at IS NULL`,
+       LEFT JOIN users u
+              ON u.pt_client_id = c.id
+             AND u.organization_id = c.organization_id
+             AND u.deleted_at IS NULL
+             AND u.is_active = TRUE
+      WHERE c.id = $1 AND c.organization_id = $2 AND c.deleted_at IS NULL
+      ORDER BY u.created_at ASC
+      LIMIT 1`,
     [clientId, orgId]
   );
   return rows[0] || null;

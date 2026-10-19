@@ -102,6 +102,13 @@ const DEGRADATION = {
       + 'later boot.',
     source: 'workers/automation.worker.js upsertJobScheduler; throws on a Redis timeout',
   },
+  'progress-reminders': {
+    mode: MODE.STOPPED,
+    impact: 'The daily re-test reminder sweep does not run. Nothing is sent while Redis is '
+      + 'down; when it resumes, only stages matching that day fire, so a multi-day outage '
+      + 'can skip a 30/14/7-day reminder. The overdue reminder still fires once.',
+    source: 'workers/progress.worker.js upsertJobScheduler; no producer fallback exists',
+  },
 };
 
 /**

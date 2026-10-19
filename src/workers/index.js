@@ -122,6 +122,7 @@ async function startWorkers() {
   const { createNotificationsWorker } = require('./notifications.worker');
   const { createRenewalWorker, scheduleRenewalCron } = require('./renewal.worker');
   const { createAutomationWorker, scheduleAutomationSweep } = require('./automation.worker');
+  const { createProgressWorker, scheduleProgressSweep } = require('./progress.worker');
 
   const workers = [
     createEmailWorker(),
@@ -130,6 +131,7 @@ async function startWorkers() {
     createNotificationsWorker(),
     createRenewalWorker(),
     createAutomationWorker(),
+    createProgressWorker(),
   ];
   await scheduleRenewalCron();
 
@@ -144,6 +146,12 @@ async function startWorkers() {
     await scheduleAutomationSweep();
   } catch (err) {
     logger.error({ err: err.message }, 'automation sweep cron not scheduled');
+  }
+
+  try {
+    await scheduleProgressSweep();
+  } catch (err) {
+    logger.error({ err: err.message }, 'progress reminder cron not scheduled');
   }
 
   activeWorkers = workers;
