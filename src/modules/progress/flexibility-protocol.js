@@ -283,7 +283,7 @@ const hipFlexorsSideSchema = z.object({
   notes: notesField,
 });
 
-/** One test: fully recorded (+ marked complete), or unable with a reason. */
+/** One test: either the recorded values, or unable with a reason. */
 function batteryTest(parts, isComplete, message) {
   return z.object({
     ...parts,
@@ -293,7 +293,7 @@ function batteryTest(parts, isComplete, message) {
   }).refine(
     (v) => (v.unable_to_complete === true
       ? typeof v.unable_reason === 'string' && v.unable_reason.trim().length > 0
-      : v.completed === true && isComplete(v)),
+      : isComplete(v)),
     { message }
   );
 }
@@ -301,17 +301,17 @@ function batteryTest(parts, isComplete, message) {
 const quadricepsTestSchema = batteryTest(
   { sides: z.object({ left: quadricepsSideSchema, right: quadricepsSideSchema }).optional() },
   (v) => !!v.sides,
-  'Record both sides and mark the test complete, or record why it cannot be completed.'
+  'Record both sides of the quadriceps test, or record why it cannot be completed.'
 );
 const hamstringsTestSchema = batteryTest(
   { sides: z.object({ left: hamstringsSideSchema, right: hamstringsSideSchema }).optional() },
   (v) => !!v.sides,
-  'Record both sides and mark the test complete, or record why it cannot be completed.'
+  'Record both sides of the hamstrings test, or record why it cannot be completed.'
 );
 const hipFlexorsTestSchema = batteryTest(
   { sides: z.object({ left: hipFlexorsSideSchema, right: hipFlexorsSideSchema }).optional() },
   (v) => !!v.sides,
-  'Record both sides and mark the test complete, or record why it cannot be completed.'
+  'Record both sides of the hip flexors test, or record why it cannot be completed.'
 );
 const sitAndReachTestSchema = batteryTest(
   {
@@ -324,7 +324,7 @@ const sitAndReachTestSchema = batteryTest(
     notes: notesField,
   },
   (v) => Array.isArray(v.attempts) && v.attempts.some((a) => a.valid === true),
-  'Record 1-3 attempts with at least one valid attempt, and mark the test complete — or record why it cannot be completed.'
+  'Record 1-3 attempts with at least one valid attempt, or record why it cannot be completed.'
 );
 
 const recordedSchema = z.object({
@@ -367,7 +367,7 @@ function validateForStorage(recorded) {
   if (!incomplete.length) return null;
   const stillRecorded = incomplete.filter((k) => !tests[k] || tests[k].unable_to_complete !== true);
   if (stillRecorded.length) {
-    return `Record ${stillRecorded.map((k) => TEST_LABELS[k]).join(', ')} — or record why each cannot be completed.`;
+    return `Still to record: ${stillRecorded.map((k) => TEST_LABELS[k]).join(', ')}. Record each test and mark it complete, or record why it cannot be completed.`;
   }
   const reason = recorded.override && typeof recorded.override.reason === 'string'
     ? recorded.override.reason.trim() : '';

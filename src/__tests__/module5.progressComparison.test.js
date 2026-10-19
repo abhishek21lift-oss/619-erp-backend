@@ -111,6 +111,43 @@ describe('Module 5 seven-domain comparison', () => {
     expect(valueOf(a, 'strength_test2_1rm')).toBeNull();
   });
 
+  it('reads K11 v3 flexibility metrics: null stays null, a negative score is a real value', () => {
+    const v3 = {
+      protocol_version: 'k11-2026.01',
+      tests: {
+        quadriceps: { sides: { left: { contact: true, distance_cm: null }, right: { contact: false, distance_cm: 6.5 } } },
+        hamstrings: { sides: { left: { hip_flexion_deg: 68 }, right: { hip_flexion_deg: 78 } } },
+        sit_and_reach: { best_raw_inches: 12.5, score_inches: -2.5 },
+      },
+    };
+    const a = assessment({ flexibility_test_data: v3, mobility_score_computed: null });
+    expect(valueOf(a, 'flex_quadriceps_right_cm')).toBe(6.5);
+    expect(valueOf(a, 'flex_quadriceps_left_cm')).toBeNull(); // a gap of "no measurement", never 0
+    expect(valueOf(a, 'flex_hamstrings_left_deg')).toBe(68);
+    expect(valueOf(a, 'flex_sit_reach_score_in')).toBe(-2.5);
+    expect(valueOf(a, 'flexibility_test1_score')).toBeNull(); // legacy keys do not resolve on a v3 row
+  });
+
+  it('compares K11 metrics by their own direction: a smaller gap improves, more degrees improves', () => {
+    const v3 = (gap, angle) => ({
+      protocol_version: 'k11-2026.01',
+      tests: {
+        quadriceps: { sides: { left: { contact: false, distance_cm: gap }, right: { contact: false, distance_cm: gap } } },
+        hamstrings: { sides: { left: { hip_flexion_deg: angle }, right: { hip_flexion_deg: angle } } },
+        sit_and_reach: { best_raw_inches: 12, score_inches: -3 },
+      },
+    });
+    const baseline = assessment({ flexibility_test_data: v3(6.5, 68), mobility_score_computed: null });
+    const latest = assessment({
+      id: 'a2', assessment_date: '2026-06-10', flexibility_test_data: v3(3, 80), mobility_score_computed: null,
+    });
+    const result = compareAssessments(baseline, latest);
+    const gap = result.domains[6].metrics.find((m) => m.key === 'flex_quadriceps_left_cm');
+    expect(gap).toMatchObject({ baseline_value: 6.5, latest_value: 3, outcome: 'improved', improved: true });
+    const angle = result.domains[6].metrics.find((m) => m.key === 'flex_hamstrings_left_deg');
+    expect(angle).toMatchObject({ baseline_value: 68, latest_value: 80, outcome: 'improved', improved: true });
+  });
+
   it('returns an explicit no-data shape instead of throwing', () => {
     const result = compareAssessments({}, {});
     expect(result.summary.compared).toBe(0);
