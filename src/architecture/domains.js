@@ -260,6 +260,11 @@ const DOMAINS = {
       'member_goals',
       // The Client Interview step of the intake journey (migration 227).
       'pt_client_interviews',
+      // Module 5 re-test cycles, reminder ledger, daily journal and trainer
+      // insight reviews (migration 231).
+      'progress_retest_settings', 'progress_retest_schedules',
+      'progress_reminder_deliveries', 'client_habit_logs',
+      'client_habit_preferences', 'progress_insight_reviews',
     ],
   },
 
