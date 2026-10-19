@@ -7,6 +7,7 @@ const { tenantScope, orgIdOf, orgWhere } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
 const { checkTrainingEligibility } = require('../../lib/screeningGate');
 const scoring = require('./fitness-scoring');
+const flexibilityProtocol = require('./flexibility-protocol');
 const goalScoring = require('./goal-scoring');
 const lifestyleScoring = require('./lifestyle-scoring');
 const nutritionScoring = require('./nutrition-scoring');
@@ -94,8 +95,9 @@ const assessmentCreateSchema = {
     endurance_test_type_2: z.enum(['Push Up Test', 'Curl Up Test', 'Wall Sit', 'Plank', 'Bodyweight Squat', 'Custom']).optional().nullable(),
     endurance_test_data: z.record(z.string(), z.unknown()).optional().nullable(),
 
-    // Step 7 — Flexibility (two distinct tests required — same battery
-    // pattern; flexibility_test_data now holds {test1, test2})
+    // Step 7 — Flexibility. The K11 four-test battery (v3 payload, shape and
+    // rules in flexibility-protocol.js) or a legacy {test1, test2} blob —
+    // legacy payloads stay readable and round-trip unchanged forever.
     flexibility_test_data: z.record(z.string(), z.unknown()).optional().nullable(),
 
     posture_notes: text(2000),
@@ -162,6 +164,13 @@ function assessmentAsBody(row) {
   return out;
 }
 
+/** A JSONB column as an object, whichever form the driver or a mock returns it in. */
+function asObject(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
 async function demographics(req, clientId, b) {
   // Age and gender pick the norm band every result is graded against, so the
   // client record decides them. They used to come from the request first,
@@ -189,7 +198,7 @@ async function demographics(req, clientId, b) {
  * and edit so the two can never score the same numbers differently.
  * Returns `{ error }` when the safety rules refuse the test.
  */
-function computeAssessment(b, age, gender) {
+function computeAssessment(b, age, gender, opts = {}) {
   // ── Step 1: Blood Pressure ──
   const bp = scoring.classifyBp(b.bp_systolic ?? null, b.bp_diastolic ?? null);
   const exertion = [b.cardio_test_type, b.strength_exercise, b.strength_exercise_2, b.endurance_test_type, b.endurance_test_type_2]
@@ -279,15 +288,39 @@ function computeAssessment(b, age, gender) {
   const enduranceCategory2 = scoring.classifyEndurance(b.endurance_test_type_2, enduranceValue2, gender);
   const enduranceScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(enduranceCategory), scoring.scoreCategory(enduranceCategory2));
 
-  // ── Step 7: Flexibility (two-test battery) ──
+  // ── Step 7: Flexibility (K11 four-test battery or legacy two-slot blob) ──
+  // A v3 payload is validated and re-derived here — the single writer of the
+  // stored form — and its derived score columns stay null on purpose: four
+  // tests in centimetres, degrees and inches have no honest common 0-100
+  // score. Legacy blobs keep the original two-slot scoring, so old rows read
+  // exactly as they always did.
   const fd = b.flexibility_test_data || {};
-  const ft1 = fd.test1 || {};
-  const ft2 = fd.test2 || {};
-  const hasAsymmetry = scoring.checkAsymmetry(num(ft1.left, null), num(ft1.right, null))
-    || scoring.checkAsymmetry(num(ft2.left, null), num(ft2.right, null));
-  const flexibilityCategory = scoring.classifyFlexibilityScore(num(ft1.score, null));
-  const flexibilityCategory2 = scoring.classifyFlexibilityScore(num(ft2.score, null));
-  const mobilityScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(flexibilityCategory), scoring.scoreCategory(flexibilityCategory2));
+  let flexibilityCell;
+  let flexibilityCategory = null;
+  let flexibilityCategory2 = null;
+  let mobilityScore = null;
+  let hasAsymmetry;
+  if (flexibilityProtocol.isRecordedBattery(fd)) {
+    const parsed = flexibilityProtocol.parseRecorded(fd);
+    if (!parsed.ok) return { error: { status: 400, code: 'FLEXIBILITY_INVALID', message: parsed.message } };
+    const incomplete = flexibilityProtocol.validateForStorage(parsed.recorded);
+    if (incomplete) return { error: { status: 400, code: 'FLEXIBILITY_INCOMPLETE', message: incomplete } };
+    const derived = flexibilityProtocol.deriveFlexibility(parsed.recorded);
+    hasAsymmetry = derived.has_asymmetry;
+    flexibilityCell = JSON.stringify(flexibilityProtocol.assembleStored(parsed.recorded, {
+      userId: opts.userId,
+      prev: opts.existingFlexibility,
+    }));
+  } else {
+    const ft1 = fd.test1 || {};
+    const ft2 = fd.test2 || {};
+    hasAsymmetry = scoring.checkAsymmetry(num(ft1.left, null), num(ft1.right, null))
+      || scoring.checkAsymmetry(num(ft2.left, null), num(ft2.right, null));
+    flexibilityCategory = scoring.classifyFlexibilityScore(num(ft1.score, null));
+    flexibilityCategory2 = scoring.classifyFlexibilityScore(num(ft2.score, null));
+    mobilityScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(flexibilityCategory), scoring.scoreCategory(flexibilityCategory2));
+    flexibilityCell = JSON.stringify(fd);
+  }
 
   // ── Dashboard scores ──
   const bodyCompositionScore = scoring.scoreBodyComposition(b.body_fat_pct ?? null, gender);
@@ -330,7 +363,7 @@ function computeAssessment(b, age, gender) {
       endurance_test_type: b.endurance_test_type || null, endurance_test_type_2: b.endurance_test_type_2 || null,
       endurance_test_data: JSON.stringify(ed), endurance_category: enduranceCategory, endurance_category_2: enduranceCategory2,
       endurance_score_computed: enduranceScore,
-      flexibility_test_data: JSON.stringify(fd), flexibility_category: flexibilityCategory, flexibility_category_2: flexibilityCategory2,
+      flexibility_test_data: flexibilityCell, flexibility_category: flexibilityCategory, flexibility_category_2: flexibilityCategory2,
       has_asymmetry: hasAsymmetry, mobility_score_computed: mobilityScore,
       body_composition_score: bodyCompositionScore, health_risk_score: healthRiskScore, overall_fitness_score: overallScore,
       posture_notes: b.posture_notes || null, health_notes: healthNotes,
@@ -353,7 +386,7 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
   if (blocked) return res.status(blocked.status).json(blocked.body);
 
   const { age, gender } = await demographics(req, b.client_id, b);
-  const result = computeAssessment(b, age, gender);
+  const result = computeAssessment(b, age, gender, { userId: req.user.id });
   if (result.error) return res.status(result.error.status).json({ error: { code: result.error.code, message: result.error.message } });
 
   // The assessor is the studio's trainer profile, from the session. A
@@ -405,7 +438,13 @@ router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdate
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   const merged = { ...assessmentAsBody(existing), ...req.body };
   const { age, gender } = await demographics(req, existing.client_id, merged);
-  const result = computeAssessment(merged, age, gender);
+  // The row's stored v3 battery travels beside the merged body: provenance
+  // (recorded_at, assessor, override stamp) is write-once, so an edit that
+  // does not change the battery round-trips it byte-identically.
+  const result = computeAssessment(merged, age, gender, {
+    userId: req.user.id,
+    existingFlexibility: asObject(existing.flexibility_test_data),
+  });
   if (result.error) return res.status(result.error.status).json({ error: { code: result.error.code, message: result.error.message } });
   const tx = await pool.connect();
   let row;
