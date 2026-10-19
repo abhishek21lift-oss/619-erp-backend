@@ -4,6 +4,12 @@
 // formulas, duplicated deliberately since there's no shared package between
 // the two apps. Scores/categories are always computed here (server-side),
 // never trusted from client-submitted values.
+//
+// Formula-bundle version. Bump whenever any formula in this module changes.
+// Persisting it per assessment requires the approval-gated migration described
+// in F10 (new nullable `scoring_formula_version` column on pt_assessments);
+// until then this is documentation only and legacy rows are treated as unknown.
+const FITNESS_SCORING_VERSION = '1';
 
 function round(n, decimals = 1) {
   const f = 10 ** decimals;
@@ -131,7 +137,7 @@ function ageBand(age) {
   return 'senior';
 }
 function classifyVo2Max(vo2, age, gender) {
-  if (vo2 == null) return null;
+  if (vo2 == null || !Number.isFinite(vo2) || vo2 <= 0) return null;
   const g = sexOf(gender);
   if (!g) return null;
   const [excellent, good, average, belowAverage] = VO2_MAX_NORMS[g][ageBand(age || 30)];
@@ -145,7 +151,9 @@ function classifyVo2Max(vo2, age, gender) {
 // YMCA 3-Minute Step Test has no standard closed-form VO2max — classify
 // heart-rate recovery only, on a simplified single scale.
 function classifyStepTestRecovery(recoveryHr) {
-  if (recoveryHr == null) return null;
+  // Implausible recovery heart rate (not a real measurement) must not produce
+  // a category — guard the physiological range.
+  if (recoveryHr == null || !Number.isFinite(recoveryHr) || recoveryHr < 40 || recoveryHr > 220) return null;
   if (recoveryHr < 80) return 'Excellent';
   if (recoveryHr < 90) return 'Good';
   if (recoveryHr < 100) return 'Average';
@@ -210,7 +218,9 @@ const CURLUP_NORMS = { Male: [40, 30, 20, 10], Female: [35, 25, 15, 8] };
 const PLANK_NORMS_SEC = [120, 60, 30, 15]; // single scale, no standard gender norm
 
 function classifyEndurance(testType, value, gender) {
-  if (value == null) return null;
+  // A zero or negative result is not a performed test — never classify it as
+  // "Poor" (20), which would masquerade as a real (bad) score.
+  if (value == null || !Number.isFinite(value) || value <= 0) return null;
   const g = sexOf(gender);
   let thresholds;
   // Plank norms are a single scale; the others are split by sex.
@@ -238,8 +248,10 @@ function checkAsymmetry(left, right, thresholdPct = 10) {
 }
 
 function classifyFlexibilityScore(score) {
-  // score expected 0-10 (trainer-entered subjective/measured composite)
-  if (score == null) return null;
+  // score expected 0-10 (trainer-entered subjective/measured composite). Out-of-
+  // range or non-finite input is not a score — never classify it, so a 25
+  // cannot masquerade as "Excellent" (95). 0 is legitimate ("very limited").
+  if (score == null || !Number.isFinite(score) || score < 0 || score > 10) return null;
   if (score >= 8) return 'Excellent';
   if (score >= 6) return 'Good';
   if (score >= 4) return 'Average';
@@ -274,7 +286,8 @@ function scoreCategory(category) {
 }
 
 // Body Composition Score: 100 within a gender-specific "ideal" body-fat
-// range, linear falloff outside it.
+// range, linear falloff outside it. Returns null when gender is missing or
+// 'Other' — there is no sex-neutral reference range, so no score is invented.
 const IDEAL_BODY_FAT = { Male: [10, 20], Female: [18, 28] };
 function scoreBodyComposition(bodyFatPct, gender) {
   if (bodyFatPct == null) return null;
@@ -286,7 +299,12 @@ function scoreBodyComposition(bodyFatPct, gender) {
   return Math.max(0, Math.round(100 - distance * 4));
 }
 
-// Health Risk Score: average of a BP-category subscore and a BMI-category subscore.
+// Health Score (stored column `health_risk_score`): average of a BP-category
+// subscore and a BMI-category subscore. Higher is better — 100 is normal BP
+// within the healthy BMI band — same direction as the other five axes. BP bands
+// follow AHA BP categories; the BMI bands are a project-specific risk proxy
+// (not a clinical diagnosis): healthy 100, overweight and underweight both 60,
+// obese 30 — no separate underweight penalty. Discontinuity: 24.9 → 100, 25.0 → 60.
 const BP_RISK_SCORE = { Normal: 100, Elevated: 80, 'Hypertension Stage 1': 55, 'Hypertension Stage 2': 20, Hypotension: 40 };
 function scoreBmiRisk(bmi) {
   if (bmi == null) return null;
@@ -318,6 +336,7 @@ function computeOverallScore(scores) {
 }
 
 module.exports = {
+  FITNESS_SCORING_VERSION,
   classifyBp,
   calcBmi,
   calcWhr,

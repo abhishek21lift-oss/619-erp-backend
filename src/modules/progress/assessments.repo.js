@@ -7,7 +7,7 @@
 // organization with orgWhere(). The helpers that take a client_id are only
 // ever called after clientInOrg() has already checked that client.
 const pool = require('../../db/pool');
-const { orgWhere } = require('../../lib/tenant-db');
+const { orgWhere, orgIdOf } = require('../../lib/tenant-db');
 const strengthLogs = require('./strength-logs.repo');
 
 const JSONB = new Set(['cardio_test_data', 'strength_test_data', 'endurance_test_data', 'flexibility_test_data']);
@@ -24,13 +24,17 @@ const placeholders = (keys, offset = 0) =>
  * count and the insert one step. Column names come from the route, never
  * from the request.
  */
-async function insertAssessment(cols) {
-  const tx = await pool.connect();
+// `client` is an optional transaction connection supplied by the caller (F6
+// atomicity). When omitted, this function owns its transaction (legacy callers).
+async function insertAssessment(cols, client = null) {
+  const own = !client;
+  const tx = client || await pool.connect();
   try {
-    await tx.query('BEGIN');
+    if (own) await tx.query('BEGIN');
     await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`pt_assessments:${cols.client_id}`]);
+    // MAX (not COUNT) so a deleted assessment does not get its number reused (F11).
     const { rows: next } = await tx.query(
-      'SELECT COUNT(*)::int + 1 AS n FROM pt_assessments WHERE client_id = $1', [cols.client_id]
+      'SELECT COALESCE(MAX(assessment_number), 0)::int + 1 AS n FROM pt_assessments WHERE client_id = $1', [cols.client_id]
     );
     const record = { ...cols, assessment_number: next[0].n };
     const keys = Object.keys(record);
@@ -38,13 +42,13 @@ async function insertAssessment(cols) {
       `INSERT INTO pt_assessments (${keys.join(', ')}) VALUES (${placeholders(keys).join(', ')}) RETURNING *`,
       keys.map((k) => record[k])
     );
-    await tx.query('COMMIT');
+    if (own) await tx.query('COMMIT');
     return rows[0];
   } catch (err) {
-    await tx.query('ROLLBACK').catch(() => {});
+    if (own) await tx.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
-    tx.release();
+    if (own) tx.release();
   }
 }
 
@@ -56,23 +60,39 @@ async function findAssessment(req, id) {
 }
 
 /** `id` must already be one the caller's organization owns (findAssessment). */
-async function updateAssessment(id, cols) {
+async function updateAssessment(id, organizationId, cols, client = null) {
+  const c = client || pool;
   const keys = Object.keys(cols);
   const sets = keys.map((k, i) => `${k} = ${placeholders([k], i + 1)[0]}`);
-  const { rows } = await pool.query(
-    `UPDATE pt_assessments SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $1 RETURNING *`,
-    [id, ...keys.map((k) => cols[k])]
+  const orgClause = organizationId != null ? ` AND organization_id = $${keys.length + 2}` : '';
+  const params = [id, ...keys.map((k) => cols[k])];
+  if (organizationId != null) params.push(organizationId);
+  const { rows } = await c.query(
+    `UPDATE pt_assessments SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $1${orgClause} RETURNING *`,
+    params
   );
   return rows[0];
 }
 
 /** Removes the test and the lifts it recorded. Returns false when not found. */
-async function deleteAssessment(req, id) {
+async function deleteAssessment(req, id, client = null) {
   const found = await findAssessment(req, id);
   if (!found) return false;
-  await pool.query('DELETE FROM strength_logs WHERE assessment_id = $1', [id]);
-  await pool.query('DELETE FROM pt_assessments WHERE id = $1', [id]);
-  return true;
+  const own = !client;
+  const c = client || await pool.connect();
+  const orgId = orgIdOf(req);
+  try {
+    if (own) await c.query('BEGIN');
+    await c.query(`DELETE FROM strength_logs WHERE assessment_id = $1 AND organization_id = $2`, [id, orgId]);
+    await c.query(`DELETE FROM pt_assessments WHERE id = $1 AND organization_id = $2`, [id, orgId]);
+    if (own) await c.query('COMMIT');
+    return true;
+  } catch (err) {
+    if (own) await c.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    if (own) c.release();
+  }
 }
 
 /**
@@ -82,8 +102,9 @@ async function deleteAssessment(req, id) {
  * Replaced whole on every save of the test, so an edit cannot leave a stale
  * lift behind.
  */
-async function replaceAssessmentLifts(assessment, lifts) {
-  await pool.query('DELETE FROM strength_logs WHERE assessment_id = $1', [assessment.id]);
+async function replaceAssessmentLifts(assessment, lifts, client = null) {
+  const c = client || pool;
+  await c.query('DELETE FROM strength_logs WHERE assessment_id = $1', [assessment.id]);
   const logDate = String(assessment.assessment_date instanceof Date
     ? assessment.assessment_date.toISOString() : assessment.assessment_date || '').slice(0, 10) || null;
   for (const l of lifts) {
@@ -92,6 +113,7 @@ async function replaceAssessmentLifts(assessment, lifts) {
       setsDone: 1, repsDone: l.reps, oneRm: l.oneRm, notes: 'Recorded in a fitness test',
       assessmentId: assessment.id, formula: l.formula, direct: l.direct,
       organizationId: assessment.organization_id, logDate,
+      client,
     });
   }
 }
@@ -101,9 +123,10 @@ async function replaceAssessmentLifts(assessment, lifts) {
  * the PAR-Q autofill and the profile read it from. Nothing wrote these
  * columns before, so all three showed blank.
  */
-async function updateClientBody(clientId, organizationId, weight, heightCm) {
+async function updateClientBody(clientId, organizationId, weight, heightCm, client = null) {
   if (weight == null && heightCm == null) return;
-  await pool.query(
+  const c = client || pool;
+  await c.query(
     `UPDATE pt_clients SET weight = COALESCE($3, weight), height = COALESCE($4, height)
       WHERE id = $1 AND organization_id = $2`,
     [clientId, organizationId, weight ?? null, heightCm ?? null]
