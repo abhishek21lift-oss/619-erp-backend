@@ -131,7 +131,7 @@ router.get('/assessments', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT pa.*, t.name AS trainer_name FROM pt_assessments pa
      LEFT JOIN trainers t ON t.id = pa.trainer_id AND t.organization_id = pa.organization_id ${whereSql}
-     ORDER BY assessment_date DESC LIMIT $${limIdx} OFFSET $${offIdx}`, params
+     ORDER BY assessment_date DESC, created_at DESC, id DESC LIMIT $${limIdx} OFFSET $${offIdx}`, params
   );
   res.json({ data: rows });
 }));
@@ -278,8 +278,14 @@ function computeAssessment(b, age, gender, opts = {}) {
   const ed = b.endurance_test_data || {};
   const t1 = ed.test1 || {};
   const t2 = ed.test2 || {};
-  const enduranceCategory = scoring.classifyEndurance(b.endurance_test_type, num(t1.reps, null) ?? num(t1.durationSec, null), gender);
-  const enduranceCategory2 = scoring.classifyEndurance(b.endurance_test_type_2, num(t2.reps, null) ?? num(t2.durationSec, null), gender);
+  // Interpret by the test's own protocol: rep-based tests use repetitions,
+  // time-based tests use duration. A stray value in the other field is ignored
+  // rather than reinterpreted (F7).
+  const isRepBasedEndurance = (t) => t === 'Push Up Test' || t === 'Curl Up Test';
+  const enduranceValue1 = isRepBasedEndurance(b.endurance_test_type) ? num(t1.reps, null) : num(t1.durationSec, null);
+  const enduranceValue2 = isRepBasedEndurance(b.endurance_test_type_2) ? num(t2.reps, null) : num(t2.durationSec, null);
+  const enduranceCategory = scoring.classifyEndurance(b.endurance_test_type, enduranceValue1, gender);
+  const enduranceCategory2 = scoring.classifyEndurance(b.endurance_test_type_2, enduranceValue2, gender);
   const enduranceScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(enduranceCategory), scoring.scoreCategory(enduranceCategory2));
 
   // ── Step 7: Flexibility (K11 four-test battery or legacy two-slot blob) ──
@@ -386,15 +392,26 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
   // The assessor is the studio's trainer profile, from the session. A
   // trainer_id in the body is ignored: it is a foreign key, and taking it
   // from the request would let a row point at another studio's trainer.
-  const row = await assessmentsRepo.insertAssessment({
-    client_id: b.client_id, trainer_id: req.user.trainer_id || null,
-    ...result.cols, created_by: req.user.id, organization_id: orgIdOf(req),
-  });
-  await assessmentsRepo.replaceAssessmentLifts(row, result.lifts);
-  await assessmentsRepo.updateClientBody(row.client_id, row.organization_id, result.cols.weight, result.cols.height_cm);
-  // The assessment is already saved. A scheduling failure must not turn a
-  // successful test into a 500 the trainer will retry and duplicate, so it is
-  // logged and reported beside the assessment instead.
+  // All three writes (assessment row, lift sync, client body data) must succeed
+  // or fail together (F6). The re-test scheduling side effect stays outside
+  // the transaction: it is not a data write that must roll back.
+  const tx = await pool.connect();
+  let row;
+  try {
+    await tx.query('BEGIN');
+    row = await assessmentsRepo.insertAssessment({
+      client_id: b.client_id, trainer_id: req.user.trainer_id || null,
+      ...result.cols, created_by: req.user.id, organization_id: orgIdOf(req),
+    }, tx);
+    await assessmentsRepo.replaceAssessmentLifts(row, result.lifts, tx);
+    await assessmentsRepo.updateClientBody(row.client_id, row.organization_id, result.cols.weight, result.cols.height_cm, tx);
+    await tx.query('COMMIT');
+  } catch (err) {
+    await tx.query('ROLLBACK').catch(() => {});
+    tx.release();
+    throw err;
+  }
+  tx.release();
   let retest = null;
   let retestError = null;
   try {
@@ -429,9 +446,20 @@ router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdate
     existingFlexibility: asObject(existing.flexibility_test_data),
   });
   if (result.error) return res.status(result.error.status).json({ error: { code: result.error.code, message: result.error.message } });
-  const row = await assessmentsRepo.updateAssessment(existing.id, result.cols);
-  await assessmentsRepo.replaceAssessmentLifts(row, result.lifts);
-  await assessmentsRepo.updateClientBody(row.client_id, row.organization_id, result.cols.weight, result.cols.height_cm);
+  const tx = await pool.connect();
+  let row;
+  try {
+    await tx.query('BEGIN');
+    row = await assessmentsRepo.updateAssessment(existing.id, orgIdOf(req), result.cols, tx);
+    await assessmentsRepo.replaceAssessmentLifts(row, result.lifts, tx);
+    await assessmentsRepo.updateClientBody(row.client_id, row.organization_id, result.cols.weight, result.cols.height_cm, tx);
+    await tx.query('COMMIT');
+  } catch (err) {
+    await tx.query('ROLLBACK').catch(() => {});
+    tx.release();
+    throw err;
+  }
+  tx.release();
   res.json({ data: { ...row, bp_unsafe: result.bpUnsafe } });
 }));
 

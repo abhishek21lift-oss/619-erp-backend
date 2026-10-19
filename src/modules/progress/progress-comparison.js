@@ -84,7 +84,7 @@ const DOMAINS = [
   {
     key: 'flexibility', label: 'Flexibility & Mobility',
     metrics: [
-      { key: 'mobility_score_computed', label: 'Mobility score', unit: '/100', higherIsBetter: true, decimals: 0 },
+      { key: 'mobility_score_computed', label: 'Flexibility score', unit: '/100', higherIsBetter: true, decimals: 0 },
       { key: 'flexibility_test1_score', label: 'Test 1 score', unit: 'score', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type' },
       { key: 'flexibility_test1_right', label: 'Test 1 right', unit: 'cm', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type' },
       { key: 'flexibility_test1_left', label: 'Test 1 left', unit: 'cm', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type' },
