@@ -247,25 +247,6 @@ function classifyFlexibilityScore(score) {
   return 'Poor';
 }
 
-// Flexibility ROM norm-sheet benchmark. Norms are intentionally empty:
-// values must come from a validated reference (ACSM/YMCA/published ROM
-// tables) with documented population, units and age/sex bands. We never
-// fabricate benchmark values. With no matching norm this returns null and
-// the caller renders "Norm data unavailable".
-const FLEXIBILITY_ROM_NORMS = [];
-
-function classifyFlexibilityROM(test, value, age, sex) {
-  if (value == null || !Number.isFinite(value) || age == null || !sex) return null;
-  const norm = FLEXIBILITY_ROM_NORMS.find(
-    (n) => n.test === test && n.sex === (sex === 'Female' ? 'Female' : 'Male') && age >= n.ageMin && age <= n.ageMax
-  );
-  if (!norm) return null;
-  if (value >= norm.excellent) return 'Excellent';
-  if (value >= norm.good) return 'Good';
-  if (value >= norm.average) return 'Average';
-  return 'Below Average';
-}
-
 // ── Category → score mapping (used consistently across Cardio/
 //    Endurance/Mobility/Strength for the 0-100 dashboard scores) ──
 const CATEGORY_SCORES = { Excellent: 95, Good: 80, Average: 60, 'Below Average': 40, Poor: 20 };
@@ -336,7 +317,6 @@ module.exports = {
   classifyEndurance,
   checkAsymmetry,
   classifyFlexibilityScore,
-  classifyFlexibilityROM,
   scoreCategory,
   scoreBodyComposition,
   scoreHealthRisk,
