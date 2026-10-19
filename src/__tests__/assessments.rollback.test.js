@@ -35,7 +35,6 @@ const CID = 'rb-client';
 describeIf('assessment rollback on lift-sync failure', () => {
   let pool;
   let app;
-  const request = () => require('supertest')(app);
 
   beforeAll(async () => {
     pool = require('../db/pool');
