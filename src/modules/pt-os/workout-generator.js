@@ -13,7 +13,10 @@
 
 const { prescribeStrengthLoad } = require('./rm-prescription');
 const { sequenceWorkout } = require('./exercise-sequencing');
-const { buildFivePhaseCardio } = require('./cardio');
+const {
+  buildFivePhaseCardio, buildFittPrescription, classifyCardioModality,
+  getK11IntensityBand, isCardioCalculationMethod, isCardioProgramType, resolveHeartRateInputs,
+} = require('./cardio');
 
 /** Movement patterns a balanced session tries to cover, in priority order. */
 const PATTERN_COVERAGE = Object.freeze(['Squat', 'Hinge', 'Horizontal Push', 'Horizontal Pull', 'Vertical Push', 'Vertical Pull', 'Carry', 'Anti-Extension']);
@@ -166,7 +169,87 @@ function generateWorkout(input) {
   let conditioning = null;
   if (includeCardio && cardioMinutes > 0) {
     const modality = options.modality || (cardioOptions[0] ? cardioOptions[0].name : 'Cycling');
-    conditioning = { modality, minutes: cardioMinutes, intensity: 'moderate', notes: 'Steady state or intervals per tolerance.' };
+
+    // The request supplies structured FITT choices when the trainer made them;
+    // otherwise these are application defaults, not K11 physiological limits.
+    // Defaulting to moderate/3x/continuous is a product decision, and it is
+    // marked as such on the returned conditioning block.
+    const requestedIntensity = options.cardioIntensity;
+    const intensityIsDefault = !(requestedIntensity && getK11IntensityBand(requestedIntensity));
+    const cardioIntensity = intensityIsDefault ? 'moderate' : requestedIntensity;
+    const requestedProgram = options.cardioProgramType;
+    const programIsDefault = !(requestedProgram && isCardioProgramType(requestedProgram));
+    const programType = programIsDefault ? 'continuous-liss' : requestedProgram;
+    const frequencyIsDefault = !(Number.isInteger(options.cardioFrequencyPerWeek)
+      && options.cardioFrequencyPerWeek > 0);
+    const frequencyPerWeek = frequencyIsDefault ? 3 : options.cardioFrequencyPerWeek;
+    // Name each default rather than one all-or-nothing flag: a trainer who
+    // chose HIIT but left frequency blank still needs to see that 3x is ours.
+    const defaults = [
+      ...(intensityIsDefault ? ['intensity'] : []),
+      ...(frequencyIsDefault ? ['frequency'] : []),
+      ...(programIsDefault ? ['programme'] : []),
+    ];
+
+    // Heart-rate targets need an explicit method and client numbers. The repo
+    // does not supply age or a measured max, so without request options this
+    // stays null rather than guessing one.
+    const hasHeartRateInput = options.age != null
+      || options.measuredMaxHeartRate != null
+      || options.restingHeartRate != null;
+    const heartRate = hasHeartRateInput
+      ? resolveHeartRateInputs({
+        age: options.age,
+        measuredMaxHeartRate: options.measuredMaxHeartRate,
+        restingHeartRate: options.restingHeartRate,
+      })
+      : { value: null, errors: [] };
+    const fittResult = heartRate.value
+      ? buildFittPrescription({
+        maxHeartRate: heartRate.value.maxHeartRate,
+        restingHeartRate: heartRate.value.restingHeartRate,
+        method: isCardioCalculationMethod(options.cardioMethod) ? options.cardioMethod : 'karvonen',
+        intensity: cardioIntensity,
+        frequencyPerWeek,
+        mainWorkMinutes: cardioMinutes,
+        modality,
+        programType,
+      })
+      : null;
+    const fittValue = fittResult ? fittResult.value : null;
+    const warnings = [];
+    if (heartRate.errors.length) warnings.push(...heartRate.errors);
+    if (fittResult) {
+      warnings.push(...fittResult.errors);
+      if (fittValue) warnings.push(...fittValue.warnings);
+    }
+
+    conditioning = {
+      modality,
+      minutes: cardioMinutes,
+      intensity: cardioIntensity,
+      notes: 'Steady state or intervals per tolerance.',
+      fitt: {
+        frequencyPerWeek,
+        timeMinutes: cardioMinutes,
+        intensity: cardioIntensity,
+        modalityCategory: fittValue
+          ? fittValue.modalityCategory
+          : classifyCardioModality(modality),
+        programType,
+        basis: defaults.length === 0 ? 'requested' : 'application-default',
+        defaults,
+      },
+      targetHeartRate: fittValue
+        ? {
+          method: fittValue.targetHeartRate.method,
+          minBpm: fittValue.targetHeartRate.minBpm,
+          maxBpm: fittValue.targetHeartRate.maxBpm,
+          basisLabel: fittValue.targetHeartRate.basisLabel,
+        }
+        : null,
+      warnings,
+    };
   }
 
   const cooldown = [
@@ -177,6 +260,7 @@ function generateWorkout(input) {
   const warnings = [];
   if (!sequenced.length) warnings.push('No suitable exercises were found in the library pool for this client\'s constraints.');
   if (excluded.length) warnings.push(`${excluded.length} exercise(s) were excluded by recorded restrictions.`);
+  if (conditioning && conditioning.warnings.length) warnings.push(...conditioning.warnings);
 
   const explanations = sequenced.map((ex) => ({ exerciseId: ex.id, reason: ex.reason, prescriptionBasis: ex.prescription.notes }));
 

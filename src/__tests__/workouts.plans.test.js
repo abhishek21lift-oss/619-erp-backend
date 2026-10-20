@@ -239,6 +239,19 @@ describe('granular endpoints — what makes autosave safe', () => {
     expect(sqls().some((s) => /DELETE FROM workout_exercises/.test(s))).toBe(false);
   });
 
+  it('opens the transaction before loading the plan, so app_tenant can see it', async () => {
+    // pool.connect() scopes app.org_id to the transaction. A plan read before
+    // BEGIN returns no rows under the RLS-serving role, which surfaced as a
+    // 404 on the builder's autosave.
+    await request(app).patch(`/api/workouts/plans/${PLAN}/exercises/row-9`)
+      .send({ sets: 5 });
+    const calls = sqls();
+    const begin = calls.findIndex((s) => /^BEGIN/.test(s));
+    const load = calls.findIndex((s) => /SELECT wp\.\* FROM workout_plans wp WHERE wp\.id/.test(s));
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(load).toBeGreaterThan(begin);
+  });
+
   it('only patches whitelisted columns', async () => {
     await request(app).patch(`/api/workouts/plans/${PLAN}/exercises/row-9`)
       .send({ sets: 5, id: 'hijack', workout_plan_id: 'other-plan', created_at: 'x' });
@@ -445,6 +458,64 @@ describe('plan rosters — real progress, and only the clients you may see', () 
     });
     const res = await request(app).get('/api/workouts/plans?client_id=c1');
     expect(res.body[0].progress).toBe(73);
+  });
+});
+
+describe('cardio prescriptions cannot bypass validation through whole-plan writes', () => {
+  const validCardioConfig = {
+    cardio_source: 'k11',
+    target_heart_rate_min: 126,
+    target_heart_rate_max: 153,
+    target_heart_rate: 140,
+    target_heart_rate_basis: '% MHR',
+    cardio_method: 'mhr',
+    cardio_intensity: 'high',
+    cardio_frequency_per_week: 4,
+    cardio_main_work_minutes: 30,
+    cardio_modality: 'Running',
+    cardio_modality_category: 'weight-bearing-high-impact',
+    cardio_program_type: 'fartlek',
+  };
+
+  it('rejects an invalid nested config on create before writing anything', async () => {
+    const res = await request(app).post('/api/workouts/plans').send({
+      name: 'Bad cardio',
+      exercises: [{
+        exercise_id: 'ex-1',
+        config: { ...validCardioConfig, target_heart_rate: Number.NaN },
+      }],
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/cardio/i);
+    expect(res.body.exercise_index).toBe(0);
+    expect(sqls().some((s) => /INSERT INTO workout_plans|INSERT INTO workout_exercises/.test(s))).toBe(false);
+  });
+
+  it('rejects an invalid nested config on whole-plan replace without deleting the stored rows', async () => {
+    const res = await request(app).put(`/api/workouts/plans/${PLAN}`).send({
+      name: 'Bad cardio',
+      exercises: [{
+        exercise_id: 'ex-1',
+        config: { ...validCardioConfig, cardio_frequency_per_week: 15 },
+      }],
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.exercise_index).toBe(0);
+    expect(sqls().some((s) => /DELETE FROM workout_exercises|UPDATE workout_plans SET/.test(s))).toBe(false);
+  });
+
+  it('persists a valid nested config on create', async () => {
+    const res = await request(app).post('/api/workouts/plans').send({
+      name: 'Cardio plan',
+      exercises: [{ exercise_id: 'ex-1', config: validCardioConfig }],
+    });
+
+    expect(res.status).toBe(201);
+    const insert = pool.query.mock.calls.find(([sql]) => /INSERT INTO workout_exercises/.test(String(sql)));
+    expect(insert).toBeDefined();
+    expect(JSON.parse(insert[1][14])).toEqual(validCardioConfig);
   });
 });
 

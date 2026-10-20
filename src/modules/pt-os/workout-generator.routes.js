@@ -39,6 +39,9 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 const GOALS = ['strength', 'powerlifting', 'hypertrophy', 'fat_loss', 'endurance', 'general_fitness'];
 const EXPERIENCE = ['beginner', 'intermediate', 'advanced'];
 const DIFFICULTY = ['beginner', 'intermediate', 'advanced'];
+const CARDIO_INTENSITIES = ['low', 'moderate', 'high', 'very-high'];
+const CARDIO_METHODS = ['mhr', 'karvonen'];
+const CARDIO_PROGRAMS = ['continuous-liss', 'liit-miit', 'hiit', 'fartlek'];
 
 const previewSchema = z.object({
   goal: z.enum(GOALS).optional(),
@@ -51,6 +54,15 @@ const previewSchema = z.object({
   cardioMinutes: z.number().int().min(0).max(180).optional(),
   modality: z.string().max(80).optional(),
   hasVerified1RM: z.boolean().optional(),
+  // Additive cardio inputs. Heart-rate fields are optional: without them the
+  // generator returns FITT structure but no invented target BPM.
+  cardioIntensity: z.enum(CARDIO_INTENSITIES).optional(),
+  cardioMethod: z.enum(CARDIO_METHODS).optional(),
+  cardioFrequencyPerWeek: z.number().int().min(1).max(14).optional(),
+  cardioProgramType: z.enum(CARDIO_PROGRAMS).optional(),
+  age: z.number().int().min(1).max(120).optional(),
+  restingHeartRate: z.number().int().positive().optional(),
+  measuredMaxHeartRate: z.number().int().positive().optional(),
 });
 
 /** Map the studio's stored values onto the generator's vocabulary. */
@@ -94,6 +106,13 @@ router.post('/clients/:id/workout-generator/preview', auth, validate({ body: pre
       cardioMinutes: body.cardioMinutes,
       modality: body.modality,
       hasVerified1RM: body.hasVerified1RM,
+      cardioIntensity: body.cardioIntensity,
+      cardioMethod: body.cardioMethod,
+      cardioFrequencyPerWeek: body.cardioFrequencyPerWeek,
+      cardioProgramType: body.cardioProgramType,
+      age: body.age,
+      restingHeartRate: body.restingHeartRate,
+      measuredMaxHeartRate: body.measuredMaxHeartRate,
     },
   });
 

@@ -7,6 +7,7 @@ const { checkTrainingEligibility } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
 const { markAccepted, acceptGeneration } = require('../modules/pt-os/programming-memory');
+const { validateCardioPlanConfig } = require('../modules/pt-os/cardio');
 const logger = require('../lib/logger');
 const { today: studioToday } = require('../lib/appTime');
 const { shapeError, syncAssignmentEnds } = require('../lib/workoutPlanShape');
@@ -102,6 +103,31 @@ function exerciseParams(ex) {
     num(ex.target_weight), ex.tempo ?? null, num(ex.rpe), num(ex.warmup_sets),
     ex.superset_group ?? null, ex.config ? JSON.stringify(ex.config) : null,
   ];
+}
+
+/**
+ * Cardio prescriptions travel inside `config`. Validate the K11 keys at the
+ * write boundary so a caller cannot persist NaN, infinity, negatives, a decimal
+ * heart rate or an out-of-range frequency by skipping the calculator UI.
+ * Configs without `cardio_source` are legacy/other and pass through untouched.
+ */
+function cardioConfigErrors(config) {
+  const check = validateCardioPlanConfig(config);
+  return check.ok ? null : check.errors;
+}
+
+/**
+ * The same check for a plan body that carries exercises inline. The create and
+ * whole-plan replace paths write `config` the same way the granular endpoints
+ * do, so they must not be a way around the calculator's validation.
+ */
+function nestedCardioErrors(exercises) {
+  if (!Array.isArray(exercises)) return null;
+  for (let i = 0; i < exercises.length; i++) {
+    const errors = cardioConfigErrors(exercises[i]?.config);
+    if (errors) return { index: i, errors };
+  }
+  return null;
 }
 
 /**
@@ -567,6 +593,14 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
     return res.status(400).json({ error: 'Plan name required' });
   const badShape = shapeError(d);
   if (badShape) return res.status(400).json({ error: badShape });
+  const badCardio = nestedCardioErrors(d.exercises);
+  if (badCardio) {
+    return res.status(400).json({
+      error: 'Invalid cardio prescription',
+      details: badCardio.errors,
+      exercise_index: badCardio.index,
+    });
+  }
 
   try {
     const id = randomUUID();
@@ -646,6 +680,14 @@ router.put('/plans/:id', auth, requireTrainer, async (req, res, next) => {
     const d = req.body;
     const badShape = shapeError(d);
     if (badShape) return res.status(400).json({ error: badShape });
+    const badCardio = nestedCardioErrors(d.exercises);
+    if (badCardio) {
+      return res.status(400).json({
+        error: 'Invalid cardio prescription',
+        details: badCardio.errors,
+        exercise_index: badCardio.index,
+      });
+    }
     await client.query('BEGIN');
 
     const existing = await loadEditablePlan(req, req.params.id, client);
@@ -837,6 +879,10 @@ router.post('/plans/:id/exercises', auth, requireTrainer, async (req, res, next)
 
     const ex = req.body;
     if (!ex.exercise_id) return res.status(400).json({ error: 'exercise_id required' });
+    const configErrors = cardioConfigErrors(ex.config);
+    if (configErrors) {
+      return res.status(400).json({ error: 'Invalid cardio prescription', details: configErrors });
+    }
     const day = num(ex.day_of_week, 1);
     // Adding to a computed week has to write that week out first. Otherwise
     // the row lands in week 1 and appears in every week — the trainer adds a
@@ -886,12 +932,15 @@ router.post('/plans/:id/exercises', auth, requireTrainer, async (req, res, next)
 router.patch('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, res, next) => {
   const client = await pool.connect();
   try {
-    const plan = await loadEditablePlan(req, req.params.id, client);
-    if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
-
     // Whitelist. A blind loop over req.body would let a caller rewrite id,
     // workout_plan_id or created_at — the same reason the billing settings
     // endpoint enumerates its fields.
+    if ('config' in req.body) {
+      const configErrors = cardioConfigErrors(req.body.config);
+      if (configErrors) {
+        return res.status(400).json({ error: 'Invalid cardio prescription', details: configErrors });
+      }
+    }
     const EDITABLE = {
       exercise_id: (v) => v,
       day_of_week: (v) => num(v),
@@ -925,7 +974,14 @@ router.patch('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, re
     // which is week 1's, and rewriting that would move every week at once.
     const week = weekParam(req.body.week_number ?? req.query.week);
 
+    // BEGIN first: pool.connect() scopes app.org_id to the transaction, so a
+    // plan read before this sees no rows once the API runs as app_tenant.
     await client.query('BEGIN');
+    const plan = await loadEditablePlan(req, req.params.id, client);
+    if (!plan) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Workout plan not found' });
+    }
     await lockPlan(client, req.params.id);
 
     let targetId = req.params.rowId;
@@ -956,13 +1012,15 @@ router.patch('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, re
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Exercise not found in this plan' });
     }
-    await client.query('COMMIT');
 
+    // Read the saved row before COMMIT: after it the transaction-local
+    // app.org_id is gone and RLS would hide the row again.
     const { rows: full } = await client.query(
       `SELECT ${EXERCISE_SELECT} FROM workout_exercises we
          LEFT JOIN exercises e ON e.id = we.exercise_id WHERE we.id = $1`,
       [targetId]
     );
+    await client.query('COMMIT');
     res.json({ message: 'Exercise updated', exercise: full[0] });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
