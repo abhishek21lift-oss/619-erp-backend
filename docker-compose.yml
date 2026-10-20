@@ -123,6 +123,47 @@ services:
       DOCKER_PROXY_URL: ${DOCKER_PROXY_URL:-}
       CC_API_CONTAINER: ${CC_API_CONTAINER:-erp-api}
       CC_WORKER_CONTAINER: ${CC_WORKER_CONTAINER:-erp-worker}
+      # ── AI surface (round-2 remediation) ──────────────────────────────────
+      # Compose forwards ONLY the variables named here — an entry in the box's
+      # .env that is not listed below never reaches the api process (this was
+      # round-1 P1: every AI var was missing, so deployed boxes reported AND
+      # behaved as NOT_CONFIGURED). Blank defaults change nothing until the .env
+      # sets them; the api boot guard still fails loudly when a required var
+      # (JWT/JWT-level secrets, DB) is missing.
+      AI_API_KEY: ${AI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_PRIMARY_MODEL: ${AI_PRIMARY_MODEL:-}
+      AI_SECONDARY_MODEL: ${AI_SECONDARY_MODEL:-}
+      AI_FALLBACK_MODEL: ${AI_FALLBACK_MODEL:-}
+      AI_OPENROUTER_TIMEOUT_MS: ${AI_OPENROUTER_TIMEOUT_MS:-}
+      AI_ALLOW_DATA_COLLECTION: ${AI_ALLOW_DATA_COLLECTION:-}
+      # on a non-OpenRouter gateway, where to still send usage/include fields:
+      # auto (default, host-gated), always, never. See lib/ai/openrouter.js.
+      AI_USAGE_FIELDS_MODE: ${AI_USAGE_FIELDS_MODE:-}
+      AI_USD_TO_INR: ${AI_USD_TO_INR:-}
+      AI_RATE_LIMIT_PER_MINUTE: ${AI_RATE_LIMIT_PER_MINUTE:-}
+      AI_QUOTA_FAILURE_ALERT_AFTER: ${AI_QUOTA_FAILURE_ALERT_AFTER:-}
+      # Limiting-stack failure bias (round-1 P1 #2): blank keeps the historical
+      # fail-open behaviour; "fail-closed" makes an unverifiable limiter or
+      # quota check refuse the AI call instead of allowing it.
+      AI_QUOTA_FAILURE_MODE: ${AI_QUOTA_FAILURE_MODE:-}
+      AI_LIMITER_FAILURE_MODE: ${AI_LIMITER_FAILURE_MODE:-}
+      AI_CHAT_HISTORY_LIMIT: ${AI_CHAT_HISTORY_LIMIT:-}
+      AI_EMBEDDING_CACHE_DIR: ${AI_EMBEDDING_CACHE_DIR:-}
+      AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-}
+      AI_EMBEDDING_PROVIDER: ${AI_EMBEDDING_PROVIDER:-}
+      AI_EMBEDDING_TIMEOUT_MS: ${AI_EMBEDDING_TIMEOUT_MS:-}
+      AI_EMBEDDING_LOAD_TIMEOUT_MS: ${AI_EMBEDDING_LOAD_TIMEOUT_MS:-}
+      AI_RAG_CHUNK_SIZE: ${AI_RAG_CHUNK_SIZE:-}
+      AI_RAG_CHUNK_OVERLAP: ${AI_RAG_CHUNK_OVERLAP:-}
+      AI_RAG_TOP_K: ${AI_RAG_TOP_K:-}
+      AI_RAG_SIMILARITY_THRESHOLD: ${AI_RAG_SIMILARITY_THRESHOLD:-}
+      AI_SETTINGS_REFRESH_MS: ${AI_SETTINGS_REFRESH_MS:-}
+      # Validates the X-Service-Auth attestation from the mps-ai service. Must
+      # equal the AI service's own SERVICE_AUTH_SECRET. Required for the
+      # /api/ai/usage/service/* internal endpoints.
+      SERVICE_AUTH_SECRET: ${SERVICE_AUTH_SECRET:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -187,6 +228,22 @@ services:
       R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
       SENTRY_DSN: ${SENTRY_DSN:-}
+      # AI vars forwarded here for the same reason as on the api service
+      # (Compose forwards only named lines): a background job that calls the
+      # AI provider or the usage metering must see the same provider
+      # configuration the API does. Blank defaults change nothing until the
+      # box's .env sets them.
+      AI_API_KEY: ${AI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_PRIMARY_MODEL: ${AI_PRIMARY_MODEL:-}
+      AI_SECONDARY_MODEL: ${AI_SECONDARY_MODEL:-}
+      AI_FALLBACK_MODEL: ${AI_FALLBACK_MODEL:-}
+      AI_OPENROUTER_TIMEOUT_MS: ${AI_OPENROUTER_TIMEOUT_MS:-}
+      AI_ALLOW_DATA_COLLECTION: ${AI_ALLOW_DATA_COLLECTION:-}
+      AI_USAGE_FIELDS_MODE: ${AI_USAGE_FIELDS_MODE:-}
+      AI_USD_TO_INR: ${AI_USD_TO_INR:-}
+      SERVICE_AUTH_SECRET: ${SERVICE_AUTH_SECRET:-}
     depends_on:
       redis:
         condition: service_healthy

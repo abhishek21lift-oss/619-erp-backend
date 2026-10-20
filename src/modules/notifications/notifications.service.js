@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
 const { providerSignal } = require('../../lib/providerTimeout');
+const { escapeHtml } = require('../../lib/escape-html');
 
 /**
  * A stable idempotency key for one WhatsApp send, derived from the actual
@@ -208,7 +209,7 @@ const templates = {
     body: `Hi ${name}, we received your payment of ${currency}${amount}. Thanks!`,
     email: {
       subject: 'Payment receipt — MY PT STUDIO',
-      html: `<p>Hi ${name},</p><p>We received your payment of <b>${currency}${amount}</b>.</p>`,
+      html: `<p>Hi ${escapeHtml(name)},</p><p>We received your payment of <b>${escapeHtml(currency)}${escapeHtml(amount)}</b>.</p>`,
     },
     whatsapp: { template: 'payment_received', variables: [name, `${currency}${amount}`] },
   }),
@@ -217,7 +218,7 @@ const templates = {
     body: `Your ${plan} plan ends in ${days} days. Renew to keep training.`,
     email: {
       subject: `Your membership expires in ${days} days`,
-      html: `<p>Hi ${name},</p><p>Your <b>${plan}</b> ends in <b>${days} days</b>.</p>`,
+      html: `<p>Hi ${escapeHtml(name)},</p><p>Your <b>${escapeHtml(plan)}</b> ends in <b>${escapeHtml(days)} days</b>.</p>`,
     },
     whatsapp: { template: 'membership_expiring', variables: [name, String(days), plan] },
   }),
@@ -226,7 +227,7 @@ const templates = {
     body: `Hi ${name}, your next fitness assessment is due on ${scheduled_date}. Reply to your trainer if you need to move it.`,
     email: {
       subject: `Fitness re-test in ${days} days`,
-      html: `<p>Hi ${name},</p><p>Your next fitness assessment is due on <b>${scheduled_date}</b>.</p><p>Reply to your trainer if you need to move it.</p>`,
+      html: `<p>Hi ${escapeHtml(name)},</p><p>Your next fitness assessment is due on <b>${escapeHtml(scheduled_date)}</b>.</p><p>Reply to your trainer if you need to move it.</p>`,
     },
   }),
   assessment_due: ({ name, scheduled_date }) => ({
@@ -234,7 +235,7 @@ const templates = {
     body: `Hi ${name}, your fitness assessment is due today (${scheduled_date}). Your trainer will confirm the time.`,
     email: {
       subject: 'Fitness re-test due today',
-      html: `<p>Hi ${name},</p><p>Your fitness assessment is due today, <b>${scheduled_date}</b>.</p><p>Your trainer will confirm the time.</p>`,
+      html: `<p>Hi ${escapeHtml(name)},</p><p>Your fitness assessment is due today, <b>${escapeHtml(scheduled_date)}</b>.</p><p>Your trainer will confirm the time.</p>`,
     },
   }),
   assessment_overdue: ({ name, scheduled_date, days }) => ({
@@ -242,9 +243,30 @@ const templates = {
     body: `Hi ${name}, your fitness assessment was due on ${scheduled_date} (${days} days ago). Your trainer can help you rebook.`,
     email: {
       subject: 'Fitness re-test is overdue',
-      html: `<p>Hi ${name},</p><p>Your fitness assessment was due on <b>${scheduled_date}</b> (${days} days ago).</p><p>Your trainer can help you rebook.</p>`,
+      html: `<p>Hi ${escapeHtml(name)},</p><p>Your fitness assessment was due on <b>${escapeHtml(scheduled_date)}</b> (${escapeHtml(days)} days ago).</p><p>Your trainer can help you rebook.</p>`,
     },
   }),
+  assessment_trainer_reminder: ({ name, client_name, scheduled_date, days, state }) => {
+    // Trainer-facing re-test notice; client_name is user-controlled text.
+    const timing = state === 'overdue'
+      ? `was due on ${scheduled_date} and is overdue`
+      : state === 'due'
+        ? `is due today (${scheduled_date})`
+        : `is due in ${days} day${days === 1 ? '' : 's'} (${scheduled_date})`;
+    const subject = state === 'overdue'
+      ? `Re-test overdue: ${client_name}`
+      : state === 'due'
+        ? `Re-test due today: ${client_name}`
+        : `Re-test in ${days} days: ${client_name}`;
+    return {
+      title: subject,
+      body: `Hi ${name}, ${client_name}'s fitness re-test ${timing}. Open the progress hub to confirm or move it.`,
+      email: {
+        subject,
+        html: `<p>Hi ${escapeHtml(name)},</p><p><b>${escapeHtml(client_name)}</b>'s fitness re-test ${escapeHtml(timing)}.</p><p>Open the progress hub to confirm or move it.</p>`,
+      },
+    };
+  },
   class_reminder: ({ name, class_name, time }) => ({
     title: `${class_name} starts soon`,
     body: `Hi ${name}, reminder: ${class_name} at ${time}.`,

@@ -24,6 +24,10 @@ const { models }                       = require('../lib/ai/models');
 const { logUsage, getUserUsage, getModelStats } = require('../lib/ai/usage');
 const { usageFields, meteredChat } = require('../lib/ai/metering');
 const { retrieveContext }              = require('../lib/ai/knowledgeBase');
+// MPTS grounding enforcement: evidence assembly, insufficient-evidence gate
+// and the deterministic citation validator whose contract every gated
+// generation here (workout/diet/progress/fitness-testing) must satisfy.
+const grounding = require('../lib/ai/grounding');
 const { runTools }                     = require('../lib/ai/tools');
 const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // The client's digital twin: the assessments, the screen and the logged sets
@@ -45,7 +49,7 @@ const {
  * interpolates this client's own facts, so a hash would differ per client and
  * answer a question nobody asked.
  */
-const WORKOUT_PROMPT_VERSION = '2026-09-14.adapt';
+const WORKOUT_PROMPT_VERSION = '2026-10-20.mpts';
 // Checking the plan the model returned against the rules that shaped it.
 const {
   auditPlan, scorePlan, buildRevisionInstruction, parseCritique, describeAudit,
@@ -225,15 +229,30 @@ const arrayToText = (arr) => (Array.isArray(arr) && arr.length ? arr.join(', ') 
 // `stats` (optional) is an out-param object used by workout/generate for the
 // ai_generate_rag_retrieval observability event. It records latency and the
 // failure flag — nothing else; chunk content never leaves this function.
-async function retrieveRagChunks(org, query, logKey, stats = null) {
+// STATE reporting is what the MPTS gate is built on: the caller (workout/diet)
+// must be able to tell an empty corpus apart from an outage, which is exactly
+// the distinction ([]-returns used to erase). `stats.rag.state` therefore
+// records ok/empty/unavailable/stale/skipped, retrievalStats keeping the same
+// latency/failed shape it already had.
+//
+// route/userId go straight into retrieveContext so every ledger row names the
+// generating route instead of 'internal'.
+function ragResultState(chunks, err, org) {
+  if (err) {
+    try { return grounding.classifyRagError(err); } catch { return 'unavailable'; }
+  }
+  return chunks.length ? 'ok' : (!org ? 'skipped' : 'empty');
+}
+
+async function retrieveRagChunks(org, query, logKey, stats = null, { route = 'internal', userId = null } = {}) {
   const startedAt = Date.now();
   try {
-    const chunks = await retrieveContext({ organizationId: org, query });
-    if (stats) stats.rag = { latencyMs: Date.now() - startedAt, failed: false };
+    const chunks = await retrieveContext({ organizationId: org, query, route, userId });
+    if (stats) stats.rag = { latencyMs: Date.now() - startedAt, failed: false, state: ragResultState(chunks, null, org) };
     return chunks;
   } catch (err) {
     logger.error({ err: err.message }, logKey);
-    if (stats) stats.rag = { latencyMs: Date.now() - startedAt, failed: true };
+    if (stats) stats.rag = { latencyMs: Date.now() - startedAt, failed: true, state: ragResultState([], err, org) };
     return [];
   }
 }
@@ -323,7 +342,7 @@ async function retrieveExerciseLibrary({ organizationId, userId, query, limit = 
 //
 // `options.retrievalStats` (optional out-param) collects retrieval
 // latency/failure metadata for the ai_generate_rag_retrieval event.
-async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerciseQuery = null, exerciseUserId = null, retrievalStats = null } = {}) {
+async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRoute = 'internal', exerciseQuery = null, exerciseUserId = null, ragUserId = null, retrievalStats = null } = {}) {
   const { rows: clientRows } = await pool.query(
     'SELECT * FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
     [client_id, org]
@@ -384,7 +403,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, exerci
       `SELECT value FROM system_settings
         WHERE organization_id = $1 AND key = 'studio_equipment' LIMIT 1`, [org]),
     ...(ragQuery
-      ? [retrieveRagChunks(org, ragQuery, 'ai_client_context_rag_failed', retrievalStats)]
+      ? [retrieveRagChunks(org, ragQuery, 'ai_client_context_rag_failed', retrievalStats, { route: ragRoute, userId: ragUserId })]
       : []),
     ...(exerciseQuery
       ? [retrieveExerciseLibrary({ organizationId: org, userId: exerciseUserId, query: exerciseQuery }, retrievalStats)]
@@ -621,13 +640,18 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     let knowledgeChunks = [];
     // 'no_match' until retrieval says otherwise. See buildCoachSystemPrompt:
     // an outage must not be described to the model as an empty knowledge base.
-    let grounding = 'no_match';
+    // Named chatGrounding — `grounding` is the enforcement module's name in
+    // this file; chat does not run its failure gate (general questions are
+    // allowed to answer from general knowledge, honestly labelled).
+    let chatGrounding = 'no_match';
     try {
-      knowledgeChunks = await retrieveContext({ organizationId: orgParam(req), query: message });
-      if (knowledgeChunks.length) grounding = 'ok';
+      knowledgeChunks = await retrieveContext({
+        organizationId: orgParam(req), userId: req.user.id, route: 'chat', query: message,
+      });
+      if (knowledgeChunks.length) chatGrounding = 'ok';
     } catch (ragErr) {
-      grounding = 'unavailable';
-      logger.warn({ err: ragErr.message, grounding }, 'ai_chat_rag_retrieval_failed');
+      chatGrounding = 'unavailable';
+      logger.warn({ err: ragErr.message, grounding: chatGrounding }, 'ai_chat_rag_retrieval_failed');
     }
     const knowledgeCtx = knowledgeChunks
       .map((c, i) => `[${i + 1}] (${c.title}) ${c.content}`)
@@ -651,7 +675,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       toolCtx = "[Live data] This studio's live records could not be read just now. Say so plainly if the question needs them — do not estimate or recall figures.";
     }
 
-    const systemPrompt = buildCoachSystemPrompt(clientCtx, knowledgeCtx, toolCtx, grounding);
+    const systemPrompt = buildCoachSystemPrompt(clientCtx, knowledgeCtx, toolCtx, chatGrounding);
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -659,12 +683,12 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     ];
 
     send({ type: 'start', conversation_id: convId });
-    if (grounding === 'unavailable') {
+    if (chatGrounding === 'unavailable') {
       // The reader is told too, not just the model. An answer given while the
       // document store was unreachable looks identical to a well-grounded one
       // on screen, and "no sources shown" is the same display as "this studio
       // has nothing on file" — the ambiguity this whole change exists to end.
-      send({ type: 'grounding', grounding });
+      send({ type: 'grounding', grounding: chatGrounding });
     }
     if (knowledgeChunks.length) {
       // De-duplicated document titles, in relevance order — lets the UI show
@@ -734,7 +758,17 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       used_fallback:   Boolean(chatMeta?.used_fallback),
     });
 
-    send({ type: 'done', conversation_id: convId });
+    send({
+      type: 'done',
+      conversation_id: convId,
+      // The grounding truth in the terminal event as well as the mid-stream
+      // ones: a client that restores this thread later, or that joined a
+      // stream late, still knows exactly how this answer was grounded.
+      grounding: chatGrounding,
+      ...(knowledgeChunks.length
+        ? { sources: [...new Set(knowledgeChunks.map((c) => c.title))] }
+        : {}),
+    });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_chat_error');
     send({ type: 'error', message: publicAiMessage(err) });
@@ -852,6 +886,8 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   try {
     ctx = await loadAuthoritativeClient(client_id, org, {
       ragQuery: 'MY PT STUDIO workout programming methodology, exercise selection, progressive overload, training technique, and injury modification',
+      ragRoute: 'workout.generate',
+      ragUserId: req.user?.id,
       exerciseQuery: 'strength training, mobility, and conditioning exercises',
       exerciseUserId: req.user?.id,
       retrievalStats,
@@ -878,6 +914,38 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     retrieval_failed: Boolean(retrievalStats.rag?.failed || retrievalStats.exercise?.failed),
     retrieval_latency_ms: Math.max(retrievalStats.rag?.latencyMs ?? 0, retrievalStats.exercise?.latencyMs ?? 0),
   }, 'ai_generate_rag_retrieval');
+
+  // ── The MPTS evidence gate ───────────────────────────────────────────────
+  //
+  // An empty corpus and an unreachable corpus are different failures with the
+  // same symptom before this gate existed: ragChunks come back [] either way,
+  // and the generator went ahead — writing a programme that presents itself as
+  // "authorized MY PT STUDIO methodology" while holding none of it. Blocked
+  // here, before SSE headers, before any model call:
+  //
+  //   · 'empty'       → 422. A curation prerequisite, not an outage: the
+  //                     approved ledger returned nothing relevant for this
+  //                     route's methodology query. Answer names the state and
+  //                     the corpus version, so the curation screen can say
+  //                     exactly what is missing.
+  //   · 'unavailable' / 'stale' → 503. We could not verify grounding at all;
+  //                     generating while blind to the base would claim a
+  //                     provenance the ledger could not support.
+  //
+  // The retrieval attempt already lives in ai_retrieval_log with this route
+  // in `route`, so the refusal is auditable without a second write.
+  const evidence = await grounding.evidenceFromChunks(ctx.ragChunks, {
+    organizationId: org,
+    state: retrievalStats.rag?.state || null,
+  });
+  if (evidence.status !== 'ok') {
+    const refuse = grounding.insufficientEvidenceResponse('WORKOUT generation', evidence);
+    logger.warn({
+      req_id: req.id, intent: 'workout', grounding: evidence.status,
+      corpus_version: evidence.corpusVersion,
+    }, 'ai_generate_mpts_gate_blocked');
+    return res.status(refuse.httpStatus).json(refuse.body);
+  }
 
   // ── What this studio actually knows about this client ────────────────────
   //
@@ -1328,6 +1396,17 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
 
     const quality = scorePlan(audit);
 
+    // ── Citation validation is deterministic and runs on the FINAL output ──
+    //
+    // After the stream has completed and, if a fallback model took over, its
+    // output has been audited too — validation cannot be routed around by the
+    // provider chain because it happens after the chain ends, on the plan
+    // actually being sent. Fabricated or out-of-range citations are stripped
+    // (the in-range subset stays) and the status is frozen into the ledger and
+    // surfaced to the trainer beside the plan.
+    const citationCheck = grounding.validateGroundedOutput(plan, evidence);
+    grounding.sanitizeCitations(plan, citationCheck);
+
     // ── The critic ───────────────────────────────────────────────────────
     //
     // A second model, asked only what a rule cannot answer: whether the
@@ -1407,7 +1486,17 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
           not_assessed: twin.brief.missing,
           stale: twin.brief.stale ?? [],
         },
-        audit: { violations: audit.violations, unverified: audit.unverified, counts: audit.counts },
+        // Grounding is frozen inside the audit JSONB rather than as a new
+        // column of ai_workout_generations: the ledger row must say WHICH
+        // approved corpus version grounded a plan and whether its citations
+        // survived validation, without a migration for every fact. Same
+        // object the done event carries — one shape, two consumers.
+        audit: {
+          violations: audit.violations,
+          unverified: audit.unverified,
+          counts: audit.counts,
+          grounding: grounding.groundingBlock(evidence, citationCheck),
+        },
         // What the engine knew, and what it did not. Frozen with the
         // proposal for the same reason the screen is: a ledger row that
         // cannot say the height was never recorded cannot answer why the
@@ -1474,6 +1563,9 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
         revised,
       },
       quality,
+      // Which approved corpus version grounded this, with the validated
+      // citations and their passages — same object the ledger froze above.
+      grounding: grounding.groundingBlock(evidence, citationCheck),
       critique: critique.critique,
       critique_verdict: critique.verdict,
       screen: {
@@ -1510,6 +1602,19 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
    3. DIET / NUTRITION PLAN GENERATOR  (SSE streaming)
    POST /api/ai/diet/generate
    ═══════════════════════════════════════════════════════════════════════════ */
+
+// The diet plan's load-bearing fields, checked WITHOUT a model: the schema the
+// system prompt publishes, in its cheapest checkable form. Cosmetic gaps (notes
+// wording, grocery granularity) are the trainer's edit, not a re-generation.
+// Returns null when structurally fine, or the reason it is not.
+function dietPlanNeedsWork(plan) {
+  if (!plan || typeof plan !== 'object') return 'unparseable';
+  if (!Number.isFinite(plan.total_calories)) return 'structure';
+  if (!plan.macros || typeof plan.macros !== 'object') return 'structure';
+  if (!Array.isArray(plan.meals) || plan.meals.length === 0) return 'structure';
+  return null;
+}
+
 router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
   const { client_id } = req.body || {};
   if (!client_id) return res.status(400).json({ error: 'client_id is required' });
@@ -1521,16 +1626,37 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
   // Authorized knowledge base (own org + explicitly global) is
   // retrieved with the client data, strictly after the in-org client check.
   const org = orgParam(req);
+  const retrievalStats = {};
   let ctx;
   try {
     ctx = await loadAuthoritativeClient(client_id, org, {
       ragQuery: 'MY PT STUDIO nutrition methodology, calorie and macro targets, meal planning, food selection, and allergy-safe nutrition handling',
+      ragRoute: 'diet.generate',
+      ragUserId: req.user?.id,
+      retrievalStats,
     });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_diet_generate_load_failed');
     return res.status(503).json({ error: 'AI diet generation failed', message: publicAiMessage(err) });
   }
   if (!ctx) return res.status(404).json({ error: 'Client not found' });
+
+  // The MPTS evidence gate — same contract as workout: an empty approved
+  // corpus (422) and a corpus we could not verify (503) both refuse with no
+  // model call, so a nutrition plan can never present trainer-invented macros
+  // as grounded curation. The retrieval ledger already names this route.
+  const evidence = await grounding.evidenceFromChunks(ctx.ragChunks, {
+    organizationId: org,
+    state: retrievalStats.rag?.state || null,
+  });
+  if (evidence.status !== 'ok') {
+    const refuse = grounding.insufficientEvidenceResponse('DIET generation', evidence);
+    logger.warn({
+      req_id: req.id, intent: 'diet', grounding: evidence.status,
+      corpus_version: evidence.corpusVersion,
+    }, 'ai_generate_mpts_gate_blocked');
+    return res.status(refuse.httpStatus).json(refuse.body);
+  }
 
   const p = resolveDietInputs(ctx, req.body || {});
   const required = {
@@ -1638,12 +1764,70 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     }
     if (step.value && typeof step.value === 'object') streamMeta = step.value;
 
-    const plan = extractJson(fullContent);
+    let plan = extractJson(fullContent);
     if (!plan) {
       send({ type: 'error', message: 'Could not parse AI response as JSON' });
       res.end();
       return;
     }
+
+    // ── Minimal deterministic validation, then ONE bounded revision ────────
+    //
+    // The diet path had no validators at all; this adds the two checks a
+    // client can verify without a model — the citation array is only reliable
+    // numbers from the AUTHORIZED KNOWLEDGE BASE section, and the schema's
+    // load-bearing fields are present. A failed check costs one bounded
+    // revision (same rule as workout: a model that ignored an explicit
+    // correction once usually ignores it twice), and after that the plan
+    // ships flagged rather than refused — the token spend exists either way,
+    // and validation_status is what protects the trainer.
+    let structural = dietPlanNeedsWork(plan);
+    let citationCheck = grounding.validateGroundedOutput(plan, evidence);
+    if (structural || citationCheck.status !== 'ok') {
+      const instruction = [
+        structural
+          ? 'Rewrite so the JSON has, at minimum, a numeric top-level "total_calories", a "macros" object, and a non-empty "meals" array. Fix only what is broken; keep the rest.'
+          : null,
+        'the top-level "knowledge_citations" array must hold ONLY bracket numbers [n] from the AUTHORIZED KNOWLEDGE BASE section of the request that you actually relied on — no number outside that section, "knowledge_citations": [] if you relied on none.',
+        'Emit the complete corrected JSON object only — no prose.',
+      ].filter(Boolean).join(' ');
+      try {
+        const retry = await meteredChat(req, 'diet_revision', routedChat)({
+          intent: 'diet',
+          temperature: 0.2,      // correction, not invention
+          max_tokens: 14000,
+          messages: [
+            { role: 'system', content: buildDietSystemPrompt(trainerName) },
+            { role: 'user', content: userPromptText },
+            { role: 'assistant', content: JSON.stringify(plan) },
+            { role: 'user', content: instruction },
+          ],
+        });
+        const fixed = extractJson(retry?.content || '');
+        if (fixed) {
+          // Adopt only on strict improvement — never in exchange for a new
+          // structural gap, and never on rank: invalid > none > ok.
+          const rank = (s) => (s === 'ok' ? 2 : s === 'no_citations' ? 1 : 0);
+          const fixedStructural = dietPlanNeedsWork(fixed);
+          const fixedCheck = grounding.validateGroundedOutput(fixed, evidence);
+          const better = fixedStructural === null
+            && (structural
+              ? rank(fixedCheck.status) >= rank(citationCheck.status)
+              : rank(fixedCheck.status) > rank(citationCheck.status));
+          if (better) {
+            plan = fixed;
+            structural = fixedStructural;
+            citationCheck = fixedCheck;
+          }
+        }
+      } catch (err) {
+        logger.warn({ err: err.message }, 'ai_diet_revision_failed');
+      }
+    }
+    // Fabricated citations never reach the client: out-of-range numbers are
+    // stripped, and the surviving (or empty) array is what both the done
+    // event and any future ledger audit carry.
+    grounding.sanitizeCitations(plan, citationCheck);
 
     logUsage({
       user_id:           req.user.id,
@@ -1654,7 +1838,19 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
-    send({ type: 'done', data: plan, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
+    send({
+      type: 'done',
+      data: plan,
+      model: streamMeta.model,
+      tier: streamMeta.tier,
+      used_fallback: streamMeta.used_fallback,
+      // Same evidence block as workout: corpus version, validated citations
+      // and the passages behind each. An unplanned revision surfaces here too.
+      grounding: {
+        ...grounding.groundingBlock(evidence, citationCheck),
+        structure_ok: structural === null,
+      },
+    });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_diet_generate_error');
     if (!res.headersSent) {
@@ -1695,6 +1891,27 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
     const clientRes = await pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2', [client_id, org]);
     const client = clientRes.rows[0];
     if (!client) return res.status(404).json({ error: 'Client not found' });
+
+    // ── The MPTS evidence gate ─────────────────────────────────────────────
+    //
+    // As elsewhere: interpretation of a client's progress is training
+    // methodology applied to data, so it grounds against the approved corpus
+    // or refuses. Its own retrieval (route-tagged for the ledger) runs before
+    // the progress reads' Promise.all — independent, so no ordering hazard.
+    const evidence = await grounding.assembleEvidence({
+      organizationId: org,
+      userId: req.user?.id,
+      route: 'progress.analyze',
+      query: 'MY PT STUDIO methodology for interpreting client progress, reassessment norms, plateau handling, load adjustments, goal and programme modification',
+    });
+    if (evidence.status !== 'ok') {
+      const refuse = grounding.insufficientEvidenceResponse('PROGRESS analysis', evidence);
+      logger.warn({
+        req_id: req.id, intent: 'progress', grounding: evidence.status,
+        corpus_version: evidence.corpusVersion,
+      }, 'ai_generate_mpts_gate_blocked');
+      return res.status(refuse.httpStatus).json(refuse.body);
+    }
 
     // Fetch all progress data for this client
     const [assessRes, goalsRes, checkinsRes, strengthRes, attRes, photosRes] = await Promise.all([
@@ -1752,7 +1969,9 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
       }))
       .filter((p) => p.date && Number.isFinite(p.weight_kg));
 
-    const userPrompt = `Analyse the following client progress data and generate a comprehensive report:\n\n${JSON.stringify(contextData, null, 2)}`;
+    // Same block the plan generators use: numbered passages the model can cite
+    // deterministically. The gate above guarantees the corpus returned hits.
+    const userPrompt = `Analyse the following client progress data and generate a comprehensive report:\n\n${JSON.stringify(contextData, null, 2)}\n\nAUTHORIZED KNOWLEDGE BASE:\n${evidence.chunks.map((c, i) => `[${i + 1}] (${c.title}) ${c.content}`).join('\n')}`;
 
     // Switch to SSE before the slow AI call
     res.setHeader('Content-Type',      'text/event-stream');
@@ -1805,6 +2024,11 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
       return;
     }
 
+    // Deterministic citation enforcement on the final output — after the
+    // provider chain has settled, so a fallback model cannot bypass it.
+    const citationCheck = grounding.validateGroundedOutput(analysis, evidence);
+    grounding.sanitizeCitations(analysis, citationCheck);
+
     logUsage({
       user_id:           req.user.id,
       model:             streamMeta.model,
@@ -1814,7 +2038,7 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
-    send({ type: 'done', data: analysis, data_counts: dataCounts, weight_history: weightHistory, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
+    send({ type: 'done', data: analysis, data_counts: dataCounts, weight_history: weightHistory, grounding: grounding.groundingBlock(evidence, citationCheck), model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_progress_analyze_error');
     // Headers may or may not have been sent yet depending on where the error occurred
@@ -1866,6 +2090,28 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
 
     const client = clientRes.rows[0];
     if (!client) return res.status(404).json({ error: 'Client not found' });
+
+    // ── The MPTS evidence gate ─────────────────────────────────────────────
+    //
+    // Assessment interpretation uses methodology (testing standards, norms,
+    // progression readiness), so it grounds against the approved corpus or
+    // refuses rather than answering from a model's general knowledge while
+    // implying curated authority.
+    const evidence = await grounding.assembleEvidence({
+      organizationId: org,
+      userId: req.user?.id,
+      route: 'fitness-testing.analyze',
+      query: 'MY PT STUDIO methodology for fitness assessment interpretation, testing norms and standards, and progression readiness',
+    });
+    if (evidence.status !== 'ok') {
+      const refuse = grounding.insufficientEvidenceResponse('FITNESS TESTING analysis', evidence);
+      logger.warn({
+        req_id: req.id, intent: 'fitness_testing', grounding: evidence.status,
+        corpus_version: evidence.corpusVersion,
+      }, 'ai_generate_mpts_gate_blocked');
+      return res.status(refuse.httpStatus).json(refuse.body);
+    }
+
     const age = client.dob ? Math.floor((Date.now() - new Date(client.dob).getTime()) / 31557600000) : null;
 
     const contextData = {
@@ -1874,7 +2120,7 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
       previous_assessment: previousRes.rows[0] || null,
     };
 
-    const userPrompt = `Analyse the following fitness assessment and generate a structured report:\n\n${JSON.stringify(contextData, null, 2)}`;
+    const userPrompt = `Analyse the following fitness assessment and generate a structured report:\n\n${JSON.stringify(contextData, null, 2)}\n\nAUTHORIZED KNOWLEDGE BASE:\n${evidence.chunks.map((c, i) => `[${i + 1}] (${c.title}) ${c.content}`).join('\n')}`;
 
     // Switch to SSE before the slow AI call
     res.setHeader('Content-Type',      'text/event-stream');
@@ -1927,6 +2173,11 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
       return;
     }
 
+    // Deterministic citation enforcement on the final output — after the
+    // provider chain has settled, so a fallback model cannot bypass it.
+    const citationCheck = grounding.validateGroundedOutput(analysis, evidence);
+    grounding.sanitizeCitations(analysis, citationCheck);
+
     logUsage({
       user_id:           req.user.id,
       model:             streamMeta.model,
@@ -1936,7 +2187,7 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
       used_fallback:     streamMeta.used_fallback,
     }).catch(() => {});
 
-    send({ type: 'done', data: analysis, model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
+    send({ type: 'done', data: analysis, grounding: grounding.groundingBlock(evidence, citationCheck), model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_fitness_testing_analyze_error');
     // Headers may or may not have been sent yet depending on where the error occurred

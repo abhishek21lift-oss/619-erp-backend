@@ -86,6 +86,10 @@ describe('super-admin API — the H-03 split', () => {
     // A failure here is either a deliberate new endpoint (add it below, and say
     // so in the commit) or an endpoint the refactor lost.
     const EXPECTED = [
+    // Plus the platform knowledge-corpus curation lifecycle (migration 232):
+    // upload → review → approve/activate → revoke/reindex/delete. This is a
+    // deliberate new endpoint family, not something the H-03 split lost.
+    'DELETE /ai/knowledge/:id',
     'DELETE /announcements/:id',
     'DELETE /coupons/:id',
     'DELETE /hostinger/credential',
@@ -96,6 +100,7 @@ describe('super-admin API — the H-03 split', () => {
     'GET /activity',
     'GET /ai/by-model',
     'GET /ai/by-studio',
+    'GET /ai/knowledge',
     'GET /ai/overview',
     'GET /ai/routing',
     'GET /ai/settings',
@@ -207,6 +212,10 @@ describe('super-admin API — the H-03 split', () => {
     'PATCH /organizations/:id/subscription/expiry',
     'PATCH /support/tickets/:id',
     'PATCH /users/:id',
+    'POST /ai/knowledge',
+    'POST /ai/knowledge/:id/approve',
+    'POST /ai/knowledge/:id/reindex',
+    'POST /ai/knowledge/:id/revoke',
     'POST /announcements',
     'POST /announcements/:id/cancel',
     'POST /announcements/:id/preview',

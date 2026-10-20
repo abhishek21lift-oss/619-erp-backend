@@ -22,8 +22,16 @@ function usdToInr() {
  * quota counted a fraction of real use. The provider now returns exact usage
  * (lib/ai/openrouter.js requests it). The estimate survives only for a
  * response that carried no usage at all, and says so in usage_source.
+ *
+ * completionText may be the reply STRING (as everywhere here) or a NUMBER of
+ * characters — the /api/ai/usage/service ingest from the mps-ai assistant has
+ * no body to hand over, only a length (round-2 MPS-01). One estimate rule,
+ * both callers.
  */
 function usageFields(usage, completionText = '') {
+  const completionLen = typeof completionText === 'number'
+    ? completionText
+    : String(completionText || '').length;
   const prompt = Number(usage?.prompt_tokens);
   const completion = Number(usage?.completion_tokens);
   if (Number.isFinite(prompt) && Number.isFinite(completion) && (prompt > 0 || completion > 0)) {
@@ -37,12 +45,11 @@ function usageFields(usage, completionText = '') {
   }
   return {
     tokens_prompt: 0,
-    tokens_completion: Math.ceil(String(completionText || '').length / 4),
+    tokens_completion: Math.ceil(completionLen / 4),
     cost_inr: null,
     usage_source: 'estimated',
   };
 }
-
 /**
  * A chat function that logs what it spent.
  *

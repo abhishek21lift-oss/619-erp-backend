@@ -363,6 +363,10 @@ const DOMAINS = {
     tables: [
       'ai_documents', 'ai_document_chunks', 'ai_conversations', 'ai_messages',
       'ai_usage_log', 'ai_action_plans', 'ai_model_rates', 'ai_provider_settings',
+      // The retrieval ledger (migration 232): one row per grounding attempt so
+      // any generated artifact traces back to the approved corpus state it
+      // was grounded in. Owned here with the rest of the retrieval stack.
+      'ai_retrieval_log',
       'agent_tasks', 'agent_audit_log', 'organization_ai_limits',
       // The programming engine's proposal ledger (migration 199): what the AI
       // suggested for a client, the screen and audit as they stood at the

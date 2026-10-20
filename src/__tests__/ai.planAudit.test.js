@@ -60,6 +60,16 @@ const SQUAT = {
   movement_pattern: 'Squat', equipment: 'Barbell', difficulty: 'beginner',
 };
 
+// The grounding gate refuses a generation the approved corpus cannot ground,
+// so the mock answers the corpus reads the way ai.generators does: one
+// passage hit above the similarity threshold, plus the corpus-version count.
+const CORPUS_CHUNK = {
+  content: 'Every session starts with a 10-minute dynamic warm-up, and leg work never precedes 48 hours of recovery for the same movement pattern.',
+  chunk_index: 0, title: 'MPTS Programming SOP', category: 'methodology',
+  document_id: 'doc-mpts-1', similarity: 0.91,
+};
+const CORPUS_VERSION_ROW = { n: 3, last_approved: '2026-10-20T09:30:00.000Z' };
+
 const regions = (o = {}) => [
   'Neck', 'Shoulders', 'Thoracic Spine', 'Hip', 'Hamstrings', 'Quadriceps', 'Ankles', 'Wrists',
 ].map((region) => ({ region, score: 3, pain: false, restriction: false, ...(o[region] || {}) }));
@@ -91,6 +101,9 @@ function mockDb({ history = [] } = {}) {
     }
     if (/FROM ai_workout_generations/.test(sql)) return Promise.resolve({ rows: history });
     if (/FROM muscle_volume_landmarks/.test(sql)) return Promise.resolve({ rows: [] });
+    // Approved-corpus retrieval + corpus-version count (grounding gate).
+    if (/ai_document_chunks/.test(sql)) return Promise.resolve({ rows: [CORPUS_CHUNK] });
+    if (/MAX\(approved_at\)/.test(sql)) return Promise.resolve({ rows: [CORPUS_VERSION_ROW] });
     const rows =
       /FROM pt_clients/.test(sql) ? [CLIENT]
         : /FROM pt_parq_forms/.test(sql)

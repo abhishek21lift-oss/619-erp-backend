@@ -2,6 +2,7 @@ const dns = require('dns').promises;
 const net = require('net');
 const nodemailer = require('nodemailer');
 const logger = require('./logger');
+const { escapeHtml } = require('./escape-html');
 const { frontendUrl } = require('./frontendUrl');
 const { invitationHtml, invitationText } = require('./emailTemplates/invitation');
 const { clientActivationHtml, clientActivationText } = require('./emailTemplates/clientActivation');
@@ -633,13 +634,6 @@ function describeConfig(env = process.env) {
 }
 
 
-/** A studio name is user-supplied and goes straight into the markup below. */
-function escapeHtml(v) {
-  return String(v == null ? '' : v)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
 /**
  * Welcome mail sent the moment a studio application is approved.
  *
@@ -755,5 +749,5 @@ module.exports = {
   sendClientActivation, sendEmailChangedNotice, sendEmailChangedNoticeInline, maskEmail,
   sendWelcomeInline, sendPasswordResetInline, sendAdminResetOtpInline,
   verifyConnection, diagnose, describeError, smtpTimeouts, SMTP_TIMEOUT_DEFAULTS,
-  isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient,
+  isConfigured, describeConfig, REQUIRED_VARS, sendWithRetry, isTransient, escapeHtml,
 };

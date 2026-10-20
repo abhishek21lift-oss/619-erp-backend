@@ -53,11 +53,19 @@ function getApiKey() {
 //
 // Both are OpenRouter request fields. Another OpenAI-compatible endpoint
 // (AI_BASE_URL) may reject unknown fields, so they are sent to OpenRouter
-// only.
+// only — with one operator override (round-1 P1 #3): behind a gateway that
+// FORWARDS to OpenRouter, the fields were silently dropped and every gateway
+// conversation lost its exact token/cost accounting. AI_USAGE_FIELDS_MODE:
+//   auto   (default) — host-gate as before
+//   always — send the fields to whatever AI_BASE_URL is set
+//   never  — send them nowhere, even to OpenRouter (gateway that chokes)
 const isOpenRouter = () => /(^|\.)openrouter\.ai(\/|$)/.test(new URL(BASE_URL).host + '/');
 
 function requestExtras() {
-  if (!isOpenRouter()) return {};
+  const mode = String(process.env.AI_USAGE_FIELDS_MODE || '').toLowerCase();
+  if (mode === 'never') return {};
+  const send = mode === 'always' || isOpenRouter();
+  if (!send) return {};
   const allowCollection = String(process.env.AI_ALLOW_DATA_COLLECTION || '').toLowerCase() === 'true';
   return {
     provider: { data_collection: allowCollection ? 'allow' : 'deny' },

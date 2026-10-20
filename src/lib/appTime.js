@@ -33,6 +33,10 @@
 const DEFAULT_TIME_ZONE = 'Asia/Kolkata';
 
 let warned = false;
+let lastConfigured;
+let lastZone = DEFAULT_TIME_ZONE;
+const dateFormatters = new Map();
+const dayFormatters = new Map();
 
 /**
  * The configured zone, validated once.
@@ -42,12 +46,14 @@ let warned = false;
  * falls back to the default and says so — once, not per call.
  */
 function appTimeZone() {
-  const configured = process.env.APP_TIMEZONE;
-  if (!configured) return DEFAULT_TIME_ZONE;
+  const configured = process.env.APP_TIMEZONE || DEFAULT_TIME_ZONE;
+  if (configured === lastConfigured) return lastZone;
+  lastConfigured = configured;
   try {
     new Intl.DateTimeFormat('en-CA', { timeZone: configured });
-    return configured;
+    lastZone = configured;
   } catch {
+    lastZone = DEFAULT_TIME_ZONE;
     if (!warned) {
       warned = true;
       // Required lazily: logger pulls in config that imports this module.
@@ -56,8 +62,29 @@ function appTimeZone() {
         'APP_TIMEZONE is not a valid IANA time zone — falling back',
       );
     }
-    return DEFAULT_TIME_ZONE;
   }
+  return lastZone;
+}
+
+/** Reuse formatters: dbDate calls this once per date field per row. */
+function dateFormatter(timeZone) {
+  let formatter = dateFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-CA', {
+      year: 'numeric', month: '2-digit', day: '2-digit', timeZone,
+    });
+    dateFormatters.set(timeZone, formatter);
+  }
+  return formatter;
+}
+
+function dayFormatter(timeZone) {
+  let formatter = dayFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone });
+    dayFormatters.set(timeZone, formatter);
+  }
+  return formatter;
 }
 
 /**
@@ -69,12 +96,7 @@ function appTimeZone() {
  * mocking the clock globally.
  */
 function todayIn(timeZone = appTimeZone(), date = new Date()) {
-  return new Intl.DateTimeFormat('en-CA', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    timeZone,
-  }).format(date);
+  return dateFormatter(timeZone).format(date);
 }
 
 /** Today in the studio's zone — the form nearly every caller wants. */
@@ -98,10 +120,7 @@ function today(date = new Date()) {
  * exists to end.
  */
 function todayShortDay(date = new Date()) {
-  return new Intl.DateTimeFormat('en-US', {
-    weekday: 'short',
-    timeZone: appTimeZone(),
-  }).format(date);
+  return dayFormatter(appTimeZone()).format(date);
 }
 
 /**

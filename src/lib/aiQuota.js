@@ -171,7 +171,15 @@ function recordQuotaCheckOutcome(ok, err) {
  * itself failing — calls next(). A quota check that errors must not take the
  * AI Suite down with it; failing open is the correct bias for a cost control.
  * It is no longer a SILENT fail-open — see recordQuotaCheckOutcome above.
+ *
+ * Round-1 P1 #2: AI_QUOTA_FAILURE_MODE=fail-closed flips the bias — a check
+ * that cannot be evaluated refuses the request (503) instead of letting it
+ * through uncapped. Operators choose; blank keeps today's behaviour.
  */
+function quotaFailClosed() {
+  return String(process.env.AI_QUOTA_FAILURE_MODE).toLowerCase() === 'fail-closed';
+}
+
 function requireAiQuota() {
   return async function aiQuotaGuard(req, res, next) {
     try {
@@ -194,6 +202,14 @@ function requireAiQuota() {
       });
     } catch (err) {
       recordQuotaCheckOutcome(false, err);
+      if (quotaFailClosed()) {
+        return res.status(503).json({
+          error: {
+            code: 'AI_QUOTA_UNVERIFIABLE',
+            message: 'AI usage cannot be verified right now; the request was refused for lack of a verifiable allowance.',
+          },
+        });
+      }
       return next();
     }
   };

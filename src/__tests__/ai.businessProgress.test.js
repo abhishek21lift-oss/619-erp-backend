@@ -134,6 +134,16 @@ describe('progress analyze route guard', () => {
 });
 
 describe('progress analyze grounded companions', () => {
+  // The grounding gate refuses a generation the approved corpus cannot
+  // ground, so the mock answers the corpus reads with a real passage hit
+  // (same fixture shape ai.generators uses).
+  const CORPUS_CHUNK = {
+    content: 'Progression is graded by weekly volume targets, not by subjective soreness reports.',
+    chunk_index: 0, title: 'MPTS Programming SOP', category: 'methodology',
+    document_id: 'doc-mpts-2', similarity: 0.88,
+  };
+  const CORPUS_VERSION_ROW = { n: 3, last_approved: '2026-10-20T09:30:00.000Z' };
+
   function mockProgressDb() {
     pool.query.mockImplementation((sql) => {
       if (sql.includes('FROM pt_clients')) {
@@ -154,6 +164,9 @@ describe('progress analyze grounded companions', () => {
       if (sql.includes('FROM pt_sessions')) {
         return Promise.resolve({ rows: [{ total_sessions: '30', sessions_30d: '8' }] });
       }
+      // Approved-corpus retrieval + corpus-version count (grounding gate).
+      if (sql.includes('ai_document_chunks')) return Promise.resolve({ rows: [CORPUS_CHUNK] });
+      if (sql.includes('MAX(approved_at)')) return Promise.resolve({ rows: [CORPUS_VERSION_ROW] });
       return Promise.resolve({ rows: [{ total_photos: '0' }] });
     });
   }

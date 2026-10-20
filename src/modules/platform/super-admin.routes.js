@@ -93,6 +93,10 @@ router.use(require('./super-admin/announcements'));
 router.use(require('./super-admin/security'));
 router.use(require('./super-admin/analytics'));
 router.use(require('./super-admin/ai'));
+// Shared MPTS methodology corpus curation: upload/review/approve/revoke for
+// is_global documents. The write path migration 173 reserved for the
+// platform; retrieval-side gating lives in lib/ai/knowledgeBase.js (232).
+router.use(require('./super-admin/knowledge'));
 router.use(require('./super-admin/invitations'));
 router.use(require('./super-admin/support'));
 router.use(require('./super-admin/storage'));

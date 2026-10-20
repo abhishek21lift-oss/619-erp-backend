@@ -944,6 +944,11 @@ app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), 
 // check did not stop: any client could have another client's health record
 // summarised back to them. The member app calls none of these; a client's own
 // data is /api/me. Every AI action is trainer-only in its registry as well.
+// Internal service endpoints (round-2 remediation): usage ingest + quota
+// probe used by the mps-ai assistant. Mounted BEFORE the /api/ai mounts so
+// the more specific path wins. requireServiceAuth rejects the open internet;
+// identity is resolved from the forwarded user token, same as tool reads.
+app.use('/api/ai/usage/service', require('./routes/aiServiceUsage'));
 app.use('/api/ai',               userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
 app.use('/api/ai',               ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/ai'));
 
