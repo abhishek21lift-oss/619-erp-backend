@@ -92,7 +92,7 @@ function streamOnce(text) {
   };
 }
 
-function mockDb({ parq = [], mobility = [], posture = [], exercises = [], sets = [] } = {}) {
+function mockDb({ parq = [], mobility = [], posture = [], exercises = [], sets = [], knowledge = null } = {}) {
   pool.query.mockReset();
   pool.query.mockImplementation((sql) => {
     const rows =
@@ -104,7 +104,17 @@ function mockDb({ parq = [], mobility = [], posture = [], exercises = [], sets =
                 : /FROM workout_sets s/.test(sql) ? sets
                   : /FROM pt_goals/.test(sql) ? [GOAL]
                     : /FROM pt_assessments/.test(sql) ? [ASSESSMENT]
-                      : [];
+                      // The approved-corpus retrieval (the MPTS gate): one
+                      // passage by default so the screen tests exercise the
+                      // generator, not the gate. Pass knowledge: [] to prove
+                      // an empty corpus refuses instead.
+                      : /ai_document_chunks/.test(sql) ? (knowledge ?? [{
+                          content: 'a 48-hour window between sessions loading the same movement pattern is the floor for intermediate lifters.',
+                          chunk_index: 0, title: 'MPTS Programming SOP', category: 'methodology',
+                          document_id: 'doc-mpts-1', similarity: 0.9,
+                        }])
+                        : /MAX\(approved_at\)/.test(sql) ? [{ n: 2, last_approved: '2026-10-20T09:30:00.000Z' }]
+                          : [];
     return Promise.resolve({ rows });
   });
 }

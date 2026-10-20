@@ -165,32 +165,71 @@ async function deleteDocument(documentId) {
  * pgvector's `<=>` operator is cosine DISTANCE (0 = identical, 2 = opposite);
  * similarity = 1 - distance.
  */
-async function retrieveContext({ organizationId, query, topK = DEFAULT_TOP_K, similarityThreshold = DEFAULT_SIMILARITY_THRESHOLD }) {
-  if (!organizationId || !query?.trim()) return [];
-
-  let queryVector;
-  try {
-    queryVector = await embedText(query);
-  } catch (err) {
-    // Throws rather than returning []. See RagUnavailableError above: an
-    // outage and an empty knowledge base must not look identical to callers.
-    logger.error({ err: err.message }, 'ai_knowledge_query_embed_failed');
-    throw new RagUnavailableError(err.message);
+async function retrieveContext({ organizationId, query, topK = DEFAULT_TOP_K, similarityThreshold = DEFAULT_SIMILARITY_THRESHOLD, route = 'internal', userId = null }) {
+  if (!organizationId || !query?.trim()) {
+    try {
+      await pool.query(
+        `INSERT INTO ai_retrieval_log (organization_id, user_id, route, result, corpus_version, top_k)
+         VALUES ($1, $2, $3, 'skipped', NULL, $4)`,
+        [organizationId ?? null, userId ?? null, route, topK]
+      );
+    } catch (logErr) {
+      logger.warn({ err: logErr.message, route }, 'ai_retrieval_log_write_failed');
+    }
+    return [];
   }
 
-  let rows;
-  try {
-    ({ rows } = await pool.query(SIMILARITY_SQL, [toVectorLiteral(queryVector), organizationId, topK, EMBEDDING_MODEL]));
-  } catch (err) {
-    // A database failure during retrieval is the same class of event as an
-    // embed failure, and was previously not caught here at all — it surfaced
-    // as a 500 from whichever route happened to be calling.
-    logger.error({ err: err.message }, 'ai_knowledge_query_search_failed');
-    throw new RagUnavailableError(err.message);
+  // Every retrieval is logged to ai_retrieval_log (corpus version included,
+  // computed from the same table state, so any generated artifact can be
+  // traced to the exact approved corpus it was grounded in). Logging is
+  // observability, not correctness: a ledger failure must never break the
+  // retrieval it describes.
+  async function logRetrieval(result, documentIds) {
+    try {
+      await pool.query(
+        `INSERT INTO ai_retrieval_log
+           (organization_id, user_id, route, result, document_ids, corpus_version, top_k)
+         SELECT $1, $2, $3, $4, COALESCE($5, '{}'::uuid[]),
+                'v' || TO_CHAR(MAX(m.approved_at) AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISS') || '-n' || COUNT(*)::text,
+                $6
+           FROM (SELECT approved_at FROM ai_documents
+                  WHERE status = 'ready' AND approval_status = 'approved' AND is_global = TRUE) m`,
+        [organizationId ?? null, userId ?? null, route, result, documentIds ?? [], topK]
+      );
+    } catch (logErr) {
+      logger.warn({ err: logErr.message, route }, 'ai_retrieval_log_write_failed');
+    }
   }
 
-  const hits = rows.filter((r) => Number(r.similarity) >= similarityThreshold);
-  if (hits.length) return hits;
+  async function runRetrieval() {
+    let queryVector;
+    try {
+      queryVector = await embedText(query);
+    } catch (err) {
+      // Throws rather than returning []. See RagUnavailableError above: an
+      // outage and an empty knowledge base must not look identical to callers.
+      logger.error({ err: err.message }, 'ai_knowledge_query_embed_failed');
+      await logRetrieval('unavailable');
+      throw new RagUnavailableError(err.message);
+    }
+
+    let rows;
+    try {
+      ({ rows } = await pool.query(SIMILARITY_SQL, [toVectorLiteral(queryVector), organizationId, topK, EMBEDDING_MODEL]));
+    } catch (err) {
+      // A database failure during retrieval is the same class of event as an
+      // embed failure, and was previously not caught here at all — it surfaced
+      // as a 500 from whichever route happened to be calling.
+      logger.error({ err: err.message }, 'ai_knowledge_query_search_failed');
+      await logRetrieval('unavailable');
+      throw new RagUnavailableError(err.message);
+    }
+
+    const hits = rows.filter((r) => Number(r.similarity) >= similarityThreshold);
+    if (hits.length) {
+      await logRetrieval('ok', hits.map((r) => r.document_id));
+      return hits;
+    }
 
   // Nothing came back. Before reporting the honest zero, check whether the
   // studio DOES have documents that were simply embedded by another model —
@@ -203,6 +242,7 @@ async function retrieveContext({ organizationId, query, topK = DEFAULT_TOP_K, si
     const stale = staleRows[0]?.n ?? 0;
     if (stale > 0) {
       logger.error({ model: EMBEDDING_MODEL, stale }, 'ai_knowledge_stale_index');
+      await logRetrieval('stale');
       throw new RagStaleIndexError(EMBEDDING_MODEL, stale);
     }
   } catch (err) {
@@ -212,7 +252,30 @@ async function retrieveContext({ organizationId, query, topK = DEFAULT_TOP_K, si
     logger.warn({ err: err.message }, 'ai_knowledge_stale_probe_failed');
   }
 
+  await logRetrieval('empty');
   return hits;
+  }
+
+  return runRetrieval();
+}
+
+/**
+ * A deterministic, reproducible identifier for the current approved MPTS
+ * corpus state: changes the moment any shared document is approved or
+ * revoked, and identical reads give identical versions. Returned with
+ * every grounded generation and written to the retrieval ledger.
+ */
+async function getCorpusVersion() {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS n, MAX(approved_at) AS last_approved
+       FROM ai_documents
+      WHERE status = 'ready' AND approval_status = 'approved' AND is_global = TRUE`
+  );
+  const n = rows[0]?.n ?? 0;
+  const stamp = rows[0]?.last_approved
+    ? new Date(rows[0].last_approved).toISOString().slice(0, 19).replace(/\D/g, '')
+    : 'none';
+  return `mpts-v${stamp}-n${n}`;
 }
 
 const SIMILARITY_SQL = `
@@ -221,6 +284,7 @@ const SIMILARITY_SQL = `
     FROM ai_document_chunks c
     JOIN ai_documents d ON d.id = c.document_id
     WHERE d.status = 'ready'
+      AND d.approval_status = 'approved'
       AND (d.is_global = TRUE OR d.organization_id = $2)
       AND c.embedding_model = $4
     ORDER BY c.embedding <=> $1::vector ASC
@@ -234,7 +298,11 @@ const STALE_COUNT_SQL = `
     FROM ai_document_chunks c
     JOIN ai_documents d ON d.id = c.document_id
     WHERE d.status = 'ready'
+      AND d.approval_status = 'approved'
       AND (d.is_global = TRUE OR d.organization_id = $1)
       AND c.embedding_model <> $2`;
 
-module.exports = { ingestDocument, deleteDocument, retrieveContext, RagUnavailableError, RagStaleIndexError };
+module.exports = {
+  ingestDocument, deleteDocument, retrieveContext, getCorpusVersion,
+  RagUnavailableError, RagStaleIndexError,
+};

@@ -103,18 +103,21 @@ describe('retrieveContext tenant isolation', () => {
     expect(sql).not.toContain('organization_id IS NULL OR d.is_global');
   });
 
-  test('a missing organizationId fails closed — no query runs, not even for global docs', async () => {
+  test('a missing organizationId fails closed — never retrieves, not even for global docs', async () => {
     const rows = await retrieveContext({ organizationId: undefined, query: 'anything' });
     expect(rows).toEqual([]);
-    expect(pool.query).not.toHaveBeenCalled();
+    // The only statement issued is the ledger's 'skipped' row; no retrieval
+    // SQL (the authorization gate) ever runs.
+    expect(pool.query.mock.calls.filter(([sql]) => !sql.includes('ai_retrieval_log'))).toHaveLength(0);
 
     await retrieveContext({ organizationId: null, query: 'anything' });
-    expect(pool.query).not.toHaveBeenCalled();
+    // Another 'skipped' ledger row, still zero retrieval SQL.
+    expect(pool.query.mock.calls.filter(([sql]) => !sql.includes('ai_retrieval_log'))).toHaveLength(0);
   });
 
   test('an empty query fails closed', async () => {
     await retrieveContext({ organizationId: 'org-a', query: '   ' });
-    expect(pool.query).not.toHaveBeenCalled();
+    expect(pool.query.mock.calls.filter(([sql]) => !sql.includes('ai_retrieval_log'))).toHaveLength(0);
   });
 
   test('an embedding failure throws rather than passing as an empty result', async () => {
@@ -134,18 +137,22 @@ describe('retrieveContext tenant isolation', () => {
     await expect(retrieveContext({ organizationId: 'org-a', query: 'warm up' }))
       .rejects.toMatchObject({ code: 'RAG_UNAVAILABLE' });
 
-    // The security half is unchanged: no query is issued.
-    expect(pool.query).not.toHaveBeenCalled();
+    // No retrieval SQL ran; only the ledger's 'unavailable' note did.
+    expect(pool.query).toHaveBeenCalledTimes(1);
+    expect(pool.query.mock.calls[0][0]).toContain('ai_retrieval_log');
   });
 
   test('a search failure is also reported, not silently empty', async () => {
     // Previously uncaught here at all — it surfaced as a 500 from whichever
     // route was calling, which at least was not a lie. It is now the same
     // typed failure as a cold embedder, so callers handle one case.
-    pool.query.mockRejectedValueOnce(new Error('pgvector down'));
+    pool.query.mockRejectedValueOnce(new Error('pgvector down')); // the similarity search
 
     await expect(retrieveContext({ organizationId: 'org-a', query: 'warm up' }))
       .rejects.toMatchObject({ code: 'RAG_UNAVAILABLE' });
+
+    // The ledger still notes the outage (call #1... no: search = call #1, ledger = #2).
+    expect(pool.query.mock.calls[1][0]).toContain('ai_retrieval_log');
   });
 
   test('a genuinely empty knowledge base still returns [] — the honest zero', async () => {
@@ -219,7 +226,12 @@ describe('embedding model provenance (migration 207)', () => {
     const rows = await retrieveContext({ organizationId: 'org-a', query: 'warm up' });
 
     expect(rows).toHaveLength(1);
-    expect(pool.query).toHaveBeenCalledTimes(1);
+    // Search + the ledger's 'ok' row; no staleness probe.
+    expect(pool.query).toHaveBeenCalledTimes(2);
+    const [sql, params] = pool.query.mock.calls[1];
+    expect(sql).toContain('ai_retrieval_log');
+    expect(params[3]).toBe('ok');            // retrieval outcome as a bound param
+    expect(params[4]).toEqual(['doc-1']);
   });
 
   test('chunks below the similarity threshold are dropped', async () => {
@@ -241,5 +253,42 @@ describe('embedding model provenance (migration 207)', () => {
     expect(params[2]).toBe(7);
     expect(embedText).toHaveBeenCalledTimes(1);
     expect(embedText).toHaveBeenCalledWith('warm up');
+  });
+});
+
+describe('approved-corpus gate (232_mpts_knowledge_lifecycle)', () => {
+  // MPTS grounding rule: only REVIEWED/ACCEPTED documents may act as evidence
+  // for generation. 'pending' (uploaded, awaiting review) and 'revoked'
+  // (superseded or withdrawn versions) must be invisible to retrieval.
+  test('similarity search reads approved documents only', async () => {
+    pool.query.mockResolvedValue({ rows: [] });
+    await retrieveContext({ organizationId: 'org-a', query: 'warm up' });
+    const [sql] = pool.query.mock.calls[0];
+    expect(sql).toContain("d.approval_status = 'approved'");
+  });
+
+  test('the stalessness probe shares the same approval gate', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ n: 0 }] });
+    await retrieveContext({ organizationId: 'org-a', query: 'warm up' });
+    const [sql] = pool.query.mock.calls[1];
+    expect(sql).toContain("d.approval_status = 'approved'");
+  });
+
+  test('the ledger row carries the corpus version and the hit document ids', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rows: [CHUNK()] })
+      .mockResolvedValue({ rows: [] });
+
+    await retrieveContext({ organizationId: 'org-a', query: 'warm up', topK: 5 });
+
+    const [sql, params] = pool.query.mock.calls[1];
+    expect(sql).toContain('ai_retrieval_log');
+    // The corpus version is computed from approved global docs, in-ledger.
+    expect(sql).toContain("approval_status = 'approved' AND is_global = TRUE");
+    expect(params[2]).toContain('internal'); // route watermark
+    expect(params[3]).toBe('ok');            // retrieval outcome as a bound param
+    expect(params[4]).toEqual(['doc-1']);
   });
 });

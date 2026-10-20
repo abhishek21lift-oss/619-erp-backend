@@ -104,6 +104,7 @@ router.get('/', auth, requireTrainer, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT d.id, d.title, d.category, d.filename, d.mime_type, d.file_size_bytes,
             d.status, d.error_message, d.chunk_count, d.is_global, d.created_at,
+            d.source_version, d.approval_status,
             u.name AS uploaded_by_name
      FROM ai_documents d
      LEFT JOIN users u ON u.id = d.uploaded_by
@@ -176,8 +177,13 @@ router.get('/search', auth, requireTrainer, async (req, res) => {
   // covers that". An assistant told only that the result was empty will happily
   // report the first as the second, which is how "we have no refund policy"
   // gets said about a studio that has one.
+  //
+  // approval_status = 'approved': with the MPTS gate live, retrieval returns only
+  // approved documents, so counting pending/revoked ones here would promise
+  // documents the search cannot return.
   const { rows: countRows } = await pool.query(
-    `SELECT COUNT(*)::int AS n FROM ai_documents WHERE organization_id = $1 AND status = 'ready'`,
+    `SELECT COUNT(*)::int AS n FROM ai_documents
+      WHERE organization_id = $1 AND status = 'ready' AND approval_status = 'approved'`,
     [scope.orgId]
   );
   const documentsAvailable = countRows[0]?.n ?? 0;
@@ -191,7 +197,10 @@ router.get('/search', auth, requireTrainer, async (req, res) => {
   let chunks = [];
   let retrieval = 'ok';
   try {
-    chunks = await retrieveContext({ organizationId: scope.orgId, query: q, topK });
+    chunks = await retrieveContext({
+      organizationId: scope.orgId, query: q, topK,
+      route: 'knowledge.search', userId: req.user?.id ?? null,
+    });
   } catch (err) {
     // Still not a 500: a cold embedding model is not a reason to break a
     // search box. But the caller is told, rather than shown a clean zero.

@@ -85,6 +85,21 @@ const DIET_PLAN = {
   hydration_ml: 3000, notes: '',
 };
 
+// ── The approved MPTS corpus fixture ──────────────────────────────────────
+//
+// The grounding gate (workout/diet/progress/fitness-testing) refuses any
+// generation the approved corpus cannot ground, so a passage hit is the
+// DEFAULT retrieval row, and the gate tests override it to nothing. Chunk
+// rows are what retrieveContext's SIMILARITY_SQL returns (with similarity
+// above the 0.55 threshold so `hits` keeps them).
+const CORPUS_CHUNK = {
+  content: 'Every session starts with a 10-minute dynamic warm-up, and leg work never precedes 48 hours of recovery for the same movement pattern.',
+  chunk_index: 0, title: 'MPTS Programming SOP', category: 'methodology',
+  document_id: 'doc-mpts-1', similarity: 0.91,
+};
+// getCorpusVersion() reads the approved-corpus count directly.
+const CORPUS_VERSION_ROW = { n: 3, last_approved: '2026-10-20T09:30:00.000Z' };
+
 const DEFAULT_META = { model: 'primary-model', tier: 'primary', used_fallback: false };
 
 /** An async iterator that yields `chunks` then returns `meta` as its value. */
@@ -117,8 +132,11 @@ function mockQueries(overrides = {}) {
     'FROM pt_nutrition_assessments WHERE client_id=$1': [],
     'FROM workout_assignments wa': [],
     'FROM diet_assignments da': [],
-    // RAG + exercise-library retrieval: no matching docs/exercises by default.
-    'ai_document_chunks': [],
+    // RAG + exercise-library retrieval. The approved-corpus hit is the PLAN
+    // (the grounding gate refuses an empty corpus), and the corpus-version
+    // read answers the approved-count. Gate tests override 'ai_document_chunks'.
+    'ai_document_chunks': [CORPUS_CHUNK],
+    'MAX(approved_at)': [CORPUS_VERSION_ROW],
     'FROM exercises e': [],
 
     // ── The digital twin's reads ──────────────────────────────────────────
@@ -676,14 +694,52 @@ describe('RAG: authorized knowledge in workout/generate', () => {
     expect(serialized).not.toContain(process.env.OPENROUTER_API_KEY);
   });
 
-  test('a retrieval failure is reported in the metadata event and remains non-fatal', async () => {
+  test('workout retrieval failure suppression moved to the MPTS gate', () => {
+    // Remains covered above: a retrieval outage now refuses generation outright
+    // (fail-closed), so this placeholder documents the intent rather than
+    // asserting a behaviour that changed by design.
+    expect(true).toBe(true);
+  });
+
+  // ── The corpus is empty = the gate refuses, honestly ────────────────────
+  //
+  // The OLD honest-empty prompt behaviour is now a REFUSAL: with the approved
+  // corpus holding nothing for this methodology query, a plan that presents
+  // itself as "authorized MY PT STUDIO methodology" cannot be written at all
+  // (acceptance: fail-closed on unsupported topics). The refusal names the
+  // state and the corpus version; no model call is spent.
+  test('an empty approved corpus refuses generation as insufficient evidence', async () => {
+    mockQueries({ 'ai_document_chunks': [], 'FROM exercises e': [] });
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(WORKOUT_PLAN)]));
+
+    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('INSUFFICIENT_EVIDENCE');
+    expect(res.body.grounding).toBe('insufficient_evidence');
+    expect(res.body.detail).toBe('empty');
+    // The refusal is traceable to the exact approved corpus state.
+    expect(res.body.corpus_version).toMatch(/^mpts-v\d{14}-n\d+$/);
+    // The facts were NOT read and no plan was written: the gate fires before
+    // the digital twin and every model call.
+    expect(res.body.message).toContain('nothing was generated');
+    expect(routedStream).not.toHaveBeenCalled();
+    // The retrieval event still lands (the attempt was logged)…
+    const event = ragRetrievalEvent();
+    expect(event[0].rag_chunks_count).toBe(0);
+    expect(event[0].rag_titles).toEqual([]);
+    expect(event[0].retrieval_failed).toBe(false);
+  });
+
+  // The outage and the empty corpus are different failures with different
+  // answers — since retrieveContext stopped conflating them. An outage MUST
+  // NOT be couched as "your studio has nothing on file", and a generation
+  // that could not check its base must not present itself as grounded: 503.
+  test('a retrieval outage refuses generation as insufficient evidence (503, no model call)', async () => {
     pool.query.mockImplementation((sql) => {
       if (sql.includes('ai_document_chunks')) return Promise.reject(new Error('embeddings down'));
       if (sql.includes('FROM exercises e')) return Promise.resolve({ rows: [] });
       if (sql.includes('FROM pt_clients WHERE id=$1')) return Promise.resolve({ rows: [CLIENT] });
-      // The digital twin re-runs its own org-scoped client lookup, spelled
-      // differently — without this it finds no client and the route 404s.
-      if (sql.includes('FROM pt_clients')) return Promise.resolve({ rows: [CLIENT] });
       if (sql.includes('FROM pt_goals WHERE client_id=$1')) return Promise.resolve({ rows: [GOAL] });
       if (sql.includes('FROM pt_assessments WHERE client_id=$1')) return Promise.resolve({ rows: [ASSESSMENT] });
       return Promise.resolve({ rows: [] });
@@ -692,14 +748,39 @@ describe('RAG: authorized knowledge in workout/generate', () => {
 
     const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
 
-    expect(res.status).toBe(200);
-    const event = ragRetrievalEvent();
-    expect(event).toBeDefined();
-    expect(event[0].retrieval_failed).toBe(true);
-    expect(event[0].rag_chunks_count).toBe(0);
-    expect(event[0].rag_titles).toEqual([]);
-    // Generation still streams normally.
-    expect(res.text).toContain('"type":"done"');
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('INSUFFICIENT_EVIDENCE');
+    expect(res.body.detail).toBe('unavailable');
+    expect(res.body.message).toContain('nothing was generated');
+    expect(routedStream).not.toHaveBeenCalled();
+    // And the client never sees a plan.
+    expect(res.text).not.toContain('"type":"done"');
+  });
+
+  // A corpus embedded by another model is not an empty corpus — retrieveContext
+  // raises StaleIndex and the gate refuses with the same honesty.
+  test('a stale-index corpus refuses generation with a distinct unavailable state', async () => {
+    pool.query.mockImplementation((sql) => {
+      // Similarity search returns zero hits…
+      if (sql.includes('ai_document_chunks') && sql.includes('<=>')) return Promise.resolve({ rows: [] });
+      // …but the staleness probe finds chunks embedded by another model.
+      if (sql.includes('ai_document_chunks') && sql.includes('embedding_model <> $2')) {
+        return Promise.resolve({ rows: [{ n: 4 }] });
+      }
+      if (sql.includes('FROM exercises e')) return Promise.resolve({ rows: [] });
+      if (sql.includes('FROM pt_clients WHERE id=$1')) return Promise.resolve({ rows: [CLIENT] });
+      if (sql.includes('FROM pt_goals WHERE client_id=$1')) return Promise.resolve({ rows: [GOAL] });
+      if (sql.includes('FROM pt_assessments WHERE client_id=$1')) return Promise.resolve({ rows: [ASSESSMENT] });
+      return Promise.resolve({ rows: [] });
+    });
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(WORKOUT_PLAN)]));
+
+    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
+
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('INSUFFICIENT_EVIDENCE');
+    expect(res.body.detail).toBe('stale');
+    expect(routedStream).not.toHaveBeenCalled();
   });
 
   test('the workout prompt includes the authorized exercise-library context', async () => {
@@ -742,51 +823,6 @@ describe('RAG: authorized knowledge in workout/generate', () => {
     expect(sql).toContain('(e.organization_id IS NULL OR (e.organization_id = $1::uuid AND e.created_by = $2))');
     expect(params[0]).toBe('org-1');
     expect(params[1]).toBe('u1');
-  });
-
-  test('with no matching knowledge the prompt never fabricates a citation', async () => {
-    mockQueries({ 'ai_document_chunks': [], 'FROM exercises e': [] });
-    routedStream.mockReturnValue(streamChunks([JSON.stringify(WORKOUT_PLAN)]));
-
-    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
-
-    expect(res.status).toBe(200);
-    const prompt = promptOf(routedStream.mock.calls[0][0]);
-    expect(prompt).not.toContain('AUTHORIZED KNOWLEDGE BASE');
-    expect(prompt).not.toContain('[1] (');
-    expect(prompt).not.toContain('EXERCISE LIBRARY');
-    // The facts and instructions survive without the RAG sections.
-    expect(prompt).toContain("CLIENT FACTS (from the studio's records):");
-    expect(prompt).toContain('INSTRUCTIONS:');
-    expect(res.text).toContain('"type":"done"');
-    // Empty retrieval is reported honestly in the metadata event.
-    const event = ragRetrievalEvent();
-    expect(event[0].rag_chunks_count).toBe(0);
-    expect(event[0].rag_titles).toEqual([]);
-    expect(event[0].exercise_count).toBe(0);
-    expect(event[0].retrieval_failed).toBe(false);
-  });
-
-  test('a knowledge retrieval failure is non-fatal and never fails generation', async () => {
-    pool.query.mockImplementation((sql) => {
-      if (sql.includes('ai_document_chunks')) return Promise.reject(new Error('embeddings down'));
-      if (sql.includes('FROM exercises e')) return Promise.resolve({ rows: [] });
-      if (sql.includes('FROM pt_clients WHERE id=$1')) return Promise.resolve({ rows: [CLIENT] });
-      // The digital twin re-runs its own org-scoped client lookup, spelled
-      // differently — without this it finds no client and the route 404s.
-      if (sql.includes('FROM pt_clients')) return Promise.resolve({ rows: [CLIENT] });
-      if (sql.includes('FROM pt_goals WHERE client_id=$1')) return Promise.resolve({ rows: [GOAL] });
-      if (sql.includes('FROM pt_assessments WHERE client_id=$1')) return Promise.resolve({ rows: [ASSESSMENT] });
-      return Promise.resolve({ rows: [] });
-    });
-    routedStream.mockReturnValue(streamChunks([JSON.stringify(WORKOUT_PLAN)]));
-
-    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
-
-    expect(res.status).toBe(200);
-    const prompt = promptOf(routedStream.mock.calls[0][0]);
-    expect(prompt).not.toContain('AUTHORIZED KNOWLEDGE BASE');
-    expect(res.text).toContain('"type":"done"');
   });
 
   test('a cross-tenant client 404s before any knowledge retrieval runs', async () => {
