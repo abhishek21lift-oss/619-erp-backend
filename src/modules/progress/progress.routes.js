@@ -14,6 +14,8 @@ const mobilityScoring = require('./mobility-scoring');
 const postureScoring = require('./posture-scoring');
 const strengthLogs = require('./strength-logs.repo');
 const assessmentsRepo = require('./assessments.repo');
+const retests = require('./retests.service');
+const logger = require('../../lib/logger');
 const { today: studioToday, mondayOf } = require('../../lib/appTime');
 const { optionalNumber } = require('../../lib/zodNumbers');
 
@@ -99,6 +101,7 @@ const assessmentCreateSchema = {
     posture_notes: text(2000),
     health_notes: text(2000),
     trainer_notes: text(2000),
+    testing_conditions: text(2000),
     // An acknowledged skip of the blood-pressure reading (see BP_REQUIRED).
     bp_not_measured: z.boolean().optional(),
   }),
@@ -143,7 +146,7 @@ const ASSESSMENT_INPUTS = [
   ...ASSESSMENT_NUMERIC, 'assessment_type', 'assessment_date', 'body_comp_method',
   'cardio_test_type', 'cardio_test_data', 'strength_exercise', 'strength_exercise_2', 'strength_test_data',
   'endurance_test_type', 'endurance_test_type_2', 'endurance_test_data', 'flexibility_test_data',
-  'posture_notes', 'health_notes', 'trainer_notes',
+  'posture_notes', 'health_notes', 'trainer_notes', 'testing_conditions',
 ];
 
 /** A stored test, read back as the request body that would have produced it. */
@@ -325,6 +328,7 @@ function computeAssessment(b, age, gender) {
       has_asymmetry: hasAsymmetry, mobility_score_computed: mobilityScore,
       body_composition_score: bodyCompositionScore, health_risk_score: healthRiskScore, overall_fitness_score: overallScore,
       posture_notes: b.posture_notes || null, health_notes: healthNotes,
+      testing_conditions: b.testing_conditions || null,
     },
   };
 }
@@ -355,7 +359,25 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
   });
   await assessmentsRepo.replaceAssessmentLifts(row, result.lifts);
   await assessmentsRepo.updateClientBody(row.client_id, row.organization_id, result.cols.weight, result.cols.height_cm);
-  res.status(201).json({ data: { ...row, bp_unsafe: result.bpUnsafe }, screening_warnings: screeningWarnings });
+  // The assessment is already saved. A scheduling failure must not turn a
+  // successful test into a 500 the trainer will retry and duplicate, so it is
+  // logged and reported beside the assessment instead.
+  let retest = null;
+  let retestError = null;
+  try {
+    retest = await retests.syncAfterAssessment({
+      orgId: orgIdOf(req), clientId: row.client_id, assessment: row, userId: req.user.id,
+    });
+  } catch (err) {
+    retestError = 'Re-test schedule could not be updated.';
+    logger.error({ err: err.message, assessmentId: row.id, clientId: row.client_id }, 'assessment re-test sync failed');
+  }
+  res.status(201).json({
+    data: { ...row, bp_unsafe: result.bpUnsafe },
+    screening_warnings: screeningWarnings,
+    retest,
+    ...(retestError ? { retest_error: retestError } : {}),
+  });
 }));
 
 // A test used to be permanent: a typo in the weight fed the goal's starting

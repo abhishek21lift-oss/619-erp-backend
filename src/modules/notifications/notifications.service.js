@@ -15,6 +15,7 @@
 const crypto = require('crypto');
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
+const { escapeHtml } = require('../../lib/escape-html');
 const { providerSignal } = require('../../lib/providerTimeout');
 
 /**
@@ -208,7 +209,7 @@ const templates = {
     body: `Hi ${name}, we received your payment of ${currency}${amount}. Thanks!`,
     email: {
       subject: 'Payment receipt — MY PT STUDIO',
-      html: `<p>Hi ${name},</p><p>We received your payment of <b>${currency}${amount}</b>.</p>`,
+      html: `<p>Hi ${escapeHtml(name)},</p><p>We received your payment of <b>${escapeHtml(currency)}${escapeHtml(amount)}</b>.</p>`,
     },
     whatsapp: { template: 'payment_received', variables: [name, `${currency}${amount}`] },
   }),
@@ -217,10 +218,54 @@ const templates = {
     body: `Your ${plan} plan ends in ${days} days. Renew to keep training.`,
     email: {
       subject: `Your membership expires in ${days} days`,
-      html: `<p>Hi ${name},</p><p>Your <b>${plan}</b> ends in <b>${days} days</b>.</p>`,
+      html: `<p>Hi ${escapeHtml(name)},</p><p>Your <b>${escapeHtml(plan)}</b> ends in <b>${escapeHtml(days)} days</b>.</p>`,
     },
     whatsapp: { template: 'membership_expiring', variables: [name, String(days), plan] },
   }),
+  assessment_reminder: ({ name, scheduled_date, days }) => ({
+    title: `Fitness re-test in ${days} days`,
+    body: `Hi ${name}, your next fitness assessment is due on ${scheduled_date}. Reply to your trainer if you need to move it.`,
+    email: {
+      subject: `Fitness re-test in ${days} days`,
+      html: `<p>Hi ${escapeHtml(name)},</p><p>Your next fitness assessment is due on <b>${escapeHtml(scheduled_date)}</b>.</p><p>Reply to your trainer if you need to move it.</p>`,
+    },
+  }),
+  assessment_due: ({ name, scheduled_date }) => ({
+    title: 'Fitness re-test due today',
+    body: `Hi ${name}, your fitness assessment is due today (${scheduled_date}). Your trainer will confirm the time.`,
+    email: {
+      subject: 'Fitness re-test due today',
+      html: `<p>Hi ${escapeHtml(name)},</p><p>Your fitness assessment is due today, <b>${escapeHtml(scheduled_date)}</b>.</p><p>Your trainer will confirm the time.</p>`,
+    },
+  }),
+  assessment_overdue: ({ name, scheduled_date, days }) => ({
+    title: 'Fitness re-test is overdue',
+    body: `Hi ${name}, your fitness assessment was due on ${scheduled_date} (${days} days ago). Your trainer can help you rebook.`,
+    email: {
+      subject: 'Fitness re-test is overdue',
+      html: `<p>Hi ${escapeHtml(name)},</p><p>Your fitness assessment was due on <b>${escapeHtml(scheduled_date)}</b> (${escapeHtml(days)} days ago).</p><p>Your trainer can help you rebook.</p>`,
+    },
+  }),
+  assessment_trainer_reminder: ({ name, client_name, scheduled_date, days, state }) => {
+    const timing = state === 'overdue'
+      ? `was due on ${scheduled_date} and is overdue`
+      : state === 'due'
+        ? `is due today (${scheduled_date})`
+        : `is due in ${days} day${days === 1 ? '' : 's'} (${scheduled_date})`;
+    const subject = state === 'overdue'
+      ? `Re-test overdue: ${client_name}`
+      : state === 'due'
+        ? `Re-test due today: ${client_name}`
+        : `Re-test in ${days} days: ${client_name}`;
+    return {
+      title: subject,
+      body: `Hi ${name}, ${client_name}'s fitness re-test ${timing}. Open the progress hub to confirm or move it.`,
+      email: {
+        subject,
+        html: `<p>Hi ${escapeHtml(name)},</p><p><b>${escapeHtml(client_name)}</b>'s fitness re-test ${escapeHtml(timing)}.</p><p>Open the progress hub to confirm or move it.</p>`,
+      },
+    };
+  },
   class_reminder: ({ name, class_name, time }) => ({
     title: `${class_name} starts soon`,
     body: `Hi ${name}, reminder: ${class_name} at ${time}.`,
@@ -390,9 +435,39 @@ async function recipientFromClient(orgId, clientId) {
   const { rows } = await pool.query(
     `SELECT c.id AS client_id, c.id AS member_id, c.name, c.email,
             COALESCE(NULLIF(c.whatsapp, ''), c.mobile) AS phone, c.organization_id,
-            NULL AS user_id
+            u.id AS user_id
        FROM pt_clients c
-      WHERE c.id = $1 AND c.organization_id = $2 AND c.deleted_at IS NULL`,
+       LEFT JOIN users u
+              ON u.pt_client_id = c.id
+             AND u.organization_id = c.organization_id
+             AND u.deleted_at IS NULL
+             AND u.is_active = TRUE
+      WHERE c.id = $1 AND c.organization_id = $2 AND c.deleted_at IS NULL
+      ORDER BY u.created_at ASC
+      LIMIT 1`,
+    [clientId, orgId]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * The trainer who should act on a client's re-test: the assigned trainer's
+ * user when one is linked, otherwise the studio's first active trainer. Always
+ * org-scoped; a client outside the studio is null, never a fallback lookup.
+ */
+async function recipientFromTrainer(orgId, clientId) {
+  const { rows } = await pool.query(
+    `SELECT u.id AS user_id, u.name, u.email, c.organization_id
+       FROM pt_clients c
+       JOIN users u
+         ON u.organization_id = c.organization_id
+        AND u.role = 'trainer'
+        AND u.is_active = TRUE
+        AND u.deleted_at IS NULL
+      WHERE c.id = $1 AND c.organization_id = $2 AND c.deleted_at IS NULL
+      ORDER BY CASE WHEN u.trainer_id = c.trainer_id THEN 0 ELSE 1 END,
+               u.created_at ASC
+      LIMIT 1`,
     [clientId, orgId]
   );
   return rows[0] || null;
@@ -477,6 +552,7 @@ async function markAllRead(userId) {
 }
 
 module.exports = {
-  send, deliverChannel, processNotificationJob, recipientFromMember, recipientFromClient, inbox, markRead, markAllRead,
+  send, deliverChannel, processNotificationJob, recipientFromMember, recipientFromClient,
+  recipientFromTrainer, inbox, markRead, markAllRead,
   templates, channels, TRANSACTIONAL_NOTIFICATIONS,
 };
