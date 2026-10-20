@@ -183,3 +183,59 @@ describe('no secrets in logs', () => {
     expect(serialized).toContain('ai_completion_timeout');
   });
 });
+// ── Round-1 P1 #3 regression: usage fields and the gateway host-gate ─────────
+// usage:{include:true} is what keeps the quota/cost ledger honest. It used to
+// be sent ONLY to openrouter.ai; behind a custom AI_BASE_URL (a forwarding
+// gateway) the fields vanished silently and every gateway call lost its exact
+// accounting. AI_USAGE_FIELDS_MODE makes the bias an operator decision.
+describe('AI_USAGE_FIELDS_MODE (round-1 P1 #3)', () => {
+  const bodyOf = async (mod) => {
+    let captured;
+    global.fetch = jest.fn(async (_url, opts) => {
+      captured = JSON.parse(opts.body);
+      return {
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 1 } }),
+      };
+    });
+    await mod.chatCompletion({ model: 'vendor/m', messages: MSG });
+    return captured;
+  };
+
+  afterEach(() => {
+    delete process.env.AI_USAGE_FIELDS_MODE;
+    delete process.env.AI_BASE_URL;
+    jest.resetModules();
+  });
+
+  it('auto (default) sends the fields to openrouter.ai', async () => {
+    const fresh = require('../lib/ai/openrouter');
+    const body = await bodyOf(fresh);
+    expect(body.usage).toEqual({ include: true });
+    expect(body.provider).toBeDefined();
+  });
+
+  it('auto with a custom AI_BASE_URL keeps the fields OFF (gateway may reject them)', async () => {
+    process.env.AI_BASE_URL = 'https://gw.example.test/v1';
+    const fresh = require('../lib/ai/openrouter');
+    const body = await bodyOf(fresh);
+    expect(body.usage).toBeUndefined();
+    expect(body.provider).toBeUndefined();
+  });
+
+  it('always sends the fields to the configured gateway too', async () => {
+    process.env.AI_BASE_URL = 'https://gw.example.test/v1';
+    process.env.AI_USAGE_FIELDS_MODE = 'always';
+    const fresh = require('../lib/ai/openrouter');
+    const body = await bodyOf(fresh);
+    expect(body.usage).toEqual({ include: true });
+  });
+
+  it('never suppresses the fields even on openrouter.ai', async () => {
+    process.env.AI_USAGE_FIELDS_MODE = 'never';
+    const fresh = require('../lib/ai/openrouter');
+    const body = await bodyOf(fresh);
+    expect(body.usage).toBeUndefined();
+    expect(body.provider).toBeUndefined();
+  });
+});

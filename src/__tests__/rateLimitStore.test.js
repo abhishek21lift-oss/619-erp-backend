@@ -164,12 +164,20 @@ describe('every limiter in the codebase uses the shared store', () => {
     const src = read(file);
     const limiters = (src.match(/rateLimit\(\{/g) || []).length;
     const stores = (src.match(/store: makeStore\('/g) || []).length;
-    const passOn = (src.match(/passOnStoreError: true/g) || []).length;
+    const passOn = (src.match(/passOnStoreError: (true|[A-Z_]+)/g) || []).length;
 
     // A new limiter added without a store silently reintroduces the finding
     // for that endpoint only — the hardest kind to notice.
     expect(stores).toBe(limiters);
     expect(passOn).toBe(limiters);
+    // The bias decision must stay explicit in every file. The literal `true`
+    // is the norm; a gated variable is allowed ONLY when the gate provably
+    // defaults to passing on store errors and flips solely on the named
+    // fail-closed opt-in (round-2 remediation: AI_LIMITER_FAILURE_MODE on the
+    // AI limiter). A bare `false` still fails this test.
+    if (/passOnStoreError: [A-Z_]/.test(src)) {
+      expect(src).toMatch(/toLowerCase\(\)\s*!==\s*'fail-closed'/);
+    }
   });
 
   it('gives every limiter a DISTINCT prefix', () => {

@@ -10,14 +10,15 @@ async function logUsage({
   user_id, conversation_id, model, provider = 'openrouter',
   intent_type = 'fitness', tokens_prompt = 0, tokens_completion = 0,
   latency_ms = 0, used_fallback = false, cost_inr = null, usage_source = null,
+  request_id = null,
 }) {
   try {
     await pool.query(
       `INSERT INTO ai_usage_log
          (user_id, conversation_id, model, provider, intent_type,
           tokens_prompt, tokens_completion, tokens_total,
-          latency_ms, used_fallback, cost_inr, usage_source)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          latency_ms, used_fallback, cost_inr, usage_source, request_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [
         user_id,
         conversation_id || null,
@@ -31,6 +32,7 @@ async function logUsage({
         used_fallback,
         cost_inr,
         usage_source,
+        request_id,
       ]
     );
   } catch (err) {

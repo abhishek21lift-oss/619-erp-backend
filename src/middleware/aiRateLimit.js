@@ -17,9 +17,16 @@ const AI_REQUESTS_PER_MINUTE = Number(process.env.AI_RATE_LIMIT_PER_MINUTE) > 0
   ? Number(process.env.AI_RATE_LIMIT_PER_MINUTE)
   : 20;
 
+// Round-1 P1 #2: the limiting stack failed OPEN on a Redis blip (uncapped AI
+// spend for the duration of the outage, silently). It stays the default — a
+// redis-refresh must not take the AI Suite down with it — but
+// AI_LIMITER_FAILURE_MODE=fail-closed flips the bias for operators who prefer
+// refused requests over uncounted ones on this surface.
+const PASS_ON_STORE_ERROR = String(process.env.AI_LIMITER_FAILURE_MODE).toLowerCase() !== 'fail-closed';
+
 const aiLimiter = rateLimit({
   store: makeStore('ai'),
-  passOnStoreError: true,
+  passOnStoreError: PASS_ON_STORE_ERROR,
   windowMs: 60 * 1000,
   max: AI_REQUESTS_PER_MINUTE,
   standardHeaders: true,

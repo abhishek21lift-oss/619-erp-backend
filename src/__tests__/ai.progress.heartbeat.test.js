@@ -28,8 +28,18 @@ jest.mock('../lib/ai/usage', () => ({
   getUserUsage: jest.fn(),
   getModelStats: jest.fn(),
 }));
-jest.mock('../lib/ai/knowledgeBase', () => ({ retrieveContext: jest.fn() }));
-jest.mock('../lib/ai/tools', () => ({ runTools: jest.fn() }));
+  // The knowledge-base mock is partial by design: the grounding gate (now on
+  // every progress/fitness-testing call) reads the approved corpus through it,
+  // so retrieveContext must answer with a passage for the gate to pass.
+  // Classification relies on error shape, never on the module's classes.
+  jest.mock('../lib/ai/knowledgeBase', () => ({
+    retrieveContext: jest.fn().mockResolvedValue([{
+      content: 'consult weeks-6-12 progression against the reassessment norms before adjusting load',
+      chunk_index: 0, title: 'MPTS Methodology SOP', category: 'methodology',
+      document_id: 'doc-mpts-1', similarity: 0.9,
+    }]),
+    getCorpusVersion: jest.fn().mockResolvedValue('mpts-v20261020093000-n1'),
+  }));jest.mock('../lib/ai/tools', () => ({ runTools: jest.fn() }));
 jest.mock('../lib/sse-heartbeat', () => ({ startSseHeartbeat: jest.fn() }));
 jest.mock('../lib/logger', () => ({ warn: jest.fn(), error: jest.fn(), info: jest.fn() }));
 
@@ -137,11 +147,18 @@ describe('POST /api/ai/progress/analyze — heartbeat lifecycle (P2-2)', () => {
     expect(res.headers['content-type']).toMatch(/text\/event-stream/);
     expect(res.text).toContain(': ping');
     const done = donePayloadOf(res.text);
+    // The grounding sanitizer stamps the (empty here — the model cited none)
+    // citations array onto every grounded output: an absent field is
+    // indistinguishable from "citations validated" to a consumer.
     expect(done.type).toBe('done');
-    expect(done.data).toEqual(REPORT);
+    expect(done.data).toEqual({ ...REPORT, knowledge_citations: [] });
     expect(done.model).toBe('primary-model');
     expect(done.tier).toBe('primary');
     expect(done.used_fallback).toBe(false);
+    // And the done event itself now names the provenance of the analysis.
+    expect(done.grounding.corpus_version).toBe('mpts-v20261020093000-n1');
+    expect(done.grounding.sources).toHaveLength(1);
+    expect(done.grounding.validation_status).toBe('no_citations');
     expect(eventTypesOf(res.text)).toEqual(['done']);
   });
 
@@ -205,7 +222,8 @@ describe('POST /api/ai/fitness-testing/analyze — heartbeat lifecycle (P2-2)', 
     expect(res.text).toContain(': ping');
     const done = donePayloadOf(res.text);
     expect(done.type).toBe('done');
-    expect(done.data).toEqual(REPORT);
+    expect(done.data).toEqual({ ...REPORT, knowledge_citations: [] });
+    expect(done.grounding.corpus_version).toBe('mpts-v20261020093000-n1');
     expect(eventTypesOf(res.text)).toEqual(['done']);
   });
 

@@ -25,7 +25,17 @@ jest.mock('../lib/ai/usage', () => ({
   getUserUsage: jest.fn(),
   getModelStats: jest.fn(),
 }));
-jest.mock('../lib/ai/knowledgeBase', () => ({ retrieveContext: jest.fn() }));
+  // The knowledge-base mock is partial by design: the grounding gate (now on
+  // every progress call) reads the approved corpus through it, so
+  // retrieveContext answers with a passage for the gate to pass.
+  jest.mock('../lib/ai/knowledgeBase', () => ({
+    retrieveContext: jest.fn().mockResolvedValue([{
+      content: 'consult weeks-6-12 progression against the reassessment norms before adjusting load',
+      chunk_index: 0, title: 'MPTS Methodology SOP', category: 'methodology',
+      document_id: 'doc-mpts-1', similarity: 0.9,
+    }]),
+    getCorpusVersion: jest.fn().mockResolvedValue('mpts-v20261020093000-n1'),
+  }));
 jest.mock('../lib/ai/tools', () => ({ runTools: jest.fn() }));
 jest.mock('../lib/logger', () => ({ warn: jest.fn(), error: jest.fn(), info: jest.fn() }));
 
@@ -77,7 +87,10 @@ function mockProgressDB({ assessments = [], checkins = [], logs = [], client = C
 
 const sqlAt = (i) => pool.query.mock.calls[i][0];
 const userPrompt = () => routedStream.mock.calls[0][0].messages.find((m) => m.role === 'user').content;
-const contextData = () => JSON.parse(userPrompt().slice(userPrompt().indexOf('{')));
+// The prompt now carries the grounding block AFTER the data (same order the
+// plan generators use: payload first, authorized knowledge second), so slice
+// from the first '{' to the LAST '}' — the knowledge section follows the JSON.
+const contextData = () => JSON.parse(userPrompt().slice(userPrompt().indexOf('{'), userPrompt().lastIndexOf('}') + 1));
 
 beforeEach(() => {
   pool.query.mockReset();

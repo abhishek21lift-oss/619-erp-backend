@@ -90,4 +90,56 @@ function serviceAuth(req, res, next) {
   return next();
 }
 
-module.exports = { serviceAuth, safeEqual, HEADER };
+/**
+ * Enforced variant for FIRST-PARTY-ONLY endpoints — round-2 remediation
+ * (audit MPS-05: the attestation header was never consumed by any route).
+ *
+ * Used by `/api/ai/usage/service/*` (usage ingest from the mps-ai service):
+ * endpoints the browser must never reach, where a missing or wrong
+ * attestation is a hard 401 rather than a silent pass-through. The secret is
+ * compared time-safely and NEVER logged, and every failure is fail-closed.
+ *
+ * It grants nothing by itself — these routes still resolve the END USER via
+ * `auth()` and their studio via requireTrainer. The service header proves the
+ * relay is ours; the user token proves who is acting; the two are independent.
+ */
+function requireServiceAuth() {
+  return function requireServiceAuthMw(req, res, next) {
+    const expected = process.env.SERVICE_AUTH_SECRET;
+
+    if (presentedHeader(req) == null || presentedHeader(req) === '') {
+      return res.status(401).json({
+        error: { code: 'SERVICE_AUTH_REQUIRED', message: 'Internal endpoint; service credential required.' },
+      });
+    }
+
+    if (!expected) {
+      // Fail-closed by design (internal-only surface): a deploy without the
+      // secret must not accept unattested internal traffic.
+      logger.error({ path: req.path }, 'service_auth_not_configured');
+      return res.status(503).json({
+        error: {
+          code: 'SERVICE_AUTH_NOT_CONFIGURED',
+          message: 'Service authentication is not configured on this server.',
+        },
+      });
+    }
+
+    if (!safeEqual(presentedHeader(req), expected)) {
+      logger.warn({ path: req.path, ip: req.ip }, 'service_auth_rejected');
+      return res.status(401).json({
+        error: { code: 'SERVICE_AUTH_INVALID', message: 'Invalid service credential.' },
+      });
+    }
+
+    req.serviceCaller = 'ai';
+    return next();
+  };
+}
+
+function presentedHeader(req) {
+  const v = req.headers[HEADER];
+  return Array.isArray(v) ? v[0] : v;
+}
+
+module.exports = { serviceAuth, requireServiceAuth, safeEqual, HEADER };

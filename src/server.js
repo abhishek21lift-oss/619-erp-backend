@@ -944,6 +944,11 @@ app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), 
 // check did not stop: any client could have another client's health record
 // summarised back to them. The member app calls none of these; a client's own
 // data is /api/me. Every AI action is trainer-only in its registry as well.
+// Internal service endpoints (round-2 remediation): usage ingest + quota
+// probe used by the mps-ai assistant. Mounted BEFORE the /api/ai mounts so
+// the more specific path wins. requireServiceAuth rejects the open internet;
+// identity is resolved from the forwarded user token, same as tool reads.
+app.use('/api/ai/usage/service', require('./routes/aiServiceUsage'));
 app.use('/api/ai',               userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
 app.use('/api/ai',               ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/ai'));
 
@@ -979,6 +984,7 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 // refuses anyone who is not a `member` linked to a client record, and every
 // query inside is scoped to req.user.pt_client_id — never to an id from the
 // request.
+app.use('/api/me',               auth, requireClient, require('./modules/progress/member-progress.routes'));
 app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-portal.routes'));
 
 // The studio's side of member ↔ studio messaging. The member's side is
@@ -1006,6 +1012,7 @@ app.use('/api/client-login',     auth, requireTrainer, require('./routes/client-
 // userApiLimiter as well: these two mounts had only the 2000-per-15-minutes
 // global bucket, which is a generous ceiling for an endpoint that returns
 // health records a page at a time.
+app.use('/api/progress',   userApiLimiter, auth, requireTrainer, require('./modules/progress/progress-module5.routes'));
 app.use('/api/progress',   userApiLimiter, auth, requireTrainer, require('./modules/progress/progress.routes'));
 app.use('/api/automation', userApiLimiter, auth, requireTrainer, require('./modules/automation/automation.routes'));
 
