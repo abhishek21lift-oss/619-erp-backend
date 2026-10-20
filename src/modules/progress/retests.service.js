@@ -76,25 +76,19 @@ async function syncAfterAssessment({ orgId, clientId, assessment, userId = null 
   const row = normalizeAssessment(assessment);
   if (!row?.assessment_date) return { schedule: null, completed_previous: null };
   const settings = await getSettings(orgId);
-  const active = normalizeSchedule(await repo.activeSchedule(orgId, clientId));
-
-  if (active) {
-    if (active.baseline_assessment_id === row.id) return { schedule: active, completed_previous: null };
-    const currentBaseline = active.baseline_assessment_id
-      ? normalizeAssessment(await repo.getAssessment(orgId, clientId, active.baseline_assessment_id))
-      : null;
-    if (currentBaseline?.assessment_date && row.assessment_date < currentBaseline.assessment_date) {
-      return { schedule: active, completed_previous: null };
-    }
-    await repo.completeSchedule(orgId, active.id, row.id, userId || null);
-  }
-
   const scheduledDate = scheduling.scheduleFromBaseline(row.assessment_date, settings.cadence_months);
-  const created = await repo.createSchedule({
-    orgId, clientId, baselineAssessmentId: row.id, scheduledDate,
-    cadenceMonths: settings.cadence_months, source: 'auto', createdBy: userId,
+
+  // Close the old cycle and open the next one in one transaction. If the
+  // INSERT fails, the close is rolled back and the client keeps the open
+  // cycle; retrying the same assessment is idempotent.
+  const result = await repo.advanceCycle({
+    orgId, clientId, assessmentId: row.id, assessmentDate: row.assessment_date,
+    scheduledDate, cadenceMonths: settings.cadence_months, userId: userId || null,
   });
-  return { schedule: normalizeSchedule(created), completed_previous: active?.id || null };
+  return {
+    schedule: normalizeSchedule(result.schedule),
+    completed_previous: result.completed_previous || null,
+  };
 }
 
 async function overview(orgId, clientId) {
@@ -153,6 +147,89 @@ async function overview(orgId, clientId) {
     history: rawHistory.map(normalizeSchedule).map((h) => (
       h.id === schedule.id ? { ...h, status: state.state } : h
     )),
+  };
+}
+
+const ROSTER_STATES = ['missing_baseline', 'not_scheduled', 'upcoming', 'due', 'overdue', 'rescheduled'];
+const STATE_ORDER = { overdue: 0, due: 1, upcoming: 2, rescheduled: 3, not_scheduled: 4, missing_baseline: 5 };
+
+/**
+ * Cross-client roster for the trainer hub. State is derived here, not in SQL,
+ * because "today" is the studio's local day and a UTC CURRENT_DATE would move
+ * a client between due and overdue at the wrong hour.
+ */
+async function rosterOverview(orgId, { search = '', status = 'all', page = 1, limit = 20 } = {}) {
+  const timezone = await timezoneFor(orgId);
+  const today = scheduling.todayInZone(timezone);
+  // shortcut: loads the whole org then filters/paginates here. Measured 2026-10-20
+  // at ~2,000 clients: 0.37-0.50 s warm, 1.5 s cold. Move state filtering and
+  // counts into SQL if a studio outgrows a few thousand clients.
+  const rows = await repo.rosterForOverview(orgId);
+
+  const clients = rows.map((row) => {
+    const assessmentCount = Number(row.assessment_count) || 0;
+    const scheduledDate = row.scheduled_date ? dateOnly(row.scheduled_date) : null;
+    let state;
+    if (!assessmentCount) {
+      state = { state: 'missing_baseline', days_until: null, label: 'No baseline assessment' };
+    } else if (!scheduledDate) {
+      state = { state: 'not_scheduled', days_until: null, label: 'No re-test scheduled' };
+    } else {
+      state = scheduling.deriveState({
+        status: row.schedule_status, scheduledDate, today,
+      });
+    }
+    return {
+      client_id: row.client_id,
+      name: row.name,
+      email: row.email,
+      mobile: row.mobile,
+      client_status: row.client_status,
+      trainer_name: row.trainer_name,
+      assessment_count: assessmentCount,
+      baseline_date: row.baseline_date ? dateOnly(row.baseline_date) : null,
+      latest_date: row.latest_date ? dateOnly(row.latest_date) : null,
+      latest_score: row.latest_score == null ? null : Number(row.latest_score),
+      schedule_id: row.schedule_id || null,
+      scheduled_date: scheduledDate,
+      cadence_months: row.cadence_months || null,
+      schedule_status: row.schedule_status || null,
+      rescheduled_from: row.rescheduled_from ? dateOnly(row.rescheduled_from) : null,
+      state,
+    };
+  });
+
+  const term = String(search || '').trim().toLowerCase();
+  const searched = term
+    ? clients.filter((c) => [c.name, c.email, c.mobile]
+      .some((v) => String(v || '').toLowerCase().includes(term)))
+    : clients;
+
+  const counts = { total: searched.length };
+  for (const key of ROSTER_STATES) counts[key] = 0;
+  for (const c of searched) counts[c.state.state] += 1;
+
+  const filtered = status && status !== 'all'
+    ? searched.filter((c) => c.state.state === status)
+    : searched;
+  filtered.sort((a, b) => (
+    (STATE_ORDER[a.state.state] ?? 99) - (STATE_ORDER[b.state.state] ?? 99)
+    || String(a.scheduled_date || '9999-12-31').localeCompare(String(b.scheduled_date || '9999-12-31'))
+    || a.name.localeCompare(b.name)
+  ));
+
+  const size = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  const currentPage = Math.max(Number(page) || 1, 1);
+  const total = filtered.length;
+  return {
+    today,
+    timezone,
+    counts,
+    clients: filtered.slice((currentPage - 1) * size, currentPage * size),
+    page: currentPage,
+    limit: size,
+    total,
+    pages: Math.max(Math.ceil(total / size), 1),
   };
 }
 
@@ -235,15 +312,25 @@ async function complete(orgId, clientId, scheduleId, assessmentId, userId = null
   if (schedule.baseline_assessment_id && String(schedule.baseline_assessment_id) === String(assessmentId)) {
     throw httpError(409, 'BASELINE_IS_NOT_RETEST', 'The baseline test cannot close its own re-test cycle. Record the new test first.');
   }
-  const row = await repo.completeSchedule(orgId, scheduleId, assessmentId, userId);
-  if (!row) throw httpError(409, 'NOT_OPEN', 'This re-test is already closed.');
-  // Closing a cycle is also when the next one opens; otherwise a manual
-  // completion would leave the client with no re-test at all.
-  await syncAfterAssessment({ orgId, clientId, assessment, userId });
-  return normalizeSchedule(row);
+  // Closing a cycle is also when the next one opens. Both writes share one
+  // transaction, so a creation failure leaves the cycle open and retryable
+  // instead of stranding the client with no scheduled re-test.
+  const normalized = normalizeAssessment(assessment);
+  const settings = await getSettings(orgId);
+  const result = await repo.advanceCycle({
+    orgId, clientId, assessmentId, assessmentDate: normalized.assessment_date,
+    scheduledDate: scheduling.scheduleFromBaseline(normalized.assessment_date, settings.cadence_months),
+    cadenceMonths: settings.cadence_months,
+    userId, expectedScheduleId: scheduleId,
+  });
+  if (result.not_open || !result.completed_schedule) {
+    throw httpError(409, 'NOT_OPEN', 'This re-test is already closed.');
+  }
+  return normalizeSchedule(result.completed_schedule);
 }
 
 module.exports = {
-  DEFAULT_SETTINGS, syncAfterAssessment, overview, comparisonFor, getSettings, saveSettings,
+  DEFAULT_SETTINGS, syncAfterAssessment, overview, rosterOverview, comparisonFor, getSettings, saveSettings,
   startSchedule, reschedule, cancel, complete, timezoneFor, normalizeAssessment, normalizeSchedule,
+  ROSTER_STATES,
 };

@@ -452,6 +452,29 @@ async function recipientFromClient(orgId, clientId) {
 }
 
 /**
+ * The trainer who should act on a client's re-test: the assigned trainer's
+ * user when one is linked, otherwise the studio's first active trainer. Always
+ * org-scoped; a client outside the studio is null, never a fallback lookup.
+ */
+async function recipientFromTrainer(orgId, clientId) {
+  const { rows } = await pool.query(
+    `SELECT u.id AS user_id, u.name, u.email, c.organization_id
+       FROM pt_clients c
+       JOIN users u
+         ON u.organization_id = c.organization_id
+        AND u.role = 'trainer'
+        AND u.is_active = TRUE
+        AND u.deleted_at IS NULL
+      WHERE c.id = $1 AND c.organization_id = $2 AND c.deleted_at IS NULL
+      ORDER BY CASE WHEN u.trainer_id = c.trainer_id THEN 0 ELSE 1 END,
+               u.created_at ASC
+      LIMIT 1`,
+    [clientId, orgId]
+  );
+  return rows[0] || null;
+}
+
+/**
  * Resolve a member into a recipient object with all contact info.
  */
 async function recipientFromMember(memberId) {
@@ -530,6 +553,6 @@ async function markAllRead(userId) {
 }
 
 module.exports = {
-  send, deliverChannel, processNotificationJob, recipientFromMember, recipientFromClient, inbox, markRead, markAllRead,
+  send, deliverChannel, processNotificationJob, recipientFromMember, recipientFromClient, recipientFromTrainer, inbox, markRead, markAllRead,
   templates, channels, TRANSACTIONAL_NOTIFICATIONS,
 };

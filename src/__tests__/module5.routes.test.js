@@ -15,6 +15,8 @@ const mockClientInOrg = jest.fn(async () => true);
 jest.mock('../lib/orgGuard', () => ({ clientInOrg: (...a) => mockClientInOrg(...a) }));
 
 jest.mock('../modules/progress/retests.service', () => ({
+  ROSTER_STATES: ['missing_baseline', 'not_scheduled', 'upcoming', 'due', 'overdue', 'rescheduled'],
+  rosterOverview: jest.fn(async () => ({ clients: [], counts: { total: 0 } })),
   getSettings: jest.fn(async () => ({ cadence_months: 4, reminder_days: [30, 14, 7], is_enabled: true })),
   saveSettings: jest.fn(async () => ({ cadence_months: 5, reminder_days: [30, 14, 7], is_enabled: true })),
   overview: jest.fn(async () => ({ assessment_count: 0, state: { state: 'missing_baseline' } })),
@@ -67,6 +69,18 @@ describe('Module 5 trainer routes', () => {
     expect(retests.overview).not.toHaveBeenCalled();
   });
 
+  it('scopes the cross-client overview to the caller organization', async () => {
+    await request(app()).get('/api/progress/module5/overview?search=asha&status=overdue&page=2&limit=10').expect(200);
+    expect(retests.rosterOverview).toHaveBeenCalledWith(ORG, {
+      search: 'asha', status: 'overdue', page: 2, limit: 10,
+    });
+  });
+
+  it('rejects an unknown overview status before it reaches the service', async () => {
+    await request(app()).get('/api/progress/module5/overview?status=archived').expect(400);
+    expect(retests.rosterOverview).not.toHaveBeenCalled();
+  });
+
   it('rejects a cadence outside the 4–6 month policy', async () => {
     await request(app()).put('/api/progress/module5/settings')
       .send({ cadence_months: 3, reminder_days: [30] }).expect(400);
@@ -114,6 +128,54 @@ describe('Module 5 member routes', () => {
   it('uses the client id on the token for the dashboard', async () => {
     await request(app()).get('/api/me/progress?days=7').expect(200);
     expect(habits.memberDashboard).toHaveBeenCalledWith(ORG, CLIENT, expect.objectContaining({ days: 7 }));
+  });
+
+  it('strips tenant and audit identifiers from the member progress payloads', async () => {
+    habits.memberDashboard.mockResolvedValueOnce({
+      today: '2026-10-19',
+      schedule: { id: 's1', organization_id: ORG, created_by: 'u-1', updated_by: 'u-1', scheduled_date: '2026-11-18' },
+      assessment: { count: 1, baseline: { id: 'a1', organization_id: ORG, trainer_id: 'u-1', weight: 80 } },
+    });
+    retests.overview.mockResolvedValueOnce({
+      state: { state: 'upcoming' },
+      schedule: { id: 's1', organization_id: ORG, completed_by: 'u-1' },
+    });
+    retests.comparisonFor.mockResolvedValueOnce({
+      baseline: { id: 'a1', organization_id: ORG, trainer_notes: 'visible note' },
+      domains: [],
+    });
+
+    const dashboard = await request(app()).get('/api/me/progress').expect(200);
+    expect(dashboard.body.data.schedule).toEqual({
+      id: 's1', scheduled_date: '2026-11-18',
+    });
+    expect(dashboard.body.data.assessment.baseline).toEqual({ id: 'a1', weight: 80 });
+
+    const retest = await request(app()).get('/api/me/progress/retest').expect(200);
+    expect(retest.body.data.schedule).toEqual({ id: 's1' });
+
+    const comparison = await request(app()).get('/api/me/progress/comparison').expect(200);
+    expect(comparison.body.data.baseline).toEqual({ id: 'a1', trainer_notes: 'visible note' });
+  });
+
+  it('strips tenant and audit identifiers from the member journal payloads', async () => {
+    habits.getLog.mockResolvedValueOnce({ id: 'l1', organization_id: ORG, created_by: 'u-1', updated_by: 'u-1', steps: 1 });
+    habits.listLogs.mockResolvedValueOnce([{ id: 'l1', organization_id: ORG, created_by: 'u-1', steps: 1 }]);
+    habits.getPreferences.mockResolvedValueOnce({ organization_id: ORG, updated_by: 'u-1', sleep_target_min: 7 });
+    habits.upsertLog.mockResolvedValueOnce({ id: 'l1', organization_id: ORG, created_by: 'u-1', steps: 2 });
+
+    const today = await request(app()).get('/api/me/habits/today').expect(200);
+    expect(today.body.data).toEqual({ id: 'l1', steps: 1 });
+
+    const list = await request(app()).get('/api/me/habits?from=2026-10-01&to=2026-10-31').expect(200);
+    expect(list.body.data).toEqual([{ id: 'l1', steps: 1 }]);
+
+    const prefs = await request(app()).get('/api/me/habit-preferences').expect(200);
+    expect(prefs.body.data).toEqual({ sleep_target_min: 7 });
+
+    const saved = await request(app()).post('/api/me/habits')
+      .send({ log_date: '2026-10-19', steps: 2 }).expect(200);
+    expect(saved.body.data).toEqual({ id: 'l1', steps: 2 });
   });
 
   it('rejects a malformed day on the single-day journal read', async () => {

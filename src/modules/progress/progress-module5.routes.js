@@ -44,6 +44,27 @@ const dateString = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD')
 const optionalDateString = dateString.optional().nullable();
 const optionalText = (max) => z.string().max(max).optional().nullable();
 
+// ── Cross-client overview ───────────────────────────────────
+const overviewSchema = {
+  query: z.object({
+    search: z.string().max(100).optional(),
+    status: z.enum(['all', ...retests.ROSTER_STATES]).optional(),
+    page: z.coerce.number().int().min(1).optional(),
+    limit: z.coerce.number().int().min(1).max(100).optional(),
+  }),
+};
+
+router.get('/module5/overview', validate(overviewSchema), wrap(async (req, res) => {
+  res.json({
+    data: await retests.rosterOverview(orgIdOf(req), {
+      search: req.query.search,
+      status: req.query.status || 'all',
+      page: req.query.page,
+      limit: req.query.limit,
+    }),
+  });
+}));
+
 // ── Settings ────────────────────────────────────────────────
 const settingsSchema = {
   body: z.object({
