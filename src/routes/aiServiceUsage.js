@@ -55,7 +55,7 @@ router.get('/quota', requireServiceAuth(), auth, requireTrainer, async (req, res
     const s = await statusFor(orgId);
     // Plain object JSON; the mps-ai side tolerates {data:...} wrappers too.
     return res.json(s);
-  } catch (err) {
+  } catch (_err) {
     // The quota probe exists BECAUSE a check may fail; the assistant's
     // enforce-mode treats this as fail-closed. Report as an upstream state,
     // not a stack trace.
