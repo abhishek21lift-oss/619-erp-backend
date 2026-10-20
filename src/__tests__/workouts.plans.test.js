@@ -239,6 +239,19 @@ describe('granular endpoints — what makes autosave safe', () => {
     expect(sqls().some((s) => /DELETE FROM workout_exercises/.test(s))).toBe(false);
   });
 
+  it('opens the transaction before loading the plan, so app_tenant can see it', async () => {
+    // pool.connect() scopes app.org_id to the transaction. A plan read before
+    // BEGIN returns no rows under the RLS-serving role, which surfaced as a
+    // 404 on the builder's autosave.
+    await request(app).patch(`/api/workouts/plans/${PLAN}/exercises/row-9`)
+      .send({ sets: 5 });
+    const calls = sqls();
+    const begin = calls.findIndex((s) => /^BEGIN/.test(s));
+    const load = calls.findIndex((s) => /SELECT wp\.\* FROM workout_plans wp WHERE wp\.id/.test(s));
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(load).toBeGreaterThan(begin);
+  });
+
   it('only patches whitelisted columns', async () => {
     await request(app).patch(`/api/workouts/plans/${PLAN}/exercises/row-9`)
       .send({ sets: 5, id: 'hijack', workout_plan_id: 'other-plan', created_at: 'x' });

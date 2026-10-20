@@ -932,9 +932,6 @@ router.post('/plans/:id/exercises', auth, requireTrainer, async (req, res, next)
 router.patch('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, res, next) => {
   const client = await pool.connect();
   try {
-    const plan = await loadEditablePlan(req, req.params.id, client);
-    if (!plan) return res.status(404).json({ error: 'Workout plan not found' });
-
     // Whitelist. A blind loop over req.body would let a caller rewrite id,
     // workout_plan_id or created_at — the same reason the billing settings
     // endpoint enumerates its fields.
@@ -977,7 +974,14 @@ router.patch('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, re
     // which is week 1's, and rewriting that would move every week at once.
     const week = weekParam(req.body.week_number ?? req.query.week);
 
+    // BEGIN first: pool.connect() scopes app.org_id to the transaction, so a
+    // plan read before this sees no rows once the API runs as app_tenant.
     await client.query('BEGIN');
+    const plan = await loadEditablePlan(req, req.params.id, client);
+    if (!plan) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Workout plan not found' });
+    }
     await lockPlan(client, req.params.id);
 
     let targetId = req.params.rowId;
@@ -1008,13 +1012,15 @@ router.patch('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, re
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Exercise not found in this plan' });
     }
-    await client.query('COMMIT');
 
+    // Read the saved row before COMMIT: after it the transaction-local
+    // app.org_id is gone and RLS would hide the row again.
     const { rows: full } = await client.query(
       `SELECT ${EXERCISE_SELECT} FROM workout_exercises we
          LEFT JOIN exercises e ON e.id = we.exercise_id WHERE we.id = $1`,
       [targetId]
     );
+    await client.query('COMMIT');
     res.json({ message: 'Exercise updated', exercise: full[0] });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
