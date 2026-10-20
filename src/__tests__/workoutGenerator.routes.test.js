@@ -87,3 +87,50 @@ test('only reads live library rows for the caller\'s org', async () => {
   expect(libQuery).toMatch(/archived_at IS NULL/);
   expect(libQuery).toMatch(/e\.organization_id IS NULL OR e\.organization_id = \$1/);
 });
+
+test('passes structured cardio inputs through and returns a heart-rate target', async () => {
+  pool.query.mockResolvedValueOnce({ rows: [clientRow()] });
+  pool.query.mockResolvedValueOnce({ rows: poolRows() });
+  const res = await request(app).post(`/api/pt-os/clients/${CLIENT}/workout-generator/preview`).send({
+    includeCardio: true,
+    cardioMinutes: 30,
+    modality: 'Running',
+    cardioIntensity: 'high',
+    cardioMethod: 'karvonen',
+    cardioFrequencyPerWeek: 4,
+    cardioProgramType: 'hiit',
+    age: 40,
+    restingHeartRate: 60,
+  });
+  expect(res.status).toBe(200);
+  expect(res.body.data.draft.conditioning.fitt).toMatchObject({
+    frequencyPerWeek: 4,
+    programType: 'hiit',
+    modalityCategory: 'weight-bearing-high-impact',
+  });
+  expect(res.body.data.draft.conditioning.targetHeartRate).toEqual({
+    method: 'karvonen',
+    minBpm: 144,
+    maxBpm: 162,
+    basisLabel: '% HRR',
+  });
+});
+
+test('rejects invalid cardio inputs at the request boundary', async () => {
+  const badBodies = [
+    { age: 40.5 },
+    { age: 121 },
+    { restingHeartRate: 0 },
+    { measuredMaxHeartRate: -1 },
+    { cardioFrequencyPerWeek: 15 },
+    { cardioFrequencyPerWeek: 3.5 },
+    { cardioIntensity: 'max' },
+    { cardioMethod: 'estimated' },
+    { cardioProgramType: 'sprint' },
+  ];
+  for (const body of badBodies) {
+    const res = await request(app).post(`/api/pt-os/clients/${CLIENT}/workout-generator/preview`).send(body);
+    expect(res.status).toBe(400);
+  }
+  expect(pool.query).not.toHaveBeenCalled();
+});
