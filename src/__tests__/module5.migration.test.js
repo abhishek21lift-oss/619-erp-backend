@@ -31,8 +31,17 @@ describe('231_module5_progress_habits.sql', () => {
     expect(body).toMatch(/'cancelled'/);
   });
 
-  it('makes reminder delivery idempotent in the schema, not only in the sweep', () => {
-    expect(body).toMatch(/UNIQUE \(schedule_id, kind, stage_days, due_date\)/);
+  it('makes reminder delivery idempotent per recipient in the schema', () => {
+    expect(body).toMatch(/recipient\s+TEXT\s+NOT NULL DEFAULT 'client'/);
+    expect(body).toMatch(/CREATE UNIQUE INDEX[^;]*progress_reminder_delivery_recipient_key[\s\S]*?\(schedule_id, kind, stage_days, due_date, recipient\)/i);
+    expect(body).toContain("CHECK (recipient IN ('client','trainer'))");
+  });
+
+  it('drops an earlier draft unique key by its column shape, not a guessed name', () => {
+    expect(body).toMatch(/FROM pg_constraint[\s\S]*contype = 'u'/);
+    expect(body).toContain('unnest(conkey)');
+    expect(body).toContain('unnest(i.indkey::smallint[])');
+    expect(body).toContain('DROP CONSTRAINT');
   });
 
   it('backfills the first cycle from the latest assessment and studio cadence', () => {

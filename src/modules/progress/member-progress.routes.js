@@ -28,6 +28,25 @@ function fail(res, err) {
   throw err;
 }
 
+// The member pages reuse the trainer read models, which carry tenant and audit
+// columns. Strip those identifiers before the payload leaves the member's own
+// API; the measurements and dates in the same objects are intentionally kept.
+const INTERNAL_KEYS = new Set([
+  'organization_id', 'created_by', 'updated_by', 'completed_by', 'trainer_id',
+]);
+
+function memberSafe(value) {
+  if (Array.isArray(value)) return value.map(memberSafe);
+  if (value && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => !INTERNAL_KEYS.has(key))
+        .map(([key, nested]) => [key, memberSafe(nested)]),
+    );
+  }
+  return value;
+}
+
 function requireSelf(req, res) {
   const { clientId, orgId } = selfOf(req);
   if (!clientId || !orgId) {
@@ -53,7 +72,7 @@ router.get('/progress', validate({
   const self = requireSelf(req, res);
   if (!self) return;
   try {
-    res.json({ data: await habits.memberDashboard(self.orgId, self.clientId, { date: req.query.date, days: req.query.days }) });
+    res.json({ data: memberSafe(await habits.memberDashboard(self.orgId, self.clientId, { date: req.query.date, days: req.query.days })) });
   } catch (err) { fail(res, err); }
 }));
 
@@ -61,7 +80,7 @@ router.get('/progress', validate({
 router.get('/progress/retest', wrap(async (req, res) => {
   const self = requireSelf(req, res);
   if (!self) return;
-  res.json({ data: await retests.overview(self.orgId, self.clientId) });
+  res.json({ data: memberSafe(await retests.overview(self.orgId, self.clientId)) });
 }));
 
 // GET /api/me/progress/comparison — baseline vs latest, seven domains
@@ -69,7 +88,7 @@ router.get('/progress/comparison', wrap(async (req, res) => {
   const self = requireSelf(req, res);
   if (!self) return;
   try {
-    res.json({ data: await retests.comparisonFor(self.orgId, self.clientId) });
+    res.json({ data: memberSafe(await retests.comparisonFor(self.orgId, self.clientId)) });
   } catch (err) { fail(res, err); }
 }));
 
@@ -84,7 +103,7 @@ router.get('/habits', wrap(async (req, res) => {
   if (!parsedFrom.success || !parsedTo.success || parsedFrom.data > parsedTo.data) {
     return res.status(400).json({ error: { code: 'INVALID_RANGE', message: 'from and to must be real YYYY-MM-DD dates, with from on or before to' } });
   }
-  res.json({ data: await habits.listLogs(self.orgId, self.clientId, from, to) });
+  res.json({ data: memberSafe(await habits.listLogs(self.orgId, self.clientId, from, to)) });
 }));
 
 router.get('/habits/today', validate({
@@ -93,7 +112,7 @@ router.get('/habits/today', validate({
   const self = requireSelf(req, res);
   if (!self) return;
   const date = req.query.date || await habits.todayFor(self.orgId);
-  res.json({ data: await habits.getLog(self.orgId, self.clientId, date) });
+  res.json({ data: memberSafe(await habits.getLog(self.orgId, self.clientId, date)) });
 }));
 
 const logSchema = {
@@ -120,14 +139,14 @@ router.post('/habits', validate(logSchema), wrap(async (req, res) => {
   if (!self) return;
   try {
     const { log_date: logDate, ...values } = req.body;
-    res.json({ data: await habits.upsertLog({ ...self, logDate: logDate || null, values, userId: req.user.id }) });
+    res.json({ data: memberSafe(await habits.upsertLog({ ...self, logDate: logDate || null, values, userId: req.user.id })) });
   } catch (err) { fail(res, err); }
 }));
 
 router.get('/habit-preferences', wrap(async (req, res) => {
   const self = requireSelf(req, res);
   if (!self) return;
-  res.json({ data: await habits.getPreferences(self.orgId, self.clientId) });
+  res.json({ data: memberSafe(await habits.getPreferences(self.orgId, self.clientId)) });
 }));
 
 const preferenceSchema = {
@@ -146,7 +165,7 @@ router.put('/habit-preferences', validate(preferenceSchema), wrap(async (req, re
   const self = requireSelf(req, res);
   if (!self) return;
   try {
-    res.json({ data: await habits.savePreferences(self.orgId, self.clientId, req.body) });
+    res.json({ data: memberSafe(await habits.savePreferences(self.orgId, self.clientId, req.body)) });
   } catch (err) { fail(res, err); }
 }));
 
