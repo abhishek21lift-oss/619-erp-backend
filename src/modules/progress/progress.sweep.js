@@ -5,8 +5,8 @@
 // notification service.
 //
 // Exactly-once is enforced by progress_reminder_deliveries, not by this loop.
-// If two replicas sweep at once, the unique (schedule, kind, stage, due_date,
-// recipient) row means one claims the send and the other skips it.
+// If two replicas sweep at once, the unique (schedule, kind, stage, due_date)
+// row means one claims the send and the other skips it.
 
 const logger = require('../../lib/logger');
 const repo = require('./retests.repo');
@@ -20,18 +20,10 @@ function dateOnly(value) {
   return String(value).slice(0, 10);
 }
 
-function templateFor(kind, recipient = 'client') {
-  if (recipient === 'trainer') return 'assessment_trainer_reminder';
+function templateFor(kind) {
   if (kind === 'due') return 'assessment_due';
   if (kind === 'overdue') return 'assessment_overdue';
   return 'assessment_reminder';
-}
-
-/** Resolve the recipient for one ledger row, or null when no account exists. */
-function loadRecipient(orgId, clientId, recipient) {
-  return recipient === 'trainer'
-    ? notifier.recipientFromTrainer(orgId, clientId)
-    : notifier.recipientFromClient(orgId, clientId);
 }
 
 function deliveryOutcome(results) {
@@ -72,17 +64,12 @@ async function runProgressSweep({ now = new Date() } = {}) {
         orgId: row.organization_id, scheduleId: row.id, dueDate: scheduledDate,
       });
       const attempted = new Set();
-      // The trainer always gets a copy; the client keeps the channels they had.
-      // Each recipient is a separate ledger row, so a trainer delivery failure
-      // cannot suppress or duplicate the client's reminder.
       const queue = [
-        ...retryable.map((r) => ({
-          kind: r.kind, stage_days: r.stage_days, recipient: r.recipient || 'client',
-        })),
-        ...(reminder ? ['client', 'trainer'].map((recipient) => ({ ...reminder, recipient })) : []),
+        ...retryable.map((r) => ({ kind: r.kind, stage_days: r.stage_days })),
+        ...(reminder ? [reminder] : []),
       ];
       for (const item of queue) {
-        const key = `${item.kind}:${item.stage_days}:${item.recipient}`;
+        const key = `${item.kind}:${item.stage_days}`;
         if (attempted.has(key)) continue;
         attempted.add(key);
 
@@ -93,19 +80,15 @@ async function runProgressSweep({ now = new Date() } = {}) {
           kind: item.kind,
           stageDays: item.stage_days,
           dueDate: scheduledDate,
-          recipient: item.recipient,
         });
         if (!delivery) {
           summary.skipped += 1;
           continue;
         }
 
-        const recipient = await loadRecipient(row.organization_id, row.client_id, item.recipient);
+        const recipient = await notifier.recipientFromClient(row.organization_id, row.client_id);
         if (!recipient) {
-          await repo.markReminder(delivery.id, {
-            status: 'skipped',
-            error: item.recipient === 'trainer' ? 'trainer_not_found' : 'client_not_found',
-          });
+          await repo.markReminder(delivery.id, { status: 'skipped', error: 'client_not_found' });
           summary.skipped += 1;
           continue;
         }
@@ -115,27 +98,23 @@ async function runProgressSweep({ now = new Date() } = {}) {
         if (recipient.email) channels.push('email');
         // A client with a phone but no email or member login still has a way to
         // be reached. Do not send an email channel with no address in front of it.
-        if (item.recipient === 'client' && !recipient.email && !recipient.user_id && recipient.phone) {
-          channels.push('whatsapp');
-        }
+        if (!recipient.email && !recipient.user_id && recipient.phone) channels.push('whatsapp');
         if (!channels.length) {
           await repo.markReminder(delivery.id, { status: 'skipped', error: 'no_contact_channel' });
           summary.skipped += 1;
           continue;
         }
 
-        const type = templateFor(item.kind, item.recipient);
+        const type = templateFor(item.kind);
         const daysUntil = state.days_until;
         const result = await notifier.send(type, recipient, {
           name: recipient.name,
-          client_name: item.recipient === 'trainer' ? row.client_name : recipient.name,
+          client_name: recipient.name,
           scheduled_date: scheduledDate,
           days: daysUntil == null ? null : Math.abs(daysUntil),
           days_until: daysUntil,
           state: state.state,
-          link: item.recipient === 'trainer'
-            ? `/pt-os/progress?client_id=${encodeURIComponent(row.client_id)}`
-            : '/member/progress',
+          link: '/member/progress',
         }, channels);
 
         const outcome = deliveryOutcome(result);
@@ -146,8 +125,7 @@ async function runProgressSweep({ now = new Date() } = {}) {
 
         logger.info({
           scheduleId: row.id, orgId: row.organization_id, kind: item.kind,
-          stageDays: item.stage_days, recipient: item.recipient,
-          state: state.state, outcome: outcome.status,
+          stageDays: item.stage_days, state: state.state, outcome: outcome.status,
         }, 'progress reminder attempt');
       }
     } catch (err) {

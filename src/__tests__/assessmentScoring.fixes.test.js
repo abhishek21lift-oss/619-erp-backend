@@ -55,3 +55,60 @@ describe('referrals (M-1, PO-1)', () => {
     expect(posture.calcPostureReferrals(['Forward Head'], null, null)).toEqual([]);
   });
 });
+
+describe('flexibility composite bounds (F2a)', () => {
+  test.each([
+    [null, null], [NaN, null], [-1, null], [-0.1, null], [10.1, null], [25, null],
+  ])('classifyFlexibilityScore(%p) → %p', (score, cat) => {
+    expect(fitness.classifyFlexibilityScore(score)).toBe(cat);
+  });
+  test('0 is a legitimate "very limited" score (Poor), not missing', () => {
+    expect(fitness.classifyFlexibilityScore(0)).toBe('Poor');
+  });
+  test('10 is the top of the scale (Excellent)', () => {
+    expect(fitness.classifyFlexibilityScore(10)).toBe('Excellent');
+  });
+});
+
+describe('body composition prerequisites (F14)', () => {
+  test('returns null for missing or unsupported gender — no invented range', () => {
+    expect(fitness.scoreBodyComposition(15, null)).toBeNull();
+    expect(fitness.scoreBodyComposition(15, 'Other')).toBeNull();
+  });
+  test('still scores supported genders', () => {
+    expect(fitness.scoreBodyComposition(15, 'Male')).toBe(100);
+    expect(fitness.scoreBodyComposition(25, 'Female')).toBe(100);
+  });
+});
+
+describe('health score direction and bands (F15)', () => {
+  test('100 is normal BP + healthy BMI', () => {
+    expect(fitness.scoreHealthRisk('Normal', 22)).toBe(100);
+  });
+  test('BMI band discontinuity: 24.9 → 100, 25.0 → 80 (normal BP)', () => {
+    expect(fitness.scoreHealthRisk('Normal', 24.9)).toBe(100);
+    expect(fitness.scoreHealthRisk('Normal', 25)).toBe(80);
+  });
+  test('BMI 30+ → 65 with normal BP', () => {
+    expect(fitness.scoreHealthRisk('Normal', 30)).toBe(65);
+  });
+  test('underweight (<18.5) treated like overweight (60)', () => {
+    expect(fitness.scoreHealthRisk('Normal', 17)).toBe(80);
+  });
+  test('BP-only input still scores', () => {
+    expect(fitness.scoreHealthRisk('Hypertension Stage 1', null)).toBe(55);
+  });
+  test('both missing → null, never 0', () => {
+    expect(fitness.scoreHealthRisk(null, null)).toBeNull();
+  });
+  test('Hypertension Stage 2 is the worst BP band (20)', () => {
+    expect(fitness.scoreHealthRisk('Hypertension Stage 2', 22)).toBe(60);
+  });
+});
+
+describe('scoring formula version (F10)', () => {
+  test('exposes a non-empty version identifier', () => {
+    expect(typeof fitness.FITNESS_SCORING_VERSION).toBe('string');
+    expect(fitness.FITNESS_SCORING_VERSION.length).toBeGreaterThan(0);
+  });
+});

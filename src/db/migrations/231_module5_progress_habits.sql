@@ -87,7 +87,6 @@ CREATE TABLE IF NOT EXISTS progress_reminder_deliveries (
   kind             TEXT NOT NULL CHECK (kind IN ('reminder','due','overdue')),
   stage_days       INT NOT NULL,
   due_date         DATE NOT NULL,
-  recipient        TEXT NOT NULL DEFAULT 'client',
   channel          TEXT NOT NULL DEFAULT 'inapp',
   status           TEXT NOT NULL DEFAULT 'pending'
                    CHECK (status IN ('pending','sent','failed','skipped')),
@@ -95,69 +94,9 @@ CREATE TABLE IF NOT EXISTS progress_reminder_deliveries (
   last_error       TEXT,
   sent_at          TIMESTAMPTZ,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (schedule_id, kind, stage_days, due_date)
 );
-
--- Safe for a database that applied an earlier draft of this migration: add the
--- recipient, keep the old rows as client deliveries, and widen the idempotency
--- key so the trainer's copy is tracked independently.
-ALTER TABLE progress_reminder_deliveries
-  ADD COLUMN IF NOT EXISTS recipient TEXT NOT NULL DEFAULT 'client';
-
--- Drop the earlier draft's four-column uniqueness by its shape, not by a
--- guessed name. PostgreSQL truncates identifiers at 63 bytes and chooses a
--- different spelling for an auto-named UNIQUE constraint than for the explicit
--- name this migration used to drop, so a name-based DROP can silently leave
--- the narrow key in place and make the trainer's copy collide with the
--- client's. Match the exact column set instead.
-DO $$
-DECLARE
-  old_cols smallint[];
-  old_obj record;
-BEGIN
-  SELECT array_agg(attnum ORDER BY attnum) INTO old_cols
-    FROM pg_attribute
-   WHERE attrelid = 'public.progress_reminder_deliveries'::regclass
-     AND attname IN ('schedule_id', 'kind', 'stage_days', 'due_date');
-
-  FOR old_obj IN
-    SELECT conname AS name, 'constraint' AS kind
-      FROM pg_constraint
-     WHERE conrelid = 'public.progress_reminder_deliveries'::regclass
-       AND contype = 'u'
-       AND (SELECT array_agg(k ORDER BY k) FROM unnest(conkey) k) = old_cols
-    UNION ALL
-    SELECT c.relname AS name, 'index' AS kind
-      FROM pg_index i
-      JOIN pg_class c ON c.oid = i.indexrelid
-     WHERE i.indrelid = 'public.progress_reminder_deliveries'::regclass
-       AND i.indisunique
-       AND NOT i.indisprimary
-       AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
-       AND (SELECT array_agg(k ORDER BY k) FROM unnest(i.indkey::smallint[]) k) = old_cols
-  LOOP
-    IF old_obj.kind = 'constraint' THEN
-      EXECUTE format('ALTER TABLE public.progress_reminder_deliveries DROP CONSTRAINT %I', old_obj.name);
-    ELSE
-      EXECUTE format('DROP INDEX public.%I', old_obj.name);
-    END IF;
-  END LOOP;
-END $$;
-
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint
-     WHERE conname = 'progress_reminder_deliveries_recipient_check'
-  ) THEN
-    ALTER TABLE progress_reminder_deliveries
-      ADD CONSTRAINT progress_reminder_deliveries_recipient_check
-      CHECK (recipient IN ('client','trainer'));
-  END IF;
-END $$;
-
-CREATE UNIQUE INDEX IF NOT EXISTS progress_reminder_delivery_recipient_key
-  ON progress_reminder_deliveries (schedule_id, kind, stage_days, due_date, recipient);
 
 CREATE INDEX IF NOT EXISTS progress_reminder_pending_idx
   ON progress_reminder_deliveries (organization_id, status, created_at);

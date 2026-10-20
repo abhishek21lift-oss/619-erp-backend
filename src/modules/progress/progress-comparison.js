@@ -84,13 +84,21 @@ const DOMAINS = [
   {
     key: 'flexibility', label: 'Flexibility & Mobility',
     metrics: [
-      { key: 'mobility_score_computed', label: 'Mobility score', unit: '/100', higherIsBetter: true, decimals: 0 },
+      { key: 'mobility_score_computed', label: 'Flexibility score', unit: '/100', higherIsBetter: true, decimals: 0 },
       { key: 'flexibility_test1_score', label: 'Test 1 score', unit: 'score', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type' },
       { key: 'flexibility_test1_right', label: 'Test 1 right', unit: 'cm', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type' },
       { key: 'flexibility_test1_left', label: 'Test 1 left', unit: 'cm', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type' },
       { key: 'flexibility_test2_score', label: 'Test 2 score', unit: 'score', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type_2' },
       { key: 'flexibility_test2_right', label: 'Test 2 right', unit: 'cm', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type_2' },
       { key: 'flexibility_test2_left', label: 'Test 2 left', unit: 'cm', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type_2' },
+      // K11 four-test battery (v3 payload). The legacy metrics above and the
+      // v3 metrics below never both resolve on the same row — different
+      // protocols, different units, so no cross-protocol delta is offered.
+      { key: 'flex_quadriceps_left_cm', label: 'Quadriceps left (gap)', unit: 'cm', higherIsBetter: false, decimals: 1 },
+      { key: 'flex_quadriceps_right_cm', label: 'Quadriceps right (gap)', unit: 'cm', higherIsBetter: false, decimals: 1 },
+      { key: 'flex_hamstrings_left_deg', label: 'Hamstrings left', unit: 'deg', higherIsBetter: true, decimals: 0 },
+      { key: 'flex_hamstrings_right_deg', label: 'Hamstrings right', unit: 'deg', higherIsBetter: true, decimals: 0 },
+      { key: 'flex_sit_reach_score_in', label: 'Sit and reach score', unit: 'in', higherIsBetter: true, decimals: 1 },
     ],
   },
 ];
@@ -139,6 +147,10 @@ function derived(assessment) {
   const flex1 = testObj(assessment, 'flexibility_test_data', 1);
   const flex2 = testObj(assessment, 'flexibility_test_data', 2);
   const flexType = (t) => t.testType || t.customTestType || null;
+  // The K11 battery stores raw values inside tests.<key>.sides[side].
+  const flexBlob = json(assessment?.flexibility_test_data);
+  const v3 = flexBlob.protocol_version && flexBlob.tests ? flexBlob.tests : null;
+  const v3val = (test, side, key) => num(v3 && v3[test] && v3[test].sides && v3[test].sides[side] ? v3[test].sides[side][key] : null);
   return {
     strength_test1_1rm: strength1,
     strength_test2_1rm: strength2,
@@ -154,6 +166,11 @@ function derived(assessment) {
     flexibility_test2_left: num(flex2.left),
     flexibility_test_type: flexType(flex1),
     flexibility_test_type_2: flexType(flex2),
+    flex_quadriceps_left_cm: v3val('quadriceps', 'left', 'distance_cm'),
+    flex_quadriceps_right_cm: v3val('quadriceps', 'right', 'distance_cm'),
+    flex_hamstrings_left_deg: v3val('hamstrings', 'left', 'hip_flexion_deg'),
+    flex_hamstrings_right_deg: v3val('hamstrings', 'right', 'hip_flexion_deg'),
+    flex_sit_reach_score_in: num(v3 && v3.sit_and_reach ? v3.sit_and_reach.score_inches : null),
   };
 }
 

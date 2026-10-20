@@ -37,7 +37,7 @@ describe('Module 5 re-test scheduling', () => {
       .toMatchObject({ state: 'completed' });
   });
 
-  it('fires the configured stages, catches up a missed threshold, then due and overdue', () => {
+  it('fires only the configured reminder stages, then due and overdue', () => {
     const reminderDays = [30, 14, 7];
     expect(s.reminderFor({ scheduledDate: '2026-11-18', today: '2026-10-19', reminderDays }))
       .toEqual({ kind: 'reminder', stage_days: 30 });
@@ -45,17 +45,7 @@ describe('Module 5 re-test scheduling', () => {
       .toEqual({ kind: 'reminder', stage_days: 14 });
     expect(s.reminderFor({ scheduledDate: '2026-10-26', today: '2026-10-19', reminderDays }))
       .toEqual({ kind: 'reminder', stage_days: 7 });
-    // The sweep missed day 30: send the 30-day stage on the next run instead
-    // of dropping it, and the ledger still makes it once.
-    expect(s.reminderFor({ scheduledDate: '2026-11-08', today: '2026-10-19', reminderDays }))
-      .toEqual({ kind: 'reminder', stage_days: 30 });
-    // A threshold crossed after an outage: the most recent one wins, so three
-    // missed stages do not produce three messages in one day.
-    expect(s.reminderFor({ scheduledDate: '2026-10-29', today: '2026-10-19', reminderDays }))
-      .toEqual({ kind: 'reminder', stage_days: 14 });
-    expect(s.reminderFor({ scheduledDate: '2026-10-20', today: '2026-10-19', reminderDays }))
-      .toEqual({ kind: 'reminder', stage_days: 7 });
-    expect(s.reminderFor({ scheduledDate: '2026-12-01', today: '2026-10-19', reminderDays })).toBeNull();
+    expect(s.reminderFor({ scheduledDate: '2026-10-20', today: '2026-10-19', reminderDays })).toBeNull();
     expect(s.reminderFor({ scheduledDate: '2026-10-19', today: '2026-10-19', reminderDays }))
       .toEqual({ kind: 'due', stage_days: 0 });
     expect(s.reminderFor({ scheduledDate: '2026-10-01', today: '2026-10-19', reminderDays }))

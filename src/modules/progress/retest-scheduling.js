@@ -111,20 +111,15 @@ function deriveState({ status = 'upcoming', scheduledDate, today }) {
 
 /**
  * Which reminder, if any, belongs to today.
- *
- * The most recent threshold that has been crossed is selected, not only the
- * exact day. A sweep that was down on day 30 still sends on day 29 (or day 15),
- * because the ledger key is the stage rather than the calendar day. Due fires
- * on the day; overdue fires on every sweep and the ledger makes it once.
+ * Upcoming reminders fire on the exact configured day; due fires on the day;
+ * overdue fires on every sweep and the delivery ledger makes it once.
  */
 function reminderFor({ scheduledDate, today, reminderDays = [30, 14, 7] }) {
   if (!scheduledDate) return null;
   const days = daysBetween(today, scheduledDate);
   if (days > 0) {
-    const stage = normalizeReminderDays(reminderDays)
-      .filter((d) => d >= days)
-      .sort((a, b) => a - b)[0];
-    return stage == null ? null : { kind: 'reminder', stage_days: stage };
+    const stage = normalizeReminderDays(reminderDays).find((d) => d === days);
+    return stage ? { kind: 'reminder', stage_days: stage } : null;
   }
   if (days === 0) return { kind: 'due', stage_days: 0 };
   return { kind: 'overdue', stage_days: -1 };
