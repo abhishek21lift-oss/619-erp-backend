@@ -131,6 +131,22 @@ const REVIEWED_EXCEPTIONS = {
     'platform-operator audit rows with no owning organisation, under ' +
     'runAsPlatform. Reached from /api/super-admin (requireSuperAdmin + MFA) ' +
     'and from API boot; never from a tenant request.',
+  'modules/command-center/ai-inventory.service.js':
+    'AI Operations model inventory (GET /api/super-admin/command-center/ai/'
+    + 'models). usageByModel() is a platform-wide, model-grouped 30-day '
+    + 'aggregate: the operator console must see the whole platform\'s model '
+    + 'fleet, so an org filter would blind it by construction. Returns model '
+    + 'names, timestamps and counts only — no rows, identifiers or PII. Its '
+    + 'single caller is the guarded route; the router opens runAsPlatform and '
+    + 'the mount carries auth + requireSuperAdmin + requireSuperAdminMfa.',
+  'modules/command-center/collectors/ai.collector.js':
+    'Command Center AI health collector — a background job with no request '
+    + 'context (tenant-context state 1) that reads today / last-hour / '
+    + 'last-request / served-24h aggregates across every studio plus the '
+    + 'platform_ai_settings singleton, deliberately sharing COST_SQL with '
+    + 'super-admin/ai.js. Aggregation across tenants IS the card\'s purpose; '
+    + 'its output surfaces only through the snapshot, mounted under '
+    + '/api/super-admin behind requireSuperAdmin + requireSuperAdminMfa.',
   'modules/platform/super-admin/shared.js':
     'audit() logs super-admin actions (organisation suspend/activate, plan ' +
     'changes, impersonation, invitations) that operate ON a tenant from ' +
