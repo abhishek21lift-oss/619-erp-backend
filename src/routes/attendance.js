@@ -297,53 +297,119 @@ router.post('/bulk', auth, async function(req, res, next) {
       return res.status(400).json({ error: 'Maximum 200 records per bulk operation' });
     }
 
-    const results = [];
     const errors = [];
     const bulkOrgId = orgIdOf(req);
+    const ATTENDANCE_STATUSES = ['present', 'absent', 'late', 'half_day'];
 
+    // Validate and normalise every record BEFORE touching the database. One
+    // malformed date or status has to fail its own row, not the batch — the
+    // loop this replaces got that for free, and a single bulk INSERT does not.
+    const valid = [];
     for (let i = 0; i < records.length; i++) {
       const d = records[i];
       if (!d.ref_id || !d.date || !d.status) {
         errors.push({ index: i, error: 'ref_id, date, and status required' });
         continue;
       }
+      const type = d.type || 'client';
+      const status = d.status || 'present';
+      if (!SUBJECT_TYPES.includes(type)) {
+        // Same answer as the old subjectInOrg() check, which returned false
+        // for a type it did not know.
+        errors.push({ index: i, ref_id: d.ref_id, error: 'Not found' });
+        continue;
+      }
+      if (!ATTENDANCE_STATUSES.includes(status)) {
+        errors.push({ index: i, ref_id: d.ref_id, error: `Invalid status: ${status}` });
+        continue;
+      }
+      valid.push({
+        index: i,
+        refId: d.ref_id,
+        type,
+        name: d.ref_name || null,
+        date: d.date,
+        checkIn: studioInstant(d.date, d.check_in),
+        checkOut: studioInstant(d.date, d.check_out),
+        status,
+        notes: d.notes || null,
+      });
+    }
 
+    // One existence query per subject table instead of one per record.
+    const allowed = new Set();
+    for (const type of SUBJECT_TYPES) {
+      const ids = valid.filter((v) => v.type === type).map((v) => v.refId);
+      if (!ids.length) continue;
+      const table = type === 'client' ? 'pt_clients' : 'trainers';
+      const { rows } = await pool.query(
+        `SELECT id::text AS id FROM ${table}
+          WHERE organization_id = $1 AND deleted_at IS NULL AND id::text = ANY($2::text[])`,
+        [bulkOrgId, ids]
+      );
+      for (const row of rows) allowed.add(`${type}:${row.id}`);
+    }
+
+    const accepted = [];
+    for (const v of valid) {
+      if (allowed.has(`${v.type}:${v.refId}`)) accepted.push(v);
+      else errors.push({ index: v.index, ref_id: v.refId, error: 'Not found' });
+    }
+
+    // A batch may name the same (ref, type, date) twice. The old loop wrote
+    // them in order, so the last one won; a multi-row upsert cannot touch a
+    // row twice, so keep the last and write it once.
+    const byKey = new Map();
+    for (const v of accepted) byKey.set(`${v.type}:${v.refId}:${v.date}`, v);
+    const toWrite = [...byKey.values()];
+
+    const columns = `(id, ref_id, ref_type, ref_name, date,
+       check_in_time, check_out_time, status, notes, method, marked_by, organization_id)`;
+    const conflict = `ON CONFLICT (ref_id, ref_type, date) DO UPDATE
+       SET status = EXCLUDED.status, notes = EXCLUDED.notes,
+           organization_id = COALESCE(attendance_logs.organization_id, EXCLUDED.organization_id)
+       WHERE attendance_logs.organization_id IS NULL
+          OR attendance_logs.organization_id = EXCLUDED.organization_id`;
+
+    const rowParams = (v) => [randomUUID(), v.refId, v.type, v.name, v.date,
+      v.checkIn, v.checkOut, v.status, v.notes, 'manual', req.user.id, bulkOrgId];
+    const writeOne = (v) => pool.query(
+      `INSERT INTO attendance_logs ${columns} VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ${conflict}`,
+      rowParams(v)
+    );
+
+    const failedKeys = new Set();
+    const keyOf = (v) => `${v.type}:${v.refId}:${v.date}`;
+    if (toWrite.length) {
+      const params = [];
+      const tuples = toWrite.map((v, n) => {
+        const base = n * 12;
+        params.push(...rowParams(v));
+        return `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6},$${base + 7},$${base + 8},$${base + 9},$${base + 10},$${base + 11},$${base + 12})`;
+      });
       try {
-        const type = d.type || 'client';
-        const id = randomUUID();
-
-        // Same rule as POST /: the subject must be this studio's, because the
-        // upsert's conflict key has no organization in it.
-        if (!await subjectInOrg(bulkOrgId, type, d.ref_id)) {
-          errors.push({ index: i, ref_id: d.ref_id, error: 'Not found' });
-          continue;
+        await pool.query(`INSERT INTO attendance_logs ${columns} VALUES ${tuples.join(',')} ${conflict}`, params);
+      } catch {
+        // One row the database rejects must not discard the other 199. The
+        // batch statement is atomic, so nothing was written; retry row by row
+        // to find the offender, exactly the granularity the old loop had.
+        for (const v of toWrite) {
+          try {
+            await writeOne(v);
+          } catch (rowErr) {
+            failedKeys.add(keyOf(v));
+            errors.push({ index: v.index, ref_id: v.refId, error: rowErr.message });
+          }
         }
-
-        const bulkCheckIn = studioInstant(d.date, d.check_in);
-        const bulkCheckOut = studioInstant(d.date, d.check_out);
-        await pool.query(`
-          INSERT INTO attendance_logs
-            (id, ref_id, ref_type, ref_name, date,
-             check_in_time, check_out_time, status, notes, method, marked_by, organization_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-          ON CONFLICT (ref_id, ref_type, date) DO UPDATE
-            SET status=$8, notes=$9,
-                organization_id=COALESCE(attendance_logs.organization_id, $12)
-            WHERE attendance_logs.organization_id IS NULL OR attendance_logs.organization_id = $12`,
-          [id, d.ref_id, type, d.ref_name || null,
-           d.date, bulkCheckIn, bulkCheckOut,
-           d.status || 'present', d.notes || null,
-           'manual', req.user.id, bulkOrgId]
-        );
-        results.push({ index: i, ref_id: d.ref_id, status: d.status });
-      } catch (err) {
-        errors.push({ index: i, ref_id: d.ref_id, error: err.message });
       }
     }
 
+    // `accepted` keeps duplicates (the old response counted each submission);
+    // a failed write is charged once per accepted row that shares its key.
+    const processed = accepted.filter((v) => !failedKeys.has(keyOf(v))).length;
     res.status(201).json({
-      message: results.length + ' records processed',
-      processed: results.length,
+      message: processed + ' records processed',
+      processed,
       failed: errors.length,
       errors: errors.length > 0 ? errors : undefined,
     });
