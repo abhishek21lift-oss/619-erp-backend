@@ -11,7 +11,7 @@ const {
 } = require('../modules/pt-os/client-snapshot');
 
 const TODAY = '2026-07-31';
-const CLIENT = { id: 'c-1', name: 'Ratnam Yadav', pt_end_date: null, balance_amount: 0 };
+const CLIENT = { id: 'c-1', name: 'Ratnam Yadav', pt_end_date: null, current_term_balance: 0 };
 
 const alerts = (over = {}) => buildAlerts({
   client: CLIENT, lifestyle: null, weights: [], lastSession: null, today: TODAY, ...over,
@@ -70,12 +70,16 @@ describe('alerts — only from a measurement that exists', () => {
     expect(ids(alerts({ client: { ...CLIENT, pt_end_date: '2026-12-01' } }))).not.toContain('pt_expiring');
   });
 
-  it('reads money owed from the balance, not from payment rows', () => {
-    // Every payment row in the live database says "completed". A studio that
-    // has taken no payment at all has no rows — which is the case that matters.
-    expect(alerts({ client: { ...CLIENT, balance_amount: 4500 } })
+  it('reads money owed from the current term, not the lifetime balance', () => {
+    // balance_amount mixes the current fee with lifetime paid, so a renewed
+    // client's alert understated what they owe. The route computes the
+    // term-aware figure (lib/ptTerm.js); this reads only that.
+    expect(alerts({ client: { ...CLIENT, current_term_balance: 4500 } })
       .find((a) => a.id === 'pending_payment')).toMatchObject({ detail: '₹4,500 outstanding' });
-    expect(ids(alerts({ client: { ...CLIENT, balance_amount: 0 } }))).not.toContain('pending_payment');
+    expect(ids(alerts({ client: { ...CLIENT, current_term_balance: 0 } }))).not.toContain('pending_payment');
+    // A row carrying only the lifetime figure raises no claim about money.
+    expect(ids(alerts({ client: { ...CLIENT, current_term_balance: undefined, balance_amount: 4500 } })))
+      .not.toContain('pending_payment');
   });
 
   it('flags sleep once, from the category or the hours but never both', () => {
@@ -122,7 +126,7 @@ describe('alerts — only from a measurement that exists', () => {
 
   it('puts the worst first, because the order is a claim about what to look at', () => {
     const a = alerts({
-      client: { ...CLIENT, pt_end_date: '2026-08-02', balance_amount: 1000 },
+      client: { ...CLIENT, pt_end_date: '2026-08-02', current_term_balance: 1000 },
       lifestyle: { sleep_category: 'Poor' },
       weights: [{ on: '2026-07-20', kg: 80 }, { on: '2026-06-01', kg: 84 }],
     });
@@ -223,7 +227,7 @@ describe('coach — derived, never generated', () => {
 describe('buildSnapshot', () => {
   it('assembles a client with everything, and nothing without data', () => {
     const snap = buildSnapshot({
-      client: { ...CLIENT, pt_end_date: '2026-08-08', balance_amount: 2000 },
+      client: { ...CLIENT, pt_end_date: '2026-08-08', current_term_balance: 2000 },
       lifestyle: { sleep_category: 'Poor', recovery_score: 50 },
       assessments: [{ assessment_date: '2026-07-27', weight: 73.2 }, { assessment_date: '2026-01-02', weight: 80 }],
       goal: { priority_goal: 'weight_loss', target_weight: 70, target_date: '2026-10-27' },

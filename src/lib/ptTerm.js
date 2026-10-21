@@ -73,4 +73,33 @@ async function termRecordCount(db, clientId) {
   return Number(rows[0]?.n ?? 0);
 }
 
-module.exports = { hasPtTerm, hasPtTermSql, termRecordCount, hasEndDate };
+/**
+ * The current term's money, for a pt_clients alias.
+ *
+ * The canonical definition is the comment above GET /clients/:id: the fee is
+ * current-term, paid is lifetime minus terms already closed. `balance_amount`
+ * mixes the two and understates anyone who has renewed, so a screen or alert
+ * that reports "owed" must not read it.
+ *
+ * Use the join and the expression together, once per query — both refer to the
+ * `prior` lateral alias.
+ */
+function priorTermsPaidJoin(alias = 'c') {
+  return `LEFT JOIN LATERAL (
+    SELECT COALESCE(SUM(s.amount_paid), 0) AS paid
+      FROM pt_client_subscriptions s
+     WHERE s.client_id = ${alias}.id
+       AND s.start_date IS NOT NULL
+       AND ${alias}.pt_start_date IS NOT NULL
+       AND s.start_date < ${alias}.pt_start_date
+  ) prior ON TRUE`;
+}
+
+function currentTermBalanceSql(alias = 'c') {
+  return `GREATEST(COALESCE(${alias}.final_amount, 0) - GREATEST(COALESCE(${alias}.paid_amount, 0) - COALESCE(prior.paid, 0), 0), 0)`;
+}
+
+module.exports = {
+  hasPtTerm, hasPtTermSql, termRecordCount, hasEndDate,
+  priorTermsPaidJoin, currentTermBalanceSql,
+};
