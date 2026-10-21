@@ -95,10 +95,11 @@ function buildAlerts({ client, lifestyle, weights, lastSession, today }) {
   }
 
   // ── Money owed ──
-  // From the client's own balance, not from payment rows: a studio that has
-  // taken no payment at all has no rows to read, and that is the case that
-  // matters most.
-  const balance = num(client?.balance_amount);
+  // The current term's balance, computed by the route (lib/ptTerm.js), not
+  // balance_amount: that mixes the current fee with lifetime paid and
+  // understates anyone who has renewed. A caller that has not computed it
+  // raises no money alert rather than a stale one.
+  const balance = num(client?.current_term_balance);
   if (balance !== null && balance > 0) {
     push({
       id: 'pending_payment', severity: 'warning', label: 'Pending payment',

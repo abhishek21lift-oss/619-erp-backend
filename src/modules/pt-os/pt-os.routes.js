@@ -11,7 +11,7 @@ const svc = require('./pt-os.service');
 const { orgIdOf, tenantScope } = require('../../lib/tenant-db');
 const { resolveTrainerId, trainerForOrg } = require('../../lib/studioTrainer');
 const { today: studioToday } = require('../../lib/appTime');
-const { hasPtTermSql } = require('../../lib/ptTerm');
+const { hasPtTermSql, priorTermsPaidJoin, currentTermBalanceSql } = require('../../lib/ptTerm');
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
 const { sweepRoster } = require('./client-context');
@@ -1842,8 +1842,11 @@ router.get('/clients/:id/snapshot', auth, wrap(async (req, res) => {
   const orgClause = orgWhere(req, params, 'c.organization_id');
 
   const { rows: clientRows } = await pool.query(
-    `SELECT c.id, c.name, c.pt_end_date, c.balance_amount, c.organization_id
-       FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
+    `SELECT c.id, c.name, c.pt_end_date, c.organization_id,
+            ${currentTermBalanceSql('c')} AS current_term_balance
+       FROM pt_clients c
+       ${priorTermsPaidJoin('c')}
+      WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
     params,
   );
   const client = clientRows[0];
@@ -1918,8 +1921,11 @@ router.post('/clients/:id/coach', auth, aiLimiter, requireAiQuota(), wrap(async 
 
   const { rows: clientRows } = await pool.query(
     `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes,
-            c.pt_end_date, c.balance_amount, c.organization_id
-       FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
+            c.pt_end_date, c.organization_id,
+            ${currentTermBalanceSql('c')} AS current_term_balance
+       FROM pt_clients c
+       ${priorTermsPaidJoin('c')}
+      WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
     params,
   );
   const client = clientRows[0];
