@@ -4,6 +4,7 @@
 // by a .env file present in the working tree.
 if (!process.env.JEST_WORKER_ID) require('dotenv').config();
 const fs = require('fs');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const { Pool } = require('pg');
 const logger = require('../lib/logger');
 const { appTimeZone } = require('../lib/appTime');
@@ -257,6 +258,12 @@ async function withOrgScope(client, orgId, run) {
 const _origQuery = pool.query.bind(pool);
 const _origConnect = pool.connect.bind(pool);
 
+// The client a withTenantSession() call has pinned for the current async
+// chain, if any. pool.query below reads it, so the statements inside that
+// callback share one connection and one BEGIN/COMMIT instead of paying
+// BEGIN → set_config → COMMIT per statement (four round trips each).
+const pinnedClient = new AsyncLocalStorage();
+
 // Instrument pool.query to log slow queries (> 1 second) and, when
 // TENANT_RLS_ENFORCE is on and the request resolved an org id, to run the
 // query inside the org-scoping transaction above. The two compose: timing
@@ -265,12 +272,12 @@ const _origConnect = pool.connect.bind(pool);
 // TENANT-RLS-PLAN.md needs before this ever reaches production traffic.
 pool.query = function slowQueryInstrument(...args) {
   const start = Date.now();
-  // Platform-wide work — operators, workers, migrations, pre-auth routes —
-  // goes to the owner connection, which is not subject to the tenant
-  // policies. Checked BEFORE the org id, because a platform-wide context
-  // deliberately has no org and would otherwise fall into the unscoped branch
-  // below and read nothing.
-  const result = useOwnerConnection()
+  const pinned = pinnedClient.getStore();
+  // A withTenantSession() caller has already borrowed the connection and
+  // opened the transaction; every statement inside it belongs there.
+  const result = pinned
+    ? pinned.query(...args)
+    : useOwnerConnection()
     ? ownerPool().query(...args)
     : (() => {
         const orgId = TENANT_RLS_ENFORCE ? currentOrgId() : null;
@@ -414,6 +421,46 @@ pool.connect = function tenantScopedConnect(...args) {
     const orgId = currentOrgId();
     return orgId == null ? client : scopeClient(client, orgId);
   });
+};
+
+/**
+ * Run `fn` with one checked-out client pinned for its whole duration.
+ *
+ * The dashboard loads a dozen small reads, one after another. Through
+ * pool.query each was its own transaction — BEGIN, set_config(app.org_id),
+ * the statement, COMMIT — because the org GUC must be set inside a transaction
+ * to be visible to RLS. Twelve reads meant forty-eight round trips for twelve
+ * statements.
+ *
+ * Inside this callback the same twelve reads share one connection and one
+ * transaction: one BEGIN (followed automatically by set_config from
+ * scopeClient), twelve statements, one COMMIT. Writes are allowed and commit
+ * with the rest, so this is a session boundary, not a read-only one; it is
+ * used for the dashboard because those handlers only read.
+ *
+ * Falls back to plain fn() when there is no request org to scope (workers,
+ * pre-auth routes, platform-wide callers) or when RLS enforcement is off —
+ * exactly the cases where pool.query would not have opened a scoped
+ * transaction either. Nested calls join the outer session rather than
+ * borrowing a second connection.
+ */
+pool.withTenantSession = async function withTenantSession(fn) {
+  const ambient = pinnedClient.getStore();
+  if (ambient) return fn(ambient);
+  if (!TENANT_RLS_ENFORCE || currentOrgId() == null) return fn(null);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await pinnedClient.run(client, () => fn(client));
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 };
 
 // Exposed on the pool instance (not a separate module export — every

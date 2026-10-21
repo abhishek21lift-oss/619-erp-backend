@@ -159,7 +159,9 @@ router.get('/trainers', auth, wrap(async (req, res) => {
 
 // ─── Dashboard stats ─────────────────────────────────────────
 router.get('/dashboard', auth, wrap(async (req, res) => {
-  const stats = await svc.getDashboardStats(tenantScope(req));
+  // One connection and one transaction for the four aggregates, instead of
+  // four separate BEGIN/set_config/COMMIT cycles. See pool.withTenantSession.
+  const stats = await pool.withTenantSession(() => svc.getDashboardStats(tenantScope(req)));
   res.json({ data: stats });
 }));
 
@@ -1768,7 +1770,8 @@ router.get('/screening-gaps', auth, wrap(async (req, res) => {
 router.get('/dashboard/ops', auth, wrap(async (req, res) => {
   // The studio's whole day: the programme panel is derived from the same
   // canonical Today rule /pt-os/today uses, scoped to the trainer's studio.
-  const data = await svc.getOpsSummary(tenantScope(req));
+  // All eight reads share one session — see pool.withTenantSession.
+  const data = await pool.withTenantSession(() => svc.getOpsSummary(tenantScope(req)));
   res.json({ data });
 }));
 
