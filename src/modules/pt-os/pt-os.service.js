@@ -23,6 +23,7 @@ async function getBalanceSheet(scope = {}) {
       SELECT client_id, SUM(incentive_amt) AS total_incentives
       FROM pt_payments
       WHERE deleted_at IS NULL
+        AND organization_id = $1
       GROUP BY client_id
     ) pp ON pp.client_id = c.id
     WHERE c.deleted_at IS NULL
@@ -49,7 +50,7 @@ async function getBalanceSheet(scope = {}) {
  * Unfiltered behaviour is unchanged: no options still returns every
  * non-deleted client, which is what the All Clients page relies on.
  */
-async function getActiveClients(scope = {}, opts = {}) {
+function clientFilters(scope = {}, opts = {}) {
   const where = ['TRUE'];
   const params = [];
 
@@ -62,7 +63,8 @@ async function getActiveClients(scope = {}, opts = {}) {
   if (opts.search && String(opts.search).trim()) {
     params.push(`%${String(opts.search).trim()}%`);
     const p = params.length;
-    where.push(`(c.name ILIKE $${p} OR c.mobile ILIKE $${p} OR c.client_id ILIKE $${p} OR c.email ILIKE $${p})`);
+    where.push(`(c.name ILIKE $${p} OR c.trainer_name ILIKE $${p} OR c.unique_id ILIKE $${p}
+      OR c.mobile ILIKE $${p} OR c.client_id ILIKE $${p} OR c.email ILIKE $${p})`);
   }
   if (opts.status) {
     params.push(opts.status);
@@ -71,7 +73,22 @@ async function getActiveClients(scope = {}, opts = {}) {
   if (opts.dues === '1' || opts.dues === true) {
     where.push('c.balance_amount > 0');
   }
+  // The list's Expired pill means "the term has ended", which is the status
+  // OR a past end date — the sweep that flips status runs later. Expressed as
+  // an explicit option rather than folded into `status` so existing callers
+  // of status=expired keep their exact meaning.
+  if (opts.expired === true) {
+    where.push(`(c.status = 'expired' OR COALESCE(CASE
+      WHEN c.pt_end_date IS NULL OR c.pt_end_date::TEXT = '' THEN NULL
+      ELSE c.pt_end_date::DATE
+    END, CURRENT_DATE) < CURRENT_DATE)`);
+  }
 
+  return { where, params };
+}
+
+async function getActiveClients(scope = {}, opts = {}) {
+  const { where, params } = clientFilters(scope, opts);
   const page = pageClause(opts.limit, opts.offset, params.length);
   const { rows } = await pool.query(`
     SELECT c.id, c.unique_id, c.client_id, c.name, c.gender, c.mobile, c.email,
@@ -97,6 +114,7 @@ async function getActiveClients(scope = {}, opts = {}) {
       SELECT client_id, SUM(incentive_amt) AS total_incentives
       FROM pt_payments
       WHERE deleted_at IS NULL
+        AND organization_id = $1
       GROUP BY client_id
     ) pp ON pp.client_id = c.id
     LEFT JOIN LATERAL (
@@ -108,9 +126,74 @@ async function getActiveClients(scope = {}, opts = {}) {
         AND s.start_date < c.pt_start_date
     ) prior ON TRUE
     WHERE ${where.join(' AND ')}
-    ORDER BY c.name${page.sql}
+    ORDER BY c.name, c.id${page.sql}
   `, [...params, ...page.params]);
   return rows;
+}
+
+/**
+ * How many rows the same filters match, ignoring LIMIT/OFFSET.
+ *
+ * The list response used to report `total: rows.length`, which is only the
+ * truth when nothing was paged. A paginated list needs the count the page is
+ * a slice of.
+ */
+async function countActiveClients(scope = {}, opts = {}) {
+  const { where, params } = clientFilters(scope, opts);
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::INT AS total FROM pt_clients c WHERE ${where.join(' AND ')}`,
+    params
+  );
+  return rows[0]?.total ?? 0;
+}
+
+/**
+ * The roster KPIs the list header shows, over the WHOLE studio.
+ *
+ * They were computed in the browser from the full client array. Once the list
+ * is paged, that array is one page, so the totals would silently become
+ * "totals of the first fifty". Same definitions as the list (term-aware
+ * balance) and as the old client-side reduce (lifetime paid_amount), scoped
+ * to one organization.
+ */
+async function getClientSummary(scope = {}) {
+  const { rows: [row] } = await pool.query(`
+    SELECT
+      COUNT(*)::INT AS total,
+      COALESCE(SUM(c.final_amount), 0) AS revenue,
+      COALESCE(SUM(c.paid_amount), 0) AS paid,
+      COALESCE(SUM(GREATEST(
+        COALESCE(c.final_amount, 0)
+          - GREATEST(COALESCE(c.paid_amount, 0) - COALESCE(prior.paid, 0), 0), 0)), 0) AS balance,
+      -- Same "active" the row badge shows: status active AND the term has not
+      -- ended. The CASE keeps an empty end date from being cast to DATE.
+      COUNT(*) FILTER (
+        WHERE c.status = 'active'
+          AND COALESCE(CASE
+            WHEN c.pt_end_date IS NULL OR c.pt_end_date::TEXT = '' THEN NULL
+            ELSE c.pt_end_date::DATE - CURRENT_DATE
+          END, 0) >= 0
+      )::INT AS active_count
+    FROM pt_clients c
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(SUM(s.amount_paid), 0) AS paid
+      FROM pt_client_subscriptions s
+      WHERE s.client_id = c.id
+        AND s.start_date IS NOT NULL
+        AND c.pt_start_date IS NOT NULL
+        AND s.start_date < c.pt_start_date
+    ) prior ON TRUE
+    WHERE c.deleted_at IS NULL
+      AND c.organization_id = $1
+  `, [scope.orgId]);
+
+  return {
+    total: row?.total ?? 0,
+    revenue: Number(row?.revenue ?? 0),
+    paid: Number(row?.paid ?? 0),
+    balance: Number(row?.balance ?? 0),
+    active_count: row?.active_count ?? 0,
+  };
 }
 
 /**
@@ -1102,6 +1185,8 @@ module.exports = {
   getTodayRoster,
   getBalanceSheet,
   getActiveClients,
+  countActiveClients,
+  getClientSummary,
   findClientForAccess,
   searchClients,
   getClientAttendance,

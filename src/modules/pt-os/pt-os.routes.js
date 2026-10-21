@@ -199,15 +199,27 @@ router.get('/clients', auth, wrap(async (req, res) => {
   // The trainer owns the studio, so the list is the studio's whole roster;
   // tenantScope() is the only narrowing. search/status/dues/limit/offset are
   // inherited from the retired GET /api/clients, whose callers still pass them.
-  const rows = await svc.getActiveClients(tenantScope(req), {
+  // `term=ended` is the list's derived Expired filter (status OR past end
+  // date); `limit`/`offset` make it a page, and `total` is the match count.
+  const scope = tenantScope(req);
+  const opts = {
     search: req.query.search,
     status: req.query.status,
     dues: req.query.dues,
     limit: req.query.limit,
     offset: req.query.offset,
     includeDeleted: req.query.include_deleted === '1',
-  });
-  res.json({ data: rows, total: rows.length });
+    expired: req.query.term === 'ended',
+  };
+  const rows = await svc.getActiveClients(scope, opts);
+  // Dropdowns call this endpoint for the whole roster and read only `data`.
+  // Counting and summarising on those calls would add two studio-wide
+  // aggregates to every picker, so they are paid for only by a paged caller —
+  // the roster page, which renders them.
+  const paged = req.query.limit !== undefined;
+  const total = paged ? await svc.countActiveClients(scope, opts) : rows.length;
+  const summary = paged ? await svc.getClientSummary(scope) : undefined;
+  res.json({ data: rows, total, ...(summary ? { summary } : {}) });
 }));
 
 // ─── Inherited from the retired /api/clients mount ───────────
