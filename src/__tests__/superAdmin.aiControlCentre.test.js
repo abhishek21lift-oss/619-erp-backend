@@ -136,6 +136,18 @@ describe('by studio', () => {
     await request(app()).get('/api/super-admin/ai/by-studio');
     expect(calls()[0].sql).toMatch(/o\.status <> 'deleted'/);
   });
+
+  it('prefers the stored organization_id, falling back to the user join', async () => {
+    // Phase-4 S-4: rows written after the attribution migration carry their
+    // own organization_id; the join through users only answers for legacy
+    // rows. A transferred trainer's new rows must attribute to the org the
+    // row names, not to wherever that user currently sits.
+    pool.query.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [SETTINGS] });
+    await request(app()).get('/api/super-admin/ai/by-studio');
+    const sql = calls()[0].sql;
+    expect(sql).toMatch(/COALESCE\(l\.organization_id, u\.organization_id\)/);
+    expect(sql).toMatch(/COALESCE\(l\.organization_id, u\.organization_id\) IS NOT NULL/);
+  });
 });
 
 describe('settings', () => {

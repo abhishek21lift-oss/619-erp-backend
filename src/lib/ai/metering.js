@@ -64,11 +64,16 @@ function meteredChat(req, intent_type, chat) {
     const result = await chat(args);
     require('./usage').logUsage({
       user_id: req.user?.id,
+      // The studio from the authenticated token — never from anything the
+      // caller or model said (phase-4 S-4).
+      organization_id: req.user?.organization_id ?? null,
       model: result?.model,
       intent_type,
       ...usageFields(result?.usage, result?.content),
       latency_ms: result?.latency_ms ?? 0,
       used_fallback: Boolean(result?.used_fallback),
+      // What the gateway itself named as the upstream, when it says (S-5).
+      routed_via: result?.routed_via ?? null,
     }).catch(() => {});
     return result;
   };

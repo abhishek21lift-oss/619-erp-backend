@@ -20,7 +20,7 @@ function orgParam(req) {
 }
 const { routedChat, routedStream }     = require('../lib/ai/router');
 const { pingModel }                    = require('../lib/ai/openrouter');
-const { models }                       = require('../lib/ai/models');
+const { models, INTENT_ROUTES }        = require('../lib/ai/models');
 const { logUsage, getUserUsage, getModelStats } = require('../lib/ai/usage');
 const { usageFields, meteredChat } = require('../lib/ai/metering');
 const { retrieveContext }              = require('../lib/ai/knowledgeBase');
@@ -753,6 +753,8 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       conversation_id: convId,
       model:           chatMeta?.model || routedModel,
       intent_type:     'chat',
+      organization_id: req.user?.organization_id ?? null,
+      routed_via:      chatMeta?.routed_via ?? null,
       ...usageFields(chatMeta?.usage, fullContent),
       latency_ms:      chatMeta?.latency_ms ?? 0,
       used_fallback:   Boolean(chatMeta?.used_fallback),
@@ -1523,6 +1525,8 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       user_id:           req.user.id,
       model:             streamMeta.model,
       intent_type:       'workout',
+      organization_id:   req.user?.organization_id ?? null,
+      routed_via:        streamMeta.routed_via ?? null,
       ...usageFields(streamMeta.usage, fullContent),
       latency_ms:        streamMeta.latency_ms ?? 0,
       used_fallback:     streamMeta.used_fallback,
@@ -1833,6 +1837,8 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       user_id:           req.user.id,
       model:             streamMeta.model,
       intent_type:       'diet',
+      organization_id:   req.user?.organization_id ?? null,
+      routed_via:        streamMeta.routed_via ?? null,
       ...usageFields(streamMeta.usage, fullContent),
       latency_ms:        streamMeta.latency_ms ?? 0,
       used_fallback:     streamMeta.used_fallback,
@@ -2033,6 +2039,8 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
       user_id:           req.user.id,
       model:             streamMeta.model,
       intent_type:       'progress',
+      organization_id:   req.user?.organization_id ?? null,
+      routed_via:        streamMeta.routed_via ?? null,
       ...usageFields(streamMeta.usage, fullContent),
       latency_ms:        streamMeta.latency_ms ?? 0,
       used_fallback:     streamMeta.used_fallback,
@@ -2182,6 +2190,8 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
       user_id:           req.user.id,
       model:             streamMeta.model,
       intent_type:       'fitness_testing',
+      organization_id:   req.user?.organization_id ?? null,
+      routed_via:        streamMeta.routed_via ?? null,
       ...usageFields(streamMeta.usage, fullContent),
       latency_ms:        streamMeta.latency_ms ?? 0,
       used_fallback:     streamMeta.used_fallback,
@@ -2329,6 +2339,8 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
       user_id:           req.user.id,
       model:             result.model,
       intent_type:       'business',
+      organization_id:   req.user?.organization_id ?? null,
+      routed_via:        result.routed_via ?? null,
       ...usageFields(result.usage, result.content),
       latency_ms:        result.latency_ms,
       used_fallback:     result.used_fallback,
@@ -2475,12 +2487,60 @@ router.get('/health', auth, requireTrainer, async (req, res) => {
 /* ═══════════════════════════════════════════════════════════════════════════
    9. TEST  (the studio's trainer)
    POST /api/ai/test
-   ═══════════════════════════════════════════════════════════════════════════ */
-router.post('/test', auth, requireTrainer, requireConfigured, async (req, res) => {
 
-  const { intent = 'chat', prompt = 'Say "MY PT STUDIO AI is ready" and nothing else.' } = req.body || {};
+   S-3 (phase 4): this was the one AI surface that spent the provider without
+   the meter. Three closed shape now, without changing who can call it:
+
+     * the intent must be a name in the model registry (INTENT_ROUTES) —
+       anything else used to fall through to the primary tier silently, so a
+       typo'd intent routed a "test" into production traffic at full weight;
+     * prompt and payload are bounded and rejected BEFORE any model call;
+     * the call goes through the same meteredChat path as every other AI
+       route, so it is logged exactly once. The bare POST keeps the historical
+       sentinel prompt — that boot-check is what the default was for — but a
+       body that supplies fields supplies well-formed ones.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const MAX_TEST_PROMPT_CHARS = 4000;
+const MAX_TEST_BODY_BYTES   = 32 * 1024;
+
+router.post('/test', auth, requireTrainer, requireConfigured, async (req, res) => {
+  const body = req.body || {};
+
+  const contentLength = Number(req.headers['content-length'] || 0);
+  if (contentLength > MAX_TEST_BODY_BYTES) {
+    return res.status(413).json({
+      error: { code: 'PAYLOAD_TOO_LARGE', message: `Test payload must be under ${MAX_TEST_BODY_BYTES} bytes.` },
+    });
+  }
+
+  // No body, no intent, no prompt: the historical boot-check default.
+  const bare = !('intent' in body) && !('prompt' in body);
+  if (!bare) {
+    const intent = body.intent;
+    const prompt = body.prompt;
+    if (typeof intent !== 'string' || !Object.hasOwn(INTENT_ROUTES, intent)) {
+      return res.status(400).json({
+        error: { code: 'BAD_INTENT', message: 'intent must be one of the supported intent names.' },
+      });
+    }
+    if (typeof prompt !== 'string') {
+      return res.status(400).json({
+        error: { code: 'BAD_PROMPT', message: 'prompt must be a string.' },
+      });
+    }
+    if (prompt.length > MAX_TEST_PROMPT_CHARS) {
+      return res.status(413).json({
+        error: { code: 'PROMPT_TOO_LONG', message: `prompt must be at most ${MAX_TEST_PROMPT_CHARS} characters.` },
+      });
+    }
+  }
+
+  const intent = bare ? 'chat' : body.intent;
+  const prompt = bare ? 'Say "MY PT STUDIO AI is ready" and nothing else.' : body.prompt;
+
   try {
-    const result = await routedChat({
+    const metered = meteredChat(req, intent, routedChat);
+    const result = await metered({
       intent,
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 50,

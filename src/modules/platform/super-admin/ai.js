@@ -99,7 +99,12 @@ router.get('/ai/by-studio', async (req, res, next) => {
     const days = aiDays(req.query.days);
     const { rows } = await pool.query(
       `WITH usage AS (
-         SELECT u.organization_id,
+         -- Prefer the organization_id stamped on the row (resolved from the
+         -- authenticated user at write time); the join through users answers
+         -- only for legacy rows written before 234, so a transferred
+         -- trainer's new rows attribute to the org the row names, not to
+         -- wherever that user sits today.
+         SELECT COALESCE(l.organization_id, u.organization_id) AS organization_id,
                 count(*)::int                                AS requests,
                 COALESCE(SUM(l.tokens_total), 0)::bigint      AS tokens,
                 COALESCE(SUM(${COST_SQL}), 0)::numeric        AS cost_inr,
@@ -113,8 +118,8 @@ router.get('/ai/by-studio', async (req, res, next) => {
            JOIN users u ON u.id = l.user_id
            LEFT JOIN ai_model_rates r ON r.model = l.model
           WHERE l.created_at >= now() - ($1 || ' days')::interval
-            AND u.organization_id IS NOT NULL
-          GROUP BY u.organization_id
+            AND COALESCE(l.organization_id, u.organization_id) IS NOT NULL
+          GROUP BY COALESCE(l.organization_id, u.organization_id)
        )
        SELECT o.id AS organization_id, o.name AS organization_name, o.plan_code,
               usage.requests, usage.tokens::bigint, usage.cost_inr,

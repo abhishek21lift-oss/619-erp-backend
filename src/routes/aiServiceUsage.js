@@ -89,7 +89,10 @@ router.post('/ingest', requireServiceAuth(), auth, requireTrainer, async (req, r
   // partial or absent flows into usageFields() and is labelled 'estimated'
   // (completion ≈ replyChars/4) — the ERP's own convention. A silent 0 never
   // happens here, and nothing the body claims about the user is trusted:
-  // identity comes from auth() alone (round-2 MPS-01 requirements 2-4).
+  // identity and studio come from auth() alone (round-2 MPS-01, phase-4 S-4).
+  // provider stays 'openrouter' because mps-ai's provider is OpenRouter by
+  // construction (config AI_PROVIDER is an enum with one value, its client
+  // posts to openrouter.ai directly) — the ERP's own calls derive theirs.
   const promptKnown = intWithin(body.promptTokens, MAX_TOKENS);
   const completionKnown = intWithin(body.completionTokens, MAX_TOKENS);
   const usageIn = {
@@ -99,9 +102,10 @@ router.post('/ingest', requireServiceAuth(), auth, requireTrainer, async (req, r
   const replyChars = intWithin(body.replyChars, MAX_REPLY_CHARS) ?? 0;
   const fields = usageFieldsFor(usageIn, promptKnown !== null && completionKnown !== null, replyChars);
 
-  await usage.logUsage({
+  const recorded = await usage.logUsage({
     user_id: req.user.id,
     conversation_id: null,
+    organization_id: req.user.organization_id ?? null,
     model,
     provider: 'openrouter',
     intent_type: 'client_agent',
@@ -113,6 +117,20 @@ router.post('/ingest', requireServiceAuth(), auth, requireTrainer, async (req, r
     usage_source: fields.usage_source,
     request_id: requestId,
   });
+
+  // Phase 4E: the ledger write can no longer pretend. A null from logUsage is
+  // a failed write — say so (503), so the caller's log carries a real error
+  // and an operator can see bookkeeping degraded, not "all good, estimated".
+  // A duplicate (same requestId + user re-ingested) is a 202 `duplicate`, and
+  // the row was NOT written twice — the count stays correct.
+  if (recorded === null) {
+    return res.status(503).json({
+      error: { code: 'USAGE_LOG_UNAVAILABLE', message: 'The usage ledger could not record this turn; report again with the same requestId.' },
+    });
+  }
+  if (!recorded.inserted) {
+    return res.status(202).json({ ok: true, duplicate: true });
+  }
 
   return res.status(202).json({ ok: true, usage_source: fields.usage_source });
 });
