@@ -112,3 +112,30 @@ describe('but it is no longer silent about it', () => {
     expect(quotaEnforcementHealth()).toMatchObject({ consecutive_failures: 0, degraded: false });
   });
 });
+
+// ── Phase 5C: the other failure bias, behind an explicit operator switch ─────
+
+describe('an operator may flip the bias: AI_QUOTA_FAILURE_MODE=fail-closed', () => {
+  const REAL_ENV = process.env;
+  beforeEach(() => {
+    process.env = { ...REAL_ENV, AI_QUOTA_FAILURE_MODE: 'fail-closed' };
+  });
+  afterEach(() => { process.env = REAL_ENV; });
+
+  it('refuses with 503 AI_QUOTA_UNVERIFIABLE when the check errors — never silently uncapped', async () => {
+    pool.query.mockRejectedValue(new Error('db down'));
+    let nexted = false;
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() };
+    await guard(reqFor(), res, () => { nexted = true; });
+    expect(nexted).toBe(false);
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json.mock.calls[0][0].error.code).toBe('AI_QUOTA_UNVERIFIABLE');
+  });
+
+  it('leave the env unset and the default stays fail-open (the bias is opt-in, not ambient)', async () => {
+    delete process.env.AI_QUOTA_FAILURE_MODE;
+    pool.query.mockRejectedValue(new Error('db down'));
+    const next = await runGuard();
+    expect(next).toHaveBeenCalled();
+  });
+});

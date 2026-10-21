@@ -42,6 +42,7 @@ const { models: aiModels } = require('../../../lib/ai/models');
 const gateway = require('../../../lib/ai/gateway');
 const observations = require('../../../lib/ai/observations');
 const { configuredInCatalog } = require('./freellmapi.collector');
+const { runAsPlatform } = require('../../../lib/tenant-context');
 
 const NAME = 'ai';
 
@@ -182,7 +183,18 @@ function reconcile({ routing, served24h, probe, verdict, obs, now = Date.now() }
   return { state, findings, verified };
 }
 
-async function collect() {
+/**
+ * Background read across every studio — by design. runAsPlatform SAYS so
+ * (tenant-context.js: it exists so deliberately cross-tenant code "can say
+ * so, rather than depending on the absence of a context"), so the card
+ * describes the platform even if a future caller invokes this collector
+ * from inside a tenant context.
+ */
+function collect() {
+  return runAsPlatform(collectPlatformWide);
+}
+
+async function collectPlatformWide() {
   if (!aiConfig.isConfigured()) {
     // `expected: true` — the probe answered. There is no provider key, so no AI
     // request can be made: a capability this deployment has not wired up, not

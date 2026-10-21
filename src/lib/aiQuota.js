@@ -39,10 +39,15 @@ async function loadSettings(client) {
 /**
  * Tokens this studio has spent in the current calendar month.
  *
- * ai_usage_log has no organization_id, so this joins through users. That means
- * usage follows the ACCOUNT: a trainer who moves studios takes their history
- * with them. Worth knowing when reading a sudden jump — it may be a transfer,
- * not a spike.
+ * New rows carry organization_id, resolved from the authenticated context at
+ * write time; older ones did not, and the studio for those is still reached
+ * through the user who made each call. The query prefers the stored org and
+ * falls back to that join, so the deploy month's legacy rows keep counting
+ * and nothing currently enforced silently drops out of the total.
+ *
+ * The fallback keeps one documented legacy wart: an old row by a trainer who
+ * moved studios attributes to whichever studio that trainer belongs to NOW.
+ * New rows are immune — a transfer moves only what has no stored org.
  */
 async function usedThisMonth(orgId, client) {
   const db = client || require('../db/pool');
@@ -51,7 +56,7 @@ async function usedThisMonth(orgId, client) {
             count(*)::int AS requests
        FROM ai_usage_log l
        JOIN users u ON u.id = l.user_id
-      WHERE u.organization_id = $1::uuid
+      WHERE COALESCE(l.organization_id, u.organization_id) = $1::uuid
         AND l.created_at >= ${PERIOD_SQL}`,
     [orgId]
   );

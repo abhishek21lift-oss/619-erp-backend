@@ -60,6 +60,19 @@ jest.mock('../lib/logger', () => ({
   info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn(), fatal: jest.fn(),
 }));
 
+// The AI card's gateway half would otherwise reach for the network; the
+// property under test here is the database context, not the gateway.
+jest.mock('../lib/ai/gateway', () => ({
+  probe: jest.fn(async () => ({
+    kind: 'freellmapi',
+    endpoint: 'http://127.0.0.1:1/v1',
+    checked_at: '2026-10-21T00:00:00.000Z',
+    catalog: { models: [], routers: [], source: null, exposed: null, reason: null },
+  })),
+  grade: jest.fn(() => ({ status: 'healthy', reason: null })),
+  isRouterModel: jest.fn(() => false),
+}));
+
 // Collector registration is irrelevant here and pulls in Redis/BullMQ.
 jest.mock('../modules/command-center/index', () => ({
   registerCollectors: jest.fn(),
@@ -115,6 +128,8 @@ describe('every Command Center read runs platform-wide', () => {
       '/api/super-admin/command-center/logs/history'],
     ['alerts (system_alerts — zero rows under app_tenant)',
       '/api/super-admin/command-center/alerts'],
+    ['AI model inventory (ai_usage_log — one studio\'s numbers under a platform heading)',
+      '/api/super-admin/command-center/ai/models'],
   ])('%s', async (_label, url) => {
     const res = await request(app()).get(url);
     expect(res.status).toBe(200);
@@ -164,5 +179,27 @@ describe('the platform context is opened by the router, not inherited', () => {
     const firstRouteAt = src.search(/router\.(get|post)\(/);
     expect(guardAt).toBeGreaterThan(-1);
     expect(guardAt).toBeLessThan(firstRouteAt);
+  });
+});
+
+describe('the AI collector reads platform-wide even from inside a tenant context', () => {
+  it('re-opens the platform context itself, so a caller cannot scope it', async () => {
+    // The AI card aggregates every studio by design, and runs from the
+    // collector loop with no request context. Nothing stops a future caller
+    // from invoking it INSIDE one, though — AsyncLocalStorage leaks inward.
+    // collect() therefore states its intent itself with runAsPlatform; this
+    // test attacks it from exactly the context that would scope it.
+    const aiCollector = require('../modules/command-center/collectors/ai.collector');
+    process.env.AI_API_KEY = 'test-key-not-a-credential';
+    try {
+      await runWithTenantContext(PINNED_ORG, () => aiCollector.collect(), { platformWide: false });
+    } finally {
+      delete process.env.AI_API_KEY;
+    }
+    expect(observed.length).toBeGreaterThan(0);
+    for (const q of observed) {
+      expect(q.platformWide).toBe(true);
+      expect(q.orgId).toBeNull();
+    }
   });
 });

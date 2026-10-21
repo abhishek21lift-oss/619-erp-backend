@@ -15,7 +15,7 @@ jest.mock('../lib/logger', () => ({
   info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn(),
 }));
 
-const mockLogUsage = jest.fn().mockResolvedValue(undefined);
+const mockLogUsage = jest.fn().mockResolvedValue({ inserted: true });
 jest.mock('../lib/ai/usage', () => ({
   logUsage: mockLogUsage,
 }));
@@ -198,4 +198,86 @@ describe('POST /ingest', () => {
     expect(row.latency_ms).toBe(0);
     expect(row.usage_source).toBe('estimated');
   });
+
+  // ── Phase 4C: organisation attribution from the token, not the body ──────
+  test('the studio on the ledger row comes from the resolved user, never the body', async () => {
+    const res = await ingest(app(), { ...VALID, organization_id: 'forged-org' }, { 'X-Service-Auth': SECRET });
+    expect(res.status).toBe(202);
+    const row = mockLogUsage.mock.calls[0][0];
+    expect(row.organization_id).toBe('org-1');
+    expect(JSON.stringify(row)).not.toContain('forged-org');
+  });
+
+  test('a token with no studio stores explicit NULL, the unknown-attribution mark', async () => {
+    mockAuthFixture.user = { id: 'u-1', organization_id: null };
+    const res = await ingest(app(), VALID, { 'X-Service-Auth': SECRET });
+    expect(res.status).toBe(202);
+    expect(mockLogUsage.mock.calls[0][0].organization_id).toBeNull();
+  });
+
+  // ── Phase 4E: idempotency and honest failure ─────────────────────────────
+  test('a first ingest reports inserted and carries no duplicate flag', async () => {
+    mockLogUsage.mockResolvedValueOnce({ inserted: true });
+    const res = await ingest(app(), VALID, { 'X-Service-Auth': SECRET });
+    expect(res.status).toBe(202);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.duplicate).toBeUndefined();
+  });
+
+  test('a re-ingest of the same turn answers 202 duplicate, having logged nothing new', async () => {
+    mockLogUsage.mockResolvedValueOnce({ inserted: true });
+    expect((await ingest(app(), VALID, { 'X-Service-Auth': SECRET })).status).toBe(202);
+    mockLogUsage.mockClear();
+    mockLogUsage.mockResolvedValueOnce({ inserted: false }); // conflict → DO NOTHING
+    const res = await ingest(app(), VALID, { 'X-Service-Auth': SECRET });
+    expect(res.status).toBe(202);
+    expect(res.body).toMatchObject({ ok: true, duplicate: true });
+    // The duplicate is not re-counted anywhere else either.
+    expect(mockLogUsage).toHaveBeenCalledTimes(1);
+  });
+
+  test('a ledger write failure is a typed 503, so it is observable upstream', async () => {
+    mockLogUsage.mockResolvedValueOnce(null); // logUsage never throws; failure is null
+    const res = await ingest(app(), VALID, { 'X-Service-Auth': SECRET });
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe('USAGE_LOG_UNAVAILABLE');
+  });
+
+  // ── Phase 5B: a failed ingest recovers by plain re-delivery, same request id ─
+  test('transient ledger failure: the SAME turn re-delivered is accepted once, with identical attribution',
+    async () => {
+      const a = app();
+      mockLogUsage.mockResolvedValueOnce(null); // first attempt: ledger write fails
+      const bad = await ingest(a, VALID, { 'X-Service-Auth': SECRET });
+      expect(bad.status).toBe(503);
+
+      mockLogUsage.mockResolvedValueOnce({ inserted: true });
+      const retried = await ingest(a, VALID, { 'X-Service-Auth': SECRET });
+      expect(retried.status).toBe(202);
+      expect(retried.body.ok).toBe(true);
+
+      // Recovery cannot re-tenant the row: every attempt resolves identity the
+      // same auth-resolved way, so both rows would carry identical attribution.
+      expect(mockLogUsage).toHaveBeenCalledTimes(2);
+      const [firstRow, secondRow] = mockLogUsage.mock.calls.map((c) => c[0]);
+      for (const k of ['user_id', 'organization_id', 'request_id', 'model', 'usage_source']) {
+        expect(secondRow[k]).toBe(firstRow[k]);
+      }
+      expect(secondRow.request_id).toBe('req-abc-123');
+      expect(secondRow.organization_id).toBe('org-1');
+    });
+
+  test('a persistently failing ledger keeps answering with the same typed 503, each attempt one write try',
+    async () => {
+      const a = app();
+      mockLogUsage.mockResolvedValueOnce(null);
+      mockLogUsage.mockResolvedValueOnce(null);
+      const r1 = await ingest(a, VALID, { 'X-Service-Auth': SECRET });
+      const r2 = await ingest(a, VALID, { 'X-Service-Auth': SECRET });
+      expect(r1.status).toBe(503);
+      expect(r2.status).toBe(503);
+      expect(r1.body.error.code).toBe('USAGE_LOG_UNAVAILABLE');
+      expect(r2.body.error.code).toBe('USAGE_LOG_UNAVAILABLE');
+      expect(mockLogUsage).toHaveBeenCalledTimes(2); // no route-level retry loop
+    });
 });
