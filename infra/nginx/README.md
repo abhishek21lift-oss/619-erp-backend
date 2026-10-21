@@ -23,24 +23,27 @@ diffed and restored.
   myptstudio.com     ──► │ nginx (host)                          │
   www.myptstudio.com ──► │   443 TLS, routes on the Host header  │
   api.myptstudio.com ──► │                                       │
-                         └───────┬───────────────────┬──────────┘
-                                 │                   │
-                    127.0.0.1:3000                127.0.0.1:5000
-                    frontend container            backend container
-                                                        │
-                                              127.0.0.1:6379  redis
-                                                     worker container
+                         └───┬──────────────┬─────────────┬──────┘
+                             │              │             │
+                127.0.0.1:3000    127.0.0.1:5000    127.0.0.1:4100
+                frontend          backend           mps-ai (repo: mps-ai)
+                container         container         the client-agent AI
+                                      │             (loopback only; see
+                            127.0.0.1:6379  redis   the one-route note below)
+                                   worker container
 ```
 
-All three names resolve to the same address. Both app containers bind to
-**loopback only** (`docker-compose.yml`), so nginx is the only route in — do not
-"fix" a connection problem by exposing a container on `0.0.0.0`.
+All names resolve to the same address. All app containers bind to **loopback
+only** (`docker-compose.yml`; mps-ai likewise, `docker-compose.snippet.yml`), so
+nginx is the only route in — do not "fix" a connection problem by exposing a
+container on `0.0.0.0`.
 
-## The request path has two shapes
+## The request path has three shapes
 
 ```
 API calls    browser → nginx → frontend container → Next rewrite → backend
 WebSocket    browser → nginx ──────────────────────────────────→ backend
+Client AI    browser → nginx → mps-ai directly (location /ai/ :4100)
 ```
 
 Ordinary API calls use relative URLs (`apiBase()` returns `''` in production)
@@ -82,6 +85,47 @@ The fix is two layers, both in this folder / the box:
 
 Only `/api/ai/` is widened; ordinary requests keep the 60s default. Do not raise
 the timeout globally.
+
+## Client-agent AI on the frontend vhost (`/ai/` → mps-ai)
+
+The Ask AI panel is a **different service** (repo: `mps-ai`, its own container on
+loopback `:4100`), not a backend route. Its stream
+(`POST /ai/client-agent/chat/stream`) is terminated by nginx itself:
+
+```
+browser → nginx location /ai/ → mps-ai            (Cookie + Origin intact)
+```
+
+`myptstudio.conf` scopes `location /ai/` with the same treatment as `/api/ai/`:
+`proxy_read_timeout 300s`, `proxy_buffering off`. The request never enters the
+Next.js container, so this route does not depend on `AI_SERVICE_URL`.
+
+Two rules keep this deployment safe:
+
+1. **One route only (safety-critical).** While this `location /ai/` block exists
+   on the box, `AI_SERVICE_URL` must stay **unset** for the frontend build. If
+   it is set as well, the Next rewrite becomes a second, redundant answer for
+   the same path — whichever route wins silently depends on build-time config,
+   which is how environments drift. The rewrite exists as the alternative for
+   deploys that cannot adopt this vhost; the vhost route is the canonical one.
+2. **`AI_ALLOWED_ORIGINS` must include the real origin** (`https://myptstudio.com`).
+   Browsers send `Origin` on every POST, and mps-ai rejects unknown origins with
+   403 even when the route is wired correctly — a 403 here is a CORS list
+   problem, not a proxy problem.
+
+Proving the route from outside, like the curl below does for WebSockets:
+
+```bash
+curl -isS -m 10 https://myptstudio.com/ai/client-agent/chat/stream \
+  -H 'Content-Type: application/json' --data '{"clientId":"probe","message":"hi"}' | head -5
+```
+
+| You get | Means |
+|---|---|
+| `401` (JSON error envelope) | **the proxy is correct** — mps-ai answered, no token supplied. The success case. |
+| `200` with HTML | the request reached the **frontend** app instead — the `/ai/` block is missing on the box |
+| `403` | mps-ai answered, but `AI_ALLOWED_ORIGINS` / origin handling — check the allow-list |
+| `404` JSON | nginx reached a service, but the wrong one (path got rewritten or stripped) |
 
 ## Files
 
