@@ -9,7 +9,7 @@
 // Persisting it per assessment requires the approval-gated migration described
 // in F10 (new nullable `scoring_formula_version` column on pt_assessments);
 // until then this is documentation only and legacy rows are treated as unknown.
-const FITNESS_SCORING_VERSION = '2';
+const FITNESS_SCORING_VERSION = '3';
 
 function round(n, decimals = 1) {
   const f = 10 ** decimals;
@@ -225,6 +225,12 @@ function classifyHarvardPei(pei) {
 // Simplified gender-split, 3-age-band VO2max norms (mL/kg/min).
 // Simplification vs. full per-decade Cooper Institute tables — Phase 1
 // deliberately trades precision for a small, maintainable table.
+//
+// SOURCE GAP — K11's VO2max table uses Superior / Excellent / Very Good / Good
+// / Fair / Poor / Very Poor, but the K11 threshold values are not available
+// here. These bands are an existing NON-K11 reference, shared by Rockport,
+// Cooper and Bruce results; do not describe them as K11-approved until the
+// missing table is sourced.
 const VO2_MAX_NORMS = {
   Male:   { young: [42, 37, 33, 28], mid: [39, 34, 30, 25], senior: [35, 30, 26, 21] },
   Female: { young: [37, 32, 28, 23], mid: [34, 29, 25, 20], senior: [30, 25, 21, 16] },
@@ -246,17 +252,81 @@ function classifyVo2Max(vo2, age, gender) {
   return 'Poor';
 }
 
-// YMCA 3-Minute Step Test has no standard closed-form VO2max — classify
-// heart-rate recovery only, on a simplified single scale.
-function classifyStepTestRecovery(recoveryHr) {
+// YMCA 3-Minute Step Test. K11 publishes recovery heart-rate norms by age and
+// sex for ages 18–55 only, with no VO2max conversion. Bands below are the
+// published whole-bpm ranges, written as closed integer intervals exactly as
+// printed: `<79` becomes 40–78, `79–89` stays 79–89, and male `>128` becomes
+// 129–220 (the physiological guard). Two source gaps are preserved rather than
+// papered over:
+//   • female tables print no Very Poor row, so values above the Poor ceiling
+//     (140 / 138 / 140 / 135 by age group) return no category;
+//   • the female 46–55 row jumps from "Excellent <94" to "Good 95–104", so
+//     94 bpm is in neither band and returns no category.
+// A non-integer reading is not one of the published whole-bpm bands either.
+const YMCA_STEP_RECOVERY_NORMS = {
+  Male: {
+    '18-25': [
+      ['Excellent', 40, 78], ['Good', 79, 89], ['Above Average', 90, 99],
+      ['Average', 100, 105], ['Below Average', 106, 116], ['Poor', 117, 128],
+      ['Very Poor', 129, 220],
+    ],
+    '26-35': [
+      ['Excellent', 40, 80], ['Good', 81, 89], ['Above Average', 90, 99],
+      ['Average', 100, 107], ['Below Average', 108, 117], ['Poor', 118, 128],
+      ['Very Poor', 129, 220],
+    ],
+    '36-45': [
+      ['Excellent', 40, 82], ['Good', 83, 96], ['Above Average', 97, 103],
+      ['Average', 104, 112], ['Below Average', 113, 119], ['Poor', 120, 130],
+      ['Very Poor', 131, 220],
+    ],
+    '46-55': [
+      ['Excellent', 40, 86], ['Good', 87, 97], ['Above Average', 98, 105],
+      ['Average', 106, 116], ['Below Average', 117, 122], ['Poor', 123, 132],
+      ['Very Poor', 133, 220],
+    ],
+  },
+  Female: {
+    '18-25': [
+      ['Excellent', 40, 84], ['Good', 85, 98], ['Above Average', 99, 108],
+      ['Average', 109, 117], ['Below Average', 118, 126], ['Poor', 127, 140],
+    ],
+    '26-35': [
+      ['Excellent', 40, 87], ['Good', 88, 99], ['Above Average', 100, 111],
+      ['Average', 112, 119], ['Below Average', 120, 126], ['Poor', 127, 138],
+    ],
+    '36-45': [
+      ['Excellent', 40, 89], ['Good', 90, 102], ['Above Average', 103, 110],
+      ['Average', 111, 118], ['Below Average', 119, 128], ['Poor', 129, 140],
+    ],
+    '46-55': [
+      ['Excellent', 40, 93], ['Good', 95, 104], ['Above Average', 105, 115],
+      ['Average', 116, 120], ['Below Average', 121, 126], ['Poor', 127, 135],
+    ],
+  },
+};
+
+function recoveryAgeGroup(age) {
+  // The published bands are whole-year ranges; a fractional age is not in one.
+  if (age == null || !Number.isInteger(age)) return null;
+  if (age >= 18 && age <= 25) return '18-25';
+  if (age >= 26 && age <= 35) return '26-35';
+  if (age >= 36 && age <= 45) return '36-45';
+  if (age >= 46 && age <= 55) return '46-55';
+  return null;
+}
+
+function classifyStepTestRecovery(recoveryHr, age, gender) {
   // Implausible recovery heart rate (not a real measurement) must not produce
   // a category — guard the physiological range.
   if (recoveryHr == null || !Number.isFinite(recoveryHr) || recoveryHr < 40 || recoveryHr > 220) return null;
-  if (recoveryHr < 80) return 'Excellent';
-  if (recoveryHr < 90) return 'Good';
-  if (recoveryHr < 100) return 'Average';
-  if (recoveryHr < 110) return 'Below Average';
-  return 'Poor';
+  const g = sexOf(gender);
+  const group = recoveryAgeGroup(age);
+  if (!g || !group) return null;
+  for (const [category, min, max] of YMCA_STEP_RECOVERY_NORMS[g][group]) {
+    if (recoveryHr >= min && recoveryHr <= max) return category;
+  }
+  return null;
 }
 
 // ── Step 5: Muscular Strength ───────────────────────────────
@@ -359,7 +429,9 @@ function classifyFlexibilityScore(score) {
 
 // ── Category → score mapping (used consistently across Cardio/
 //    Endurance/Mobility/Strength for the 0-100 dashboard scores) ──
-const CATEGORY_SCORES = { Excellent: 95, Good: 80, Average: 60, 'Below Average': 40, Poor: 20 };
+const CATEGORY_SCORES = {
+  Excellent: 95, Good: 80, 'Above Average': 70, Average: 60, 'Below Average': 40, Poor: 20, 'Very Poor': 10,
+};
 function scoreCategory(category) {
   return CATEGORY_SCORES[category] ?? null;
 }
