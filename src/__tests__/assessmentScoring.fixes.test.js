@@ -35,6 +35,48 @@ describe('no invented categories (F-4, F-8)', () => {
   });
 });
 
+describe('anthropometric norms (MPTS adult Asian bands)', () => {
+  test.each([
+    [18.4, 'Underweight'], [18.5, 'Normal'], [22.9, 'Normal'],
+    [23, 'Overweight'], [24.9, 'Overweight'], [25, 'Obese'], [40, 'Obese'],
+  ])('classifyBmi(%p) → %s', (bmi, category) => {
+    expect(fitness.classifyBmi(bmi)).toBe(category);
+  });
+
+  test('BMI without a usable measurement is not a category', () => {
+    for (const bmi of [null, NaN, Infinity, 0, -1]) {
+      expect(fitness.classifyBmi(bmi)).toBeNull();
+    }
+  });
+
+  test.each([
+    [89.9, 'Male', 'Low risk'], [90, 'Male', 'Above low-risk threshold'],
+    [79.9, 'Female', 'Low risk'], [80, 'Female', 'Above low-risk threshold'],
+    [89.9, 'male', 'Low risk'],
+  ])('classifyWaistRisk(%p cm, %s) → %s', (waist, gender, expected) => {
+    expect(fitness.classifyWaistRisk(waist, gender)).toBe(expected);
+  });
+
+  test.each([
+    [0.94, 'Male', 'Low risk'], [0.95, 'Male', 'Above low-risk threshold'],
+    [0.85, 'Female', 'Low risk'], [0.86, 'Female', 'Above low-risk threshold'],
+    [0.94, 'male', 'Low risk'],
+  ])('classifyWhrRisk(%p, %s) → %s', (whr, gender, expected) => {
+    expect(fitness.classifyWhrRisk(whr, gender)).toBe(expected);
+  });
+
+  test('no sex-specific category without a supported sex', () => {
+    for (const gender of [null, undefined, 'Other']) {
+      expect(fitness.classifyWaistRisk(85, gender)).toBeNull();
+      expect(fitness.classifyWhrRisk(0.9, gender)).toBeNull();
+    }
+    for (const value of [null, NaN, Infinity, 0, -1]) {
+      expect(fitness.classifyWaistRisk(value, 'Male')).toBeNull();
+      expect(fitness.classifyWhrRisk(value, 'Male')).toBeNull();
+    }
+  });
+});
+
 describe('goal readiness (G-1)', () => {
   test('is out of the questions answered', () => {
     expect(goal.calcLifestyleReadinessScore({ can_train_4_6_days: true, sleep_7_8_hours: true, family_support: true })).toBe(100);
@@ -103,6 +145,20 @@ describe('health score direction and bands (F15)', () => {
   });
   test('Hypertension Stage 2 is the worst BP band (20)', () => {
     expect(fitness.scoreHealthRisk('Hypertension Stage 2', 22)).toBe(60);
+  });
+
+  // The anthropometric block uses the adult Asian BMI bands, while the stored
+  // Health Score deliberately keeps its older project bands (18.5–<25 healthy).
+  // This regression pins the divergence so a future change cannot silently
+  // move Health Score bands to match classifyBmi.
+  test.each([
+    [18.4, 'Underweight', 80],
+    [23.0, 'Overweight', 100],
+    [24.9, 'Overweight', 100],
+    [25.0, 'Obese', 80],
+  ])('BMI %p is %s while Health Score remains %p', (bmi, category, healthScore) => {
+    expect(fitness.classifyBmi(bmi)).toBe(category);
+    expect(fitness.scoreHealthRisk('Normal', bmi)).toBe(healthScore);
   });
 });
 

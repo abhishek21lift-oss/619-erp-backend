@@ -241,6 +241,11 @@ function computeAssessment(b, age, gender, opts = {}) {
   // ── Step 2: Anthropometric ──
   const bmi = scoring.calcBmi(b.weight, b.height_cm);
   const waistHipRatio = scoring.calcWhr(b.waist_cm, b.hips_cm);
+  // Norms only where the recorded sex supports them. Waist risk comes from
+  // waist_cm (the narrowest-waist site), never the separate iliac reading.
+  const bmiCategory = scoring.classifyBmi(bmi);
+  const waistRisk = scoring.classifyWaistRisk(b.waist_cm ?? null, gender);
+  const whrRisk = scoring.classifyWhrRisk(waistHipRatio, gender);
 
   // ── Step 3: Body Composition ──
   const leanBodyMass = scoring.calcLeanBodyMass(b.weight, b.body_fat_pct);
@@ -366,8 +371,9 @@ function computeAssessment(b, age, gender, opts = {}) {
       resting_heart_rate: b.resting_heart_rate ?? null, resting_spo2: b.resting_spo2 ?? null,
       bp_category: bpCategory, rhr_category: rhrCategory, spo2_category: spo2Category,
       vitals_safety: vitalsSafety.level,
-      weight: b.weight ?? null, height_cm: b.height_cm ?? null, bmi,
+      weight: b.weight ?? null, height_cm: b.height_cm ?? null, bmi, bmi_category: bmiCategory,
       waist_cm: b.waist_cm ?? null, waist_iliac_cm: b.waist_iliac_cm ?? null, hips_cm: b.hips_cm ?? null, waist_hip_ratio: waistHipRatio,
+      waist_risk: waistRisk, whr_risk: whrRisk,
       neck_cm: b.neck_cm ?? null, chest_cm: b.chest_cm ?? null,
       arm_right_cm: b.arm_right_cm ?? null, arm_left_cm: b.arm_left_cm ?? null,
       thigh_right_cm: b.thigh_right_cm ?? null, thigh_left_cm: b.thigh_left_cm ?? null,

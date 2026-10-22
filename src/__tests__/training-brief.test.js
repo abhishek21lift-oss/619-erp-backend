@@ -175,6 +175,34 @@ describe('history', () => {
   });
 });
 
+describe('anthropometric norm labels', () => {
+  it('carries the stored classifications with their measurements', () => {
+    const brief = buildBrief({
+      client: CLIENT,
+      assessment: {
+        assessment_date: '2026-07-01', weight: 80, height_cm: 175, bmi: 26.1,
+        bmi_category: 'Obese', waist_cm: 92, waist_risk: 'Above low-risk threshold',
+        waist_hip_ratio: 0.98, whr_risk: 'Above low-risk threshold',
+      },
+    });
+    expect(brief.sections.body).toMatchObject({
+      bmi_category: 'Obese',
+      waist_risk: 'Above low-risk threshold',
+      whr_risk: 'Above low-risk threshold',
+    });
+  });
+
+  it('leaves a legacy row unclassified rather than guessing', () => {
+    const brief = buildBrief({
+      client: CLIENT,
+      assessment: { assessment_date: '2026-07-01', weight: 80, height_cm: 175, bmi: 26.1 },
+    });
+    expect(brief.sections.body.bmi_category).toBeNull();
+    expect(brief.sections.body.waist_risk).toBeNull();
+    expect(brief.sections.body.whr_risk).toBeNull();
+  });
+});
+
 describe('ageFrom', () => {
   it('is null rather than NaN for a missing or unusable dob', () => {
     expect(ageFrom(null)).toBeNull();

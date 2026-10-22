@@ -16,9 +16,9 @@ let mockExistingLog = null;
 let mockClient = null;
 const mockQueries = [];
 const mockTx = () => ({
-  query: jest.fn(async (sql) => {
+  query: jest.fn(async (sql, params = []) => {
     const text = String(sql).replace(/\s+/g, ' ').trim();
-    mockQueries.push({ sql: text, params: [] });
+    mockQueries.push({ sql: text, params });
     if (/^SELECT COALESCE\(MAX\(assessment_number\)/i.test(text)) return { rows: [{ n: 1 }], rowCount: 1 };
     if (/^INSERT INTO pt_assessments/i.test(text)) {
       return { rows: [{ id: 'a1', client_id: 'c1', organization_id: ORG_A, assessment_number: 1, assessment_date: '2026-01-01' }], rowCount: 1 };
@@ -69,6 +69,12 @@ function app() {
 }
 
 const insertParams = () => mockQueries.find((q) => /^INSERT INTO strength_logs/i.test(q.sql))?.params;
+const assessmentCols = () => {
+  const q = mockQueries.find((x) => /^INSERT INTO pt_assessments/i.test(x.sql));
+  if (!q) return null;
+  const keys = q.sql.match(/INSERT INTO pt_assessments \(([^)]*)\)/i)[1].split(',').map((k) => k.trim());
+  return Object.fromEntries(keys.map((k, i) => [k, q.params[i]]));
+};
 const lift = (extra) => ({ client_id: 'c1', exercise_name: 'Squat', weight_kg: 100, reps_done: 5, ...extra });
 
 beforeEach(() => { mockBlocked = null; mockAssessmentOwned = true; mockExistingLog = null; mockClient = null; mockQueries.length = 0; });
@@ -122,6 +128,48 @@ describe('POST /progress/assessments', () => {
     expect(res.status).toBe(403);
     expect(res.body.code).toBe('PARQ_BLOCKED');
     expect(mockQueries.some((q) => /INSERT INTO pt_assessments/i.test(q.sql))).toBe(false);
+  });
+});
+
+describe('anthropometric classifications are persisted', () => {
+  const body = { client_id: 'c1', weight: 80, height_cm: 175, waist_cm: 92, waist_iliac_cm: 74, hips_cm: 94 };
+
+  beforeEach(() => {
+    mockClient = { gender: 'Male', dob: '1998-04-12', workout_experience_level: 'intermediate' };
+  });
+
+  test('stores the Asian BMI band and sex-specific waist/WHR risk from waist_cm', async () => {
+    const res = await request(app()).post('/api/progress/assessments').send(body);
+    expect(res.status).toBe(201);
+    const cols = assessmentCols();
+    expect(cols.bmi).toBe(26.1);
+    expect(cols.bmi_category).toBe('Obese');
+    // If the 74 cm iliac reading had been substituted, this would be Low risk.
+    expect(cols.waist_risk).toBe('Above low-risk threshold');
+    expect(cols.whr_risk).toBe('Above low-risk threshold');
+    expect(cols.waist_iliac_cm).toBe(74);
+    expect(cols.waist_hip_ratio).toBe(0.98);
+  });
+
+  test('missing waist_cm is never replaced by waist_iliac_cm', async () => {
+    const res = await request(app()).post('/api/progress/assessments')
+      .send({ ...body, waist_cm: undefined });
+    expect(res.status).toBe(201);
+    const cols = assessmentCols();
+    expect(cols.waist_cm).toBeNull();
+    expect(cols.waist_risk).toBeNull();
+    expect(cols.waist_hip_ratio).toBeNull();
+    expect(cols.whr_risk).toBeNull();
+  });
+
+  test('unsupported sex leaves waist/WHR unclassified but still bands BMI', async () => {
+    mockClient = { gender: 'Other', dob: '1998-04-12', workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments').send(body);
+    expect(res.status).toBe(201);
+    const cols = assessmentCols();
+    expect(cols.bmi_category).toBe('Obese');
+    expect(cols.waist_risk).toBeNull();
+    expect(cols.whr_risk).toBeNull();
   });
 });
 
