@@ -92,6 +92,11 @@ jest.mock('../modules/command-center/collectors/queue.collector', () => ({
   collect: mockQueueCollect, CRITICAL_QUEUES: new Set(), FAILED_CRIT: 10, WAITING_WARN: 100,
 }));
 
+// The verifier treats this process as starting at boot and only claims rows
+// from its 5-minute window. A full Jest run can exceed that, so pin uptime to
+// keep this file's synthetic pre-boot row inside the window.
+jest.spyOn(process, 'uptime').mockReturnValue(2);
+
 const commands = require('../modules/command-center/commands.service');
 const verification = require('../modules/command-center/restart-verification');
 const docker = require('../modules/command-center/container-recovery');
