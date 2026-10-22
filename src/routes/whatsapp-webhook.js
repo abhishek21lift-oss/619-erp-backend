@@ -43,7 +43,7 @@ router.use(express.raw({ type: 'application/json', limit: '64kb' }));
  * timingSafeEqual throws on a length mismatch, and returning early on that
  * throw leaks the secret's length through response timing. Hashing both sides
  * first makes every comparison run over 32 bytes. Same helper, same reasoning,
- * as middleware/serviceAuth.js.
+ * as the webhook signature check above.
  */
 function safeEqual(a, b) {
   const ha = crypto.createHash('sha256').update(String(a), 'utf8').digest();
@@ -161,7 +161,7 @@ async function recordOutcome(client, eventId, subject, applied) {
 router.post('/', async (req, res) => {
   const secret = process.env.WA_WEBHOOK_SECRET;
   if (!secret) {
-    // Fail closed on a half-configured deploy, as serviceAuth.js does: an
+    // Fail closed on a half-configured deploy: an
     // unverifiable claim answered with "fine" is worse than an outage.
     logger.error('WA_WEBHOOK_SECRET is not set — whatsapp webhook rejected');
     return res.status(503).json({ error: 'Webhook not configured' });

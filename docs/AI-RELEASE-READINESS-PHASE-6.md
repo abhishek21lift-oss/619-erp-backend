@@ -1,5 +1,20 @@
 # AI RELEASE READINESS — PHASE 6 (read-only consolidation of Phases 1–5)
 
+> **Superseded 2026-10-22. HISTORICAL RECORD — DO NOT EXECUTE COMMANDS FROM
+> THIS DOCUMENT.** The standalone `mps-ai` service has been retired. The Client
+> Assistant now runs in this backend at
+> `POST /api/ai/client-agent/chat/stream`, behind `ai_suite`, trainer auth, the
+> AI rate limiter and `requireAiQuota()`, and writes usage to `ai_usage_log`
+> in-process. The `SERVICE_AUTH_SECRET` / `X-Service-Auth` bridge, the nginx
+> `/ai/` block and the frontend `AI_SERVICE_URL` rewrite are gone.
+>
+> **The current production runbook is
+> [`docs/AI-CLIENT-ASSISTANT-CUTOVER.md`](./AI-CLIENT-ASSISTANT-CUTOVER.md).**
+> Sections 4, 5 and 6 below still contain the retired mps-ai checklist, SQL
+> gate and deployment order; they are preserved as the Phase 6 record and must
+> not be followed. Nginx now needs the `/api/ai/` SSE block on **both** vhosts,
+> not a `/ai/` route.
+
 Written 2026-10-21. **This phase changed nothing except this document.**
 No new code, no migration change, no deploy, no SQL execution anywhere.
 
@@ -66,7 +81,7 @@ Nothing was reset, stashed, cleaned, checked out over, committed or pushed.
 
 ---
 
-## 4. Production configuration checklist (presence-only; never print values)
+## 4. Production configuration checklist (HISTORICAL — DO NOT RUN)
 
 All items **[needs live]**. Run on the VPS via SSH where marked; every probe below tests **presence or wiring**, not content.
 
@@ -112,7 +127,7 @@ docker compose … ps mps-ai        # Up + published 127.0.0.1:4100
 
 ---
 
-## 5. Migration 218/234 release gate
+## 5. Migration 218/234 release gate (HISTORICAL — see current runbook)
 
 **Blocker #0 — backup/restore verified.** `backup.yml` pg_dumps off-site; the operator shows a dump produced within 24 h AND a restore exercised per `docs/DISASTER-RECOVERY.md`. **NO-GO without both.**
 
@@ -159,7 +174,7 @@ UPDATE ai_platform_settings
 
 ---
 
-## 6. Deployment & smoke-test plan (staged; nothing executed in this phase)
+## 6. Deployment & smoke-test plan (HISTORICAL — DO NOT RUN)
 
 1. **Pre-deployment:** backup verified (Blocker #0) → §4 checklist (presence + pairing) → §5 preflight captured with GO observations → open PRs / merge branches and **read the actual CI runs** for backend, mps-ai, frontend, whatsapp (today **[not run]**).
 2. **Order & version compatibility:** recommended **backend first, mps-ai second, frontend last.** Rationale: `deploy.yml` runs migrations in the backend pipeline BEFORE replacing the container, so the schema (218/234) is in place when any new code runs; both sides of the service-auth/ingest contract are forward-compatible in either order (proven contract tests), so the pairing check in §4 is the real gate. `AI_SERVICE_URL` stays unset while nginx keeps `/ai/`. WhatsApp: unrelated to this release, deploys independently (`deploy-vps.yml`).

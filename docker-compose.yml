@@ -160,15 +160,6 @@ services:
       AI_RAG_TOP_K: ${AI_RAG_TOP_K:-}
       AI_RAG_SIMILARITY_THRESHOLD: ${AI_RAG_SIMILARITY_THRESHOLD:-}
       AI_SETTINGS_REFRESH_MS: ${AI_SETTINGS_REFRESH_MS:-}
-      # Validates the X-Service-Auth attestation from the mps-ai service. Must
-      # equal the AI service's own SERVICE_AUTH_SECRET. Required for the
-      # /api/ai/usage/service/* internal endpoints.
-      #
-      # Left optional here on purpose: a box that does not run the AI service
-      # must still boot the ERP. The AI service's block lives in
-      # mps-ai/docker-compose.snippet.yml and refuses to start without this
-      # value, so the pairing fails at the AI container, not the whole app.
-      SERVICE_AUTH_SECRET: ${SERVICE_AUTH_SECRET:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -248,7 +239,6 @@ services:
       AI_ALLOW_DATA_COLLECTION: ${AI_ALLOW_DATA_COLLECTION:-}
       AI_USAGE_FIELDS_MODE: ${AI_USAGE_FIELDS_MODE:-}
       AI_USD_TO_INR: ${AI_USD_TO_INR:-}
-      SERVICE_AUTH_SECRET: ${SERVICE_AUTH_SECRET:-}
     depends_on:
       redis:
         condition: service_healthy

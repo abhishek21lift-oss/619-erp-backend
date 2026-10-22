@@ -23,28 +23,32 @@ diffed and restored.
   myptstudio.com     ──► │ nginx (host)                          │
   www.myptstudio.com ──► │   443 TLS, routes on the Host header  │
   api.myptstudio.com ──► │                                       │
-                         └───┬──────────────┬─────────────┬──────┘
-                             │              │             │
-                127.0.0.1:3000    127.0.0.1:5000    127.0.0.1:4100
-                frontend          backend           mps-ai (repo: mps-ai)
-                container         container         the client-agent AI
-                                      │             (loopback only; see
-                            127.0.0.1:6379  redis   the one-route note below)
+                         └───┬──────────────┬────────────────────┘
+                             │              │
+                127.0.0.1:3000    127.0.0.1:5000
+                frontend          backend
+                container         container
+                                      │
+                            127.0.0.1:6379  redis
                                    worker container
 ```
 
 All names resolve to the same address. All app containers bind to **loopback
-only** (`docker-compose.yml`; mps-ai likewise, `docker-compose.snippet.yml`), so
-nginx is the only route in — do not "fix" a connection problem by exposing a
-container on `0.0.0.0`.
+only** (`docker-compose.yml`), so nginx is the only route in — do not "fix" a
+connection problem by exposing a container on `0.0.0.0`. The standalone AI
+container (mps-ai, :4100) is retired; the Client Assistant runs in the backend.
 
-## The request path has three shapes
+## The request path has two shapes
 
 ```
 API calls    browser → nginx → frontend container → Next rewrite → backend
 WebSocket    browser → nginx ──────────────────────────────────→ backend
-Client AI    browser → nginx → mps-ai directly (location /ai/ :4100)
 ```
+
+The Client Assistant is an API call: `POST
+/api/ai/client-agent/chat/stream` uses the frontend origin, the Next rewrite and
+the backend, and is covered by the `/api/ai/` block below. There is no `/ai/*`
+route.
 
 Ordinary API calls use relative URLs (`apiBase()` returns `''` in production)
 and are forwarded by the Next.js rewrite in the frontend's `next.config.js`.
@@ -65,67 +69,58 @@ usual suspects and neither is the application code:
    `Refused to connect to 'wss://…'` and nowhere in these logs at all, which is
    why it is worth ruling out early.
 
-## Long-running AI generation (SSE) on the frontend vhost
+## Long-running AI generation (SSE) on both vhosts
 
 AI generation (`POST /api/ai/workout/generate`, `POST /api/ai/diet/generate`,
-and the AI coach chat stream) flows through the **frontend** vhost
-(`browser → nginx → frontend → Next rewrite → backend`), not `api.`. The 60s
-default `proxy_read_timeout` therefore applies to it, and it kills a stream that
-is still waiting for the model's first token — a full diet plan can take longer
-than that before producing anything, surfacing as a 504.
+and the AI coach chat stream) crosses **two** proxies:
+`browser → frontend vhost → frontend container → Next rewrite → api. vhost → backend`.
+Both vhosts therefore need the same SSE treatment. The 60s default
+`proxy_read_timeout` on either hop kills a stream that is still waiting for the
+model's first token — a full diet plan can take longer than that before
+producing anything, surfacing as a 504.
 
-The fix is two layers, both in this folder / the box:
+The fix is three layers, all in this folder / the box:
 
 1. `myptstudio.conf` scopes `location /api/ai/` on the frontend vhost with
    `proxy_read_timeout 300s` (above the backend's per-attempt AI timeout plus
    the primary → fallback retry chain) and `proxy_buffering off`.
-2. The backend sends an SSE heartbeat (`: ping` every 15s, `src/lib/sse-heartbeat.js`)
+2. The same `location /api/ai/` block is on the `api.myptstudio.com` vhost,
+   because the Next rewrite is the client for that second hop.
+3. The backend sends an SSE heartbeat (`: ping` every 15s, `src/lib/sse-heartbeat.js`)
    during the wait for the first token, so the socket is never idle no matter
    which timeout a proxy in the chain applies.
 
-Only `/api/ai/` is widened; ordinary requests keep the 60s default. Do not raise
-the timeout globally.
+Only `/api/ai/` is widened; ordinary requests keep the 60s/120s defaults. Do not
+raise the timeout globally.
 
-## Client-agent AI on the frontend vhost (`/ai/` → mps-ai)
+## Client Assistant (`/api/ai/client-agent/chat/stream`)
 
-The Ask AI panel is a **different service** (repo: `mps-ai`, its own container on
-loopback `:4100`), not a backend route. Its stream
-(`POST /ai/client-agent/chat/stream`) is terminated by nginx itself:
+The Ask AI panel now calls the backend through the ordinary API path:
 
 ```
-browser → nginx location /ai/ → mps-ai            (Cookie + Origin intact)
+browser → nginx (frontend) /api/ai/ → frontend container → Next rewrite
+        → nginx (api) /api/ai/ → backend
 ```
 
-`myptstudio.conf` scopes `location /ai/` with the same treatment as `/api/ai/`:
-`proxy_read_timeout 300s`, `proxy_buffering off`. The request never enters the
-Next.js container, so this route does not depend on `AI_SERVICE_URL`.
+Both vhosts need the `/api/ai/` block. It widens the read timeout to 300s and
+disables buffering, which is what lets the SSE answer stream while it is
+written. The route sits behind the studio's `ai_suite` gate,
+trainer auth, the AI rate limiter and the monthly quota, and it authorises the
+client before opening the stream.
 
-Two rules keep this deployment safe:
-
-1. **One route only (safety-critical).** While this `location /ai/` block exists
-   on the box, `AI_SERVICE_URL` must stay **unset** for the frontend build. If
-   it is set as well, the Next rewrite becomes a second, redundant answer for
-   the same path — whichever route wins silently depends on build-time config,
-   which is how environments drift. The rewrite exists as the alternative for
-   deploys that cannot adopt this vhost; the vhost route is the canonical one.
-2. **`AI_ALLOWED_ORIGINS` must include the real origin** (`https://myptstudio.com`).
-   Browsers send `Origin` on every POST, and mps-ai rejects unknown origins with
-   403 even when the route is wired correctly — a 403 here is a CORS list
-   problem, not a proxy problem.
-
-Proving the route from outside, like the curl below does for WebSockets:
+Proving the route from outside:
 
 ```bash
-curl -isS -m 10 https://myptstudio.com/ai/client-agent/chat/stream \
+curl -isS -m 10 https://myptstudio.com/api/ai/client-agent/chat/stream \
   -H 'Content-Type: application/json' --data '{"clientId":"probe","message":"hi"}' | head -5
 ```
 
 | You get | Means |
 |---|---|
-| `401` (JSON error envelope) | **the proxy is correct** — mps-ai answered, no token supplied. The success case. |
-| `200` with HTML | the request reached the **frontend** app instead — the `/ai/` block is missing on the box |
-| `403` | mps-ai answered, but `AI_ALLOWED_ORIGINS` / origin handling — check the allow-list |
-| `404` JSON | nginx reached a service, but the wrong one (path got rewritten or stripped) |
+| `401` (JSON error envelope) | **the proxy is correct** — the backend answered, no token supplied. The success case. |
+| `200` with HTML | the request reached the frontend page shell instead of the API rewrite — check `next.config.js` / `NEXT_PUBLIC_API_URL` |
+| `404` JSON | the backend answered; for an authenticated request check `CLIENT_NOT_FOUND` first |
+| `504` after ~60s | the vhost is missing the `/api/ai/` 300s treatment |
 
 ## Files
 

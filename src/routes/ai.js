@@ -33,6 +33,7 @@ const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // The client's digital twin: the assessments, the screen and the logged sets
 // that this file could not see. See modules/pt-os/client-context.js.
 const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
+const { checkScreeningGate } = require('../lib/screeningGate');
 const {
   resolveClientFacts, describeFacts, numInRange,
 } = require('../modules/pt-os/client-facts');
@@ -1010,6 +1011,25 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   }
   if (!twin) return res.status(404).json({ error: 'Client not found' });
 
+  // ── Authoritative screening gate (PAR-Q, consent, physician advice) ───────
+  //
+  // Runs BEFORE any model call. Checks live: drafts excluded, clearance expiry
+  // re-checked, revoked consent and physician-advised-against honoured.
+  let screening;
+  try {
+    screening = await checkScreeningGate(req, client_id);
+  } catch (err) {
+    // A gate that cannot be evaluated must not be treated as passed.
+    logger.error({ req_id: req.id, err: err.message }, 'ai_workout_screening_failed');
+    return res.status(503).json({
+      error: 'Screening could not be verified',
+      code: 'SCREENING_UNAVAILABLE',
+    });
+  }
+  if (screening.blocked) {
+    return res.status(screening.blocked.status).json(screening.blocked.body);
+  }
+
   // ── The gate ─────────────────────────────────────────────────────────────
   //
   // The rules module reports one flag, `may_program`, which is true only when
@@ -1554,6 +1574,10 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       // this beside the plan, because "NOT RECORDED" changes how much of the
       // programme they should trust without checking.
       data_quality: dataQuality,
+      // What the screening gate warned about (incomplete PAR-Q, stale screen,
+      // consent not completed, etc.). The action proceeds, but the UI surfaces
+      // these so the trainer knows what paperwork is missing.
+      screening_warnings: screening.warnings,
       // What this generation was: a new block, or the next weeks of one the
       // client is already training. Without it a saved plan cannot say which
       // it was, and the ledger cannot answer why a week-4 client received a

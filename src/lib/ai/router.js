@@ -21,6 +21,12 @@ function chainFor(tier, attemptedModel, intent) {
   return chain;
 }
 
+function abortedError() {
+  const err = new Error('Model request cancelled');
+  err.code = 'AI_ABORTED';
+  return err;
+}
+
 function buildAllModelsFailed(primaryErr, attempts) {
   const final = new Error('AI service temporarily unavailable — all models failed');
   final.code = 'ALL_MODELS_FAILED';
@@ -94,12 +100,16 @@ async function* relay(gen) {
   return yield* gen;
 }
 
-async function* routedStream({ intent, messages, temperature, max_tokens, timeout }) {
+async function* routedStream({ intent, messages, temperature, max_tokens, timeout, signal, fallbackNotice = true }) {
+  // A caller who hung up before we started should not open a provider
+  // connection at all — and must never reach a fallback model.
+  if (signal?.aborted) throw abortedError();
+
   const { model, tier } = resolveModel(intent);
   const chain = chainFor(tier, model, intent);
 
   try {
-    const gen = streamCompletion({ model, messages, temperature, max_tokens, timeout });
+    const gen = streamCompletion({ model, messages, temperature, max_tokens, timeout, signal });
     const meta = yield* relay(gen);
     return {
       // The model that ANSWERED, falling back to the one requested when the
@@ -115,15 +125,26 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
       routed_via: meta?.routed_via ?? null,
     };
   } catch (primaryErr) {
+    // Caller aborted — rethrow AI_ABORTED, never try a fallback. If the
+    // signal fired but the provider reported a different error, the abort is
+    // the truth; do not pass a misleading provider error to the caller.
+    if (signal?.aborted) throw abortedError();
+    if (primaryErr?.code === 'AI_ABORTED') throw primaryErr;
+
     logger.warn({ model, tier, intent, err: primaryErr.message }, 'ai_stream_primary_failed');
 
     const attempts = [{ model, tier, err: primaryErr }];
     for (const step of chain) {
-      // Notify caller we're switching
-      yield '\n\n[Retrying with backup model…]\n\n';
+      // Check for caller abort before each fallback attempt
+      if (signal?.aborted) throw abortedError();
+
+      // Notify caller we're switching (only when fallbackNotice is true)
+      if (fallbackNotice) {
+        yield '\n\n[Retrying with backup model…]\n\n';
+      }
 
       try {
-        const gen = streamCompletion({ model: step.model, messages, temperature, max_tokens, timeout });
+        const gen = streamCompletion({ model: step.model, messages, temperature, max_tokens, timeout, signal });
         const meta = yield* relay(gen);
         return {
           model: (meta && meta.model) || step.model,
@@ -134,6 +155,9 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
           routed_via: meta?.routed_via ?? null,
         };
       } catch (fbErr) {
+        // Caller aborted during fallback — rethrow immediately
+        if (signal?.aborted) throw abortedError();
+        if (fbErr?.code === 'AI_ABORTED') throw fbErr;
         attempts.push({ model: step.model, tier: step.tier, err: fbErr });
         logger.error({ model: step.model, tier: step.tier, err: fbErr.message }, 'ai_stream_fallback_failed');
       }

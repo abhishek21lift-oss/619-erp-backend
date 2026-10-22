@@ -145,7 +145,7 @@ describe('signature verification', () => {
 
   it('fails closed when the secret is not configured', async () => {
     // A half-configured deploy answering "fine" to an unverifiable claim is
-    // worse than an outage — same rule as middleware/serviceAuth.js.
+    // worse than an outage — fail closed on a half-configured deploy.
     const saved = process.env.WA_WEBHOOK_SECRET;
     delete process.env.WA_WEBHOOK_SECRET;
     try {

@@ -120,10 +120,10 @@ router.get('/', auth, requireTrainer, async (req, res) => {
 
    Until now retrieveContext() was reachable only from inside routes/ai.js, so
    the AI Coach was the only thing that could ever be grounded in a studio's own
-   documents. The MY PT STUDIO AI service (repo: mps-ai) answers policy
-   questions too, and with nothing to retrieve it can only say "I don't have
-   your policy documents" — correct, and less useful than the answer that is
-   sitting in the library already.
+   documents. The Client Assistant answers policy questions too, and with
+   nothing to retrieve it can only say "I don't have your policy documents" —
+   correct, and less useful than the answer that is sitting in the library
+   already.
 
    Declared BEFORE the /:id routes below so a document can never be named
    "search". Those are DELETE and POST today, so there is no collision yet;

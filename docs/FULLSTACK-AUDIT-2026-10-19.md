@@ -1,5 +1,13 @@
 # Full-Stack Wiring & Functionality Audit — MY PT STUDIO (619 Fitness ERP)
 
+> **Historical audit (2026-10-19).** The AI findings below describe the retired
+> standalone `mps-ai` topology and are kept as the audit record. The Client
+> Assistant now runs in the ERP backend at
+> `POST /api/ai/client-agent/chat/stream`; `AI_SERVICE_URL`, the Next `/ai`
+> rewrite, `SERVICE_AUTH_SECRET` and the nginx `/ai/` route are gone. For the
+> current topology and production commands see
+> [`AI-CLIENT-ASSISTANT-CUTOVER.md`](./AI-CLIENT-ASSISTANT-CUTOVER.md).
+
 **Date:** 2026-10-19
 **Scope:** `619-erp-frontend` (Next.js 16.2 / React 19 / TS), `619-erp-backend` (Express 4 / node-postgres), `619-erp-whatsapp` (Fastify 5 / Baileys gateway), PostgreSQL schema + 246 migrations, Docker/Nginx/CI, and the WhatsApp/Email/AI/Razorpay/UPI integrations.
 **Method:** Read-only static inspection of the actual working trees (including uncommitted work), plus safe executable checks (lint, typecheck, unit tests, production build). No file was modified, no migration applied, no mutating SQL executed, no external message, email, or payment triggered, no secret value printed.

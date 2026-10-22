@@ -41,8 +41,14 @@ jest.mock('../lib/ai/usage', () => ({
   getUserUsage: jest.fn(), getModelStats: jest.fn(),
 }));
 
+// Mock the screening gate so the stored-status gate can be tested in isolation.
+jest.mock('../lib/screeningGate', () => ({
+  checkScreeningGate: jest.fn().mockResolvedValue({ blocked: null, warnings: [] }),
+}));
+
 const pool = require('../db/pool');
 const { routedStream } = require('../lib/ai/router');
+const { checkScreeningGate } = require('../lib/screeningGate');
 
 const app = express();
 app.use(require('../middleware/requestId'));
@@ -128,6 +134,8 @@ const doneOf = (text) => JSON.parse(
 beforeEach(() => {
   routedStream.mockReset();
   routedStream.mockReturnValue(streamOnce(JSON.stringify(PLAN)));
+  checkScreeningGate.mockClear();
+  checkScreeningGate.mockResolvedValue({ blocked: null, warnings: [] });
 });
 
 describe('an unscreened client', () => {

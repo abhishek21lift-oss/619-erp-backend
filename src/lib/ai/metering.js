@@ -24,9 +24,7 @@ function usdToInr() {
  * response that carried no usage at all, and says so in usage_source.
  *
  * completionText may be the reply STRING (as everywhere here) or a NUMBER of
- * characters — the /api/ai/usage/service ingest from the mps-ai assistant has
- * no body to hand over, only a length (round-2 MPS-01). One estimate rule,
- * both callers.
+ * characters, for a caller that only has a length. One estimate rule.
  */
 function usageFields(usage, completionText = '') {
   const completionLen = typeof completionText === 'number'

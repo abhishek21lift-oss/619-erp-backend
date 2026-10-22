@@ -1,11 +1,16 @@
 # AI REMEDIATION — PR & CI READINESS PLAN (Phase 7)
 
+> **Superseded 2026-10-22. HISTORICAL PLAN — DO NOT EXECUTE.** The standalone
+> `mps-ai` service and its service-auth/ingest contract are retired; the Client
+> Assistant runs in the ERP backend. The current production runbook is
+> [`AI-CLIENT-ASSISTANT-CUTOVER.md`](./AI-CLIENT-ASSISTANT-CUTOVER.md).
+
 Written 2026-10-21. **Read-only phase: audit + plan.** Nothing was committed, pushed,
 stashed, cleaned, deployed or executed. The only file this phase adds is this document.
 Evidence tags as in the Phase-6 doc: **[proven]** / **[assumption]** / **[not run]**.
 
-Companion doc: `docs/AI-RELEASE-READINESS-PHASE-6.md` (release gate — still the authority
-for migration/config/deploy decisions).
+Companion doc: `docs/AI-RELEASE-READINESS-PHASE-6.md` (historical Phase-6 record; the
+current runbook above supersedes both for migration/config/deploy decisions).
 
 ---
 

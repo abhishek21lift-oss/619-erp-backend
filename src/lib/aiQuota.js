@@ -129,7 +129,10 @@ let consecutiveFailures = 0;
 let streakStartedAt = null;
 
 /** Escalate once a streak is long enough to mean "degraded", not "blip". */
-const FAILURE_STREAK_ALERT = Number(process.env.AI_QUOTA_FAILURE_ALERT_AFTER || 3);
+const failureAlertAfter = Number(process.env.AI_QUOTA_FAILURE_ALERT_AFTER);
+const FAILURE_STREAK_ALERT = Number.isInteger(failureAlertAfter) && failureAlertAfter >= 1
+  ? failureAlertAfter
+  : 3; // a typo must not disable the fail-closed threshold
 
 /** Test seam + operational read: how blind is the cost control right now. */
 function quotaEnforcementHealth() {
@@ -138,6 +141,12 @@ function quotaEnforcementHealth() {
     degraded: consecutiveFailures >= FAILURE_STREAK_ALERT,
     since: streakStartedAt,
   };
+}
+
+/** Reset the failure streak state (test seam + ops). */
+function resetQuotaFailureState() {
+  consecutiveFailures = 0;
+  streakStartedAt = null;
 }
 
 function recordQuotaCheckOutcome(ok, err) {
@@ -173,16 +182,25 @@ function recordQuotaCheckOutcome(ok, err) {
  *
  * Refuses only when enforcement is ON, a limit exists, and it is exceeded.
  * Every other path — enforcement off, no limit, under the limit, or the check
- * itself failing — calls next(). A quota check that errors must not take the
- * AI Suite down with it; failing open is the correct bias for a cost control.
- * It is no longer a SILENT fail-open — see recordQuotaCheckOutcome above.
+ * itself failing — calls next() (fail-open).
  *
- * Round-1 P1 #2: AI_QUOTA_FAILURE_MODE=fail-closed flips the bias — a check
- * that cannot be evaluated refuses the request (503) instead of letting it
- * through uncapped. Operators choose; blank keeps today's behaviour.
+ * Fail-open is bounded to prevent silent uncapped spend during sustained
+ * outages. The behaviour is controlled by AI_QUOTA_FAILURE_MODE:
+ *   - "fail-open"  -> always fail open (never refuse on check error)
+ *   - "fail-closed" -> always fail closed (refuse immediately on check error)
+ *   - unset/other  -> fail open for the first FAILURE_STREAK_ALERT-1 errors,
+ *                     then fail closed once the streak reaches the threshold.
+ * This keeps transient blips open (AI suite stays up) but refuses after a
+ * sustained streak when spending is genuinely uncapped.
+ *
+ * See recordQuotaCheckOutcome for the streak counter and alerting.
  */
 function quotaFailClosed() {
-  return String(process.env.AI_QUOTA_FAILURE_MODE).toLowerCase() === 'fail-closed';
+  const mode = String(process.env.AI_QUOTA_FAILURE_MODE || '').toLowerCase();
+  if (mode === 'fail-open') return false;
+  if (mode === 'fail-closed') return true;
+  // default: bounded fail-open — closed only after sustained streak
+  return consecutiveFailures >= FAILURE_STREAK_ALERT;
 }
 
 function requireAiQuota() {
@@ -220,4 +238,4 @@ function requireAiQuota() {
   };
 }
 
-module.exports = { PERIOD_SQL, loadSettings, usedThisMonth, limitFor, statusFor, requireAiQuota, quotaEnforcementHealth };
+module.exports = { PERIOD_SQL, loadSettings, usedThisMonth, limitFor, statusFor, requireAiQuota, quotaEnforcementHealth, quotaFailClosed, resetQuotaFailureState };

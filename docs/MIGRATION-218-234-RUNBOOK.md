@@ -85,7 +85,8 @@ SELECT count(*) FILTER (WHERE request_id IS NOT NULL) AS service_rows,
   FROM ai_usage_log;
 ```
 
-Then: one chat turn through mps-ai, confirm a single ledger row with
+Then: one Client Assistant turn through
+`POST /api/ai/client-agent/chat/stream`, confirm a single ledger row with
 `request_id` + `organization_id` set, and re-run the duplicate summary
 (preflight 3b) expecting zero.
 

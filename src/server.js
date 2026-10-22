@@ -552,19 +552,6 @@ const { originCheck } = require('./middleware/originCheck');
 app.use('/api/', originCheck);
 
 // ────────────────────────
-// FIRST-PARTY SERVICE ATTESTATION
-// ────────────────────────
-// The AI service (repo: mps-ai) relays the end user's own token and adds
-// X-Service-Auth to attest that the relay was it. Mounted here — after
-// originCheck, before auth — so a forged attestation is refused before any
-// user lookup or database work happens.
-//
-// It grants NOTHING: `auth` still resolves the user and tenantScope still
-// filters. Requests without the header — every browser — pass straight through.
-const { serviceAuth } = require('./middleware/serviceAuth');
-app.use('/api/', serviceAuth);
-
-// ────────────────────────
 // INPUT SANITIZATION
 // ────────────────────────
 const { sanitizeBody, sanitizeQuery } = require('./middleware/sanitize');
@@ -944,11 +931,12 @@ app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), 
 // check did not stop: any client could have another client's health record
 // summarised back to them. The member app calls none of these; a client's own
 // data is /api/me. Every AI action is trainer-only in its registry as well.
-// Internal service endpoints (round-2 remediation): usage ingest + quota
-// probe used by the mps-ai assistant. Mounted BEFORE the /api/ai mounts so
-// the more specific path wins. requireServiceAuth rejects the open internet;
-// identity is resolved from the forwarded user token, same as tool reads.
-app.use('/api/ai/usage/service', require('./routes/aiServiceUsage'));
+// The consolidated Client Assistant. Mounted before the generic /api/ai router
+// so the more specific path wins. Same gates as every other AI route: the
+// studio must have the ai_suite feature, the caller must be a trainer, and the
+// monthly allowance is checked before the handler can spend a token. The
+// handler itself authorises the client BEFORE opening the SSE stream.
+app.use('/api/ai/client-agent',   ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/aiClientAgent'));
 app.use('/api/ai',               userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
 app.use('/api/ai',               ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/ai'));
 

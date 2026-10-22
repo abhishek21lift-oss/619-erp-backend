@@ -1,11 +1,13 @@
-# AI Quota Behavior Matrix (Phase 5C)
+# AI Quota Behavior Matrix
 
-Source of truth: `src/lib/aiQuota.js` (ERP) and
-`mps-ai/src/agents/client/agent.js:93-128` (service `checkQuota`). Tests
-pinning every row: `src/__tests__/aiQuota.test.js`, `aiQuota.degraded.test.js`,
-`ai.privacyAndMetering.test.js`; and `mps-ai/__tests__/contract-frontend.test.js`
-(MPS-01). **This document describes behavior; Phase 5 changed no defaults,
-policy, caps or billing.**
+Source of truth: `src/lib/aiQuota.js`. Tests pinning every row:
+`src/__tests__/aiQuota.test.js`, `aiQuota.degraded.test.js`,
+`aiQuota.failureMode.test.js`, and `ai.privacyAndMetering.test.js`.
+
+The standalone assistant (`mps-ai`) is retired. The Client Assistant runs at
+`POST /api/ai/client-agent/chat/stream`, mounted behind the same
+`requireAiQuota()` as every other `/api/ai` route, and does not keep a second
+quota opinion.
 
 ## Facts the matrix rests on
 
@@ -19,11 +21,16 @@ policy, caps or billing.**
   → platform default; neither → unlimited (source `none`).
 - Usage measured per calendar month via `date_trunc('month', now())`,
   joined through `COALESCE(l.organization_id, u.organization_id)`.
-- Failure bias: default **fail-open**; `AI_QUOTA_FAILURE_MODE=fail-closed`
-  flips it to 503. Degraded execution is not silent: fail-open logs a warn per
-  failure and escalates to error after 3 consecutive
-  (`ai_quota_enforcement_degraded`), exposes `quotaEnforcementHealth()` state
-  and logs `ai_quota_check_recovered` on recovery.
+- Failure bias: **bounded fail-open**. The first `AI_QUOTA_FAILURE_ALERT_AFTER
+  - 1` consecutive check failures pass (default threshold 3, so the first two
+  errors), so a transient database blip does not take the AI suite down. At
+  the threshold the check fails closed (503) — a sustained outage must not
+  leave spend uncapped. Explicit `AI_QUOTA_FAILURE_MODE=fail-open` always
+  passes; `fail-closed` refuses from the first failure.
+- Degraded execution is not silent: every failure logs a warn, the streak
+  escalates to error (`ai_quota_enforcement_degraded`), and
+  `quotaEnforcementHealth()` exposes the state. Recovery logs
+  `ai_quota_check_recovered` and resets the streak.
 
 ## ERP — `requireAiQuota()` / probe
 
@@ -35,36 +42,41 @@ policy, caps or billing.**
 | Enforcement on, ≥ limit | **429** (numbers echoed on the error) | `AI_QUOTA_EXCEEDED` |
 | Studio exempt (`organization_ai_limits` row with NULL) | Pass at any usage — `over`/`warn` never fire | — |
 | No settings row (pre-migration database) | Pass — fail-open defaults | — |
-| Any check error, `AI_QUOTA_FAILURE_MODE` unset (default) | **Pass** + warn → error after 3-streak | — |
-| Any check error, `AI_QUOTA_FAILURE_MODE=fail-closed` | **503** | `AI_QUOTA_UNVERIFIABLE` |
+| Check error, unset mode, streak **below** threshold | Pass + warn | — |
+| Check error, unset mode, streak **at/above** threshold | **503** | `AI_QUOTA_UNVERIFIABLE` |
+| Check error, `AI_QUOTA_FAILURE_MODE=fail-open` | Pass + warn (always) | — |
+| Check error, `AI_QUOTA_FAILURE_MODE=fail-closed` | **503** from the first failure | `AI_QUOTA_UNVERIFIABLE` |
 
-## mps-ai — `AI_QUOTA_MODE` × ERP probe answer
+## Client Assistant
 
-The service never self-decides: the ERP's `enforcement_enabled` (from the same
-settings) is what it obeys; `AI_QUOTA_MODE` is only the service's local posture.
+The mount in `src/server.js` is:
 
-| ERP probe answer | `off` | `monitor` (default) | `enforce` |
-| --- | --- | --- | --- |
-| No probe performed | ✔ skip | | |
-| Under limit | | pass | pass |
-| Over + ERP `enforcement_enabled: true` | | pass + warn `client_agent_quota_spent` | **429** refuse, `QUOTA_EXCEEDED`, no provider call |
-| Over + ERP `enforcement_enabled: false` | | pass + warn | **pass + warn** — mode defers to the ERP switch |
-| Probe errors / ERP unreachable | | pass + warn `client_agent_quota_check_unavailable` | **503 fail-closed** `QUOTA_UNVERIFIED`, no provider call |
+```js
+app.use('/api/ai/client-agent',
+  ...studioGate('ai_suite'), aiLimiter, requireAiQuota(),
+  require('./routes/aiClientAgent'));
+```
 
-## Dangerous-mismatch notes (review before altering either side alone)
+So entitlement, trainer role, rate limiting and the monthly allowance are all
+decided before the handler can authorise a client or spend a token. A quota
+refusal is an ordinary JSON 429 (`AI_QUOTA_EXCEEDED`) or 503
+(`AI_QUOTA_UNVERIFIABLE`) — not an SSE event, because the stream has not opened.
+Usage is written exactly once per answered turn to `ai_usage_log` with
+`intent_type = 'client_agent'`; a caller who disconnects mid-answer is not
+billed.
 
-1. `AI_QUOTA_MODE=enforce` while ERP `enforcement_enabled: false` must stay
-   pass-through (new 5C test pins it). Flipping the service to self-enforce
-   would double-gate studios the operator explicitly released.
-2. `AI_QUOTA_MODE=off` on the service does not disable the ERP's own AI-suite
-   guard — quota off means "this service doesn't gate", not "quota is gone".
-3. `monitor` with a broken ERP probe = blind `monitor`: warn per turn (counted
-   in logs, no alert rule yet). Enforce mode's blindness is loud by design
-   (503 or, on the ERP, streak-error + `quotaEnforcementHealth`).
+## Dangerous-mismatch notes
+
+1. The agent must not add its own quota check. Two gates drift; one gate is the
+   allowance.
+2. A 503 here is deliberate: it means the allowance cannot be verified after a
+   sustained failure, not that the model is down. The panel maps both the 429
+   and 503 codes to distinct messages.
+3. `fail-open` is an operator override for a known-good database path, not the
+   default. Sustained failure must fail closed.
 
 ## Error-code cross-reference
 
 | Where | 429 | 503 | Origin semantics |
 | --- | --- | --- | --- |
-| ERP suite | `AI_QUOTA_EXCEEDED` | `AI_QUOTA_UNVERIFIABLE` (fail-closed only) | Failure bias per env; never fails open ON 429 paths |
-| mps-ai | `QUOTA_EXCEEDED` | `QUOTA_UNVERIFIED` | Enforce = fail-closed on unverifiable; monitor = fail-open |
+| ERP suite + Client Assistant | `AI_QUOTA_EXCEEDED` | `AI_QUOTA_UNVERIFIABLE` (after streak, or explicit fail-closed) | Bounded fail-open; never fails open ON 429 paths |

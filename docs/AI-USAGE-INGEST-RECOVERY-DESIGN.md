@@ -1,5 +1,10 @@
 # AI Usage-Ingest Recovery — Current State, Explicit Limits, Design Proposal (Phase 5B)
 
+> **Superseded 2026-10-22.** The `/api/ai/usage/service/ingest` bridge and the
+> `mps-ai` service are retired. The Client Assistant writes `ai_usage_log`
+> in-process, exactly once per answered turn; there is no ingest hop to
+> recover. Kept as the Phase 5B design record.
+
 Scope: failed ingestion of `/api/ai/usage/service/ingest` (mps-ai → ERP), what
 recovers automatically today, what cannot honestly be called recovery yet, and
 the smallest safe design that would make it durable. **Phase 5 implements no

@@ -149,10 +149,28 @@ async function chatCompletion({ model, messages, temperature = 0.7, max_tokens =
  * Streaming chat completion — yields text delta strings.
  * Returns { usage } after the stream is exhausted.
  */
-async function* streamCompletion({ model, messages, temperature = 0.7, max_tokens = 2048, timeout = defaultTimeoutMs() }) {
+async function* streamCompletion({ model, messages, temperature = 0.7, max_tokens = 2048, timeout = defaultTimeoutMs(), signal }) {
+  // Do not open a connection for a caller who already hung up. The listener
+  // below only fires on a future abort; an already-aborted signal never does.
+  if (signal?.aborted) {
+    const err = new Error('Model request cancelled');
+    err.code = 'AI_ABORTED';
+    throw err;
+  }
+
   const start      = Date.now();
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), timeout);
+
+  // Relay external abort signal to our internal controller
+  let externalAborted = false;
+  function onExternalAbort() {
+    externalAborted = true;
+    controller.abort();
+  }
+  if (signal) {
+    signal.addEventListener('abort', onExternalAbort, { once: true });
+  }
 
   let res;
   try {
@@ -164,7 +182,15 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
     });
   } catch (err) {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onExternalAbort);
+    // Distinguish caller abort from timeout
     if (err.name === 'AbortError') {
+      if (externalAborted || signal?.aborted) {
+        const t = new Error('Model request cancelled');
+        t.code = 'AI_ABORTED';
+        // Do NOT record a provider failure for caller abort
+        throw t;
+      }
       logger.warn({ model, timeout_ms: timeout, latency_ms: Date.now() - start }, 'ai_stream_timeout');
       const t = new Error(`Stream timed out after ${timeout}ms`);
       t.code = 'TIMEOUT';
@@ -181,6 +207,7 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
 
   if (!res.ok) {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onExternalAbort);
     const text = await res.text().catch(() => '');
     const err  = new Error(`OpenRouter stream ${res.status}: ${text.slice(0, 300)}`);
     err.status = res.status;
@@ -237,8 +264,15 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
       }
     }
   } catch (err) {
+    // Distinguish caller abort from timeout during body read
     if (err.name === 'AbortError' || err.message === 'This operation was aborted.' ||
         err.message === 'Load failed') {
+      if (externalAborted || signal?.aborted) {
+        const t = new Error('Model request cancelled');
+        t.code = 'AI_ABORTED';
+        // Do NOT record a provider failure for caller abort
+        throw t;
+      }
       logger.warn({ model, timeout_ms: timeout, latency_ms: Date.now() - start }, 'ai_stream_timeout');
       const t = new Error(`OpenRouter stream timed out after ${timeout}ms`);
       t.code = 'TIMEOUT';
@@ -253,6 +287,7 @@ async function* streamCompletion({ model, messages, temperature = 0.7, max_token
     throw err;
   } finally {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onExternalAbort);
     reader.releaseLock();
     logger.info(
       { model, served_model: servedModel, latency_ms: Date.now() - start },
