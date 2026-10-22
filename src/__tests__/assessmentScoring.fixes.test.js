@@ -106,6 +106,89 @@ describe('health score direction and bands (F15)', () => {
   });
 });
 
+describe('vitals norms (BP, resting heart rate, SpO₂)', () => {
+  test.each([
+    [85, 55, 'Hypotension'],
+    [89, 60, 'Hypotension'],
+    [90, 60, 'Normal'],
+    [119, 79, 'Normal'],
+    [120, 79, 'Elevated'],
+    [129, 79, 'Elevated'],
+    [120, 80, 'Hypertension Stage 1'],
+    [130, 79, 'Hypertension Stage 1'],
+    [139, 89, 'Hypertension Stage 1'],
+    [140, 89, 'Hypertension Stage 2'],
+    [139, 90, 'Hypertension Stage 2'],
+    [179, 119, 'Hypertension Stage 2'],
+    [180, 119, 'Hypertensive Crisis'],
+    [179, 120, 'Hypertensive Crisis'],
+    [160, 58, 'Hypertension Stage 2'],
+    [135, 55, 'Hypotension'],
+    [125, null, 'Elevated'],
+    [85, null, 'Hypotension'],
+    [150, null, 'Hypertension Stage 2'],
+    [185, null, 'Hypertensive Crisis'],
+    [null, 125, 'Hypertensive Crisis'],
+    [null, 70, null],
+  ])('classifyBp(%p, %p) → %p', (systolic, diastolic, category) => {
+    expect(fitness.classifyBp(systolic, diastolic)).toBe(category);
+  });
+
+  test.each([
+    [39, 'Low'], [40, 'Low'], [59, 'Low'], [60, 'Normal'], [72, 'Normal'], [80, 'Normal'],
+    [81, 'High Normal'], [100, 'High Normal'], [101, 'High'],
+  ])('classifyRhr(%p) → %s', (rhr, category) => {
+    expect(fitness.classifyRhr(rhr)).toBe(category);
+  });
+
+  test.each([[89, 'Critical'], [90, 'Mildly Low'], [94, 'Mildly Low'], [95, 'Normal'], [100, 'Normal']])(
+    'classifySpo2(%p) → %s', (spo2, category) => {
+      expect(fitness.classifySpo2(spo2)).toBe(category);
+    },
+  );
+
+  const safety = (over = {}) => fitness.assessVitalsSafety({
+    systolic: 118, diastolic: 70, restingHeartRate: 72, restingSpo2: 98, athlete: false, ...over,
+  });
+
+  test('stage 2, crisis and hypotension stop exertion', () => {
+    expect(safety({ systolic: 160, diastolic: 95 }).level).toBe('stop');
+    expect(safety({ systolic: 185, diastolic: 95 }).level).toBe('stop');
+    expect(safety({ systolic: 85, diastolic: 55 }).level).toBe('stop');
+  });
+
+  test('stage 1 and elevated are caution, not stop', () => {
+    expect(safety({ systolic: 135, diastolic: 85 }).level).toBe('caution');
+    expect(safety({ systolic: 125, diastolic: 75 }).level).toBe('caution');
+  });
+
+  test('RHR and SpO₂ stops', () => {
+    expect(safety({ restingHeartRate: 110 }).level).toBe('stop');
+    expect(safety({ restingHeartRate: 38 }).level).toBe('stop');
+    expect(safety({ restingSpo2: 88 }).level).toBe('stop');
+    expect(safety({ restingSpo2: 92 }).level).toBe('caution');
+  });
+
+  test('an athlete\'s 40–50 bpm is context, not a flag', () => {
+    expect(safety({ restingHeartRate: 45, athlete: true }).level).toBe('safe');
+    expect(safety({ restingHeartRate: 45, athlete: false }).level).toBe('caution');
+    expect(safety({ restingHeartRate: 45, athlete: true }).athleteLowRhr).toBe(true);
+  });
+
+  test('a normal reading is safe', () => {
+    const result = safety();
+    expect(result.level).toBe('safe');
+    expect(result.requiresMedicalClearance).toBe(false);
+    expect(result.repeatBp).toBe(false);
+  });
+
+  test('crisis is the worst health-risk BP band', () => {
+    expect(fitness.scoreHealthRisk('Hypertensive Crisis', 22)).toBeLessThan(
+      fitness.scoreHealthRisk('Hypertension Stage 2', 22),
+    );
+  });
+});
+
 describe('scoring formula version (F10)', () => {
   test('exposes a non-empty version identifier', () => {
     expect(typeof fitness.FITNESS_SCORING_VERSION).toBe('string');

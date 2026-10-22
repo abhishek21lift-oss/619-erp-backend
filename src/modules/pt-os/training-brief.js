@@ -307,9 +307,13 @@ function buildBrief({
     waist_cm: num(assessment.waist_cm),
     waist_hip_ratio: num(assessment.waist_hip_ratio),
     resting_hr: num(assessment.resting_heart_rate),
+    rhr_category: assessment.rhr_category ?? null,
+    resting_spo2: num(assessment.resting_spo2),
+    spo2_category: assessment.spo2_category ?? null,
     bp: assessment.bp_systolic && assessment.bp_diastolic
       ? `${assessment.bp_systolic}/${assessment.bp_diastolic}` : null,
     bp_category: assessment.bp_category ?? null,
+    vitals_safety: assessment.vitals_safety ?? null,
   } : { present: false };
 
   // ── Capacity: what they can currently do. Scores are the studio's own

@@ -111,18 +111,57 @@ function buildInsights({ comparison = null, analytics = null, schedule = null, g
 
     const systolic = metric(comparison, 'bp_systolic');
     const diastolic = metric(comparison, 'bp_diastolic');
-    if (systolic?.latest_value != null && diastolic?.latest_value != null
-      && (systolic.latest_value >= 140 || diastolic.latest_value >= 90)) {
+    if (systolic?.latest_value != null && diastolic?.latest_value != null) {
+      const crisis = systolic.latest_value >= 180 || diastolic.latest_value >= 120;
+      const stage2 = systolic.latest_value >= 140 || diastolic.latest_value >= 90;
+      if (crisis) {
+        out.push(base({
+          key: 'bp_crisis_reading', type: 'observation', severity: 'high',
+          title: 'Latest resting blood pressure is in the hypertensive crisis range',
+          detail: `The latest recorded reading was ${systolic.latest_value}/${diastolic.latest_value} mmHg. This is a recorded reading, not a diagnosis.`,
+          evidence: {
+            metric: 'bp_systolic/bp_diastolic',
+            latest: [systolic.latest_value, diastolic.latest_value],
+            assessment_date: comparison.latest?.assessment_date,
+          },
+          recommendation: 'Stop exertion testing and advise urgent medical assessment. Follow the studio screening policy.',
+        }));
+      } else if (stage2) {
+        out.push(base({
+          key: 'bp_high_reading', type: 'observation', severity: 'high',
+          title: 'Latest resting blood pressure reading is elevated',
+          detail: `The latest recorded reading was ${systolic.latest_value}/${diastolic.latest_value} mmHg. This is a recorded reading, not a diagnosis.`,
+          evidence: {
+            metric: 'bp_systolic/bp_diastolic',
+            latest: [systolic.latest_value, diastolic.latest_value],
+            assessment_date: comparison.latest?.assessment_date,
+          },
+          recommendation: 'Follow the studio screening policy and advise the client to have the reading reviewed by a qualified clinician.',
+        }));
+      }
+    }
+
+    const spo2 = metric(comparison, 'resting_spo2');
+    if (spo2?.latest_value != null && spo2.latest_value < 95) {
       out.push(base({
-        key: 'bp_high_reading', type: 'observation', severity: 'high',
-        title: 'Latest resting blood pressure reading is elevated',
-        detail: `The latest recorded reading was ${systolic.latest_value}/${diastolic.latest_value} mmHg. This is a recorded reading, not a diagnosis.`,
-        evidence: {
-          metric: 'bp_systolic/bp_diastolic',
-          latest: [systolic.latest_value, diastolic.latest_value],
-          assessment_date: comparison.latest?.assessment_date,
-        },
-        recommendation: 'Follow the studio screening policy and advise the client to have the reading reviewed by a qualified clinician.',
+        key: 'spo2_low_reading', type: 'observation', severity: spo2.latest_value < 90 ? 'high' : 'attention',
+        title: `Latest resting SpO₂ is ${spo2.latest_value < 90 ? 'critically low' : 'below the normal range'}`,
+        detail: `The latest recorded reading was ${fmt(spo2.latest_value, '%')}. This is a recorded reading, not a diagnosis.`,
+        evidence: { metric: 'resting_spo2', latest: spo2.latest_value, assessment_date: comparison.latest?.assessment_date },
+        recommendation: spo2.latest_value < 90
+          ? 'Do not proceed with exertion testing; seek medical assessment.'
+          : 'Recheck after rest and monitor for breathlessness before exertion testing.',
+      }));
+    }
+
+    const rhr = metric(comparison, 'resting_heart_rate');
+    if (rhr?.latest_value != null && (rhr.latest_value < 40 || rhr.latest_value > 100)) {
+      out.push(base({
+        key: 'rhr_out_of_range', type: 'observation', severity: 'high',
+        title: `Latest resting heart rate is ${rhr.latest_value < 40 ? 'below 40' : 'above 100'} bpm`,
+        detail: `The latest recorded reading was ${fmt(rhr.latest_value, 'bpm')}. This is a recorded reading, not a diagnosis.`,
+        evidence: { metric: 'resting_heart_rate', latest: rhr.latest_value, assessment_date: comparison.latest?.assessment_date },
+        recommendation: 'Reassess at rest and follow the studio screening policy before exertion testing.',
       }));
     }
 

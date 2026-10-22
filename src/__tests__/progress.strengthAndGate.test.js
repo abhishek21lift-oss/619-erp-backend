@@ -13,12 +13,26 @@ const ORG_A = '11111111-1111-1111-1111-111111111111';
 let mockBlocked = null;
 let mockAssessmentOwned = true;
 let mockExistingLog = null;
+let mockClient = null;
 const mockQueries = [];
+const mockTx = () => ({
+  query: jest.fn(async (sql) => {
+    const text = String(sql).replace(/\s+/g, ' ').trim();
+    mockQueries.push({ sql: text, params: [] });
+    if (/^SELECT COALESCE\(MAX\(assessment_number\)/i.test(text)) return { rows: [{ n: 1 }], rowCount: 1 };
+    if (/^INSERT INTO pt_assessments/i.test(text)) {
+      return { rows: [{ id: 'a1', client_id: 'c1', organization_id: ORG_A, assessment_number: 1, assessment_date: '2026-01-01' }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  }),
+  release: jest.fn(),
+});
 jest.mock('../db/pool', () => ({
   query: jest.fn(async (sql, params) => {
     const text = String(sql).replace(/\s+/g, ' ').trim();
     mockQueries.push({ sql: text, params });
     if (/^SELECT 1 FROM pt_assessments/i.test(text)) return { rows: [], rowCount: mockAssessmentOwned ? 1 : 0 };
+    if (/^SELECT dob, gender, workout_experience_level/i.test(text)) return { rows: mockClient ? [mockClient] : [], rowCount: mockClient ? 1 : 0 };
     if (/^INSERT INTO strength_logs/i.test(text)) return { rows: [{ id: 'sl-1' }], rowCount: 1 };
     if (/^SELECT \* FROM strength_logs/i.test(text)) return { rows: mockExistingLog ? [mockExistingLog] : [], rowCount: mockExistingLog ? 1 : 0 };
     if (/^UPDATE strength_logs/i.test(text)) return { rows: [{ id: 'sl-1' }], rowCount: 1 };
@@ -31,7 +45,7 @@ jest.mock('../db/pool', () => ({
     }
     return { rows: [], rowCount: 0 };
   }),
-  connect: jest.fn(),
+  connect: jest.fn(async () => mockTx()),
 }));
 jest.mock('../lib/orgGuard', () => ({ clientInOrg: jest.fn(async () => true) }));
 jest.mock('../lib/screeningGate', () => ({
@@ -57,7 +71,7 @@ function app() {
 const insertParams = () => mockQueries.find((q) => /^INSERT INTO strength_logs/i.test(q.sql))?.params;
 const lift = (extra) => ({ client_id: 'c1', exercise_name: 'Squat', weight_kg: 100, reps_done: 5, ...extra });
 
-beforeEach(() => { mockBlocked = null; mockAssessmentOwned = true; mockExistingLog = null; mockQueries.length = 0; });
+beforeEach(() => { mockBlocked = null; mockAssessmentOwned = true; mockExistingLog = null; mockClient = null; mockQueries.length = 0; });
 
 describe('POST /progress/strength-logs', () => {
   test.each([
@@ -124,6 +138,46 @@ describe('unsafe resting blood pressure stops exertion tests', () => {
     const res = await request(app()).post('/api/progress/assessments')
       .send({ client_id: 'c1', bp_systolic: 85, bp_diastolic: 55, cardio_test_type: 'YMCA 3-Minute Step Test' });
     expect(res.status).toBe(400);
+  });
+
+  test('a hypertensive crisis reading is refused', async () => {
+    const res = await request(app()).post('/api/progress/assessments')
+      .send({ client_id: 'c1', bp_systolic: 185, bp_diastolic: 122, cardio_test_type: 'YMCA 3-Minute Step Test' });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('BP_UNSAFE');
+  });
+});
+
+describe('other resting vitals stop exertion tests', () => {
+  test('critical SpO₂ is refused', async () => {
+    const res = await request(app()).post('/api/progress/assessments')
+      .send({ client_id: 'c1', bp_systolic: 118, bp_diastolic: 70, resting_spo2: 88, cardio_test_type: 'YMCA 3-Minute Step Test' });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('SPO2_UNSAFE');
+  });
+
+  test('a resting heart rate above 100 is refused', async () => {
+    const res = await request(app()).post('/api/progress/assessments')
+      .send({ client_id: 'c1', bp_systolic: 118, bp_diastolic: 70, resting_heart_rate: 110, strength_exercise: 'Squat' });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('RHR_UNSAFE');
+  });
+
+  test('stage-1 blood pressure is a caution and does not block', async () => {
+    const res = await request(app()).post('/api/progress/assessments')
+      .send({ client_id: 'c1', bp_systolic: 135, bp_diastolic: 85, cardio_test_type: 'YMCA 3-Minute Step Test' });
+    expect(res.status).toBe(201);
+    expect(res.body.data.vitals_safety.level).toBe('caution');
+    expect(mockQueries.some((q) => /INSERT INTO pt_assessments/i.test(q.sql))).toBe(true);
+  });
+
+  test('a trained athlete\'s 45 bpm is context, not a caution', async () => {
+    mockClient = { workout_experience_level: 'athlete' };
+    const res = await request(app()).post('/api/progress/assessments')
+      .send({ client_id: 'c1', bp_systolic: 118, bp_diastolic: 70, resting_heart_rate: 45, cardio_test_type: 'YMCA 3-Minute Step Test' });
+    expect(res.status).toBe(201);
+    expect(res.body.data.vitals_safety.level).toBe('safe');
+    expect(res.body.data.vitals_safety.athleteLowRhr).toBe(true);
   });
 });
 

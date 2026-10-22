@@ -178,7 +178,7 @@ async function demographics(req, clientId, b) {
   // against 25-year-old male norms. The request is only a fallback for a
   // record that has no date of birth or gender yet.
   const { rows: [c] } = await pool.query(
-    'SELECT dob, gender FROM pt_clients WHERE id = $1 AND organization_id = $2',
+    'SELECT dob, gender, workout_experience_level FROM pt_clients WHERE id = $1 AND organization_id = $2',
     [clientId, tenantScope(req).orgId],
   );
   let age = null;
@@ -190,6 +190,9 @@ async function demographics(req, clientId, b) {
   return {
     age: age ?? b.age ?? null,
     gender: (c && c.gender) || b.gender || null,
+    // The recorded training level is the context that keeps a trained
+    // athlete's 40–50 bpm resting rate from being flagged as bradycardia.
+    athlete: (c && c.workout_experience_level) === 'athlete',
   };
 }
 
@@ -199,17 +202,32 @@ async function demographics(req, clientId, b) {
  * Returns `{ error }` when the safety rules refuse the test.
  */
 function computeAssessment(b, age, gender, opts = {}) {
-  // ── Step 1: Blood Pressure ──
-  const bp = scoring.classifyBp(b.bp_systolic ?? null, b.bp_diastolic ?? null);
+  // ── Step 1: Vitals ──
+  const bpCategory = scoring.classifyBp(b.bp_systolic ?? null, b.bp_diastolic ?? null);
+  const rhrCategory = scoring.classifyRhr(b.resting_heart_rate ?? null);
+  const spo2Category = scoring.classifySpo2(b.resting_spo2 ?? null);
+  // Clinical labels above; this is the exercise-safety decision that uses
+  // them. It is deliberately not the same thing as a diagnosis.
+  const vitalsSafety = scoring.assessVitalsSafety({
+    systolic: b.bp_systolic ?? null,
+    diastolic: b.bp_diastolic ?? null,
+    restingHeartRate: b.resting_heart_rate ?? null,
+    restingSpo2: b.resting_spo2 ?? null,
+    athlete: Boolean(opts.athlete),
+  });
   const exertion = [b.cardio_test_type, b.strength_exercise, b.strength_exercise_2, b.endurance_test_type, b.endurance_test_type_2]
     .some((v) => v != null && v !== '');
-  // An unsafe resting reading (stage-2 hypertension or hypotension) stops
-  // the exertion tests: a step test, a 1RM or an endurance set to failure
-  // on top of it is the risk the reading exists to catch. The reading itself,
-  // the measurements and flexibility are still recorded.
-  if (bp.isUnsafe && exertion) {
-    return { error: { status: 400, code: 'BP_UNSAFE',
-      message: `Resting blood pressure is ${bp.category} — exertion tests (cardio, strength, endurance) cannot be recorded. Refer for medical clearance.` } };
+  // An unsafe resting reading stops the exertion tests: a step test, a 1RM or
+  // an endurance set to failure on top of it is the risk the reading exists to
+  // catch. The reading itself, the measurements and flexibility are still
+  // recorded.
+  if (vitalsSafety.level === 'stop' && exertion) {
+    const code = bpCategory === 'Hypertensive Crisis' || bpCategory === 'Hypertension Stage 2' || bpCategory === 'Hypotension'
+      ? 'BP_UNSAFE'
+      : spo2Category === 'Critical' ? 'SPO2_UNSAFE'
+        : rhrCategory === 'High' || rhrCategory === 'Low' ? 'RHR_UNSAFE' : 'VITALS_UNSAFE';
+    return { error: { status: 400, code,
+      message: `${vitalsSafety.reasons[0]} Cardio, strength and endurance tests cannot be recorded. Refer for medical clearance where indicated.` } };
   }
   // No reading at all used to pass the same check: a 1RM and a step test
   // were recorded with blood pressure never taken. The trainer may still
@@ -324,7 +342,7 @@ function computeAssessment(b, age, gender, opts = {}) {
 
   // ── Dashboard scores ──
   const bodyCompositionScore = scoring.scoreBodyComposition(b.body_fat_pct ?? null, gender);
-  const healthRiskScore = scoring.scoreHealthRisk(bp.category, bmi);
+  const healthRiskScore = scoring.scoreHealthRisk(bpCategory, bmi);
   const overallScore = scoring.computeOverallScore({
     bodyComposition: bodyCompositionScore, endurance: enduranceScore,
     mobility: mobilityScore, cardio: cardioScore, healthRisk: healthRiskScore, strength: strengthScore,
@@ -337,14 +355,17 @@ function computeAssessment(b, age, gender, opts = {}) {
     : priorNotes) || null;
 
   return {
-    bpUnsafe: bp.isUnsafe,
+    bpUnsafe: bpCategory === 'Hypertensive Crisis' || bpCategory === 'Hypertension Stage 2' || bpCategory === 'Hypotension',
+    vitalsSafety,
     lifts,
     cols: {
       assessment_type: b.assessment_type || 'initial',
       assessment_date: b.assessment_date || studioToday(),
       trainer_notes: b.trainer_notes || b.assessment_notes || null,
       bp_systolic: b.bp_systolic ?? null, bp_diastolic: b.bp_diastolic ?? null,
-      resting_heart_rate: b.resting_heart_rate ?? null, resting_spo2: b.resting_spo2 ?? null, bp_category: bp.category,
+      resting_heart_rate: b.resting_heart_rate ?? null, resting_spo2: b.resting_spo2 ?? null,
+      bp_category: bpCategory, rhr_category: rhrCategory, spo2_category: spo2Category,
+      vitals_safety: vitalsSafety.level,
       weight: b.weight ?? null, height_cm: b.height_cm ?? null, bmi,
       waist_cm: b.waist_cm ?? null, waist_iliac_cm: b.waist_iliac_cm ?? null, hips_cm: b.hips_cm ?? null, waist_hip_ratio: waistHipRatio,
       neck_cm: b.neck_cm ?? null, chest_cm: b.chest_cm ?? null,
@@ -385,8 +406,8 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
     req, b.client_id, { requireActive: false, action: 'fitness_test' });
   if (blocked) return res.status(blocked.status).json(blocked.body);
 
-  const { age, gender } = await demographics(req, b.client_id, b);
-  const result = computeAssessment(b, age, gender, { userId: req.user.id });
+  const { age, gender, athlete } = await demographics(req, b.client_id, b);
+  const result = computeAssessment(b, age, gender, { userId: req.user.id, athlete });
   if (result.error) return res.status(result.error.status).json({ error: { code: result.error.code, message: result.error.message } });
 
   // The assessor is the studio's trainer profile, from the session. A
@@ -423,7 +444,7 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
     logger.error({ err: err.message, assessmentId: row.id, clientId: row.client_id }, 'assessment re-test sync failed');
   }
   res.status(201).json({
-    data: { ...row, bp_unsafe: result.bpUnsafe },
+    data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety },
     screening_warnings: screeningWarnings,
     retest,
     ...(retestError ? { retest_error: retestError } : {}),
@@ -437,12 +458,13 @@ router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdate
   const existing = await assessmentsRepo.findAssessment(req, req.params.id);
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   const merged = { ...assessmentAsBody(existing), ...req.body };
-  const { age, gender } = await demographics(req, existing.client_id, merged);
+  const { age, gender, athlete } = await demographics(req, existing.client_id, merged);
   // The row's stored v3 battery travels beside the merged body: provenance
   // (recorded_at, assessor, override stamp) is write-once, so an edit that
   // does not change the battery round-trips it byte-identically.
   const result = computeAssessment(merged, age, gender, {
     userId: req.user.id,
+    athlete,
     existingFlexibility: asObject(existing.flexibility_test_data),
   });
   if (result.error) return res.status(result.error.status).json({ error: { code: result.error.code, message: result.error.message } });
@@ -460,7 +482,7 @@ router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdate
     throw err;
   }
   tx.release();
-  res.json({ data: { ...row, bp_unsafe: result.bpUnsafe } });
+  res.json({ data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety } });
 }));
 
 router.delete('/assessments/:id', auth, requireTrainer, wrap(async (req, res) => {
