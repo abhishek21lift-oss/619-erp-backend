@@ -337,8 +337,8 @@ function computeAssessment(b, age, gender, opts = {}) {
   const isRepBasedEndurance = (t) => t === 'Push Up Test' || t === 'Curl Up Test';
   const enduranceValue1 = isRepBasedEndurance(b.endurance_test_type) ? num(t1.reps, null) : num(t1.durationSec, null);
   const enduranceValue2 = isRepBasedEndurance(b.endurance_test_type_2) ? num(t2.reps, null) : num(t2.durationSec, null);
-  const enduranceCategory = scoring.classifyEndurance(b.endurance_test_type, enduranceValue1, gender);
-  const enduranceCategory2 = scoring.classifyEndurance(b.endurance_test_type_2, enduranceValue2, gender);
+  const enduranceCategory = scoring.classifyEndurance(b.endurance_test_type, enduranceValue1, gender, age);
+  const enduranceCategory2 = scoring.classifyEndurance(b.endurance_test_type_2, enduranceValue2, gender, age);
   const enduranceScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(enduranceCategory), scoring.scoreCategory(enduranceCategory2));
 
   // ── Step 7: Flexibility (K11 four-test battery or legacy two-slot blob) ──
@@ -358,11 +358,13 @@ function computeAssessment(b, age, gender, opts = {}) {
     if (!parsed.ok) return { error: { status: 400, code: 'FLEXIBILITY_INVALID', message: parsed.message } };
     const incomplete = flexibilityProtocol.validateForStorage(parsed.recorded);
     if (incomplete) return { error: { status: 400, code: 'FLEXIBILITY_INCOMPLETE', message: incomplete } };
-    const derived = flexibilityProtocol.deriveFlexibility(parsed.recorded);
+    const derived = flexibilityProtocol.deriveFlexibility(parsed.recorded, { age, gender });
     hasAsymmetry = derived.has_asymmetry;
     flexibilityCell = JSON.stringify(flexibilityProtocol.assembleStored(parsed.recorded, {
       userId: opts.userId,
       prev: opts.existingFlexibility,
+      age,
+      gender,
     }));
   } else {
     const ft1 = fd.test1 || {};

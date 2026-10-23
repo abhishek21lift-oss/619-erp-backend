@@ -9,7 +9,7 @@
 // Persisting it per assessment requires the approval-gated migration described
 // in F10 (new nullable `scoring_formula_version` column on pt_assessments);
 // until then this is documentation only and legacy rows are treated as unknown.
-const FITNESS_SCORING_VERSION = '4';
+const FITNESS_SCORING_VERSION = '5';
 
 function round(n, decimals = 1) {
   const f = 10 ** decimals;
@@ -222,34 +222,56 @@ function classifyHarvardPei(pei) {
   return 'Excellent';
 }
 
-// Simplified gender-split, 3-age-band VO2max norms (mL/kg/min).
-// Simplification vs. full per-decade Cooper Institute tables — Phase 1
-// deliberately trades precision for a small, maintainable table.
-//
-// SOURCE GAP — K11's VO2max table uses Superior / Excellent / Very Good / Good
-// / Fair / Poor / Very Poor, but the K11 threshold values are not available
-// here. These bands are an existing NON-K11 reference, shared by Rockport,
-// Cooper and Bruce results; do not describe them as K11-approved until the
-// missing table is sourced.
-const VO2_MAX_NORMS = {
-  Male:   { young: [42, 37, 33, 28], mid: [39, 34, 30, 25], senior: [35, 30, 26, 21] },
-  Female: { young: [37, 32, 28, 23], mid: [34, 29, 25, 20], senior: [30, 25, 21, 16] },
+// K11 age-adjusted VO2max norms (mL/kg/min), by sex and five-year age band.
+// Each row is [minimum, category], highest category first; below the Poor floor
+// is Very Poor. The 65+ row is the last supplied band, so it also applies to
+// older clients. Male 65 uses 46–42: the source prints 48–42, which overlaps
+// the Superior floor and is a typo, not a second band.
+const K11_VO2_NORMS = {
+  Male: {
+    15: [[57, 'Superior'], [56, 'Excellent'], [51, 'Very Good'], [46, 'Good'], [41, 'Fair'], [35, 'Poor']],
+    20: [[56, 'Superior'], [55, 'Excellent'], [50, 'Very Good'], [45, 'Good'], [40, 'Fair'], [35, 'Poor']],
+    25: [[55, 'Superior'], [54, 'Excellent'], [49, 'Very Good'], [44, 'Good'], [39, 'Fair'], [34, 'Poor']],
+    30: [[54, 'Superior'], [53, 'Excellent'], [48, 'Very Good'], [43, 'Good'], [38, 'Fair'], [33, 'Poor']],
+    35: [[53, 'Superior'], [52, 'Excellent'], [47, 'Very Good'], [42, 'Good'], [37, 'Fair'], [32, 'Poor']],
+    40: [[52, 'Superior'], [51, 'Excellent'], [46, 'Very Good'], [41, 'Good'], [36, 'Fair'], [31, 'Poor']],
+    45: [[51, 'Superior'], [50, 'Excellent'], [45, 'Very Good'], [40, 'Good'], [35, 'Fair'], [30, 'Poor']],
+    50: [[50, 'Superior'], [49, 'Excellent'], [44, 'Very Good'], [39, 'Good'], [34, 'Fair'], [29, 'Poor']],
+    55: [[49, 'Superior'], [48, 'Excellent'], [43, 'Very Good'], [38, 'Good'], [33, 'Fair'], [28, 'Poor']],
+    60: [[48, 'Superior'], [47, 'Excellent'], [42, 'Very Good'], [37, 'Good'], [32, 'Fair'], [27, 'Poor']],
+    65: [[47, 'Superior'], [46, 'Excellent'], [41, 'Very Good'], [36, 'Good'], [31, 'Fair'], [26, 'Poor']],
+  },
+  Female: {
+    15: [[54, 'Superior'], [53, 'Excellent'], [48, 'Very Good'], [43, 'Good'], [38, 'Fair'], [33, 'Poor']],
+    20: [[53, 'Superior'], [52, 'Excellent'], [47, 'Very Good'], [42, 'Good'], [37, 'Fair'], [32, 'Poor']],
+    25: [[52, 'Superior'], [51, 'Excellent'], [46, 'Very Good'], [41, 'Good'], [36, 'Fair'], [31, 'Poor']],
+    30: [[51, 'Superior'], [50, 'Excellent'], [45, 'Very Good'], [40, 'Good'], [35, 'Fair'], [30, 'Poor']],
+    35: [[50, 'Superior'], [49, 'Excellent'], [44, 'Very Good'], [39, 'Good'], [34, 'Fair'], [29, 'Poor']],
+    40: [[49, 'Superior'], [48, 'Excellent'], [43, 'Very Good'], [38, 'Good'], [33, 'Fair'], [28, 'Poor']],
+    45: [[48, 'Superior'], [47, 'Excellent'], [42, 'Very Good'], [37, 'Good'], [32, 'Fair'], [27, 'Poor']],
+    50: [[47, 'Superior'], [46, 'Excellent'], [41, 'Very Good'], [36, 'Good'], [31, 'Fair'], [26, 'Poor']],
+    55: [[46, 'Superior'], [45, 'Excellent'], [40, 'Very Good'], [35, 'Good'], [30, 'Fair'], [25, 'Poor']],
+    60: [[45, 'Superior'], [44, 'Excellent'], [39, 'Very Good'], [34, 'Good'], [29, 'Fair'], [24, 'Poor']],
+    65: [[44, 'Superior'], [43, 'Excellent'], [38, 'Very Good'], [33, 'Good'], [28, 'Fair'], [23, 'Poor']],
+  },
 };
-function ageBand(age) {
-  if (age < 30) return 'young';
-  if (age < 50) return 'mid';
-  return 'senior';
+
+/** The K11 row for an age at the test; under 15 has no supplied norm. */
+function vo2AgeRow(age) {
+  if (age == null || !Number.isFinite(age) || age < 15) return null;
+  if (age >= 65) return 65;
+  return Math.floor(age / 5) * 5;
 }
+
 function classifyVo2Max(vo2, age, gender) {
   if (vo2 == null || !Number.isFinite(vo2) || vo2 <= 0) return null;
   const g = sexOf(gender);
-  if (!g) return null;
-  const [excellent, good, average, belowAverage] = VO2_MAX_NORMS[g][ageBand(age || 30)];
-  if (vo2 >= excellent) return 'Excellent';
-  if (vo2 >= good) return 'Good';
-  if (vo2 >= average) return 'Average';
-  if (vo2 >= belowAverage) return 'Below Average';
-  return 'Poor';
+  const row = vo2AgeRow(age);
+  if (!g || row == null) return null;
+  for (const [minimum, category] of K11_VO2_NORMS[g][row]) {
+    if (vo2 >= minimum) return category;
+  }
+  return 'Very Poor';
 }
 
 // YMCA 3-Minute Step Test. K11 publishes recovery heart-rate norms by age and
@@ -440,34 +462,130 @@ function classifyStrength(oneRM, bodyWeightKg, exercise, gender, age) {
 }
 
 // ── Step 6: Muscular Endurance ──────────────────────────────
-// Single-scale, gender-split thresholds (no age bands) — Phase 1 simplification.
-const PUSHUP_NORMS = { Male: [36, 29, 22, 17], Female: [30, 21, 15, 10] };
-const CURLUP_NORMS = { Male: [40, 30, 20, 10], Female: [35, 25, 15, 8] };
-const PLANK_NORMS_SEC = [120, 60, 30, 15]; // single scale, no standard gender norm
+// K11 supplies age- and sex-specific tables for the push-up and curl-up only.
+// Plank, wall sit, bodyweight squat and custom have no supplied K11 norm, so
+// they return null rather than borrowing another test's thresholds.
+const K11_PUSHUP_NORMS = {
+  Male: {
+    '20-29': [[36, 'Excellent'], [29, 'Very Good'], [22, 'Good'], [17, 'Fair']],
+    '30-39': [[30, 'Excellent'], [22, 'Very Good'], [17, 'Good'], [12, 'Fair']],
+    '40-49': [[25, 'Excellent'], [17, 'Very Good'], [13, 'Good'], [10, 'Fair']],
+    '50-59': [[21, 'Excellent'], [13, 'Very Good'], [10, 'Good'], [7, 'Fair']],
+    '60-69': [[18, 'Excellent'], [11, 'Very Good'], [8, 'Good'], [5, 'Fair']],
+  },
+  Female: {
+    '20-29': [[30, 'Excellent'], [21, 'Very Good'], [15, 'Good'], [10, 'Fair']],
+    '30-39': [[27, 'Excellent'], [20, 'Very Good'], [13, 'Good'], [8, 'Fair']],
+    '40-49': [[24, 'Excellent'], [15, 'Very Good'], [11, 'Good'], [5, 'Fair']],
+    '50-59': [[21, 'Excellent'], [11, 'Very Good'], [7, 'Good'], [2, 'Fair']],
+    '60-69': [[17, 'Excellent'], [12, 'Very Good'], [5, 'Good'], [2, 'Fair']],
+  },
+};
 
-function classifyEndurance(testType, value, gender) {
+// Each row is [percentile, minimum repetitions], highest percentile first.
+const K11_CURLUP_NORMS = {
+  Male: {
+    '20-29': [[90, 75], [80, 56], [60, 31], [50, 27], [40, 23], [20, 13]],
+    '30-39': [[90, 75], [80, 69], [60, 36], [50, 31], [40, 26], [20, 13]],
+    '40-49': [[90, 75], [80, 75], [60, 51], [50, 39], [40, 31], [20, 21]],
+    '50-59': [[90, 74], [80, 60], [60, 35], [50, 27], [40, 23], [20, 13]],
+    '60-69': [[90, 53], [80, 33], [60, 19], [50, 16], [40, 9], [20, 0]],
+  },
+  Female: {
+    '20-29': [[90, 70], [80, 45], [60, 32], [50, 27], [40, 21], [20, 12]],
+    '30-39': [[90, 55], [80, 43], [60, 28], [50, 21], [40, 15], [20, 0]],
+    '40-49': [[90, 50], [80, 42], [60, 28], [50, 25], [40, 20], [20, 5]],
+    '50-59': [[90, 48], [80, 30], [60, 16], [50, 9], [40, 2], [20, 0]],
+    '60-69': [[90, 50], [80, 30], [60, 19], [50, 9], [40, 3], [20, 0]],
+  },
+};
+
+const K11_CURLUP_PERCENTILE_CATEGORY = {
+  90: 'Well Above Average', 80: 'Above Average',
+  60: 'Average', 50: 'Average',
+  40: 'Below Average', 20: 'Well Below Average',
+};
+
+function enduranceAgeBand(age) {
+  if (age == null || !Number.isFinite(age)) return null;
+  const whole = Math.floor(age);
+  if (whole < 20 || whole > 69) return null;
+  const start = Math.floor(whole / 10) * 10;
+  return `${start}-${start + 9}`;
+}
+
+/**
+ * K11 endurance category. `age` is the age at the time of testing; missing age
+ * or sex means no category, never a default row.
+ */
+function classifyEndurance(testType, value, gender, age) {
   // A zero or negative result is not a performed test — never classify it as
   // "Poor" (20), which would masquerade as a real (bad) score.
   if (value == null || !Number.isFinite(value) || value <= 0) return null;
   const g = sexOf(gender);
-  let thresholds;
-  // Plank norms are a single scale; the others are split by sex.
-  if (testType === 'Plank') thresholds = PLANK_NORMS_SEC;
-  else if (!g) return null;
-  else if (testType === 'Push Up Test') thresholds = PUSHUP_NORMS[g];
-  else if (testType === 'Curl Up Test') thresholds = CURLUP_NORMS[g];
-  // Wall Sit, Bodyweight Squat and Custom have no norms here; plank norms
-  // applied to them were an invented category.
-  else return null;
-  const [excellent, good, average, belowAverage] = thresholds;
-  if (value >= excellent) return 'Excellent';
-  if (value >= good) return 'Good';
-  if (value >= average) return 'Average';
-  if (value >= belowAverage) return 'Below Average';
-  return 'Poor';
+  const band = enduranceAgeBand(age);
+  if (!g || !band) return null;
+  if (testType === 'Push Up Test') {
+    for (const [minimum, category] of K11_PUSHUP_NORMS[g][band]) {
+      if (value >= minimum) return category;
+    }
+    return 'Poor';
+  }
+  if (testType === 'Curl Up Test') {
+    for (const [percentile, minimum] of K11_CURLUP_NORMS[g][band]) {
+      if (value >= minimum) return K11_CURLUP_PERCENTILE_CATEGORY[percentile];
+    }
+    return 'Well Below Average';
+  }
+  return null;
 }
 
 // ── Step 7: Flexibility ─────────────────────────────────────
+// K11 YMCA sit-and-reach table, in raw inches. Each row is
+// [minimum printed range value, category], highest first; below the lowest
+// floor is Well Below Average. The source prints integer ranges with gaps, so
+// the minimum of each printed range is used as that category's floor.
+const K11_SIT_AND_REACH_TABLE_VERSION = 'k11-2026.01-sit-and-reach';
+const K11_SIT_AND_REACH_NORMS = {
+  Male: {
+    '18-25': [[22, 'Excellent'], [18, 'Good'], [15, 'Average'], [13, 'Below Average']],
+    '26-35': [[21, 'Excellent'], [17, 'Good'], [14, 'Average'], [11, 'Below Average']],
+    '36-45': [[21, 'Excellent'], [16, 'Good'], [13, 'Average'], [11, 'Below Average']],
+    '46-55': [[19, 'Excellent'], [14, 'Good'], [11, 'Average'], [9, 'Below Average']],
+    '56-65': [[17, 'Excellent'], [13, 'Good'], [9, 'Average'], [7, 'Below Average']],
+  },
+  Female: {
+    '18-25': [[24, 'Excellent'], [20, 'Good'], [18, 'Average'], [16, 'Below Average']],
+    '26-35': [[23, 'Excellent'], [20, 'Good'], [17, 'Average'], [15, 'Below Average']],
+    '36-45': [[22, 'Excellent'], [18, 'Good'], [16, 'Average'], [14, 'Below Average']],
+    '46-55': [[21, 'Excellent'], [17, 'Good'], [14, 'Average'], [12, 'Below Average']],
+    '56-65': [[20, 'Excellent'], [16, 'Good'], [14, 'Average'], [11, 'Below Average']],
+  },
+};
+
+function sitAndReachAgeBand(age) {
+  if (age == null || !Number.isFinite(age)) return null;
+  const whole = Math.floor(age);
+  if (whole < 18 || whole > 65) return null;
+  if (whole <= 25) return '18-25';
+  if (whole <= 35) return '26-35';
+  if (whole <= 45) return '36-45';
+  if (whole <= 55) return '46-55';
+  return '56-65';
+}
+
+function classifySitAndReach(inches, age, gender) {
+  if (inches == null || !Number.isFinite(inches) || inches < 0) return null;
+  const g = sexOf(gender);
+  const band = sitAndReachAgeBand(age);
+  if (!g || !band) return null;
+  for (const [minimum, category] of K11_SIT_AND_REACH_NORMS[g][band]) {
+    if (inches >= minimum) return category;
+  }
+  return 'Well Below Average';
+}
+
+// ── Flexibility composite / asymmetry ───────────────────────
 function checkAsymmetry(left, right, thresholdPct = 10) {
   if (left == null || right == null) return false;
   const max = Math.max(Math.abs(left), Math.abs(right));
@@ -490,7 +608,7 @@ function classifyFlexibilityScore(score) {
 // ── Category → score mapping (used consistently across Cardio/
 //    Endurance/Mobility/Strength for the 0-100 dashboard scores) ──
 const CATEGORY_SCORES = {
-  Excellent: 95, Good: 80,
+  Superior: 100, Excellent: 95, 'Very Good': 85, Good: 80, Fair: 50,
   'Well Above Average': 90, 'Above Average': 70, Average: 60, 'Below Average': 40,
   'Well Below Average': 20, 'Below Supported Range': 20,
   Poor: 20, 'Very Poor': 10,
@@ -499,18 +617,18 @@ function scoreCategory(category) {
   return CATEGORY_SCORES[category] ?? null;
 }
 
-// Body Composition Score: 100 within a gender-specific "ideal" body-fat
-// range, linear falloff outside it. Returns null when gender is missing or
-// 'Other' — there is no sex-neutral reference range, so no score is invented.
-const IDEAL_BODY_FAT = { Male: [10, 20], Female: [18, 28] };
+// Body Composition Score: K11 gives an upper bound only — 100 at or below 15%
+// for men and 20% for women, then four points off per percentage point above
+// it. No lower-bound penalty is invented where K11 supplies none. Returns null
+// when gender is missing or 'Other' — no sex-neutral reference exists.
+const K11_IDEAL_BODY_FAT_MAX = { Male: 15, Female: 20 };
 function scoreBodyComposition(bodyFatPct, gender) {
-  if (bodyFatPct == null) return null;
+  if (bodyFatPct == null || !Number.isFinite(bodyFatPct)) return null;
   const g = sexOf(gender);
   if (!g) return null;
-  const [low, high] = IDEAL_BODY_FAT[g];
-  if (bodyFatPct >= low && bodyFatPct <= high) return 100;
-  const distance = bodyFatPct < low ? low - bodyFatPct : bodyFatPct - high;
-  return Math.max(0, Math.round(100 - distance * 4));
+  const max = K11_IDEAL_BODY_FAT_MAX[g];
+  if (bodyFatPct <= max) return 100;
+  return Math.max(0, Math.round(100 - (bodyFatPct - max) * 4));
 }
 
 // Health Score (stored column `health_risk_score`): average of a BP-category
@@ -583,6 +701,8 @@ module.exports = {
   classifyStrengthDetail,
   strengthAgeBand,
   classifyEndurance,
+  K11_SIT_AND_REACH_TABLE_VERSION,
+  classifySitAndReach,
   checkAsymmetry,
   classifyFlexibilityScore,
   scoreCategory,

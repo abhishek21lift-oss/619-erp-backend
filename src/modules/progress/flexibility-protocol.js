@@ -9,16 +9,16 @@
 //   - The derived score columns for a v3 row stay null. There is no honest
 //     single 0-100 "mobility score" across centimetres, degrees and inches.
 //   - The hamstrings 70-80° window is THIS protocol's reference range (the one
-//     the supplied K11 material defines), not a population norm, and that
-//     material contains no YMCA sit-and-reach norm table, so the norm
-//     classification is reported as unavailable rather than invented.
+//     the supplied K11 material defines), not a population norm. The supplied
+//     material also has the YMCA sit-and-reach table, applied when age and sex
+//     are known; without them a stored norm is preserved rather than invented.
 //
 // The stored payload is built here and only here (assembleStored), and the
 // frontend mirrors deriveFlexibility in src/lib/flexibility-protocol.ts for
 // live display; scripts/assert-scoring-parity.ts keeps the mirror honest.
 
 const { z } = require('../../lib/validation');
-const { checkAsymmetry } = require('./fitness-scoring');
+const { checkAsymmetry, classifySitAndReach, K11_SIT_AND_REACH_TABLE_VERSION } = require('./fitness-scoring');
 
 const PROTOCOL_VERSION = 'k11-2026.01';
 const ZERO_POINT_INCHES = 15;
@@ -167,7 +167,7 @@ function deriveHipFlexors(raw) {
   };
 }
 
-function deriveSitAndReach(raw) {
+function deriveSitAndReach(raw, context = {}) {
   const state = testState(raw);
   if (state.unable_to_complete) return unableResult(state);
   const t = raw || {};
@@ -183,6 +183,28 @@ function deriveSitAndReach(raw) {
       bestAttemptIndex = i;
     }
   });
+
+  // With age and sex, classify the raw reach against K11. Without them (the
+  // PDF/history path), preserve a norm already stored in the payload instead
+  // of erasing it; a live preview has no stored norm and stays unavailable.
+  const contextProvided = context.age != null && context.gender != null;
+  const category = classifySitAndReach(bestRaw, context.age, context.gender);
+  const stored = t.norm && typeof t.norm === 'object' ? t.norm : null;
+  const storedCategory = stored && typeof stored.category === 'string' ? stored.category : null;
+  const norm = category
+    ? {
+      table_version: K11_SIT_AND_REACH_TABLE_VERSION,
+      category,
+      message: 'K11 age/sex sit-and-reach norm',
+    }
+    : (!contextProvided && storedCategory
+      ? {
+        table_version: typeof stored.table_version === 'string' ? stored.table_version : null,
+        category: storedCategory,
+        message: typeof stored.message === 'string' ? stored.message : NORM_UNAVAILABLE.message,
+      }
+      : NORM_UNAVAILABLE);
+
   return {
     attempts,
     best_attempt_index: bestAttemptIndex,
@@ -195,9 +217,9 @@ function deriveSitAndReach(raw) {
     bouncing: t.bouncing === true,
     notes: str(t.notes),
     norm: {
-      table_version: NORM_UNAVAILABLE.table_version,
-      category: NORM_UNAVAILABLE.category,
-      message: NORM_UNAVAILABLE.message,
+      table_version: norm.table_version,
+      category: norm.category,
+      message: norm.message,
     },
     completed: state.completed,
     unable_to_complete: false,
@@ -209,14 +231,16 @@ function deriveSitAndReach(raw) {
  * The shared derivation: raw recorded observations in, interpretations out.
  * Pure and deterministic — the frontend runs this same function's mirror for
  * the live preview, and the parity script fails if the two ever drift.
+ * `context` is the client's age and sex at the time of testing; omit it when
+ * replaying a stored payload and the stored norm should be kept.
  */
-function deriveFlexibility(recorded) {
+function deriveFlexibility(recorded, context = {}) {
   const r = recorded || {};
   const t = r.tests || {};
   const quadriceps = deriveQuadriceps(t.quadriceps);
   const hamstrings = deriveHamstrings(t.hamstrings);
   const hip_flexors = deriveHipFlexors(t.hip_flexors);
-  const sit_and_reach = deriveSitAndReach(t.sit_and_reach);
+  const sit_and_reach = deriveSitAndReach(t.sit_and_reach, context);
   const all = [quadriceps, hamstrings, hip_flexors, sit_and_reach];
   const allRecorded = all.every((x) => x.completed);
   const incomplete = all.filter((x) => !x.completed);
@@ -381,8 +405,8 @@ function validateForStorage(recorded) {
  * is write-once, so an unrelated edit round-trips the payload byte-identically
  * instead of re-stamping it.
  */
-function assembleStored(recorded, { userId = null, prev = null, now = new Date() } = {}) {
-  const derived = deriveFlexibility(recorded);
+function assembleStored(recorded, { userId = null, prev = null, now = new Date(), age = null, gender = null } = {}) {
+  const derived = deriveFlexibility(recorded, { age, gender });
   const previous = prev && prev.protocol_version === PROTOCOL_VERSION ? prev : null;
   const prevOverride = (previous && previous.override) || {};
   const reason = recorded.override && typeof recorded.override.reason === 'string' ? recorded.override.reason.trim() : '';
