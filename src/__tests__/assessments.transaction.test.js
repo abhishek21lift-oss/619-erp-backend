@@ -24,6 +24,9 @@ jest.mock('../middleware/auth', () => ({
 
 const ORG = mockUser.organization_id;
 const CID = 'tx-client';
+// Jan 1 makes the client exactly `age` on every run date, so the K11 band is
+// deterministic in CI.
+const dobForAge = (age) => `${new Date().getFullYear() - age}-01-01`;
 
 describeIf('assessment transaction atomicity', () => {
   let pool;
@@ -34,7 +37,7 @@ describeIf('assessment transaction atomicity', () => {
     pool = require('../db/pool');
     await pool.query(`INSERT INTO organizations (id, name, slug) VALUES ($1, 'Tx Audit', 'tx-audit') ON CONFLICT (id) DO NOTHING`, [ORG]);
     await pool.query(`INSERT INTO users (id, name, email, password, role, organization_id, is_active) VALUES ($1, 'Tx Trainer', 'tx-trainer@audit.test', '!not-a-hash', 'trainer', $2, TRUE) ON CONFLICT (id) DO NOTHING`, [mockUser.id, ORG]);
-    await pool.query(`INSERT INTO pt_clients (id, name, mobile, organization_id, workout_experience_level) VALUES ($1, 'Tx Client', '+919000099999', $2, 'beginner') ON CONFLICT (id) DO NOTHING`, [CID, ORG]);
+    await pool.query(`INSERT INTO pt_clients (id, name, mobile, organization_id, workout_experience_level, gender, dob) VALUES ($1, 'Tx Client', '+919000099999', $2, 'beginner', 'Male', $3) ON CONFLICT (id) DO NOTHING`, [CID, ORG, dobForAge(30)]);
     await pool.query(`INSERT INTO pt_informed_consents (client_id, organization_id, full_name, status) VALUES ($1, $2, 'Tx Client', 'completed')`, [CID, ORG]);
     const answers = Array.from({ length: 10 }, (_, i) => ({ question_id: i + 1, answer: 'no' }));
     await pool.query(`INSERT INTO pt_parq_forms (client_id, full_name, parq_answers, parq_yes_count, risk_level, status, workout_gate_status, organization_id, assessment_date) VALUES ($1, 'Tx Client', $2::jsonb, 0, 'low', 'submitted', 'cleared', $3, CURRENT_DATE - 1)`, [CID, JSON.stringify(answers), ORG]);
@@ -81,6 +84,13 @@ describeIf('assessment transaction atomicity', () => {
     expect(lifts.length).toBeGreaterThan(0);
     const { rows: c } = await pool.query('SELECT weight, height FROM pt_clients WHERE id = $1', [CID]);
     expect(Number(c[0].weight)).toBe(80);
+    // K11 detail rides in the existing strength JSONB; no migration.
+    // 60 kg × 8 reps Epley = 76 kg; 76 / 80 = 0.95. Male 30–39 bench is 50th
+    // at 0.93 and 60th at 0.98, so the stored percentile is 50.
+    const strength = typeof a[0].strength_test_data === 'string'
+      ? JSON.parse(a[0].strength_test_data) : a[0].strength_test_data;
+    expect(a[0].strength_category).toBe('Average');
+    expect(strength.test1).toMatchObject({ k11_percentile: 50, k11_age_band: '30-39', strength_ratio: 0.95 });
   });
 
   test('delete removes assessment row and its lifts', async () => {

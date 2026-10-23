@@ -322,11 +322,26 @@ function buildBrief({
   // ── Capacity: what they can currently do. Scores are the studio's own
   // computed values from the fitness test; categories are the words that go
   // with them, kept together so a number never appears without its scale.
+  // Strength test JSON carries the K11 percentile computed at save time; a
+  // historical row has none, so it stays null rather than being re-derived
+  // against today's age.
+  const strengthData = typeof assessment?.strength_test_data === 'string'
+    ? (safeParse(assessment.strength_test_data) || {})
+    : (assessment?.strength_test_data && typeof assessment.strength_test_data === 'object' ? assessment.strength_test_data : {});
+  const strengthTest = (key) => {
+    const t = strengthData[key];
+    return t && typeof t === 'object' && !Array.isArray(t) ? t : {};
+  };
   sections.capacity = assessment ? {
     present: true,
     as_of: dateOf(assessment.assessment_date),
     overall: num(assessment.overall_fitness_score),
-    strength: { score: num(assessment.strength_score_computed ?? assessment.strength_score), category: assessment.strength_category ?? null },
+    strength: {
+      score: num(assessment.strength_score_computed ?? assessment.strength_score),
+      category: assessment.strength_category ?? null,
+      percentile: num(strengthTest('test1').k11_percentile),
+      percentile_2: num(strengthTest('test2').k11_percentile),
+    },
     cardio: { score: num(assessment.cardio_score_computed ?? assessment.cardio_score), category: assessment.cardio_category ?? null, vo2_max: num(assessment.vo2_max) },
     endurance: { score: num(assessment.endurance_score_computed), category: assessment.endurance_category ?? null },
     // The dashboard's "Flexibility" category is the computed 0-100 score from

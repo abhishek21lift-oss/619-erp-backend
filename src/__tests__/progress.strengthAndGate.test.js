@@ -176,6 +176,68 @@ describe('anthropometric classifications are persisted', () => {
   });
 });
 
+describe('K11 strength norms are applied and persisted', () => {
+  const body = {
+    client_id: 'c1', weight: 80, height_cm: 175, bp_systolic: 118, bp_diastolic: 70,
+    strength_exercise: 'Bench Press',
+    strength_test_data: { test1: { weightKg: 80, reps: 5, formula: 'epley', isDirect: false } },
+  };
+  const storedStrength = () => {
+    const raw = assessmentCols().strength_test_data;
+    return typeof raw === 'string' ? JSON.parse(raw) : raw;
+  };
+
+  test('a 30-year-old male stores the K11 category, percentile and age band', async () => {
+    mockClient = { gender: 'Male', dob: dobForAge(30), workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments').send(body);
+    expect(res.status).toBe(201);
+    const cols = assessmentCols();
+    // 80 kg × 5 reps Epley = 93.3 kg; 93.3 / 80 kg = 1.17. Male 30–39
+    // bench is 80th at 1.12 and 90th at 1.24, so this is 80th.
+    expect(cols.strength_category).toBe('Well Above Average');
+    expect(cols.strength_score_computed).toBe(90);
+    expect(storedStrength().test1).toMatchObject({
+      k11_percentile: 80, k11_age_band: '30-39', strength_ratio: 1.17,
+    });
+  });
+
+  test('a lift with no supplied K11 table stores no category and no percentile', async () => {
+    mockClient = { gender: 'Male', dob: dobForAge(30), workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments')
+      .send({ ...body, strength_exercise: 'Squat' });
+    expect(res.status).toBe(201);
+    const cols = assessmentCols();
+    expect(cols.strength_category).toBeNull();
+    expect(cols.strength_score_computed).toBeNull();
+    expect(storedStrength().test1).toMatchObject({
+      k11_percentile: null, k11_age_band: null, strength_ratio: null,
+    });
+  });
+
+  test('under 20 has no K11 band and is not guessed', async () => {
+    mockClient = { gender: 'Male', dob: dobForAge(19), workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments').send(body);
+    expect(res.status).toBe(201);
+    expect(assessmentCols().strength_category).toBeNull();
+  });
+
+  test('a beginner gets the K11 technique warning without being blocked', async () => {
+    mockClient = { gender: 'Male', dob: dobForAge(30), workout_experience_level: 'beginner' };
+    const res = await request(app()).post('/api/progress/assessments').send(body);
+    expect(res.status).toBe(201);
+    expect(res.body.screening_warnings).toEqual([expect.stringMatching(/beginners should not perform an initial maximal 1RM/)]);
+    // A warning, not a gate: the row is still written.
+    expect(assessmentCols().strength_category).toBe('Well Above Average');
+  });
+
+  test('an intermediate client gets no beginner warning', async () => {
+    mockClient = { gender: 'Male', dob: dobForAge(30), workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments').send(body);
+    expect(res.status).toBe(201);
+    expect(res.body.screening_warnings).toEqual([]);
+  });
+});
+
 describe('K11 YMCA step-test category is persisted from client demographics', () => {
   const body = {
     client_id: 'c1', bp_systolic: 118, bp_diastolic: 70,

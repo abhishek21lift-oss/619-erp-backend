@@ -193,6 +193,9 @@ async function demographics(req, clientId, b) {
     // The recorded training level is the context that keeps a trained
     // athlete's 40–50 bpm resting rate from being flagged as bradycardia.
     athlete: (c && c.workout_experience_level) === 'athlete',
+    // K11's beginner rule reads the same recorded field; it is not inferred
+    // from age, body weight or any other measurement.
+    beginner: (c && c.workout_experience_level) === 'beginner',
   };
 }
 
@@ -278,7 +281,8 @@ function computeAssessment(b, age, gender, opts = {}) {
   const cardioScore = scoring.scoreCategory(cardioCategory);
 
   // ── Step 5: Strength (two-test battery; the combined score averages both) ──
-  const sd = b.strength_test_data || {};
+  const sd = b.strength_test_data && typeof b.strength_test_data === 'object' && !Array.isArray(b.strength_test_data)
+    ? { ...b.strength_test_data } : {};
   const lifts = [];
   const oneRmFor = (t, exercise) => {
     const formula = t.formula === 'brzycki' ? 'brzycki' : 'epley';
@@ -293,9 +297,35 @@ function computeAssessment(b, age, gender, opts = {}) {
   };
   const strengthOneRm1 = oneRmFor(sd.test1 || {}, b.strength_exercise);
   const strengthOneRm2 = oneRmFor(sd.test2 || {}, b.strength_exercise_2);
-  const strengthCategory = scoring.classifyStrength(strengthOneRm1, b.weight ?? null, b.strength_exercise || null, gender);
-  const strengthCategory2 = scoring.classifyStrength(strengthOneRm2, b.weight ?? null, b.strength_exercise_2 || null, gender);
+  // K11 norms need the sex- and age-specific table. K11 tables exist only for
+  // Bench Press and Leg Press; every other lift (including Squat, which K11
+  // names without supplying percentiles) returns no category.
+  const strengthDetail1 = scoring.classifyStrengthDetail(strengthOneRm1, b.weight ?? null, b.strength_exercise || null, gender, age);
+  const strengthDetail2 = scoring.classifyStrengthDetail(strengthOneRm2, b.weight ?? null, b.strength_exercise_2 || null, gender, age);
+  const strengthCategory = strengthDetail1 ? strengthDetail1.category : null;
+  const strengthCategory2 = strengthDetail2 ? strengthDetail2.category : null;
   const strengthScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(strengthCategory), scoring.scoreCategory(strengthCategory2));
+  // Percentile detail belongs to the test it was computed from. It rides in
+  // the existing JSONB (no migration); the category columns stay the source
+  // for the dashboard, score and historical rows. Explicit nulls on every
+  // recompute, so editing a lift to an unsupported one cannot leave stale
+  // K11 detail behind.
+  const withK11Detail = (test, detail) => (test && typeof test === 'object' && !Array.isArray(test)
+    ? {
+      ...test,
+      k11_percentile: detail ? detail.percentile : null,
+      k11_age_band: detail ? detail.ageBand : null,
+      strength_ratio: detail ? detail.ratio : null,
+    }
+    : test);
+  if (sd.test1 != null) sd.test1 = withK11Detail(sd.test1, strengthDetail1);
+  if (sd.test2 != null) sd.test2 = withK11Detail(sd.test2, strengthDetail2);
+  // K11: beginners should not undergo an initial maximal 1RM test — their
+  // priority is technique. This is a warning, not a new safety gate; existing
+  // vitals/medical stops remain the only blockers.
+  const beginnerStrengthWarning = opts.beginner && (b.strength_exercise || b.strength_exercise_2)
+    ? 'K11 guidance: beginners should not perform an initial maximal 1RM test — prioritise movement technique. Record a comfortable submaximal set (8–12 reps) in Strength Tracking instead.'
+    : null;
 
   // ── Step 6: Endurance (two tests, combined into one averaged score) ──
   const ed = b.endurance_test_data || {};
@@ -362,6 +392,7 @@ function computeAssessment(b, age, gender, opts = {}) {
   return {
     bpUnsafe: bpCategory === 'Hypertensive Crisis' || bpCategory === 'Hypertension Stage 2' || bpCategory === 'Hypotension',
     vitalsSafety,
+    strengthWarning: beginnerStrengthWarning,
     lifts,
     cols: {
       assessment_type: b.assessment_type || 'initial',
@@ -412,8 +443,8 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
     req, b.client_id, { requireActive: false, action: 'fitness_test' });
   if (blocked) return res.status(blocked.status).json(blocked.body);
 
-  const { age, gender, athlete } = await demographics(req, b.client_id, b);
-  const result = computeAssessment(b, age, gender, { userId: req.user.id, athlete });
+  const { age, gender, athlete, beginner } = await demographics(req, b.client_id, b);
+  const result = computeAssessment(b, age, gender, { userId: req.user.id, athlete, beginner });
   if (result.error) return res.status(result.error.status).json({ error: { code: result.error.code, message: result.error.message } });
 
   // The assessor is the studio's trainer profile, from the session. A
@@ -451,7 +482,7 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
   }
   res.status(201).json({
     data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety },
-    screening_warnings: screeningWarnings,
+    screening_warnings: result.strengthWarning ? [...screeningWarnings, result.strengthWarning] : screeningWarnings,
     retest,
     ...(retestError ? { retest_error: retestError } : {}),
   });
@@ -464,13 +495,14 @@ router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdate
   const existing = await assessmentsRepo.findAssessment(req, req.params.id);
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   const merged = { ...assessmentAsBody(existing), ...req.body };
-  const { age, gender, athlete } = await demographics(req, existing.client_id, merged);
+  const { age, gender, athlete, beginner } = await demographics(req, existing.client_id, merged);
   // The row's stored v3 battery travels beside the merged body: provenance
   // (recorded_at, assessor, override stamp) is write-once, so an edit that
   // does not change the battery round-trips it byte-identically.
   const result = computeAssessment(merged, age, gender, {
     userId: req.user.id,
     athlete,
+    beginner,
     existingFlexibility: asObject(existing.flexibility_test_data),
   });
   if (result.error) return res.status(result.error.status).json({ error: { code: result.error.code, message: result.error.message } });
@@ -488,7 +520,7 @@ router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdate
     throw err;
   }
   tx.release();
-  res.json({ data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety } });
+  res.json({ data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety, ...(result.strengthWarning ? { strength_warning: result.strengthWarning } : {}) } });
 }));
 
 router.delete('/assessments/:id', auth, requireTrainer, wrap(async (req, res) => {

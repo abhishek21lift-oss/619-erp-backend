@@ -17,8 +17,10 @@ describe('Harvard step test (F-2) — published fitness-index bands', () => {
 
 describe('no invented categories (F-4, F-8)', () => {
   test('a lift without norms has no strength category', () => {
-    expect(fitness.classifyStrength(100, 80, 'Lunges', 'Male')).toBeNull();
-    expect(fitness.classifyStrength(100, 80, 'Squat', 'Male')).toBe('Average');
+    expect(fitness.classifyStrength(100, 80, 'Lunges', 'Male', 30)).toBeNull();
+    // K11 names a Squat test but supplies no percentile table for it, so it
+    // must not borrow the bench-press numbers either.
+    expect(fitness.classifyStrength(100, 80, 'Squat', 'Male', 30)).toBeNull();
   });
 
   test('endurance tests without norms have no category; plank needs no sex', () => {
