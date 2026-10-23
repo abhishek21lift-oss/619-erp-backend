@@ -76,6 +76,9 @@ const assessmentCols = () => {
   return Object.fromEntries(keys.map((k, i) => [k, q.params[i]]));
 };
 const lift = (extra) => ({ client_id: 'c1', exercise_name: 'Squat', weight_kg: 100, reps_done: 5, ...extra });
+// Jan 1 makes the client exactly `age` on every run date (the birthday has
+// passed or is today), so the K11 age band is deterministic in CI.
+const dobForAge = (age) => `${new Date().getFullYear() - age}-01-01`;
 
 beforeEach(() => { mockBlocked = null; mockAssessmentOwned = true; mockExistingLog = null; mockClient = null; mockQueries.length = 0; });
 
@@ -170,6 +173,48 @@ describe('anthropometric classifications are persisted', () => {
     expect(cols.bmi_category).toBe('Obese');
     expect(cols.waist_risk).toBeNull();
     expect(cols.whr_risk).toBeNull();
+  });
+});
+
+describe('K11 YMCA step-test category is persisted from client demographics', () => {
+  const body = {
+    client_id: 'c1', bp_systolic: 118, bp_diastolic: 70,
+    cardio_test_type: 'YMCA 3-Minute Step Test', cardio_test_data: { recoveryHr: 90 },
+  };
+
+  test('a 30-year-old male at 90 bpm stores Above Average and 70', async () => {
+    mockClient = { gender: 'Male', dob: dobForAge(30), workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments').send(body);
+    expect(res.status).toBe(201);
+    const cols = assessmentCols();
+    expect(cols.cardio_category).toBe('Above Average');
+    expect(cols.cardio_score_computed).toBe(70);
+  });
+
+  test('a 30-year-old female at 94 bpm is graded on the female table', async () => {
+    mockClient = { gender: 'Female', dob: dobForAge(30), workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments').send(body);
+    expect(res.status).toBe(201);
+    const cols = assessmentCols();
+    expect(cols.cardio_category).toBe('Good');
+    expect(cols.cardio_score_computed).toBe(80);
+  });
+
+  test('the female 46–55 source gap at 94 bpm stays unclassified, never scored', async () => {
+    mockClient = { gender: 'Female', dob: dobForAge(50), workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments')
+      .send({ ...body, cardio_test_data: { recoveryHr: 94 } });
+    expect(res.status).toBe(201);
+    expect(assessmentCols().cardio_category).toBeNull();
+    expect(assessmentCols().cardio_score_computed).toBeNull();
+  });
+
+  test('outside 18–55 there is no K11 category and no invented score', async () => {
+    mockClient = { gender: 'Male', dob: dobForAge(60), workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments').send(body);
+    expect(res.status).toBe(201);
+    expect(assessmentCols().cardio_category).toBeNull();
+    expect(assessmentCols().cardio_score_computed).toBeNull();
   });
 });
 

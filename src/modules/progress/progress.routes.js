@@ -272,7 +272,7 @@ function computeAssessment(b, age, gender, opts = {}) {
     cardioCategory = scoring.classifyHarvardPei(pei);
     cd.pei = pei;
   } else if (b.cardio_test_type === 'YMCA 3-Minute Step Test') {
-    cardioCategory = scoring.classifyStepTestRecovery(num(cd.recoveryHr, null));
+    cardioCategory = scoring.classifyStepTestRecovery(num(cd.recoveryHr, null), age, gender);
   }
   if (vo2Max != null && !cardioCategory) cardioCategory = scoring.classifyVo2Max(vo2Max, age, gender);
   const cardioScore = scoring.scoreCategory(cardioCategory);
