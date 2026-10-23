@@ -23,16 +23,16 @@ describe('no invented categories (F-4, F-8)', () => {
     expect(fitness.classifyStrength(100, 80, 'Squat', 'Male', 30)).toBeNull();
   });
 
-  test('endurance tests without norms have no category; plank needs no sex', () => {
-    expect(fitness.classifyEndurance('Wall Sit', 90, 'Male')).toBeNull();
-    expect(fitness.classifyEndurance('Custom', 90, 'Female')).toBeNull();
-    expect(fitness.classifyEndurance('Plank', 90, null)).toBe('Good');
+  test('endurance tests without K11 norms have no category', () => {
+    expect(fitness.classifyEndurance('Wall Sit', 90, 'Male', 30)).toBeNull();
+    expect(fitness.classifyEndurance('Custom', 90, 'Female', 30)).toBeNull();
+    expect(fitness.classifyEndurance('Plank', 90, null, 30)).toBeNull();
   });
 
   test('an unknown sex no longer falls through to the female norms', () => {
-    expect(fitness.classifyEndurance('Push Up Test', 25, null)).toBeNull();
-    expect(fitness.classifyEndurance('Push Up Test', 25, 'Other')).toBeNull();
-    expect(fitness.classifyEndurance('Push Up Test', 25, 'male')).toBe(fitness.classifyEndurance('Push Up Test', 25, 'Male'));
+    expect(fitness.classifyEndurance('Push Up Test', 25, null, 30)).toBeNull();
+    expect(fitness.classifyEndurance('Push Up Test', 25, 'Other', 30)).toBeNull();
+    expect(fitness.classifyEndurance('Push Up Test', 25, 'male', 30)).toBe(fitness.classifyEndurance('Push Up Test', 25, 'Male', 30));
     expect(fitness.scoreBodyComposition(15, null)).toBeNull();
   });
 });
@@ -121,7 +121,7 @@ describe('body composition prerequisites (F14)', () => {
   });
   test('still scores supported genders', () => {
     expect(fitness.scoreBodyComposition(15, 'Male')).toBe(100);
-    expect(fitness.scoreBodyComposition(25, 'Female')).toBe(100);
+    expect(fitness.scoreBodyComposition(25, 'Female')).toBe(80);
   });
 });
 

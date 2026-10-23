@@ -14,8 +14,8 @@ jest.mock('../db/pool', () => {
   const run = async (sql, params) => {
     const text = String(sql).replace(/\s+/g, ' ').trim();
     mockQueries.push({ sql: text, params });
-    if (/^SELECT dob, gender FROM pt_clients/i.test(text)) {
-      return { rows: [{ dob: '1990-05-01', gender: 'Male' }], rowCount: 1 };
+    if (/^SELECT dob, gender/i.test(text)) {
+      return { rows: [{ dob: '1990-05-01', gender: 'Male', workout_experience_level: 'intermediate' }], rowCount: 1 };
     }
     if (/^SELECT \* FROM pt_assessments/i.test(text)) {
       return { rows: mockExistingAssessment ? [mockExistingAssessment] : [], rowCount: mockExistingAssessment ? 1 : 0 };
@@ -108,7 +108,7 @@ beforeEach(() => {
 });
 
 describe('POST /progress/assessments — K11 battery', () => {
-  test('stores the derived v3 payload, with no invented category or mobility score', async () => {
+  test('stores the derived v3 payload, with the K11 sit-and-reach norm and no mobility score', async () => {
     const res = await post({ flexibility_test_data: battery() });
     expect(res.status).toBe(201);
 
@@ -117,7 +117,9 @@ describe('POST /progress/assessments — K11 battery', () => {
     expect(stored.protocol_version).toBe('k11-2026.01');
     expect(stored.tests.quadriceps.sides_interpretation).toEqual({ left: 'Normal', right: 'Normal' });
     expect(stored.tests.sit_and_reach.score_inches).toBe(1); // 16 in − 15 in zero point
-    expect(stored.tests.sit_and_reach.norm.message).toBe('Norm classification unavailable');
+    expect(stored.tests.sit_and_reach.norm.category).toBe('Good'); // male 36, 16 in
+    expect(stored.tests.sit_and_reach.norm.table_version).toBe('k11-2026.01-sit-and-reach');
+    expect(stored.tests.sit_and_reach.norm.message).toBe('K11 age/sex sit-and-reach norm');
     expect(stored.assessor_id).toBe('u1'); // from the session, never the body
     expect(stored.override).toEqual({ used: false, reason: null, by: null, at: null });
     expect(typeof stored.recorded_at).toBe('string');
