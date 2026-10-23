@@ -5,6 +5,8 @@
 // between the two apps). Scores/analysis are always computed here
 // (server-side), never trusted from client-submitted values.
 
+const { z } = require('../../lib/validation');
+
 function round(n, decimals = 2) {
   const f = 10 ** decimals;
   return Math.round(n * f) / f;
@@ -61,6 +63,55 @@ function calcSafeWeeklyRate(startingWeight, direction) {
   return null;
 }
 
+// ── K11 measurable targets ──────────────────────────────────
+// Weight keeps the Phase-1 kg/week benchmarks above. The other metrics get
+// conservative general-population benchmarks, not clinical guidance:
+// body fat 0.25 percentage points/week, strength 0.5% of the current lift/
+// week. A session count is a weekly frequency, so it has no rate at all.
+const K11_METRICS = ['weight', 'body_fat', 'lift', 'sessions', 'custom'];
+
+function calcSafeWeeklyRateFor(metric, current, direction) {
+  if (direction == null || direction === 'maintain') return null;
+  if (metric === 'body_fat') return 0.25;
+  if (metric === 'lift') return current != null && current > 0 ? round(current * 0.005) : null;
+  if (metric === 'sessions' || metric === 'custom') return null;
+  return calcSafeWeeklyRate(current, direction);
+}
+
+const k11MeasureNumber = z.preprocess(
+  (v) => (v === '' || v === null || v === undefined ? undefined : v),
+  z.coerce.number().min(0).max(10000).optional()
+);
+
+// A target of zero is not a goal: it would divide the plan by nothing.
+const k11TargetNumber = z.preprocess(
+  (v) => (v === '' || v === null || v === undefined ? undefined : v),
+  z.coerce.number().gt(0).max(10000)
+);
+
+const k11Schema = z.object({
+  measure: z.object({
+    metric: z.enum(K11_METRICS),
+    exercise: z.string().max(100).optional().nullable(),
+    label: z.string().max(100).optional().nullable(),
+    current: k11MeasureNumber,
+    target: k11TargetNumber,
+    unit: z.string().max(20).optional().nullable(),
+  }).optional().nullable(),
+  client_agreement: z.boolean().optional(),
+  client_expectation: z.string().max(1000).optional().nullable(),
+});
+
+/**
+ * Validate the K11 block before it is stored in routine_blueprint.
+ * null = absent, undefined = invalid (the route answers 400).
+ */
+function sanitizeK11(raw) {
+  if (raw == null) return null;
+  const parsed = k11Schema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
+}
+
 // ── Difficulty ───────────────────────────────────────────────
 const DIFFICULTY_LEVELS = ['Easy', 'Moderate', 'Hard', 'Very Hard'];
 function classifyGoalDifficulty(requiredRate, safeRate, lifestyleReadinessScore, motivationLevel, commitmentLevel) {
@@ -100,12 +151,18 @@ function recommendPtDurationMonths(estimatedWeeks) {
 }
 
 // ── Risk factors ─────────────────────────────────────────────
-function buildRiskFactors({ requiredRate, safeRate, lifestyleReadinessScore, medicalRestrictions, daysRemaining, motivationLevel, commitmentLevel }) {
+function buildRiskFactors({ requiredRate, safeRate, lifestyleReadinessScore, medicalRestrictions, daysRemaining, motivationLevel, commitmentLevel, metric }) {
   const risks = [];
   const ratio = requiredRate != null && safeRate ? Math.abs(requiredRate) / safeRate : null;
 
   if (ratio != null && ratio > 1.5) {
-    risks.push('Required weekly rate of change exceeds safe guidelines for this timeline.');
+    if (metric === 'lift') {
+      risks.push('Required weekly strength gain exceeds the 0.5% of current lift / week benchmark.');
+    } else if (metric === 'body_fat') {
+      risks.push('Required body-fat change exceeds the 0.25 percentage points / week benchmark.');
+    } else {
+      risks.push('Required weekly rate of change exceeds safe guidelines for this timeline.');
+    }
   }
   if (lifestyleReadinessScore != null && lifestyleReadinessScore < 40) {
     risks.push('Low lifestyle readiness — schedule, sleep, or support may limit consistency.');
@@ -126,10 +183,13 @@ function buildRiskFactors({ requiredRate, safeRate, lifestyleReadinessScore, med
 }
 
 module.exports = {
+  K11_METRICS,
+  sanitizeK11,
   calcLifestyleReadinessScore,
   goalDirection,
   calcRequiredWeeklyRate,
   calcSafeWeeklyRate,
+  calcSafeWeeklyRateFor,
   classifyGoalDifficulty,
   calcEstimatedDurationWeeks,
   recommendPtDurationMonths,
