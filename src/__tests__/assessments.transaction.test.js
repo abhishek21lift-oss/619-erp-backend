@@ -85,12 +85,12 @@ describeIf('assessment transaction atomicity', () => {
     const { rows: c } = await pool.query('SELECT weight, height FROM pt_clients WHERE id = $1', [CID]);
     expect(Number(c[0].weight)).toBe(80);
     // K11 detail rides in the existing strength JSONB; no migration.
-    // 60 kg × 8 reps Epley = 76 kg; 76 / 80 = 0.95. Male 30–39 bench is 30th
-    // at 0.93, so the stored percentile is 30.
+    // 60 kg × 8 reps Epley = 76 kg; 76 / 80 = 0.95. Male 30–39 bench is 50th
+    // at 0.93 and 60th at 0.98, so the stored percentile is 50.
     const strength = typeof a[0].strength_test_data === 'string'
       ? JSON.parse(a[0].strength_test_data) : a[0].strength_test_data;
-    expect(a[0].strength_category).toBe('Below Average');
-    expect(strength.test1).toMatchObject({ k11_percentile: 30, k11_age_band: '30-39', strength_ratio: 0.95 });
+    expect(a[0].strength_category).toBe('Average');
+    expect(strength.test1).toMatchObject({ k11_percentile: 50, k11_age_band: '30-39', strength_ratio: 0.95 });
   });
 
   test('delete removes assessment row and its lifts', async () => {
