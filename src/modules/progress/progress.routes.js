@@ -580,21 +580,52 @@ const goalUpdateSchema = {
 
 // Shared by POST (create) and PATCH (update) so the Smart Goal Analysis
 // columns never drift out of sync between the two write paths.
-function computeGoalAnalysis({ startingWeight, targetWeight, targetDate, lifestyleReadiness, motivationLevel, commitmentLevel }) {
+//
+// The measured value is the K11 block when the goal has one, else the legacy
+// weight/body-fat columns. K11 data lives in routine_blueprint (no
+// migration); the stored kg/week columns hold the metric's own unit.
+function effectiveMeasure({ startingWeight, targetWeight, startingBodyFat, targetBodyFat, routineBlueprint }) {
+  const k11 = asObject(routineBlueprint)?.k11;
+  const m = k11 && typeof k11 === 'object' ? k11.measure : null;
+  if (m && typeof m === 'object' && m.metric) {
+    if (m.metric === 'weight') {
+      return { metric: 'weight', current: startingWeight ?? m.current ?? null, target: targetWeight ?? m.target ?? null };
+    }
+    if (m.metric === 'body_fat') {
+      return { metric: 'body_fat', current: startingBodyFat ?? m.current ?? null, target: targetBodyFat ?? m.target ?? null };
+    }
+    return { metric: m.metric, current: m.current ?? null, target: m.target ?? null };
+  }
+  if (targetWeight != null) return { metric: 'weight', current: startingWeight, target: targetWeight };
+  if (targetBodyFat != null) return { metric: 'body_fat', current: startingBodyFat, target: targetBodyFat };
+  return null;
+}
+
+function computeGoalAnalysis({ startingWeight, targetWeight, startingBodyFat, targetBodyFat, targetDate, lifestyleReadiness, motivationLevel, commitmentLevel, routineBlueprint }) {
   const daysRemaining = targetDate ? Math.ceil((new Date(targetDate).getTime() - Date.now()) / 86400000) : null;
-  const direction = goalScoring.goalDirection(startingWeight, targetWeight);
-  const requiredRate = goalScoring.calcRequiredWeeklyRate(startingWeight, targetWeight, daysRemaining);
-  const safeRate = goalScoring.calcSafeWeeklyRate(startingWeight, direction);
+  const measure = effectiveMeasure({ startingWeight, targetWeight, startingBodyFat, targetBodyFat, routineBlueprint });
+  const direction = measure ? goalScoring.goalDirection(measure.current, measure.target) : null;
+  const requiredRate = measure ? goalScoring.calcRequiredWeeklyRate(measure.current, measure.target, daysRemaining) : null;
+  const safeRate = measure ? goalScoring.calcSafeWeeklyRateFor(measure.metric, measure.current, direction) : null;
   const lifestyleScore = goalScoring.calcLifestyleReadinessScore(lifestyleReadiness || null);
   const difficulty = goalScoring.classifyGoalDifficulty(requiredRate, safeRate, lifestyleScore, motivationLevel, commitmentLevel);
-  const estimatedWeeks = goalScoring.calcEstimatedDurationWeeks(startingWeight, targetWeight, safeRate);
+  const estimatedWeeks = measure ? goalScoring.calcEstimatedDurationWeeks(measure.current, measure.target, safeRate) : null;
   const recommendedMonths = goalScoring.recommendPtDurationMonths(estimatedWeeks);
   const riskFactors = goalScoring.buildRiskFactors({
     requiredRate, safeRate, lifestyleReadinessScore: lifestyleScore,
     medicalRestrictions: lifestyleReadiness ? lifestyleReadiness.medical_restrictions === true : null,
-    daysRemaining, motivationLevel, commitmentLevel,
+    daysRemaining, motivationLevel, commitmentLevel, metric: measure?.metric ?? null,
   });
   return { lifestyleScore, difficulty, estimatedWeeks, recommendedMonths, requiredRate, safeRate, riskFactors };
+}
+
+/** Validate and normalise the K11 block on a write. undefined = invalid. */
+function cleanK11(routineBlueprint) {
+  const rb = asObject(routineBlueprint);
+  if (!rb || rb.k11 == null) return { rb, k11: null };
+  const k11 = goalScoring.sanitizeK11(rb.k11);
+  if (k11 === undefined) return { rb, k11: undefined };
+  return { rb: { ...rb, k11 }, k11 };
 }
 
 router.get('/goals', auth, wrap(async (req, res) => {
@@ -614,6 +645,14 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
+  // K11 block is stored in routine_blueprint; validate it here so a typo in
+  // a measurement cannot reach the JSONB and silently break analysis.
+  const cleaned = cleanK11(b.routine_blueprint);
+  if (cleaned.k11 === undefined) {
+    return res.status(400).json({ error: { code: 'INVALID_K11', message: 'The goal measurement is invalid.' } });
+  }
+  if (cleaned.rb && b.routine_blueprint != null) b.routine_blueprint = cleaned.rb;
+
   // Starting weight/body-fat: prefer client-submitted (manual entry when no
   // assessment exists yet), else snapshot the client's latest assessment.
   let startingWeight = b.starting_weight ?? null;
@@ -631,8 +670,11 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
   }
 
   const analysis = computeGoalAnalysis({
-    startingWeight, targetWeight: b.target_weight ?? null, targetDate: b.target_date || null,
+    startingWeight, targetWeight: b.target_weight ?? null,
+    startingBodyFat, targetBodyFat: b.target_body_fat ?? null,
+    targetDate: b.target_date || null,
     lifestyleReadiness: b.lifestyle_readiness || null, motivationLevel: b.motivation_level ?? null, commitmentLevel: b.commitment_level ?? null,
+    routineBlueprint: b.routine_blueprint ?? null,
   });
 
   const { rows } = await pool.query(
@@ -705,6 +747,12 @@ router.patch('/goals/:id', auth, validate(goalUpdateSchema), wrap(async (req, re
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
+  const cleaned = cleanK11(req.body.routine_blueprint !== undefined ? req.body.routine_blueprint : existing.routine_blueprint);
+  if (cleaned.k11 === undefined) {
+    return res.status(400).json({ error: { code: 'INVALID_K11', message: 'The goal measurement is invalid.' } });
+  }
+  if (req.body.routine_blueprint !== undefined) req.body.routine_blueprint = cleaned.rb;
+
   const sets = []; const params = [req.params.id];
   for (const key of allowed) {
     if (req.body[key] !== undefined) {
@@ -719,10 +767,13 @@ router.patch('/goals/:id', auth, validate(goalUpdateSchema), wrap(async (req, re
   const analysis = computeGoalAnalysis({
     startingWeight: merged.starting_weight != null ? parseFloat(merged.starting_weight) : null,
     targetWeight: merged.target_weight != null ? parseFloat(merged.target_weight) : null,
+    startingBodyFat: merged.starting_body_fat_pct != null ? parseFloat(merged.starting_body_fat_pct) : null,
+    targetBodyFat: merged.target_body_fat != null ? parseFloat(merged.target_body_fat) : null,
     targetDate: merged.target_date || null,
     lifestyleReadiness: merged.lifestyle_readiness || null,
     motivationLevel: merged.motivation_level != null ? parseInt(merged.motivation_level, 10) : null,
     commitmentLevel: merged.commitment_level != null ? parseInt(merged.commitment_level, 10) : null,
+    routineBlueprint: merged.routine_blueprint ?? null,
   });
 
   for (const [col, val] of Object.entries({
