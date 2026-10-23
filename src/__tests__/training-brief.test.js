@@ -203,6 +203,36 @@ describe('anthropometric norm labels', () => {
   });
 });
 
+describe('K11 strength percentiles', () => {
+  it('carries the category and both stored percentiles', () => {
+    const brief = buildBrief({
+      client: CLIENT,
+      assessment: {
+        assessment_date: '2026-07-01',
+        strength_score_computed: 80,
+        strength_category: 'Well Above Average',
+        strength_test_data: JSON.stringify({
+          test1: { k11_percentile: 80, k11_age_band: '30-39', strength_ratio: 1.17 },
+          test2: { k11_percentile: 30 },
+        }),
+      },
+    });
+    expect(brief.sections.capacity.strength).toEqual({
+      score: 80, category: 'Well Above Average', percentile: 80, percentile_2: 30,
+    });
+  });
+
+  it('leaves a legacy row without percentiles rather than re-deriving them', () => {
+    const brief = buildBrief({
+      client: CLIENT,
+      assessment: { assessment_date: '2026-07-01', strength_category: 'Average' },
+    });
+    expect(brief.sections.capacity.strength).toEqual({
+      score: null, category: 'Average', percentile: null, percentile_2: null,
+    });
+  });
+});
+
 describe('ageFrom', () => {
   it('is null rather than NaN for a missing or unusable dob', () => {
     expect(ageFrom(null)).toBeNull();

@@ -9,7 +9,7 @@
 // Persisting it per assessment requires the approval-gated migration described
 // in F10 (new nullable `scoring_formula_version` column on pt_assessments);
 // until then this is documentation only and legacy rows are treated as unknown.
-const FITNESS_SCORING_VERSION = '3';
+const FITNESS_SCORING_VERSION = '4';
 
 function round(n, decimals = 1) {
   const f = 10 ** decimals;
@@ -342,41 +342,101 @@ function calc1RM(weightKg, reps, formula) {
   return round(weightKg * (1 + reps / 30), 1);
 }
 
-// Relative-strength standards (1RM ÷ bodyweight), gender- and exercise-split,
-// single scale (no age bands) — Phase 1 simplification, same spirit as the
-// endurance/VO2max tables above. Approximate published strength-standard
-// ratios, rounded for a small maintainable table.
-const STRENGTH_NORMS = {
+// K11 relative-strength norms: 1RM ÷ body weight, by sex, exercise and the
+// age at the test. Each row is [percentile, minimum ratio]; a ratio at or above
+// the minimum belongs to that percentile. Values supplied exactly as given.
+//
+// Only Bench Press (upper body) and Leg Press (lower body) have supplied K11
+// tables. K11 names Squat as an alternative lower-body test but supplies no
+// Squat percentiles, and Deadlift / Shoulder Press have none either — those
+// lifts therefore get no K11 category rather than borrowed Leg Press or
+// bench-press thresholds.
+const K11_STRENGTH_NORMS = {
   Male: {
-    'Bench Press':    [1.5, 1.15, 0.85, 0.6],
-    'Squat':          [2.0, 1.5, 1.15, 0.85],
-    'Deadlift':       [2.25, 1.75, 1.35, 1.0],
-    'Shoulder Press': [0.9, 0.7, 0.5, 0.35],
-    'Leg Press':      [2.5, 2.0, 1.5, 1.0],
+    'Bench Press': {
+      '20-29': [[90, 1.48], [80, 1.32], [70, 1.22], [60, 1.14], [50, 1.06], [40, 0.99], [30, 0.93], [20, 0.88], [10, 0.80]],
+      '30-39': [[90, 1.24], [80, 1.12], [70, 1.04], [60, 0.98], [50, 0.93], [40, 0.88], [30, 0.83], [20, 0.78], [10, 0.71]],
+      '40-49': [[90, 1.10], [80, 1.00], [70, 0.93], [60, 0.88], [50, 0.84], [40, 0.80], [30, 0.76], [20, 0.72], [10, 0.65]],
+      '50-59': [[90, 0.97], [80, 0.90], [70, 0.84], [60, 0.79], [50, 0.75], [40, 0.71], [30, 0.68], [20, 0.63], [10, 0.57]],
+      '60+':   [[90, 0.89], [80, 0.82], [70, 0.77], [60, 0.72], [50, 0.68], [40, 0.66], [30, 0.63], [20, 0.57], [10, 0.53]],
+    },
+    'Leg Press': {
+      '20-29': [[90, 2.27], [80, 2.13], [70, 2.05], [60, 1.97], [50, 1.91], [40, 1.83], [30, 1.74], [20, 1.63], [10, 1.51]],
+      '30-39': [[90, 2.07], [80, 1.93], [70, 1.85], [60, 1.77], [50, 1.71], [40, 1.65], [30, 1.59], [20, 1.52], [10, 1.43]],
+      '40-49': [[90, 1.92], [80, 1.82], [70, 1.74], [60, 1.68], [50, 1.62], [40, 1.57], [30, 1.51], [20, 1.44], [10, 1.35]],
+      '50-59': [[90, 1.80], [80, 1.71], [70, 1.64], [60, 1.58], [50, 1.52], [40, 1.46], [30, 1.39], [20, 1.32], [10, 1.22]],
+      '60+':   [[90, 1.73], [80, 1.62], [70, 1.56], [60, 1.49], [50, 1.43], [40, 1.38], [30, 1.30], [20, 1.25], [10, 1.16]],
+    },
   },
   Female: {
-    'Bench Press':    [1.0, 0.75, 0.55, 0.4],
-    'Squat':          [1.5, 1.15, 0.85, 0.6],
-    'Deadlift':       [1.75, 1.35, 1.0, 0.75],
-    'Shoulder Press': [0.6, 0.45, 0.35, 0.25],
-    'Leg Press':      [2.0, 1.5, 1.15, 0.85],
+    // The supplied female tables stop at the 20th percentile. No 10th-percentile
+    // row is invented; a lower ratio is reported as below the supported range.
+    'Bench Press': {
+      '20-29': [[90, 0.90], [80, 0.80], [70, 0.74], [60, 0.70], [50, 0.65], [40, 0.59], [30, 0.56], [20, 0.51]],
+      '30-39': [[90, 0.76], [80, 0.70], [70, 0.63], [60, 0.60], [50, 0.57], [40, 0.53], [30, 0.51], [20, 0.47]],
+      '40-49': [[90, 0.71], [80, 0.62], [70, 0.57], [60, 0.54], [50, 0.52], [40, 0.50], [30, 0.47], [20, 0.43]],
+      '50-59': [[90, 0.61], [80, 0.55], [70, 0.52], [60, 0.48], [50, 0.46], [40, 0.44], [30, 0.42], [20, 0.39]],
+      '60+':   [[90, 0.64], [80, 0.54], [70, 0.51], [60, 0.47], [50, 0.45], [40, 0.43], [30, 0.40], [20, 0.38]],
+    },
+    'Leg Press': {
+      '20-29': [[90, 1.82], [80, 1.68], [70, 1.58], [60, 1.50], [50, 1.44], [40, 1.37], [30, 1.27], [20, 1.22]],
+      '30-39': [[90, 1.61], [80, 1.47], [70, 1.39], [60, 1.33], [50, 1.27], [40, 1.21], [30, 1.15], [20, 1.09]],
+      '40-49': [[90, 1.48], [80, 1.37], [70, 1.29], [60, 1.23], [50, 1.18], [40, 1.13], [30, 1.08], [20, 1.02]],
+      '50-59': [[90, 1.37], [80, 1.25], [70, 1.17], [60, 1.10], [50, 1.05], [40, 0.99], [30, 0.95], [20, 0.88]],
+      '60+':   [[90, 1.32], [80, 1.18], [70, 1.13], [60, 1.04], [50, 0.99], [40, 0.93], [30, 0.88], [20, 0.85]],
+    },
   },
 };
-function classifyStrength(oneRM, bodyWeightKg, exercise, gender) {
-  if (oneRM == null || !bodyWeightKg) return null;
+
+const K11_PERCENTILE_CATEGORY = {
+  90: 'Well Above Average', 80: 'Well Above Average',
+  70: 'Above Average', 60: 'Above Average',
+  50: 'Average',
+  40: 'Below Average', 30: 'Below Average',
+  20: 'Well Below Average', 10: 'Well Below Average',
+};
+
+/** The K11 age band at the time of testing. Under 20 has no supplied norms. */
+function strengthAgeBand(age) {
+  if (age == null || !Number.isFinite(age) || age < 20) return null;
+  if (age < 30) return '20-29';
+  if (age < 40) return '30-39';
+  if (age < 50) return '40-49';
+  if (age < 60) return '50-59';
+  return '60+';
+}
+
+/**
+ * Full K11 classification, keeping the percentile separate from the category.
+ * Returns null when any input needed to pick a table is missing or invalid —
+ * a missing age, an unsupported sex, or a zero/negative/non-finite 1RM or body
+ * weight must not produce a confident category.
+ */
+function classifyStrengthDetail(oneRM, bodyWeightKg, exercise, gender, age) {
+  if (oneRM == null || !Number.isFinite(oneRM) || oneRM <= 0) return null;
+  if (bodyWeightKg == null || !Number.isFinite(bodyWeightKg) || bodyWeightKg <= 0) return null;
   const g = sexOf(gender);
   if (!g) return null;
-  // No published norms for this lift, no category — bench-press norms applied
-  // to a leg press or a lunge were an invented judgement.
-  const thresholds = STRENGTH_NORMS[g][exercise];
-  if (!thresholds) return null;
+  if (exercise !== 'Bench Press' && exercise !== 'Leg Press') return null;
+  const ageBand = strengthAgeBand(age);
+  if (!ageBand) return null;
   const ratio = oneRM / bodyWeightKg;
-  const [excellent, good, average, belowAverage] = thresholds;
-  if (ratio >= excellent) return 'Excellent';
-  if (ratio >= good) return 'Good';
-  if (ratio >= average) return 'Average';
-  if (ratio >= belowAverage) return 'Below Average';
-  return 'Poor';
+  if (!Number.isFinite(ratio) || ratio <= 0) return null;
+  const roundedRatio = round(ratio, 2);
+
+  for (const [percentile, minimum] of K11_STRENGTH_NORMS[g][exercise][ageBand]) {
+    if (ratio >= minimum) {
+      return { category: K11_PERCENTILE_CATEGORY[percentile], percentile, ratio: roundedRatio, ageBand };
+    }
+  }
+  // Below every supplied row: say exactly that, with no fabricated percentile.
+  return { category: 'Below Supported Range', percentile: null, ratio: roundedRatio, ageBand };
+}
+
+/** The stored/scored category only. `age` is the age at the time of testing. */
+function classifyStrength(oneRM, bodyWeightKg, exercise, gender, age) {
+  const detail = classifyStrengthDetail(oneRM, bodyWeightKg, exercise, gender, age);
+  return detail ? detail.category : null;
 }
 
 // ── Step 6: Muscular Endurance ──────────────────────────────
@@ -430,7 +490,10 @@ function classifyFlexibilityScore(score) {
 // ── Category → score mapping (used consistently across Cardio/
 //    Endurance/Mobility/Strength for the 0-100 dashboard scores) ──
 const CATEGORY_SCORES = {
-  Excellent: 95, Good: 80, 'Above Average': 70, Average: 60, 'Below Average': 40, Poor: 20, 'Very Poor': 10,
+  Excellent: 95, Good: 80,
+  'Well Above Average': 90, 'Above Average': 70, Average: 60, 'Below Average': 40,
+  'Well Below Average': 20, 'Below Supported Range': 20,
+  Poor: 20, 'Very Poor': 10,
 };
 function scoreCategory(category) {
   return CATEGORY_SCORES[category] ?? null;
@@ -517,6 +580,8 @@ module.exports = {
   classifyStepTestRecovery,
   calc1RM,
   classifyStrength,
+  classifyStrengthDetail,
+  strengthAgeBand,
   classifyEndurance,
   checkAsymmetry,
   classifyFlexibilityScore,
