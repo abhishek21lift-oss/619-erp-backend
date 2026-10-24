@@ -165,6 +165,31 @@ describeIf('Client journey, against a real database', () => {
     expect((await journey(id)).steps.find((s) => s.key === 'enrolment').state).toBe('renew');
   });
 
+  it('marks the welcome tour once and keeps the first timestamp', async () => {
+    const id = await newClient();
+    const first = await request().post(`/api/pt-os/clients/${id}/welcome-tour`);
+    expect(first.status).toBe(200);
+    expect(first.body.data.welcome_tour_completed_at).toBeTruthy();
+    const second = await request().post(`/api/pt-os/clients/${id}/welcome-tour`);
+    expect(second.body.data.welcome_tour_completed_at).toBe(first.body.data.welcome_tour_completed_at);
+    const { rows: [log] } = await pool.query(
+      `SELECT action FROM activity_log WHERE entity_id = $1 AND action = 'client.welcome_tour.complete'`, [id],
+    );
+    expect(log).toBeTruthy();
+  });
+
+  it('another studio cannot mark the welcome tour', async () => {
+    const id = await newClient();
+    mockOrg = OTHER_ORG;
+    try {
+      expect((await request().post(`/api/pt-os/clients/${id}/welcome-tour`)).status).toBe(404);
+    } finally {
+      mockOrg = ORG;
+    }
+    const { rows: [c] } = await pool.query('SELECT welcome_tour_completed_at FROM pt_clients WHERE id = $1', [id]);
+    expect(c.welcome_tour_completed_at).toBeNull();
+  });
+
   it('the interview is optional: enrolment does not wait for it', async () => {
     const id = await newClient();
     await screenClient(pool, { clientId: id, orgId: ORG });

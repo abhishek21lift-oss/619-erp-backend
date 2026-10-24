@@ -142,6 +142,19 @@ async function updateInterview(orgId, interviewId, userId, body) {
 
 // ── The journey ─────────────────────────────────────────────────────────────
 
+/** Record the K11 welcome and gym tour. Idempotent: the first timestamp stays. */
+async function markWelcomeTour(orgId, clientId) {
+  const { rows } = await pool.query(
+    `UPDATE pt_clients
+        SET welcome_tour_completed_at = COALESCE(welcome_tour_completed_at, NOW()),
+            updated_at = NOW()
+      WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL
+      RETURNING id, welcome_tour_completed_at`,
+    [clientId, orgId],
+  );
+  return rows[0] || null;
+}
+
 const STEP_ORDER = Object.freeze([
   'welcome_tour', 'enrolment', 'consent', 'parq', 'interview', 'goals', 'assessment', 'program_design',
 ]);
@@ -232,6 +245,6 @@ async function journey(orgId, clientId) {
 }
 
 module.exports = {
-  listInterviews, createInterview, updateInterview, journey,
+  listInterviews, createInterview, updateInterview, journey, markWelcomeTour,
   InterviewInputError, INTERVIEW_FIELDS, STEP_ORDER,
 };

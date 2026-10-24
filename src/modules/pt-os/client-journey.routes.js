@@ -29,6 +29,14 @@ router.get('/clients/:id/journey', wrap(async (req, res) => {
   res.json({ data: out });
 }));
 
+// POST /pt-os/clients/:id/welcome-tour — record the K11 welcome and gym tour.
+router.post('/clients/:id/welcome-tour', wrap(async (req, res) => {
+  const row = await svc.markWelcomeTour(orgIdOf(req), req.params.id);
+  if (!row) return res.status(404).json(NOT_FOUND);
+  await logActivity(req, 'client.welcome_tour.complete', 'pt_client', row.id, {});
+  res.json({ data: row });
+}));
+
 // GET /pt-os/clients/:id/interviews — newest first.
 router.get('/clients/:id/interviews', wrap(async (req, res) => {
   const rows = await svc.listInterviews(orgIdOf(req), req.params.id);
