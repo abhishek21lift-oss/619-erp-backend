@@ -228,6 +228,7 @@ async function isTrainingBlocked(clientId) {
 
 const ELIGIBILITY_BLOCKS = {
   CLIENT_NOT_ENROLLED: 'This client is not enrolled in PT yet. Enrol them before assigning or starting training.',
+  CLIENT_PENDING_ACTIVATION: 'This client is enrolled but not active yet. Complete their Informed Consent and PAR-Q to activate them.',
   TERM_EXPIRED: 'This client\'s PT term has ended. Renew their PT before assigning or starting training.',
   CLIENT_FROZEN: 'This client\'s membership is frozen. Unfreeze it before assigning or starting training.',
   CLIENT_NOT_ACTIVE: 'This client is not active. Reactivate them before assigning or starting training.',
@@ -256,7 +257,10 @@ async function loadClientFacts(orgId, clientId) {
 
 /** Which status block applies, or null when the client may train. */
 function statusBlock(facts) {
-  if (!facts.has_pt_term || facts.status === 'pending') return 'CLIENT_NOT_ENROLLED';
+  // A provisional enrolment has a term but is not activated until screening
+  // completes; saying "not enrolled" would send the trainer to the wrong page.
+  if (facts.status === 'pending') return facts.has_pt_term ? 'CLIENT_PENDING_ACTIVATION' : 'CLIENT_NOT_ENROLLED';
+  if (!facts.has_pt_term) return 'CLIENT_NOT_ENROLLED';
   if (facts.status === 'expired' || (facts.status === 'active' && facts.ended)) return 'TERM_EXPIRED';
   if (facts.status === 'frozen') return 'CLIENT_FROZEN';
   if (facts.status !== 'active') return 'CLIENT_NOT_ACTIVE';
@@ -295,6 +299,13 @@ async function checkTrainingEligibility(req, clientId, { requireActive = true, a
       await logActivity(req, 'training.blocked', 'pt_client', clientId, { reason: code.toLowerCase(), action });
       return { blocked: { status: 409, body: { error: ELIGIBILITY_BLOCKS[code], code } }, warnings: [], facts };
     }
+  } else if (facts.has_pt_term && facts.status === 'pending') {
+    // Fitness testing runs before enrolment in the old order, so it does not
+    // require an active term. A client who IS enrolled but still pending
+    // activation must not be tested — the screening is not complete.
+    const code = 'CLIENT_PENDING_ACTIVATION';
+    await logActivity(req, 'training.blocked', 'pt_client', clientId, { reason: code.toLowerCase(), action });
+    return { blocked: { status: 409, body: { error: ELIGIBILITY_BLOCKS[code], code } }, warnings: [], facts };
   }
 
   // Strict screening for a client who has never been enrolled. The medical
@@ -315,6 +326,34 @@ async function checkTrainingEligibility(req, clientId, { requireActive = true, a
 
   const { blocked, warnings } = await checkScreeningGate(req, clientId);
   return { blocked, warnings, facts };
+}
+
+/**
+ * Promote a provisionally enrolled client once their screening is complete.
+ *
+ * Enrolment writes the term before consent and the PAR-Q exist; the client
+ * stays `pending` so nothing trains. This is called after every write that can
+ * complete the picture (consent completed, PAR-Q submitted/edited, clearance
+ * approved) and moves them to `active` only when nothing is missing and
+ * nothing hard-blocks.
+ *
+ * @returns {Promise<boolean>} true only when this call moved pending → active
+ */
+async function maybeActivateClient(req, clientId) {
+  const orgId = require('./tenant-db').orgIdOf(req);
+  const facts = await loadClientFacts(orgId, clientId);
+  if (!facts || !facts.has_pt_term || facts.status !== 'pending') return false;
+  const { code, parq, consent } = await evaluate(clientId);
+  if (code || missingScreening(parq, consent).length) return false;
+  const { rows } = await pool.query(
+    `UPDATE pt_clients SET status = 'active', updated_at = NOW()
+      WHERE id = $1 AND organization_id = $2 AND status = 'pending' AND deleted_at IS NULL
+      RETURNING id`,
+    [clientId, orgId],
+  );
+  if (!rows[0]) return false;
+  await logActivity(req, 'client.activated', 'pt_client', clientId, {});
+  return true;
 }
 
 /**
@@ -371,6 +410,7 @@ const DRAFTS_SQL = `
  *           has_valid_clearance: boolean, complete: boolean, stale: boolean },
  *   block: null | { code: string, message: string },
  *   warnings: string[],
+ *   missing: ('informed_consent' | 'parq')[],
  *   complete: boolean,
  * }>}
  */
@@ -400,6 +440,7 @@ async function screeningSummary(clientId) {
     },
     block: code ? { code, message: BLOCKS[code] } : null,
     warnings,
+    missing: missingScreening(parq, consent),
     complete: !code && missingScreening(parq, consent).length === 0,
   };
 }
@@ -481,5 +522,5 @@ async function screeningGaps(orgId) {
 module.exports = {
   checkScreeningGate, isTrainingBlocked, parqBlocks, parqWarnings, validClearanceSql,
   checkTrainingEligibility, enrolmentScreeningBlock, statusBlock, missingScreening, screeningSummary,
-  screeningGaps, ELIGIBILITY_BLOCKS, PARQ_QUESTION_COUNT,
+  screeningGaps, maybeActivateClient, ELIGIBILITY_BLOCKS, PARQ_QUESTION_COUNT,
 };
