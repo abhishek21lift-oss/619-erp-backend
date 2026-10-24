@@ -28,7 +28,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { recordPtPayment } = require('../../lib/ptPayments');
 const { renewClient, addMonthsIso } = require('./renewal.service');
 const { genReceiptNo } = require('../../db/receipts');
-const { checkTrainingEligibility, enrolmentScreeningBlock, screeningSummary, screeningGaps } = require('../../lib/screeningGate');
+const { checkTrainingEligibility, screeningSummary, screeningGaps } = require('../../lib/screeningGate');
 const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
 
 /**
@@ -460,29 +460,38 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
     // Only ever a trainer profile in this studio — see lib/studioTrainer.js.
     const trainer_id = await resolveTrainerId(pool, orgIdOf(req), req.body.trainer_id);
 
-    // Enrolling here would skip screening. A new client cannot have signed a
-    // consent or answered a PAR-Q before they exist, so a package on create is
-    // refused: add the client, screen them, then enrol (PATCH /clients/:id).
-    // An existing client named by client_id is held to the same rule as
-    // enrolment if they have never had a term.
-    const wantsTerm = Boolean(pt_end_date) || Number(duration_months) > 0 || Boolean(pt_package_id);
+    // Enrolling here skips the consent and PAR-Q steps a new client cannot
+    // have done yet, so a package on create is refused: add the client, screen
+    // them, then enrol (PATCH /clients/:id). An existing client named by
+    // client_id is held to the same rule as enrolment if they have never had
+    // a term — allowed, but only provisionally, pending their screening.
+    const wantsTerm = Boolean(pt_end_date) || Number(duration_months) > 0
+      || Boolean(pt_package_id) || Number(base_amount) > 0;
     if (wantsTerm && !client_id) {
       return res.status(409).json({ error: {
         code: 'SCREENING_REQUIRED',
-        message: 'Add the client first, complete their Informed Consent and PAR-Q, then enrol them in PT.',
+        message: 'Add the client first, then enrol them from their profile.',
         missing: ['informed_consent', 'parq'],
       } });
     }
+    let provisional = false;
+    let hadTerm = false;
     if (wantsTerm && client_id) {
       const tParams = [client_id];
       const tOrg = orgWhere(req, tParams, 'c.organization_id');
       const { rows: [termRow] } = await pool.query(
-        `SELECT ${hasPtTermSql('c')} AS has_pt_term FROM pt_clients c
+        `SELECT ${hasPtTermSql('c')} AS has_pt_term, c.status FROM pt_clients c
           WHERE c.id = $1 AND c.deleted_at IS NULL${tOrg}`, tParams);
       if (!termRow) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-      if (!termRow.has_pt_term) {
-        const blocked = await enrolmentScreeningBlock(req, client_id);
-        if (blocked) return res.status(blocked.status).json(eligibilityError(blocked));
+      hadTerm = termRow.has_pt_term;
+      if (!hadTerm) {
+        const screening = await screeningSummary(client_id);
+        provisional = Boolean(screening.block || screening.missing.length);
+      } else if (termRow.status === 'pending') {
+        // Re-sending the enrol form for a provisional client must not skip
+        // the screening gate that keeps them pending.
+        const screening = await screeningSummary(client_id);
+        if (screening.block || screening.missing.length) provisional = true;
       }
     }
 
@@ -561,6 +570,12 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
       endDate = addMonthsIso(startDate, Number(resolvedDurationMonths));
     }
 
+    // Only a request that establishes a term promotes the status, and only to
+    // 'active' once the screening is complete. A provisional enrolment stays
+    // 'pending' until maybeActivateClient promotes it.
+    const termPromotes = Boolean(endDate) || finalAmt > 0 || Number(resolvedDurationMonths) > 0;
+    const nextStatus = termPromotes ? (provisional ? 'pending' : 'active') : null;
+
     const { rows } = await pool.query(`
       UPDATE pt_clients SET
         trainer_id        = COALESCE($2,  trainer_id),
@@ -597,17 +612,11 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
         address           = COALESCE($29, address),
         client_source     = COALESCE($30, client_source),
         -- Promote to 'active' only once the client is actually enrolled in a
-        -- package (has an end date, a charged amount, or a duration). A name-only
-        -- add stays 'pending' so it never shows in the active-clients list/counts.
-        -- Existing enrolled clients keep 'active' since COALESCE preserves their
-        -- stored package fields even when this edit doesn't touch them.
-        status = CASE
-          WHEN COALESCE($10, pt_end_date) IS NOT NULL
-            OR COALESCE($7, final_amount) > 0
-            OR COALESCE($11, duration_months) > 0
-          THEN 'active'
-          ELSE status
-        END,
+        -- package (has an end date, a charged amount, or a duration) AND their
+        -- screening is complete. A name-only add stays 'pending', and a
+        -- provisional enrolment stays 'pending' until maybeActivateClient
+        -- promotes it (see lib/screeningGate).
+        status = COALESCE($32, status),
         updated_at = NOW()
       WHERE id = $1 AND deleted_at IS NULL AND organization_id = $31
       RETURNING *
@@ -625,6 +634,7 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
       emergency_phone || null, emergency_contact_relationship || null,
       address || null, client_source || null,
       orgIdOf(req),
+      nextStatus,
     ]);
     // A client_id from the body that is not a live client of THIS studio
     // updates nothing. 404, not 403: another studio's id must look exactly
@@ -634,7 +644,13 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
     }
 
     await logActivity(req, 'client.create', 'pt_client', rows[0].id, rows[0]);
-    res.status(201).json({ data: rows[0] });
+    const screening = await screeningSummary(rows[0].id);
+    res.status(201).json({ data: {
+      ...rows[0],
+      activation_pending: rows[0].status === 'pending' && (hadTerm || termPromotes),
+      screening_missing: screening.missing,
+      screening_block: screening.block,
+    } });
   } catch (err) {
     logger.error({ err: err.message, body: req.body, user: req.user?.id }, 'PT OS create client failed');
     throw err;
@@ -832,6 +848,7 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
   const tx = await pool.connect();
   let rows = null;
   let ledger = null;
+  let activationPending = false;
   try {
     await tx.query('BEGIN');
     // Every refusal below ends the transaction before answering.
@@ -873,14 +890,15 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
       return refuse(400, { error: { code: 'VALIDATION', field: 'pt_end_date', message: 'The PT end date cannot be before the start date.' } });
     }
 
-    // Enrolling a client who has never had a term needs their screening done:
-    // a completed Informed Consent and a fully answered PAR-Q, and nothing
-    // medically blocking them (lib/screeningGate enrolmentScreeningBlock).
+    // Enrolling a client who has never had a term is allowed before their
+    // screening is done, but only provisionally: the term is written and the
+    // client stays pending until a completed consent and a fully answered
+    // PAR-Q exist (lib/screeningGate maybeActivateClient promotes them).
     const establishingTerm = body.pt_end_date != null || Number(body.duration_months) > 0
       || (wantsFinalAmount && Number(body.final_amount) > 0);
     if (establishingTerm && !existing.has_pt_term) {
-      const blocked = await enrolmentScreeningBlock(req, req.params.id);
-      if (blocked) return refuse(blocked.status, eligibilityError(blocked));
+      const screening = await screeningSummary(req.params.id);
+      if (screening.block || screening.missing.length) body.status = 'pending';
     }
 
     // 'active' means a running term. Setting it on a client with no term, or
@@ -1016,6 +1034,10 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
     ));
     if (rows.length === 0) { rows = null; return refuse(404, { error: { code: 'NOT_FOUND', message: 'Client not found' } }); }
 
+    // Still pending with a term means the screening is not done — whether the
+    // term was written by this request or by an earlier provisional enrolment.
+    activationPending = rows[0].status === 'pending' && (Boolean(existing.has_pt_term) || looksEnrolled);
+
     // Term history: unlike /clients/:id/renew, this endpoint (the actual
     // enrollment action — see the enroll page) never wrote a row into
     // pt_client_subscriptions, so a client's first term never appeared on
@@ -1109,7 +1131,13 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
   // purely to capture prior state on every edit isn't worth the round trip
   // this record already gets from the UPDATE ... RETURNING above.
   await logActivity(req, 'client.update', 'pt_client', rows[0].id, rows[0]);
-  res.json({ data: rows[0] });
+  const screening = await screeningSummary(rows[0].id);
+  res.json({ data: {
+    ...rows[0],
+    activation_pending: activationPending,
+    screening_missing: screening.missing,
+    screening_block: screening.block,
+  } });
 }));
 
 // ─── Client photo upload ────────────────────────────────────

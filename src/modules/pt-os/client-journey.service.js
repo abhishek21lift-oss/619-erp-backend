@@ -202,10 +202,17 @@ async function journey(orgId, clientId) {
   else parqState = 'done';
 
   let enrolmentState;
-  if (c.has_pt_term && c.status === 'active' && !c.ended) enrolmentState = 'done';
-  else if (c.has_pt_term && (c.status === 'expired' || c.ended)) enrolmentState = 'renew';
-  else if (c.has_pt_term && c.status === 'frozen') enrolmentState = 'blocked';
-  else enrolmentState = screening.complete ? 'todo' : 'blocked';
+  if (c.has_pt_term && (c.status === 'expired' || c.ended)) enrolmentState = 'renew';
+  else if (c.has_pt_term && (c.status === 'frozen' || c.status === 'inactive')) enrolmentState = 'blocked';
+  else if (c.has_pt_term && (c.status === 'active' || c.status === 'pending')) enrolmentState = 'done';
+  else enrolmentState = 'todo';
+  const enrolmentDetail = enrolmentState === 'blocked'
+    ? (c.status === 'frozen'
+      ? 'This client\'s membership is frozen. Unfreeze it before enrolling.'
+      : 'This client is inactive. Reactivate them before enrolling.')
+    : c.status === 'pending' && c.has_pt_term
+      ? 'PT enrolled — activation pending screening.'
+      : undefined;
 
   // A plan can only be built for a client who may train. A provisional
   // enrolment (pending until screening completes) is done as a step but not
@@ -224,8 +231,7 @@ async function journey(orgId, clientId) {
     },
     {
       key: 'enrolment', state: enrolmentState,
-      ...(enrolmentState === 'blocked' && !c.has_pt_term
-        ? { detail: 'Complete the Informed Consent and PAR-Q before enrolling.' } : {}),
+      ...(enrolmentDetail ? { detail: enrolmentDetail } : {}),
     },
     { key: 'consent', state: consentState, ...(consentState === 'blocked' ? { detail: screening.block?.message } : {}) },
     { key: 'parq', state: parqState, ...(parqState === 'blocked' ? { detail: screening.block?.message } : {}) },

@@ -65,7 +65,8 @@ jest.mock('../../lib/activityLog', () => ({ logActivity: jest.fn(async () => {})
 jest.mock('../../lib/screeningGate', () => ({
   checkScreeningGate: jest.fn(async () => ({ blocked: null, warnings: [] })),
   checkTrainingEligibility: jest.fn(async () => ({ blocked: null, warnings: [] })),
-  enrolmentScreeningBlock: jest.fn(async () => null),
+  screeningSummary: jest.fn(async () => ({ missing: [], block: null, warnings: [], complete: true })),
+  maybeActivateClient: jest.fn(async () => false),
 }));
 jest.mock('../../modules/automation/automation.engine', () => ({
   memberCreated: jest.fn(async () => {}),
@@ -134,7 +135,7 @@ describe('POST /pt-os/clients — the body client_id is not a key to another stu
     // whatever its position.
     expect(update.sql).toMatch(/WHERE id = \$1 AND deleted_at IS NULL AND organization_id = \$31/);
     // The screening pre-read that enrolment now does is bound to the studio too.
-    const termRead = stmt(/AS has_pt_term FROM pt_clients c/i);
+    const termRead = stmt(/AS has_pt_term, c\.status FROM pt_clients c/i);
     expect(termRead.sql).toMatch(/c\.organization_id = \$2/);
     expect(termRead.params).toEqual([FOREIGN, ORG_A]);
     expect(update.params[30]).toBe(ORG_A);

@@ -356,27 +356,6 @@ async function maybeActivateClient(req, clientId) {
   return true;
 }
 
-/**
- * Enrolment's half: a client with no PT term may only be enrolled once their
- * screening is complete and nothing medically blocks them. Clients who
- * already have a term (renewals, edits) are not re-gated here.
- *
- * @returns {Promise<null | { status, body }>}
- */
-async function enrolmentScreeningBlock(req, clientId) {
-  const { code, parq, consent } = await evaluate(clientId);
-  if (code) {
-    await logActivity(req, 'enrolment.blocked', 'pt_client', clientId, { reason: code.toLowerCase() });
-    return { status: 403, body: { error: BLOCKS[code], code } };
-  }
-  const missing = missingScreening(parq, consent);
-  if (missing.length) {
-    await logActivity(req, 'enrolment.blocked', 'pt_client', clientId, { reason: 'screening_required', missing });
-    return { status: 403, body: { error: SCREENING_REQUIRED_MESSAGE, code: 'SCREENING_REQUIRED', missing } };
-  }
-  return null;
-}
-
 // ── What the profile shows ──────────────────────────────────────────────────
 //
 // The client profile summarised screening from the newest row of each list,
@@ -521,6 +500,6 @@ async function screeningGaps(orgId) {
 
 module.exports = {
   checkScreeningGate, isTrainingBlocked, parqBlocks, parqWarnings, validClearanceSql,
-  checkTrainingEligibility, enrolmentScreeningBlock, statusBlock, missingScreening, screeningSummary,
+  checkTrainingEligibility, statusBlock, missingScreening, screeningSummary,
   screeningGaps, maybeActivateClient, ELIGIBILITY_BLOCKS, PARQ_QUESTION_COUNT,
 };

@@ -98,35 +98,39 @@ describeIf('Client journey, against a real database', () => {
     const id = await newClient();
     let j = await journey(id);
     expect(states(j)).toEqual({
-      welcome_tour: 'todo', enrolment: 'blocked', consent: 'todo', parq: 'todo',
+      welcome_tour: 'todo', enrolment: 'todo', consent: 'todo', parq: 'todo',
       interview: 'todo', goals: 'todo', assessment: 'todo', program_design: 'blocked',
     });
     expect(j.next).toBe('welcome_tour');
-
-    // Enrolment is refused until screening is done (provisional enrolment
-    // arrives in a later change).
-    const early = await request().patch(`/api/pt-os/clients/${id}`).send({
-      status: 'active', pt_start_date: '2026-10-01', pt_end_date: '2026-12-31', duration_months: 3, final_amount: 9000, paid_amount: 0,
-    });
-    expect(early.body.error.code).toBe('SCREENING_REQUIRED');
 
     // Step 1: the welcome and gym tour.
     await pool.query(`UPDATE pt_clients SET welcome_tour_completed_at = NOW() WHERE id = $1`, [id]);
     expect((await journey(id)).next).toBe('enrolment');
 
-    await screenClient(pool, { clientId: id, orgId: ORG });
-    j = await journey(id);
-    expect(states(j)).toMatchObject({ welcome_tour: 'done', consent: 'done', parq: 'done', enrolment: 'todo' });
-    expect(j.next).toBe('enrolment');
-
-    // Enrol, then interview, goals and assessment in the K11 order.
-    const enrolled = await request().patch(`/api/pt-os/clients/${id}`).send({
+    // Step 2: enrol before screening — allowed, but only provisionally. The
+    // client stays pending until consent and the PAR-Q are complete.
+    const early = await request().patch(`/api/pt-os/clients/${id}`).send({
       status: 'active', pt_start_date: '2026-10-01', pt_end_date: '2026-12-31', duration_months: 3, final_amount: 9000, paid_amount: 0,
     });
-    expect(enrolled.status).toBe(200);
+    expect(early.status).toBe(200);
+    expect(early.body.data.status).toBe('pending');
+    expect(early.body.data.activation_pending).toBe(true);
     j = await journey(id);
-    expect(states(j)).toMatchObject({ enrolment: 'done' });
+    expect(states(j)).toMatchObject({ welcome_tour: 'done', enrolment: 'done', consent: 'todo', parq: 'todo' });
+    expect(j.steps.find((s) => s.key === 'enrolment')).toMatchObject({
+      detail: 'PT enrolled — activation pending screening.',
+    });
+    expect(j.next).toBe('consent');
+
+    // Steps 3 and 4: the screening, which completes the activation.
+    await screenClient(pool, { clientId: id, orgId: ORG });
+    j = await journey(id);
+    expect(states(j)).toMatchObject({ consent: 'done', parq: 'done', enrolment: 'done' });
     expect(j.next).toBe('interview');
+
+    const activated = await request().patch(`/api/pt-os/clients/${id}`).send({ status: 'active' });
+    expect(activated.status).toBe(200);
+    expect(activated.body.data.status).toBe('active');
 
     // The interview: a draft, then completed.
     const started = await request().post(`/api/pt-os/clients/${id}/interviews`).send({ training_history: 'Ran 5k twice a week' });
