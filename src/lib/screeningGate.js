@@ -293,9 +293,14 @@ async function checkTrainingEligibility(req, clientId, { requireActive = true, a
     return { blocked: { status: 404, body: { error: 'Client not found', code: 'NOT_FOUND' } }, warnings: [], facts: null };
   }
 
+  // A provisional enrolment still owes its screening. Defer that 409 until
+  // after the screening gate, so a medical hard stop names the real reason.
+  let pendingActivation = false;
   if (requireActive) {
     const code = statusBlock(facts);
-    if (code) {
+    if (code === 'CLIENT_PENDING_ACTIVATION') {
+      pendingActivation = true;
+    } else if (code) {
       await logActivity(req, 'training.blocked', 'pt_client', clientId, { reason: code.toLowerCase(), action });
       return { blocked: { status: 409, body: { error: ELIGIBILITY_BLOCKS[code], code } }, warnings: [], facts };
     }
@@ -303,9 +308,7 @@ async function checkTrainingEligibility(req, clientId, { requireActive = true, a
     // Fitness testing runs before enrolment in the old order, so it does not
     // require an active term. A client who IS enrolled but still pending
     // activation must not be tested — the screening is not complete.
-    const code = 'CLIENT_PENDING_ACTIVATION';
-    await logActivity(req, 'training.blocked', 'pt_client', clientId, { reason: code.toLowerCase(), action });
-    return { blocked: { status: 409, body: { error: ELIGIBILITY_BLOCKS[code], code } }, warnings: [], facts };
+    pendingActivation = true;
   }
 
   // Strict screening for a client who has never been enrolled. The medical
@@ -325,6 +328,11 @@ async function checkTrainingEligibility(req, clientId, { requireActive = true, a
   }
 
   const { blocked, warnings } = await checkScreeningGate(req, clientId);
+  if (!blocked && pendingActivation) {
+    const code = 'CLIENT_PENDING_ACTIVATION';
+    await logActivity(req, 'training.blocked', 'pt_client', clientId, { reason: code.toLowerCase(), action });
+    return { blocked: { status: 409, body: { error: ELIGIBILITY_BLOCKS[code], code } }, warnings, facts };
+  }
   return { blocked, warnings, facts };
 }
 

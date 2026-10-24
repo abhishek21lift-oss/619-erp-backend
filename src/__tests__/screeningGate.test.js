@@ -186,6 +186,15 @@ describe('a provisionally enrolled client is pending until screening completes',
       .toBe('CLIENT_NOT_ENROLLED');
   });
 
+  test('a medical hard stop is reported before the pending activation', async () => {
+    mockClient = { id: 'c1', status: 'pending', has_pt_term: true, ended: false };
+    mockConsent = completed;
+    mockParq = { ...cleanParq, risk_level: 'high', has_valid_clearance: false };
+    const { blocked } = await checkTrainingEligibility(req, 'c1');
+    expect(blocked.status).toBe(403);
+    expect(blocked.body.code).toBe('PARQ_BLOCKED');
+  });
+
   test('a pending client with a term cannot be fitness-tested either', async () => {
     mockClient = { id: 'c1', status: 'pending', has_pt_term: true, ended: false };
     mockParq = cleanParq;

@@ -334,7 +334,9 @@ router.get('/parq/forms/:id/gate-status', auth, wrap(async (req, res) => {
   // and the Assign button stayed disabled for a client just cleared.
   const gate = await recomputeGateStatus(pool, req.params.id);
   if (!gate) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-  res.json({ data: gate });
+  // client_id is carried for maybeActivateClient on the write paths; it is not
+  // part of this endpoint's published shape.
+  res.json({ data: { workout_gate_status: gate.workout_gate_status, risk_level: gate.risk_level } });
 }));
 
 // POST /parq/forms
