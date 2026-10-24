@@ -1,8 +1,8 @@
 'use strict';
-// The intake journey, and its one missing step: the Client Interview.
+// The intake journey, in the K11 onboarding order:
 //
-//   Registration → Informed Consent → PAR-Q → Client Interview →
-//   Fitness Assessment → Goals → PT Enrolment → Workout Plan
+//   Welcome & Gym Tour → PT Enrolment → Informed Consent → PAR-Q →
+//   Client Interview → Goals → Fitness Assessment → Program Design
 //
 // Each step's state is read here, live and org-scoped, from the record that
 // step produces — never from what a screen last showed. The profile's journey
@@ -10,7 +10,8 @@
 // the gates that enforce the order (lib/screeningGate).
 //
 // The interview is optional (studio decision, Phase 2, 2026-10-02): it shows
-// as a step with its status and never blocks enrolment.
+// as a step with its status and never blocks enrolment. Registration is the
+// prerequisite for the journey, not one of its steps.
 
 const pool = require('../../db/pool');
 const { screeningSummary } = require('../../lib/screeningGate');
@@ -142,7 +143,7 @@ async function updateInterview(orgId, interviewId, userId, body) {
 // ── The journey ─────────────────────────────────────────────────────────────
 
 const STEP_ORDER = Object.freeze([
-  'registration', 'consent', 'parq', 'interview', 'assessment', 'goals', 'enrolment', 'workout_plan',
+  'welcome_tour', 'enrolment', 'consent', 'parq', 'interview', 'goals', 'assessment', 'program_design',
 ]);
 
 /**
@@ -157,7 +158,7 @@ const STEP_ORDER = Object.freeze([
  */
 async function journey(orgId, clientId) {
   const { rows: [c] } = await pool.query(
-    `SELECT c.id, c.status,
+    `SELECT c.id, c.status, c.welcome_tour_completed_at,
             ${hasPtTermSql('c')} AS has_pt_term,
             (c.pt_end_date IS NOT NULL AND c.pt_end_date < CURRENT_DATE) AS ended,
             (SELECT status FROM pt_client_interviews i
@@ -193,25 +194,37 @@ async function journey(orgId, clientId) {
   else if (c.has_pt_term && c.status === 'frozen') enrolmentState = 'blocked';
   else enrolmentState = screening.complete ? 'todo' : 'blocked';
 
+  // A plan can only be built for a client who may train. A provisional
+  // enrolment (pending until screening completes) is done as a step but not
+  // yet trainable.
+  const canTrain = c.status === 'active' && !c.ended;
+  const programDesignState = c.has_active_plan ? 'done'
+    : enrolmentState === 'done' && canTrain ? 'todo' : 'blocked';
+  const programDesignDetail = enrolmentState !== 'done'
+    ? 'Enrol the client in PT before assigning a plan.'
+    : 'Activate the client (complete screening) before assigning a plan.';
+
   const steps = [
-    { key: 'registration', state: 'done' },
+    {
+      key: 'welcome_tour',
+      state: c.welcome_tour_completed_at || c.has_pt_term ? 'done' : 'todo',
+    },
+    {
+      key: 'enrolment', state: enrolmentState,
+      ...(enrolmentState === 'blocked' && !c.has_pt_term
+        ? { detail: 'Complete the Informed Consent and PAR-Q before enrolling.' } : {}),
+    },
     { key: 'consent', state: consentState, ...(consentState === 'blocked' ? { detail: screening.block?.message } : {}) },
     { key: 'parq', state: parqState, ...(parqState === 'blocked' ? { detail: screening.block?.message } : {}) },
     {
       key: 'interview', optional: true,
       state: c.interview_status === 'completed' ? 'done' : c.interview_status === 'draft' ? 'in_progress' : 'todo',
     },
-    { key: 'assessment', state: c.has_assessment ? 'done' : 'todo' },
     { key: 'goals', state: c.has_goal ? 'done' : 'todo' },
+    { key: 'assessment', state: c.has_assessment ? 'done' : 'todo' },
     {
-      key: 'enrolment', state: enrolmentState,
-      ...(enrolmentState === 'blocked' && !c.has_pt_term
-        ? { detail: 'Complete the Informed Consent and PAR-Q before enrolling.' } : {}),
-    },
-    {
-      key: 'workout_plan',
-      state: c.has_active_plan ? 'done' : enrolmentState === 'done' ? 'todo' : 'blocked',
-      ...(!c.has_active_plan && enrolmentState !== 'done' ? { detail: 'Enrol the client in PT before assigning a plan.' } : {}),
+      key: 'program_design', state: programDesignState,
+      ...(programDesignState === 'blocked' ? { detail: programDesignDetail } : {}),
     },
   ];
   const next = steps.find((s) => s.state !== 'done')?.key ?? null;

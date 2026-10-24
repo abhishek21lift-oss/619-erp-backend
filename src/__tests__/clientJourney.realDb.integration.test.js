@@ -98,20 +98,34 @@ describeIf('Client journey, against a real database', () => {
     const id = await newClient();
     let j = await journey(id);
     expect(states(j)).toEqual({
-      registration: 'done', consent: 'todo', parq: 'todo', interview: 'todo', assessment: 'todo',
-      goals: 'todo', enrolment: 'blocked', workout_plan: 'blocked',
+      welcome_tour: 'todo', enrolment: 'blocked', consent: 'todo', parq: 'todo',
+      interview: 'todo', goals: 'todo', assessment: 'todo', program_design: 'blocked',
     });
-    expect(j.next).toBe('consent');
+    expect(j.next).toBe('welcome_tour');
 
-    // Enrolment is refused until screening is done.
+    // Enrolment is refused until screening is done (provisional enrolment
+    // arrives in a later change).
     const early = await request().patch(`/api/pt-os/clients/${id}`).send({
       status: 'active', pt_start_date: '2026-10-01', pt_end_date: '2026-12-31', duration_months: 3, final_amount: 9000, paid_amount: 0,
     });
     expect(early.body.error.code).toBe('SCREENING_REQUIRED');
 
+    // Step 1: the welcome and gym tour.
+    await pool.query(`UPDATE pt_clients SET welcome_tour_completed_at = NOW() WHERE id = $1`, [id]);
+    expect((await journey(id)).next).toBe('enrolment');
+
     await screenClient(pool, { clientId: id, orgId: ORG });
     j = await journey(id);
-    expect(states(j)).toMatchObject({ consent: 'done', parq: 'done', enrolment: 'todo' });
+    expect(states(j)).toMatchObject({ welcome_tour: 'done', consent: 'done', parq: 'done', enrolment: 'todo' });
+    expect(j.next).toBe('enrolment');
+
+    // Enrol, then interview, goals and assessment in the K11 order.
+    const enrolled = await request().patch(`/api/pt-os/clients/${id}`).send({
+      status: 'active', pt_start_date: '2026-10-01', pt_end_date: '2026-12-31', duration_months: 3, final_amount: 9000, paid_amount: 0,
+    });
+    expect(enrolled.status).toBe(200);
+    j = await journey(id);
+    expect(states(j)).toMatchObject({ enrolment: 'done' });
     expect(j.next).toBe('interview');
 
     // The interview: a draft, then completed.
@@ -122,20 +136,16 @@ describeIf('Client journey, against a real database', () => {
     expect(done.status).toBe(200);
     expect(done.body.data.completed_at).toBeTruthy();
     j = await journey(id);
+    expect(j.next).toBe('goals');
+
+    await pool.query(`INSERT INTO pt_goals (client_id, organization_id, goal_type) VALUES ($1, $2, 'fat_loss')`, [id, ORG]);
+    j = await journey(id);
     expect(j.next).toBe('assessment');
 
     await pool.query(`INSERT INTO pt_assessments (client_id, organization_id) VALUES ($1, $2)`, [id, ORG]);
-    await pool.query(`INSERT INTO pt_goals (client_id, organization_id, goal_type) VALUES ($1, $2, 'fat_loss')`, [id, ORG]);
     j = await journey(id);
-    expect(j.next).toBe('enrolment');
-
-    const enrolled = await request().patch(`/api/pt-os/clients/${id}`).send({
-      status: 'active', pt_start_date: '2026-10-01', pt_end_date: '2026-12-31', duration_months: 3, final_amount: 9000, paid_amount: 0,
-    });
-    expect(enrolled.status).toBe(200);
-    j = await journey(id);
-    expect(states(j)).toMatchObject({ enrolment: 'done', workout_plan: 'todo' });
-    expect(j.next).toBe('workout_plan');
+    expect(states(j)).toMatchObject({ goals: 'done', assessment: 'done', program_design: 'todo' });
+    expect(j.next).toBe('program_design');
 
     const planId = randomUUID();
     plans.push(planId);
@@ -144,6 +154,15 @@ describeIf('Client journey, against a real database', () => {
     j = await journey(id);
     expect(j.steps.every((s) => s.state === 'done')).toBe(true);
     expect(j.next).toBeNull();
+  });
+
+  it('a pending client with an ended term shows renew, not done', async () => {
+    const id = await newClient();
+    await pool.query(
+      `UPDATE pt_clients SET status = 'pending', pt_end_date = CURRENT_DATE - 1, duration_months = 1 WHERE id = $1`,
+      [id],
+    );
+    expect((await journey(id)).steps.find((s) => s.key === 'enrolment').state).toBe('renew');
   });
 
   it('the interview is optional: enrolment does not wait for it', async () => {
