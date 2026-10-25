@@ -1,5 +1,7 @@
 'use strict';
 
+const { ageFromDob } = require('../../lib/age');
+
 /**
  * The client facts a workout generation is allowed to assert.
  *
@@ -85,17 +87,6 @@ function countDays(text) {
   if (typeof text !== 'string') return null;
   const n = text.split(',').map((s) => s.trim()).filter(Boolean).length;
   return n >= 1 && n <= 7 ? n : null;
-}
-
-function ageFromDob(dob) {
-  if (!dob) return null;
-  const d = new Date(dob);
-  if (Number.isNaN(d.getTime())) return null;
-  const now = new Date();
-  let age = now.getUTCFullYear() - d.getUTCFullYear();
-  const m = now.getUTCMonth() - d.getUTCMonth();
-  if (m < 0 || (m === 0 && now.getUTCDate() < d.getUTCDate())) age -= 1;
-  return age >= 0 && age < 130 ? age : null;
 }
 
 function num(v) {

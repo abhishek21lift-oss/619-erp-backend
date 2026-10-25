@@ -25,6 +25,7 @@
 
 /** Sections a brief can carry, in the order a trainer would want to read them. */
 const SECTIONS = ['readiness', 'body', 'capacity', 'limitations', 'lifestyle', 'goal', 'history'];
+const { ageFromDob: ageFrom } = require('../../lib/age');
 
 /**
  * How old a section may be before it is reported as stale, in days.
@@ -128,17 +129,6 @@ function staleness(sections = {}, today = new Date()) {
 }
 
 /** Whole years between a date of birth and today, or null. */
-function ageFrom(dob) {
-  if (!dob) return null;
-  const d = new Date(dob);
-  if (Number.isNaN(d.getTime())) return null;
-  const now = new Date();
-  let age = now.getUTCFullYear() - d.getUTCFullYear();
-  const m = now.getUTCMonth() - d.getUTCMonth();
-  if (m < 0 || (m === 0 && now.getUTCDate() < d.getUTCDate())) age -= 1;
-  return age >= 0 && age < 130 ? age : null;
-}
-
 /** A number, or null — never NaN, never a string that renders as one. */
 const num = (v) => {
   if (v === null || v === undefined || v === '') return null;
