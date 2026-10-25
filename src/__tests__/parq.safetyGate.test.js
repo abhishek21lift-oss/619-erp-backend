@@ -41,8 +41,8 @@ function mockRoute(sql, params) {
   if (/^UPDATE pt_consent_records SET pdf_url/i.test(text)) return mockResult([{ id: 'consent-1', pdf_url: 'https://example.test/c.pdf' }]);
   if (/FOR UPDATE/i.test(text)) return mockResult(mockExistingForm ? [mockExistingForm] : []);
   if (/^INSERT INTO pt_parq_forms/i.test(text)) return mockResult([{ id: FORM_ID }]);
-  if (/SELECT risk_level FROM pt_parq_forms/i.test(text)) return mockResult([{ risk_level: 'high' }]);
-  if (/^UPDATE pt_parq_forms SET workout_gate_status/i.test(text)) return mockResult([{ workout_gate_status: 'blocked', risk_level: 'high' }]);
+  if (/SELECT risk_level, client_id FROM pt_parq_forms/i.test(text)) return mockResult([{ risk_level: 'high', client_id: 'c1' }]);
+  if (/^UPDATE pt_parq_forms SET workout_gate_status/i.test(text)) return mockResult([{ workout_gate_status: 'blocked', risk_level: 'high', client_id: 'c1' }]);
   if (/SELECT \* FROM pt_parq_forms WHERE id = \$1$/i.test(text)) return mockResult([{ id: FORM_ID }]);
   return mockResult([]);
 }

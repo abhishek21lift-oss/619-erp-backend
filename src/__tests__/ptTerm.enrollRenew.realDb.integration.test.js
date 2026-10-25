@@ -191,6 +191,14 @@ describeIf('Enroll vs Renew, against a real database', () => {
     expect(res.body.error.code).toBe('SCREENING_REQUIRED');
   });
 
+  it('a charged amount alone is a term: create still needs screening', async () => {
+    const res = await request().post('/api/pt-os/clients').send({
+      name: 'Priced Client', mobile: `94${String(Date.now()).slice(-8)}`, base_amount: 5000,
+    });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('SCREENING_REQUIRED');
+  });
+
   it('a legacy client with renewal history but a cleared end date can still be renewed', async () => {
     const c = await create({});
     await enroll(c.id);

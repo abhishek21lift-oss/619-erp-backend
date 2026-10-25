@@ -6,24 +6,36 @@
 
 let mockParq = null;
 let mockConsent = null;
+let mockClient = null;
 const mockQueries = [];
 jest.mock('../db/pool', () => ({
   query: jest.fn(async (sql, params) => {
     mockQueries.push({ sql: String(sql), params });
     if (/FROM pt_parq_forms/i.test(sql)) return { rows: mockParq ? [mockParq] : [] };
     if (/FROM pt_informed_consents/i.test(sql)) return { rows: mockConsent ? [mockConsent] : [] };
+    if (/FROM pt_clients/i.test(sql)) return { rows: mockClient ? [mockClient] : [] };
+    if (/UPDATE pt_clients/i.test(sql)) {
+      return { rows: mockClient && mockClient.status === 'pending' ? [{ id: mockClient.id }] : [] };
+    }
     return { rows: [] };
   }),
 }));
 jest.mock('../lib/activityLog', () => ({ logActivity: jest.fn() }));
 
-const { checkScreeningGate, isTrainingBlocked } = require('../lib/screeningGate');
+const {
+  checkScreeningGate, checkTrainingEligibility, isTrainingBlocked, statusBlock,
+  maybeActivateClient, screeningSummary,
+} = require('../lib/screeningGate');
+const { logActivity } = require('../lib/activityLog');
 
-const req = { user: { id: 'u1' } };
+const req = { user: { id: 'u1', organization_id: 'org-a' } };
 const completed = { status: 'completed', physician_block: false };
 const cleanParq = { risk_level: 'low', workout_gate_status: 'cleared', status: 'submitted', has_valid_clearance: false, answered_count: 10, is_stale: false };
 
-beforeEach(() => { mockParq = null; mockConsent = completed; mockQueries.length = 0; });
+beforeEach(() => {
+  mockParq = null; mockConsent = completed; mockClient = null;
+  mockQueries.length = 0; logActivity.mockClear();
+});
 
 test('high risk with no valid clearance blocks', async () => {
   mockParq = { risk_level: 'high', workout_gate_status: 'cleared', has_valid_clearance: false };
@@ -163,5 +175,64 @@ describe('screeningGaps — the dashboard list of clients not cleared to train',
     expect(out.map((g) => [g.client_id, g.block])).toEqual([
       ['risk', 'PARQ_BLOCKED'], ['revoked', 'CONSENT_REVOKED'], ['doctor', 'PHYSICIAN_ADVISED_AGAINST'],
     ]);
+  });
+});
+
+describe('a provisionally enrolled client is pending until screening completes', () => {
+  test('a pending client with a term is CLIENT_PENDING_ACTIVATION', () => {
+    expect(statusBlock({ has_pt_term: true, status: 'pending', ended: false }))
+      .toBe('CLIENT_PENDING_ACTIVATION');
+    expect(statusBlock({ has_pt_term: false, status: 'pending', ended: false }))
+      .toBe('CLIENT_NOT_ENROLLED');
+  });
+
+  test('a medical hard stop is reported before the pending activation', async () => {
+    mockClient = { id: 'c1', status: 'pending', has_pt_term: true, ended: false };
+    mockConsent = completed;
+    mockParq = { ...cleanParq, risk_level: 'high', has_valid_clearance: false };
+    const { blocked } = await checkTrainingEligibility(req, 'c1');
+    expect(blocked.status).toBe(403);
+    expect(blocked.body.code).toBe('PARQ_BLOCKED');
+  });
+
+  test('a pending client with a term cannot be fitness-tested either', async () => {
+    mockClient = { id: 'c1', status: 'pending', has_pt_term: true, ended: false };
+    mockParq = cleanParq;
+    const { blocked } = await checkTrainingEligibility(req, 'c1', { requireActive: false, action: 'fitness_test' });
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.code).toBe('CLIENT_PENDING_ACTIVATION');
+  });
+
+  test('maybeActivateClient activates a provisionally enrolled, fully screened client', async () => {
+    mockClient = { id: 'c1', status: 'pending', has_pt_term: true, ended: false };
+    mockParq = cleanParq;
+    mockConsent = completed;
+    await expect(maybeActivateClient(req, 'c1')).resolves.toBe(true);
+    expect(mockQueries.some((q) => /UPDATE pt_clients[\s\S]*status = 'active'/.test(q.sql))).toBe(true);
+    expect(logActivity).toHaveBeenCalledWith(req, 'client.activated', 'pt_client', 'c1', {});
+  });
+
+  test('maybeActivateClient leaves a client pending without consent, a full PAR-Q, or with a hard block', async () => {
+    mockClient = { id: 'c1', status: 'pending', has_pt_term: true, ended: false };
+    mockConsent = { status: null, physician_block: false };
+    expect(await maybeActivateClient(req, 'c1')).toBe(false);
+    mockConsent = completed;
+    mockParq = { ...cleanParq, answered_count: 3 };
+    expect(await maybeActivateClient(req, 'c1')).toBe(false);
+    mockParq = { ...cleanParq, risk_level: 'high', has_valid_clearance: false };
+    expect(await maybeActivateClient(req, 'c1')).toBe(false);
+  });
+
+  test('maybeActivateClient does nothing for an active client or one with no term', async () => {
+    mockClient = { id: 'c1', status: 'active', has_pt_term: true, ended: false };
+    expect(await maybeActivateClient(req, 'c1')).toBe(false);
+    mockClient = { id: 'c1', status: 'pending', has_pt_term: false, ended: false };
+    expect(await maybeActivateClient(req, 'c1')).toBe(false);
+  });
+
+  test('screeningSummary reports what is missing', async () => {
+    mockParq = null;
+    mockConsent = { status: null, physician_block: false };
+    expect((await screeningSummary('c1')).missing).toEqual(['informed_consent', 'parq']);
   });
 });

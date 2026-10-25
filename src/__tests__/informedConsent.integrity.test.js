@@ -36,6 +36,7 @@ jest.mock('../db/pool', () => ({
     if (/^INSERT INTO pt_informed_consents/.test(text)) return { rows: [{ id: 'ic-new', status: 'draft' }] };
     if (/^UPDATE pt_informed_consents SET \w+_signature = \$2/.test(text)) return { rows: mockSigned ? [mockSigned] : [] };
     if (/^UPDATE pt_informed_consents SET status = 'completed'/.test(text)) return { rows: mockCompleted ? [mockCompleted] : [] };
+    if (/^UPDATE pt_informed_consents SET pdf_url = \$1/.test(text)) return { rows: mockCompleted ? [{ ...mockCompleted, pdf_url: 'https://example.test/ic.pdf' }] : [] };
     return { rows: [] };
   }),
   connect: jest.fn(async () => mockTx),
@@ -62,7 +63,7 @@ function app() {
 }
 
 const signedDraft = () => ({
-  id: 'ic-1', status: 'draft', full_name: 'Mina Rao', dob: new Date(1990, 4, 17), mobile: '9000000000',
+  id: 'ic-1', client_id: 'c1', status: 'draft', full_name: 'Mina Rao', dob: new Date(1990, 4, 17), mobile: '9000000000',
   acknowledgements: { final_declaration: true, understands_confidentiality: true, voluntary_participation: true },
   physician_advised_against: false, medical_condition: null, exercise_consent_checked: true,
   client_signature: 'data:image/png;base64,AAA', trainer_signature: null, witness_signature: null,

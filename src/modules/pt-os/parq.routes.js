@@ -18,6 +18,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { generateConsentPdf } = require('../../lib/parqPdf');
 const { saveFile } = require('../../lib/fileStorage');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+const { maybeActivateClient } = require('../../lib/screeningGate');
 const { clientInOrg } = require('../../lib/orgGuard');
 const { computeParqAnalysis } = require('./parq-scoring');
 const { clearanceApprovalProblem } = require('./parq-clearance');
@@ -86,7 +87,7 @@ const answersChanged = (before, after) => {
 // clearance later must flip a previously-blocked form to cleared.
 async function recomputeGateStatus(pool, formId) {
   const { rows: formRows } = await pool.query(
-    'SELECT risk_level FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL', [formId]
+    'SELECT risk_level, client_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL', [formId]
   );
   const form = formRows[0];
   if (!form) return null;
@@ -105,7 +106,7 @@ async function recomputeGateStatus(pool, formId) {
 
   const { rows } = await pool.query(
     `UPDATE pt_parq_forms SET workout_gate_status = $1, updated_at = NOW()
-      WHERE id = $2 RETURNING workout_gate_status, risk_level`,
+      WHERE id = $2 RETURNING workout_gate_status, risk_level, client_id`,
     [gateStatus, formId]
   );
   return rows[0];
@@ -333,7 +334,9 @@ router.get('/parq/forms/:id/gate-status', auth, wrap(async (req, res) => {
   // and the Assign button stayed disabled for a client just cleared.
   const gate = await recomputeGateStatus(pool, req.params.id);
   if (!gate) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-  res.json({ data: gate });
+  // client_id is carried for maybeActivateClient on the write paths; it is not
+  // part of this endpoint's published shape.
+  res.json({ data: { workout_gate_status: gate.workout_gate_status, risk_level: gate.risk_level } });
 }));
 
 // POST /parq/forms
@@ -412,7 +415,8 @@ router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema),
   // Authoritative recompute after commit (accounts for any pre-existing
   // approved medical clearance — unlikely on first submit, but keeps this
   // the single source of truth for gate status everywhere).
-  await recomputeGateStatus(pool, formId);
+  const gate = await recomputeGateStatus(pool, formId);
+  if (gate) await maybeActivateClient(req, gate.client_id);
 
   await logActivity(req, status === 'draft' ? 'parq.draft' : 'parq.submit', 'pt_parq_forms', formId, {
     client_id: b.client_id, risk_level: analysis.riskLevel, yes_count: analysis.yesCount,
@@ -542,7 +546,8 @@ router.patch('/parq/forms/:id', auth, requireTrainer, validate(parqFormUpdateSch
   // Authoritative recompute — approving a clearance earlier may already
   // have cleared the gate; this re-confirms against the clearance table
   // rather than trusting the tentative value written above.
-  await recomputeGateStatus(pool, formId);
+  const gate = await recomputeGateStatus(pool, formId);
+  if (gate) await maybeActivateClient(req, gate.client_id);
   if (audit) await logActivity(req, audit[0], 'pt_parq_forms', formId, audit[1]);
 
   const { rows } = await pool.query('SELECT * FROM pt_parq_forms WHERE id = $1', [formId]);
@@ -580,6 +585,7 @@ router.post('/parq/forms/:formId/clearance', auth, requireTrainer, validate(clea
   );
 
   const gate = await recomputeGateStatus(pool, formId);
+  if (gate) await maybeActivateClient(req, gate.client_id);
   res.status(201).json({ data: { ...rows[0], gate } });
 }));
 
@@ -622,6 +628,7 @@ router.patch('/parq/clearance/:id', auth, requireTrainer, validate(clearanceUpda
   const updated = rows[0];
 
   const gate = await recomputeGateStatus(pool, updated.parq_form_id);
+  if (gate) await maybeActivateClient(req, gate.client_id);
 
   if (statusChanged) {
     const action = updated.approval_status === 'approved' ? 'parq.clearance.approve'

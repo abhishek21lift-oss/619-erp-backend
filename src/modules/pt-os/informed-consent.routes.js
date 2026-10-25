@@ -22,6 +22,7 @@ const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
 const { consentVersions, completeConsent } = require('./informed-consent.repository');
 const { invalidFileType } = require('../../middleware/errorHandler');
 const { signatureDataUrl, describeAgent } = require('../../lib/signing');
+const { maybeActivateClient } = require('../../lib/screeningGate');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -477,6 +478,9 @@ router.post('/informed-consent/:id/sign', auth, requireTrainer, validate(signSch
     }
 
     await logActivity(req, 'informed_consent.completed', 'pt_informed_consents', id, {});
+
+    // A provisional enrolment becomes active only once its screening exists.
+    await maybeActivateClient(req, record.client_id);
   }
 
   res.json({ data: record });

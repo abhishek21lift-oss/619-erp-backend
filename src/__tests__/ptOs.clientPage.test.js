@@ -60,6 +60,17 @@ describe('payment aggregates are org-scoped', () => {
   });
 });
 
+describe('the list can tell pending from not enrolled', () => {
+  it('returns has_pt_term', async () => {
+    respond([{ id: 'ptc-1', has_pt_term: true }]);
+    await svc.getActiveClients({ orgId: ORG }, {});
+
+    const [{ sql }] = calls;
+    expect(sql).toMatch(/AS has_pt_term/);
+    expect(sql).toMatch(/pt_client_subscriptions/);
+  });
+});
+
 describe('paging', () => {
   it('orders by name with id as the tiebreaker so pages cannot overlap', async () => {
     respond([]);

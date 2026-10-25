@@ -1,5 +1,6 @@
 const pool = require('../../db/pool');
 const { today: studioToday, todayShortDay: studioShortDay } = require('../../lib/appTime');
+const { hasPtTermSql } = require('../../lib/ptTerm');
 
 async function getBalanceSheet(scope = {}) {
   const params = [scope.orgId];
@@ -107,7 +108,8 @@ async function getActiveClients(scope = {}, opts = {}) {
              THEN c.pt_end_date::DATE - CURRENT_DATE
              ELSE NULL
            END AS days_left,
-           c.status, c.monthly_pt_amount, c.trainer_commission,
+           c.status, ${hasPtTermSql('c')} AS has_pt_term,
+           c.monthly_pt_amount, c.trainer_commission,
            COALESCE(pp.total_incentives, 0) AS total_earned_commission
     FROM pt_clients c
     LEFT JOIN (

@@ -66,6 +66,8 @@ describeIf('Training eligibility, against a real database', () => {
     app.use(express.json());
     app.use('/api/pt-os', require('../modules/pt-os/pt-os.routes'));
     app.use('/api/pt-os', require('../modules/pt-os/workout-log.routes'));
+    app.use('/api/pt-os', require('../modules/pt-os/informed-consent.routes'));
+    app.use('/api/pt-os', require('../modules/pt-os/parq.routes'));
     app.use('/api/workouts', require('../routes/workouts'));
     app.use((err, _req, res, _next) => res.status(500).json({ error: err.message }));
     request = () => require('supertest')(app);
@@ -225,36 +227,77 @@ describeIf('Training eligibility, against a real database', () => {
     });
   });
 
-  describe('enrolling a NEW client needs completed screening', () => {
+  describe('enrolling a NEW client provisionally', () => {
     const enroll = (id, extra = {}) => request().patch(`/api/pt-os/clients/${id}`).send({
       status: 'active', pt_start_date: '2026-10-01', pt_end_date: '2026-12-31', duration_months: 3,
       final_amount: 9000, paid_amount: 0, ...extra,
     });
 
-    it('is refused with what is missing, and nothing is written', async () => {
+    it('enrols provisionally as pending, and nothing trains yet', async () => {
       const id = await client({ status: 'pending', term: false });
       const res = await enroll(id);
-      expect(res.status).toBe(403);
-      expect(res.body.error.code).toBe('SCREENING_REQUIRED');
-      expect(res.body.error.missing).toEqual(['informed_consent', 'parq']);
-      const { rows: [c] } = await pool.query('SELECT status, pt_end_date FROM pt_clients WHERE id = $1', [id]);
-      expect(c).toEqual({ status: 'pending', pt_end_date: null });
+      expect(res.status).toBe(200);
+      expect(res.body.data.status).toBe('pending');
+      expect(res.body.data.activation_pending).toBe(true);
+      expect(res.body.data.screening_missing).toEqual(['informed_consent', 'parq']);
+      expect((await assign(id)).status).toBe(409);
+      expect(code(await assign(id))).toBe('CLIENT_PENDING_ACTIVATION');
     });
 
-    it('a draft PAR-Q is not a screening', async () => {
+    it('a draft PAR-Q is still missing', async () => {
       const id = await client({ status: 'pending', term: false });
       await pool.query(`INSERT INTO pt_informed_consents (client_id, organization_id, full_name, status)
                         VALUES ($1, $2, 'X', 'completed')`, [id, ORG]);
       await pool.query(`INSERT INTO pt_parq_forms (client_id, organization_id, full_name, status)
                         VALUES ($1, $2, 'X', 'draft')`, [id, ORG]);
       const res = await enroll(id);
-      expect(res.body.error.missing).toEqual(['parq']);
+      expect(res.body.data.status).toBe('pending');
+      expect(res.body.data.screening_missing).toEqual(['parq']);
+    });
+
+    it('activates on PAR-Q submit after a provisional enrolment', async () => {
+      const id = await client({ status: 'pending', term: false });
+      await enroll(id);
+      await pool.query(`INSERT INTO pt_informed_consents (client_id, organization_id, full_name, status)
+                        VALUES ($1, $2, 'X', 'completed')`, [id, ORG]);
+      const answers = Array.from({ length: 10 }, (_, i) => ({ question_id: i + 1, answer: 'no' }));
+      const res = await request().post('/api/pt-os/parq/forms')
+        .send({ client_id: id, full_name: 'X', status: 'submitted', parq_answers: answers });
+      expect(res.status).toBe(201);
+      const { rows: [c] } = await pool.query('SELECT status FROM pt_clients WHERE id = $1', [id]);
+      expect(c.status).toBe('active');
+    });
+
+    it('activates when the consent is completed after a provisional enrolment', async () => {
+      const id = await client({ status: 'pending', term: false });
+      await enroll(id);
+      await pool.query(`INSERT INTO pt_parq_forms (client_id, organization_id, full_name, parq_answers, status, risk_level, workout_gate_status)
+                        VALUES ($1, $2, 'X', $3::jsonb, 'submitted', 'low', 'cleared')`,
+        [id, ORG, JSON.stringify(Array.from({ length: 10 }, (_, i) => ({ question_id: i + 1, answer: 'no' })))]);
+      const created = await request().post('/api/pt-os/informed-consent').send({ client_id: id });
+      expect(created.status).toBe(201);
+      const cid = created.body.data.id;
+      expect((await request().patch(`/api/pt-os/informed-consent/${cid}`).send({
+        acknowledgements: {
+          understands_confidentiality: true, voluntary_participation: true, final_declaration: true,
+        },
+        exercise_consent_checked: true,
+      })).status).toBe(200);
+      const sig = 'data:image/png;base64,iVBORw0KGgo=';
+      await request().post(`/api/pt-os/informed-consent/${cid}/sign`).send({ signer: 'client', signature: sig });
+      const res = await request().post(`/api/pt-os/informed-consent/${cid}/sign`).send({ signer: 'trainer', signature: sig });
+      expect(res.status).toBe(200);
+      const { rows: [c] } = await pool.query('SELECT status FROM pt_clients WHERE id = $1', [id]);
+      expect(c.status).toBe('active');
     });
 
     it('goes through once consent and PAR-Q are complete', async () => {
       const id = await client({ status: 'pending', term: false });
       await screenClient(pool, { clientId: id, orgId: ORG });
-      expect((await enroll(id)).status).toBe(200);
+      const res = await enroll(id);
+      expect(res.status).toBe(200);
+      expect(res.body.data.status).toBe('active');
+      expect(res.body.data.activation_pending).toBe(false);
     });
 
     it('an already-enrolled client\'s edits are not re-gated', async () => {
