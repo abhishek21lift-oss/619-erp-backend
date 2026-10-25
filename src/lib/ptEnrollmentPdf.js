@@ -14,6 +14,7 @@
 'use strict';
 
 const PDFDocument = require('pdfkit');
+const { ageFromDob: ageFrom } = require('./age');
 const { fmtDate, drawSectionHeading, drawLabelValue, embedSignature } = require('./pdfHelpers');
 
 const METHOD_LABELS = {
@@ -31,17 +32,6 @@ function money(n) {
 }
 
 /** Whole years between a date of birth and today, or null. */
-function ageFrom(dob) {
-  if (!dob) return null;
-  const d = new Date(dob);
-  if (Number.isNaN(d.getTime())) return null;
-  const now = new Date();
-  let age = now.getUTCFullYear() - d.getUTCFullYear();
-  const m = now.getUTCMonth() - d.getUTCMonth();
-  if (m < 0 || (m === 0 && now.getUTCDate() < d.getUTCDate())) age -= 1;
-  return age >= 0 && age < 130 ? age : null;
-}
-
 /**
  * Builds the enrolment form for one pt_clients row.
  * @param {object} c a pt_clients row

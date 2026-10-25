@@ -8,16 +8,7 @@
 const PDFDocument = require('pdfkit');
 const { fmtDate, drawSectionHeading, drawLabelValue, embedSignature } = require('./pdfHelpers');
 const { saveFile } = require('./fileStorage');
-
-const CONSENT_LABELS = {
-  info_true: 'I confirm that all the information provided above is true and accurate to the best of my knowledge.',
-  understands_risk: 'I understand that physical exercise carries inherent risks, including the risk of injury.',
-  will_inform_changes: 'I agree to inform my trainer of any changes to my health status before or during training.',
-  understands_incorrect_info_risk: 'I understand that providing incorrect or incomplete information may put my health at risk.',
-  voluntary_participation: 'I am participating in this training program voluntarily and of my own free will.',
-  consents_emergency_care: 'I consent to receive emergency medical care/first aid if required during a session.',
-  agrees_data_storage: 'I agree to my health data being securely stored and used for training purposes.',
-};
+const { PARQ_CONSENT_LABELS: CONSENT_LABELS } = require('./consentText');
 
 /**
  * Generates the consent PDF for a PAR-Q form and writes it to
