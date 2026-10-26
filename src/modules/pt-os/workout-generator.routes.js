@@ -32,6 +32,7 @@ const { auth } = require('../../middleware/auth');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { generateWorkout } = require('./workout-generator');
+const { resolveClientFacts } = require('./client-facts');
 const repo = require('./workout-generator.repo');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -85,16 +86,35 @@ function normaliseExperience(level, requested) {
 
 router.post('/clients/:id/workout-generator/preview', auth, validate({ body: previewSchema }), wrap(async (req, res) => {
   const orgId = orgIdOf(req);
-  const client = await repo.findClientForOrg(req.params.id, orgId);
-  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  const sources = await repo.loadClientFactSources(req.params.id, orgId);
+  if (!sources) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  const { client } = sources;
+  const body = req.body || {};
+
+  // The same resolution the AI generator uses: active goal first, then the
+  // profile, then the enrolment column; experience from the profile and
+  // lifestyle record too. The request is the trainer's explicit choice for
+  // this session and still wins where they supplied one.
+  const facts = resolveClientFacts(sources);
+  const missing = [];
+  if (!body.goal && !facts.facts.goal.value) missing.push('goal');
+  if (!body.experience && !facts.facts.experience_level.value) missing.push('experience_level');
+  if (missing.length) {
+    return res.status(422).json({
+      error: {
+        code: 'MISSING_CLIENT_DATA',
+        missing,
+        message: `Record ${missing.map((f) => f.replace('_level', ' level')).join(', ')} on the client, or supply ${missing.length === 1 ? 'it' : 'them'} in this request.`,
+      },
+    });
+  }
 
   const poolRows = await repo.listLibraryPool(orgId);
 
-  const body = req.body || {};
   const draft = generateWorkout({
     client: {
-      goal: normaliseGoal(client.goal, body.goal),
-      experience: normaliseExperience(client.workout_experience_level, body.experience),
+      goal: normaliseGoal(facts.facts.goal.value, body.goal),
+      experience: normaliseExperience(facts.facts.experience_level.value, body.experience),
       avoidPatterns: body.avoidPatterns,
       avoidMuscles: body.avoidMuscles,
       equipment: body.equipment,

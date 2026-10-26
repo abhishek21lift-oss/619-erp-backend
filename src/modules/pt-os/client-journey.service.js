@@ -217,12 +217,23 @@ async function journey(orgId, clientId) {
   // A plan can only be built for a client who may train. A provisional
   // enrolment (pending until screening completes) is done as a step but not
   // yet trainable.
+  //
+  // `done` also requires canTrain. A plan row left active on a client whose
+  // term has ended used to mark this step complete, which removed every "next
+  // step" button while /api/workouts/assign would still refuse them. The
+  // journey and the gate have to answer the same question the same way.
   const canTrain = c.status === 'active' && !c.ended;
-  const programDesignState = c.has_active_plan ? 'done'
+  const programDesignState = c.has_active_plan && canTrain ? 'done'
     : enrolmentState === 'done' && canTrain ? 'todo' : 'blocked';
-  const programDesignDetail = enrolmentState !== 'done'
-    ? 'Enrol the client in PT before assigning a plan.'
-    : 'Activate the client (complete screening) before assigning a plan.';
+  const programDesignDetail = enrolmentState === 'renew'
+    ? 'Renew the client\'s PT before assigning a plan.'
+    : enrolmentState === 'blocked'
+      ? (c.status === 'frozen'
+        ? 'This client\'s membership is frozen. Unfreeze it before assigning a plan.'
+        : 'This client is inactive. Reactivate them before assigning a plan.')
+      : enrolmentState !== 'done'
+        ? 'Enrol the client in PT before assigning a plan.'
+        : 'Activate the client (complete screening) before assigning a plan.';
 
   const steps = [
     {

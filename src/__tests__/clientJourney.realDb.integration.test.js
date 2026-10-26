@@ -166,7 +166,14 @@ describeIf('Client journey, against a real database', () => {
       `UPDATE pt_clients SET status = 'pending', pt_end_date = CURRENT_DATE - 1, duration_months = 1 WHERE id = $1`,
       [id],
     );
-    expect((await journey(id)).steps.find((s) => s.key === 'enrolment').state).toBe('renew');
+    const j = await journey(id);
+    expect(j.steps.find((s) => s.key === 'enrolment').state).toBe('renew');
+    // Program Design says what to do about it, rather than "enrol" to somebody
+    // who has already enrolled once.
+    expect(j.steps.find((s) => s.key === 'program_design')).toMatchObject({
+      state: 'blocked',
+      detail: "Renew the client's PT before assigning a plan.",
+    });
   });
 
   it('marks the welcome tour once and keeps the first timestamp', async () => {
