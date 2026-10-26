@@ -265,6 +265,29 @@ describe('diet gate + deterministic validator + one bounded revision', () => {
     expect(revisionInstruction).toContain('[]');
   });
 
+  test('a plan outside the save route ranges is revised, not shipped as saveable', async () => {
+    // 100 kcal is finite and the meals array is non-empty, so the old
+    // three-field gate called this saveable. normalisePlan caps the range at
+    // 500–10000, and structure_ok must predict what Save & assign accepts.
+    mockQueries();
+    const broken = { ...DIET_PLAN, total_calories: 100, knowledge_citations: [1] };
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(broken)]));
+    routedChat.mockResolvedValue({
+      content: JSON.stringify({ ...DIET_PLAN, knowledge_citations: [1] }),
+      usage: {}, model: 'primary-model',
+    });
+
+    const res = await request(app).post('/api/ai/diet/generate').send({
+      client_id: 'client-1', activity_level: 'moderate',
+    });
+
+    expect(res.status).toBe(200);
+    expect(routedChat).toHaveBeenCalledTimes(1);
+    const done = doneOf(res.text);
+    expect(done.grounding.structure_ok).toBe(true);
+    expect(done.data.total_calories).toBe(1800);
+  });
+
   test('an unfixable plan still ships — flagged, after exactly one attempt', async () => {
     mockQueries();
     routedStream.mockReturnValue(streamChunks([JSON.stringify({ ...DIET_PLAN, meals: [] })]));

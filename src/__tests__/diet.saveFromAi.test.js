@@ -92,6 +92,19 @@ describe('POST /api/diet/plans/from-ai', () => {
     expect(mockClient.release).toHaveBeenCalled();
   });
 
+  it('completes the client previous active plan before inserting the new one', async () => {
+    await request(app).post('/api/diet/plans/from-ai').send({ client_id: 'cl-1', plan: PLAN }).expect(201);
+
+    const close = mockQueries.findIndex((q) =>
+      /^UPDATE diet_assignments/i.test(q.sql) && /status = 'completed'/i.test(q.sql));
+    const insert = mockQueries.findIndex((q) => /^INSERT INTO diet_assignments/i.test(q.sql));
+
+    expect(close).toBeGreaterThan(-1);
+    expect(close).toBeLessThan(insert);
+    expect(mockQueries[close].sql).toMatch(/status = 'active'/i);
+    expect(mockQueries[close].params).toEqual(['cl-1', ORG_A]);
+  });
+
   it('stamps every studio-owned row with the caller studio', async () => {
     await request(app).post('/api/diet/plans/from-ai').send({ client_id: 'cl-1', plan: PLAN }).expect(201);
     for (const q of [...inserts('diet_templates'), ...inserts('meals'), ...inserts('diet_assignments')]) {

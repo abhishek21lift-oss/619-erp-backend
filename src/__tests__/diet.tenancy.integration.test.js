@@ -129,6 +129,16 @@ describeIf('diet template tenancy, against a real database', () => {
           WHERE conrelid = 'public.diet_plan_meals'::regclass AND contype = 'f'`);
       expect(rows.map((r) => r.def).join(' ')).toMatch(/REFERENCES diet_templates\(id\)/);
     });
+
+    test('one ACTIVE assignment per template/client, with history allowed', async () => {
+      const { rows } = await db.query(
+        `SELECT indexdef FROM pg_indexes
+          WHERE schemaname='public' AND tablename='diet_assignments'
+            AND indexname='diet_assignments_active_unique'`);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].indexdef).toMatch(/\(diet_template_id, client_id\)/i);
+      expect(rows[0].indexdef).toMatch(/WHERE .*status.*active/i);
+    });
   });
 
   // ── 2. the shared shape ───────────────────────────────────────────────────
@@ -184,7 +194,7 @@ describeIf('diet template tenancy, against a real database', () => {
        SELECT $1,$2,$3,NULL,CURRENT_DATE,NULL,'active',NULL,$4
         WHERE EXISTS (SELECT 1 FROM diet_templates dt WHERE dt.id = $2
                         AND (dt.organization_id IS NULL OR dt.organization_id = $4))
-       ON CONFLICT (diet_template_id, client_id, status)
+       ON CONFLICT (diet_template_id, client_id) WHERE status = 'active'
        DO UPDATE SET status = 'active', updated_at = NOW()
        RETURNING id`,
       [`diet-as-${templateId}-${clientId}`, templateId, clientId, orgId]);

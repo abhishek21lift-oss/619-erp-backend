@@ -493,6 +493,30 @@ describe('diet/generate', () => {
     expect(prompt).toContain('Preferred meals per day: 6');
   });
 
+  test('a silent record is NOT RECORDED, never "none"', async () => {
+    mockQueries({});
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(DIET_PLAN)]));
+
+    await request(app).post('/api/ai/diet/generate').send({
+      client_id: 'client-1', activity_level: 'moderate',
+    }).expect(200);
+
+    const call = routedStream.mock.calls[0][0];
+    const prompt = promptOf(call);
+    expect(prompt).toContain('Dietary preferences: NOT RECORDED');
+    expect(prompt).toContain('Allergies / intolerances: NOT RECORDED');
+    expect(prompt).not.toContain('Dietary preferences: none');
+    expect(prompt).not.toContain('Allergies / intolerances: none');
+
+    // The system prompt must say what NOT RECORDED means, and must name the
+    // section the user prompt actually emits (it said CLIENT AUTHORITATIVE
+    // DATA for a while, which no longer existed in the request).
+    const system = systemPromptOf(call);
+    expect(system).toContain('NOT RECORDED');
+    expect(system).toContain('End of CLIENT DATA.');
+    expect(system).not.toContain('CLIENT AUTHORITATIVE DATA');
+  });
+
   test('client_id is required', async () => {
     const res = await request(app).post('/api/ai/diet/generate').send({ age: 30 });
     expect(res.status).toBe(400);
