@@ -24,6 +24,50 @@ async function findClientForOrg(clientId, organizationId) {
 }
 
 /**
+ * Everything the shared fact resolver needs to answer "what is this client's
+ * goal and experience level" from the records the rest of the product writes.
+ *
+ * The rules generator used to read pt_clients.goal and
+ * pt_clients.workout_experience_level directly. The AI generator reads the
+ * ACTIVE pt_goals row first, then the fitness profile, then that column — so
+ * the two doors could program the same client for different goals. This loads
+ * the same sources so both resolve the same way.
+ *
+ * Returns null when the client is not this org's, before any child query runs.
+ */
+async function loadClientFactSources(clientId, organizationId) {
+  const client = await findClientForOrg(clientId, organizationId);
+  if (!client) return null;
+
+  const [profile, goals, lifestyle] = await Promise.all([
+    pool.query(
+      `SELECT goal, fitness_level
+         FROM client_fitness_profiles WHERE client_id = $1 LIMIT 1`,
+      [clientId],
+    ),
+    pool.query(
+      `SELECT goal_type
+         FROM pt_goals WHERE client_id = $1 AND is_active = true
+        ORDER BY created_at DESC LIMIT 3`,
+      [clientId],
+    ),
+    pool.query(
+      `SELECT workout_experience_level
+         FROM pt_lifestyle_assessments WHERE client_id = $1
+        ORDER BY assessment_date DESC, created_at DESC LIMIT 1`,
+      [clientId],
+    ),
+  ]);
+
+  return {
+    client,
+    profile: profile.rows[0] || null,
+    goals: goals.rows,
+    lifestyle: lifestyle.rows[0] || null,
+  };
+}
+
+/**
  * The exercise pool: shared built-ins (organization_id IS NULL) plus the org's
  * custom exercises. Archived and soft-deleted rows are never candidates.
  */
@@ -46,4 +90,4 @@ async function listLibraryPool(organizationId) {
   return rows;
 }
 
-module.exports = { findClientForOrg, listLibraryPool };
+module.exports = { findClientForOrg, loadClientFactSources, listLibraryPool };
