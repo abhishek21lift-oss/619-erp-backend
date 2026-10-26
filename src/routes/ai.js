@@ -33,6 +33,7 @@ const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // The client's digital twin: the assessments, the screen and the logged sets
 // that this file could not see. See modules/pt-os/client-context.js.
 const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
+const { normalisePlan, DietPlanError } = require('../modules/nutrition/ai-diet.service');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const {
   resolveClientFacts, describeFacts, numInRange,
@@ -492,8 +493,11 @@ function resolveDietInputs({ client, profile, goals, latestAssessment, latestChe
     height_cm: firstDefined(height, statedHeight),
     activity_level: firstDefined(lifestyle?.activity_level, body.activity_level),
     goal:     firstDefined(goal, body.goal),
-    dietary_preferences: firstDefined(dietPrefs, body.dietary_preferences) || 'none',
-    allergies: firstDefined(allergies, body.allergies) || 'none',
+    // Silent stays silent. The old `|| 'none'` printed a clean bill of health
+    // for every client nobody had written a note about, and the model then
+    // designed around allergies it had been told did not exist.
+    dietary_preferences: firstDefined(dietPrefs, body.dietary_preferences) || null,
+    allergies: firstDefined(allergies, body.allergies) || null,
     budget:   firstDefined(nutrition?.nutrition_budget, body.budget) || 'medium',
     // Bounded for the same reason: "40" meals a day is a prompt the model will
     // try to satisfy. Falls back to four, as it always did.
@@ -1631,16 +1635,18 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
    POST /api/ai/diet/generate
    ═══════════════════════════════════════════════════════════════════════════ */
 
-// The diet plan's load-bearing fields, checked WITHOUT a model: the schema the
-// system prompt publishes, in its cheapest checkable form. Cosmetic gaps (notes
-// wording, grocery granularity) are the trainer's edit, not a re-generation.
-// Returns null when structurally fine, or the reason it is not.
+// The diet plan's load-bearing fields, checked WITHOUT a model — and checked
+// by the SAME normaliser the save route uses. The old gate only proved that
+// total_calories, macros and a non-empty meals array existed, so a plan could
+// stream with structure_ok:true and then be refused by "Save & assign".
+// Returns null when the plan is saveable, or the reason it is not.
 function dietPlanNeedsWork(plan) {
-  if (!plan || typeof plan !== 'object') return 'unparseable';
-  if (!Number.isFinite(plan.total_calories)) return 'structure';
-  if (!plan.macros || typeof plan.macros !== 'object') return 'structure';
-  if (!Array.isArray(plan.meals) || plan.meals.length === 0) return 'structure';
-  return null;
+  try {
+    normalisePlan(plan);
+    return null;
+  } catch (err) {
+    return err instanceof DietPlanError ? err.message : 'structure';
+  }
 }
 
 router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
@@ -1706,8 +1712,8 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     `- Height: ${p.height_cm} cm`,
     `- Activity level: ${p.activity_level}`,
     `- Goal: ${p.goal}`,
-    `- Dietary preferences: ${p.dietary_preferences}`,
-    `- Allergies / intolerances: ${p.allergies}`,
+    `- Dietary preferences: ${p.dietary_preferences || 'NOT RECORDED'}`,
+    `- Allergies / intolerances: ${p.allergies || 'NOT RECORDED'}`,
     `- Budget: ${p.budget}`,
     `- Preferred meals per day: ${p.meal_frequency}`,
   ];

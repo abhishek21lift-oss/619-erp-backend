@@ -109,6 +109,17 @@ describe('GET /api/diet/templates is bounded by the caller studio', () => {
     expect(q.sql).toMatch(/dt\.organization_id IS NULL OR dt\.organization_id = \$1/i);
     expect(q.params[0]).toBeNull();
   });
+
+  it('bounds the meal composition subqueries by the caller studio too', async () => {
+    // The template predicate alone is not enough: the count and the json_agg
+    // read meals through the link table, so a template row visible here could
+    // still carry another studio's meal names and macros.
+    await request(app).get('/api/diet/templates').expect(200);
+
+    const [q] = touching('diet_templates');
+    expect(q.sql.match(/m\.organization_id IS NULL OR m\.organization_id = \$1/gi)).toHaveLength(2);
+    expect(q.sql).toMatch(/JOIN meals m ON m\.id = dpm\.meal_id/gi);
+  });
 });
 
 describe('POST /api/diet/assign is bounded by the caller studio', () => {
@@ -147,6 +158,75 @@ describe('POST /api/diet/assign is bounded by the caller studio', () => {
     mockCurrentUser = { id: 'usr-0', role: 'super_admin', organization_id: null, trainer_id: null };
     mockRows = [{ id: 'as-1' }];
     await request(app).post('/api/diet/assign').send(body).expect(403);
+    expect(touching('diet_assignments')).toHaveLength(0);
+  });
+});
+
+describe('the assign CTE supersedes prior plans safely', () => {
+  const body = { diet_template_id: 'tpl-1', client_id: 'cl-1' };
+
+  it('uses the partial unique index as its conflict target', async () => {
+    mockRows = [{ id: 'as-1' }];
+    await request(app).post('/api/diet/assign').send(body).expect(201);
+
+    const [q] = touching('diet_assignments');
+    expect(q.sql).toMatch(/ON CONFLICT \(diet_template_id, client_id\) WHERE status = 'active'/i);
+  });
+
+  it('closes the client other active plans only when the insert produced a row', async () => {
+    mockRows = [{ id: 'as-1' }];
+    await request(app).post('/api/diet/assign').send(body).expect(201);
+
+    const [q] = touching('diet_assignments');
+    expect(q.sql).toMatch(/closed AS \(/i);
+    expect(q.sql).toMatch(/da\.status = 'active'/i);
+    expect(q.sql).toMatch(/da\.id <> \(SELECT id FROM ins\)/i);
+    expect(q.sql).toMatch(/AND EXISTS \(SELECT 1 FROM ins\)/i);
+    expect(q.sql).toMatch(/status = 'completed'/i);
+  });
+
+  it('a refused template leaves the closing CTE with nothing to act on', async () => {
+    mockRows = [];
+    await request(app).post('/api/diet/assign').send(body).expect(404);
+
+    // The guard is inside `ins`; `closed` only runs when `ins` returned a row.
+    // The SQL is the proof the route cannot close a plan on a failed assign.
+    const [q] = touching('diet_assignments');
+    expect(q.sql).toMatch(/WHERE EXISTS \(SELECT 1 FROM diet_templates dt/i);
+    expect(q.sql).toMatch(/AND EXISTS \(SELECT 1 FROM ins\)/i);
+  });
+});
+
+describe('PATCH /api/diet/assignments/:id is bounded by the caller studio', () => {
+  it('ends the plan and stamps the end date', async () => {
+    mockRows = [{ id: 'as-1', status: 'completed' }];
+    const res = await request(app)
+      .patch('/api/diet/assignments/as-1')
+      .send({ status: 'completed' })
+      .expect(200);
+
+    expect(res.body.assignment.status).toBe('completed');
+    const [q] = touching('diet_assignments');
+    expect(q.sql).toMatch(/WHERE id = \$2 AND organization_id = \$3/i);
+    expect(q.params).toEqual(['completed', 'as-1', ORG_A]);
+    expect(q.sql).toMatch(/CURRENT_DATE/i);
+  });
+
+  it('404s for an assignment in another studio', async () => {
+    mockRows = [];
+    const res = await request(app)
+      .patch('/api/diet/assignments/as-foreign')
+      .send({ status: 'completed' })
+      .expect(404);
+    expect(res.body.error).toMatch(/assignment not found/i);
+  });
+
+  it('refuses a status outside the lifecycle', async () => {
+    const res = await request(app)
+      .patch('/api/diet/assignments/as-1')
+      .send({ status: 'deleted' })
+      .expect(400);
+    expect(res.body.error).toMatch(/status must be one of/i);
     expect(touching('diet_assignments')).toHaveLength(0);
   });
 });

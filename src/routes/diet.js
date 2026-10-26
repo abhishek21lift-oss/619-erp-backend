@@ -6,7 +6,11 @@ const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
 const { parseStrict } = require('../lib/zodNumbers');
+const { cleanDate } = require('../lib/credentials');
 const { saveAiDietPlan, DietPlanError } = require('../modules/nutrition/ai-diet.service');
+const {
+  createTemplate, upsertTracker, updateAssignmentStatus, DietInputError,
+} = require('../modules/nutrition/diet.repository');
 
 // ─── MEALS ───────────────────────────────────────────────────
 
@@ -111,7 +115,6 @@ router.post('/meals', auth, requireTrainer, async (req, res, next) => {
 // ─── DIET TEMPLATES ──────────────────────────────────────────
 
 // GET /api/diet/templates
-// GET /api/diet/templates
 //
 // Same SHARED shape as /meals above: a row with no organization_id is
 // product-seeded content every studio draws from, a row with one belongs to
@@ -153,7 +156,11 @@ router.get('/templates', auth, async (req, res, next) => {
     params.push(limit, offset);
     const { rows } = await pool.query(`
       SELECT dt.*,
-        COALESCE((SELECT COUNT(*) FROM diet_plan_meals dpm WHERE dpm.diet_template_id = dt.id), 0)::int AS meal_count,
+        COALESCE((SELECT COUNT(*)
+          FROM diet_plan_meals dpm
+          JOIN meals m ON m.id = dpm.meal_id
+          WHERE dpm.diet_template_id = dt.id
+            AND (m.organization_id IS NULL OR m.organization_id = $1)), 0)::int AS meal_count,
         COALESCE((SELECT json_agg(json_build_object(
           'id', dpm.id, 'meal_id', dpm.meal_id, 'name', m.name,
           'meal_type', m.meal_type, 'calories', m.calories,
@@ -161,8 +168,9 @@ router.get('/templates', auth, async (req, res, next) => {
           'day_of_week', dpm.day_of_week, 'sort_order', dpm.sort_order
         ) ORDER BY dpm.day_of_week, dpm.sort_order)
         FROM diet_plan_meals dpm
-        LEFT JOIN meals m ON m.id = dpm.meal_id
-        WHERE dpm.diet_template_id = dt.id), '[]'::json) AS meals
+        JOIN meals m ON m.id = dpm.meal_id
+        WHERE dpm.diet_template_id = dt.id
+          AND (m.organization_id IS NULL OR m.organization_id = $1)), '[]'::json) AS meals
       FROM diet_templates dt
       WHERE ${conds.join(' AND ')}
       ORDER BY dt.name
@@ -177,38 +185,22 @@ router.get('/templates', auth, async (req, res, next) => {
 });
 
 // POST /api/diet/templates
+//
+// Validation, the transaction and the meal-visibility check live in
+// modules/nutrition/diet.repository.js. This adapter answers 400 for a bad
+// input and 201 with the row.
 router.post('/templates', auth, requireTrainer, async (req, res, next) => {
   try {
-    const d = req.body;
-    if (!d.name?.trim())
-      return res.status(400).json({ error: 'Template name required' });
-
-    const id = randomUUID();
-    const { rows } = await pool.query(`
-      INSERT INTO diet_templates (id, name, description, goal,
-        daily_calories, daily_protein_g, daily_carbs_g, daily_fats_g, created_by, organization_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [id, d.name.trim(), d.description || null, d.goal || 'maintenance',
-       parseInt(d.daily_calories) || 2000, parseFloat(d.daily_protein_g) || 0,
-       parseFloat(d.daily_carbs_g) || 0, parseFloat(d.daily_fats_g) || 0, req.user.id,
-       // Stamps the owning studio (migration 106). NULL only for a platform
-       // operator authoring a template every studio should see.
-       orgIdOf(req)]
-    );
-
-    // Link meals
-    if (Array.isArray(d.meals)) {
-      for (const m of d.meals) {
-        await pool.query(`
-          INSERT INTO diet_plan_meals (id, diet_template_id, meal_id, day_of_week, sort_order)
-          VALUES ($1,$2,$3,$4,$5)`,
-          [randomUUID(), id, m.meal_id, parseInt(m.day_of_week) || null, parseInt(m.sort_order) || 0]
-        );
-      }
-    }
-
-    res.status(201).json({ message: 'Diet template created', template: rows[0] });
+    const template = await createTemplate({
+      input: req.body,
+      // Stamps the owning studio (migration 106). NULL only for a platform
+      // operator authoring a template every studio should see.
+      orgId: orgIdOf(req),
+      userId: req.user.id,
+    });
+    res.status(201).json({ message: 'Diet template created', template });
   } catch (err) {
+    if (err instanceof DietInputError) return res.status(400).json({ error: err.message });
     next(err);
   }
 });
@@ -272,15 +264,36 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
     // product-seeded (no org) or this studio's own.
     const templateGuard = 'AND (dt.organization_id IS NULL OR dt.organization_id = $9)';
 
+    // `ins` inserts or re-activates this template for this client. `closed`
+    // then ends the client's OTHER active plans — but only when `ins` actually
+    // produced a row. That ordering is the point: a foreign template must 404
+    // without silently ending the plan the client is already on.
+    //
+    // The conflict target is the partial unique index from migration 238:
+    // one active row per (template, client), any number of history rows.
     const { rows } = await pool.query(`
-      INSERT INTO diet_assignments (id, diet_template_id, client_id, trainer_id,
-        start_date, end_date, status, notes, organization_id)
-      SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9
-       WHERE EXISTS (SELECT 1 FROM diet_templates dt WHERE dt.id = $2 ${templateGuard})
-      ON CONFLICT (diet_template_id, client_id, status)
-      DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date,
-        organization_id = COALESCE(diet_assignments.organization_id, EXCLUDED.organization_id), updated_at = NOW()
-      RETURNING *`,
+      WITH ins AS (
+        INSERT INTO diet_assignments (id, diet_template_id, client_id, trainer_id,
+          start_date, end_date, status, notes, organization_id)
+        SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9
+         WHERE EXISTS (SELECT 1 FROM diet_templates dt WHERE dt.id = $2 ${templateGuard})
+        ON CONFLICT (diet_template_id, client_id) WHERE status = 'active'
+        DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date,
+          end_date = EXCLUDED.end_date, notes = EXCLUDED.notes,
+          organization_id = COALESCE(diet_assignments.organization_id, EXCLUDED.organization_id),
+          updated_at = NOW()
+        RETURNING *
+      ), closed AS (
+        UPDATE diet_assignments da
+           SET status = 'completed',
+               end_date = COALESCE(da.end_date, CURRENT_DATE),
+               updated_at = NOW()
+         WHERE da.client_id = $3 AND da.organization_id = $9 AND da.status = 'active'
+           AND da.id <> (SELECT id FROM ins)
+           AND EXISTS (SELECT 1 FROM ins)
+        RETURNING da.id
+      )
+      SELECT * FROM ins`,
       [randomUUID(), d.diet_template_id, d.client_id, req.user.trainer_id || null,
        d.start_date || new Date().toISOString().split('T')[0],
        d.end_date || null, 'active', d.notes || null, orgIdOf(req)]
@@ -290,6 +303,26 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
     if (!rows[0]) return res.status(404).json({ error: 'Diet template not found' });
     res.status(201).json({ message: 'Diet plan assigned', assignment: rows[0] });
   } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/diet/assignments/:id — end, pause or cancel a plan.
+//
+// The row carries its own organization_id, so the update is scoped by it
+// rather than by a client_id from the request. No row → 404, which is also
+// what a caller naming another studio's assignment gets.
+router.patch('/assignments/:id', auth, requireTrainer, async (req, res, next) => {
+  try {
+    const assignment = await updateAssignmentStatus({
+      id: req.params.id,
+      orgId: orgIdOf(req),
+      status: req.body?.status,
+    });
+    if (!assignment) return res.status(404).json({ error: 'Assignment not found' });
+    res.json({ message: 'Diet assignment updated', assignment });
+  } catch (err) {
+    if (err instanceof DietInputError) return res.status(400).json({ error: err.message });
     next(err);
   }
 });
@@ -306,7 +339,9 @@ router.get('/tracker', auth, requireTrainer, async (req, res, next) => {
     const { client_id, date } = req.query;
     if (!client_id) return res.status(400).json({ error: 'client_id required' });
 
-    const logDate = date || new Date().toISOString().split('T')[0];
+    const parsedDate = cleanDate(date ?? null);
+    if (parsedDate === undefined) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    const logDate = parsedDate || new Date().toISOString().split('T')[0];
     const scope = tenantScope(req);
     const orgGuard = ' AND organization_id=$3';
 
@@ -323,10 +358,10 @@ router.get('/tracker', auth, requireTrainer, async (req, res, next) => {
       [client_id, logDate, scope.orgId]
     );
 
-    res.json({
-      today: rows[0] || { client_id, log_date: logDate, calories_consumed: 0, protein_g: 0, carbs_g: 0, fats_g: 0, water_glasses: 0 },
-      history,
-    });
+    // No row means no log. A fabricated zero row is indistinguishable from a
+    // client who ate nothing, which is the exact lie the intake card exists
+    // to stop.
+    res.json({ today: rows[0] || null, history });
   } catch (err) {
     if (err.message?.includes('does not exist')) {
       return res.json({ today: null, history: [] });
@@ -342,35 +377,30 @@ router.get('/tracker', auth, requireTrainer, async (req, res, next) => {
 // this: the client portal is /api/me.
 router.put('/tracker', auth, requireTrainer, async (req, res, next) => {
   try {
-    const d = req.body;
+    const d = req.body || {};
     if (!d.client_id)
       return res.status(400).json({ error: 'client_id required' });
     if (!await clientInOrg(req, d.client_id))
       return res.status(404).json({ error: 'Client not found' });
 
-    const logDate = d.log_date || new Date().toISOString().split('T')[0];
+    const parsedDate = cleanDate(d.log_date ?? null);
+    if (parsedDate === undefined) {
+      return res.status(400).json({ error: 'log_date must be YYYY-MM-DD' });
+    }
+    const logDate = parsedDate || new Date().toISOString().split('T')[0];
 
-    const { rows } = await pool.query(`
-      INSERT INTO nutrition_logs (id, client_id, log_date, calories_consumed,
-        protein_g, carbs_g, fats_g, water_glasses, notes, organization_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-      ON CONFLICT (client_id, log_date) DO UPDATE SET
-        calories_consumed = EXCLUDED.calories_consumed,
-        protein_g = EXCLUDED.protein_g,
-        carbs_g = EXCLUDED.carbs_g,
-        fats_g = EXCLUDED.fats_g,
-        water_glasses = EXCLUDED.water_glasses,
-        notes = EXCLUDED.notes,
-        organization_id = COALESCE(nutrition_logs.organization_id, EXCLUDED.organization_id),
-        updated_at = NOW()
-      RETURNING *`,
-      [randomUUID(), d.client_id, logDate,
-       parseInt(d.calories_consumed) || 0, parseFloat(d.protein_g) || 0,
-       parseFloat(d.carbs_g) || 0, parseFloat(d.fats_g) || 0,
-       parseInt(d.water_glasses) || 0, d.notes || null, orgIdOf(req)]
-    );
-    res.json({ message: 'Nutrition log updated', log: rows[0] });
+    // Only the fields actually sent are written. This is what makes a
+    // water-only tap safe: calories and macros are untouched, not zeroed.
+    const { client_id: _clientId, log_date: _logDate, ...input } = d;
+    const log = await upsertTracker({
+      clientId: d.client_id,
+      orgId: orgIdOf(req),
+      logDate,
+      input,
+    });
+    res.json({ message: 'Nutrition log updated', log });
   } catch (err) {
+    if (err instanceof DietInputError) return res.status(400).json({ error: err.message });
     next(err);
   }
 });

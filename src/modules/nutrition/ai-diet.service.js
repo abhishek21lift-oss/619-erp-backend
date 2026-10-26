@@ -167,6 +167,15 @@ async function saveAiDietPlan({ plan, clientId, orgId, userId, trainerId }) {
       );
     }
 
+    // One active plan per client: the new plan supersedes the old one in the
+    // same transaction, so there is never a moment with two, or with none.
+    await db.query(
+      `UPDATE diet_assignments
+          SET status = 'completed', end_date = COALESCE(end_date, CURRENT_DATE), updated_at = NOW()
+        WHERE client_id = $1 AND organization_id = $2 AND status = 'active'`,
+      [clientId, orgId],
+    );
+
     const { rows } = await db.query(
       `INSERT INTO diet_assignments (id, diet_template_id, client_id, trainer_id,
          start_date, status, organization_id)
