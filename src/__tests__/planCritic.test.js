@@ -138,6 +138,23 @@ describe('safety', () => {
     expect(a.counts.verified).toBe(1);
   });
 
+  it('spends one revision asking for a name the library actually holds', () => {
+    const p = plan({
+      weekly_schedule: {
+        Monday: { name: 'Push', focus: 'Shoulders', exercises: [ex({ name: 'Overhead Press' })] },
+        Thursday: { name: 'Lower', focus: 'Legs', exercises: [ex()] },
+      },
+    });
+    const a = audit(p, screenedMap([['Barbell Squat', 'allow']]));
+
+    // A name the write path cannot resolve is dropped on save, so the trainer
+    // would receive a shorter session than the one previewed.
+    expect(a.needs_revision).toBe(true);
+    const text = buildRevisionInstruction(a);
+    expect(text).toContain('"Overhead Press" is not an exercise in the library');
+    expect(text).toContain('copied exactly from EXERCISE LIBRARY');
+  });
+
   it('does not let an unverifiable plan score as a checked one', () => {
     const p = plan({
       weekly_schedule: {

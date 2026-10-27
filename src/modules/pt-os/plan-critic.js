@@ -266,7 +266,11 @@ function auditPlan(plan, { screened = new Map(), requested = {} } = {}) {
     },
     /** Whether a revision is worth spending a second generation on. */
     needs_revision: violations.some((v) => v.severity === SEVERITY.CRITICAL
-      || v.rule === 'frequency_mismatch'),
+      || v.rule === 'frequency_mismatch')
+      // A name the library does not hold cannot be saved: the write path drops
+      // it, so the trainer receives a shorter session than the one previewed.
+      // One targeted pass asks the model to copy a listed name instead.
+      || unverified.length > 0,
   };
 }
 
@@ -333,11 +337,14 @@ function buildRevisionInstruction(audit) {
   const worth = (audit?.violations || []).filter(
     (v) => v.severity === SEVERITY.CRITICAL || v.severity === SEVERITY.MAJOR,
   );
-  if (!worth.length) return null;
+  // Deduplicated: a name repeated across six sessions needs one line, not six.
+  const missing = [...new Set((audit?.unverified || []).map((u) => u.name).filter(Boolean))];
+  if (!worth.length && !missing.length) return null;
 
   return [
     'Your previous plan broke rules that were given to you. Fix exactly these and change nothing else:',
     ...worth.map((v) => `- ${v.where && !Array.isArray(v.where) ? `${v.where}: ` : ''}${v.detail}`),
+    ...missing.map((name) => `- "${name}" is not an exercise in the library. Replace every occurrence with an exercise whose name is copied exactly from EXERCISE LIBRARY.`),
     '',
     'An excluded exercise must be REPLACED with one that trains a different movement, not reworded,',
     'not given a lighter load, and not annotated with a caution. Reply with the corrected plan as the',
