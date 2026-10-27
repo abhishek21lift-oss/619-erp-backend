@@ -509,18 +509,59 @@ function limitationsLine(twin, typed = null) {
  * or no user returns an empty map, so nothing is cleared by an unscoped read.
  */
 async function lookupExercisesByName(names = [], { orgId, userId } = {}) {
-  const wanted = [...new Set(names.map(normaliseName).filter(Boolean))];
-  if (!wanted.length || !orgId || !userId) return [];
+  // The prompt prints a name and then its muscle group, and a model sometimes
+  // copies both: "Bench Press (Chest)". The parenthetical is decoration ONLY
+  // when it names the matched row's own muscle group. A qualifier such as
+  // "(Decline)" stays part of the name and must never resolve to the flat
+  // press. Keys are built before the query so one pass fetches both spellings.
+  const wanted = new Map();
+  for (const raw of names) {
+    const key = normaliseName(raw);
+    if (!key || wanted.has(key)) continue;
+    const paren = /\s*\(([^()]*)\)\s*$/.exec(String(raw ?? ''));
+    const base = paren ? normaliseName(String(raw).slice(0, paren.index)) : '';
+    wanted.set(key, {
+      key,
+      base: base && base !== key ? base : '',
+      suffix: paren ? normaliseName(paren[1]) : '',
+    });
+  }
+  if (!wanted.size || !orgId || !userId) return [];
 
+  const values = [...new Set([...wanted.values()].flatMap((w) => [w.key, w.base]).filter(Boolean))];
   const { rows } = await pool.query(
     `SELECT id, name, muscle_group, body_part, target_muscle, movement_pattern, equipment, difficulty
        FROM exercises
       WHERE deleted_at IS NULL AND archived_at IS NULL
         AND (organization_id IS NULL OR (organization_id = $1::uuid AND created_by = $2))
         AND regexp_replace(lower(btrim(name)), '[^a-z0-9]+', ' ', 'g') = ANY($3::text[])`,
-    [orgId, userId, wanted],
+    [orgId, userId, values],
   );
-  return rows;
+
+  // Every spelling → its rows. Duplicates are kept: two library rows can share
+  // one normalised name, and the screen has to judge both.
+  const byKey = new Map();
+  for (const row of rows) {
+    const key = normaliseName(row.name);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(row);
+  }
+
+  const matches = [];
+  for (const w of wanted.values()) {
+    const exact = byKey.get(w.key) || [];
+    if (exact.length) {
+      for (const row of exact) matches.push({ key: w.key, row });
+      continue;
+    }
+    if (!w.base) continue;
+    for (const row of byKey.get(w.base) || []) {
+      if (w.suffix && w.suffix === normaliseName(row.muscle_group || row.body_part)) {
+        matches.push({ key: w.key, row });
+      }
+    }
+  }
+  return matches;
 }
 
 /**
@@ -538,8 +579,7 @@ async function lookupExercisesByName(names = [], { orgId, userId } = {}) {
  */
 async function resolveExerciseNames(names = [], { orgId, userId } = {}) {
   const out = new Map();
-  for (const row of await lookupExercisesByName(names, { orgId, userId })) {
-    const key = normaliseName(row.name);
+  for (const { key, row } of await lookupExercisesByName(names, { orgId, userId })) {
     if (!out.has(key)) out.set(key, { id: row.id, name: row.name });
   }
   return out;
@@ -547,11 +587,10 @@ async function resolveExerciseNames(names = [], { orgId, userId } = {}) {
 
 async function screenPlanExercises(names = [], { orgId, userId, screen } = {}) {
   if (!screen) return new Map();
-  const rows = await lookupExercisesByName(names, { orgId, userId });
+  const matches = await lookupExercisesByName(names, { orgId, userId });
 
   const out = new Map();
-  for (const row of rows) {
-    const key = normaliseName(row.name);
+  for (const { key, row } of matches) {
     const result = screenExercise(row, screen);
     const prior = out.get(key);
     // Four library names normalise onto another (verified: all four pairs

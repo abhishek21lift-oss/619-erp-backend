@@ -827,7 +827,10 @@ describe('RAG: authorized knowledge in workout/generate', () => {
     // Renamed when the stage-2 screen was wired in: what reaches the model is
     // now the authorized library MINUS anything blocked for this client.
     expect(prompt).toContain('EXERCISE LIBRARY (AUTHORIZED AND SCREENED):');
-    expect(prompt).toContain('Barbell Back Squat (Legs), barbell, intermediate, 4 sets x 8-12 reps, tempo 3-1-2-0');
+    // The name is quoted on its own so the model cannot copy the muscle group
+    // printed beside it as part of the name — the failure that produced
+    // "Bench Press (Chest)" for every exercise in production.
+    expect(prompt).toContain('"Barbell Back Squat" | Legs | barbell | intermediate | 4 sets x 8-12 reps | tempo 3-1-2-0');
     expect(prompt).toContain('cues: knees track over toes');
     expect(prompt).toContain('avoid if: knee pain');
     expect(res.text).toContain('"type":"done"');

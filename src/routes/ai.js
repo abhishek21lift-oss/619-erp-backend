@@ -1216,9 +1216,12 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     );
   }
 
-  // EXERCISE LIBRARY (AUTHORIZED): top matching exercises through the
-  // library's own tenancy predicate (built-ins shared, customs = author's org
-  // + author only). A short, complete one-liner per exercise.
+  // EXERCISE LIBRARY (AUTHORIZED AND SCREENED): the studio's whole library
+  // through the library's own tenancy predicate (built-ins shared, customs =
+  // author's org + author only), one line per exercise. The name is quoted on
+  // its own because the model previously copied the muscle group printed
+  // beside it — "Bench Press (Chest)" — and every name failed the exact-match
+  // audit.
   //
   // SCREENED as well as authorized: exercises stage 2 blocked for this client
   // are not in this list at all. Sending them with a "do not use" note beside
@@ -1234,16 +1237,17 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       '',
       'EXERCISE LIBRARY (AUTHORIZED AND SCREENED):',
       'This is the complete list of exercises this client may be prescribed.',
-      'For every exercise in your plan, copy a name EXACTLY as written below — same words, same spelling, same plural. Do not rename it, translate it, shorten it, add a qualifier, or substitute a more familiar exercise you know from elsewhere. If the movement you wanted is not in this list, choose the closest exercise that IS in it.',
+      'For every exercise in your plan, copy the text inside the double quotes EXACTLY — same words, same spelling, same plural. The text after the closing quote describes the exercise; it is not part of its name. Do not add a parenthetical or qualifier of your own, and do not substitute a more familiar exercise you know from elsewhere. If the movement you wanted is not in this list, choose the closest exercise that IS in it.',
       ...offered.map((x) => [
-        `- ${x.name}${x.muscle_group || x.body_part ? ` (${x.muscle_group || x.body_part})` : ''}`,
-        x.equipment ? `, ${x.equipment}` : '',
-        x.difficulty ? `, ${x.difficulty}` : '',
-         x.prescription_mode_primary ? `, primary mode ${x.prescription_mode_primary}` : '',
-         x.prescription_mode_allowed?.length ? `, allowed modes ${x.prescription_mode_allowed.join('|')}` : '',
-         x.recommended_sets ? `, ${x.recommended_sets} sets` : '',
+        `- "${x.name}"`,
+        x.muscle_group || x.body_part ? ` | ${x.muscle_group || x.body_part}` : '',
+        x.equipment ? ` | ${x.equipment}` : '',
+        x.difficulty ? ` | ${x.difficulty}` : '',
+         x.prescription_mode_primary ? ` | primary mode ${x.prescription_mode_primary}` : '',
+         x.prescription_mode_allowed?.length ? ` | allowed modes ${x.prescription_mode_allowed.join('|')}` : '',
+         x.recommended_sets ? ` | ${x.recommended_sets} sets` : '',
          x.recommended_reps ? ` x ${x.recommended_reps} reps` : '',
-        x.tempo_recommendation ? `, tempo ${x.tempo_recommendation}` : '',
+        x.tempo_recommendation ? ` | tempo ${x.tempo_recommendation}` : '',
         txt(x.coaching_cues) ? ` | cues: ${txt(x.coaching_cues)}` : '',
         txt(x.safety_tips) ? ` | safety: ${txt(x.safety_tips)}` : '',
         txt(x.contraindications) ? ` | avoid if: ${txt(x.contraindications)}` : '',

@@ -25,7 +25,7 @@ jest.mock('../db/pool', () => ({ query: jest.fn() }));
 const pool = require('../db/pool');
 const {
   loadDigitalTwin, describeTwin, limitationsLine, adherenceInputs, screenPlanExercises,
-  resolveLandmarks,
+  resolveExerciseNames, resolveLandmarks,
 } = require('../modules/pt-os/client-context');
 const { buildConstraints } = require('../modules/pt-os/programming-rules');
 
@@ -378,6 +378,34 @@ describe('screening the exercises a plan actually named', () => {
     // Absent from the map, so the audit reports it unverified rather than
     // clearing it — see plan-critic.js on why fuzzy matching is unsafe here.
     expect(out.size).toBe(0);
+  });
+
+  it('reads the muscle group printed beside a name as decoration, not a name', async () => {
+    // Production: the prompt listed "- Bench Press (Chest) ..." and the model
+    // copied the whole string, so all 23 exercises in a generation were
+    // unverified and a saved plan would have dropped every one. The suffix is
+    // accepted only when it is that row's own muscle group.
+    mockLibrary([{ ...LEG_PRESS_MACHINE, id: 'ex-leg-press' }]);
+    const out = await screenPlanExercises(['Leg Press (Legs)'], {
+      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+    });
+    expect(out.get('leg press legs')).toMatchObject({ name: 'Leg Press', verdict: 'allow' });
+  });
+
+  it('does not let a qualifier ride in as if it were the muscle group', async () => {
+    mockLibrary([LEG_PRESS_MACHINE]);
+    const out = await screenPlanExercises(['Leg Press (Decline)'], {
+      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+    });
+    // "Decline Leg Press" is a different movement; resolving it to the plain
+    // press would clear an exercise the trainer did not name.
+    expect(out.size).toBe(0);
+  });
+
+  it('resolves the decorated name to the library row when saving', async () => {
+    mockLibrary([{ ...LEG_PRESS_MACHINE, id: 'ex-leg-press' }]);
+    const map = await resolveExerciseNames(['Leg Press (Legs)'], { orgId: 'org-1', userId: 'u1' });
+    expect(map.get('leg press legs')).toEqual({ id: 'ex-leg-press', name: 'Leg Press' });
   });
 
   it('fails closed without an org or a user', async () => {
