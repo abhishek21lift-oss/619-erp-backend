@@ -36,7 +36,7 @@
 // Pure functions, no database: the mapping is where this can be wrong, and it
 // is testable directly.
 
-const { planExercises, normaliseName } = require('./plan-critic');
+const { planExercises, normaliseName, REPS_TYPES } = require('./plan-critic');
 
 /** 1 = Monday, matching workout_exercises.day_of_week and the builder's tabs. */
 const DAYS = Object.freeze({
@@ -55,8 +55,8 @@ const WEEK_ONE = 1;
  */
 const SINGLE_BOUT = 1;
 
-/** Prescription types that owe sets and reps; everything else owes `config`. */
-const SETS_REPS = 'SETS_REPS';
+/** The builder's progression rules; workout_plans rejects anything else. */
+const PROGRESSION_TYPES = Object.freeze(['none', 'weight', 'reps', 'rpe']);
 
 /** Cardio and interval fields carried into `config` rather than invented columns. */
 const CONFIG_FIELDS = Object.freeze([
@@ -121,6 +121,12 @@ function parseReps(value) {
   return m ? Math.max(1, Number(m[0])) : null;
 }
 
+/** Does this prescription carry a rep count? `''` is the unstated strength mode. */
+function isRepsType(value) {
+  const type = text(value).toUpperCase();
+  return type === '' || REPS_TYPES.includes(type);
+}
+
 /** The prescription a trainer should still be able to read after the mapping. */
 function notesFor(ex) {
   const parts = [];
@@ -128,7 +134,9 @@ function notesFor(ex) {
   // Only when the range says more than the stored integer does.
   if (reps && !/^\d+$/.test(reps)) parts.push(`Reps: ${reps}`);
   const type = text(ex.prescription_type).toUpperCase();
-  if (type && type !== SETS_REPS) parts.push(`Prescription: ${type}`);
+  // WEIGHT_REPS/BODYWEIGHT/REPS are the ordinary strength modes, not a
+  // second prescription worth repeating beside the one already stored.
+  if (type && !isRepsType(type)) parts.push(`Prescription: ${type}`);
   if (text(ex.notes)) parts.push(text(ex.notes));
   return parts.length ? parts.join(' · ') : null;
 }
@@ -137,10 +145,50 @@ function notesFor(ex) {
 function configFor(ex) {
   const cfg = {};
   for (const f of CONFIG_FIELDS) {
-    const v = f === 'distance_unit' ? text(ex[f]) : num(ex[f]);
-    if (v !== null && v !== '') cfg[f] = v;
+    if (f === 'distance_unit') continue;
+    const v = num(ex[f]);
+    if (v === null) continue;
+    // A model filling every schema key writes 0 for the ones it did not use.
+    // Incline is the exception: 0% is a treadmill setting somebody chose.
+    if (v === 0 && f !== 'incline') continue;
+    cfg[f] = v;
   }
+  const distance = num(ex.distance);
+  const unit = text(ex.distance_unit);
+  // A unit with no distance labels nothing and reads as a broken bout.
+  if (distance !== null && distance !== 0 && unit) cfg.distance_unit = unit;
   return Object.keys(cfg).length ? cfg : null;
+}
+
+/** The plan-level text workout_plans has no columns for, kept in `description`. */
+function descriptionFor(plan) {
+  const parts = [];
+  if (text(plan?.description)) parts.push(text(plan.description));
+  if (text(plan?.warm_up)) parts.push(`Warm-up: ${text(plan.warm_up)}`);
+  if (text(plan?.cool_down)) parts.push(`Cool-down: ${text(plan.cool_down)}`);
+  if (text(plan?.progression_notes)) parts.push(`Progression: ${text(plan.progression_notes)}`);
+  return parts.length ? parts.join('\n\n') : null;
+}
+
+/**
+ * The generator's progression rule, in the form workout_plans accepts.
+ *
+ * A type without a positive amount violates the column's own CHECK, so a
+ * half-filled rule is dropped to `none` rather than failing the entire save.
+ */
+function progressionFor(plan) {
+  const rule = plan?.progression || {};
+  const type = enumText(rule.type ?? plan?.progression_type, PROGRESSION_TYPES) || 'none';
+  const amount = num(rule.amount ?? plan?.progression_amount);
+  if (type === 'none' || amount === null || amount <= 0) {
+    return { progression_type: 'none', progression_amount: null, progression_every_weeks: 1 };
+  }
+  const every = num(rule.every_weeks ?? plan?.progression_every_weeks);
+  return {
+    progression_type: type,
+    progression_amount: amount,
+    progression_every_weeks: every !== null && every >= 1 ? Math.round(every) : 1,
+  };
 }
 
 /**
@@ -182,7 +230,7 @@ function materialise(plan, resolver = new Map()) {
       continue;
     }
 
-    const isSetsReps = !text(ex.prescription_type) || text(ex.prescription_type).toUpperCase() === SETS_REPS;
+    const isSetsReps = isRepsType(ex.prescription_type);
     const sort = nextSort.get(day) ?? 0;
     nextSort.set(day, sort + 1);
 
@@ -206,10 +254,15 @@ function materialise(plan, resolver = new Map()) {
   return {
     plan: {
       name: text(plan?.name) || 'AI programme',
+      description: descriptionFor(plan),
       goal: enumText(plan?.goal, GOALS),
       difficulty: enumText(plan?.level, LEVELS),
       duration_weeks: num(plan?.weeks),
-      sessions_per_week: num(plan?.days_per_week) ?? new Set(rows.map((r) => r.day_of_week)).size,
+      // Counted from the rows that will actually be written. A model that
+      // claims four days but names two unresolvable ones leaves a two-day
+      // programme, and the plan must not advertise a frequency it does not have.
+      sessions_per_week: new Set(rows.map((r) => r.day_of_week)).size,
+      ...progressionFor(plan),
     },
     exercises: rows,
     // Never empty silently: the trainer is told which exercises did not make

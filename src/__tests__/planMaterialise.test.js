@@ -125,9 +125,41 @@ describe('the prescription', () => {
     expect(row.notes).toContain('Prescription: TIME_DISTANCE');
   });
 
+  it('keeps reps for the library modes that use them', () => {
+    // WEIGHT_REPS, BODYWEIGHT and REPS are rep prescriptions. Treating them
+    // as "not sets/reps" stored reps = 1, so a 4x6-10 bench press became a
+    // single rep in the saved plan.
+    for (const [type, reps, want] of [
+      ['WEIGHT_REPS', '6-10', 6],
+      ['BODYWEIGHT', '10-12', 10],
+      ['REPS', '15', 15],
+    ]) {
+      const row = one({ prescription_type: type, reps });
+      expect(row.reps).toBe(want);
+      // The mode is normal strength work, so it is not clutter in the notes.
+      expect(row.notes ?? '').not.toContain('Prescription:');
+    }
+  });
+
   it('leaves config null for ordinary strength work', () => {
     expect(one({}).config).toBeNull();
     expect(configFor(ex())).toBeNull();
+  });
+
+  it('does not persist zero-valued cardio fields the generator left empty', () => {
+    // A model that emits every schema key writes 0 for the ones it did not
+    // use. Saved as-is, a treadmill run says 0 calories, 0 speed and 0
+    // incline, and the client reads a prescription nobody wrote.
+    const cfg = configFor(ex({
+      prescription_type: 'TIME', duration_seconds: 1200, distance: 0,
+      speed: 0, calories: 0, incline: 0, distance_unit: 'km',
+    }));
+    expect(cfg).toEqual({ duration_seconds: 1200, incline: 0 });
+  });
+
+  it('keeps distance_unit only when there is a distance to label', () => {
+    expect(configFor(ex({ prescription_type: 'TIME', duration_seconds: 600, distance_unit: 'km' })))
+      .toEqual({ duration_seconds: 600 });
   });
 
   it('numbers slots per day, not across the week', () => {
@@ -187,7 +219,49 @@ describe('the plan itself', () => {
     expect(out.plan).toEqual({
       name: 'Hypertrophy Block', goal: 'muscle_gain', difficulty: 'intermediate',
       duration_weeks: 8, sessions_per_week: 2,
+      description: 'x',
+      progression_type: 'none', progression_amount: null, progression_every_weeks: 1,
     });
+  });
+
+  it('keeps the warm-up, cool-down and progression the model wrote', () => {
+    // workout_plans has no columns for these three, so the save used to drop
+    // them entirely. The trainer paid for a programme and got its exercises
+    // with the instructions removed.
+    const out = materialise(plan({ Monday: [ex()] }, {
+      warm_up: '5 min bike, then ramp sets',
+      cool_down: 'stretch hamstrings',
+      progression_notes: 'add 2.5kg each week',
+    }), resolver(['Barbell Squat']));
+
+    expect(out.plan.description).toContain('5 min bike');
+    expect(out.plan.description).toContain('stretch hamstrings');
+    expect(out.plan.description).toContain('add 2.5kg each week');
+  });
+
+  it('maps structured progression onto the builder rule', () => {
+    const out = materialise(plan({ Monday: [ex()] }, {
+      progression: { type: 'weight', amount: 2.5, every_weeks: 2 },
+    }), resolver(['Barbell Squat']));
+
+    expect(out.plan.progression_type).toBe('weight');
+    expect(out.plan.progression_amount).toBe(2.5);
+    expect(out.plan.progression_every_weeks).toBe(2);
+  });
+
+  it('refuses a progression rule the builder cannot apply', () => {
+    // The column constraint requires an amount whenever the type is not
+    // 'none', so a bare type would fail the whole save.
+    for (const progression of [
+      { type: 'weight' },
+      { type: 'magic', amount: 2 },
+      { type: 'reps', amount: 0 },
+    ]) {
+      const out = materialise(plan({ Monday: [ex()] }, { progression }),
+        resolver(['Barbell Squat']));
+      expect(out.plan.progression_type).toBe('none');
+      expect(out.plan.progression_amount).toBeNull();
+    }
   });
 
   it('normalises a goal and level the columns only accept in enum form', () => {
@@ -226,6 +300,21 @@ describe('the plan itself', () => {
     const p = plan({ Monday: [ex()], Thursday: [ex()] });
     delete p.days_per_week;
     expect(materialise(p, resolver(['Barbell Squat'])).plan.sessions_per_week).toBe(2);
+  });
+
+  it('counts the days it actually saved, not the ones the model claimed', () => {
+    // Two of the four days hold names the library cannot resolve, so the
+    // saved programme has two sessions. Reading days_per_week would advertise
+    // a four-day block the client cannot train.
+    const out = materialise(plan({
+      Monday: [ex()],
+      Tuesday: [ex({ name: 'Machine Chest Fly' })],
+      Thursday: [ex()],
+      Friday: [ex({ name: 'Cable Y Raise' })],
+    }, { days_per_week: 4 }), resolver(['Barbell Squat']));
+
+    expect(out.exercises).toHaveLength(2);
+    expect(out.plan.sessions_per_week).toBe(2);
   });
 
   it('names an unnamed plan rather than saving a blank', () => {

@@ -136,6 +136,31 @@ describe('saving a proposal', () => {
     const res = await post({ generation_id: 'gen-1', name: '  Priya — Block 2  ' });
     expect(res.body.name).toBe('Priya — Block 2');
   });
+
+  it('keeps the warm-up, cool-down and progression rule', async () => {
+    mockDb({
+      generation: {
+        id: 'gen-1', client_id: 'cl-1', accepted_plan_id: null,
+        proposed_plan: {
+          ...PROPOSED,
+          warm_up: '5 min bike, then ramp sets',
+          cool_down: 'stretch hamstrings',
+          progression_notes: 'add 2.5kg each week',
+          progression: { type: 'weight', amount: 2.5, every_weeks: 2 },
+        },
+      },
+    });
+
+    await post();
+    const [sql, params] = pool.query.mock.calls.find(([s]) => /INSERT INTO workout_plans/.test(String(s)));
+
+    expect(sql).toMatch(/progression_type/);
+    const description = params.find((p) => typeof p === 'string' && p.includes('Warm-up:'));
+    expect(description).toContain('stretch hamstrings');
+    expect(description).toContain('add 2.5kg each week');
+    expect(params).toContain('weight');
+    expect(params).toContain(2.5);
+  });
 });
 
 describe('what it refuses', () => {
@@ -208,6 +233,31 @@ describe('what it refuses', () => {
     const res = await post({});
     expect(res.status).toBe(400);
     expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it('refuses a proposal whose audit found a critical violation', async () => {
+    // A blocked exercise is a CRITICAL finding. The generation screen showed
+    // it, but nothing stopped the trainer clicking Save and putting it on the
+    // client's plan anyway.
+    mockDb({
+      generation: {
+        id: 'gen-1', client_id: 'cl-1', proposed_plan: PROPOSED, accepted_plan_id: null,
+        audit: {
+          counts: { critical: 1, major: 0, minor: 0, exercises: 2, verified: 2 },
+          violations: [{
+            severity: 'critical', rule: 'blocked_exercise_prescribed',
+            exercise: 'Overhead Press', detail: 'excluded for this client',
+          }],
+          unverified: [],
+        },
+      },
+    });
+
+    const res = await post();
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('CRITICAL_VIOLATIONS');
+    expect(sqls().some((s) => /INSERT INTO workout_plans/.test(s))).toBe(false);
+    expect(pool.connect).not.toHaveBeenCalled();
   });
 });
 
@@ -304,6 +354,26 @@ describe('the proposal has to actually reach the client', () => {
     const count = sqls().find((s) => /COUNT\(\*\)::int AS n/.test(s));
     expect(count).toMatch(/status = 'active'/);
     expect(count).toMatch(/id <> \$2/);
+    // Same live window the Today roster and the session auto-link use. A
+    // programme whose end date has passed is not something the client is "on".
+    expect(count).toMatch(/start_date <= \$3::date/);
+    expect(count).toMatch(/end_date IS NULL OR end_date >= \$3::date/);
+  });
+
+  it('resolves custom exercises as the trainer who generated the plan', async () => {
+    // A custom library row is visible only to its creator. Resolving with the
+    // accepting trainer's id made another trainer's generation report its own
+    // custom exercises as "not in the library".
+    mockDb({
+      generation: {
+        id: 'gen-1', client_id: 'cl-1', created_by: 'u-generator',
+        proposed_plan: PROPOSED, accepted_plan_id: null,
+      },
+    });
+
+    await post();
+    const lookup = pool.query.mock.calls.find(([s]) => /FROM exercises/.test(String(s)));
+    expect(lookup[1][1]).toBe('u-generator');
   });
 
   it('writes no assignment when the save fails', async () => {

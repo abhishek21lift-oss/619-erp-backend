@@ -292,7 +292,7 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
   if (!generationId) return { ok: false, reason: 'no_generation' };
 
   const { rows } = await pool.query(
-    `SELECT id, client_id, proposed_plan, accepted_plan_id
+    `SELECT id, client_id, created_by, proposed_plan, audit, accepted_plan_id
        FROM ai_workout_generations
       WHERE id = $1 AND organization_id = $2`,
     [generationId, orgId || null],
@@ -305,6 +305,16 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
     return { ok: false, reason: 'already_accepted', plan_id: generation.accepted_plan_id };
   }
 
+  // A critical finding is the audit's own fact about THIS plan — a blocked
+  // exercise, or no exercises at all. The generation screen showed it, but
+  // nothing stopped the trainer clicking Save. Refusing here is the last
+  // deterministic check before the programme becomes the client's.
+  const critical = (generation.audit?.violations || [])
+    .filter((v) => v.severity === 'critical');
+  if (critical.length) {
+    return { ok: false, reason: 'critical_violations', violations: critical };
+  }
+
   let screeningWarnings = [];
   if (gate && generation.client_id) {
     const { blocked, warnings } = await gate(generation.client_id);
@@ -313,9 +323,12 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
   }
 
   const proposed = generation.proposed_plan || {};
+  // Custom library rows are visible to their creator. The proposal is resolved
+  // against the library as the trainer who GENERATED it saw it; using the
+  // accepting trainer's id made another trainer's custom exercises vanish.
   const resolver = await resolveExerciseNames(
     planExercises(proposed).map((e) => e.name),
-    { orgId, userId },
+    { orgId, userId: generation.created_by || userId },
   );
   const built = materialise(proposed, resolver);
 
@@ -328,6 +341,7 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
 
   const planId = randomUUID();
   const assignmentId = randomUUID();
+  const startedOn = studioToday();
   let wasAssigned = false;
   let otherActive = 0;
   const client = await pool.connect();
@@ -337,11 +351,14 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
     await client.query(
       `INSERT INTO workout_plans
          (id, name, description, goal, difficulty, duration_weeks, sessions_per_week,
+          progression_type, progression_amount, progression_every_weeks,
           is_template, is_active, created_by, organization_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, false, true, $8, $9)`,
-      [planId, name || built.plan.name, proposed.description || null,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false, true, $11, $12)`,
+      [planId, name || built.plan.name, built.plan.description,
         built.plan.goal, built.plan.difficulty,
         built.plan.duration_weeks, built.plan.sessions_per_week,
+        built.plan.progression_type, built.plan.progression_amount,
+        built.plan.progression_every_weeks,
         userId || null, orgId || null],
     );
 
@@ -387,7 +404,6 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
       // "active" on the Today roster for as long as nobody retired it by
       // hand; and the start is the STUDIO's day, not CURRENT_DATE's, which is
       // the database's and rolls over at 05:30 IST.
-      const startedOn = studioToday();
       const planWeeks = Number(built.plan.duration_weeks);
       const endOn = Number.isFinite(planWeeks) && planWeeks > 0
         ? new Date(Date.parse(startedOn) + (planWeeks * 7 - 1) * 86400000).toISOString().slice(0, 10)
@@ -402,17 +418,18 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
       assigned = true;
     }
 
-    // How many OTHER programmes this client is already on. It decides whether
-    // a logged session can auto-link to one plan at all: the session log links
-    // automatically only when there is exactly one active assignment, and
-    // measured on production 29 of 34 clients had none and four had between
-    // four and seven. A trainer who is about to create the second needs to be
-    // told, because from then on attribution is theirs to make by hand.
+    // How many OTHER programmes this client is already on. Counted on the
+    // same live window the Today roster and the session auto-link use — an
+    // assignment whose end date has passed is not something they are "on".
+    // The log still picks one automatically (the live assignment that
+    // prescribes the date, newest first); this count is context for the
+    // trainer, not a warning that attribution has become manual.
     const { rows: others } = await client.query(
       `SELECT COUNT(*)::int AS n
          FROM workout_assignments
-        WHERE client_id = $1 AND status = 'active' AND id <> $2`,
-      [generation.client_id, assignmentId],
+        WHERE client_id = $1 AND status = 'active' AND id <> $2
+          AND start_date <= $3::date AND (end_date IS NULL OR end_date >= $3::date)`,
+      [generation.client_id, assignmentId, startedOn],
     );
     otherActive = others[0]?.n ?? 0;
     wasAssigned = assigned;
