@@ -95,6 +95,7 @@ async function getActiveClients(scope = {}, opts = {}) {
     SELECT c.id, c.unique_id, c.client_id, c.name, c.gender, c.mobile, c.email,
            c.photo_url, c.dob, c.weight, c.notes, c.address, c.emergency_contact,
            c.trainer_id, c.trainer_name,
+           c.sessions_per_week, c.preferred_training_days,
            c.package_type, c.base_amount, c.discount, c.final_amount,
            c.paid_amount, c.balance_amount, c.joining_date,
            c.duration_months, c.pt_start_date, c.pt_end_date,

@@ -269,10 +269,27 @@ async function retrieveRagChunks(org, query, logKey, stats = null, { route = 'in
 // platform-wide) gets no exercise context at all, and a retrieval error
 // returns [] after logging.
 //
+// ── Why there is no text query any more ──────────────────────────────────
+//
+// This used to search the library with the prose string "strength training,
+// mobility, and conditioning exercises". websearch_to_tsquery ANDs its terms,
+// so nothing matched all five; the ILIKE compared the whole sentence to a
+// name; and similarity against a sentence found nothing either. Production
+// returned zero rows, the prompt's library section was empty, and the model
+// invented every exercise name it used.
+//
+// The generator needs the SET of exercises it may prescribe, not a search
+// result. So it gets the studio's whole library (built-ins plus its own), and
+// the prompt tells the model to copy names from it exactly. That is also what
+// lets the audit verify what came back.
+//
+// `limit` is a safety cap, not a relevance cut: 1200 covers the built-in
+// catalogue (~880) with room for a studio's own rows.
+//
 // `stats` (optional) is an out-param object used by workout/generate for the
 // ai_generate_rag_retrieval observability event: latency and the failure
 // flag only.
-async function retrieveExerciseLibrary({ organizationId, userId, query, limit = 12 }, stats = null) {
+async function retrieveExerciseLibrary({ organizationId, userId, limit = 1200 }, stats = null) {
   if (!organizationId || !userId) {
     if (stats) stats.exercise = { latencyMs: 0, failed: false };
     return [];
@@ -280,21 +297,18 @@ async function retrieveExerciseLibrary({ organizationId, userId, query, limit = 
   const startedAt = Date.now();
   try {
     const { rows } = await pool.query(
-      `SELECT e.name, e.muscle_group, e.body_part, e.target_muscle, e.equipment, e.difficulty,
-               e.prescription_mode_primary, e.prescription_mode_allowed,
-               e.recommended_sets, e.recommended_reps, e.tempo_recommendation,
+      `SELECT e.name, e.muscle_group, e.body_part, e.target_muscle, e.movement_pattern,
+              e.equipment, e.difficulty,
+              e.prescription_mode_primary, e.prescription_mode_allowed,
+              e.recommended_sets, e.recommended_reps, e.tempo_recommendation,
               e.coaching_cues, e.common_mistakes, e.safety_tips, e.contraindications,
               e.beginner_notes, e.advanced_notes
        FROM exercises e
        WHERE e.deleted_at IS NULL AND e.archived_at IS NULL
          AND (e.organization_id IS NULL OR (e.organization_id = $1::uuid AND e.created_by = $2))
-         AND (e.search_vector @@ websearch_to_tsquery('english', $3)
-              OR e.name ILIKE '%' || $3 || '%'
-              OR similarity(e.name, $3) > 0.2)
-       ORDER BY (ts_rank(e.search_vector, websearch_to_tsquery('english', $3)) * 2 + similarity(e.name, $3)) DESC,
-                e.name ASC
-       LIMIT $4`,
-      [organizationId, userId, query, limit]
+       ORDER BY e.muscle_group NULLS LAST, e.name ASC
+       LIMIT $3`,
+      [organizationId, userId, limit]
     );
     if (stats) stats.exercise = { latencyMs: Date.now() - startedAt, failed: false };
     return rows;
@@ -334,17 +348,17 @@ async function retrieveExerciseLibrary({ organizationId, userId, query, limit = 
 //
 // `options.ragQuery` retrieves the caller's AUTHORIZED KNOWLEDGE BASE
 // (their own org's documents + explicitly-global ones) and
-// `options.exerciseQuery` retrieves the workout generator's exercise-library
-// context through the library's own tenancy predicate. Both run INSIDE the
-// same Promise.all as the client child queries — i.e. strictly AFTER the
-// parent pt_clients check has passed — so a cross-tenant or missing client
-// never triggers any retrieval. Both are fail-closed to [] on any error
+// `options.withExerciseLibrary` retrieves the workout generator's complete
+// exercise-library context through the library's own tenancy predicate. Both
+// run INSIDE the same Promise.all as the client child queries — i.e. strictly
+// AFTER the parent pt_clients check has passed — so a cross-tenant or missing
+// client never triggers any retrieval. Both are fail-closed to [] on any error
 // (see retrieveRagChunks / retrieveExerciseLibrary), so a retrieval hiccup
 // can never fail generation nor widen what the model is told.
 //
 // `options.retrievalStats` (optional out-param) collects retrieval
 // latency/failure metadata for the ai_generate_rag_retrieval event.
-async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRoute = 'internal', exerciseQuery = null, exerciseUserId = null, ragUserId = null, retrievalStats = null } = {}) {
+async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRoute = 'internal', withExerciseLibrary = false, exerciseUserId = null, ragUserId = null, retrievalStats = null } = {}) {
   const { rows: clientRows } = await pool.query(
     'SELECT * FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
     [client_id, org]
@@ -407,8 +421,8 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRou
     ...(ragQuery
       ? [retrieveRagChunks(org, ragQuery, 'ai_client_context_rag_failed', retrievalStats, { route: ragRoute, userId: ragUserId })]
       : []),
-    ...(exerciseQuery
-      ? [retrieveExerciseLibrary({ organizationId: org, userId: exerciseUserId, query: exerciseQuery }, retrievalStats)]
+    ...(withExerciseLibrary
+      ? [retrieveExerciseLibrary({ organizationId: org, userId: exerciseUserId }, retrievalStats)]
       : []),
   ]);
 
@@ -822,8 +836,8 @@ router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res)
 
   let ctx;
   try {
-    // No ragQuery and no exerciseQuery: this is a summary of the client, not
-    // a generation, and retrieval is the expensive half.
+    // No ragQuery and no withExerciseLibrary: this is a summary of the client,
+    // not a generation, and retrieval is the expensive half.
     ctx = await loadAuthoritativeClient(clientId, org);
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_context_load_failed');
@@ -895,7 +909,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       ragQuery: 'MY PT STUDIO workout programming methodology, exercise selection, progressive overload, training technique, and injury modification',
       ragRoute: 'workout.generate',
       ragUserId: req.user?.id,
-      exerciseQuery: 'strength training, mobility, and conditioning exercises',
+      withExerciseLibrary: true,
       exerciseUserId: req.user?.id,
       retrievalStats,
     });
@@ -1219,6 +1233,8 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     userPrompt.push(
       '',
       'EXERCISE LIBRARY (AUTHORIZED AND SCREENED):',
+      'This is the complete list of exercises this client may be prescribed.',
+      'For every exercise in your plan, copy a name EXACTLY as written below — same words, same spelling, same plural. Do not rename it, translate it, shorten it, add a qualifier, or substitute a more familiar exercise you know from elsewhere. If the movement you wanted is not in this list, choose the closest exercise that IS in it.',
       ...offered.map((x) => [
         `- ${x.name}${x.muscle_group || x.body_part ? ` (${x.muscle_group || x.body_part})` : ''}`,
         x.equipment ? `, ${x.equipment}` : '',
@@ -1405,7 +1421,8 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
           // and shipping it because it was newer would make the loop a
           // liability.
           if (reaudit.counts.critical <= audit.counts.critical
-            && reaudit.counts.major <= audit.counts.major) {
+            && reaudit.counts.major <= audit.counts.major
+            && reaudit.unverified.length <= audit.unverified.length) {
             plan = fixed;
             audit = reaudit;
             revised = true;
