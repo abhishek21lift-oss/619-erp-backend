@@ -73,8 +73,11 @@ const num = (v) => {
 
 const text = (v) => (typeof v === 'string' ? v.trim() : '');
 
-/** The values the goal and difficulty columns accept (migration 219). */
-const GOALS = Object.freeze(['weight_loss', 'muscle_gain', 'strength', 'endurance', 'general_fitness', 'recovery']);
+/** The values the goal and difficulty columns accept (migrations 239 and 006). */
+const GOALS = Object.freeze([
+  'weight_loss', 'muscle_gain', 'strength', 'endurance',
+  'general_fitness', 'body_recomposition', 'recovery',
+]);
 const LEVELS = Object.freeze(['beginner', 'intermediate', 'advanced']);
 
 /**

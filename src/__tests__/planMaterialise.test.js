@@ -202,6 +202,17 @@ describe('the plan itself', () => {
     expect(out.plan.difficulty).toBe('advanced');
   });
 
+  it('keeps body recomposition, which the goal constraint now accepts', () => {
+    // The generator is told body_recomposition is a valid goal. The column
+    // rejected it, so this mapping dropped it to NULL and the saved plan lost
+    // the goal the trainer generated it for.
+    const out = materialise(
+      plan({ Monday: [ex()] }, { goal: 'body_recomposition', level: 'Intermediate' }),
+      resolver(['Barbell Squat']),
+    );
+    expect(out.plan.goal).toBe('body_recomposition');
+  });
+
   it('drops a goal or level the columns would reject instead of failing the save', () => {
     const out = materialise(
       plan({ Monday: [ex()] }, { goal: 'powerbuilding', level: 'elite' }),

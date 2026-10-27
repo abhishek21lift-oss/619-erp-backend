@@ -901,6 +901,22 @@ describe('workout quality & structure (prompt contract)', () => {
     expect(system).toContain('"rir_or_rpe": "string"');
   });
 
+  test('the JSON schema offers body recomposition, a goal the studio actually records', async () => {
+    const { system } = await generate();
+    // pt_goals.goal_type holds body_recomposition; the schema used to omit it,
+    // so the model was told the goal and forced to answer general_fitness.
+    expect(system).toContain('body_recomposition');
+  });
+
+  test('the workout prompt never names the trainer', async () => {
+    // The only human name in the prompt used to be the trainer's, and the model
+    // put it in the programme title: "Abhishek Katiyar 8-Week …" on a plan
+    // assigned to a different client.
+    mockUser = { ...mockUser, name: 'Abhishek Katiyar' };
+    const { system } = await generate();
+    expect(system).not.toContain('Abhishek Katiyar');
+  });
+
   test('training frequency is respected — exactly the client\'s days per week (4)', async () => {
     const { prompt } = await generate();
     expect(prompt).toContain('Training days per week: 4');
