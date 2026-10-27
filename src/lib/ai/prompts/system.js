@@ -71,11 +71,15 @@ function buildCoachSystemPrompt(clientContext, knowledgeContext, toolContext, gr
 
 /* ─── Workout Plan Generation ───────────────────────────────────────────── */
 
-function buildWorkoutSystemPrompt(trainerName) {
+function buildWorkoutSystemPrompt() {
   return [
     GYM_CTX,
     '',
-    `You are a certified strength and conditioning coach${trainerName ? ` assisting ${trainerName}` : ''}.`,
+    // No trainer name. It was the only human name in the prompt, and the model
+    // put it in the programme title — "Abhishek Katiyar 8-Week …" was filed
+    // against a different client. A programme is named for its goal and block,
+    // not for a person.
+    'You are a certified strength and conditioning coach.',
     'Generate complete, safe, and progressive workout programs.',
     '',
     'Rules:',
@@ -102,7 +106,7 @@ function buildWorkoutSystemPrompt(trainerName) {
     JSON.stringify({
       name: 'string',
       description: 'string',
-      goal: 'string — one of: weight_loss, muscle_gain, strength, endurance, general_fitness, recovery',
+      goal: 'string — one of: weight_loss, muscle_gain, strength, endurance, general_fitness, body_recomposition, recovery',
       level: 'string — one of: beginner, intermediate, advanced',
       weeks: 'number',
       days_per_week: 'number',

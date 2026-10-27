@@ -1312,14 +1312,13 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
   try {
-    const trainerName = req.user?.name || '';
     let fullContent = '';
     let streamMeta  = { model: models.primary, tier: 'primary', used_fallback: false };
 
     const it = routedStream({
       intent:      'workout',
       messages:    [
-        { role: 'system', content: buildWorkoutSystemPrompt(trainerName) },
+        { role: 'system', content: buildWorkoutSystemPrompt() },
         { role: 'user',   content: userPromptText },
       ],
       temperature: 0.6,
@@ -1392,7 +1391,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
           temperature: 0.2,      // correction, not invention
           max_tokens: 8000,
           messages: [
-            { role: 'system', content: buildWorkoutSystemPrompt(trainerName) },
+            { role: 'system', content: buildWorkoutSystemPrompt() },
             { role: 'user', content: userPromptText },
             { role: 'assistant', content: JSON.stringify(plan) },
             { role: 'user', content: instruction },

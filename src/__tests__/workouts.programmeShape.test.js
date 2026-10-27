@@ -154,8 +154,11 @@ describe('PUT /plans/:id', () => {
 });
 
 describe('shapeError', () => {
-  it('knows the six goals the database allows', () => {
-    expect(PLAN_GOALS).toEqual(['weight_loss', 'muscle_gain', 'strength', 'endurance', 'general_fitness', 'recovery']);
+  it('knows the seven goals the database allows', () => {
+    expect(PLAN_GOALS).toEqual([
+      'weight_loss', 'muscle_gain', 'strength', 'endurance',
+      'general_fitness', 'body_recomposition', 'recovery',
+    ]);
     for (const g of PLAN_GOALS) expect(shapeError({ goal: g })).toBeNull();
   });
 

@@ -8,11 +8,14 @@
  * hold, and this is the rule both the create and the edit path apply.
  */
 
-// Mirrors workout_plans_goal_check (migration 219) and
+// Mirrors workout_plans_goal_check (migration 239) and
 // workout_plans_difficulty_check (migration 006). Checked here as well so a
 // bad value is a 400 that names the field, not a constraint violation that
 // surfaces as a 500.
-const PLAN_GOALS = ['weight_loss', 'muscle_gain', 'strength', 'endurance', 'general_fitness', 'recovery'];
+const PLAN_GOALS = [
+  'weight_loss', 'muscle_gain', 'strength', 'endurance',
+  'general_fitness', 'body_recomposition', 'recovery',
+];
 const PLAN_DIFFICULTIES = ['beginner', 'intermediate', 'advanced'];
 
 // The progression engine's own ceiling (pt-os/progression MAX_WEEKS). The
