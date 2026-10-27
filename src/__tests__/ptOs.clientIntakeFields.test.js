@@ -181,8 +181,55 @@ describe('POST /pt-os/clients stores the new intake fields', () => {
   });
 });
 
-describe('PATCH /pt-os/clients/:id can correct both fields', () => {
-  test('the relationship is editable after onboarding', async () => {
+describe('POST /pt-os/clients stores the training frequency', () => {
+  test('sessions_per_week is written to its typed column', async () => {
+    const res = await request(app())
+      .post('/api/pt-os/clients')
+      .send(intake({ sessions_per_week: 4 }));
+    expect(res.status).toBe(201);
+    expect(update().params).toContain(4);
+  });
+
+  test('a frequency outside 1-7 is refused', async () => {
+    for (const bad of [0, 8, 3.5, 'thrice']) {
+      queries.length = 0;
+      const res = await request(app())
+        .post('/api/pt-os/clients')
+        .send(intake({ sessions_per_week: bad }));
+      expect([bad, res.status]).toEqual([bad, 400]);
+      expect(update()).toBeUndefined();
+    }
+  });
+
+  test('the legacy free-text frequency is no longer written', async () => {
+    const res = await request(app())
+      .post('/api/pt-os/clients')
+      .send(intake({ frequency: '4' }));
+    expect(res.status).toBe(201);
+    expect(update().sql).not.toMatch(/\bfrequency\b/);
+  });
+});
+
+describe('PATCH /pt-os/clients/:id validates training frequency', () => {
+  test('a whole number from 1 to 7 is accepted', async () => {
+    const res = await request(app())
+      .patch('/api/pt-os/clients/c1')
+      .send({ sessions_per_week: 4 });
+    expect(res.status).toBe(200);
+    expect(update().params).toContain(4);
+  });
+
+  test('a value outside 1-7 is refused before the write', async () => {
+    const res = await request(app())
+      .patch('/api/pt-os/clients/c1')
+      .send({ sessions_per_week: 8 });
+    expect(res.status).toBe(400);
+    expect(res.body.error.field).toBe('sessions_per_week');
+    expect(update()).toBeUndefined();
+  });
+});
+
+describe('PATCH /pt-os/clients/:id can correct both fields', () => {  test('the relationship is editable after onboarding', async () => {
     const res = await request(app())
       .patch('/api/pt-os/clients/c1')
       .send({ emergency_contact_relationship: 'Spouse' });

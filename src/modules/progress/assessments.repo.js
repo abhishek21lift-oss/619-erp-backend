@@ -133,12 +133,6 @@ async function updateClientBody(clientId, organizationId, weight, heightCm, clie
   );
 }
 
-/** Training experience, from the client record Enrollment writes. */
-async function clientExperience(clientId) {
-  const { rows } = await pool.query('SELECT workout_experience_level FROM pt_clients WHERE id = $1', [clientId]);
-  return rows[0]?.workout_experience_level || null;
-}
-
 /**
  * What the latest Nutrition assessment says about water and meals. Nutrition
  * is where those questions live; Lifestyle and Goal read them from here
@@ -179,5 +173,5 @@ async function deactivateOtherGoals(clientId, organizationId, keepId) {
 
 module.exports = {
   insertAssessment, findAssessment, updateAssessment, deleteAssessment, replaceAssessmentLifts,
-  updateClientBody, clientExperience, latestNutritionHabits, latestLifestyleHabits, deactivateOtherGoals,
+  updateClientBody, latestNutritionHabits, latestLifestyleHabits, deactivateOtherGoals,
 };

@@ -68,7 +68,7 @@ const ptClientCreateSchema = {
     body_fat: optionalNumber({ label: 'body_fat', min: 3, max: 70 }),
     health_conditions: z.string().max(500).optional().nullable(),
     injuries: z.string().max(500).optional().nullable(),
-    frequency: z.string().max(50).optional().nullable(),
+    sessions_per_week: optionalNumber({ label: 'sessions_per_week', min: 1, max: 7, int: true }),
     notes: z.string().max(2000).optional().nullable(),
     monthly_pt_amount: optionalNumber({ label: 'monthly_pt_amount', min: 0, max: 10_000_000 }),
     base_amount: optionalNumber({ label: 'base_amount', min: 0, max: 10_000_000 }),
@@ -452,7 +452,7 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
           trainer_name: reqTrainerName, package_type, base_amount, discount,
           pt_start_date, pt_end_date, duration_months, monthly_pt_amount,
           notes, weight,
-          goal, height, body_fat, health_conditions, injuries, frequency,
+          goal, height, body_fat, health_conditions, injuries, sessions_per_week,
           pt_package_id,
           whatsapp, occupation, emergency_contact, emergency_phone, address,
           emergency_contact_relationship, client_source,
@@ -596,7 +596,7 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
         body_fat          = COALESCE($16, body_fat),
         health_conditions = COALESCE($17, health_conditions),
         injuries          = COALESCE($18, injuries),
-        frequency         = COALESCE($19, frequency),
+        sessions_per_week = COALESCE($19, sessions_per_week),
         -- Contact/identity fields used to be validated and then discarded on
         -- this path (only the INSERT stored them): a corrected phone number
         -- on an enrol-existing-client call 201'd into nothing.
@@ -628,7 +628,7 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
       notes || null, weight != null ? Number(weight) : null,
       goal || null, height != null ? Number(height) : null,
       body_fat != null ? Number(body_fat) : null,
-      health_conditions || null, injuries || null, frequency || null,
+      health_conditions || null, injuries || null, sessions_per_week ?? null,
       mobile || null, email || null, gender || null, dob || null,
       whatsapp || null, occupation || null, emergency_contact || null,
       emergency_phone || null, emergency_contact_relationship || null,
@@ -730,7 +730,7 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
        'duration_months','status','notes',
        'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact','emergency_phone',
        'emergency_contact_relationship','client_source',
-       'goal','height','body_fat','health_conditions','injuries','frequency',
+       'goal','height','body_fat','health_conditions','injuries',
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week',
        'workout_experience_level','previous_trainer_experience',
        'agreement_accepted_at','agreement_signature','agreement_text',
@@ -819,6 +819,14 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
     const m = Number(body.duration_months);
     if (!Number.isInteger(m) || m < 1 || m > 60) {
       return res.status(400).json({ error: { code: 'VALIDATION', field: 'duration_months', message: 'duration_months must be a whole number of months between 1 and 60.' } });
+    }
+  }
+
+  if (body.sessions_per_week === '') body.sessions_per_week = null;
+  if (body.sessions_per_week !== undefined && body.sessions_per_week !== null) {
+    const days = Number(body.sessions_per_week);
+    if (!Number.isInteger(days) || days < 1 || days > 7) {
+      return res.status(400).json({ error: { code: 'VALIDATION', field: 'sessions_per_week', message: 'sessions_per_week must be a whole number between 1 and 7.' } });
     }
   }
 
@@ -1824,7 +1832,7 @@ router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
   const orgClause = orgWhere(req, params, 'c.organization_id');
 
   const { rows: clientRows } = await pool.query(
-    `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes, c.organization_id
+    `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes, c.workout_experience_level, c.organization_id
        FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
     params,
   );
@@ -1964,7 +1972,7 @@ router.post('/clients/:id/coach', auth, aiLimiter, requireAiQuota(), wrap(async 
 
   const { rows: clientRows } = await pool.query(
     `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes,
-            c.pt_end_date, c.organization_id,
+            c.workout_experience_level, c.pt_end_date, c.organization_id,
             ${currentTermBalanceSql('c')} AS current_term_balance
        FROM pt_clients c
        ${priorTermsPaidJoin('c')}

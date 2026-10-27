@@ -376,7 +376,9 @@ function buildBrief({
   sections.lifestyle = lifestyle ? {
     present: true,
     as_of: dateOf(lifestyle.assessment_date),
-    experience_level: lifestyle.workout_experience_level ?? null,
+    // Enrollment owns this fact; the Lifestyle row's copy is legacy and may
+    // contradict it. No fallback: an unrecorded level stays null.
+    experience_level: client?.workout_experience_level ?? null,
     years_training: num(lifestyle.years_of_experience),
     sleep_hours: num(lifestyle.sleep_duration_hours),
     sleep_quality: lifestyle.sleep_quality ?? null,
