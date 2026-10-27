@@ -550,6 +550,16 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
           unresolved: out.unresolved,
         });
       }
+      if (out.reason === 'critical_violations') {
+        // The audit found a blocked exercise (or nothing prescribed at all).
+        // Saving would put it on the client's Today screen regardless of what
+        // the generation screen said.
+        return res.status(422).json({
+          error: 'This proposal has a critical safety finding and cannot be saved',
+          code: 'CRITICAL_VIOLATIONS',
+          violations: out.violations,
+        });
+      }
       return res.status(404).json({ error: 'Generation not found' });
     }
 
@@ -575,8 +585,8 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       // assigned never reaches Today and no session can ever be attributed
       // back to it — the bug acceptGeneration now fixes — so the answer is
       // reported rather than assumed. `other_active_assignments` above zero
-      // means the session log can no longer auto-link this client to one
-      // plan, which is the trainer's to resolve, not ours.
+      // means the trainer has more than one programme to choose between; the
+      // session log still picks the one scheduled for the day.
       assigned: out.assigned,
       assignment_id: out.assignment_id,
       other_active_assignments: out.other_active_assignments,

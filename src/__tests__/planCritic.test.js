@@ -193,6 +193,36 @@ describe('structure', () => {
     expect(a.needs_revision).toBe(true);
   });
 
+  it('catches a schedule on the wrong weekdays', () => {
+    // Three days is the right count and the wrong answer if the client is
+    // recorded to train Mon/Wed/Fri and the plan lands Tue/Thu/Sat.
+    const a = audit(plan(), CLEAN, { ...REQUESTED, weekdays: 'Monday, Wednesday, Friday' });
+    const v = a.violations.find((x) => x.rule === 'weekday_mismatch');
+    expect(v).toBeTruthy();
+    expect(v.severity).toBe(SEVERITY.MAJOR);
+    expect(v.detail).toContain('Monday');
+    expect(a.needs_revision).toBe(true);
+  });
+
+  it('accepts a schedule that uses the recorded weekdays', () => {
+    const a = auditPlan(plan(), {
+      screened: CLEAN,
+      requested: { training_days: 2, duration_weeks: 8, weekdays: 'Monday, Thursday' },
+    });
+    expect(a.violations.find((x) => x.rule === 'weekday_mismatch')).toBeUndefined();
+  });
+
+  it('flags day keys the save path would silently drop', () => {
+    // "Mon" would pass a looser check and then materialise to no day at all.
+    const a = audit(plan({
+      weekly_schedule: {
+        Mon: { name: 'Lower', focus: 'Legs', exercises: [ex()] },
+        Thu: { name: 'Upper', focus: 'Chest', exercises: [ex({ name: 'Bench Press' })] },
+      },
+    }), CLEAN, { ...REQUESTED, weekdays: 'Monday, Thursday' });
+    expect(a.violations.find((x) => x.rule === 'weekday_mismatch')).toBeTruthy();
+  });
+
   it('catches the wrong block length', () => {
     const a = audit(plan({ weeks: 4 }), CLEAN, { training_days: 2, duration_weeks: 12 });
     expect(a.violations.find((v) => v.rule === 'duration_mismatch').detail)
@@ -247,6 +277,26 @@ describe('completeness', () => {
     // Forcing cardio into sets × reps is the error the system prompt already
     // forbids; the audit must not re-introduce it from the other side.
     expect(a.violations.filter((v) => v.rule === 'no_sets' || v.rule === 'no_reps')).toEqual([]);
+  });
+
+  it('demands sets and reps of the library modes that prescribe them', () => {
+    // WEIGHT_REPS, BODYWEIGHT and REPS are rep prescriptions. The audit used
+    // to treat them as cardio and stopped checking, which is how a plan with
+    // no sets for a barbell lift passed as complete.
+    for (const type of ['WEIGHT_REPS', 'BODYWEIGHT', 'REPS']) {
+      const p = plan({
+        weekly_schedule: {
+          Monday: {
+            name: 'A', focus: 'x',
+            exercises: [ex({ prescription_type: type, sets: null, reps: null })],
+          },
+          Thursday: { name: 'B', focus: 'y', exercises: [ex({ name: 'Bench Press' })] },
+        },
+      });
+      const a = audit(p);
+      expect(a.violations.some((v) => v.rule === 'no_sets')).toBe(true);
+      expect(a.violations.some((v) => v.rule === 'no_reps')).toBe(true);
+    }
   });
 
   it('catches a plan that never says what changes week to week', () => {

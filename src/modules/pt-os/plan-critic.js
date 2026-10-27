@@ -56,8 +56,18 @@
 const SEVERITY = Object.freeze({ CRITICAL: 'critical', MAJOR: 'major', MINOR: 'minor' });
 const SEVERITY_RANK = Object.freeze({ critical: 3, major: 2, minor: 1 });
 
-/** Prescription types that owe sets and reps. Others owe their own fields. */
-const SETS_REPS_TYPES = Object.freeze(['SETS_REPS', '', null, undefined]);
+/**
+ * Prescription types that owe sets and reps.
+ *
+ * WEIGHT_REPS, BODYWEIGHT and REPS all prescribe a rep count from the library;
+ * they are strength modes, not cardio. Treating them as "everything else" made
+ * the audit stop checking their sets and the save path store reps = 1.
+ */
+const REPS_TYPES = Object.freeze(['SETS_REPS', 'WEIGHT_REPS', 'BODYWEIGHT', 'REPS']);
+
+const WEEKDAY_NAMES = Object.freeze([
+  'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+]);
 
 /**
  * The quality score's components, and what each is worth.
@@ -82,6 +92,14 @@ function normaliseName(name) {
     .trim()
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
+}
+
+/** A schedule key as a weekday, or null when the save path cannot read it. */
+function weekdayName(key) {
+  const k = text(key).toLowerCase();
+  if (WEEKDAY_NAMES.includes(k)) return k;
+  const m = k.match(/^(?:day\s*)?([1-7])$/);
+  return m ? WEEKDAY_NAMES[Number(m[1]) - 1] : null;
 }
 
 const num = (v) => {
@@ -116,7 +134,7 @@ function planExercises(plan) {
 /** Does this exercise owe sets and reps, or its own cardio fields? */
 function owesSetsReps(ex) {
   const type = text(ex?.prescription_type).toUpperCase();
-  return SETS_REPS_TYPES.includes(type) || type === 'SETS_REPS';
+  return type === '' || REPS_TYPES.includes(type);
 }
 
 /**
@@ -184,6 +202,27 @@ function auditPlan(plan, { screened = new Map(), requested = {} } = {}) {
       rule: 'frequency_mismatch',
       detail: `${days} training days generated, ${wantDays} requested`,
     });
+  }
+
+  // The count and the weekdays are separate facts. Three sessions on the
+  // wrong three days is the right number and the wrong programme.
+  const wantedWeekdays = text(requested.weekdays)
+    .split(',').map((d) => weekdayName(d)).filter(Boolean);
+  if (wantedWeekdays.length) {
+    const keys = Object.keys(plan?.weekly_schedule || {});
+    const gotWeekdays = keys.map(weekdayName).filter(Boolean);
+    const want = new Set(wantedWeekdays);
+    const got = new Set(gotWeekdays);
+    const missing = [...want].filter((d) => !got.has(d));
+    const extra = [...got].filter((d) => !want.has(d));
+    if (missing.length || extra.length || gotWeekdays.length !== keys.length) {
+      violations.push({
+        severity: SEVERITY.MAJOR,
+        rule: 'weekday_mismatch',
+        detail: `scheduled ${keys.join(', ') || 'no days'}; `
+          + `the client is recorded to train ${wantedWeekdays.join(', ')}`,
+      });
+    }
   }
 
   const wantWeeks = num(requested.duration_weeks);
@@ -266,7 +305,7 @@ function auditPlan(plan, { screened = new Map(), requested = {} } = {}) {
     },
     /** Whether a revision is worth spending a second generation on. */
     needs_revision: violations.some((v) => v.severity === SEVERITY.CRITICAL
-      || v.rule === 'frequency_mismatch')
+      || v.rule === 'frequency_mismatch' || v.rule === 'weekday_mismatch')
       // A name the library does not hold cannot be saved: the write path drops
       // it, so the trainer receives a shorter session than the one previewed.
       // One targeted pass asks the model to copy a listed name instead.
@@ -424,6 +463,7 @@ module.exports = {
   describeAudit,
   planExercises,
   normaliseName,
+  REPS_TYPES,
   CRITIC_SYSTEM_PROMPT,
   SEVERITY,
   SCORE_WEIGHTS,

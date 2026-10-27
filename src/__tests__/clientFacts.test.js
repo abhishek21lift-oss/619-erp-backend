@@ -206,6 +206,34 @@ describe('equipment', () => {
     expect(facts.equipment).toEqual({ value: 'dumbbells only today', source: 'trainer', origin: 'stated' });
   });
 
+  test('keeps the exact weekdays the client is recorded to train', () => {
+    // The count says three days; the weekdays say WHICH three. Losing them
+    // let the generator choose any three, so a Mon/Wed/Fri client was
+    // programmed Tue/Thu/Sat.
+    const { facts } = resolveClientFacts(bare({
+      sessions_per_week: 3, preferred_training_days: 'Mon, Wed, Fri',
+    }));
+    expect(facts.training_days.value).toBe(3);
+    expect(facts.preferred_days.value).toBe('Monday, Wednesday, Friday');
+  });
+
+  test('refuses weekday text it cannot read rather than guessing', () => {
+    for (const bad of ['Mon, someday', '3 days', '']) {
+      expect(resolveClientFacts(bare({ preferred_training_days: bad }))
+        .facts.preferred_days.origin).toBe('missing');
+    }
+  });
+
+  test('omits weekdays that contradict a separately recorded count', () => {
+    // sessions_per_week is the trainer's stated frequency; the picker can be
+    // stale. Sending both would demand three sessions on exactly five days.
+    const { facts } = resolveClientFacts(bare({
+      sessions_per_week: 3, preferred_training_days: 'Mon, Tue, Wed, Thu, Fri',
+    }));
+    expect(facts.training_days.value).toBe(3);
+    expect(facts.preferred_days.origin).toBe('missing');
+  });
+
   test('and that exception applies to equipment ALONE', () => {
     expect(STATED_SUPERSEDES).toEqual(['equipment']);
     // The anti-fabrication rule is unchanged everywhere else: a request body

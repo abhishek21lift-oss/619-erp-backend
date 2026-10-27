@@ -51,7 +51,7 @@ const {
  * interpolates this client's own facts, so a hash would differ per client and
  * answer a question nobody asked.
  */
-const WORKOUT_PROMPT_VERSION = '2026-10-20.mpts';
+const WORKOUT_PROMPT_VERSION = '2026-10-27.mpts';
 // Checking the plan the model returned against the rules that shaped it.
 const {
   auditPlan, scorePlan, buildRevisionInstruction, parseCritique, describeAudit,
@@ -1289,6 +1289,9 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     '',
     'TRAINING FREQUENCY:',
     `The client trains ${val('training_days')} days per week. Generate exactly ${val('training_days')} sessions per week — one per training day, never fewer and never more, and never silently change the frequency.`,
+    ...(val('preferred_days')
+      ? [`The client's recorded training weekdays are ${val('preferred_days')}. Use exactly these weekdays as the weekly_schedule keys.`]
+      : []),
     '',
     'SESSION STRUCTURE:',
     'Each training day must contain: a session title, the training focus, a warm-up, main exercises, accessories, and cool-down/recovery guidance when appropriate.',
@@ -1313,6 +1316,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     'PROGRESSIVE OVERLOAD:',
     'For a multi-week program, define progression explicitly: state what changes (reps, load, sets, RIR/RPE, density, or another justified variable) and in which weeks, based on the client\'s experience level, goal, frequency, exercise selection, and recovery.',
     'Use a deload only when justified — and say why. Never leave progression vague.',
+    'When the rule is a simple linear change, also fill the top-level "progression" object so the builder can apply it: type "weight" (amount in kg), "reps" (amount in reps) or "rpe" (amount in RPE points), plus every_weeks. Use type "none" and amount null when the progression is not one of those three.',
     '',
     'QUALITY:',
     'Output must read like a professional personal trainer wrote it: every exercise has a clear programming purpose; no exercise-only lists, generic motivational filler, repetitive exercises without purpose, unnecessary volume, unexplained deloads, or contradictions.',
@@ -1378,7 +1382,11 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     // The lookup is its own: the prompt was given a dozen library rows and a
     // model may name anything, so screening only those would answer "no
     // blocked exercise" for every blocked movement that was not retrieved.
-    const requested = { training_days: val('training_days'), duration_weeks: p.duration_weeks };
+    const requested = {
+      training_days: val('training_days'),
+      duration_weeks: p.duration_weeks,
+      weekdays: val('preferred_days'),
+    };
     const auditWith = async (candidate) => {
       const screened = await screenPlanExercises(
         planExercises(candidate).map((e) => e.name),

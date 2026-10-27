@@ -89,6 +89,34 @@ function countDays(text) {
   return n >= 1 && n <= 7 ? n : null;
 }
 
+const WEEKDAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+const WEEKDAY_ALIASES = {
+  mon: 'monday', tue: 'tuesday', tues: 'tuesday', wed: 'wednesday',
+  thu: 'thursday', thur: 'thursday', thurs: 'thursday',
+  fri: 'friday', sat: 'saturday', sun: 'sunday',
+};
+
+/**
+ * The exact weekdays `preferred_training_days` names, or null.
+ *
+ * "Mon, Wed, Fri" is what the enrolment picker writes. A token this cannot
+ * read makes the whole value null rather than quietly dropping a day: the
+ * generator must not schedule three days when the trainer picked four.
+ */
+function preferredDays(value) {
+  if (typeof value !== 'string') return null;
+  const tokens = value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!tokens.length) return null;
+  const days = [];
+  for (const token of tokens) {
+    const key = token.replace(/[^a-z]/g, '');
+    const day = WEEKDAYS.includes(key) ? key : WEEKDAY_ALIASES[key];
+    if (!day || days.includes(day)) return null;
+    days.push(day);
+  }
+  return days.map((d) => d[0].toUpperCase() + d.slice(1)).join(', ');
+}
+
 function num(v) {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
@@ -273,6 +301,12 @@ function resolveClientFacts(ctx, stated = {}) {
       return n !== null && n >= 1 && n <= 7 ? n : null;
     }),
 
+    // The companion to the count: which days, not just how many. Not part of
+    // FIELDS because it is not an independent blocking fact — the count is.
+    preferred_days: fromSources([
+      ['pt_clients.preferred_training_days', preferredDays(client.preferred_training_days)],
+    ], text),
+
     // ── Equipment ────────────────────────────────────────────────────────
     //
     // No column on pt_clients records this, and `training_mode` is
@@ -326,6 +360,19 @@ function resolveClientFacts(ctx, stated = {}) {
     missing.push({ field, blocking: BLOCKING.includes(field) });
   }
 
+  // The exact weekdays are read alongside the count but are not themselves a
+  // FIELDS entry: a client can have a recorded count and an unreadable picker
+  // value, and that must not add a second blocking fact.
+  //
+  // Only when they agree. A record with sessions_per_week = 3 and five picked
+  // weekdays would otherwise produce a prompt that demands three sessions on
+  // exactly five days — unsatisfiable, and every revision fails it again.
+  const weekdays = resolved.preferred_days;
+  const weekdayCount = weekdays?.value ? weekdays.value.split(',').length : 0;
+  facts.preferred_days = weekdays && weekdayCount === Number(facts.training_days?.value)
+    ? weekdays
+    : { value: null, source: null, origin: 'missing' };
+
   const active = workoutAssignments[0] || null;
 
   return {
@@ -374,6 +421,10 @@ function describeFacts(facts) {
       lines.push(`- ${LABEL[field]}: ${f.value}`);
     }
   }
+  const days = facts.preferred_days;
+  lines.push(days?.origin === 'recorded'
+    ? `- Recorded training weekdays: ${days.value}`
+    : '- Recorded training weekdays: NOT RECORDED');
   lines.push(
     '',
     'NOT RECORDED means the studio does not hold this value. Do not infer it, do not substitute a typical value, and do not write programming that depends on it. Where a decision would need it, program conservatively and say which value would change your choice.',

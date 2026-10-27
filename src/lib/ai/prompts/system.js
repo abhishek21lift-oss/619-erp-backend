@@ -114,6 +114,11 @@ function buildWorkoutSystemPrompt() {
       warm_up: 'string',
       cool_down: 'string',
       progression_notes: 'string',
+      progression: {
+        type: 'weight | reps | rpe | none',
+        amount: 'number or null — kg for weight, reps for reps, RPE points for rpe',
+        every_weeks: 'number — default 1',
+      },
       weekly_schedule: {
         DayName: {
           name: 'string',
