@@ -233,6 +233,30 @@ describe('K11 strength percentiles', () => {
   });
 });
 
+describe('training experience has one owner', () => {
+  // Enrollment writes pt_clients.workout_experience_level. The Lifestyle
+  // assessment still carries an old copy of the column, and the brief read
+  // that copy — so a client enrolled as advanced was described to the
+  // programme writer as beginner.
+  const lifestyle = {
+    assessment_date: '2026-07-01', sleep_duration_hours: 7,
+    workout_experience_level: 'beginner',
+  };
+
+  it('reads experience from the client record, not the legacy lifestyle row', () => {
+    const brief = buildBrief({
+      client: { ...CLIENT, workout_experience_level: 'advanced' },
+      lifestyle,
+    });
+    expect(brief.sections.lifestyle.experience_level).toBe('advanced');
+  });
+
+  it('does not fall back to the legacy copy when the client has none', () => {
+    const brief = buildBrief({ client: CLIENT, lifestyle });
+    expect(brief.sections.lifestyle.experience_level).toBeNull();
+  });
+});
+
 describe('ageFrom', () => {
   it('is null rather than NaN for a missing or unusable dob', () => {
     expect(ageFrom(null)).toBeNull();

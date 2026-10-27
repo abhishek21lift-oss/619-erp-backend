@@ -34,7 +34,11 @@ async function generateInformedConsentPdf(record, studioName = 'MY PT STUDIO') {
   drawLabelValue(doc, 'Mobile:', record.mobile);
   drawLabelValue(doc, 'Email:', record.email);
   drawLabelValue(doc, 'Address:', record.address);
-  drawLabelValue(doc, 'Occupation:', record.occupation);
+  // New-client intake no longer collects occupation, so a blank one would
+  // print as an empty labelled line on the signed record.
+  if (record.occupation && String(record.occupation).trim()) {
+    drawLabelValue(doc, 'Occupation:', record.occupation);
+  }
   drawLabelValue(doc, 'Emergency Contact:', record.emergency_contact ? `${record.emergency_contact} (${record.emergency_phone || '—'})` : '—');
 
   drawSectionHeading(doc, 'Nature of the Personal Training Program');

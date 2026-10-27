@@ -146,7 +146,7 @@ async function getClientTrainingBrief(orgId, clientId) {
 
   const params = [clientId, orgId];
   const { rows: clientRows } = await pool.query(
-    `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes, c.organization_id
+    `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes, c.workout_experience_level, c.organization_id
        FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL AND c.organization_id = $2`,
     params
   );
