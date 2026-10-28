@@ -206,11 +206,11 @@ async function servePublic(req, res, next) {
   }
 }
 
-router.get('/profile/*', servePublic);
-router.get('/org-logos/*', servePublic);
+router.get('/profile/*splat', servePublic);
+router.get('/org-logos/*splat', servePublic);
 
 // ── Tier 2: authenticated, with an ownership check on tenant-owned records ──
-router.get('/*', auth, async (req, res, next) => {
+router.get('/*splat', auth, async (req, res, next) => {
   try {
     const key = normaliseKey(req, res);
     if (key === null) return;

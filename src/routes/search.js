@@ -18,6 +18,7 @@
 
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
 const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope } = require('../lib/tenant-db');
@@ -40,7 +41,7 @@ const searchLimiter = rateLimit({
   max: 240,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.id ?? req.ip,
+  keyGenerator: (req) => req.user?.id ?? ipKeyGenerator(req.ip),
   message: { error: 'Too many searches. Please slow down.' },
 });
 
