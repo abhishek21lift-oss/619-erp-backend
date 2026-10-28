@@ -32,7 +32,7 @@ async function extractText(buffer, mimeType) {
       return (result?.text || '').trim();
     } catch (err) {
       logger.warn({ err: err.message }, 'ai_knowledge_pdf_parse_failed');
-      throw new Error(`Could not read this PDF (${err.message}). It may be password-protected or corrupted.`);
+      throw new Error(`Could not read this PDF (${err.message}). It may be password-protected or corrupted.`, { cause: err });
     } finally {
       // Releases the worker/document handles. Without this, ingesting many
       // documents in one process leaks them.

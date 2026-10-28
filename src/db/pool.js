@@ -72,7 +72,7 @@ function buildSslConfig() {
       return { ca: fs.readFileSync(caPath, 'utf8'), rejectUnauthorized: true };
     } catch (err) {
       logger.fatal({ caPath, err: err.message }, 'DATABASE_SSL_CA file could not be read');
-      throw new Error(`DATABASE_SSL_CA file could not be read: ${caPath}`);
+      throw new Error(`DATABASE_SSL_CA file could not be read: ${caPath}`, { cause: err });
     }
   }
   // Supabase's Supavisor pooler uses a certificate chain that is not in the
