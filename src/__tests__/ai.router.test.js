@@ -84,8 +84,20 @@ describe('getFallbackChain', () => {
     ]);
   });
 
-  it('fallback has no chain', () => {
-    expect(getFallbackChain('fallback', 'vendor/f')).toEqual([]);
+  // Regression: business/report intents START on the fallback tier. An empty
+  // chain here meant one retired fallback model (as happened in production)
+  // produced ALL_MODELS_FAILED without a single retry.
+  it('fallback falls through to primary then secondary', () => {
+    expect(getFallbackChain('fallback', 'vendor/f')).toEqual([
+      { model: 'vendor/p', tier: 'primary' },
+      { model: 'vendor/s', tier: 'secondary' },
+    ]);
+  });
+
+  it('fallback chain drops a model that was already attempted', () => {
+    expect(getFallbackChain('fallback', 'vendor/p')).toEqual([
+      { model: 'vendor/s', tier: 'secondary' },
+    ]);
   });
 
   it('drops the secondary step when primary == secondary', () => {
@@ -152,6 +164,31 @@ describe('routedChat fallback order', () => {
     expect(chatCompletion).toHaveBeenCalledTimes(2);
     expect(chatCompletion.mock.calls.map((c) => c[0].model)).toEqual(['vendor/p', 'vendor/f']);
     expect(res).toMatchObject({ tier: 'fallback', used_fallback: true, original_error: 'primary boom' });
+  });
+
+  // Regression for the Business Insights outage: the intent starts on the
+  // fallback tier, that model was retired, and the request had no next step.
+  it('business intent survives a dead fallback model via primary', async () => {
+    chatCompletion
+      .mockRejectedValueOnce(Object.assign(new Error('No endpoints found'), { status: 404 }))
+      .mockResolvedValueOnce(okResult({ model: 'vendor/p' }));
+
+    const res = await routedChat({ intent: 'business', messages: [] });
+
+    expect(chatCompletion.mock.calls.map((c) => c[0].model)).toEqual(['vendor/f', 'vendor/p']);
+    expect(res).toMatchObject({ tier: 'primary', used_fallback: true, model: 'vendor/p' });
+  });
+
+  it('business intent tries the whole chain before giving up', async () => {
+    chatCompletion
+      .mockRejectedValueOnce(new Error('fallback boom'))
+      .mockRejectedValueOnce(new Error('primary boom'))
+      .mockResolvedValueOnce(okResult({ model: 'vendor/s' }));
+
+    const res = await routedChat({ intent: 'business', messages: [] });
+
+    expect(chatCompletion.mock.calls.map((c) => c[0].model)).toEqual(['vendor/f', 'vendor/p', 'vendor/s']);
+    expect(res).toMatchObject({ tier: 'secondary', used_fallback: true });
   });
 
   it('all models fail → ALL_MODELS_FAILED with per-attempt errors', async () => {
