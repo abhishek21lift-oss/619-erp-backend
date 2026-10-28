@@ -326,6 +326,7 @@ const cors      = require('cors');
 const helmet    = require('helmet');
 const compression = require('compression');
 const rateLimit     = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const { makeStore } = require('./lib/rateLimitStore');
 const { aiLimiter } = require('./middleware/aiRateLimit');
 const cookieParser  = require('cookie-parser');
@@ -541,6 +542,13 @@ app.use((req, res, next) => (
 // L-06: 100kb default for everything else
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+// body-parser 2 leaves req.body undefined when it parses nothing; handlers
+// across the app read req.body.<field> directly, so keep the express-4
+// guarantee that a request without a parsed body still has an object.
+app.use((req, res, next) => {
+  if (req.body === undefined) req.body = {};
+  next();
+});
 app.use(cookieParser());
 app.use(compression());
 app.use('/uploads', require('./routes/uploads'));
@@ -652,7 +660,7 @@ const userApiLimiter = rateLimit({
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.id ?? req.ip,
+  keyGenerator: (req) => req.user?.id ?? ipKeyGenerator(req.ip),
   skip: (req) => !req.user,
   message: { error: 'Too many requests. Please slow down.' },
 });

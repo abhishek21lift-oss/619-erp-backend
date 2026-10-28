@@ -50,6 +50,7 @@
 
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const { makeStore } = require('../../../lib/rateLimitStore');
 const { scrubBounded } = require('../../../lib/secretScrub');
 const { validate } = require('../../../middleware/validate');
@@ -82,7 +83,7 @@ const hostingerLimiter = rateLimit({
     : 60,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.id ?? req.ip,
+  keyGenerator: (req) => req.user?.id ?? ipKeyGenerator(req.ip),
   message: {
     error: {
       code: 'HOSTINGER_RATE_LIMITED',
