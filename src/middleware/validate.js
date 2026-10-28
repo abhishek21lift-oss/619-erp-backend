@@ -10,7 +10,17 @@ function validate(schemas) {
   return function(req, res, next) {
     try {
       if (schemas.body)   req.body   = schemas.body.parse(req.body);
-      if (schemas.query)  req.query  = schemas.query.parse(req.query);
+      if (schemas.query) {
+        // express 5 parses req.query on every access and defines no setter, so
+        // the assignment below would be dropped silently and handlers would
+        // receive the raw strings the schema was meant to coerce.
+        Object.defineProperty(req, 'query', {
+          value: schemas.query.parse(req.query),
+          writable: true,
+          configurable: true,
+          enumerable: true,
+        });
+      }
       if (schemas.params) req.params = schemas.params.parse(req.params);
       next();
     } catch (err) {
