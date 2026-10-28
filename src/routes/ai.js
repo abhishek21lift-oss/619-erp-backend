@@ -527,6 +527,14 @@ function resolveDietInputs({ client, profile, goals, latestAssessment, latestChe
   };
 }
 
+// The facts a calorie target cannot be calculated without. One list, used by
+// the generator's refusal AND by the pre-flight context route, so the disabled
+// button and the 400 name the same fields.
+const DIET_REQUIRED = ['age', 'gender', 'weight_kg', 'height_cm', 'activity_level', 'goal'];
+function missingDietFields(inputs) {
+  return DIET_REQUIRED.filter((field) => !inputs[field]);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    1. AI COACH CHAT  (SSE streaming)
    POST /api/ai/chat
@@ -862,6 +870,10 @@ router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res)
     client: { id: ctx.client.id, name: ctx.client.name },
     facts,
     data_quality: dataQuality,
+    // The diet generator's own pre-flight, from the same resolver it calls.
+    // Resolved without a body because this card has no diet fields to state:
+    // anything missing here is missing from the record.
+    diet: { missing: missingDietFields(resolveDietInputs(ctx, {})) },
     safety: twin
       ? {
         gate: twin.rules.gate,
@@ -1721,11 +1733,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
   }
 
   const p = resolveDietInputs(ctx, req.body || {});
-  const required = {
-    age: p.age, gender: p.gender, weight_kg: p.weight_kg,
-    height_cm: p.height_cm, activity_level: p.activity_level, goal: p.goal,
-  };
-  const missing  = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
+  const missing = missingDietFields(p);
   if (missing.length) return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
 
   const userPrompt = [
