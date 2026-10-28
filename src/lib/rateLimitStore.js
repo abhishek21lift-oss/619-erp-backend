@@ -143,16 +143,18 @@ function makeStore(prefix) {
         // command and its arguments already split, so this is a straight forward.
         sendCommand: (...args) => client.call(...args),
       });
-      // The constructor's two SCRIPT LOADs are floating promises. A failure is
-      // recovered by the store itself — get() and increment() reload the
-      // script when EVALSHA fails — so a rejection here is not lost work,
-      // only noise that would otherwise surface as an unhandled rejection.
-      store.incrementScriptSha.catch(() => {});
-      store.getScriptSha.catch(() => {});
-      // RedisStore.init() is the only thing that sets `windowMs`, and its own
-      // increment() reads it — so this must happen before the first call, or
-      // the Lua script receives `undefined` and the limiter breaks silently.
-      if (limiterOptions) store.init(limiterOptions);
+      // RedisStore.init() is the only thing that sets `windowMs` and the two
+      // script SHAs, and its own increment() reads them — so this must happen
+      // before the first call, or the Lua script receives `undefined` and the
+      // limiter breaks silently.
+      if (limiterOptions) store.init(limiterOptions).catch(() => {});
+      // The SCRIPT LOADs are floating promises. A failure is recovered by the
+      // store itself — get() and increment() reload the script when EVALSHA
+      // fails — so a rejection here is not lost work, only noise that would
+      // otherwise surface as an unhandled rejection. They only exist after
+      // init(), which is why this follows it.
+      store.incrementScriptSha?.catch(() => {});
+      store.getScriptSha?.catch(() => {});
     }
     return store;
   };
