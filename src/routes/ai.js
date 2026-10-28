@@ -2376,6 +2376,28 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
       deterministic_insights: buildBusinessInsights(overview),
     };
 
+    // An empty studio has nothing to analyse. Asking a model to narrate zeros
+    // produces invented trends and risks, costs a call, and can still fail —
+    // so answer deterministically and mark the response as empty. The shape
+    // stays the same so clients do not need a second code path.
+    if (rev.total === 0 && members.active_members === 0 && sessions.total_sessions === 0) {
+      const summary = 'No studio activity was recorded in this period. Add clients, sessions or payments, then generate again.';
+      return res.json({
+        data: {
+          summary,
+          executive_summary: summary,
+          period: `${bizData.period.from} → ${bizData.period.to}`,
+          kpis: { mrr: 0, renewal_rate_pct: null, active_share_pct: null, avg_session_utilisation_pct: null, revenue_per_trainer: null },
+          trends: [], opportunities: [], risks: [], recommendations: [],
+        },
+        raw_data: bizData,
+        model: 'deterministic',
+        tier: 'none',
+        used_fallback: false,
+        empty: true,
+      });
+    }
+
     const userPrompt = `Analyse the following gym business data and generate an executive insights report:\n\n${JSON.stringify(bizData, null, 2)}`;
 
     const result = await routedChat({
@@ -2389,8 +2411,17 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
     });
 
     const insights = extractJson(result.content);
-    if (!insights) {
-      return res.status(422).json({ error: 'Could not parse AI response', raw: result.content.slice(0, 500) });
+    // A model can answer with prose, an array, or `{}` and still be "successful"
+    // at the provider level. Treat all three as unusable rather than shipping
+    // an empty report — and never echo the raw completion to the browser.
+    if (!insights || typeof insights !== 'object' || Array.isArray(insights)
+        || (!insights.kpis && !insights.executive_summary && !insights.summary)) {
+      logger.warn({ model: result.model, tier: result.tier }, 'ai_business_insights_unparseable');
+      return res.status(422).json({
+        error: 'AI returned an unusable report',
+        code: 'AI_UNPARSEABLE',
+        message: 'The model replied but did not return a valid report. Try again; if it keeps happening, check the fallback model in AI settings.',
+      });
     }
 
     await logUsage({
@@ -2406,9 +2437,13 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
 
     res.json({ data: insights, raw_data: bizData, model: result.model, tier: result.tier, used_fallback: result.used_fallback });
   } catch (err) {
-    logger.error({ err: err.message }, 'ai_business_insights_error');
+    logger.error({ err: err.message, code: err.code }, 'ai_business_insights_error');
     if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-    res.status(503).json({ error: 'Business insights failed', message: publicAiMessage(err) });
+    res.status(503).json({
+      error: 'Business insights failed',
+      code: err.code === 'ALL_MODELS_FAILED' ? 'AI_UNAVAILABLE' : 'AI_FAILED',
+      message: publicAiMessage(err),
+    });
   }
 });
 

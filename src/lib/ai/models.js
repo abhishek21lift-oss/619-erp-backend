@@ -13,10 +13,16 @@
 
 const settings = require('./settings');
 
+// These IDs must exist in the live OpenRouter catalogue. The previous
+// defaults (`openai/gpt-oss-120b:free`, `poolside/laguna-m.1:free`) were
+// retired and returned "No endpoints found", so every request that reached
+// them failed — including all business/report intents, which start on the
+// fallback tier. `openrouter/auto` is the last-resort router: it is always
+// available and never depends on one vendor keeping a free SKU alive.
 const DEFAULTS = {
-  primary:   'openai/gpt-oss-120b:free',
-  secondary: 'poolside/laguna-m.1:free',
-  fallback:  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  primary:   'nvidia/nemotron-3-ultra-550b-a55b:free',
+  secondary: 'openai/gpt-oss-120b',
+  fallback:  'openrouter/auto',
 };
 
 const models = {
@@ -99,7 +105,12 @@ function getFallbackModel(currentTier) {
  * Deterministic fallback order for a tier:
  *   primary   → [secondary, fallback]
  *   secondary → [fallback]
- *   fallback  → []  (business intents have no retry)
+ *   fallback  → [primary, secondary]
+ *
+ * The fallback tier used to return an empty chain, which made it a dead end:
+ * business/report intents START on fallback, so one retired or rate-limited
+ * model took the whole feature down with no retry at all. A tier is a starting
+ * point, not a guarantee that one vendor's SKU still exists.
  *
  * Duplicate model IDs are dropped, so a chain never calls the same model
  * twice. The production config can legitimately set
@@ -116,6 +127,10 @@ function getFallbackChain(currentTier, attemptedModel) {
   }
   if (currentTier === 'primary' || currentTier === 'secondary') {
     raw.push({ model: models.fallback, tier: 'fallback' });
+  }
+  if (currentTier === 'fallback') {
+    raw.push({ model: models.primary, tier: 'primary' });
+    raw.push({ model: models.secondary, tier: 'secondary' });
   }
 
   const seen = new Set(attemptedModel ? [attemptedModel] : []);

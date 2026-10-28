@@ -124,6 +124,66 @@ describe('business insights grounded payload', () => {
   });
 });
 
+describe('business insights failure handling', () => {
+  test('an empty studio answers deterministically without calling the model', async () => {
+    require('../modules/insights/metric-engine').getOverview.mockResolvedValueOnce({
+      ...OVERVIEW,
+      revenue: { total: 0, count: 0 },
+      trainers: [],
+      monthly: [],
+    });
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ active_members: '0', inactive_members: '0', new_members_period: '0' }] })
+      .mockResolvedValueOnce({ rows: [{ total_sessions: '0', active_clients: '0' }] });
+
+    const res = await request(app)
+      .post('/api/ai/business/insights')
+      .send({ from: '2026-09-01', to: '2026-09-30' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.empty).toBe(true);
+    expect(res.body.model).toBe('deterministic');
+    expect(res.body.data.kpis.mrr).toBe(0);
+    expect(res.body.data.trends).toEqual([]);
+    expect(routedChat).not.toHaveBeenCalled();
+  });
+
+  test('unparseable model output is a 422 with no raw completion echoed', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ active_members: '12', inactive_members: '3', new_members_period: '2' }] })
+      .mockResolvedValueOnce({ rows: [{ total_sessions: '40', active_clients: '9' }] });
+    routedChat.mockResolvedValue({
+      content: 'I could not produce JSON, here is some prose instead.',
+      model: 'm', tier: 'fallback', used_fallback: false, usage: {}, latency_ms: 1,
+    });
+
+    const res = await request(app)
+      .post('/api/ai/business/insights')
+      .send({ from: '2026-09-01', to: '2026-09-30' });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('AI_UNPARSEABLE');
+    expect(JSON.stringify(res.body)).not.toContain('prose instead');
+    expect(res.body.raw).toBeUndefined();
+  });
+
+  test('an empty JSON object is rejected rather than shipped as a blank report', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ active_members: '12', inactive_members: '3', new_members_period: '2' }] })
+      .mockResolvedValueOnce({ rows: [{ total_sessions: '40', active_clients: '9' }] });
+    routedChat.mockResolvedValue({
+      content: '{}', model: 'm', tier: 'fallback', used_fallback: false, usage: {}, latency_ms: 1,
+    });
+
+    const res = await request(app)
+      .post('/api/ai/business/insights')
+      .send({ from: '2026-09-01', to: '2026-09-30' });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('AI_UNPARSEABLE');
+  });
+});
+
 describe('progress analyze route guard', () => {
   test('a member is refused at the route even without the mount gate', async () => {
     mockUser = { id: 'm1', role: 'member', organization_id: 'org-1' };

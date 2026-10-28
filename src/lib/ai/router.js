@@ -11,7 +11,7 @@ const logger = require('../logger');
  */
 function chainFor(tier, attemptedModel, intent) {
   const chain = getFallbackChain(tier, attemptedModel);
-  const expected = tier === 'primary' ? 2 : tier === 'secondary' ? 1 : 0;
+  const expected = { primary: 2, secondary: 1, fallback: 2 }[tier] ?? 0;
   if (chain.length < expected) {
     logger.warn(
       { model: attemptedModel, intent, chain: chain.map((s) => s.model) },
