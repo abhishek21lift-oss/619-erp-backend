@@ -152,10 +152,10 @@ describe('corpus lifecycle router', () => {
     expect(res2.status).toBe(404);
   });
 
-  test('duplicate bytes are refused with DUPLICATE_DOCUMENT', async () => {
+  test('duplicate bytes are refused and name the document already holding them', async () => {
     mockPool((sql) => {
       if (sql.includes("content_hash = $1 AND approval_status <> 'revoked'")) {
-        return { rows: [{ id: 'doc-1', title: 'same', approval_status: 'approved', status: 'ready' }] };
+        return { rows: [{ id: 'doc-1', title: 'MPTS WPD SOP', category: 'sop', approval_status: 'approved', status: 'ready' }] };
       }
       return { rows: [] };
     });
@@ -164,6 +164,10 @@ describe('corpus lifecycle router', () => {
       .attach('file', Buffer.from('%PDF-1.4 duplicate'), { filename: 'mpts.pdf', contentType: 'application/pdf' });
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('DUPLICATE_DOCUMENT');
+    // The message must identify the existing document, or the rejected
+    // upload looks like a failure rather than "these are the same file".
+    expect(res.body.error.message).toContain('"MPTS WPD SOP"');
+    expect(res.body.error.message).toContain('(sop, approved, ready)');
   });
 
   test('a first upload inserts a PENDING global document with a content hash (review gate)', async () => {
