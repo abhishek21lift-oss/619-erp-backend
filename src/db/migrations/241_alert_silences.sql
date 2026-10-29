@@ -31,3 +31,12 @@ CREATE TABLE IF NOT EXISTS alert_silences (
 CREATE INDEX IF NOT EXISTS alert_silences_active
   ON alert_silences (ends_at)
   WHERE cancelled_at IS NULL;
+
+-- Platform data, deny-all: a studio cannot silence the operator's alerts, and
+-- has no business reading the maintenance calendar either.
+ALTER TABLE alert_silences ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON alert_silences FROM anon, authenticated;
+
+DROP POLICY IF EXISTS deny_all_direct_access ON alert_silences;
+CREATE POLICY deny_all_direct_access ON alert_silences
+  FOR ALL USING (false) WITH CHECK (false);

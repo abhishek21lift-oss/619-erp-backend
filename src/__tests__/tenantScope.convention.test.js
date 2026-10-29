@@ -131,6 +131,13 @@ const REVIEWED_EXCEPTIONS = {
     'platform-operator audit rows with no owning organisation, under ' +
     'runAsPlatform. Reached from /api/super-admin (requireSuperAdmin + MFA) ' +
     'and from API boot; never from a tenant request.',
+  'modules/command-center/timeline.service.js':
+    'Command Center incident timeline. Reads system_alerts (platform data) and '
+    + "only activity_log rows WHERE action LIKE 'command_center.%' — "
+    + 'platform-operator audit entries with no owning organisation, and this is '
+    + 'the only prefix it selects. Mounted under /api/platform and '
+    + '/api/super-admin behind the platform guard; never reached from a tenant '
+    + 'request.',
   'modules/command-center/ai-inventory.service.js':
     'AI Operations model inventory (GET /api/super-admin/command-center/ai/'
     + 'models). usageByModel() is a platform-wide, model-grouped 30-day '

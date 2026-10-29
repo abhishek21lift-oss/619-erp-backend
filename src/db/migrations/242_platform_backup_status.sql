@@ -14,3 +14,12 @@ CREATE TABLE IF NOT EXISTS platform_backup_status (
   offsite     BOOLEAN NOT NULL DEFAULT FALSE,
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Platform data, deny-all: one operator-wide row, and the backup metadata is
+-- not a studio's to read.
+ALTER TABLE platform_backup_status ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON platform_backup_status FROM anon, authenticated;
+
+DROP POLICY IF EXISTS deny_all_direct_access ON platform_backup_status;
+CREATE POLICY deny_all_direct_access ON platform_backup_status
+  FOR ALL USING (false) WITH CHECK (false);

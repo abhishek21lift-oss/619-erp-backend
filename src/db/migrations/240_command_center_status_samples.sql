@@ -28,3 +28,13 @@ CREATE INDEX IF NOT EXISTS cc_status_samples_card_time
   ON command_center_status_samples (card, sampled_at DESC);
 CREATE INDEX IF NOT EXISTS cc_status_samples_time
   ON command_center_status_samples (sampled_at);
+
+-- Platform data, deny-all: the samples describe the operator's own console and
+-- no studio may read them through PostgREST. The API role bypasses RLS, so the
+-- console keeps working exactly as before.
+ALTER TABLE command_center_status_samples ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON command_center_status_samples FROM anon, authenticated;
+
+DROP POLICY IF EXISTS deny_all_direct_access ON command_center_status_samples;
+CREATE POLICY deny_all_direct_access ON command_center_status_samples
+  FOR ALL USING (false) WITH CHECK (false);

@@ -436,6 +436,7 @@ const DOMAINS = {
       'platform_owners', 'platform_features', 'platform_announcements',
       'platform_billing_settings', 'platform_payment_settings', 'platform_ai_settings',
       'ai_platform_settings', 'system_alerts', 'system_logs',
+      'alert_silences', 'command_center_status_samples', 'platform_backup_status',
       // `support_tickets` and `support_ticket_messages` are NOT here. See the
       // `support` domain below: they carry organization_id and are read AND
       // written by routes/support.js on the tenant plane, so classifying them
