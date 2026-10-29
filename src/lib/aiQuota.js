@@ -33,7 +33,7 @@ const PERIOD_SQL = `date_trunc('month', now())`;
 async function loadSettings(client) {
   const db = client || require('../db/pool');
   const { rows } = await db.query('SELECT * FROM ai_platform_settings WHERE id = TRUE');
-  return rows[0] || { enforcement_enabled: false, default_monthly_tokens: null, warn_at_pct: 80 };
+  return rows[0] || { enforcement_enabled: false, default_monthly_tokens: null, monthly_cost_inr: null, warn_at_pct: 80 };
 }
 
 /**

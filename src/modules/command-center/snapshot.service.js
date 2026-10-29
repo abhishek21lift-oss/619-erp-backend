@@ -16,6 +16,7 @@
 
 const registry = require('./registry');
 const contract = require('./telemetry-contract');
+const { releaseInfo } = require('../../lib/release');
 
 /** name -> { at: epochMs, value: result } */
 const cache = new Map();
@@ -116,6 +117,10 @@ async function collect(opts = {}) {
 
   return {
     status: registry.rollup(cards),
+    // Which build answered. Not a card and not a probe: it is the same for
+    // every reading below, and "is the fix deployed?" is asked before any of
+    // them. release.js already bakes the sha in at build time.
+    release: releaseInfo(),
     // ── How much of the platform was actually measured ────────────────────
     //
     // The single most important field on this payload, and the one that was

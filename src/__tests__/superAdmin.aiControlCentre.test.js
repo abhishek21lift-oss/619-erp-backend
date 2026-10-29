@@ -186,6 +186,26 @@ describe('settings', () => {
     expect(call(/UPDATE ai_platform_settings/).params[0]).toBeNull();
   });
 
+  it('stores a monthly cost budget and audits what it replaced', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rows: [{ ...SETTINGS, monthly_cost_inr: '4000.00' }] })
+      .mockResolvedValueOnce({ rows: [{ ...SETTINGS, monthly_cost_inr: '5000.00' }] })
+      .mockResolvedValue({ rows: [] });
+
+    const res = await request(app()).put('/api/super-admin/ai/settings').send({ monthly_cost_inr: 5000 });
+
+    expect(res.status).toBe(200);
+    expect(call(/UPDATE ai_platform_settings/).params[0]).toBe(5000);
+    // old_data records the budget that was replaced, not only the new one.
+    expect(JSON.stringify(call(/INSERT INTO activity_log/).params)).toMatch(/"monthly_cost_inr":"4000.00"/);
+  });
+
+  it('rejects a negative cost budget', async () => {
+    const res = await request(app()).put('/api/super-admin/ai/settings').send({ monthly_cost_inr: -1 });
+    expect(res.status).toBe(400);
+    expect(call(/UPDATE ai_platform_settings/)).toBeUndefined();
+  });
+
   it('rejects nonsense values', async () => {
     for (const body of [{ default_monthly_tokens: -5 }, { default_monthly_tokens: 'lots' },
       { warn_at_pct: 0 }, { warn_at_pct: 101 }, {}]) {

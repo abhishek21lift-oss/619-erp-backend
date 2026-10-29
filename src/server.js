@@ -1369,6 +1369,23 @@ runMigrationsWithRetry()
       logger.info({ interval: '60s' }, 'Command Center alert evaluation scheduled');
     }
 
+    // Persisted card status, so the console's history survives a restart. Runs
+    // in the API process for the same reason alert evaluation does: the runtime
+    // card measures THIS process. The first sample waits for boot to settle so
+    // a cold pool is not recorded as a platform outage.
+    // Disable with CC_METRIC_SAMPLING=off.
+    if (process.env.CC_METRIC_SAMPLING !== 'off') {
+      const availability = require('./modules/command-center/availability.service');
+      const sampleTick = () => availability.sample()
+        .catch((err) => logger.warn({ err: err.message }, 'Command Center status sample failed'));
+      setTimeout(sampleTick, 90 * 1000).unref();
+      setInterval(sampleTick, availability.SAMPLE_INTERVAL_MS).unref();
+      logger.info(
+        { interval_ms: availability.SAMPLE_INTERVAL_MS, retention_days: availability.RETENTION_DAYS },
+        'Command Center status sampling scheduled',
+      );
+    }
+
     const pool = require('./db/pool');
     function shutdown(sig) {
       return function() {

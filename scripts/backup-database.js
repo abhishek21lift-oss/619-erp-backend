@@ -34,6 +34,9 @@
 //      day they need it is worse than no dump, because it is trusted.
 //   4. Optionally uploads to Cloudflare R2, reusing the same credentials the
 //      app already uses for file storage, and prunes old objects.
+//   5. Records the verified run in platform_backup_status, which is what the
+//      Command Center's backup card reads. Best-effort: a failed metrics write
+//      must never turn a good backup into a failed job.
 //
 // Credentials come from the environment only. Nothing here writes a secret
 // to disk, to the log, or to argv.
@@ -99,7 +102,7 @@ function resolveDumpUrl(env = process.env) {
   return raw;
 }
 
-function main() {
+async function main() {
   const url = resolveDumpUrl();
   if (!url) fail('None of BACKUP_DATABASE_URL, ADMIN_DATABASE_URL or DATABASE_URL is set.');
 
@@ -157,11 +160,44 @@ function main() {
 
   prune(dir);
 
+  let offsite = false;
   if (process.env.BACKUP_UPLOAD) {
-    upload(file).catch((err) => fail(`upload: ${err.message}`));
+    try {
+      await upload(file);
+      offsite = true;
+    } catch (err) {
+      fail(`upload: ${err.message}`);
+    }
   } else {
     console.log('BACKUP_UPLOAD not set — the dump is on this machine only.');
     console.log('A backup on the same host as the thing it protects is not off-site.');
+  }
+
+  recordSuccess({ url, size, tables, offsite });
+}
+
+/**
+ * Record the run for the Command Center's backup card.
+ *
+ * Only a VERIFIED dump reaches here, so the row means "a restorable backup was
+ * produced", not "the job started". Best-effort on purpose: the dump is already
+ * good on disk, and failing the job over a metrics write would mark a real
+ * backup as failed in the workflow that produced it.
+ *
+ * psql rather than a node driver because the backup image already ships the
+ * Postgres client for pg_dump/pg_restore; adding `pg` for one INSERT would be
+ * a second dependency to keep in step with the app.
+ */
+function recordSuccess({ url, size, tables, offsite }) {
+  const sql = `INSERT INTO platform_backup_status (id, last_ok_at, size_bytes, tables, offsite, updated_at)
+    VALUES (TRUE, now(), ${Math.trunc(size)}, ${Math.trunc(tables)}, ${offsite ? 'TRUE' : 'FALSE'}, now())
+    ON CONFLICT (id) DO UPDATE SET last_ok_at = EXCLUDED.last_ok_at,
+      size_bytes = EXCLUDED.size_bytes, tables = EXCLUDED.tables,
+      offsite = EXCLUDED.offsite, updated_at = now()`;
+  try {
+    run('psql', ['-v', 'ON_ERROR_STOP=1', '-q', '-c', sql, url], { stdio: ['ignore', 'ignore', 'inherit'] });
+  } catch (err) {
+    console.warn(`backup succeeded but the run could not be recorded (${err.message}); the Command Center backup card will not see it.`);
   }
 }
 
@@ -212,6 +248,6 @@ async function upload(file) {
   console.log('Set a lifecycle rule on that bucket for retention — this script prunes only local copies.');
 }
 
-if (require.main === module) main();
+if (require.main === module) main().catch((err) => fail(err.message));
 
 module.exports = { resolveDumpUrl };
