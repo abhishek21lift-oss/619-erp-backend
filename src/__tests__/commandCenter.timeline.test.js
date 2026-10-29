@@ -152,6 +152,36 @@ describe('the incident timeline', () => {
     expect(commandSql.sql).toMatch(/created_at > NOW\(\) - \(\$1 \|\| ' hours'\)::interval/);
   });
 
+  it('titles a command by its name, not by the row id it acted on', async () => {
+    // A silence logs its own id as entity_id; the timeline used to render that
+    // id as the title, so an operator saw "1" instead of what happened.
+    mockCommands = [commandRow({
+      action: 'command_center.silence.create',
+      entity_id: '1',
+      new_data: { actor: { name: 'Admin' }, outcome: 'ok' },
+    })];
+
+    const res = await request(app()).get(TIMELINE);
+    expect(res.body.data.events[0]).toMatchObject({
+      title: 'silence.create',
+      source: 'silence.create',
+    });
+  });
+
+  it('prefers the human title recorded on the command', async () => {
+    mockCommands = [commandRow({
+      action: 'command_center.silence.create',
+      entity_id: '1',
+      new_data: { title: 'Silence created', actor: { name: 'Admin' }, outcome: 'ok' },
+    })];
+
+    const res = await request(app()).get(TIMELINE);
+    expect(res.body.data.events[0]).toMatchObject({
+      title: 'Silence created',
+      source: 'silence.create',
+    });
+  });
+
   it('clamps the window and row cap at both ends', async () => {
     await request(app()).get(TIMELINE).query({ hours: '99999', limit: '9999' });
     expect(mockCalls[0].params).toEqual(['720', 200]);

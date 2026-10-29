@@ -295,7 +295,7 @@ router.post('/command-center/silences', wrap(async (req, res, next) => {
       source, reason, minutes, by: req.user?.name ?? null,
     });
     logActivity(req, 'command_center.silence.create', 'command_center', String(row.id), {
-      source, reason, minutes,
+      title: 'Silence created', source, reason, minutes,
     }).catch(() => { /* auditing must not mask the result */ });
     res.status(201).json({ data: row });
   } catch (err) {
@@ -314,7 +314,7 @@ router.delete('/command-center/silences/:id', wrap(async (req, res, next) => {
       return res.status(404).json({ error: { code: 'SILENCE_NOT_FOUND', message: 'Silence is not active' } });
     }
     logActivity(req, 'command_center.silence.cancel', 'command_center', String(row.id), {
-      source: row.source, reason: row.reason,
+      title: 'Silence cancelled', source: row.source, reason: row.reason,
     }).catch(() => { /* auditing must not mask the result */ });
     res.json({ data: row });
   } catch (err) {
