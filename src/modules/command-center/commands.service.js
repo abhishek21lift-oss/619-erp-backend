@@ -873,6 +873,7 @@ async function run(name, { req, queue, confirm, dryRun = false } = {}) {
   // three records of one action with nothing joining them — which is exactly
   // the reconstruction an operator is doing when they open this table.
   await logActivity(req, `command_center.${name}`, 'command_center', name, {
+    title: cmd.label,
     request_id: req?.id ?? null,
     actor: {
       id: req?.user?.id ?? null,

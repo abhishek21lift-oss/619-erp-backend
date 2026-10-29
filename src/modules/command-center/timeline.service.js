@@ -88,14 +88,17 @@ function commandEvent(row) {
   const actor = data.actor && typeof data.actor === 'object' ? data.actor.name ?? null : null;
   const verdict = data.verdict && typeof data.verdict === 'object' ? data.verdict : null;
   const action = String(row.action || '');
+  const command = action.startsWith(COMMAND_PREFIX) ? action.slice(COMMAND_PREFIX.length) : action;
   return {
     id: `command:${row.id}`,
     at: row.created_at,
     kind: 'command',
     event: 'command',
     severity: data.outcome === 'error' ? 'warning' : 'info',
-    source: action.startsWith(COMMAND_PREFIX) ? action.slice(COMMAND_PREFIX.length) : action,
-    title: String(row.entity_id || action || 'Command'),
+    source: command,
+    // The command, never the row id it acted on: a silence logs its own id as
+    // entity_id, and a timeline row titled "1" tells an operator nothing.
+    title: String(data.title || command || 'Command'),
     detail: data.error || (verdict && verdict.summary) || null,
     actor: actor || row.user_name || null,
     outcome: data.outcome === 'error' ? 'error' : 'ok',
