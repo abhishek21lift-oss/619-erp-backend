@@ -1,6 +1,11 @@
 # Command Center Docker Recovery — Deployment Evidence
 
-Status: S1 complete (production path verified from authorized repo/workflow evidence). S2–S5 NOT EXECUTED — requires live VPS access (docker group, /opt/myptstudio). Rung 4/5 NOT declared operational.
+Status: S1–S4 applied on production on 2026-10-29 (operator-run). External verification: `/api/health` returns `ok` with DB and Redis connected, and the WebSocket handshake reaches the app (`GET /api/command-center/stream` → 401 without a ticket). S5 (rung 4/5 restart) NOT EXECUTED — restart is not declared operational until a real restart is exercised and verified.
+
+## Execution log (2026-10-29)
+- Operator set `DOCKER_PROXY_URL`, `COMPOSE_PROFILES=recovery`, `DOCKER_GID` and `CC_API_CONTAINER` in `/opt/myptstudio/.env`, started `docker-socket-proxy` and the backend, and applied `infra/nginx/install-websocket.sh`.
+- Verified from outside: `GET https://api.myptstudio.com/api/health` → `ok` (DB + Redis connected); a WebSocket upgrade request to `/api/command-center/stream` → 401, meaning the proxy carried the handshake and the app refused it for having no ticket.
+- Not evidenced: proxy container health, live container names, `DOCKER_GID` match, and rung 4/5 behaviour.
 
 ## Confirmed production topology (S1 — external workflow evidence)
 - Project root: `/opt/myptstudio/` (deploy.yml line 33, cc-recovery.sh default, verify-serving.sh reference).
@@ -34,12 +39,12 @@ Status: S1 complete (production path verified from authorized repo/workflow evid
 - Cooldown (60s, distributed via Redis / local fallback) prevents loops.
 - Audit: `commands.run()` records actor, request id, `health_before`, outcome; never throws for operational failure (renders during incident).
 
-## What is NOT verified (blocked by missing live access — do not claim)
-- Actual VPS IP / hostname.
-- Live `docker ps` container names / health / proxy status.
-- Production `DOCKER_GID` (likely 986 per build, must verify on host).
+## What is NOT verified (do not claim)
+- Actual VPS IP / hostname (not recorded here).
+- Live `docker ps` container names and proxy health — operator-run, no output captured.
+- Production `DOCKER_GID` value.
 - Production `activity_log` self-restart state.
-- Actual rung 4/5 operational readiness.
+- Rung 4/5 operational readiness — no restart has been exercised.
 
 ## Updated environment template (`.env.example`)
 - `DOCKER_PROXY_URL=http://docker-socket-proxy:2375`
