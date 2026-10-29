@@ -14,6 +14,7 @@ const router = require('express').Router();
 const { registerCollectors, registry, snapshot } = require('./index');
 const commands = require('./commands.service');
 const alerts = require('./alerts.service');
+const silences = require('./silences.service');
 const timeline = require('./timeline.service');
 const availability = require('./availability.service');
 const guardian = require('./guardian.service');
@@ -23,6 +24,7 @@ const tickets = require('./tickets');
 const stream = require('./stream');
 const pool = require('../../db/pool');
 const { runAsPlatform } = require('../../lib/tenant-context');
+const { logActivity } = require('../../lib/activityLog');
 
 registerCollectors();
 
@@ -247,6 +249,75 @@ router.post('/command-center/alerts/:id/resolve', wrap(async (req, res, next) =>
   } catch (err) {
     if (!err.status) return next(err);
     res.status(err.status).json({ error: { code: 'ALERT_NOT_LIVE', message: err.message } });
+  }
+}));
+
+// ── Alert silences ──────────────────────────────────────────────────────────
+//
+// A silence suppresses notification, never detection. The alert still opens and
+// still appears above; the window only decides whether anyone is paged. Create
+// and cancel are audited like every other operator action on this console.
+
+/** GET /command-center/silences — windows in force right now. */
+router.get('/command-center/silences', wrap(async (_req, res) => {
+  res.json({ data: { silences: await silences.active() } });
+}));
+
+/**
+ * POST /command-center/silences
+ *   { source?: card name | null, reason, minutes }
+ *
+ * `source` must be a registered collector name or null for everything. The
+ * window is bounded server-side: 5 minutes to 30 days.
+ */
+router.post('/command-center/silences', wrap(async (req, res, next) => {
+  const source = req.body?.source ? String(req.body.source) : null;
+  if (source && !registry.names().includes(source)) {
+    return res.status(400).json({ error: { code: 'BAD_SOURCE', message: 'Unknown card name' } });
+  }
+  const reason = String(req.body?.reason ?? '').trim();
+  if (reason.length < 3 || reason.length > 200) {
+    return res.status(400).json({ error: { code: 'BAD_REASON', message: 'Reason must be 3–200 characters' } });
+  }
+  const minutes = Number(req.body?.minutes);
+  if (!Number.isInteger(minutes) || minutes < silences.MIN_MINUTES || minutes > silences.MAX_MINUTES) {
+    return res.status(400).json({
+      error: {
+        code: 'BAD_WINDOW',
+        message: `Window must be ${silences.MIN_MINUTES}–${silences.MAX_MINUTES} minutes`,
+      },
+    });
+  }
+
+  try {
+    const row = await silences.create({
+      source, reason, minutes, by: req.user?.name ?? null,
+    });
+    logActivity(req, 'command_center.silence.create', 'command_center', String(row.id), {
+      source, reason, minutes,
+    }).catch(() => { /* auditing must not mask the result */ });
+    res.status(201).json({ data: row });
+  } catch (err) {
+    next(err);
+  }
+}));
+
+/** DELETE /command-center/silences/:id — keeps the planned window in history. */
+router.delete('/command-center/silences/:id', wrap(async (req, res, next) => {
+  if (!/^\d+$/.test(String(req.params.id))) {
+    return res.status(400).json({ error: { code: 'BAD_ID', message: 'Invalid silence id' } });
+  }
+  try {
+    const row = await silences.cancel(req.params.id, req.user?.name ?? null);
+    if (!row) {
+      return res.status(404).json({ error: { code: 'SILENCE_NOT_FOUND', message: 'Silence is not active' } });
+    }
+    logActivity(req, 'command_center.silence.cancel', 'command_center', String(row.id), {
+      source: row.source, reason: row.reason,
+    }).catch(() => { /* auditing must not mask the result */ });
+    res.json({ data: row });
+  } catch (err) {
+    next(err);
   }
 }));
 
