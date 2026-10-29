@@ -20,6 +20,7 @@ const availability = require('./availability.service');
 const guardian = require('./guardian.service');
 const logBuffer = require('./logBuffer');
 const logCapture = require('./logCapture');
+const logExport = require('./logExport');
 const tickets = require('./tickets');
 const stream = require('./stream');
 const pool = require('../../db/pool');
@@ -568,6 +569,32 @@ router.get('/command-center/logs/history', wrap(async (req, res) => {
         + `(api and worker), retained ${logCapture.retentionDays()} days.`,
     },
   });
+}));
+
+/**
+ * GET /api/super-admin/command-center/logs/history/export
+ *   ?level=error  floor (defaults to the persisted threshold)
+ *   ?source=api|worker
+ *   ?q=
+ *   ?hours=       window, clamped 1..720 (default 24)
+ *
+ * The same filters as History, streamed as a CSV attachment capped at 20,000
+ * rows. `X-Export-Truncated` says whether the cap was hit, so the operator is
+ * never handed a silently partial incident.
+ */
+router.get('/command-center/logs/history/export', wrap(async (req, res) => {
+  const file = await logExport.build({
+    hours: req.query.hours,
+    minLevel: minLevelOf(req.query.level) || logCapture.PERSIST_FROM_LEVEL,
+    source: req.query.source,
+    q: req.query.q,
+  });
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Export-Truncated', String(file.truncated));
+  res.send(file.csv);
 }));
 
 module.exports = router;
