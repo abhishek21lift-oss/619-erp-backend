@@ -14,6 +14,7 @@ const router = require('express').Router();
 const { registerCollectors, registry, snapshot } = require('./index');
 const commands = require('./commands.service');
 const alerts = require('./alerts.service');
+const timeline = require('./timeline.service');
 const guardian = require('./guardian.service');
 const logBuffer = require('./logBuffer');
 const logCapture = require('./logCapture');
@@ -246,6 +247,21 @@ router.post('/command-center/alerts/:id/resolve', wrap(async (req, res, next) =>
     if (!err.status) return next(err);
     res.status(err.status).json({ error: { code: 'ALERT_NOT_LIVE', message: err.message } });
   }
+}));
+
+// ── Incident timeline ───────────────────────────────────────────────────────
+
+/**
+ * GET /api/super-admin/command-center/timeline
+ *   ?hours=   window, clamped 1..720 (default 24)
+ *   ?limit=   events returned, clamped 1..200 (default 60)
+ *
+ * "What changed" for the operator arriving mid-incident, in one list: alert
+ * lifecycle events and audited operator commands, newest first. Both reads are
+ * windowed and capped, so this stays cheap on a screen that polls.
+ */
+router.get('/command-center/timeline', wrap(async (req, res) => {
+  res.json({ data: await timeline.read({ hours: req.query.hours, limit: req.query.limit }) });
 }));
 
 // ── AI Guardian ─────────────────────────────────────────────────────────────
