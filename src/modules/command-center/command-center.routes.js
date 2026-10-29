@@ -15,6 +15,7 @@ const { registerCollectors, registry, snapshot } = require('./index');
 const commands = require('./commands.service');
 const alerts = require('./alerts.service');
 const timeline = require('./timeline.service');
+const availability = require('./availability.service');
 const guardian = require('./guardian.service');
 const logBuffer = require('./logBuffer');
 const logCapture = require('./logCapture');
@@ -262,6 +263,20 @@ router.post('/command-center/alerts/:id/resolve', wrap(async (req, res, next) =>
  */
 router.get('/command-center/timeline', wrap(async (req, res) => {
   res.json({ data: await timeline.read({ hours: req.query.hours, limit: req.query.limit }) });
+}));
+
+// ── Persisted availability ──────────────────────────────────────────────────
+
+/**
+ * GET /api/super-admin/command-center/availability
+ *   ?hours=  window, clamped 1..(retention days × 24), default 24
+ *
+ * Per-card status rails, bucketed so a week stays a few hundred points. This is
+ * the console's memory: the live snapshot knows now, this answers "has it been
+ * flapping".
+ */
+router.get('/command-center/availability', wrap(async (req, res) => {
+  res.json({ data: await availability.history({ hours: req.query.hours }) });
 }));
 
 // ── AI Guardian ─────────────────────────────────────────────────────────────
