@@ -41,6 +41,7 @@ const aiSettings = require('../../../lib/ai/settings');
 const { models: aiModels } = require('../../../lib/ai/models');
 const gateway = require('../../../lib/ai/gateway');
 const observations = require('../../../lib/ai/observations');
+const aiQuota = require('../../../lib/aiQuota');
 const { configuredInCatalog } = require('./freellmapi.collector');
 const { runAsPlatform } = require('../../../lib/tenant-context');
 
@@ -202,7 +203,7 @@ async function collectPlatformWide() {
     return unavailable(NAME, `No AI provider is configured. ${aiConfig.configurationProblem()}`, true);
   }
 
-  const [today, overrideRow, recent, last, served24h, probe] = await Promise.all([
+  const [today, overrideRow, recent, last, served24h, monthCost, quotaSettings, probe] = await Promise.all([
     optional(async () => {
       const { rows } = await pool.query(`
         SELECT count(*)::int                                          AS requests,
@@ -271,6 +272,18 @@ async function collectPlatformWide() {
          LIMIT 10`);
       return rows.map((r) => ({ model: r.model, requests: r.requests, last_at: r.last_at }));
     }),
+    // Month-to-date spend, graded against the operator's rupee budget. The
+    // calendar month is the unit the budget is quoted in (aiQuota.PERIOD_SQL),
+    // so a 30-day window would be a different and slightly wrong number.
+    optional(async () => {
+      const { rows } = await pool.query(`
+        SELECT COALESCE(SUM(${COST_SQL}), 0)::numeric AS cost_inr
+          FROM ai_usage_log l
+          LEFT JOIN ai_model_rates r ON r.model = l.model
+         WHERE l.created_at >= ${aiQuota.PERIOD_SQL}`);
+      return rows[0] ? Number(rows[0].cost_inr) : null;
+    }),
+    optional(() => aiQuota.loadSettings()),
     // Capped well inside this card's own 5s deadline. A gateway that is
     // black-holed must cost the AI card its gateway half, not the whole card —
     // the freellmapi card reports the hang itself.
@@ -287,6 +300,22 @@ async function collectPlatformWide() {
   const hourFallbackRate = hourRequests ? (recent.fallbacks ?? 0) / hourRequests : null;
   const hourLatency = hourRequests ? int(recent.avg_latency_ms) : null;
 
+  // A budget is advisory until set: NULL means the operator never gave one,
+  // and this card must not invent a target. `cost_is_floor` travels with the
+  // number because unpriced models contribute tokens and zero rupees, so the
+  // percentage can understate the real spend but never overstate it.
+  const budgetCap = quotaSettings?.monthly_cost_inr == null
+    ? null : Number(quotaSettings.monthly_cost_inr);
+  const budget = budgetCap == null || monthCost == null ? null : {
+    monthly_cost_inr: budgetCap,
+    spent_month_inr: monthCost,
+    warn_at_pct: Number(quotaSettings.warn_at_pct) || 80,
+    pct: budgetCap > 0
+      ? Math.round((monthCost / budgetCap) * 1000) / 10
+      : (monthCost > 0 ? 100 : 0),
+    cost_is_floor: today?.cost_is_floor ?? false,
+  };
+
   const reconciliation = reconcile({ routing, served24h, probe, verdict, obs });
 
   const data = {
@@ -298,6 +327,7 @@ async function collectPlatformWide() {
     active_used_fallback: last ? Boolean(last.used_fallback) : null,
     last_request_at: last?.created_at ?? null,
     today,
+    budget,
     last_hour: recent ? {
       requests: hourRequests,
       avg_latency_ms: hourLatency,
@@ -349,6 +379,17 @@ async function collectPlatformWide() {
   } else if (hourLatency != null && hourLatency >= LATENCY_WARN_MS) {
     status = STATUS.WARNING;
     reason = `AI average latency ${hourLatency}ms in the last hour`;
+  }
+
+  // Budget grading sits below traffic because a live incident is the more
+  // urgent fact, and above reconciliation because money already spent does not
+  // stop being spent when the routing happens to look consistent.
+  if (budget && budget.pct >= 100 && status !== STATUS.CRITICAL) {
+    status = STATUS.CRITICAL;
+    reason = `AI spend this month is ₹${Math.round(budget.spent_month_inr).toLocaleString('en-IN')} — ${budget.pct}% of the ₹${Math.round(budget.monthly_cost_inr).toLocaleString('en-IN')} budget`;
+  } else if (budget && budget.pct >= budget.warn_at_pct && status === STATUS.HEALTHY) {
+    status = STATUS.WARNING;
+    reason = `AI spend this month is at ${budget.pct}% of the ₹${Math.round(budget.monthly_cost_inr).toLocaleString('en-IN')} budget`;
   }
 
   // Reconciliation can only raise the grade, never lower one the traffic set.
