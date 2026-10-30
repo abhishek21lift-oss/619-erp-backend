@@ -972,6 +972,9 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 // request.
 app.use('/api/me',               auth, requireClient, require('./modules/progress/member-progress.routes'));
 app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-portal.routes'));
+// The client's own booking: free slots, book, reschedule, cancel. Identity is
+// req.user.pt_client_id; no route takes a client or trainer id.
+app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-booking.routes'));
 
 // The studio's side of member ↔ studio messaging. The member's side is
 // /api/me/messages above; this one takes a client id, so it is trainer-only and
