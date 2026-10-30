@@ -721,6 +721,9 @@ app.use('/api/auth/refresh',         refreshLimiter);
 // Unauthenticated marketing data (plan catalogue + platform aggregates) for the
 // public landing page. Aggregate-only — no per-tenant values are exposed.
 app.use('/api/public',            require('./routes/public'));
+// Read-only calendar subscription per trainer. Token-authenticated, no login:
+// calendar clients cannot send one. See routes/calendar-feed.js.
+app.use('/api/public',            require('./routes/calendar-feed'));
 
 // Public by design: an invited admin has no password yet, so nothing here can
 // require one. The single-use hashed token IS the credential — see
