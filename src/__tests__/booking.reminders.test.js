@@ -38,7 +38,7 @@ describe('runSessionReminders', () => {
     const sessions = [row()];
     pool.query.mockImplementation(async (sql, params) => {
       if (/FROM pt_sessions/.test(sql)) {
-        return { rows: params[0] === '2026-11-02 06:30' ? sessions : [] };
+        return { rows: params[0] === '2026-11-02 06:15' ? sessions : [] };
       }
       if (/INSERT INTO notifications/.test(sql)) return { rowCount: 1 };
       return { rows: [] };
@@ -69,7 +69,7 @@ describe('runSessionReminders', () => {
     const written = new Set();
     pool.query.mockImplementation(async (sql, params) => {
       if (/FROM pt_sessions/.test(sql)) {
-        return { rows: params[0] === '2026-11-02 06:30' ? [row()] : [] };
+        return { rows: params[0] === '2026-11-02 06:15' ? [row()] : [] };
       }
       if (/INSERT INTO notifications/.test(sql)) {
         if (written.has(params[3])) return { rowCount: 0 };
@@ -95,7 +95,7 @@ describe('runSessionReminders', () => {
     pool.query.mockImplementation(async (sql, params) => {
       if (/FROM pt_sessions/.test(sql)) {
         return {
-          rows: params[0] === '2026-11-01 08:30'
+          rows: params[0] === '2026-11-01 08:15'
             ? [row({ id: 's2', session_date: '2026-11-01', start_time: '08:30' })]
             : [],
         };
@@ -114,7 +114,7 @@ describe('runSessionReminders', () => {
   it('does not remind twice when the notification already exists', async () => {
     pool.query.mockImplementation(async (sql, params) => {
       if (/FROM pt_sessions/.test(sql)) {
-        return { rows: params[0] === '2026-11-02 06:30' ? [row()] : [] };
+        return { rows: params[0] === '2026-11-02 06:15' ? [row()] : [] };
       }
       if (/INSERT INTO notifications/.test(sql)) return { rowCount: 0 };
       return { rows: [] };
@@ -124,6 +124,20 @@ describe('runSessionReminders', () => {
 
     expect(out).toMatchObject({ sent: 0, skipped: 1 });
     expect(triggers.sessionReminderFor).not.toHaveBeenCalled();
+  });
+
+  it('centres each window on the target band', async () => {
+    pool.query.mockResolvedValue({ rows: [], rowCount: 0 });
+
+    await runSessionReminders();
+
+    const ranges = pool.query.mock.calls
+      .filter((c) => /FROM pt_sessions/.test(String(c[0])))
+      .map((c) => c[1]);
+    expect(ranges).toEqual([
+      ['2026-11-02 06:15', '2026-11-02 06:45'],
+      ['2026-11-01 08:15', '2026-11-01 08:45'],
+    ]);
   });
 
   it('selects only scheduled, live sessions and never asks which studios are on', async () => {

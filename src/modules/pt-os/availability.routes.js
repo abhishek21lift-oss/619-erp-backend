@@ -228,7 +228,7 @@ router.get('/booking-settings', wrap(async (req, res) => {
   const trainerId = await trainerIdOf(req);
   if (!trainerId) return bad(res, 400, 'NO_TRAINER', 'This studio has no trainer profile.');
   const settings = await settingsFor(orgIdOf(req), trainerId);
-  res.json({ data: { ics_token: null, ...settings } });
+  res.json({ data: settings });
 }));
 
 router.put('/booking-settings', wrap(async (req, res) => {

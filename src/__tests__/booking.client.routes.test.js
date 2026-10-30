@@ -106,6 +106,7 @@ describe('DELETE /api/me/booking/:id', () => {
   it('refuses to cancel inside the cutoff and writes nothing', async () => {
     pool.query.mockImplementation(async (sql) => {
       const s = String(sql);
+      if (/FROM pt_clients/.test(s)) return { rows: [{ trainer_id: 't1' }] };
       if (/SELECT/.test(s) && /FROM pt_sessions/.test(s)) return { rows: [sessionRow()] };
       return { rows: [] };
     });
@@ -113,6 +114,19 @@ describe('DELETE /api/me/booking/:id', () => {
     const res = await request(app).delete('/api/me/booking/s1');
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('CANCEL_CUTOFF_PASSED');
+    expect(sqlLike(pool.query, /UPDATE pt_sessions/)).toBeUndefined();
+  });
+
+  it('refuses when the studio has no trainer profile', async () => {
+    pool.query.mockImplementation(async (sql) => {
+      const s = String(sql);
+      if (/SELECT/.test(s) && /FROM pt_sessions/.test(s)) return { rows: [sessionRow()] };
+      return { rows: [] };
+    });
+
+    const res = await request(app).delete('/api/me/booking/s1');
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('NO_TRAINER');
     expect(sqlLike(pool.query, /UPDATE pt_sessions/)).toBeUndefined();
   });
 });
@@ -131,6 +145,20 @@ describe('PATCH /api/me/booking/:id', () => {
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('SLOT_TAKEN');
     expect(sqlLike(pool.query, /UPDATE pt_sessions/)).toBeUndefined();
+  });
+
+  it('refuses when the session was cancelled between the read and the update', async () => {
+    pool.query.mockImplementation(async (sql) => {
+      const s = String(sql);
+      if (/FROM pt_clients/.test(s)) return { rows: [{ trainer_id: 't1' }] };
+      if (/SELECT/.test(s) && /FROM pt_sessions/.test(s)) return { rows: [sessionRow({ session_date: '2026-11-05' })] };
+      return { rows: [] }; // the guarded UPDATE matched nothing
+    });
+
+    const res = await request(app).patch('/api/me/booking/s1').send({ date: '2026-11-06', start: '07:00' });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('NOT_SCHEDULED');
+    expect(sqlLike(pool.query, /UPDATE pt_sessions/)[0]).toMatch(/status = 'scheduled'/);
   });
 });
 

@@ -193,10 +193,14 @@ router.patch('/booking/:id', wrap(async (req, res) => {
       `UPDATE pt_sessions
           SET session_date = $1, start_time = $2, end_time = $3,
               duration_minutes = $4, updated_at = NOW()
-        WHERE id = $5 AND client_id = $6 AND organization_id = $7 AND deleted_at IS NULL
+        WHERE id = $5 AND client_id = $6 AND organization_id = $7
+          AND status = 'scheduled' AND deleted_at IS NULL
         RETURNING ${SESSION_COLUMNS}`,
       [date, start, endTime, settings.slot_minutes, current.id, clientIdOf(req), orgId],
     );
+    if (!rows[0]) {
+      return bad(res, 409, 'NOT_SCHEDULED', 'Only a scheduled session can be moved.');
+    }
     return res.json({ data: rows[0] });
   } catch (err) {
     if (err.code === '23505') {
@@ -223,7 +227,9 @@ router.delete('/booking/:id', wrap(async (req, res) => {
     return bad(res, 409, 'NOT_SCHEDULED', 'Only a scheduled session can be cancelled.');
   }
 
-  const settings = await settingsFor(orgId, await trainerOf(req));
+  const trainerId = await trainerOf(req);
+  if (!trainerId) return bad(res, 409, 'NO_TRAINER', 'Your trainer has not set up a profile yet.');
+  const settings = await settingsFor(orgId, trainerId);
   if (withinCutoff(current.session_date, current.start_time, settings.cancel_cutoff_hours)) {
     return bad(res, 409, 'CANCEL_CUTOFF_PASSED',
       'This session is too close to cancel. Message your trainer.');

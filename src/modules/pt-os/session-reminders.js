@@ -24,9 +24,10 @@ const BUCKETS = [
   { bucket: '2h', hours: 2, when: 'in 2 hours' },
 ];
 
-// The scheduler runs every 15 minutes. The window is two cron periods wide so
-// a late or skipped run cannot open a gap between two runs; the overlap is
-// harmless because the notification dedupe absorbs the second sighting.
+// The scheduler runs every 15 minutes. Each window is centred on the target
+// (24h ± 15m, 2h ± 15m) and two cron periods wide, so a late or skipped run
+// cannot open a gap; the overlap is harmless because the notification dedupe
+// absorbs the second sighting.
 const WINDOW_MINUTES = 30;
 
 const pad = (n) => String(n).padStart(2, '0');
@@ -68,8 +69,8 @@ async function runSessionReminders() {
   let skipped = 0;
 
   for (const { bucket, hours, when } of BUCKETS) {
-    const from = istWall(hours * 60);
-    const to = istWall(hours * 60 + WINDOW_MINUTES);
+    const from = istWall(hours * 60 - WINDOW_MINUTES / 2);
+    const to = istWall(hours * 60 + WINDOW_MINUTES / 2);
     const { rows } = await pool.query(SESSIONS_SQL, [from, to]);
 
     for (const row of rows) {
