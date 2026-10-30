@@ -75,9 +75,9 @@ const DEFAULT_TERM_EXPIRY_CRON = '5 * * * *';
 /**
  * How often session reminders are checked.
  *
- * Every 15 minutes, because the reminder windows are 15 minutes wide: a run at
- * 06:30 covers sessions between 06:30 and 06:45 of the target hour. Waiting
- * longer than the window would skip sessions entirely.
+ * Every 15 minutes. The job itself looks 30 minutes ahead — two periods — so a
+ * run that starts late or fails cannot leave a gap: the next run still covers
+ * the target hour, and the notification dedupe absorbs the overlap.
  */
 const DEFAULT_SESSION_REMINDERS_CRON = '*/15 * * * *';
 
