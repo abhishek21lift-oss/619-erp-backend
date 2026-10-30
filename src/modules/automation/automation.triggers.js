@@ -314,6 +314,25 @@ async function paymentDue(orgId, { clientId, balance, periodStart, currency = 'â
   });
 }
 
+/**
+ * A booked session is coming up, 24 hours or 2 hours out.
+ *
+ * Sweep-driven: src/modules/pt-os/session-reminders.js finds the pair of
+ * windows and calls this. The key is session + bucket, so the same session
+ * announces itself once per bucket no matter how many runs overlap.
+ */
+async function sessionReminderFor(orgId, {
+  clientId, sessionId, date, time, when, name, bucket,
+}) {
+  return emit({
+    orgId,
+    event: 'session_reminder',
+    subjectId: clientId,
+    eventKey: `${sessionId}:${bucket}`,
+    context: { date, time, when, name },
+  });
+}
+
 module.exports = {
   // Request-driven: called from the handler that performs the business write.
   paymentReceived,
@@ -332,5 +351,7 @@ module.exports = {
   attendanceMissed,
   followupDue,
   paymentDue,
+  // Clock-driven: called from src/modules/pt-os/session-reminders.js.
+  sessionReminderFor,
 };
 

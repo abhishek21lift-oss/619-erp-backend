@@ -32,10 +32,12 @@ const redis = require('../lib/redis');
 const { runSweep } = require('../modules/automation/automation.sweep');
 const { runRecovery } = require('../modules/automation/automation.recovery');
 const { expireEndedTerms } = require('../modules/pt-os/pt-os.service');
+const { runSessionReminders } = require('../modules/pt-os/session-reminders');
 
 const SWEEP_JOB_ID = 'automation-daily-sweep';
 const RECOVERY_JOB_ID = 'automation-orphan-recovery';
 const TERM_EXPIRY_JOB_ID = 'pt-term-expiry';
+const SESSION_REMINDERS_JOB_ID = 'pt-session-reminders';
 
 /**
  * When the sweep runs.
@@ -70,12 +72,26 @@ const DEFAULT_RECOVERY_CRON = '*/15 * * * *';
  */
 const DEFAULT_TERM_EXPIRY_CRON = '5 * * * *';
 
+/**
+ * How often session reminders are checked.
+ *
+ * Every 15 minutes, because the reminder windows are 15 minutes wide: a run at
+ * 06:30 covers sessions between 06:30 and 06:45 of the target hour. Waiting
+ * longer than the window would skip sessions entirely.
+ */
+const DEFAULT_SESSION_REMINDERS_CRON = '*/15 * * * *';
+
 async function processSweepJob(job) {
   if (job.name === 'daily') return runSweep();
   if (job.name === 'recovery') return runRecovery();
   if (job.name === 'term-expiry') {
     const out = await expireEndedTerms();
     logger.info({ expired: out.expired, paused: out.paused }, 'pt term expiry completed');
+    return out;
+  }
+  if (job.name === 'session-reminders') {
+    const out = await runSessionReminders();
+    logger.info({ sent: out.sent, skipped: out.skipped }, 'pt session reminders completed');
     return out;
   }
   throw new Error(`Unknown automation job: ${job.name}`);
@@ -179,11 +195,25 @@ async function scheduleAutomationSweep() {
     }
   ), 5000);
 
-  logger.info({ cron, recoveryCron, termExpiryCron }, 'automation sweep cron scheduled');
+  const remindersCron = process.env.PT_SESSION_REMINDERS_CRON || DEFAULT_SESSION_REMINDERS_CRON;
+  await withTimeout(automationSweepQueue.upsertJobScheduler(
+    SESSION_REMINDERS_JOB_ID,
+    { pattern: remindersCron },
+    {
+      name: 'session-reminders',
+      data: {},
+      // Idempotent per notification row and per event key, so the next quarter
+      // hour is the retry.
+      opts: { attempts: 1, removeOnComplete: true, removeOnFail: true },
+    }
+  ), 5000);
+
+  logger.info({ cron, recoveryCron, termExpiryCron, remindersCron }, 'automation sweep cron scheduled');
   return {
     sweep: { jobSchedulerId: SWEEP_JOB_ID },
     recovery: { jobSchedulerId: RECOVERY_JOB_ID },
     termExpiry: { jobSchedulerId: TERM_EXPIRY_JOB_ID },
+    sessionReminders: { jobSchedulerId: SESSION_REMINDERS_JOB_ID },
     jobSchedulerId: SWEEP_JOB_ID,
   };
 }
