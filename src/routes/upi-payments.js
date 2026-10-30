@@ -89,11 +89,6 @@ const boolish = z.union([
   z.enum(['true', 'false', '1', '0']).transform((v) => v === 'true' || v === '1'),
 ]);
 
-// plans.duration is an enum of words, not a number of months.
-const DURATION_MONTHS = Object.freeze({
-  'Monthly': 1, 'Quarterly': 3, 'Half Yearly': 6, 'Yearly': 12,
-});
-
 // Mime types /upload can legitimately have returned. Echoed back by the
 // client, so it is checked against this list rather than stored as sent.
 const ALLOWED_PROOF_MIME = ['image/jpeg', 'image/png', 'application/pdf'];
@@ -402,28 +397,27 @@ router.post('/create', auth, validate(schemas.createOrder), wrap(async (req, res
     };
 
     if (plan.plan_id) {
-      // Scoped to the caller's studio, the same strict match GET /api/plans
-      // applies. Without it any studio's plan id resolved here, so a member
-      // could price their own order from another studio's cheapest plan — and
-      // read its name, price and duration back out of the response.
+      // Scoped to the caller's studio, so any studio's package id cannot price
+      // an order here — or have its name, price and duration read back out of
+      // the response.
       const { rows } = await pool.query(
-        `SELECT id, name, final_amount, duration FROM plans
-          WHERE id = $1 AND organization_id = $2
-            AND deleted_at IS NULL AND is_active = TRUE`,
+        `SELECT id, name, price, duration_days FROM pt_packages
+          WHERE id = $1 AND organization_id = $2 AND is_active = TRUE`,
         [plan.plan_id, orgId]
       );
       if (!rows[0]) {
-        return res.status(404).json({ error: { code: 'PLAN_NOT_FOUND', message: 'Plan not found' } });
+        return res.status(404).json({ error: { code: 'PLAN_NOT_FOUND', message: 'Package not found' } });
       }
       plan = {
         ...plan,
         plan_name: rows[0].name,
-        base_amount: Number(rows[0].final_amount),
-        duration_months: DURATION_MONTHS[rows[0].duration] ?? plan.duration_months,
+        base_amount: Number(rows[0].price),
+        // pt_packages is sold in days; an order is priced in whole months.
+        duration_months: Math.max(1, Math.round(Number(rows[0].duration_days) / 30)),
       };
     } else if (req.user.role === 'member') {
       return res.status(403).json({
-        error: { code: 'PLAN_REQUIRED', message: 'Choose a membership plan to continue.' },
+        error: { code: 'PLAN_REQUIRED', message: 'Choose a PT package to continue.' },
       });
     }
 
@@ -528,7 +522,7 @@ router.get('/:id/status', auth, validate(schemas.idParam), wrap(async (req, res)
     );
     const { rows: activation } = await pool.query(
       `SELECT receipt_no, amount, utr, activated_from, activated_to, approved_at
-         FROM membership_payments WHERE payment_order_id = $1`,
+         FROM pt_payment_activations WHERE payment_order_id = $1`,
       [order.id]
     );
 
@@ -763,7 +757,7 @@ router.get('/history', auth, validate(schemas.history), wrap(async (req, res) =>
           WHERE ps.payment_order_id = o.id
           ORDER BY ps.submitted_at DESC LIMIT 1
        ) s ON TRUE
-       LEFT JOIN membership_payments mp ON mp.payment_order_id = o.id
+       LEFT JOIN pt_payment_activations mp ON mp.payment_order_id = o.id
        ${where}
       ORDER BY o.created_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}`,
@@ -851,7 +845,7 @@ router.get('/pending', auth, requireTrainer, validate(schemas.pending), wrap(asy
        COALESCE(SUM(mp.amount) FILTER (WHERE mp.approved_at::date = CURRENT_DATE), 0)    AS approved_today_amount,
        COALESCE(SUM(mp.amount), 0)                                            AS total_collected
      FROM payment_orders o
-     LEFT JOIN membership_payments mp ON mp.payment_order_id = o.id
+     LEFT JOIN pt_payment_activations mp ON mp.payment_order_id = o.id
      WHERE o.organization_id = $1`,
     [orgId]
   );
@@ -983,7 +977,7 @@ router.get('/:id/receipt', auth, validate(schemas.idParam), wrap(async (req, res
     const order = await loadOrderForCaller(req, req.params.id);
 
     const { rows: activationRows } = await pool.query(
-      `SELECT * FROM membership_payments WHERE payment_order_id = $1`, [order.id]
+      `SELECT * FROM pt_payment_activations WHERE payment_order_id = $1`, [order.id]
     );
     const activation = activationRows[0];
     if (!activation) {

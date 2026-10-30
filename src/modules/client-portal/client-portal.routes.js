@@ -151,7 +151,7 @@ router.get('/payments', wrap(async (req, res) => {
     `SELECT p.id, p.amount, p.date, p.payment_method, p.notes, p.created_at,
             mp.payment_order_id AS upi_order_id
        FROM pt_payments p
-       LEFT JOIN membership_payments mp ON mp.pt_payment_id = p.id
+       LEFT JOIN pt_payment_activations mp ON mp.pt_payment_id = p.id
       WHERE p.client_id = $1 AND p.deleted_at IS NULL${orgClause(orgId, params, 'p.organization_id')}
       ORDER BY p.date DESC, p.created_at DESC
       LIMIT 200`,

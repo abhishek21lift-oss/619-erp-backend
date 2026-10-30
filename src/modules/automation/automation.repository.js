@@ -804,8 +804,8 @@ async function activeTriggerEventsFor(orgId) {
  * inside — three messages on the same day for someone one day out.
  *
  * The consequence is that a sweep which does not run on a given day loses that
- * day's bucket. That is the same trade the membership reminder in
- * renewal.worker.js has always made, and the alternative — remembering which
+ * day's bucket. That is the same trade the old membership reminder made, and
+ * the alternative — remembering which
  * buckets each client has already been sent — is what the dedupe key already
  * does one layer up, at the point where it can also see the rule.
  */

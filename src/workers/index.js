@@ -1,5 +1,5 @@
 // src/workers/index.js
-// Start all in-process BullMQ workers plus the renewal scheduler.
+// Start all in-process BullMQ workers plus the scheduled sweeps.
 //
 // Used by server.js (when RUN_WORKERS != 0 and Redis is configured) so a
 // single-instance Render deploy does not need a second worker process. Each
@@ -21,7 +21,7 @@
 // RUN_WORKERS=0 and this file runs as its own container, so these are separate
 // processes — this is not the single-process case where server.js's own
 // require would have covered the workers incidentally. What runs in here owns
-// the AI queue, email delivery, WhatsApp, notifications and renewal billing, so
+// the AI queue, email delivery, WhatsApp, notifications and scheduled sweeps, so
 // an unhandled throw in any of them was invisible to Sentry while looking, from
 // the compose file, fully configured.
 //
@@ -120,7 +120,6 @@ async function startWorkers() {
   const { createWhatsappWorker } = require('./whatsapp.worker');
   const { createAiWorker } = require('./ai.worker');
   const { createNotificationsWorker } = require('./notifications.worker');
-  const { createRenewalWorker, scheduleRenewalCron } = require('./renewal.worker');
   const { createAutomationWorker, scheduleAutomationSweep } = require('./automation.worker');
   const { createProgressWorker, scheduleProgressSweep } = require('./progress.worker');
 
@@ -129,11 +128,9 @@ async function startWorkers() {
     createWhatsappWorker(),
     createAiWorker(),
     createNotificationsWorker(),
-    createRenewalWorker(),
     createAutomationWorker(),
     createProgressWorker(),
   ];
-  await scheduleRenewalCron();
 
   // Caught, unlike the line above it, and deliberately not by changing that
   // line. An unregistered sweep schedule costs a studio one morning's

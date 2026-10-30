@@ -168,7 +168,7 @@ describe('approving a balance order', () => {
     on(/FROM pt_clients WHERE id = \$1 FOR UPDATE/,
       { rows: [{ id: 'client-1', name: 'Rohit', trainer_id: null, pt_end_date: '2026-12-31',
                  balance_amount: balanceNow }] });
-    on(/INSERT INTO membership_payments/, (params) => ({
+    on(/INSERT INTO pt_payment_activations/, (params) => ({
       rows: [{ receipt_no: params[6], amount: params[7], activated_from: params[9], activated_to: params[10] }],
     }));
   }
@@ -188,7 +188,7 @@ describe('approving a balance order', () => {
     scriptApproval();
     const result = await upi.approve({ orderId: 'ord-1', orgId: ORG, actor: ACTOR });
 
-    const mp = find(/INSERT INTO membership_payments/);
+    const mp = find(/INSERT INTO pt_payment_activations/);
     expect(mp.params[9]).toBeNull();
     expect(mp.params[10]).toBeNull();
     expect(result.activation.activated_to).toBeNull();

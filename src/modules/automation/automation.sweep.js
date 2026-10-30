@@ -59,7 +59,7 @@ const { Outcome } = require('./automation.engine');
 /**
  * How many days before expiry to remind, largest first.
  *
- * The same three buckets renewal.worker.js has always used. Each is a separate
+ * The same three buckets the membership reminders have always used. Each is a separate
  * query and a separate dedupe key, so a client 7 days out gets one message
  * today and another when they are 3 days out — not three today.
  */

@@ -26,8 +26,8 @@
 //      probe, or an UNAUTHENTICATED route (only auth.js opens a context, so
 //      login, forgot-password and /api/public never have one). Every one of
 //      these legitimately reads across organizations — login has to find a
-//      user by email before it knows their org, and the renewal worker has to
-//      sweep every studio. These belong on the owner connection.
+//      user by email before it knows their org, and a scheduled sweep has to
+//      visit every studio. These belong on the owner connection.
 //
 //   2. A STORE WITH platformWide — an authenticated platform operator acting
 //      across tenants. Same connection, but arrived at deliberately rather

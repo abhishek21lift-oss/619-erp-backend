@@ -441,8 +441,8 @@ router.get('/fitness-profile/:clientId', auth, async (req, res, next) => {
 // which client inside it, which is the same gap in the same shape.
 //
 // Gated rather than self-checked because no member surface calls this: the
-// client portal is /api/me, and the member app calls only api.me.*, bookings,
-// classes and UPI payments. This is the trainer's intake form.
+// client portal is /api/me, and the member app calls only api.me.* and UPI
+// payments. This is the trainer's intake form.
 router.put('/fitness-profile/:clientId', auth, requireTrainer, async (req, res, next) => {
   try {
     const d = req.body;

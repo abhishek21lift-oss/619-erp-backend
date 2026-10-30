@@ -26,8 +26,8 @@
 //
 // `payments` is also the legacy gym table (0 rows in production; the live
 // tables are pt_payments and subscription_payments), and the only caller of
-// lib/razorpay.js is renewal.worker.js, which server.js's own comments
-// describe as targeting abandoned tables. The Razorpay path looks vestigial
+// lib/razorpay.js was renewal.worker.js, retired in 244. The Razorpay path
+// looked vestigial
 // end to end rather than half-built.
 //
 // Fixing that means choosing which table a gateway payment belongs in, and

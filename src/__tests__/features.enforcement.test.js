@@ -84,6 +84,10 @@ describe('requireFeature', () => {
 
 describe('server.js wiring', () => {
   const server = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  // Route-level gates count too: a router mounted without a gate can still
+  // enforce one beside the handlers it protects (see automation.routes.js).
+  const wiring = server + fs.readFileSync(
+    path.join(__dirname, '..', 'modules', 'automation', 'automation.routes.js'), 'utf8');
 
   it('puts auth BEFORE requireFeature in the gate helper', () => {
     // If these ever swap, every gate silently stops enforcing.
@@ -110,8 +114,9 @@ describe('server.js wiring', () => {
       'insights', 'communication', 'integrations', 'packages', 'finance',
     ]) {
       // Either helper counts: studioGate() is gate() plus requireTrainer, so a
-      // capability behind it is still feature-gated.
-      expect(server).toMatch(new RegExp(`(?:studioG|g)ate\\('${key}'\\)`));
+      // capability behind it is still feature-gated. requireFeature('key') is
+      // the same guard applied at the router.
+      expect(wiring).toMatch(new RegExp(`(?:studioG|g)ate\\('${key}'\\)|requireFeature\\('${key}'\\)`));
     }
   });
 

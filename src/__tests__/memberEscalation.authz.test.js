@@ -104,9 +104,6 @@ const MEMBER_REACHABLE = {
   // from a right one until somebody checks the mount.
   //   '/api/client-login': '…'
   '/api/webhooks/razorpay': 'Payment provider callback, authenticated by signature rather than session.',
-  '/api/bookings': 'A member listing their OWN bookings: the handler overrides member_id with the session\'s own for role === member, so the query string cannot widen it.',
-  '/api/v1/bookings': 'Versioned alias of the same bookings router.',
-  '/api/classes': 'The class timetable a member browses in order to book. Org-scoped by migration 176 and routes/classes.js.',
   '/api/diet': 'The meal library a member\'s own diet plan is built from; shared-shape table, same as exercises.',
   '/api/exercises': 'The exercise library a member\'s own workout is built from. Platform reference content.',
   '/api/workouts': 'Same library, reached through the workouts router.',
@@ -116,7 +113,6 @@ const MEMBER_REACHABLE = {
   // from the request. It is behind studioGate() now and probed like the rest.
   '/api/v1/notifications': 'svc.inbox(req.user.id) — the member\'s own notification inbox.',
   '/api/qr': 'Generates the caller\'s OWN check-in QR, keyed from req.user.pt_client_id / member_id.',
-  '/api/plans': 'The studio\'s membership price list. Org-scoped by migration 174. A member seeing what their own studio charges is the renewal screen working, not a leak — reviewed and left reachable.',
   '/api/features':
     'Studio feature flags, fetched by FeaturesProvider in the ROOT layout — so it runs for members too, and its .catch() means a 403 would be silent but produce one on every member page load. The payload is which modules the studio has enabled: studio configuration, not client or staff data. Reviewed and left reachable deliberately; gating it needs the frontend provider to stop calling it for members in the same change.',
 };
