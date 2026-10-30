@@ -215,6 +215,8 @@ const DOMAINS = {
     dependsOn: ['tenancy', 'clients', 'packages-enrolment'],
     tables: [
       'pt_sessions', 'trial_sessions',
+      // What the trainer publishes for client self-booking (migration 245).
+      'trainer_availability', 'trainer_time_off', 'trainer_booking_settings',
     ],
   },
 

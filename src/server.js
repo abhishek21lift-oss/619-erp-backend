@@ -721,6 +721,9 @@ app.use('/api/auth/refresh',         refreshLimiter);
 // Unauthenticated marketing data (plan catalogue + platform aggregates) for the
 // public landing page. Aggregate-only — no per-tenant values are exposed.
 app.use('/api/public',            require('./routes/public'));
+// Read-only calendar subscription per trainer. Token-authenticated, no login:
+// calendar clients cannot send one. See routes/calendar-feed.js.
+app.use('/api/public',            require('./routes/calendar-feed'));
 
 // Public by design: an invited admin has no password yet, so nothing here can
 // require one. The single-use hashed token IS the credential — see
@@ -962,6 +965,9 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/client-journey.routes'));
 // Workout generation: a reviewable draft, never a write.
 app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/workout-generator.routes'));
+// Client self-booking, trainer side: weekly windows, time off, slot settings.
+// The client side lives under /api/me below.
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/availability.routes'));
 
 // The client's own surfaces. Mirror image of the block above: requireClient
 // refuses anyone who is not a `member` linked to a client record, and every
@@ -969,6 +975,9 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 // request.
 app.use('/api/me',               auth, requireClient, require('./modules/progress/member-progress.routes'));
 app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-portal.routes'));
+// The client's own booking: free slots, book, reschedule, cancel. Identity is
+// req.user.pt_client_id; no route takes a client or trainer id.
+app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-booking.routes'));
 
 // The studio's side of member ↔ studio messaging. The member's side is
 // /api/me/messages above; this one takes a client id, so it is trainer-only and

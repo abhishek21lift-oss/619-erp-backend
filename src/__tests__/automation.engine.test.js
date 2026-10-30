@@ -156,9 +156,9 @@ describe('rules', () => {
     const fs = require('fs');
     const path = require('path');
     // The latest migration that redefines the constraint wins — 012 created
-    // it, 222 added payment_due.
+    // it, 222 added payment_due, 245 added session_reminder.
     const sql = fs.readFileSync(
-      path.join(__dirname, '..', 'db/migrations/222_automation_payment_due.sql'), 'utf8',
+      path.join(__dirname, '..', 'db/migrations/245_client_self_booking.sql'), 'utf8',
     );
     const block = sql.match(/CHECK \(trigger_event IN \(([\s\S]*?)\)\)/);
     const inDb = [...block[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort();
