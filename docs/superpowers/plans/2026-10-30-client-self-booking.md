@@ -304,10 +304,10 @@ git commit -m "feat(booking): client availability, book, reschedule and cancel"
 
 - [ ] **Step 1: Write the failing tests**
 
-Mock `pool`, `automation.repository` (`orgsWithAutomationOn`, `activeTriggerEventsFor`), and `automation.triggers`. Freeze time with `jest.useFakeTimers().setSystemTime(new Date('2026-11-01T01:00:00Z'))` (= 06:30 IST).
+Mock `pool` and `automation.triggers`. Freeze time with `jest.useFakeTimers().setSystemTime(new Date('2026-11-01T01:00:00Z'))` (= 06:30 IST).
 
 Assertions:
-- An org with no `session_reminder` rule is skipped and never queried.
+- With automation off / no `session_reminder` rule, a matching session still gets a `notifications` INSERT **and** `sessionReminderFor` is called — the engine, not this job, decides whether WhatsApp goes out. (The job must not filter by `orgsWithAutomationOn()`.)
 - A session at `2026-11-02 06:30` IST is picked for the `24h` bucket and `sessionReminderFor` is called with `bucket: '24h'` and `sessionId: 's1'`.
 - The `notifications` INSERT uses `NOT EXISTS` so a second run in the same window writes one row.
 - A session already `completed`/`cancelled` is not selected.
@@ -319,7 +319,14 @@ Expected: FAIL — cannot find module.
 
 - [ ] **Step 3: Implement**
 
-Mirror `automation.sweep.js`: loop over `orgsWithAutomationOn()`, filter `activeTriggerEventsFor(orgId)` to `session_reminder`, then run two queries per org (one per bucket). Each query is `session_date = $date AND start_time BETWEEN $lo AND $hi AND status = 'scheduled' AND deleted_at IS NULL` with the IST window computed from `Date.now() + 330 min ± 15 min`. For each row: insert the in-app notification (`type 'session_reminder'`, `link '/member/book'`, `NOT EXISTS` on `ref_id = session id`), then emit with `eventKey: '${id}:${bucket}'` and context `{ date, time, when, name }`.
+Mirror the query shape of `automation.sweep.js`, not its org loop: one query across
+every org for each bucket, because the in-app notification must fire for studios with
+automation switched off. Each query is
+`session_date = $date AND start_time BETWEEN $lo AND $hi AND status = 'scheduled' AND deleted_at IS NULL`
+joined to `pt_clients` for the client's user id, with the IST window computed from
+`Date.now() + 330 min ± 15 min`. For each row: insert the in-app notification
+(`type 'session_reminder'`, `link '/member/book'`, `NOT EXISTS` on `ref_id = session id`),
+then emit with `eventKey: '${id}:${bucket}'` and context `{ date, time, when, name }`.
 
 Register the scheduler exactly like `TERM_EXPIRY_JOB_ID`, with `attempts: 1` and `removeOnComplete: true`.
 

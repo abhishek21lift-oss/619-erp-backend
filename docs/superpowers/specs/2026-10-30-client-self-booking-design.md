@@ -116,7 +116,8 @@ trainer_booking_settings (
   Verified against production on 2026-10-30: 0 duplicate slots, 1 `pt_sessions` row
   total, so the index applies cleanly.
 - `automation_rules` trigger CHECK gains `session_reminder`.
-- RLS enabled and org-scoped on the three new tables, matching `pt_sessions`.
+- RLS enabled and org-scoped on the three new tables, using the migration 227
+  `pt_client_interviews` policy template (`pt_sessions` itself has no RLS).
 
 ## Slot computation
 
@@ -173,6 +174,10 @@ configuration needed), then `emit('session_reminder', …)` with dedupe key
 `session_reminder:<rule>:<session_id>:<bucket>`. WhatsApp therefore fires only if the
 studio has an active rule for the event, and respects opt-out; the availability
 screen links to Automation settings instead of seeding a rule silently.
+
+The job scans every scheduled session in the window, not the automation-enabled
+orgs list: the in-app reminder must reach studios that never switched automation
+on, and `emit()` already no-ops for a disabled studio or a missing rule.
 
 Template placeholders: `client_name`, `date`, `time`, `when` ("tomorrow" / "in 2 hours").
 
