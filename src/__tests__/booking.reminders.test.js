@@ -60,7 +60,35 @@ describe('runSessionReminders', () => {
     const notify = pool.query.mock.calls.find((c) => /INSERT INTO notifications/.test(String(c[0])));
     expect(notify[0]).toMatch(/NOT EXISTS/);
     expect(notify[0]).toMatch(/ref_id = \$4/);
-    expect(notify[1][3]).toBe('s1');
+    // The bucket is part of the key: a bare session id would make this row
+    // suppress the 2-hour reminder for the same session.
+    expect(notify[1][3]).toBe('s1:24h');
+  });
+
+  it('writes the 2 h reminder after the 24 h one already exists', async () => {
+    const written = new Set();
+    pool.query.mockImplementation(async (sql, params) => {
+      if (/FROM pt_sessions/.test(sql)) {
+        return { rows: params[0] === '2026-11-02 06:30' ? [row()] : [] };
+      }
+      if (/INSERT INTO notifications/.test(sql)) {
+        if (written.has(params[3])) return { rowCount: 0 };
+        written.add(params[3]);
+        return { rowCount: 1 };
+      }
+      return { rows: [] };
+    });
+
+    await runSessionReminders(); // 24 h before: writes s1:24h
+
+    jest.setSystemTime(new Date('2026-11-01T23:00:00Z')); // 04:30 IST, 2 h before
+    const second = await runSessionReminders();
+
+    expect(second).toMatchObject({ sent: 1, skipped: 0 });
+    expect([...written]).toEqual(['s1:24h', 's1:2h']);
+    expect(triggers.sessionReminderFor).toHaveBeenLastCalledWith('org-1', expect.objectContaining({
+      sessionId: 's1', bucket: '2h',
+    }));
   });
 
   it('picks a session 2 h out in its own bucket', async () => {

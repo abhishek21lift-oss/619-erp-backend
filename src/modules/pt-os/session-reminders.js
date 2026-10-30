@@ -13,6 +13,8 @@
 //
 // Idempotent by construction: the notification INSERT uses NOT EXISTS on
 // (user_id, type, ref_id), and emit's eventKey is the session id plus bucket.
+// ref_id carries the bucket too — a bare session id would make the 24-hour row
+// suppress the 2-hour one, which is exactly the pair this job exists to send.
 
 const pool = require('../../db/pool');
 const triggers = require('../automation/automation.triggers');
@@ -22,9 +24,10 @@ const BUCKETS = [
   { bucket: '2h', hours: 2, when: 'in 2 hours' },
 ];
 
-// The scheduler runs every 15 minutes, so each run owns a 15-minute slice of
-// reminder targets. A session enters exactly one slice and never re-enters it.
-const WINDOW_MINUTES = 15;
+// The scheduler runs every 15 minutes. The window is two cron periods wide so
+// a late or skipped run cannot open a gap between two runs; the overlap is
+// harmless because the notification dedupe absorbs the second sighting.
+const WINDOW_MINUTES = 30;
 
 const pad = (n) => String(n).padStart(2, '0');
 
@@ -73,7 +76,8 @@ async function runSessionReminders() {
       const title = bucket === '24h' ? 'Session tomorrow' : 'Session in 2 hours';
       const body = `Your PT session is on ${row.session_date} at ${row.start_time}.`;
 
-      const { rowCount } = await pool.query(NOTIFY_SQL, [row.user_id, title, body, row.id]);
+      const refId = `${row.id}:${bucket}`;
+      const { rowCount } = await pool.query(NOTIFY_SQL, [row.user_id, title, body, refId]);
       if (rowCount === 0) {
         skipped += 1;
         continue; // already reminded in this window
