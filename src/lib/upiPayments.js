@@ -809,12 +809,12 @@ async function submitUtr({ order, utr, screenshot, notes, actor }, db = pool) {
  *   4. write the finance-ledger row (pt_payments) so UPI revenue appears in
  *      the same reports as cash — this is why the revenue dashboard and the
  *      monthly target pick it up without any special-casing
- *   5. stamp membership_payments with the receipt number
+ *   5. stamp pt_payment_activations with the receipt number
  *   6. audit
  *
  * Step 2 is what makes a double-approve safe: the UPDATE carries
  * `WHERE status = 'VERIFICATION_PENDING'`, so the second caller updates zero
- * rows and gets a 409. The UNIQUE constraint on membership_payments
+ * rows and gets a 409. The UNIQUE constraint on pt_payment_activations
  * (payment_order_id) is the belt to that braces — if the two somehow
  * interleave, the second insert cannot land.
  */
@@ -1051,7 +1051,7 @@ async function approve({ orderId, orgId, actor }, db = pool) {
     let activation;
     try {
       const { rows } = await tx.query(
-        `INSERT INTO membership_payments
+        `INSERT INTO pt_payment_activations
            (id, organization_id, payment_order_id, submission_id, client_id, pt_payment_id,
             receipt_no, amount, utr, activated_from, activated_to, approved_by)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)

@@ -10,21 +10,20 @@
 // It owns no logic: the sweep itself is
 // src/modules/automation/automation.sweep.js, which decides which studios to
 // visit and hands each row to the automation engine. This file is the cron
-// registration and the BullMQ plumbing around it, kept separate for the same
-// reason renewal.worker.js is — a worker that also contains the business rules
-// is a worker that can only be exercised by running it.
+// registration and the BullMQ plumbing around it, kept separate so the rules
+// can be exercised without running the worker.
 //
 // Standalone:   node src/workers/automation.worker.js   (one pass, then exit)
 // In-process:   see src/workers/index.js
 //
 // ── Why its own queue ───────────────────────────────────────────────────────
 //
-// Rather than a third job name on 'membership-renewals'. That queue's jobs are
-// pinned to attempts: 1 because they charge cards, and its cron is tuned to
-// that. This sweep charges nothing, is idempotent by construction (every
-// message it produces carries a date-anchored dedupe key), and wants a
-// different schedule and a different retry policy. Sharing the queue would
-// mean one of those two facts had to be wrong.
+// Rather than a third job name on one of the existing queues. Those are pinned
+// to their own retry and schedule policies, which the jobs they carry need.
+// This sweep charges nothing, is idempotent by construction (every message it
+// produces carries a date-anchored dedupe key), and wants a different schedule
+// and a different retry policy. Sharing a queue would mean one of those facts
+// had to be wrong.
 
 const { Worker } = require('bullmq');
 const { withJobContext } = require('./jobContext');
@@ -137,10 +136,10 @@ async function scheduleAutomationSweep() {
       name: 'daily',
       data: {},
       opts: {
-        // attempts: 1, like the renewal sweep, but for a different reason: a
-        // retry is harmless here (every write is idempotent) and also nearly
-        // useless, because the failures this can have — Postgres unreachable,
-        // Redis unreachable — are not the kind that clear inside a backoff.
+        // attempts: 1, for a reason worth stating: a retry is harmless here
+        // (every write is idempotent) and also nearly useless, because the
+        // failures this can have — Postgres unreachable, Redis unreachable —
+        // are not the kind that clear inside a backoff.
         // The next day's pass is the retry, and missing a day is visible in
         // the logs rather than hidden behind three silent attempts.
         attempts: 1,

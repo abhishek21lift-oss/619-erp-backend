@@ -836,8 +836,8 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
 // safety gate and their training history. orgParam() below bounds the studio,
 // which is the same org-not-role gap studioGate() exists to close.
 //
-// No member surface calls this; the member app calls only api.me.*, bookings,
-// classes and UPI payments.
+// No member surface calls this; the member app calls only api.me.* and UPI
+// payments.
 router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res) => {
   const clientId = req.params.client_id;
   const org = orgParam(req);

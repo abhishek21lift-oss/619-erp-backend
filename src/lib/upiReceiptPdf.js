@@ -39,7 +39,7 @@ function formatInr(amount) {
  * @param {object} data
  * @param {object} data.order       payment_orders row (the price snapshot)
  * @param {object} data.submission  payment_submissions row (the UTR)
- * @param {object} data.activation  membership_payments row (receipt no, window)
+ * @param {object} data.activation  pt_payment_activations row (receipt no, window)
  * @param {object} data.member      pt_clients row
  * @param {object} data.organization organizations row (studio name)
  * @returns {Promise<Buffer>} the PDF bytes

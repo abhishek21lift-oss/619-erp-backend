@@ -47,7 +47,7 @@ async function dispatchAiJob(type, payload, fallback) {
  * Worker processor. BullMQ's `Queue.add(name, data)` (see enqueueAiJob)
  * carries the job type in `job.name`; `job.data` holds only the payload
  * ({ documentId }). This matches every other worker in the repo
- * (e.g. renewal.worker.js dispatches on job.name).
+ * (e.g. automation.worker.js dispatches on job.name).
  *
  * ingestDocument already records failures on the document row
  * (status='failed'), so throwing from here is reserved for actual bugs —

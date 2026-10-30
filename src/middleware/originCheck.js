@@ -17,19 +17,6 @@ const logger = require('../lib/logger');
 // no Origin or Referer and so exits on the line above.
 const ORIGIN_EXEMPT = new Set([
   '/health',
-
-  // Google's OAuth redirect. This is a top-level browser navigation FROM
-  // accounts.google.com, so it arrives with a third-party Referer by
-  // definition — an origin allowlist can only ever reject it, which is
-  // exactly what happened: connecting a calendar died on {"error":"Forbidden"}.
-  //
-  // Exempting it does not weaken anything, because an origin check was never
-  // this endpoint's protection. The CSRF defence is the signed `state` JWT
-  // (verified with JWT_SECRET and required to carry purpose='calendar_oauth'),
-  // and the authorization code is single-use and redeemed server-to-server
-  // with Google. Both are checked in routes/calendar.js before any token is
-  // stored.
-  '/calendar/callback',
 ]);
 
 // Prefixes rather than exact paths, for exempt routes that carry an id.

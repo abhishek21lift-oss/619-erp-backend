@@ -810,8 +810,8 @@ app.use('/api/attendance',        auth, requireTrainer, ...gate('attendance'), r
 // router is the one to build on.
 //
 // What changed is that the v3 model underneath /api/v1/reports was abandoned.
-// It read members, payments and member_memberships; all three are empty, none
-// has an organization_id column, and modules/reports carried no tenant filter
+// It read members, payments and member_memberships; all three were empty, none
+// had an organization_id column, and modules/reports carried no tenant filter
 // of any kind — `GET /api/v1/reports/revenue` was `FROM payments p WHERE
 // p.deleted_at IS NULL` behind auth + admin/manager, i.e. every studio's
 // revenue to any studio's admin. This router scopes every query (see orgParam)
@@ -826,19 +826,12 @@ app.use('/api/reports',           userApiLimiter, ...studioGate('insights'), req
 // same engine; new clients must use these routes. Same guard, same feature.
 app.use('/api/insights',         userApiLimiter, ...studioGate('insights'), require('./modules/insights/insights.routes'));
 
-app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
 // studioGate, not gate: routes/expenses.js used to narrow with
 // `if (req.user.role === 'trainer')` and apply the org filter inside that
 // branch — so a member fell through it and got the studio's whole expense
 // stats. Third instance of that fall-through after reports/monthly and
 // search; a feature flag is not an authorisation decision.
 app.use('/api/expenses',          ...studioGate('finance'), require('./routes/expenses'));
-
-// ROUTE INTEGRITY NOTE (R-03 / bookings):
-// /api/bookings and /api/v1/bookings both mount the same router.
-// Same policy as auth: legacy callers use /api/bookings, new callers use /api/v1/bookings.
-app.use('/api/v1/bookings',       require('./modules/bookings/bookings.routes'));
-app.use('/api/bookings',          require('./modules/bookings/bookings.routes'));
 
 // /api/admin used to mount admin-reset.js: DELETE/DROP across every studio's
 // data with no organization_id filter, behind nothing but an emailed code. No
@@ -876,7 +869,6 @@ app.use('/api/modules',           auth, requireTrainer, require('./modules/opera
 // ────────────────────────
 // PREMIUM FEATURE ROUTES (v4)
 // ────────────────────────
-app.use('/api/calendar',          require('./routes/calendar'));
 app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-checkin'));
 // requireTrainer: the handler already hides internal_/geo_/biometric_/feature_
 // keys from non-admins, but system_settings carries NO organization_id at all
@@ -947,11 +939,6 @@ app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), 
 app.use('/api/ai/client-agent',   ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/aiClientAgent'));
 app.use('/api/ai',               userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
 app.use('/api/ai',               ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/ai'));
-
-// ────────────────────────
-// MEMBER PORTAL ROUTES
-// ────────────────────────
-app.use('/api/classes',           require('./routes/classes'));
 
 // ────────────────────────
 // PT OS — Personal Training Operating System
@@ -1026,7 +1013,7 @@ app.use('/api/automation', userApiLimiter, auth, requireTrainer, require('./modu
 // which the client actually calls, scopes every query.
 //
 // They were harmless in practice only because they read the abandoned v3
-// tables — members, payments and member_memberships are all empty, and none of
+// tables — members, payments and member_memberships were all empty, and none of
 // the three even has an organization_id column to filter on. That is precisely
 // what made them dangerous to keep: the day anyone populated those tables, five
 // endpoints would have started serving cross-tenant data with no code change
@@ -1040,9 +1027,9 @@ app.use('/api/automation', userApiLimiter, auth, requireTrainer, require('./modu
 // organisations represented, 0 attributable rows, 0 duplicate member codes.
 // See src/db/migrations/MEMBERS-TENANT-GAP.md for the audit and the decision.
 //
-// The members TABLE is deliberately untouched: workers/renewal.worker.js still
-// joins it, member_memberships still has a foreign key to it, and dropping a
-// table was never part of this.
+// The members TABLE was left untouched by that removal and, later, moved to
+// the archive schema by migration 244 with every row intact — dropping a table
+// was never part of this.
 //
 // /api/v1/notifications stays — it backs the notification bell and has a live
 // caller.

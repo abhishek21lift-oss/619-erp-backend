@@ -59,8 +59,8 @@ const SRC = path.join(__dirname, '..');
 const UNBOUNDED_TABLES = new Set([
   'system_logs', 'system_alerts', 'notifications', 'activity_log',
   'login_events', 'ai_usage_log', 'ai_messages', 'attendance',
-  'payments', 'membership_payments', 'invoices', 'expenses',
-  'payment_audit_logs', 'subscription_events', 'bookings',
+  'payments', 'pt_payment_activations', 'invoices', 'expenses',
+  'payment_audit_logs', 'subscription_events',
   'pt_sessions', 'training_sessions', 'workout_sessions', 'set_performances',
 ]);
 

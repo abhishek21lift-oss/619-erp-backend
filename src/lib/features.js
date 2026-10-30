@@ -124,7 +124,8 @@ async function isEnabled(orgId, planCode, key, client) {
 }
 
 /**
- * Express guard. Deliberately NOT applied to any existing route.
+ * Express guard. Applied at the mount in server.js, or beside the handlers a
+ * router owns when the mount carries no single capability.
  *
  * Wiring an existing Admin Studio route to a flag changes that studio's
  * behaviour, which is a product decision, not a side effect of building the

@@ -96,7 +96,7 @@ describe('UPI order plan lookup is scoped to the caller\'s studio', () => {
   it('the plans query in POST /create filters on organization_id', () => {
     const src = require('fs').readFileSync(
       require('path').join(__dirname, '..', 'routes', 'upi-payments.js'), 'utf8');
-    const q = src.match(/SELECT id, name, final_amount, duration FROM plans[\s\S]*?`/);
+    const q = src.match(/SELECT id, name, price, duration_days FROM pt_packages[\s\S]*?`/);
     expect(q).not.toBeNull();
     expect(q[0]).toMatch(/organization_id = \$2/);
   });

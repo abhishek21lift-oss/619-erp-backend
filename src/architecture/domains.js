@@ -88,7 +88,7 @@ const DOMAINS = {
     description: 'The tenant root: studios, their branches, and what they have bought.',
     dependsOn: [],
     tables: [
-      'organizations', 'branches', 'organization_features', 'plan_features',
+      'organizations', 'organization_features', 'plan_features',
       'feature_flags', 'founder_members', 'system_settings',
     ],
   },
@@ -140,13 +140,10 @@ const DOMAINS = {
     // gym-ERP baseline schema.sql reconstructs for a fresh CI database), but
     // 170_drop_legacy_clients_and_renewals.sql drops it — with a verification
     // block that fails the migration if the table still exists afterward.
-    // `members` genuinely survives to today; it stays.
     tables: [
       'pt_clients', 'client_fitness_profiles', 'pt_consent_records',
       'pt_family_medical_history', 'pt_medical_clearances',
-      'members',
     ],
-    legacyTables: ['members'],
   },
 
   'packages-enrolment': {
@@ -164,9 +161,8 @@ const DOMAINS = {
     tables: [
       'pt_packages', 'pt_plans', 'pt_client_subscriptions', 'pt_client_renewals',
       'holds_freezes', 'session_balance', 'membership_actions',
-      'plans', 'member_memberships', 'membership_payments',
+      'pt_payment_activations',
     ],
-    legacyTables: ['plans', 'member_memberships', 'membership_payments'],
   },
 
   finance: {
@@ -208,7 +204,6 @@ const DOMAINS = {
     tables: [
       'pt_commissions', 'pt_payouts',
       'revenue_targets', 'pt_trainers', 'trainers',
-      'leave_requests',
     ],
   },
 
@@ -216,10 +211,10 @@ const DOMAINS = {
   scheduling: {
     plane: PLANE.TENANT,
     tenancy: TENANCY.DERIVED,
-    description: 'When training happens. Sessions, trials and calendar sync.',
+    description: 'When training happens. Sessions and trials.',
     dependsOn: ['tenancy', 'clients', 'packages-enrolment'],
     tables: [
-      'pt_sessions', 'trial_sessions', 'google_calendar_events', 'google_calendar_tokens',
+      'pt_sessions', 'trial_sessions',
     ],
   },
 
@@ -286,22 +281,7 @@ const DOMAINS = {
       // only one writer wrote and nothing read; attendance_logs is the table
       // every attendance surface in the product actually reads.
       'attendance_logs', 'qr_tokens',
-      'face_descriptors', 'face_checkin_logs', 'biometric_attendance',
     ],
-    legacyTables: ['face_descriptors', 'face_checkin_logs', 'biometric_attendance'],
-  },
-
-  'group-classes': {
-    plane: PLANE.TENANT,
-    tenancy: TENANCY.DIRECT,
-    status: STATUS.LEGACY,
-    description:
-      'Group-class scheduling and booking. Named as its own domain rather than hidden '
-      + 'inside scheduling so the retire-or-promote decision stays visible: this is '
-      + 'gym-ERP surface in a PT-first product, and the decision needs live usage '
-      + 'evidence the code cannot supply.',
-    dependsOn: ['tenancy', 'clients'],
-    tables: ['class_sessions', 'class_templates', 'bookings'],
   },
 
   // ── Communication ───────────────────────────────────────────────────────

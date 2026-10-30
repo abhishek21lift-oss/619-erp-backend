@@ -174,7 +174,7 @@ describe('PT session balances', () => {
 
 // ── Commercial data ─────────────────────────────────────────────────────────
 
-describe('campaigns, offers, feedback and plans', () => {
+describe('campaigns, offers and feedback', () => {
   const cases = [
     ['campaigns',  '/api/campaigns',  '../routes/campaigns', 'DELETE FROM campaigns'],
     ['offers',     '/api/offers',     '../routes/offers',    'DELETE FROM offers'],
@@ -191,20 +191,6 @@ describe('campaigns, offers, feedback and plans', () => {
 
   test.each(cases)('reading another studio\'s %s row by id is 404', async (_name, mount, mod) => {
     const res = await request(app(mount, mod)).get(`${mount}/${ROW_A}`);
-    expect(res.status).toBe(404);
-    expectScopedToCaller();
-  });
-
-  test('the plans list is scoped — this one was readable by ANY role', async () => {
-    // /api/plans sat behind `auth` alone, so every trainer and every activated
-    // client account could read every studio's membership pricing.
-    mockUser = { id: 'u-b', role: 'trainer', organization_id: ORG_B };
-    await request(app('/api/plans', '../routes/plans')).get('/api/plans');
-    expectScopedToCaller();
-  });
-
-  test('deleting another studio\'s plan is 404', async () => {
-    const res = await request(app('/api/plans', '../routes/plans')).delete(`/api/plans/${ROW_A}`);
     expect(res.status).toBe(404);
     expectScopedToCaller();
   });

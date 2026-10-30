@@ -124,11 +124,10 @@ describe('every session token declares its plane', () => {
 
   it('has no minting site outside that list', () => {
     // Walks the tree rather than trusting the list above to be current.
-    // calendar.js signs an OAuth `state` value and auth-webauthn.js signs a
-    // 5-minute action token; neither opens a session, so neither carries an
-    // audience — they are named here so that being on this list is a decision
-    // rather than an oversight.
-    const NON_SESSION = ['routes/calendar.js'];
+    // Files that mint a non-session token belong here, so being on this list
+    // is a decision rather than an oversight. Empty today: the Google Calendar
+    // OAuth `state` signer was removed with the calendar integration (244).
+    const NON_SESSION = [];
     const found = [];
     const walk = (dir) => {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {

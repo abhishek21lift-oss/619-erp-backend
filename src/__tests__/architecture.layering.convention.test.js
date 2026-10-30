@@ -137,7 +137,6 @@ const BUDGETS = {
   'routes/whatsapp.js': 6,
   'routes/client-activation.js': 5,
   'routes/invitations.js': 5,
-  'routes/plans.js': 5,
   'routes/support.js': 5,
   'modules/ai-actions/ai-actions.routes.js': 4,
   'modules/operations/operations.routes.js': 4,
@@ -146,7 +145,6 @@ const BUDGETS = {
   'routes/integrations.js': 3,
   'routes/uploads.js': 2,
   'routes/whatsapp-webhook.js': 2,
-  'routes/classes.js': 1,
   'routes/features.js': 1,
   'routes/public.js': 1,
 };
@@ -226,8 +224,9 @@ describe('the migration has a number attached to it', () => {
     // moved their write to lib/ptPayments.js and those two files were re-measured; 675 → 661 when routes/admin-reset.js (14) was deleted
     // (Command Center audit CC-2). 661 → 660 when the email-change re-auth moved
     // profile.js's uniqueness check to lib/emailChange.js. 660 → 659 when consent completion moved to
-    // informed-consent.repository (screening audit 2026-10-08). Lower it with each extraction — the number only means
+    // informed-consent.repository (screening audit 2026-10-08); 659 → 653 once the gym-ERP routes
+    // (plans.js, classes.js) were removed. Lower it with each extraction — the number only means
     // something if it tracks reality.
-    expect(ceiling).toBe(659);
+    expect(ceiling).toBe(653);
   });
 });

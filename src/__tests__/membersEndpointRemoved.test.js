@@ -19,7 +19,8 @@
 // note asks for — and if it comes back, it must come back with a tenant
 // boundary, because the table still has no organization_id.
 //
-// The TABLE is deliberately untouched. See the last test here.
+// The TABLE moved to the archive schema with the rest of the gym-ERP surface
+// (migration 244). It was never dropped.
 
 const fs = require('fs');
 const path = require('path');
@@ -69,10 +70,8 @@ describe('the /api/v1/members endpoint stays removed', () => {
   });
 });
 
-describe('what was deliberately left alone', () => {
-  it('no migration drops or alters the members table', () => {
-    // The table is empty but not orphaned, and dropping a table was never part
-    // of this. A migration doing so would be a separate, larger decision.
+describe('the members table is archived, not dropped', () => {
+  it('no migration drops or truncates the members table', () => {
     const dir = path.join(SRC, 'db', 'migrations');
     const offenders = [];
     for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.sql'))) {
@@ -85,11 +84,10 @@ describe('what was deliberately left alone', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('the table still has the consumers that kept it', () => {
-    // renewal.worker.js joins members three times, and member_memberships has
-    // a foreign key to it. Both are why the table stays even though the
-    // endpoint went.
-    const worker = fs.readFileSync(path.join(SRC, 'workers', 'renewal.worker.js'), 'utf8');
-    expect(worker).toMatch(/JOIN members\b/);
+  it('244 moves it into the archive schema', () => {
+    const mig = fs.readFileSync(
+      path.join(SRC, 'db', 'migrations', '244_remove_gym_erp_surface.sql'), 'utf8');
+    expect(mig).toMatch(/'members'/);
+    expect(mig).toMatch(/SET SCHEMA archive/);
   });
 });
