@@ -15,6 +15,7 @@ const mobilityScoring = require('./mobility-scoring');
 const postureScoring = require('./posture-scoring');
 const strengthLogs = require('./strength-logs.repo');
 const assessmentsRepo = require('./assessments.repo');
+const assessmentFacts = require('./assessment-facts');
 const retests = require('./retests.service');
 const logger = require('../../lib/logger');
 const { today: studioToday, mondayOf } = require('../../lib/appTime');
@@ -1388,11 +1389,11 @@ const nutritionAssessmentUpdateSchema = {
 // smoking/alcohol risk inputs — a plain read of an existing table, no
 // hard dependency: the two risk factors simply don't fire without it.
 async function computeNutritionAnalysis(clientId, b) {
-  // Alcohol and smoking are asked in Lifestyle; this form shows them rather
-  // than asking a second time. A drinks-per-week on an older Nutrition row
-  // still counts when Lifestyle has none.
+  // Alcohol and smoking are asked in Lifestyle; this form does not ask them
+  // again. A drinks-per-week on an older Nutrition row still counts when
+  // Lifestyle has none.
   const lifestyle = await assessmentsRepo.latestLifestyleHabits(clientId);
-  const drinksPerWeek = b.alcoholic_drinks_per_week ?? (lifestyle.drinks_per_week != null ? Number(lifestyle.drinks_per_week) : null);
+  const alcohol = assessmentFacts.resolveAlcohol(lifestyle, b);
 
   const dietQualityScore = nutritionScoring.calcDietQualityScore(
     b.foods_to_avoid ?? null, b.favourite_foods ?? null, b.cravings ?? null,
@@ -1402,7 +1403,7 @@ async function computeNutritionAnalysis(clientId, b) {
   const dailyFluidIntake = nutritionScoring.calcDailyFluidIntake(
     b.water_intake_liters ?? null, b.tea_cups_per_day ?? null, b.coffee_cups_per_day ?? null, b.soft_drinks_per_day ?? null, b.juices_per_day ?? null
   );
-  const hydrationScore = nutritionScoring.calcHydrationScore(b.water_intake_liters ?? null, b.soft_drinks_per_day ?? null, drinksPerWeek);
+  const hydrationScore = nutritionScoring.calcHydrationScore(b.water_intake_liters ?? null, b.soft_drinks_per_day ?? null, alcohol.drinksPerWeek);
   const digestiveHealthScore = nutritionScoring.calcDigestiveHealthScore(b.digestive_issues ?? null);
   const supplementScore = nutritionScoring.calcSupplementScore(b.takes_supplements ?? null, b.supplements ?? null);
 
@@ -1410,7 +1411,7 @@ async function computeNutritionAnalysis(clientId, b) {
     proteinAssessment: protein.assessment, hydrationScore, digestiveHealthScore,
     cravings: b.cravings ?? null, cravingFrequency: b.craving_frequency ?? null,
     medicalConditions: b.medical_conditions ?? null, medicalNotes: b.medical_notes ?? null,
-    alcoholStatus: lifestyle.alcohol_status || null, smokingStatus: lifestyle.smoking_status || null,
+    alcoholStatus: alcohol.status, smokingStatus: lifestyle.smoking_status || null,
   };
   const nutritionRiskScore = nutritionScoring.calcNutritionRiskScore(riskInputs);
   const riskFactors = nutritionScoring.buildNutritionRiskFactors(riskInputs);
