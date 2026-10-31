@@ -26,6 +26,40 @@ const INTERVIEW_FIELDS = Object.freeze([
 ]);
 const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifestyle_occupation: 50, lifestyle_screen_time: 10, lifestyle_meal_regularity: 20, lifestyle_smoking: 20, lifestyle_alcohol: 20 });
 
+// Structured answers are enums or bounded numbers, and the database's CHECK
+// constraints reject a bad one — but as a 23514, which surfaced as a 500. The
+// values are checked here first, so a bad answer is a 400 with a field name.
+const OCCUPATIONS = Object.freeze([
+  'desk_job', 'active_job', 'physical_labor', 'student', 'homemaker', 'driver',
+  'healthcare', 'police', 'fitness_professional', 'retired', 'other',
+]);
+const STRUCTURED = Object.freeze({
+  lifestyle_occupation: { oneOf: OCCUPATIONS },
+  lifestyle_sitting_hours: { min: 0, max: 24 },
+  lifestyle_screen_time: { oneOf: ['<2', '2_4', '4_6', '6_8', '8_plus'] },
+  lifestyle_sleep_hours: { min: 0, max: 24 },
+  lifestyle_meal_regularity: { oneOf: ['regular', 'irregular', 'inconsistent'] },
+  lifestyle_smoking: { oneOf: ['never', 'occasionally', 'daily', 'former'] },
+  lifestyle_alcohol: { oneOf: ['never', 'occasionally', 'weekly', 'frequently'] },
+  lifestyle_training_days: { min: 0, max: 7, integer: true },
+});
+
+/** A structured answer, validated and normalised: enum as text, numbers as numbers. */
+function structuredValue(key, raw) {
+  const rule = STRUCTURED[key];
+  if (rule.oneOf) {
+    if (typeof raw !== 'string' || !rule.oneOf.includes(raw)) {
+      throw new InterviewInputError(`${key} must be one of: ${rule.oneOf.join(', ')}.`);
+    }
+    return raw;
+  }
+  const n = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (!Number.isFinite(n) || n < rule.min || n > rule.max || (rule.integer && !Number.isInteger(n))) {
+    throw new InterviewInputError(`${key} must be a${rule.integer ? ' whole' : ''} number between ${rule.min} and ${rule.max}.`);
+  }
+  return n;
+}
+
 class InterviewInputError extends Error {
   constructor(message, status = 400) { super(message); this.status = status; }
 }
@@ -33,16 +67,13 @@ class InterviewInputError extends Error {
 /** The fields of an interview body, trimmed and bounded. Structured lifestyle fields accept numbers/enums; text fields stay text. Unknown keys are ignored. */
 function interviewFields(body = {}) {
   const out = {};
-  const STRUCTURED = new Set(['lifestyle_occupation','lifestyle_sitting_hours','lifestyle_screen_time','lifestyle_sleep_hours','lifestyle_meal_regularity','lifestyle_smoking','lifestyle_alcohol','lifestyle_training_days']);
   for (const key of INTERVIEW_FIELDS) {
     if (body[key] === undefined) continue;
-    if (body[key] === null || body[key] === '') { out[key] = null; continue; }
-    if (STRUCTURED.has(key)) {
-      out[key] = (body[key] === null || body[key] === '') ? null : body[key];
-      continue;
-    }
-    if (typeof body[key] !== 'string') throw new InterviewInputError(`${key} must be text.`);
-    const v = body[key].trim();
+    const raw = body[key];
+    if (raw === null || (typeof raw === 'string' && raw.trim() === '')) { out[key] = null; continue; }
+    if (STRUCTURED[key]) { out[key] = structuredValue(key, raw); continue; }
+    if (typeof raw !== 'string') throw new InterviewInputError(`${key} must be text.`);
+    const v = raw.trim();
     if (v.length > (FIELD_MAX[key] || 2000)) throw new InterviewInputError(`${key} is too long.`);
     out[key] = v || null;
   }
