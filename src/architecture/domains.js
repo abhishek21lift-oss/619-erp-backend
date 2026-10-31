@@ -143,6 +143,7 @@ const DOMAINS = {
     tables: [
       'pt_clients', 'client_fitness_profiles', 'pt_consent_records',
       'pt_family_medical_history', 'pt_medical_clearances',
+      'pt_client_followups',
     ],
   },
 

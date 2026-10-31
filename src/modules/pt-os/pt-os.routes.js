@@ -15,6 +15,7 @@ const { hasPtTermSql, priorTermsPaidJoin, currentTermBalanceSql } = require('../
 const subscription = require('../../lib/subscription');
 const { buildBrief } = require('./training-brief');
 const { sweepRoster } = require('./client-context');
+const { buildChurnList, markFollowup } = require('./churn.service');
 const { buildEnrollmentPdf } = require('../../lib/ptEnrollmentPdf');
 const { buildSnapshot } = require('./client-snapshot');
 const { generateCoach } = require('./coach-ai');
@@ -195,6 +196,49 @@ router.get('/signals', auth, wrap(async (req, res) => {
     today: studioToday(),
   });
   res.json({ data });
+}));
+
+// GET /churn-risk — who may leave, why, and what to do next.
+//
+// The sweep above lists signals; this ranks them against money and term, and
+// drops the clients the trainer already handled. One call per page load and
+// no model: every point is deterministic and traceable to a reason.
+router.get('/churn-risk', auth, wrap(async (req, res) => {
+  res.json({ data: await buildChurnList(orgIdOf(req)) });
+}));
+
+// POST /churn-risk/:clientId/followup — contacted | snoozed.
+//
+// The score stored on the mark is the one the list showed (the service picks
+// it), never a value from the body. A client outside the studio answers 404,
+// not 403: another studio's id must look exactly like one that does not exist.
+router.post('/churn-risk/:clientId/followup', auth, wrap(async (req, res) => {
+  const { outcome, snooze_until: snoozeUntil, note: rawNote } = req.body || {};
+  const today = studioToday();
+  const bad = (message) => res.status(400).json({ error: { code: 'VALIDATION', message } });
+
+  if (outcome !== 'contacted' && outcome !== 'snoozed') {
+    return bad("outcome must be 'contacted' or 'snoozed'");
+  }
+
+  const note = typeof rawNote === 'string' ? rawNote.trim() : undefined;
+  if (note !== undefined && note.length > 500) return bad('note must be 500 characters or fewer');
+
+  let hideUntil;
+  if (outcome === 'contacted') {
+    hideUntil = addDaysToDate(today, 7);
+  } else {
+    if (!isCalendarDate(snoozeUntil)) return bad('snooze_until must be a real date (YYYY-MM-DD)');
+    if (snoozeUntil <= today) return bad('snooze_until must be after today');
+    if (snoozeUntil > addDaysToDate(today, 90)) return bad('snooze_until must be within 90 days');
+    hideUntil = snoozeUntil;
+  }
+
+  const mark = await markFollowup(orgIdOf(req), req.params.clientId, {
+    outcome, snoozeUntil: hideUntil, note, today,
+  });
+  if (!mark) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  res.status(201).json({ data: mark });
 }));
 
 router.get('/clients', auth, wrap(async (req, res) => {
