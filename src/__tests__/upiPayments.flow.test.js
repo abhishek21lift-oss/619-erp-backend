@@ -224,7 +224,7 @@ function scriptHappyApproval() {
   on(/SELECT id, name, email, mobile, trainer_id, trainer_name, package_type, pt_end_date, organization_id, balance_amount\s+FROM pt_clients/s,
     { rows: [{ id: 'client-1', name: 'Rohit', trainer_id: 'trn-1', pt_end_date: EXISTING_END }] });
   on(/SELECT id, incentive_rate FROM trainers/s, { rows: [{ id: 'trn-1', incentive_rate: 0.5 }] });
-  on(/INSERT INTO membership_payments/s, {
+  on(/INSERT INTO pt_payment_activations/s, {
     rows: [{ id: 'mp-1', receipt_no: 'RCP-20260726-100042', activated_from: EXISTING_END,
              activated_to: EXTENDED_END, amount: '10620.00' }],
   });
@@ -322,17 +322,17 @@ describe('approval', () => {
     await expect(upi.approve({ orderId: ORDER_ID, orgId: ORG, actor: ACTOR }))
       .rejects.toMatchObject({ code: 'CONCURRENT_UPDATE', status: 409 });
     expect(ranSql(/^ROLLBACK$/)).toBe(true);
-    expect(ranSql(/INSERT INTO membership_payments/)).toBe(false);
+    expect(ranSql(/INSERT INTO pt_payment_activations/)).toBe(false);
   });
 
   test('409s when the activation row already exists (the belt to the braces)', async () => {
     scriptHappyApproval();
     state.handlers = state.handlers.filter(
-      (h) => !/INSERT INTO membership_payments/.test(h.match.source)
+      (h) => !/INSERT INTO pt_payment_activations/.test(h.match.source)
     );
-    onThrow(/INSERT INTO membership_payments/s,
+    onThrow(/INSERT INTO pt_payment_activations/s,
       Object.assign(new Error('duplicate key'), {
-        code: '23505', constraint: 'membership_payments_order_unique',
+        code: '23505', constraint: 'pt_payment_activations_order_unique',
       }));
 
     await expect(upi.approve({ orderId: ORDER_ID, orgId: ORG, actor: ACTOR }))
@@ -365,7 +365,7 @@ describe('approval', () => {
     // following statement failing with "current transaction is aborted".
     expect(ranSql(/^SAVEPOINT upi_invoice$/)).toBe(true);
     expect(ranSql(/^ROLLBACK TO SAVEPOINT upi_invoice$/)).toBe(true);
-    expect(ranSql(/INSERT INTO membership_payments/)).toBe(true);
+    expect(ranSql(/INSERT INTO pt_payment_activations/)).toBe(true);
     expect(ranSql(/^COMMIT$/)).toBe(true);
   });
 

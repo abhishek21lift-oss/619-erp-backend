@@ -64,7 +64,7 @@ describeIf('member renewal against a real database', () => {
 
   async function cleanup() {
     await pool.query(`DELETE FROM notifications WHERE user_id = ANY($1)`, [[USER, TRAINER_USER]]);
-    await pool.query(`DELETE FROM membership_payments WHERE organization_id = $1`, [ORG]);
+    await pool.query(`DELETE FROM pt_payment_activations WHERE organization_id = $1`, [ORG]);
     await pool.query(`DELETE FROM invoices WHERE organization_id = $1`, [ORG]);
     await pool.query(`DELETE FROM payment_audit_logs WHERE organization_id = $1`, [ORG]);
     await pool.query(`DELETE FROM payment_submissions WHERE payment_order_id IN (SELECT id FROM payment_orders WHERE organization_id = $1)`, [ORG]);

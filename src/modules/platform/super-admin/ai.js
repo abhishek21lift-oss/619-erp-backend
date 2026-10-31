@@ -249,6 +249,19 @@ router.put('/ai/settings', async (req, res, next) => {
         patch.default_monthly_tokens = Math.trunc(n);
       }
     }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'monthly_cost_inr')) {
+      const v = req.body.monthly_cost_inr;
+      // null clears the budget. The Command Center card then reports spend
+      // without grading it, which is different from a budget of zero.
+      if (v === null || v === '') patch.monthly_cost_inr = null;
+      else {
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 0) {
+          return res.status(400).json({ error: { code: 'VALIDATION', message: 'monthly_cost_inr must be a non-negative number or null' } });
+        }
+        patch.monthly_cost_inr = Math.round(n * 100) / 100;
+      }
+    }
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'warn_at_pct')) {
       const n = Number(req.body.warn_at_pct);
       if (!Number.isFinite(n) || n <= 0 || n > 100) {
@@ -294,7 +307,8 @@ router.put('/ai/settings', async (req, res, next) => {
          (user_id, user_name, action, entity_type, entity_id, old_data, new_data, ip_address, user_agent)
        VALUES ($1,$2,'ai_settings_updated','ai_platform',NULL,$3,$4,$5,$6)`,
       [req.user?.id || null, req.user?.name || null,
-       { enforcement_enabled: before.enforcement_enabled, default_monthly_tokens: before.default_monthly_tokens },
+       { enforcement_enabled: before.enforcement_enabled, default_monthly_tokens: before.default_monthly_tokens,
+         monthly_cost_inr: before.monthly_cost_inr ?? null },
        { ...patch, ...(wouldBlock !== null ? { studios_already_over: wouldBlock } : {}) },
        req.ip || null, req.get('user-agent') || null]
     );

@@ -16,9 +16,10 @@
 // recovery tool must make impossible, not merely unlikely.
 //
 // With --compare, every table in the source's `public` schema must exist in
-// the restore with exactly the same row count. Without it, the drill checks
-// that the core tables came back and are not all empty. Read-only on the
-// source: it runs count(*) and nothing else.
+// the restore with exactly the same row count — except the backup's own
+// post-dump status row, which cannot be inside the dump by construction.
+// Without it, the drill checks that the core tables came back and are not all
+// empty. Read-only on the source: it runs count(*) and nothing else.
 //
 // pg_restore's own exit status is reported but not used as the verdict. A
 // Supabase dump carries Supabase-only schemas and extensions (auth, storage,
@@ -49,6 +50,17 @@ async function withClient(url, fn) {
   await c.connect();
   try { return await fn(c); } finally { await c.end(); }
 }
+
+/**
+ * Tables the backup process writes AFTER its dump is taken.
+ *
+ * scripts/backup-database.js records the verified run once the dump exists, so
+ * the dump itself cannot contain that row. Comparing it would fail every drill
+ * by design. It is backup telemetry rather than studio data, so it is left out
+ * of the comparison — not out of the dump, where it documents the last run that
+ * the restored copy knows about.
+ */
+const WRITTEN_AFTER_DUMP = new Set(['platform_backup_status']);
 
 /** row count of every ordinary table in `public`, by name. */
 async function publicCounts(url, only = null) {
@@ -107,6 +119,7 @@ async function restoreAndVerify({ file, targetUrl, sourceUrl = null }) {
   if (sourceUrl) {
     const source = await publicCounts(sourceUrl);
     for (const [table, n] of Object.entries(source)) {
+      if (WRITTEN_AFTER_DUMP.has(table)) continue;
       compared += 1;
       if (!(table in restored)) mismatches.push(`${table}: missing (source has ${n})`);
       else if (restored[table] !== n) mismatches.push(`${table}: source ${n}, restored ${restored[table]}`);

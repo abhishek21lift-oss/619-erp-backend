@@ -71,12 +71,34 @@ const SIGNATURES = Object.freeze({
     ext: 'pdf',
     magic: Object.freeze([0x25, 0x50, 0x44, 0x46]), // "%PDF"
   }),
+  mp4: Object.freeze({
+    mime: 'video/mp4',
+    ext: 'mp4',
+    // ISO base media files put the box type at byte 4; the size before it
+    // varies. The major brand at byte 8 is what separates video from HEIC.
+    magicOffset: 4,
+    magic: Object.freeze([0x66, 0x74, 0x79, 0x70]), // "ftyp"
+    brands: Object.freeze([
+      'isom', 'iso2', 'iso4', 'iso5', 'iso6', 'mp41', 'mp42', 'avc1',
+      'M4V ', 'M4VH', 'M4VP', 'dash', 'mmp4', 'MSNV', 'NDAS', 'f4v ', 'F4V ',
+    ]),
+  }),
+  mov: Object.freeze({
+    mime: 'video/quicktime',
+    ext: 'mov',
+    magicOffset: 4,
+    magic: Object.freeze([0x66, 0x74, 0x79, 0x70]), // "ftyp"
+    brands: Object.freeze(['qt  ']),
+  }),
 });
 
 /** The sets the routes actually use, named so a route declares intent. */
 const PROFILE_IMAGES = Object.freeze([
   SIGNATURES.jpg, SIGNATURES.png, SIGNATURES.gif, SIGNATURES.webp,
 ]);
+
+/** Lift videos from a phone: MP4 (Android, most cameras) and MOV (iPhone). */
+const FORM_VIDEOS = Object.freeze([SIGNATURES.mp4, SIGNATURES.mov]);
 
 /** Logos: no GIF — an animated logo is not a product feature. */
 const LOGO_IMAGES = Object.freeze([SIGNATURES.jpg, SIGNATURES.png, SIGNATURES.webp]);
@@ -85,9 +107,18 @@ const LOGO_IMAGES = Object.freeze([SIGNATURES.jpg, SIGNATURES.png, SIGNATURES.we
 const DOCUMENTS = Object.freeze([SIGNATURES.jpg, SIGNATURES.png, SIGNATURES.pdf]);
 
 function matches(buf, sig) {
-  if (!buf || buf.length < sig.magic.length) return false;
+  const at = sig.magicOffset || 0;
+  if (!buf || buf.length < at + sig.magic.length) return false;
   for (let i = 0; i < sig.magic.length; i += 1) {
-    if (buf[i] !== sig.magic[i]) return false;
+    if (buf[at + i] !== sig.magic[i]) return false;
+  }
+  // The fixed bytes say "a container"; the brand says which container. A
+  // HEIC photo shares ftyp with MP4, so a bare ftyp match would accept it.
+  if (sig.brands) {
+    const brandAt = at + sig.magic.length;
+    if (buf.length < brandAt + 4) return false;
+    const brand = buf.toString('latin1', brandAt, brandAt + 4);
+    if (!sig.brands.includes(brand)) return false;
   }
   if (sig.formatWord) {
     const { offset, bytes } = sig.formatWord;
@@ -122,5 +153,6 @@ module.exports = {
   PROFILE_IMAGES,
   LOGO_IMAGES,
   DOCUMENTS,
+  FORM_VIDEOS,
   detectFileType,
 };

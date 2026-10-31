@@ -102,6 +102,10 @@ const CONTRACT = {
     scope: 'platform',
     required: ['configured', 'host', 'port', 'from', 'delivery'],
   },
+  backup: {
+    scope: 'platform',
+    required: ['last_ok_at', 'age_hours', 'size_bytes', 'tables', 'offsite', 'stale_after_hours'],
+  },
 };
 
 /**

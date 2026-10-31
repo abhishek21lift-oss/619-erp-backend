@@ -33,6 +33,7 @@ const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // The client's digital twin: the assessments, the screen and the logged sets
 // that this file could not see. See modules/pt-os/client-context.js.
 const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
+const { buildChurnList } = require('../modules/pt-os/churn.service');
 const { normalisePlan, DietPlanError } = require('../modules/nutrition/ai-diet.service');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const {
@@ -527,6 +528,14 @@ function resolveDietInputs({ client, profile, goals, latestAssessment, latestChe
   };
 }
 
+// The facts a calorie target cannot be calculated without. One list, used by
+// the generator's refusal AND by the pre-flight context route, so the disabled
+// button and the 400 name the same fields.
+const DIET_REQUIRED = ['age', 'gender', 'weight_kg', 'height_cm', 'activity_level', 'goal'];
+function missingDietFields(inputs) {
+  return DIET_REQUIRED.filter((field) => !inputs[field]);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    1. AI COACH CHAT  (SSE streaming)
    POST /api/ai/chat
@@ -828,8 +837,8 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
 // safety gate and their training history. orgParam() below bounds the studio,
 // which is the same org-not-role gap studioGate() exists to close.
 //
-// No member surface calls this; the member app calls only api.me.*, bookings,
-// classes and UPI payments.
+// No member surface calls this; the member app calls only api.me.* and UPI
+// payments.
 router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res) => {
   const clientId = req.params.client_id;
   const org = orgParam(req);
@@ -862,6 +871,10 @@ router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res)
     client: { id: ctx.client.id, name: ctx.client.name },
     facts,
     data_quality: dataQuality,
+    // The diet generator's own pre-flight, from the same resolver it calls.
+    // Resolved without a body because this card has no diet fields to state:
+    // anything missing here is missing from the record.
+    diet: { missing: missingDietFields(resolveDietInputs(ctx, {})) },
     safety: twin
       ? {
         gate: twin.rules.gate,
@@ -1721,11 +1734,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
   }
 
   const p = resolveDietInputs(ctx, req.body || {});
-  const required = {
-    age: p.age, gender: p.gender, weight_kg: p.weight_kg,
-    height_cm: p.height_cm, activity_level: p.activity_level, goal: p.goal,
-  };
-  const missing  = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
+  const missing = missingDietFields(p);
   if (missing.length) return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
 
   const userPrompt = [
@@ -2441,6 +2450,111 @@ router.post('/business/insights', auth, requireTrainer, requireConfigured, async
     if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
     res.status(503).json({
       error: 'Business insights failed',
+      code: err.code === 'ALL_MODELS_FAILED' ? 'AI_UNAVAILABLE' : 'AI_FAILED',
+      message: publicAiMessage(err),
+    });
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   6b. CHURN BRIEFING  (one call, roster level)
+   POST /api/ai/business/churn
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const CHURN_SYSTEM_PROMPT = 'You are writing a short churn briefing for a personal trainer. '
+  + 'Quote only the numbers and client names in the payload. Never compute a number, '
+  + 'never add a client who is not in the payload, never draft a message. '
+  + 'Reply with JSON only: {summary: 3-5 sentences, themes: up to 5 short strings, '
+  + 'this_week: up to 5 short strings}.';
+
+const shortStrings = (value) => (Array.isArray(value)
+  ? value
+    .filter((s) => typeof s === 'string' && s.trim())
+    .map((s) => s.trim())
+    .slice(0, 5)
+  : []);
+
+router.post('/business/churn', auth, requireTrainer, requireConfigured, async (req, res) => {
+  try {
+    const list = await buildChurnList(orgParam(req));
+
+    // Nothing flagged: narrating an empty list invents trends and costs a call.
+    if (list.flagged === 0) {
+      return res.json({
+        data: {
+          summary: 'Nothing on the roster is flagged for churn risk today. Every assessed client is training, in term, and has no balance due.',
+          themes: [],
+          this_week: [],
+        },
+        model: 'deterministic',
+        tier: 'none',
+        used_fallback: false,
+        empty: true,
+      });
+    }
+
+    // Top ten only, and no contact details: the model needs names, scores,
+    // reasons and next actions, not a way to reach anyone or a mobile number.
+    const payload = {
+      as_of: list.as_of,
+      assessed: list.assessed,
+      flagged: list.flagged,
+      bands: list.bands,
+      clients: list.rows.slice(0, 10).map((row) => ({
+        client_name: row.client_name,
+        score: row.score,
+        band: row.band,
+        reasons: row.reasons,
+        next_action: row.next_action,
+        days_quiet: row.days_quiet,
+        term: row.term,
+        balance_amount: row.balance_amount,
+      })),
+    };
+
+    const result = await routedChat({
+      intent: 'business',
+      messages: [
+        { role: 'system', content: CHURN_SYSTEM_PROMPT },
+        { role: 'user',   content: `Write the churn briefing from this payload only:\n\n${JSON.stringify(payload, null, 2)}` },
+      ],
+      temperature: 0.3,
+      max_tokens:  700,
+    });
+
+    const raw = extractJson(result.content);
+    const summary = typeof raw?.summary === 'string' ? raw.summary.trim() : '';
+    if (!summary) {
+      logger.warn({ model: result.model, tier: result.tier }, 'ai_business_churn_unparseable');
+      return res.status(422).json({
+        error: 'AI returned an unusable briefing',
+        code: 'AI_UNPARSEABLE',
+        message: 'The model replied but did not return a valid briefing. Try again; if it keeps happening, check the fallback model in AI settings.',
+      });
+    }
+
+    await logUsage({
+      user_id:           req.user.id,
+      model:             result.model,
+      intent_type:       'business',
+      organization_id:   req.user?.organization_id ?? null,
+      routed_via:        result.routed_via ?? null,
+      ...usageFields(result.usage, result.content),
+      latency_ms:        result.latency_ms,
+      used_fallback:     result.used_fallback,
+    });
+
+    res.json({
+      data: { summary, themes: shortStrings(raw.themes), this_week: shortStrings(raw.this_week) },
+      model: result.model,
+      tier: result.tier,
+      used_fallback: result.used_fallback,
+    });
+  } catch (err) {
+    logger.error({ err: err.message, code: err.code }, 'ai_business_churn_error');
+    if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+    res.status(503).json({
+      error: 'Churn briefing failed',
       code: err.code === 'ALL_MODELS_FAILED' ? 'AI_UNAVAILABLE' : 'AI_FAILED',
       message: publicAiMessage(err),
     });

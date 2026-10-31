@@ -59,6 +59,7 @@
 
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
 
 const isProd = process.env.NODE_ENV === 'production';
@@ -130,7 +131,7 @@ function identityOf(req) {
  */
 function deviceOf(req) {
   const raw = (req.cookies && req.cookies.refresh_token) || (req.body && req.body.refresh_token);
-  return raw ? `d:${hashKey(raw)}` : `ip:${req.ip}`;
+  return raw ? `d:${hashKey(raw)}` : `ip:${ipKeyGenerator(req.ip)}`;
 }
 
 /**
@@ -190,7 +191,7 @@ const loginIdentityLimiter = rateLimit({
   passOnStoreError: true,
   max: LOGIN_FAILURES_PER_IDENTITY,
   skipSuccessfulRequests: true,
-  keyGenerator: (req) => identityOf(req) || `ip:${req.ip}`,
+  keyGenerator: (req) => identityOf(req) || `ip:${ipKeyGenerator(req.ip)}`,
   skip: (req) => identityOf(req) === null,
   handler: limitHandler(
     'identity',

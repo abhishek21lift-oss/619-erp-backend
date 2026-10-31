@@ -21,7 +21,7 @@
 //   invoices.js         INSERT of an unscopable row on invoice settlement
 //   trainers.js         revenue trend reading the empty table (a flat-zero chart)
 //   razorpay-webhook.js three UPDATEs naming columns that never existed
-//   renewal.worker.js   INSERT for the gym-era membership model
+//   renewal.worker.js   INSERT for the gym-era membership model (retired 244)
 //
 // ── Why a source scan and not a request test ────────────────────────────────
 //

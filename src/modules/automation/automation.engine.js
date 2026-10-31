@@ -60,6 +60,8 @@ const TRIGGER_EVENTS = Object.freeze([
   'anniversary', 'attendance_missed', 'trial_scheduled', 'trial_completed',
   // Migration 222.
   'payment_due',
+  // Migration 245 — client self-booking reminders.
+  'session_reminder',
 ]);
 
 /**

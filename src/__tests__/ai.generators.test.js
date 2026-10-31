@@ -1284,3 +1284,54 @@ describe('conflicting authoritative records', () => {
     expect(routedStream.mock.calls[0][0].messages[1].content).toContain('Goal: fat_loss');
   });
 });
+
+// ── The diet pre-flight, answered before the press ─────────────────────────
+//
+// The diet button sits under a panel built for the workout, so it could not
+// name what the diet needs until the server refused after a generation
+// attempt. Activity level is the worst case: it is recorded only in the
+// lifestyle assessment, which the workout facts do not include. The context
+// route now runs the diet's own resolver, so the card and the generator name
+// the same missing fields.
+describe('workout/context: what the diet still needs', () => {
+  test('names activity level when no lifestyle assessment recorded one', async () => {
+    mockQueries();
+    const res = await request(app).get('/api/ai/workout/context/client-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.diet.missing).toEqual(['activity_level']);
+  });
+
+  test('is empty when every field the diet requires is on file', async () => {
+    mockQueries({
+      'FROM pt_lifestyle_assessments WHERE client_id=$1': [{ activity_level: 'moderately_active' }],
+    });
+    const res = await request(app).get('/api/ai/workout/context/client-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.diet.missing).toEqual([]);
+  });
+});
+
+describe('workout/context: the interview answer reaches the facts', () => {
+  test('a client whose only training-days answer is the interview is not blocked', async () => {
+    // The loader has always selected lifestyle_training_days; the resolver
+    // never read it, so this client was told their training days were missing
+    // and generation refused. The route test keeps the query alive.
+    mockQueries({
+      'FROM pt_clients WHERE id=$1': [{
+        ...CLIENT, sessions_per_week: null, preferred_training_days: null, frequency: null,
+      }],
+      'FROM pt_client_interviews WHERE client_id=$1': [{ lifestyle_training_days: 3 }],
+    });
+    const res = await request(app).get('/api/ai/workout/context/client-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.facts.training_days).toMatchObject({
+      value: 3,
+      source: 'pt_client_interviews.lifestyle_training_days',
+      origin: 'recorded',
+    });
+    expect(res.body.data_quality.blocking).not.toContain('training_days');
+  });
+});

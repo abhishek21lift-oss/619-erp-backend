@@ -36,6 +36,17 @@ describe('collector harness', () => {
     expect(snap.cards.ok.checked_at).toEqual(expect.any(String));
   });
 
+  test('the snapshot names the build that answered it', async () => {
+    // "Is the fix deployed?" is asked before any card, and the answer belongs
+    // to the whole reading rather than to a probe.
+    registry.register('ok', async () => ({}));
+    const snap = await snapshot.collect();
+
+    expect(snap.release.service).toBe('backend');
+    expect(typeof snap.release.sha).toBe('string');
+    expect(typeof snap.release.contract).toBe('number');
+  });
+
   test('a throwing collector becomes a critical card, and does not reject', async () => {
     registry.register('boom', async () => { throw new Error('socket closed'); });
     const snap = await snapshot.collect();

@@ -11,6 +11,7 @@
 // below a loop.
 
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
 
 const AI_REQUESTS_PER_MINUTE = Number(process.env.AI_RATE_LIMIT_PER_MINUTE) > 0
@@ -31,7 +32,7 @@ const aiLimiter = rateLimit({
   max: AI_REQUESTS_PER_MINUTE,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.id ?? req.ip,
+  keyGenerator: (req) => req.user?.id ?? ipKeyGenerator(req.ip),
   // GETs are skipped as free — except knowledge search, which embeds the
   // query on every call and is the one expensive GET behind this limiter.
   skip: (req) =>

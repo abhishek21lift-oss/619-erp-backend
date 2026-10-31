@@ -35,6 +35,14 @@ describe('force logout', () => {
 
     expect(res.status).toBe(200);
     expect(call(/UPDATE users SET token_version/)).toBeDefined();
+
+    // A live refresh token can mint a new access token carrying the version
+    // this bump just wrote, which silently defeats the button. Ending the
+    // sessions means ending their refresh tokens, in the same statement as the
+    // bump so a half-failure cannot leave the old sessions alive.
+    const revoke = call(/UPDATE refresh_tokens/);
+    expect(revoke).toBeDefined();
+    expect(revoke[0]).toMatch(/UPDATE users SET token_version/);
   });
 
   it('does not touch the password — signing out is not locking out', async () => {
@@ -78,6 +86,9 @@ describe('reset MFA', () => {
     // A session that outlived the factor authorising it would defeat the point.
     expect(call(/UPDATE user_profiles SET mfa_enabled = FALSE/)).toBeDefined();
     expect(call(/UPDATE users SET token_version/)).toBeDefined();
+    // Same refresh-token hole as force-logout: a bump alone is a 15-minute
+    // pause, not a revocation.
+    expect(call(/UPDATE refresh_tokens/)).toBeDefined();
   });
 
   it('records the previous state, since removing a security factor is weighty', async () => {

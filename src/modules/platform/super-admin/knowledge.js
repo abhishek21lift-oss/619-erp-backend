@@ -85,17 +85,18 @@ router.post('/ai/knowledge', (req, res, next) => {
     // ingested again under a second identity (retry idempotency, accidental
     // re-uploads). No-op the row rather than silently spawning a second one.
     const { rows: dupes } = await pool.query(
-      `SELECT id, title, approval_status, status FROM ai_documents
+      `SELECT id, title, category, approval_status, status FROM ai_documents
         WHERE is_global = TRUE AND content_hash = $1 AND approval_status <> 'revoked'
         LIMIT 1`,
       [contentHash]
     );
     if (dupes.length) {
+      const existing = dupes[0];
       return res.status(409).json({
         error: {
           code: 'DUPLICATE_DOCUMENT',
-          message: `Same document content is already in the corpus (status: "${dupes[0].approval_status}", ingestion: "${dupes[0].status}")`,
-          document_id: dupes[0].id,
+          message: `These exact bytes are already in the corpus as "${existing.title}" (${existing.category}, ${existing.approval_status}, ${existing.status}). Delete that document first, or upload different content.`,
+          document_id: existing.id,
         },
       });
     }

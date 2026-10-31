@@ -91,6 +91,9 @@ describe('super-admin API — the H-03 split', () => {
     // deliberate new endpoint family, not something the H-03 split lost.
     'DELETE /ai/knowledge/:id',
     'DELETE /announcements/:id',
+    // Alert silence windows (migration 241): suppression of notification, never
+    // of detection. Deliberate, and audited like every other console action.
+    'DELETE /command-center/silences/:id',
     'DELETE /coupons/:id',
     'DELETE /hostinger/credential',
     'DELETE /organizations/:id/ai-limit',
@@ -123,13 +126,20 @@ describe('super-admin API — the H-03 split', () => {
     // AI Operations: the full model inventory, read on demand.
     'GET /command-center/ai/models',
     'GET /command-center/alerts',
+    // Persisted card status (migration 240) and the incident timeline over
+    // system_alerts + activity_log. Deliberate additions, not refactor drift.
+    'GET /command-center/availability',
     'GET /command-center/cards',
     'GET /command-center/commands',
     'GET /command-center/commands/container.restart/status/:requestId',
     'GET /command-center/guardian',
     'GET /command-center/logs',
     'GET /command-center/logs/history',
+    // The durable log as a capped CSV, for handing an incident to somebody.
+    'GET /command-center/logs/history/export',
+    'GET /command-center/silences',
     'GET /command-center/snapshot',
+    'GET /command-center/timeline',
     'GET /coupons',
     'GET /coupons/:id/redemptions',
     'GET /features',
@@ -225,6 +235,7 @@ describe('super-admin API — the H-03 split', () => {
     'POST /command-center/alerts/:id/resolve',
     'POST /command-center/commands/:name',
     'POST /command-center/guardian/:id/explain',
+    'POST /command-center/silences',
     'POST /command-center/stream-ticket',
     'POST /coupons',
     'POST /hostinger/approvals/:id/deny',

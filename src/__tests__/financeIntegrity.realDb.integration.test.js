@@ -3,7 +3,7 @@
 //
 // Two confirmed gaps, pinned here:
 //
-//   1. Invoices, expenses and plans wrote no activity_log row at all. Every
+//   1. Invoices and expenses wrote no activity_log row at all. Every
 //      other path that moves money (lib/ptPayments, UPI, /api/payments) is
 //      audited; these three let a studio's invoices be marked paid or
 //      cancelled, its expenses edited or deleted, and its prices changed, with
@@ -65,7 +65,6 @@ describeIf('Finance integrity, against a real database', () => {
     app.use(express.json());
     app.use('/api/invoices', require('../routes/invoices'));
     app.use('/api/expenses', require('../routes/expenses'));
-    app.use('/api/plans', require('../routes/plans'));
     app.use(require('../middleware/errorHandler').errorHandler);
     request = () => require('supertest')(app);
   });
@@ -78,7 +77,6 @@ describeIf('Finance integrity, against a real database', () => {
     await pool.query('DELETE FROM invoice_items WHERE invoice_id IN (SELECT id FROM invoices WHERE organization_id = $1)', [ORG]);
     await pool.query('DELETE FROM invoices WHERE organization_id = $1', [ORG]);
     await pool.query('DELETE FROM expenses WHERE organization_id = $1', [ORG]);
-    await pool.query('DELETE FROM plans WHERE organization_id = $1', [ORG]);
     await pool.query('DELETE FROM pt_clients WHERE organization_id = $1', [ORG]);
     await pool.query('DELETE FROM users WHERE id = $1', [USER]);
     await pool.query('DELETE FROM organizations WHERE id = ANY($1)', [[ORG, OTHER_ORG]]);
@@ -221,22 +219,6 @@ describeIf('Finance integrity, against a real database', () => {
 
       expect((await request().delete(`/api/expenses/${id}`)).status).toBe(200);
       expect(await audit('expense.delete', id)).toHaveLength(1);
-    });
-  });
-
-  describe('every price change is audited', () => {
-    it('create, update and delete of a plan each write an activity row', async () => {
-      const created = await request().post('/api/plans').send({ name: 'Fin Plan', base_amount: 9000, duration: 'Monthly' });
-      expect(created.status).toBe(201);
-      const id = created.body.id || created.body.plan?.id || created.body.data?.id;
-      expect(id).toBeTruthy();
-      expect(await audit('plan.create', id)).toHaveLength(1);
-
-      expect((await request().put(`/api/plans/${id}`).send({ final_amount: 8000 })).status).toBe(200);
-      expect(await audit('plan.update', id)).toHaveLength(1);
-
-      expect((await request().delete(`/api/plans/${id}`)).status).toBe(200);
-      expect(await audit('plan.delete', id)).toHaveLength(1);
     });
   });
 

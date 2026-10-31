@@ -326,6 +326,7 @@ const cors      = require('cors');
 const helmet    = require('helmet');
 const compression = require('compression');
 const rateLimit     = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const { makeStore } = require('./lib/rateLimitStore');
 const { aiLimiter } = require('./middleware/aiRateLimit');
 const cookieParser  = require('cookie-parser');
@@ -541,6 +542,13 @@ app.use((req, res, next) => (
 // L-06: 100kb default for everything else
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+// body-parser 2 leaves req.body undefined when it parses nothing; handlers
+// across the app read req.body.<field> directly, so keep the express-4
+// guarantee that a request without a parsed body still has an object.
+app.use((req, res, next) => {
+  if (req.body === undefined) req.body = {};
+  next();
+});
 app.use(cookieParser());
 app.use(compression());
 app.use('/uploads', require('./routes/uploads'));
@@ -652,7 +660,7 @@ const userApiLimiter = rateLimit({
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.id ?? req.ip,
+  keyGenerator: (req) => req.user?.id ?? ipKeyGenerator(req.ip),
   skip: (req) => !req.user,
   message: { error: 'Too many requests. Please slow down.' },
 });
@@ -713,6 +721,9 @@ app.use('/api/auth/refresh',         refreshLimiter);
 // Unauthenticated marketing data (plan catalogue + platform aggregates) for the
 // public landing page. Aggregate-only — no per-tenant values are exposed.
 app.use('/api/public',            require('./routes/public'));
+// Read-only calendar subscription per trainer. Token-authenticated, no login:
+// calendar clients cannot send one. See routes/calendar-feed.js.
+app.use('/api/public',            require('./routes/calendar-feed'));
 
 // Public by design: an invited admin has no password yet, so nothing here can
 // require one. The single-use hashed token IS the credential — see
@@ -802,8 +813,8 @@ app.use('/api/attendance',        auth, requireTrainer, ...gate('attendance'), r
 // router is the one to build on.
 //
 // What changed is that the v3 model underneath /api/v1/reports was abandoned.
-// It read members, payments and member_memberships; all three are empty, none
-// has an organization_id column, and modules/reports carried no tenant filter
+// It read members, payments and member_memberships; all three were empty, none
+// had an organization_id column, and modules/reports carried no tenant filter
 // of any kind — `GET /api/v1/reports/revenue` was `FROM payments p WHERE
 // p.deleted_at IS NULL` behind auth + admin/manager, i.e. every studio's
 // revenue to any studio's admin. This router scopes every query (see orgParam)
@@ -818,19 +829,12 @@ app.use('/api/reports',           userApiLimiter, ...studioGate('insights'), req
 // same engine; new clients must use these routes. Same guard, same feature.
 app.use('/api/insights',         userApiLimiter, ...studioGate('insights'), require('./modules/insights/insights.routes'));
 
-app.use('/api/plans',             ...gate('packages'), require('./routes/plans'));
 // studioGate, not gate: routes/expenses.js used to narrow with
 // `if (req.user.role === 'trainer')` and apply the org filter inside that
 // branch — so a member fell through it and got the studio's whole expense
 // stats. Third instance of that fall-through after reports/monthly and
 // search; a feature flag is not an authorisation decision.
 app.use('/api/expenses',          ...studioGate('finance'), require('./routes/expenses'));
-
-// ROUTE INTEGRITY NOTE (R-03 / bookings):
-// /api/bookings and /api/v1/bookings both mount the same router.
-// Same policy as auth: legacy callers use /api/bookings, new callers use /api/v1/bookings.
-app.use('/api/v1/bookings',       require('./modules/bookings/bookings.routes'));
-app.use('/api/bookings',          require('./modules/bookings/bookings.routes'));
 
 // /api/admin used to mount admin-reset.js: DELETE/DROP across every studio's
 // data with no organization_id filter, behind nothing but an emailed code. No
@@ -868,7 +872,6 @@ app.use('/api/modules',           auth, requireTrainer, require('./modules/opera
 // ────────────────────────
 // PREMIUM FEATURE ROUTES (v4)
 // ────────────────────────
-app.use('/api/calendar',          require('./routes/calendar'));
 app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-checkin'));
 // requireTrainer: the handler already hides internal_/geo_/biometric_/feature_
 // keys from non-admins, but system_settings carries NO organization_id at all
@@ -941,11 +944,6 @@ app.use('/api/ai',               userApiLimiter, ...studioGate('ai_suite'), requ
 app.use('/api/ai',               ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/ai'));
 
 // ────────────────────────
-// MEMBER PORTAL ROUTES
-// ────────────────────────
-app.use('/api/classes',           require('./routes/classes'));
-
-// ────────────────────────
 // PT OS — Personal Training Operating System
 // ────────────────────────
 // The back office, and gated as such at the MOUNT rather than per route.
@@ -967,6 +965,11 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/client-journey.routes'));
 // Workout generation: a reviewable draft, never a write.
 app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/workout-generator.routes'));
+// Client self-booking, trainer side: weekly windows, time off, slot settings.
+// The client side lives under /api/me below.
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/availability.routes'));
+// Asynchronous form review: the trainer's queue and timestamped comments.
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/form-checks/form-check.routes'));
 
 // The client's own surfaces. Mirror image of the block above: requireClient
 // refuses anyone who is not a `member` linked to a client record, and every
@@ -974,6 +977,9 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 // request.
 app.use('/api/me',               auth, requireClient, require('./modules/progress/member-progress.routes'));
 app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-portal.routes'));
+// The client's own booking: free slots, book, reschedule, cancel. Identity is
+// req.user.pt_client_id; no route takes a client or trainer id.
+app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-booking.routes'));
 
 // The studio's side of member ↔ studio messaging. The member's side is
 // /api/me/messages above; this one takes a client id, so it is trainer-only and
@@ -1018,7 +1024,7 @@ app.use('/api/automation', userApiLimiter, auth, requireTrainer, require('./modu
 // which the client actually calls, scopes every query.
 //
 // They were harmless in practice only because they read the abandoned v3
-// tables — members, payments and member_memberships are all empty, and none of
+// tables — members, payments and member_memberships were all empty, and none of
 // the three even has an organization_id column to filter on. That is precisely
 // what made them dangerous to keep: the day anyone populated those tables, five
 // endpoints would have started serving cross-tenant data with no code change
@@ -1032,9 +1038,9 @@ app.use('/api/automation', userApiLimiter, auth, requireTrainer, require('./modu
 // organisations represented, 0 attributable rows, 0 duplicate member codes.
 // See src/db/migrations/MEMBERS-TENANT-GAP.md for the audit and the decision.
 //
-// The members TABLE is deliberately untouched: workers/renewal.worker.js still
-// joins it, member_memberships still has a foreign key to it, and dropping a
-// table was never part of this.
+// The members TABLE was left untouched by that removal and, later, moved to
+// the archive schema by migration 244 with every row intact — dropping a table
+// was never part of this.
 //
 // /api/v1/notifications stays — it backs the notification bell and has a live
 // caller.
@@ -1359,6 +1365,23 @@ runMigrationsWithRetry()
       setTimeout(alertTick, 120 * 1000).unref();
       setInterval(alertTick, 60 * 1000).unref();
       logger.info({ interval: '60s' }, 'Command Center alert evaluation scheduled');
+    }
+
+    // Persisted card status, so the console's history survives a restart. Runs
+    // in the API process for the same reason alert evaluation does: the runtime
+    // card measures THIS process. The first sample waits for boot to settle so
+    // a cold pool is not recorded as a platform outage.
+    // Disable with CC_METRIC_SAMPLING=off.
+    if (process.env.CC_METRIC_SAMPLING !== 'off') {
+      const availability = require('./modules/command-center/availability.service');
+      const sampleTick = () => availability.sample()
+        .catch((err) => logger.warn({ err: err.message }, 'Command Center status sample failed'));
+      setTimeout(sampleTick, 90 * 1000).unref();
+      setInterval(sampleTick, availability.SAMPLE_INTERVAL_MS).unref();
+      logger.info(
+        { interval_ms: availability.SAMPLE_INTERVAL_MS, retention_days: availability.RETENTION_DAYS },
+        'Command Center status sampling scheduled',
+      );
     }
 
     const pool = require('./db/pool');

@@ -22,6 +22,7 @@
 const router = require('express').Router();
 const pool = require('../../db/pool');
 const { auth, requireTrainer } = require('../../middleware/auth');
+const { requireFeature } = require('../../lib/features');
 const { orgWhere, orgIdOf } = require('../../lib/tenant-db');
 const { clientInOrg } = require('../../lib/orgGuard');
 const repo = require('./automation.repository');
@@ -279,6 +280,10 @@ router.post('/session-balance/:id/use', auth, wrap(async (req, res) => {
 }));
 
 // ── PT packages ─────────────────────────────────────────────────────────────
+// The `packages` capability used to be gated on the gym membership-plans
+// mount; that route is gone, so the gate lives with the catalogue it actually
+// describes.
+router.use('/pt-packages', requireFeature('packages'));
 
 router.get('/pt-packages', auth, wrap(async (req, res) => {
   const { goal_type, is_active } = req.query;

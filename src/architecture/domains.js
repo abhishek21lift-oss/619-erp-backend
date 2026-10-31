@@ -88,7 +88,7 @@ const DOMAINS = {
     description: 'The tenant root: studios, their branches, and what they have bought.',
     dependsOn: [],
     tables: [
-      'organizations', 'branches', 'organization_features', 'plan_features',
+      'organizations', 'organization_features', 'plan_features',
       'feature_flags', 'founder_members', 'system_settings',
     ],
   },
@@ -140,13 +140,11 @@ const DOMAINS = {
     // gym-ERP baseline schema.sql reconstructs for a fresh CI database), but
     // 170_drop_legacy_clients_and_renewals.sql drops it — with a verification
     // block that fails the migration if the table still exists afterward.
-    // `members` genuinely survives to today; it stays.
     tables: [
       'pt_clients', 'client_fitness_profiles', 'pt_consent_records',
       'pt_family_medical_history', 'pt_medical_clearances',
-      'members',
+      'pt_client_followups',
     ],
-    legacyTables: ['members'],
   },
 
   'packages-enrolment': {
@@ -164,9 +162,8 @@ const DOMAINS = {
     tables: [
       'pt_packages', 'pt_plans', 'pt_client_subscriptions', 'pt_client_renewals',
       'holds_freezes', 'session_balance', 'membership_actions',
-      'plans', 'member_memberships', 'membership_payments',
+      'pt_payment_activations',
     ],
-    legacyTables: ['plans', 'member_memberships', 'membership_payments'],
   },
 
   finance: {
@@ -208,7 +205,6 @@ const DOMAINS = {
     tables: [
       'pt_commissions', 'pt_payouts',
       'revenue_targets', 'pt_trainers', 'trainers',
-      'leave_requests',
     ],
   },
 
@@ -216,10 +212,12 @@ const DOMAINS = {
   scheduling: {
     plane: PLANE.TENANT,
     tenancy: TENANCY.DERIVED,
-    description: 'When training happens. Sessions, trials and calendar sync.',
+    description: 'When training happens. Sessions and trials.',
     dependsOn: ['tenancy', 'clients', 'packages-enrolment'],
     tables: [
-      'pt_sessions', 'trial_sessions', 'google_calendar_events', 'google_calendar_tokens',
+      'pt_sessions', 'trial_sessions',
+      // What the trainer publishes for client self-booking (migration 245).
+      'trainer_availability', 'trainer_time_off', 'trainer_booking_settings',
     ],
   },
 
@@ -265,6 +263,9 @@ const DOMAINS = {
       'progress_retest_settings', 'progress_retest_schedules',
       'progress_reminder_deliveries', 'client_habit_logs',
       'client_habit_preferences', 'progress_insight_reviews',
+      // Asynchronous video form review (migration 248): the member's lift
+      // clip and the trainer's timestamped notes on it.
+      'pt_form_checks', 'pt_form_check_comments',
     ],
   },
 
@@ -286,22 +287,7 @@ const DOMAINS = {
       // only one writer wrote and nothing read; attendance_logs is the table
       // every attendance surface in the product actually reads.
       'attendance_logs', 'qr_tokens',
-      'face_descriptors', 'face_checkin_logs', 'biometric_attendance',
     ],
-    legacyTables: ['face_descriptors', 'face_checkin_logs', 'biometric_attendance'],
-  },
-
-  'group-classes': {
-    plane: PLANE.TENANT,
-    tenancy: TENANCY.DIRECT,
-    status: STATUS.LEGACY,
-    description:
-      'Group-class scheduling and booking. Named as its own domain rather than hidden '
-      + 'inside scheduling so the retire-or-promote decision stays visible: this is '
-      + 'gym-ERP surface in a PT-first product, and the decision needs live usage '
-      + 'evidence the code cannot supply.',
-    dependsOn: ['tenancy', 'clients'],
-    tables: ['class_sessions', 'class_templates', 'bookings'],
   },
 
   // ── Communication ───────────────────────────────────────────────────────
@@ -436,6 +422,7 @@ const DOMAINS = {
       'platform_owners', 'platform_features', 'platform_announcements',
       'platform_billing_settings', 'platform_payment_settings', 'platform_ai_settings',
       'ai_platform_settings', 'system_alerts', 'system_logs',
+      'alert_silences', 'command_center_status_samples', 'platform_backup_status',
       // `support_tickets` and `support_ticket_messages` are NOT here. See the
       // `support` domain below: they carry organization_id and are read AND
       // written by routes/support.js on the tenant plane, so classifying them

@@ -100,13 +100,6 @@ const REVIEWED_EXCEPTIONS = {
     'platform-wide COUNTs only (studios, trainers, active clients, sessions). ' +
     'Aggregates across all tenants is the intended behaviour; it returns no ' +
     'rows, no identifiers and no PII.',
-  'routes/classes.js':
-    'LEFT JOIN trainers ON t.id = cs.trainer_id — resolves a trainer name for ' +
-    'a class row that the surrounding query has already scoped. The join is on ' +
-    'a specific FK, not an open read of the trainers table.',
-  'modules/bookings/bookings.service.js':
-    'Name-resolution join only. Note this module targets the legacy ' +
-    'members/member_memberships tables that server.js documents as abandoned.',
   'modules/automation/automation.routes.js':
     'LEFT JOIN users u ON u.id = ar.created_by — resolves an author name for ' +
     'automation rows the surrounding query already filters. Join is on an FK.',
@@ -131,6 +124,13 @@ const REVIEWED_EXCEPTIONS = {
     'platform-operator audit rows with no owning organisation, under ' +
     'runAsPlatform. Reached from /api/super-admin (requireSuperAdmin + MFA) ' +
     'and from API boot; never from a tenant request.',
+  'modules/command-center/timeline.service.js':
+    'Command Center incident timeline. Reads system_alerts (platform data) and '
+    + "only activity_log rows WHERE action LIKE 'command_center.%' — "
+    + 'platform-operator audit entries with no owning organisation, and this is '
+    + 'the only prefix it selects. Mounted under /api/platform and '
+    + '/api/super-admin behind the platform guard; never reached from a tenant '
+    + 'request.',
   'modules/command-center/ai-inventory.service.js':
     'AI Operations model inventory (GET /api/super-admin/command-center/ai/'
     + 'models). usageByModel() is a platform-wide, model-grouped 30-day '

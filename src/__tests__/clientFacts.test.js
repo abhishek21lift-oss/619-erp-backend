@@ -160,6 +160,32 @@ describe('training frequency reads the column the rest of the product writes', (
     expect(facts.training_days.source).toBe('pt_clients.preferred_training_days');
   });
 
+  test('the interview answer is used when the client record holds no count', () => {
+    // The Client Interview asks how many days a week the client can really
+    // train. The AI loader read that row into the context and this resolver
+    // never looked at it, so the one answer the client had given was reported
+    // as missing — and training_days blocks generation.
+    const ctx = bare();
+    ctx.interviewLifestyle = { lifestyle_training_days: 3 };
+    const { facts } = resolveClientFacts(ctx);
+    expect(facts.training_days).toEqual({
+      value: 3,
+      source: 'pt_client_interviews.lifestyle_training_days',
+      origin: 'recorded',
+    });
+  });
+
+  test('a stored count still wins, and the interview answer is shown as a disagreement', () => {
+    const ctx = bare({ sessions_per_week: 4 });
+    ctx.interviewLifestyle = { lifestyle_training_days: 2 };
+    const { facts } = resolveClientFacts(ctx);
+    expect(facts.training_days.value).toBe(4);
+    expect(facts.training_days.source).toBe('pt_clients.sessions_per_week');
+    expect(facts.training_days.conflicts).toEqual([
+      { source: 'pt_client_interviews.lifestyle_training_days', value: 2 },
+    ]);
+  });
+
   test('free-text frequency is used only when it is a plain 1-7', () => {
     expect(resolveClientFacts(bare({ frequency: '5' })).facts.training_days.value).toBe(5);
     expect(resolveClientFacts(bare({ frequency: 'thrice weekly' })).facts.training_days.origin).toBe('missing');

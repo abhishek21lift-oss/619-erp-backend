@@ -28,6 +28,32 @@ router.use(auth, requireTrainer);
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
+/**
+ * Runs `fn` with the per-client assessment-number lock held.
+ *
+ * The forms used `(SELECT COUNT(*)+1 ...)` inside their INSERT, so two saves
+ * for one client at the same moment both read the same count and both became
+ * "Assessment 3" — the history then shows two third assessments and no
+ * second. A transaction-scoped advisory lock keyed per form and client makes
+ * the read and the insert one step. The lock is released by COMMIT/ROLLBACK,
+ * and the connection in every case.
+ */
+async function withNumberLock(key, fn) {
+  const tx = await pool.connect();
+  try {
+    await tx.query('BEGIN');
+    await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`assessment:${key}`]);
+    const out = await fn(tx);
+    await tx.query('COMMIT');
+    return out;
+  } catch (err) {
+    await tx.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    tx.release();
+  }
+}
+
 function num(v, fallback = 0) {
   if (v === null || v === undefined || v === '') return fallback;
   const n = parseFloat(v);
@@ -1269,7 +1295,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computeLifestyleAnalysis(await withNutritionHabits(b.client_id, b));
 
-  const { rows } = await pool.query(
+  const { rows } = await withNumberLock(`lifestyle:${b.client_id}`, (tx) => tx.query(
     `INSERT INTO pt_lifestyle_assessments (
        client_id, assessment_number, assessment_date,
        sleep_duration_hours, bed_time, wake_time, sleep_quality, sleep_category, sleep_score,
@@ -1284,7 +1310,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
        sedentary_risk, recovery_risk, habit_risk_score, risk_factors, lifestyle_score, lifestyle_readiness,
        coach_notes, created_by, organization_id
      ) VALUES (
-       $1,(SELECT COUNT(*)+1 FROM pt_lifestyle_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
+       $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_lifestyle_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,$7,$8,
        $9,$10,
        $11,$12,$13,
@@ -1311,7 +1337,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
       analysis.sedentaryRisk, analysis.recoveryRisk, analysis.habitRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.lifestyleScore, analysis.lifestyleReadiness,
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
-  );
+  ));
   res.status(201).json({ data: rows[0] });
 }));
 
@@ -1546,7 +1572,7 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = await computeNutritionAnalysis(b.client_id, b);
 
-  const { rows } = await pool.query(
+  const { rows } = await withNumberLock(`nutrition:${b.client_id}`, (tx) => tx.query(
     `INSERT INTO pt_nutrition_assessments (
        client_id, assessment_number, assessment_date,
        diet_preferences,
@@ -1563,7 +1589,7 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
        supplement_score, nutrition_risk_score, risk_factors, nutrition_score, nutrition_readiness,
        coach_notes, created_by, organization_id
      ) VALUES (
-       $1,(SELECT COUNT(*)+1 FROM pt_nutrition_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
+       $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_nutrition_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,
        $4,$5,$6,
        $7,
@@ -1597,7 +1623,7 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
       analysis.supplementScore, analysis.nutritionRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.nutritionScore, analysis.nutritionReadiness,
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
-  );
+  ));
   res.status(201).json({ data: rows[0] });
 }));
 
@@ -1718,14 +1744,14 @@ router.post('/mobility-performance-assessments', auth, requireTrainer, validate(
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computeMobilityAnalysis(b);
 
-  const { rows } = await pool.query(
+  const { rows } = await withNumberLock(`mobility:${b.client_id}`, (tx) => tx.query(
     `INSERT INTO pt_mobility_performance_assessments (
        client_id, assessment_number, assessment_date,
        body_regions, mobility_tests,
        grip_strength_kg, vertical_jump_cm, sit_reach_cm, balance_test_seconds, reaction_time_ms, performance_notes,
        mobility_score, mobility_category, created_by, organization_id
      ) VALUES (
-       $1,(SELECT COUNT(*)+1 FROM pt_mobility_performance_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
+       $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_mobility_performance_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3::jsonb,$4::jsonb,
        $5,$6,$7,$8,$9,$10,
        $11,$12,$13,$14
@@ -1736,7 +1762,7 @@ router.post('/mobility-performance-assessments', auth, requireTrainer, validate(
       b.grip_strength_kg ?? null, b.vertical_jump_cm ?? null, b.sit_reach_cm ?? null, b.balance_test_seconds ?? null, b.reaction_time_ms ?? null, b.performance_notes || null,
       analysis.mobilityScore, analysis.mobilityCategory, req.user.id, orgIdOf(req),
     ]
-  );
+  ));
   res.status(201).json({ data: withMobilityReferrals(rows[0]) });
 }));
 
@@ -1820,14 +1846,14 @@ router.post('/posture-assessments', auth, requireTrainer, validate(postureAssess
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computePostureAnalysis(b);
 
-  const { rows } = await pool.query(
+  const { rows } = await withNumberLock(`posture:${b.client_id}`, (tx) => tx.query(
     `INSERT INTO pt_posture_assessments (
        client_id, assessment_number, assessment_date,
        front_issues, side_issues, back_issues, other_issue_notes,
        posture_risk_score, posture_risk_level,
        coach_notes, created_by, organization_id
      ) VALUES (
-       $1,(SELECT COUNT(*)+1 FROM pt_posture_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
+       $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_posture_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,
        $7,$8,
        $9::jsonb,$10,$11
@@ -1841,7 +1867,7 @@ router.post('/posture-assessments', auth, requireTrainer, validate(postureAssess
       analysis.postureRiskScore, analysis.postureRiskLevel,
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
-  );
+  ));
   res.status(201).json({ data: withPostureReferrals(rows[0]) });
 }));
 

@@ -10,21 +10,20 @@
 // It owns no logic: the sweep itself is
 // src/modules/automation/automation.sweep.js, which decides which studios to
 // visit and hands each row to the automation engine. This file is the cron
-// registration and the BullMQ plumbing around it, kept separate for the same
-// reason renewal.worker.js is — a worker that also contains the business rules
-// is a worker that can only be exercised by running it.
+// registration and the BullMQ plumbing around it, kept separate so the rules
+// can be exercised without running the worker.
 //
 // Standalone:   node src/workers/automation.worker.js   (one pass, then exit)
 // In-process:   see src/workers/index.js
 //
 // ── Why its own queue ───────────────────────────────────────────────────────
 //
-// Rather than a third job name on 'membership-renewals'. That queue's jobs are
-// pinned to attempts: 1 because they charge cards, and its cron is tuned to
-// that. This sweep charges nothing, is idempotent by construction (every
-// message it produces carries a date-anchored dedupe key), and wants a
-// different schedule and a different retry policy. Sharing the queue would
-// mean one of those two facts had to be wrong.
+// Rather than a third job name on one of the existing queues. Those are pinned
+// to their own retry and schedule policies, which the jobs they carry need.
+// This sweep charges nothing, is idempotent by construction (every message it
+// produces carries a date-anchored dedupe key), and wants a different schedule
+// and a different retry policy. Sharing a queue would mean one of those facts
+// had to be wrong.
 
 const { Worker } = require('bullmq');
 const { withJobContext } = require('./jobContext');
@@ -33,10 +32,12 @@ const redis = require('../lib/redis');
 const { runSweep } = require('../modules/automation/automation.sweep');
 const { runRecovery } = require('../modules/automation/automation.recovery');
 const { expireEndedTerms } = require('../modules/pt-os/pt-os.service');
+const { runSessionReminders } = require('../modules/pt-os/session-reminders');
 
 const SWEEP_JOB_ID = 'automation-daily-sweep';
 const RECOVERY_JOB_ID = 'automation-orphan-recovery';
 const TERM_EXPIRY_JOB_ID = 'pt-term-expiry';
+const SESSION_REMINDERS_JOB_ID = 'pt-session-reminders';
 
 /**
  * When the sweep runs.
@@ -71,12 +72,26 @@ const DEFAULT_RECOVERY_CRON = '*/15 * * * *';
  */
 const DEFAULT_TERM_EXPIRY_CRON = '5 * * * *';
 
+/**
+ * How often session reminders are checked.
+ *
+ * Every 15 minutes. The job itself looks 30 minutes ahead — two periods — so a
+ * run that starts late or fails cannot leave a gap: the next run still covers
+ * the target hour, and the notification dedupe absorbs the overlap.
+ */
+const DEFAULT_SESSION_REMINDERS_CRON = '*/15 * * * *';
+
 async function processSweepJob(job) {
   if (job.name === 'daily') return runSweep();
   if (job.name === 'recovery') return runRecovery();
   if (job.name === 'term-expiry') {
     const out = await expireEndedTerms();
     logger.info({ expired: out.expired, paused: out.paused }, 'pt term expiry completed');
+    return out;
+  }
+  if (job.name === 'session-reminders') {
+    const out = await runSessionReminders();
+    logger.info({ sent: out.sent, skipped: out.skipped }, 'pt session reminders completed');
     return out;
   }
   throw new Error(`Unknown automation job: ${job.name}`);
@@ -137,10 +152,10 @@ async function scheduleAutomationSweep() {
       name: 'daily',
       data: {},
       opts: {
-        // attempts: 1, like the renewal sweep, but for a different reason: a
-        // retry is harmless here (every write is idempotent) and also nearly
-        // useless, because the failures this can have — Postgres unreachable,
-        // Redis unreachable — are not the kind that clear inside a backoff.
+        // attempts: 1, for a reason worth stating: a retry is harmless here
+        // (every write is idempotent) and also nearly useless, because the
+        // failures this can have — Postgres unreachable, Redis unreachable —
+        // are not the kind that clear inside a backoff.
         // The next day's pass is the retry, and missing a day is visible in
         // the logs rather than hidden behind three silent attempts.
         attempts: 1,
@@ -180,11 +195,25 @@ async function scheduleAutomationSweep() {
     }
   ), 5000);
 
-  logger.info({ cron, recoveryCron, termExpiryCron }, 'automation sweep cron scheduled');
+  const remindersCron = process.env.PT_SESSION_REMINDERS_CRON || DEFAULT_SESSION_REMINDERS_CRON;
+  await withTimeout(automationSweepQueue.upsertJobScheduler(
+    SESSION_REMINDERS_JOB_ID,
+    { pattern: remindersCron },
+    {
+      name: 'session-reminders',
+      data: {},
+      // Idempotent per notification row and per event key, so the next quarter
+      // hour is the retry.
+      opts: { attempts: 1, removeOnComplete: true, removeOnFail: true },
+    }
+  ), 5000);
+
+  logger.info({ cron, recoveryCron, termExpiryCron, remindersCron }, 'automation sweep cron scheduled');
   return {
     sweep: { jobSchedulerId: SWEEP_JOB_ID },
     recovery: { jobSchedulerId: RECOVERY_JOB_ID },
     termExpiry: { jobSchedulerId: TERM_EXPIRY_JOB_ID },
+    sessionReminders: { jobSchedulerId: SESSION_REMINDERS_JOB_ID },
     jobSchedulerId: SWEEP_JOB_ID,
   };
 }
@@ -212,7 +241,9 @@ module.exports = {
   SWEEP_JOB_ID,
   RECOVERY_JOB_ID,
   TERM_EXPIRY_JOB_ID,
+  SESSION_REMINDERS_JOB_ID,
   DEFAULT_SWEEP_CRON,
   DEFAULT_RECOVERY_CRON,
   DEFAULT_TERM_EXPIRY_CRON,
+  DEFAULT_SESSION_REMINDERS_CRON,
 };

@@ -35,6 +35,7 @@ const smtpCollector = require('./collectors/smtp.collector');
 const securityCollector = require('./collectors/security.collector');
 const httpCollector = require('./collectors/http.collector');
 const hostCollector = require('./collectors/host.collector');
+const backupCollector = require('./collectors/backup.collector');
 
 let registered = false;
 
@@ -70,6 +71,9 @@ function registerCollectors() {
   // The VPS every container shares, so platform scope. A 5s TTL keeps the
   // CPU delta meaningful without re-reading /proc on every console tick.
   registry.register(hostCollector.NAME, hostCollector.collect, { timeoutMs: 2000, ttlMs: 5000 });
+  // One row read. 60s is generous because a backup runs nightly: fresher than
+  // the job, never fresher than the row.
+  registry.register(backupCollector.NAME, backupCollector.collect, { timeoutMs: 3000, ttlMs: 60_000 });
   registered = true;
 }
 

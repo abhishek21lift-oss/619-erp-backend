@@ -113,9 +113,24 @@ router.post('/users/:id/force-logout', async (req, res, next) => {
     if (error === 'NOT_FOUND') return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
     if (error === 'FORBIDDEN') return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Cannot act on a platform account' } });
 
+    // One statement, not two. A bump alone is a fifteen-minute pause: the
+    // refresh handler mints a new access token carrying whatever version the
+    // row now holds, so a surviving refresh token walks straight back in. The
+    // revoke and the bump must succeed or fail together — a bump without the
+    // revoke leaves every stolen session alive.
     const { rows } = await pool.query(
-      `UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = $1
-       RETURNING id, token_version`, [req.params.id]
+      `WITH bumped AS (
+         UPDATE users SET token_version = COALESCE(token_version, 0) + 1
+          WHERE id = $1
+         RETURNING id, token_version
+       ), revoked AS (
+         UPDATE refresh_tokens
+            SET revoked_at = NOW()
+          WHERE user_id = (SELECT id FROM bumped)
+            AND revoked_at IS NULL
+       )
+       SELECT id, token_version FROM bumped`,
+      [req.params.id]
     );
     invalidateUserCache();
     await audit(req, 'user_force_logout', 'user', req.params.id,
@@ -141,10 +156,19 @@ router.post('/users/:id/reset-mfa', async (req, res, next) => {
     const wasEnabled = !!(before[0] && before[0].mfa_enabled);
 
     await pool.query(
-      `UPDATE user_profiles SET mfa_enabled = FALSE, mfa_secret = NULL WHERE user_id = $1`, [req.params.id]
-    );
-    await pool.query(
-      `UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = $1`, [req.params.id]
+      `WITH factor AS (
+         UPDATE user_profiles SET mfa_enabled = FALSE, mfa_secret = NULL
+          WHERE user_id = $1
+       ), bumped AS (
+         UPDATE users SET token_version = COALESCE(token_version, 0) + 1
+          WHERE id = $1
+         RETURNING id
+       )
+       UPDATE refresh_tokens
+          SET revoked_at = NOW()
+        WHERE user_id = (SELECT id FROM bumped)
+          AND revoked_at IS NULL`,
+      [req.params.id]
     );
     invalidateUserCache();
 

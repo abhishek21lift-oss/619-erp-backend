@@ -31,6 +31,9 @@ const usage = {
   override: {},
   mfa: true,
   fail: false,
+  // Month-to-date cost and the platform settings row, as the budget card sees them.
+  month_cost: null,
+  quota: null,
 };
 jest.mock('../db/pool', () => ({
   query: jest.fn(async (sql) => {
@@ -43,6 +46,17 @@ jest.mock('../db/pool', () => ({
     if (/ORDER BY created_at DESC LIMIT 1/.test(flat)) return { rows: usage.last ? [usage.last] : [] };
     if (/interval '24 hours'/.test(flat)) return { rows: usage.served };
     if (/interval '30 days'/.test(flat)) return { rows: usage.inventory };
+    if (/date_trunc\('month', now\(\)\)/.test(flat)) {
+      return { rows: usage.month_cost == null ? [] : [{ cost_inr: usage.month_cost }] };
+    }
+    if (/FROM ai_platform_settings/.test(flat)) {
+      return {
+        rows: [usage.quota || {
+          enforcement_enabled: false, default_monthly_tokens: null,
+          monthly_cost_inr: null, warn_at_pct: 80,
+        }],
+      };
+    }
     return { rows: [] };
   }),
   totalCount: 1, idleCount: 1, waitingCount: 0,
@@ -134,6 +148,7 @@ beforeEach(() => {
     today: { requests: 0, avg_latency_ms: null, max_latency_ms: null, p95_latency_ms: null, tokens: 0, fallbacks: 0, models_used: 0, cost_inr: 0, unpriced_models: 0 },
     hour: { requests: 0, avg_latency_ms: null, max_latency_ms: null, fallbacks: 0 },
     last: null, served: [], inventory: [], override: {}, mfa: true, fail: false,
+    month_cost: null, quota: null,
   });
   installFetch();
   gateway._reset();
@@ -363,6 +378,36 @@ describe('AI card: configured is not active, missing is not zero', () => {
     expect(card.data.reconciliation.findings.filter((f) => f.severity !== 'info')).toEqual([]);
     // The catalog verified routing, so the state is consistent even with no traffic.
     expect(card.data.reconciliation.state).toBe('consistent');
+  });
+
+  it('grades month-to-date spend against the operator budget', async () => {
+    usage.month_cost = 4300;
+    usage.quota = {
+      enforcement_enabled: false, default_monthly_tokens: null,
+      monthly_cost_inr: '5000.00', warn_at_pct: 80,
+    };
+    const card = await ai().collect();
+    expect(card.status).toBe(STATUS.WARNING);
+    expect(card.data.budget.pct).toBe(86);
+    expect(card.reason).toMatch(/86%/);
+  });
+
+  it('is critical once the month is over budget', async () => {
+    usage.month_cost = 5200;
+    usage.quota = {
+      enforcement_enabled: false, default_monthly_tokens: null,
+      monthly_cost_inr: '5000.00', warn_at_pct: 80,
+    };
+    const card = await ai().collect();
+    expect(card.status).toBe(STATUS.CRITICAL);
+    expect(card.data.budget.pct).toBe(104);
+  });
+
+  it('reports spend without inventing a budget when none is set', async () => {
+    usage.month_cost = 9999;
+    const card = await ai().collect();
+    expect(card.data.budget).toBeNull();
+    expect(card.status).toBe(STATUS.HEALTHY);
   });
 
   it('routing reports where each tier comes from', async () => {

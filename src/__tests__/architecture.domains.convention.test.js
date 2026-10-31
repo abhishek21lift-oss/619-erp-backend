@@ -96,6 +96,13 @@ const ARCHIVED = new Set([
   'cardio_performances', 'personal_records', 'training_assignments',
   'training_programs', 'training_program_phases', 'training_program_weeks',
   'workout_templates', 'workout_template_exercises',
+  // 244 retired the gym-ERP surface: group classes and booking, gym
+  // memberships, face/biometric check-in, branches, staff leave and the
+  // class-booking Google Calendar sync.
+  'bookings', 'class_sessions', 'class_templates',
+  'plans', 'members', 'member_memberships', 'branches',
+  'face_descriptors', 'face_checkin_logs', 'biometric_attendance',
+  'leave_requests', 'google_calendar_events', 'google_calendar_tokens',
 ]);
 
 function schemaTables() {
@@ -250,9 +257,6 @@ describe('the manifest records the state the audit found', () => {
     // assert is impossible, since schemaTables() no longer contains them.
     const { legacyTables } = require('../architecture/domains');
     const legacy = legacyTables();
-    for (const t of ['members']) {
-      expect(legacy).toContain(t);
-    }
     // `payments` joins clients and subscriptions on the retired side: migration
     // 191 drops it, so schemaTables() no longer contains it and listing it as
     // legacy would assert a retirement this manifest also has to assert is
@@ -274,19 +278,20 @@ describe('the manifest records the state the audit found', () => {
     const { legacyTables } = require('../architecture/domains');
     const legacy = legacyTables();
     const retired = ['clients', 'subscriptions', 'renewals', 'leads', 'lead_followups',
-      'staff', 'staff_new', 'staff_targets', 'staff_targets_new'];
+      'staff', 'staff_new', 'staff_targets', 'staff_targets_new',
+      'plans', 'members', 'member_memberships', 'branches',
+      'class_sessions', 'class_templates', 'bookings'];
     for (const t of retired) {
       expect(legacy).not.toContain(t);
     }
   });
 
-  it('places the gym-ERP surface in a domain of its own', () => {
-    // group-classes is separated from scheduling on purpose: the retire-or-
-    // promote decision needs live usage evidence, and a domain that is hidden
-    // inside another one never gets that decision made.
-    expect(DOMAINS['group-classes'].status).toBe('legacy');
-    expect(DOMAINS['group-classes'].tables).toEqual(
-      expect.arrayContaining(['bookings', 'class_sessions', 'class_templates']),
-    );
+  it('does not carry the retired gym-ERP surface', () => {
+    for (const t of ['bookings', 'class_sessions', 'class_templates', 'plans',
+      'members', 'member_memberships', 'branches', 'face_descriptors',
+      'face_checkin_logs', 'biometric_attendance', 'leave_requests']) {
+      expect(ownerOf(t)).toBeFalsy();
+    }
+    expect(DOMAINS['group-classes']).toBeUndefined();
   });
 });

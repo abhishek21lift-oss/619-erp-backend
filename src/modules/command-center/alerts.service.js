@@ -39,6 +39,7 @@ const logger = require('../../lib/logger');
 const { logActivity } = require('../../lib/activityLog');
 const { STATUS } = require('./registry');
 const snapshot = require('./snapshot.service');
+const silences = require('./silences.service');
 
 /** Statuses that constitute a problem. Deliberately excludes UNAVAILABLE. */
 const ALERTING = new Set([STATUS.WARNING, STATUS.TIMEOUT, STATUS.CRITICAL]);
@@ -277,7 +278,7 @@ let inflightEvaluation = null;
  * Never throws. It runs on an interval; a rejection would be an unhandled
  * rejection every minute for the life of the process.
  *
- * @returns {Promise<{opened, escalated, ongoing, resolved, evaluated}>}
+ * @returns {Promise<{opened, escalated, ongoing, resolved, silenced, evaluated}>}
  */
 async function evaluate({ fresh = false } = {}) {
   // A `fresh` caller may not ride a non-fresh pass: "evaluate now" is an
@@ -295,7 +296,7 @@ async function evaluate({ fresh = false } = {}) {
 }
 
 async function evaluateOnce({ fresh = false } = {}) {
-  const out = { opened: [], escalated: [], ongoing: 0, resolved: [], evaluated: 0 };
+  const out = { opened: [], escalated: [], ongoing: 0, resolved: [], silenced: 0, evaluated: 0 };
 
   let snap;
   try {
@@ -304,6 +305,15 @@ async function evaluateOnce({ fresh = false } = {}) {
     logger.error({ err: err.message }, 'alert evaluation could not collect');
     return out;
   }
+
+  // Read once per pass, not once per alert: one tick is one instant, and an
+  // operator creating a window mid-sweep should see the whole sweep agree.
+  // A lookup failure fails OPEN (notify) rather than quietly silencing the
+  // platform — the console already renders the same silence list.
+  const muted = await silences.active().catch((err) => {
+    logger.warn({ err: err.message }, 'alert silences could not be read — announcing anyway');
+    return [];
+  });
 
   for (const card of Object.values(snap.cards)) {
     out.evaluated += 1;
@@ -334,7 +344,14 @@ async function evaluateOnce({ fresh = false } = {}) {
 
         // Notify only when the row has never been announced, or an escalation
         // cleared the stamp — and CLAIM the right to do so before doing it.
-        if (!row.notified_at && await claimNotification(row.id)) {
+        //
+        // A silenced alert is NOT claimed: `notified_at` stays null, so the
+        // announcement happens after the window closes if the condition is
+        // still open. Claiming and skipping would turn a planned maintenance
+        // window into a permanently missed incident.
+        const isSilenced = silences.covers(muted, row.source);
+        if (isSilenced) out.silenced += 1;
+        if (!row.notified_at && !isSilenced && await claimNotification(row.id)) {
           const channels = await notify(row);
           logger.info({ alert: row.id, source: row.source, severity: row.severity, channels },
             'system alert announced');

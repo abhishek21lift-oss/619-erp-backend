@@ -117,16 +117,12 @@ const MEMBER_MAY = {
   'PUT /api/profile/notifications': "Updates notification preferences for the caller's OWN user account; mutation is strictly scoped to req.user.id.",
   'PUT /api/profile/preferences': "Updates UI display preferences (theme, timezone, locale) for the caller's OWN account; strictly scoped to req.user.id.",
 
-  // ── The member's own bookings and check-ins. ─────────────────────────────
-  'GET /api/bookings/': "A member listing their OWN bookings: the handler overrides member_id with the session's own when role === member, so the query string cannot widen it.",
-  'GET /api/v1/bookings/': 'Versioned alias of the same self-narrowing bookings list.',
+  // ── The member's own check-ins. ──────────────────────────────────────────
   'GET /api/qr/generate': "Generates the caller's OWN check-in QR, keyed from req.user.pt_client_id / member_id.",
   'GET /api/qr/my-history': "The caller's OWN check-in history; the route name is literal and it takes no id.",
   'POST /api/qr/checkout': 'Closes the caller\'s OWN open check-in, keyed from the session rather than from a body field.',
 
   // ── Studio reference content every member legitimately browses. ──────────
-  'GET /api/classes/sessions': 'The class timetable a member browses in order to book. Org-scoped, and identical for every member of the studio.',
-  'GET /api/plans/': "The studio's own membership price list, which the renewal screen shows the member. Org-scoped by migration 174.",
   'GET /api/diet/meals': 'The shared meal library a member\'s own diet plan is built from. Reference content, not client data.',
   'GET /api/diet/supplements': 'Shared supplement reference library, same shape as meals.',
   'GET /api/diet/templates': 'Shared diet templates. Studio and platform content, carrying no client rows.',

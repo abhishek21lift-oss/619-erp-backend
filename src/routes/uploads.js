@@ -41,6 +41,8 @@ const OWNED_CATEGORIES = {
   'knowledge': 'ai_documents',
   // Photos a member uploads from the member app: progress-photos/<row id>.<ext>.
   'progress-photos': 'progress_photos',
+  // A member's lift video: form-checks/<row id>.<ext>.
+  'form-checks': 'pt_form_checks',
 };
 
 // Payment proofs are keyed differently: routes/upi-payments.js writes
@@ -119,6 +121,7 @@ const MEMBER_OWNER_COLUMN = {
   payment_orders: 'client_id',
   pt_clients: 'id',
   progress_photos: 'client_id',
+  pt_form_checks: 'client_id',
 };
 
 async function callerOwnsRecord(req, category, key) {
@@ -200,17 +203,17 @@ async function servePublic(req, res, next) {
   try {
     const key = normaliseKey(req, res);
     if (key === null) return;
-    await serveFile(key, res, { maxAgeSeconds: PUBLIC_CACHE_SECONDS });
+    await serveFile(key, res, { maxAgeSeconds: PUBLIC_CACHE_SECONDS, range: req.headers.range });
   } catch (err) {
     next(err);
   }
 }
 
-router.get('/profile/*', servePublic);
-router.get('/org-logos/*', servePublic);
+router.get('/profile/*splat', servePublic);
+router.get('/org-logos/*splat', servePublic);
 
 // ── Tier 2: authenticated, with an ownership check on tenant-owned records ──
-router.get('/*', auth, async (req, res, next) => {
+router.get('/*splat', auth, async (req, res, next) => {
   try {
     const key = normaliseKey(req, res);
     if (key === null) return;
@@ -227,7 +230,7 @@ router.get('/*', auth, async (req, res, next) => {
 
     // Private records must never land in a shared or CDN cache.
     res.set('Cache-Control', 'private, no-store');
-    await serveFile(key, res, {});
+    await serveFile(key, res, { range: req.headers.range });
   } catch (err) {
     next(err);
   }

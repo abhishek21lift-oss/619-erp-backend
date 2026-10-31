@@ -8,8 +8,8 @@
 // executed against, and how a domain error becomes an HTTP status.
 //
 // This matters more than the Razorpay path it sits next to. Razorpay order
-// creation runs only from renewal.worker.js against tables server.js's own
-// comments call abandoned, and its webhook writes columns that do not exist —
+// creation ran only from the renewal worker, since retired with the rest of the
+// gym-ERP surface, and its webhook writes columns that do not exist —
 // so UPI plus manual verification is what actually moves money here.
 //
 // The single most important assertion in this file is that `orgId` reaching

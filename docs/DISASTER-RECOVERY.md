@@ -190,7 +190,12 @@ Honestly, so nobody reads this document and concludes the problem is solved:
 | Gap | Why it matters |
 |---|---|
 | **No PITR** | The stopgap's RPO is up to 24 hours. A bad afternoon still loses an afternoon of check-ins, payments and assessments. Only a paid plan fixes this. |
-| **Off-site copy failing (as of 2026-10-02)** | `.github/workflows/backup.yml` runs the script nightly on the VPS. The dump succeeds (7.5 MiB, 235 tables on 2026-10-02) and is kept in `/var/backups/619`, but **every run fails at the upload** — `The specified bucket does not exist` (R2 bucket `db-backups`, or `BACKUP_R2_BUCKET` if set). Until the bucket exists, the only copies are on the same host as the application. Runs #8–#17 all failed. |
 | **No restore drill on real data** | `scripts/restore-drill.js` restores a dump into a new, empty database and requires every `public` table's row count to match the source; `backupRestore.realDb.integration.test.js` runs the nightly script and the drill end to end in CI. It has not yet been run against a production dump — do that on a throwaway database: `node scripts/restore-drill.js <dump> <empty-db-url> --compare <source-url>`. |
 | **R2 backup/versioning unverified** | Uploaded files are outside the dump; their retention has not been confirmed. |
-| **No monitoring of backup success** | A job that stops running needs to page someone. Right now nothing would notice. |
+| **Alerting rides on the same stack** | The Command Center grades the last verified dump and raises a system alert when it goes stale — in-app, plus email when SMTP is configured. There is no external monitor, so an outage that takes the API down also takes the accounting with it. |
+
+**Resolved 2026-10-29:** the `db-backups` R2 bucket now exists. A manual run
+(40937256111) produced a verified 9.3 MiB / 250-table dump and uploaded it to
+`r2://db-backups/619-erp/`; `platform_backup_status` records `offsite = true`,
+and the Command Center grades its age. The nightly schedule is expected to keep
+it fresh.

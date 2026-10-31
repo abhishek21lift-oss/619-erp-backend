@@ -14,13 +14,18 @@ const router = require('express').Router();
 const { registerCollectors, registry, snapshot } = require('./index');
 const commands = require('./commands.service');
 const alerts = require('./alerts.service');
+const silences = require('./silences.service');
+const timeline = require('./timeline.service');
+const availability = require('./availability.service');
 const guardian = require('./guardian.service');
 const logBuffer = require('./logBuffer');
 const logCapture = require('./logCapture');
+const logExport = require('./logExport');
 const tickets = require('./tickets');
 const stream = require('./stream');
 const pool = require('../../db/pool');
 const { runAsPlatform } = require('../../lib/tenant-context');
+const { logActivity } = require('../../lib/activityLog');
 
 registerCollectors();
 
@@ -248,6 +253,104 @@ router.post('/command-center/alerts/:id/resolve', wrap(async (req, res, next) =>
   }
 }));
 
+// ── Alert silences ──────────────────────────────────────────────────────────
+//
+// A silence suppresses notification, never detection. The alert still opens and
+// still appears above; the window only decides whether anyone is paged. Create
+// and cancel are audited like every other operator action on this console.
+
+/** GET /command-center/silences — windows in force right now. */
+router.get('/command-center/silences', wrap(async (_req, res) => {
+  res.json({ data: { silences: await silences.active() } });
+}));
+
+/**
+ * POST /command-center/silences
+ *   { source?: card name | null, reason, minutes }
+ *
+ * `source` must be a registered collector name or null for everything. The
+ * window is bounded server-side: 5 minutes to 30 days.
+ */
+router.post('/command-center/silences', wrap(async (req, res, next) => {
+  const source = req.body?.source ? String(req.body.source) : null;
+  if (source && !registry.names().includes(source)) {
+    return res.status(400).json({ error: { code: 'BAD_SOURCE', message: 'Unknown card name' } });
+  }
+  const reason = String(req.body?.reason ?? '').trim();
+  if (reason.length < 3 || reason.length > 200) {
+    return res.status(400).json({ error: { code: 'BAD_REASON', message: 'Reason must be 3–200 characters' } });
+  }
+  const minutes = Number(req.body?.minutes);
+  if (!Number.isInteger(minutes) || minutes < silences.MIN_MINUTES || minutes > silences.MAX_MINUTES) {
+    return res.status(400).json({
+      error: {
+        code: 'BAD_WINDOW',
+        message: `Window must be ${silences.MIN_MINUTES}–${silences.MAX_MINUTES} minutes`,
+      },
+    });
+  }
+
+  try {
+    const row = await silences.create({
+      source, reason, minutes, by: req.user?.name ?? null,
+    });
+    logActivity(req, 'command_center.silence.create', 'command_center', String(row.id), {
+      title: 'Silence created', source, reason, minutes,
+    }).catch(() => { /* auditing must not mask the result */ });
+    res.status(201).json({ data: row });
+  } catch (err) {
+    next(err);
+  }
+}));
+
+/** DELETE /command-center/silences/:id — keeps the planned window in history. */
+router.delete('/command-center/silences/:id', wrap(async (req, res, next) => {
+  if (!/^\d+$/.test(String(req.params.id))) {
+    return res.status(400).json({ error: { code: 'BAD_ID', message: 'Invalid silence id' } });
+  }
+  try {
+    const row = await silences.cancel(req.params.id, req.user?.name ?? null);
+    if (!row) {
+      return res.status(404).json({ error: { code: 'SILENCE_NOT_FOUND', message: 'Silence is not active' } });
+    }
+    logActivity(req, 'command_center.silence.cancel', 'command_center', String(row.id), {
+      title: 'Silence cancelled', source: row.source, reason: row.reason,
+    }).catch(() => { /* auditing must not mask the result */ });
+    res.json({ data: row });
+  } catch (err) {
+    next(err);
+  }
+}));
+
+// ── Incident timeline ───────────────────────────────────────────────────────
+
+/**
+ * GET /api/super-admin/command-center/timeline
+ *   ?hours=   window, clamped 1..720 (default 24)
+ *   ?limit=   events returned, clamped 1..200 (default 60)
+ *
+ * "What changed" for the operator arriving mid-incident, in one list: alert
+ * lifecycle events and audited operator commands, newest first. Both reads are
+ * windowed and capped, so this stays cheap on a screen that polls.
+ */
+router.get('/command-center/timeline', wrap(async (req, res) => {
+  res.json({ data: await timeline.read({ hours: req.query.hours, limit: req.query.limit }) });
+}));
+
+// ── Persisted availability ──────────────────────────────────────────────────
+
+/**
+ * GET /api/super-admin/command-center/availability
+ *   ?hours=  window, clamped 1..(retention days × 24), default 24
+ *
+ * Per-card status rails, bucketed so a week stays a few hundred points. This is
+ * the console's memory: the live snapshot knows now, this answers "has it been
+ * flapping".
+ */
+router.get('/command-center/availability', wrap(async (req, res) => {
+  res.json({ data: await availability.history({ hours: req.query.hours }) });
+}));
+
 // ── AI Guardian ─────────────────────────────────────────────────────────────
 
 /**
@@ -466,6 +569,32 @@ router.get('/command-center/logs/history', wrap(async (req, res) => {
         + `(api and worker), retained ${logCapture.retentionDays()} days.`,
     },
   });
+}));
+
+/**
+ * GET /api/super-admin/command-center/logs/history/export
+ *   ?level=error  floor (defaults to the persisted threshold)
+ *   ?source=api|worker
+ *   ?q=
+ *   ?hours=       window, clamped 1..720 (default 24)
+ *
+ * The same filters as History, streamed as a CSV attachment capped at 20,000
+ * rows. `X-Export-Truncated` says whether the cap was hit, so the operator is
+ * never handed a silently partial incident.
+ */
+router.get('/command-center/logs/history/export', wrap(async (req, res) => {
+  const file = await logExport.build({
+    hours: req.query.hours,
+    minLevel: minLevelOf(req.query.level) || logCapture.PERSIST_FROM_LEVEL,
+    source: req.query.source,
+    q: req.query.q,
+  });
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Export-Truncated', String(file.truncated));
+  res.send(file.csv);
 }));
 
 module.exports = router;

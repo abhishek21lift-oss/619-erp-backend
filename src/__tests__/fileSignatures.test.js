@@ -15,6 +15,7 @@ const {
   PROFILE_IMAGES,
   LOGO_IMAGES,
   DOCUMENTS,
+  FORM_VIDEOS,
   SIGNATURES,
 } = require('../lib/fileSignatures');
 
@@ -135,5 +136,39 @@ describe('the sets preserve each route’s previous behaviour', () => {
     expect(Object.isFrozen(SIGNATURES)).toBe(true);
     expect(Object.isFrozen(PROFILE_IMAGES)).toBe(true);
     expect(Object.isFrozen(SIGNATURES.webp.magic)).toBe(true);
+  });
+});
+
+describe('form videos', () => {
+  /** An ISO base media header: 4 size bytes, "ftyp", then the major brand. */
+  const ftyp = (brand) => {
+    const b = Buffer.alloc(64);
+    Buffer.from([0, 0, 0, 0x18]).copy(b, 0);
+    Buffer.from('ftyp', 'ascii').copy(b, 4);
+    Buffer.from(brand, 'latin1').copy(b, 8);
+    return b;
+  };
+
+  test('accepts MP4 and iPhone MOV, identifies them by their brand', () => {
+    expect(detectFileType(ftyp('isom'), FORM_VIDEOS)).toEqual({ mime: 'video/mp4', ext: 'mp4' });
+    expect(detectFileType(ftyp('mp42'), FORM_VIDEOS)).toEqual({ mime: 'video/mp4', ext: 'mp4' });
+    expect(detectFileType(ftyp('qt  '), FORM_VIDEOS)).toEqual({ mime: 'video/quicktime', ext: 'mov' });
+  });
+
+  test('refuses an image in the same container', () => {
+    // HEIC and AVIF are ftyp files too. Without the brand check they would
+    // pass as video and be stored and served as one.
+    expect(detectFileType(ftyp('heic'), FORM_VIDEOS)).toBeNull();
+    expect(detectFileType(ftyp('avif'), FORM_VIDEOS)).toBeNull();
+    expect(detectFileType(ftyp('mif1'), FORM_VIDEOS)).toBeNull();
+  });
+
+  test('refuses a bare ftyp header and a truncated one', () => {
+    expect(detectFileType(Buffer.from('ftyp', 'ascii'), FORM_VIDEOS)).toBeNull();
+    expect(detectFileType(Buffer.alloc(12).fill(0), FORM_VIDEOS)).toBeNull();
+  });
+
+  test('video is not an avatar', () => {
+    expect(detectFileType(ftyp('isom'), PROFILE_IMAGES)).toBeNull();
   });
 });
