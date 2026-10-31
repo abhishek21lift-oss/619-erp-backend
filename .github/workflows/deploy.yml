@@ -39,17 +39,20 @@ env:
     export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "deploy: building $GIT_SHA"
     cd /opt/myptstudio
-    # The worker runs this same code. Rebuilding only the API left it on an
-    # older image, so reminder and queue jobs silently ran stale logic.
-    docker compose build --build-arg GIT_SHA="$GIT_SHA" --build-arg BUILD_TIME="$BUILD_TIME" backend worker
+    # This box's compose file is maintained outside the repo and defines only
+    # `backend` (no `worker` service), so build/up must name just that.
+    docker compose build --build-arg GIT_SHA="$GIT_SHA" --build-arg BUILD_TIME="$BUILD_TIME" backend
     echo "deploy: built; running migrations"
     docker compose run --rm --no-deps backend npm run migrate
-    echo "deploy: migrated; replacing containers"
+    echo "deploy: migrated; replacing container"
     docker compose rm -sf backend
-    docker compose up -d backend worker
-    echo "deploy: containers started; verifying the API serves $GIT_SHA"
+    docker compose up -d backend
+    echo "deploy: container started; verifying it serves $GIT_SHA"
     bash /opt/myptstudio/619-erp-backend/scripts/deploy/verify-serving.sh "$GIT_SHA" /opt/myptstudio backend http://127.0.0.1:5000/api/health /opt/myptstudio/.backend-deployed-sha
-    docker compose ps worker
+    # Read-only topology probe: says whether a separate worker container exists
+    # and whether this API process starts workers in-process.
+    docker ps --format 'deploy: running {{.Names}} {{.Image}} {{.Status}}'
+    docker compose exec -T backend sh -c 'echo "deploy: RUN_WORKERS=${RUN_WORKERS:-unset}"' || true
 
 jobs:
   deploy:
