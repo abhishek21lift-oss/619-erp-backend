@@ -103,9 +103,10 @@ describeIf('Client journey, against a real database', () => {
     });
     expect(j.next).toBe('welcome_tour');
 
-    // Step 1: the welcome and gym tour.
+    // Step 1: the welcome and gym tour. Enrolment is optional until it is
+    // done, so the next required step after the tour is the consent.
     await pool.query(`UPDATE pt_clients SET welcome_tour_completed_at = NOW() WHERE id = $1`, [id]);
-    expect((await journey(id)).next).toBe('enrolment');
+    expect((await journey(id)).next).toBe('consent');
 
     // Step 2: enrol before screening — allowed, but only provisionally. The
     // client stays pending until consent and the PAR-Q are complete.
@@ -208,6 +209,24 @@ describeIf('Client journey, against a real database', () => {
       status: 'active', pt_start_date: '2026-10-01', pt_end_date: '2026-12-31', duration_months: 3, final_amount: 9000, paid_amount: 0,
     });
     expect(res.status).toBe(200);
+  });
+
+  it('a screened client who never enrolled can still be given a plan', async () => {
+    const id = await newClient();
+    await screenClient(pool, { clientId: id, orgId: ORG });
+    await pool.query(`UPDATE pt_clients SET welcome_tour_completed_at = NOW() WHERE id = $1`, [id]);
+    let j = await journey(id);
+    expect(j.steps.find((s) => s.key === 'enrolment')).toMatchObject({ state: 'todo', optional: true });
+    expect(j.next).toBe('interview');
+    expect(j.steps.find((s) => s.key === 'program_design').state).toBe('todo');
+
+    const planId = randomUUID();
+    plans.push(planId);
+    await pool.query(`INSERT INTO workout_plans (id, name, organization_id, duration_weeks) VALUES ($1, 'P', $2, 4)`, [planId, ORG]);
+    expect((await request().post('/api/workouts/assign').send({ workout_plan_id: planId, client_id: id })).status).toBe(201);
+
+    j = await journey(id);
+    expect(j.steps.find((s) => s.key === 'program_design').state).toBe('done');
   });
 
   it('a revoked consent and a high-risk PAR-Q show as blocked, with the reason', async () => {

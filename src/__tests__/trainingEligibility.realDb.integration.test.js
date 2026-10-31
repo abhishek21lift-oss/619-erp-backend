@@ -117,14 +117,27 @@ describeIf('Training eligibility, against a real database', () => {
       expect((await book(id)).status).toBe(201);
     });
 
-    it('a pending client is refused everywhere with CLIENT_NOT_ENROLLED', async () => {
+    it('a pending client who never enrolled cannot be planned unless screened, and cannot book', async () => {
       const id = await client({ status: 'pending', term: false });
-      for (const res of [await assign(id), await book(id),
+      const assigned = await assign(id);
+      expect(assigned.status).toBe(403);
+      expect(code(assigned)).toBe('SCREENING_REQUIRED');
+      expect(assigned.body.missing).toEqual(['informed_consent', 'parq']);
+      for (const res of [await book(id),
         await request().post('/api/pt-os/workout-log/sessions').send({ client_id: id })]) {
         expect(res.status).toBe(409);
         expect(code(res)).toBe('CLIENT_NOT_ENROLLED');
       }
       expect((await pool.query('SELECT COUNT(*)::int AS n FROM workout_assignments WHERE client_id = $1', [id])).rows[0].n).toBe(0);
+    });
+
+    it('a screened client who never enrolled may be assigned a plan, but not booked', async () => {
+      const id = await client({ status: 'pending', term: false });
+      await screenClient(pool, { clientId: id, orgId: ORG });
+      expect((await assign(id)).status).toBe(201);
+      const booked = await book(id);
+      expect(booked.status).toBe(409);
+      expect(code(booked)).toBe('CLIENT_NOT_ENROLLED');
     });
 
     it('an expired client, or an active one past their last day, is TERM_EXPIRED', async () => {
@@ -240,8 +253,10 @@ describeIf('Training eligibility, against a real database', () => {
       expect(res.body.data.status).toBe('pending');
       expect(res.body.data.activation_pending).toBe(true);
       expect(res.body.data.screening_missing).toEqual(['informed_consent', 'parq']);
-      expect((await assign(id)).status).toBe(409);
-      expect(code(await assign(id))).toBe('CLIENT_PENDING_ACTIVATION');
+      // The plan gate now looks at screening instead of activation: the
+      // missing paperwork is what stops it, not the pending term.
+      expect((await assign(id)).status).toBe(403);
+      expect(code(await assign(id))).toBe('SCREENING_REQUIRED');
     });
 
     it('a draft PAR-Q is still missing', async () => {
@@ -298,6 +313,16 @@ describeIf('Training eligibility, against a real database', () => {
       expect(res.status).toBe(200);
       expect(res.body.data.status).toBe('active');
       expect(res.body.data.activation_pending).toBe(false);
+    });
+
+    it('a provisionally enrolled, fully screened client may take a plan before activation', async () => {
+      const id = await client({ status: 'pending', term: false });
+      await screenClient(pool, { clientId: id, orgId: ORG });
+      await pool.query(
+        `UPDATE pt_clients SET pt_start_date = CURRENT_DATE, pt_end_date = CURRENT_DATE + 60,
+           duration_months = 3, final_amount = 9000 WHERE id = $1`, [id],
+      );
+      expect((await assign(id)).status).toBe(201);
     });
 
     it('an already-enrolled client\'s edits are not re-gated', async () => {

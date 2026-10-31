@@ -44,6 +44,7 @@ beforeEach(() => {
     consent: { status: 'completed' },
     parq: { status: 'complete', complete: true },
     block: null,
+    complete: true,
   });
 });
 
@@ -72,6 +73,30 @@ describe('program_design follows the same eligibility as assign', () => {
       state: 'blocked',
       detail: 'This client\'s membership is frozen. Unfreeze it before assigning a plan.',
     });
+  });
+
+  it('is optional enrolment for a client who never enrolled, and their plan still counts', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [row({ status: 'pending', has_pt_term: false })] });
+    const j = await journey(ORG, CLIENT);
+    expect(step(j, 'enrolment')).toMatchObject({ state: 'todo', optional: true });
+    expect(step(j, 'program_design').state).toBe('done');
+    expect(j.next).toBeNull();
+  });
+
+  it('a never-enrolled client without complete screening cannot be planned yet', async () => {
+    screeningSummary.mockResolvedValueOnce({
+      consent: { status: 'completed' },
+      parq: { status: 'submitted', complete: false },
+      block: null,
+      complete: false,
+    });
+    pool.query.mockResolvedValueOnce({ rows: [row({ status: 'pending', has_pt_term: false, has_active_plan: false })] });
+    const j = await journey(ORG, CLIENT);
+    expect(step(j, 'program_design')).toMatchObject({
+      state: 'blocked',
+      detail: 'Complete the client\'s Informed Consent and PAR-Q before assigning a plan.',
+    });
+    expect(j.next).toBe('parq');
   });
 });
 

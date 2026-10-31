@@ -413,9 +413,10 @@ describe('the screening gate, at accept time', () => {
     checkTrainingEligibility.mockClear();
     await post();
     expect(checkTrainingEligibility).toHaveBeenCalledTimes(1);
-    const [req, clientId] = checkTrainingEligibility.mock.calls[0];
+    const [req, clientId, opts] = checkTrainingEligibility.mock.calls[0];
     expect(clientId).toBe('cl-1');
     expect(req.user).toBe(TRAINER);
+    expect(opts).toEqual({ action: 'accept_plan', allowUnenrolled: true });
   });
 
   it('a blocked client gets the gate\'s 403 and nothing is written', async () => {

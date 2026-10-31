@@ -526,7 +526,7 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       userId: req.user.id,
       name: typeof name === 'string' && name.trim() ? name.trim() : null,
       // Accepting assigns the plan, so it passes the same gate as /assign.
-      gate: (clientId) => checkTrainingEligibility(req, clientId, { action: 'accept_plan' }),
+      gate: (clientId) => checkTrainingEligibility(req, clientId, { action: 'accept_plan', allowUnenrolled: true }),
     });
 
     if (!out.ok) {
@@ -1320,10 +1320,12 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
     if (!mine[0]) return res.status(404).json({ error: 'Client not found' });
 
     // Training eligibility — shared with plan acceptance, PT sessions and
-    // Workout Log (src/lib/screeningGate.js): the client must be enrolled
-    // with a running term, and the PAR-Q + Informed Consent medical stops
-    // apply. Missing paperwork on an enrolled client proceeds with warnings.
-    const { blocked, warnings } = await checkTrainingEligibility(req, d.client_id, { action: 'assign_plan' });
+    // Workout Log (src/lib/screeningGate.js). A plan may be given before
+    // enrolment: a pending client who never enrolled (or is awaiting
+    // activation) passes with complete screening. Booking and logging still
+    // need the term. The PAR-Q + Informed Consent medical stops always apply;
+    // missing paperwork on an enrolled client proceeds with warnings.
+    const { blocked, warnings } = await checkTrainingEligibility(req, d.client_id, { action: 'assign_plan', allowUnenrolled: true });
     if (blocked) return res.status(blocked.status).json(blocked.body);
 
     const { rows } = await pool.query(`
