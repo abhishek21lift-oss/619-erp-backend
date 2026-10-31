@@ -1630,7 +1630,7 @@ function withPostureReferrals(row) {
 
 function computeMobilityAnalysis(b) {
   const mobilityScore = mobilityScoring.calcMobilityScore(b.body_regions ?? null, b.mobility_tests ?? null);
-  const mobilityCategory = mobilityScoring.classifyMobility(mobilityScore);
+  const mobilityCategory = mobilityScoring.classifyMobility(mobilityScore, b.body_regions, b.mobility_tests);
   return { mobilityScore, mobilityCategory };
 }
 
