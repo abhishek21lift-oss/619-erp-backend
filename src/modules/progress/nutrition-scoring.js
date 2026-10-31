@@ -20,6 +20,9 @@ const NEGATIVE_BEHAVIOURS = ['Emotional Eating', 'Stress Eating', 'Night Eating'
 const POSITIVE_BEHAVIOURS = ['Mindful Eater', 'Slow Eater'];
 
 function calcDietQualityScore(foodsToAvoid, favouriteFoods, cravings, cravingFrequency, eatingBehaviours, breakfastRegularity, lateNightEating) {
+  const answered = (foodsToAvoid || []).length || (favouriteFoods || []).length || (cravings || []).length
+    || (eatingBehaviours || []).length || !!cravingFrequency || !!breakfastRegularity || lateNightEating != null;
+  if (!answered) return null;
   let score = 60;
   const avoidedJunk = (foodsToAvoid || []).filter((f) => JUNK_ITEMS.includes(f)).length;
   score += Math.min(20, avoidedJunk * 4);
@@ -42,8 +45,10 @@ function calcDietQualityScore(foodsToAvoid, favouriteFoods, cravings, cravingFre
 const PROTEIN_RICH_FAVOURITES = ['Chicken', 'Eggs', 'Paneer', 'Fish', 'Dal', 'Curd', 'Peanut Butter'];
 const PROTEIN_SUPPLEMENTS = ['Whey Protein', 'EAA', 'BCAA'];
 function assessProtein(favouriteFoods, takesSupplements, supplements) {
+  const proteinSupplement = takesSupplements && (supplements || []).some((s) => PROTEIN_SUPPLEMENTS.includes(s.name));
+  if (!(favouriteFoods || []).length && !proteinSupplement) return { assessment: null, score: null };
   let points = (favouriteFoods || []).filter((f) => PROTEIN_RICH_FAVOURITES.includes(f)).length;
-  if (takesSupplements && (supplements || []).some((s) => PROTEIN_SUPPLEMENTS.includes(s.name))) points += 3;
+  if (proteinSupplement) points += 3;
   if (points >= 6) return { assessment: 'High', score: 90 };
   if (points >= 3) return { assessment: 'Adequate', score: 70 };
   if (points >= 1) return { assessment: 'Low', score: 40 };
@@ -68,7 +73,8 @@ function calcHydrationScore(waterLiters, softDrinksPerDay, alcoholicDrinksPerWee
 // ── Step 5: Digestive Health ── digestiveIssues: [{issue, frequency, severity}]
 const FREQ_WEIGHT = { daily: 3, weekly: 1.5, rare: 0.5 };
 function calcDigestiveHealthScore(digestiveIssues) {
-  if (!digestiveIssues || digestiveIssues.length === 0) return 100;
+  if (digestiveIssues == null) return null;
+  if (digestiveIssues.length === 0) return 100;
   let deduction = 0;
   for (const issue of digestiveIssues) {
     const w = FREQ_WEIGHT[issue.frequency] ?? 1;
@@ -80,9 +86,10 @@ function calcDigestiveHealthScore(digestiveIssues) {
 // ── Step 4: Supplement Usage ──
 const FOUNDATIONAL_SUPPLEMENTS = ['Whey Protein', 'Omega 3', 'Vitamin D', 'Multivitamin'];
 function calcSupplementScore(takesSupplements, supplements) {
+  if (takesSupplements == null) return null;
   if (!takesSupplements) return 50;
   const covered = FOUNDATIONAL_SUPPLEMENTS.filter((f) => (supplements || []).some((s) => s.name === f)).length;
-  return clamp(40 + covered * 15, 40, 100);
+  return clamp(50 + covered * 15, 50, 100);
 }
 
 // ── Nutrition risk score + matching badges — same trigger thresholds, kept
@@ -127,14 +134,14 @@ function buildNutritionRiskFactors({ proteinAssessment, hydrationScore, digestiv
 // ── Overall composite ──
 function calcNutritionScore(fiveScores, riskScore) {
   const vals = Object.values(fiveScores).filter((v) => v != null);
-  if (!vals.length) return null;
+  if (vals.length < 3) return null;
   const base = vals.reduce((a, b) => a + b, 0) / vals.length;
   const penalty = (riskScore || 0) * 0.2;
   return clamp(round(base - penalty), 0, 100);
 }
 
 function classifyNutritionReadiness(nutritionScore) {
-  if (nutritionScore == null) return null;
+  if (nutritionScore == null) return 'Insufficient data';
   if (nutritionScore >= 85) return 'Excellent';
   if (nutritionScore >= 70) return 'Good';
   if (nutritionScore >= 50) return 'Average';

@@ -15,6 +15,7 @@ const mobilityScoring = require('./mobility-scoring');
 const postureScoring = require('./posture-scoring');
 const strengthLogs = require('./strength-logs.repo');
 const assessmentsRepo = require('./assessments.repo');
+const assessmentFacts = require('./assessment-facts');
 const retests = require('./retests.service');
 const logger = require('../../lib/logger');
 const { today: studioToday, mondayOf } = require('../../lib/appTime');
@@ -1158,14 +1159,7 @@ function clearHabitCounts(b) {
 // fill them in when this assessment has none of its own.
 async function withNutritionHabits(clientId, b) {
   const n = await assessmentsRepo.latestNutritionHabits(clientId);
-  const pick = (own, theirs) => (own != null ? own : theirs != null ? theirs : null);
-  return {
-    ...b,
-    water_intake_liters: pick(b.water_intake_liters, n.water_intake_liters != null ? Number(n.water_intake_liters) : null),
-    meal_frequency: pick(b.meal_frequency, n.meals_per_day != null ? Number(n.meals_per_day) : null),
-    breakfast_habit: pick(b.breakfast_habit, n.breakfast_regularity),
-    late_night_eating: pick(b.late_night_eating, n.late_night_eating),
-  };
+  return { ...b, ...assessmentFacts.resolveNutritionHabits(b, n) };
 }
 
 // Shared by POST (create) and PATCH (update) so the Smart Lifestyle
@@ -1206,6 +1200,65 @@ function computeLifestyleAnalysis(b) {
   };
 }
 
+// The analysis reads a stored row, or the merged row of an update. Both go
+// through here so a value parsed one way on save is not parsed another way on
+// read.
+function lifestyleAnalysisInput(row) {
+  return {
+    sleep_duration_hours: row.sleep_duration_hours != null ? parseFloat(row.sleep_duration_hours) : null,
+    sleep_quality: row.sleep_quality != null ? parseInt(row.sleep_quality, 10) : null,
+    stress_level: row.stress_level != null ? parseInt(row.stress_level, 10) : null,
+    water_intake_liters: row.water_intake_liters != null ? parseFloat(row.water_intake_liters) : null,
+    occupation_type: row.occupation_type || null,
+    daily_steps_bracket: row.daily_steps_bracket || null,
+    meal_frequency: row.meal_frequency != null ? parseInt(row.meal_frequency, 10) : null,
+    breakfast_habit: row.breakfast_habit || null,
+    late_night_eating: row.late_night_eating,
+    energy_level: row.energy_level != null ? parseInt(row.energy_level, 10) : null,
+    recovery_quality: row.recovery_quality || null,
+    smoking_status: row.smoking_status || null,
+    alcohol_status: row.alcohol_status || null,
+  };
+}
+
+function lifestyleAnalysisColumns(analysis) {
+  return {
+    sleep_category: analysis.sleepCategory, sleep_score: analysis.sleepScore,
+    stress_score: analysis.stressScore,
+    hydration_category: analysis.hydrationCategory, hydration_score: analysis.hydrationScore,
+    activity_level: analysis.activityLevel, activity_score: analysis.activityScore,
+    nutrition_score: analysis.nutritionScore,
+    recovery_score: analysis.recoveryScore,
+    sedentary_risk: analysis.sedentaryRisk, recovery_risk: analysis.recoveryRisk,
+    habit_risk_score: analysis.habitRiskScore, risk_factors: analysis.riskFactors.length ? analysis.riskFactors : null,
+    lifestyle_score: analysis.lifestyleScore, lifestyle_readiness: analysis.lifestyleReadiness,
+  };
+}
+
+// pg returns NUMERIC as a string; a computed 85 and a stored '85' are the same
+// answer and must not cause a write on every read.
+function sameStored(stored, computed) {
+  if (stored == null || computed == null) return stored == null && computed == null;
+  if (Array.isArray(stored) || Array.isArray(computed)) return JSON.stringify(stored) === JSON.stringify(computed);
+  if (typeof stored === 'number' || typeof computed === 'number') return Number(stored) === Number(computed);
+  return stored === computed;
+}
+
+// A stored score is only as fresh as the other module's last answer. Water and
+// meals are asked in Nutrition but scored here, so the latest row is rescored
+// when it is read. Only that row: the page shows the latest, and rewriting
+// history would change what a past assessment said. updated_at is left alone —
+// this is the same assessment, freshly scored.
+async function refreshLifestyleAnalysis(req, row) {
+  const analysis = computeLifestyleAnalysis(await withNutritionHabits(row.client_id, lifestyleAnalysisInput(row)));
+  const changed = Object.entries(lifestyleAnalysisColumns(analysis))
+    .filter(([col, val]) => !sameStored(row[col], val));
+  if (!changed.length) return row;
+
+  await assessmentsRepo.updateLifestyleScores(req, row.id, Object.fromEntries(changed));
+  return { ...row, ...Object.fromEntries(changed) };
+}
+
 // GET /lifestyle-assessments
 //
 // client_id is REQUIRED, which it was not before. Called bare, this endpoint
@@ -1222,12 +1275,8 @@ router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
   if (!await clientInOrg(req, client_id)) {
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   }
-  const params = [client_id];
-  const org = orgWhere(req, params);
-  const { rows } = await pool.query(
-    `SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC`,
-    params
-  );
+  const rows = await assessmentsRepo.listLifestyleAssessments(req, client_id);
+  if (rows[0]) rows[0] = await refreshLifestyleAnalysis(req, rows[0]);
   return res.json({ data: rows });
 }));
 
@@ -1312,33 +1361,9 @@ router.patch('/lifestyle-assessments/:id', auth, validate(lifestyleAssessmentUpd
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
 
   const merged = { ...existing, ...body };
-  const analysis = computeLifestyleAnalysis(await withNutritionHabits(existing.client_id, {
-    sleep_duration_hours: merged.sleep_duration_hours != null ? parseFloat(merged.sleep_duration_hours) : null,
-    sleep_quality: merged.sleep_quality != null ? parseInt(merged.sleep_quality, 10) : null,
-    stress_level: merged.stress_level != null ? parseInt(merged.stress_level, 10) : null,
-    water_intake_liters: merged.water_intake_liters != null ? parseFloat(merged.water_intake_liters) : null,
-    occupation_type: merged.occupation_type || null,
-    daily_steps_bracket: merged.daily_steps_bracket || null,
-    meal_frequency: merged.meal_frequency != null ? parseInt(merged.meal_frequency, 10) : null,
-    breakfast_habit: merged.breakfast_habit || null,
-    late_night_eating: merged.late_night_eating,
-    energy_level: merged.energy_level != null ? parseInt(merged.energy_level, 10) : null,
-    recovery_quality: merged.recovery_quality || null,
-    smoking_status: merged.smoking_status || null,
-    alcohol_status: merged.alcohol_status || null,
-  }));
+  const analysis = computeLifestyleAnalysis(await withNutritionHabits(existing.client_id, lifestyleAnalysisInput(merged)));
 
-  for (const [col, val] of Object.entries({
-    sleep_category: analysis.sleepCategory, sleep_score: analysis.sleepScore,
-    stress_score: analysis.stressScore,
-    hydration_category: analysis.hydrationCategory, hydration_score: analysis.hydrationScore,
-    activity_level: analysis.activityLevel, activity_score: analysis.activityScore,
-    nutrition_score: analysis.nutritionScore,
-    recovery_score: analysis.recoveryScore,
-    sedentary_risk: analysis.sedentaryRisk, recovery_risk: analysis.recoveryRisk,
-    habit_risk_score: analysis.habitRiskScore, risk_factors: analysis.riskFactors.length ? analysis.riskFactors : null,
-    lifestyle_score: analysis.lifestyleScore, lifestyle_readiness: analysis.lifestyleReadiness,
-  })) {
+  for (const [col, val] of Object.entries(lifestyleAnalysisColumns(analysis))) {
     params.push(val); sets.push(`${col} = $${params.length}`);
   }
 
@@ -1414,11 +1439,11 @@ const nutritionAssessmentUpdateSchema = {
 // smoking/alcohol risk inputs — a plain read of an existing table, no
 // hard dependency: the two risk factors simply don't fire without it.
 async function computeNutritionAnalysis(clientId, b) {
-  // Alcohol and smoking are asked in Lifestyle; this form shows them rather
-  // than asking a second time. A drinks-per-week on an older Nutrition row
-  // still counts when Lifestyle has none.
+  // Alcohol and smoking are asked in Lifestyle; this form does not ask them
+  // again. A drinks-per-week on an older Nutrition row still counts when
+  // Lifestyle has none.
   const lifestyle = await assessmentsRepo.latestLifestyleHabits(clientId);
-  const drinksPerWeek = b.alcoholic_drinks_per_week ?? (lifestyle.drinks_per_week != null ? Number(lifestyle.drinks_per_week) : null);
+  const alcohol = assessmentFacts.resolveAlcohol(lifestyle, b);
 
   const dietQualityScore = nutritionScoring.calcDietQualityScore(
     b.foods_to_avoid ?? null, b.favourite_foods ?? null, b.cravings ?? null,
@@ -1428,7 +1453,7 @@ async function computeNutritionAnalysis(clientId, b) {
   const dailyFluidIntake = nutritionScoring.calcDailyFluidIntake(
     b.water_intake_liters ?? null, b.tea_cups_per_day ?? null, b.coffee_cups_per_day ?? null, b.soft_drinks_per_day ?? null, b.juices_per_day ?? null
   );
-  const hydrationScore = nutritionScoring.calcHydrationScore(b.water_intake_liters ?? null, b.soft_drinks_per_day ?? null, drinksPerWeek);
+  const hydrationScore = nutritionScoring.calcHydrationScore(b.water_intake_liters ?? null, b.soft_drinks_per_day ?? null, alcohol.drinksPerWeek);
   const digestiveHealthScore = nutritionScoring.calcDigestiveHealthScore(b.digestive_issues ?? null);
   const supplementScore = nutritionScoring.calcSupplementScore(b.takes_supplements ?? null, b.supplements ?? null);
 
@@ -1436,7 +1461,7 @@ async function computeNutritionAnalysis(clientId, b) {
     proteinAssessment: protein.assessment, hydrationScore, digestiveHealthScore,
     cravings: b.cravings ?? null, cravingFrequency: b.craving_frequency ?? null,
     medicalConditions: b.medical_conditions ?? null, medicalNotes: b.medical_notes ?? null,
-    alcoholStatus: lifestyle.alcohol_status || null, smokingStatus: lifestyle.smoking_status || null,
+    alcoholStatus: alcohol.status, smokingStatus: lifestyle.smoking_status || null,
   };
   const nutritionRiskScore = nutritionScoring.calcNutritionRiskScore(riskInputs);
   const riskFactors = nutritionScoring.buildNutritionRiskFactors(riskInputs);
@@ -1459,6 +1484,51 @@ async function computeNutritionAnalysis(clientId, b) {
   };
 }
 
+// The stored row or a merged update, parsed the same way for both.
+function nutritionAnalysisInput(row) {
+  return {
+    foods_to_avoid: row.foods_to_avoid,
+    favourite_foods: row.favourite_foods,
+    cravings: row.cravings, craving_frequency: row.craving_frequency,
+    eating_behaviours: row.eating_behaviours, breakfast_regularity: row.breakfast_regularity,
+    late_night_eating: row.late_night_eating,
+    takes_supplements: row.takes_supplements, supplements: row.supplements,
+    water_intake_liters: row.water_intake_liters != null ? parseFloat(row.water_intake_liters) : null,
+    tea_cups_per_day: row.tea_cups_per_day != null ? parseInt(row.tea_cups_per_day, 10) : null,
+    coffee_cups_per_day: row.coffee_cups_per_day != null ? parseInt(row.coffee_cups_per_day, 10) : null,
+    soft_drinks_per_day: row.soft_drinks_per_day != null ? parseInt(row.soft_drinks_per_day, 10) : null,
+    juices_per_day: row.juices_per_day != null ? parseInt(row.juices_per_day, 10) : null,
+    alcoholic_drinks_per_week: row.alcoholic_drinks_per_week != null ? parseInt(row.alcoholic_drinks_per_week, 10) : null,
+    digestive_issues: row.digestive_issues,
+    medical_conditions: row.medical_conditions, medical_notes: row.medical_notes,
+  };
+}
+
+function nutritionAnalysisColumns(analysis) {
+  return {
+    diet_quality_score: analysis.dietQualityScore,
+    protein_score: analysis.proteinScore, protein_assessment: analysis.proteinAssessment,
+    daily_fluid_intake_liters: analysis.dailyFluidIntake,
+    hydration_score: analysis.hydrationScore,
+    digestive_health_score: analysis.digestiveHealthScore,
+    supplement_score: analysis.supplementScore,
+    nutrition_risk_score: analysis.nutritionRiskScore, risk_factors: analysis.riskFactors.length ? analysis.riskFactors : null,
+    nutrition_score: analysis.nutritionScore, nutrition_readiness: analysis.nutritionReadiness,
+  };
+}
+
+// Alcohol is asked in Lifestyle but scored here; see refreshLifestyleAnalysis
+// for why only the latest row is rewritten and updated_at is left alone.
+async function refreshNutritionAnalysis(req, row) {
+  const analysis = await computeNutritionAnalysis(row.client_id, nutritionAnalysisInput(row));
+  const changed = Object.entries(nutritionAnalysisColumns(analysis))
+    .filter(([col, val]) => !sameStored(row[col], val));
+  if (!changed.length) return row;
+
+  await assessmentsRepo.updateNutritionScores(req, row.id, Object.fromEntries(changed));
+  return { ...row, ...Object.fromEntries(changed) };
+}
+
 // GET /nutrition-assessments
 //
 // Same shape, and the same reasoning, as /lifestyle-assessments above — this
@@ -1472,12 +1542,8 @@ router.get('/nutrition-assessments', auth, wrap(async (req, res) => {
   if (!await clientInOrg(req, client_id)) {
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   }
-  const params = [client_id];
-  const org = orgWhere(req, params);
-  const { rows } = await pool.query(
-    `SELECT * FROM pt_nutrition_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC`,
-    params
-  );
+  const rows = await assessmentsRepo.listNutritionAssessments(req, client_id);
+  if (rows[0]) rows[0] = await refreshNutritionAnalysis(req, rows[0]);
   return res.json({ data: rows });
 }));
 
@@ -1576,32 +1642,9 @@ router.patch('/nutrition-assessments/:id', auth, validate(nutritionAssessmentUpd
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
 
   const merged = { ...existing, ...req.body };
-  const analysis = await computeNutritionAnalysis(existing.client_id, {
-    foods_to_avoid: merged.foods_to_avoid, favourite_foods: merged.favourite_foods,
-    cravings: merged.cravings, craving_frequency: merged.craving_frequency,
-    eating_behaviours: merged.eating_behaviours, breakfast_regularity: merged.breakfast_regularity,
-    late_night_eating: merged.late_night_eating,
-    takes_supplements: merged.takes_supplements, supplements: merged.supplements,
-    water_intake_liters: merged.water_intake_liters != null ? parseFloat(merged.water_intake_liters) : null,
-    tea_cups_per_day: merged.tea_cups_per_day != null ? parseInt(merged.tea_cups_per_day, 10) : null,
-    coffee_cups_per_day: merged.coffee_cups_per_day != null ? parseInt(merged.coffee_cups_per_day, 10) : null,
-    soft_drinks_per_day: merged.soft_drinks_per_day != null ? parseInt(merged.soft_drinks_per_day, 10) : null,
-    juices_per_day: merged.juices_per_day != null ? parseInt(merged.juices_per_day, 10) : null,
-    alcoholic_drinks_per_week: merged.alcoholic_drinks_per_week != null ? parseInt(merged.alcoholic_drinks_per_week, 10) : null,
-    digestive_issues: merged.digestive_issues,
-    medical_conditions: merged.medical_conditions, medical_notes: merged.medical_notes,
-  });
+  const analysis = await computeNutritionAnalysis(existing.client_id, nutritionAnalysisInput(merged));
 
-  for (const [col, val] of Object.entries({
-    diet_quality_score: analysis.dietQualityScore,
-    protein_score: analysis.proteinScore, protein_assessment: analysis.proteinAssessment,
-    daily_fluid_intake_liters: analysis.dailyFluidIntake,
-    hydration_score: analysis.hydrationScore,
-    digestive_health_score: analysis.digestiveHealthScore,
-    supplement_score: analysis.supplementScore,
-    nutrition_risk_score: analysis.nutritionRiskScore, risk_factors: analysis.riskFactors.length ? analysis.riskFactors : null,
-    nutrition_score: analysis.nutritionScore, nutrition_readiness: analysis.nutritionReadiness,
-  })) {
+  for (const [col, val] of Object.entries(nutritionAnalysisColumns(analysis))) {
     params.push(val); sets.push(`${col} = $${params.length}`);
   }
 
@@ -1656,7 +1699,7 @@ function withPostureReferrals(row) {
 
 function computeMobilityAnalysis(b) {
   const mobilityScore = mobilityScoring.calcMobilityScore(b.body_regions ?? null, b.mobility_tests ?? null);
-  const mobilityCategory = mobilityScoring.classifyMobility(mobilityScore);
+  const mobilityCategory = mobilityScoring.classifyMobility(mobilityScore, b.body_regions, b.mobility_tests);
   return { mobilityScore, mobilityCategory };
 }
 

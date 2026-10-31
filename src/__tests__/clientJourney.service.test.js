@@ -13,7 +13,9 @@ jest.mock('../lib/ptTerm', () => ({ hasPtTermSql: () => 'true' }));
 
 const pool = require('../db/pool');
 const { screeningSummary } = require('../lib/screeningGate');
-const { journey } = require('../modules/pt-os/client-journey.service');
+const {
+  journey, createInterview, InterviewInputError,
+} = require('../modules/pt-os/client-journey.service');
 
 const ORG = '11111111-1111-1111-1111-111111111111';
 const CLIENT = 'client-1';
@@ -70,5 +72,43 @@ describe('program_design follows the same eligibility as assign', () => {
       state: 'blocked',
       detail: 'This client\'s membership is frozen. Unfreeze it before assigning a plan.',
     });
+  });
+});
+
+describe('structured interview answers are checked before the database', () => {
+  const attempt = (body) => createInterview(ORG, CLIENT, 'user-1', body);
+
+  it.each([
+    ['lifestyle_training_days', 8],
+    ['lifestyle_training_days', -1],
+    ['lifestyle_training_days', 3.5],
+    ['lifestyle_training_days', 'five'],
+    ['lifestyle_sitting_hours', 'abc'],
+    ['lifestyle_sleep_hours', 25],
+    ['lifestyle_screen_time', 'sometimes'],
+    ['lifestyle_meal_regularity', 'sometimes'],
+    ['lifestyle_smoking', 'yes'],
+    ['lifestyle_alcohol', 'often'],
+    ['lifestyle_occupation', 'astronaut'],
+  ])('rejects %s = %p with a 400 instead of a database error', async (key, value) => {
+    const err = await attempt({ [key]: value }).catch((e) => e);
+    expect(err).toBeInstanceOf(InterviewInputError);
+    expect(err.status).toBe(400);
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 1, 7, '5'])('accepts %p training days a week', async (value) => {
+    pool.query.mockResolvedValueOnce({ rowCount: 1 });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1', lifestyle_training_days: Number(value) }] });
+    const saved = await attempt({ lifestyle_training_days: value });
+    expect(saved.lifestyle_training_days).toBe(Number(value));
+  });
+
+  it('normalises numeric strings so the driver receives numbers', async () => {
+    pool.query.mockResolvedValueOnce({ rowCount: 1 });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1' }] });
+    await attempt({ lifestyle_sitting_hours: '3', lifestyle_sleep_hours: '7.5' });
+    const insertParams = pool.query.mock.calls[1][1];
+    expect(insertParams).toEqual(expect.arrayContaining([3, 7.5]));
   });
 });

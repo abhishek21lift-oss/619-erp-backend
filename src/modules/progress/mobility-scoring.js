@@ -35,13 +35,23 @@ function calcMobilityScore(bodyRegions, mobilityTests) {
 // strength (fitness-scoring.js's CATEGORY_SCORES: Excellent 95, Good 80,
 // Average 60, Below Average 40, Poor 20) — thresholds set at the midpoints
 // between those anchors for a consistent reverse mapping.
-function classifyMobility(score) {
+const CATEGORY_RANK = ['Poor', 'Below Average', 'Average', 'Good', 'Excellent'];
+
+function classifyMobility(score, bodyRegions, mobilityTests) {
   if (score == null) return null;
-  if (score >= 88) return 'Excellent';
-  if (score >= 70) return 'Good';
-  if (score >= 50) return 'Average';
-  if (score >= 30) return 'Below Average';
-  return 'Poor';
+  let category = 'Poor';
+  if (score >= 88) category = 'Excellent';
+  else if (score >= 70) category = 'Good';
+  else if (score >= 50) category = 'Average';
+  else if (score >= 30) category = 'Below Average';
+
+  // Pain is a stop, not a deduction: a screen that refers cannot read above
+  // Average, and a restriction cannot read above Good. The cap only lowers.
+  const all = [...(bodyRegions || []), ...(mobilityTests || [])];
+  const hasPain = all.some((i) => i && i.pain === true);
+  const hasRestriction = all.some((i) => i && i.restriction === true);
+  const cap = hasPain ? 'Average' : hasRestriction ? 'Good' : 'Excellent';
+  return CATEGORY_RANK[Math.min(CATEGORY_RANK.indexOf(category), CATEGORY_RANK.indexOf(cap))];
 }
 
 // Pain during a movement screen is not a score, it is a stop: the pattern

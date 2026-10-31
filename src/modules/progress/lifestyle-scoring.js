@@ -66,7 +66,8 @@ function calcNutritionScore(mealFrequency, breakfastHabit, lateNightEating) {
   if (mealFrequency == null && breakfastHabit == null && lateNightEating == null) return null;
   let score = 100;
   if (mealFrequency != null) {
-    if (mealFrequency === 2 || mealFrequency === 5) score -= 10;
+    if (mealFrequency < 2) score -= 30;
+    else if (mealFrequency === 2 || mealFrequency === 5) score -= 10;
     else if (mealFrequency >= 6) score -= 20;
   }
   if (breakfastHabit === 'sometimes') score -= 15;
@@ -125,14 +126,16 @@ function buildLifestyleRiskFactors({ smokingStatus, alcoholStatus, sleepScore, s
 
 // ── Overall composite ──
 function calcLifestyleScore(sixScores, habitRiskScore) {
-  const base = mean(Object.values(sixScores));
+  const vals = Object.values(sixScores);
+  if (vals.filter((v) => v != null).length < 4) return null;
+  const base = mean(vals);
   if (base == null) return null;
   const penalty = (habitRiskScore || 0) * 0.2;
   return clamp(round(base - penalty), 0, 100);
 }
 
 function classifyLifestyleReadiness(lifestyleScore) {
-  if (lifestyleScore == null) return null;
+  if (lifestyleScore == null) return 'Insufficient data';
   if (lifestyleScore >= 85) return 'Excellent';
   if (lifestyleScore >= 70) return 'Good';
   if (lifestyleScore >= 50) return 'Average';

@@ -160,6 +160,51 @@ async function latestLifestyleHabits(clientId) {
 }
 
 /**
+ * The full list the assessment page shows, newest first. The GET handler
+ * rescored only the first row, so it needs the list and then a rewrite of
+ * that row; both live here rather than in the adapter.
+ */
+async function listLifestyleAssessments(req, clientId) {
+  const params = [clientId];
+  const org = orgWhere(req, params);
+  const { rows } = await pool.query(
+    `SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC, created_at DESC`,
+    params
+  );
+  return rows;
+}
+
+async function listNutritionAssessments(req, clientId) {
+  const params = [clientId];
+  const org = orgWhere(req, params);
+  const { rows } = await pool.query(
+    `SELECT * FROM pt_nutrition_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC, created_at DESC`,
+    params
+  );
+  return rows;
+}
+
+/**
+ * Rewrites the derived score columns on one row. `cols` keys come from
+ * lifestyleAnalysisColumns()/nutritionAnalysisColumns(), never from a request.
+ * updated_at is deliberately untouched: this is the same assessment, freshly
+ * scored against the other module's latest answer.
+ */
+async function updateLifestyleScores(req, id, cols) {
+  const params = [id];
+  const sets = Object.keys(cols).map((col) => { params.push(cols[col]); return `${col} = $${params.length}`; });
+  const org = orgWhere(req, params);
+  await pool.query(`UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1${org}`, params);
+}
+
+async function updateNutritionScores(req, id, cols) {
+  const params = [id];
+  const sets = Object.keys(cols).map((col) => { params.push(cols[col]); return `${col} = $${params.length}`; });
+  const org = orgWhere(req, params);
+  await pool.query(`UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1${org}`, params);
+}
+
+/**
  * One active goal per client. Every new goal used to stay active beside the
  * old ones, and whatever read "the client's goal" took the newest by luck.
  */
@@ -174,4 +219,5 @@ async function deactivateOtherGoals(clientId, organizationId, keepId) {
 module.exports = {
   insertAssessment, findAssessment, updateAssessment, deleteAssessment, replaceAssessmentLifts,
   updateClientBody, latestNutritionHabits, latestLifestyleHabits, deactivateOtherGoals,
+  listLifestyleAssessments, listNutritionAssessments, updateLifestyleScores, updateNutritionScores,
 };
