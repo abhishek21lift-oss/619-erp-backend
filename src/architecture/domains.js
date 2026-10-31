@@ -251,6 +251,9 @@ const DOMAINS = {
     dependsOn: ['tenancy', 'clients', 'files-storage'],
     tables: [
       'pt_assessments', 'pt_parq_forms', 'pt_parq_documents', 'pt_informed_consents',
+      // One-time links that let a client sign the two forms above remotely
+      // (migration 250).
+      'pt_form_links',
       'pt_posture_assessments', 'pt_mobility_performance_assessments',
       'pt_nutrition_assessments', 'pt_lifestyle_assessments', 'pt_os_measurements',
       'body_metrics', 'progress_photos', 'weekly_checkins', 'pt_goals', 'weight_logs',

@@ -10,11 +10,11 @@
 //
 // ── The rule this enforces ───────────────────────────────────────────────
 //
-// A login is what somebody gets for having paid. Activation is refused unless
-// the client has paid something, has a real email, has no login already, and
-// the studio's subscription is live. The refusal carries a reason, because the
-// trainer's screen explains why the button is unavailable and a bare 403
-// cannot.
+// A login needs a real email and the trainer's activation — not payment and
+// not PT enrolment. Activation is refused unless the client has a valid email,
+// has no login already, and the studio's subscription is live. The refusal
+// carries a reason, because the trainer's screen explains why the button is
+// unavailable and a bare 403 cannot.
 
 const express = require('express');
 const crypto = require('crypto');

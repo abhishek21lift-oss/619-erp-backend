@@ -571,3 +571,6 @@ router.post('/informed-consent/:id/medical-clearance', auth, requireTrainer, cle
 }));
 
 module.exports = router;
+// The remote-signing route enforces the same acknowledgements; importing the
+// list from here keeps one definition of what a completed consent requires.
+module.exports.ACK_KEYS = ACK_KEYS;

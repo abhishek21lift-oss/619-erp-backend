@@ -43,6 +43,8 @@ describe('image bodies are allowed on exactly the paths that carry one', () => {
     // PATCHes the client's.
     expect(matches('/api/pt-os/parq/forms/f-1/consent')).toBe(true);
     expect(matches('/api/pt-os/informed-consent/xyz-9', 'PATCH')).toBe(true);
+    // Remote signing posts the same signature from a phone with no session.
+    expect(matches(`/api/public/form-signing/${'a'.repeat(64)}`)).toBe(true);
   });
 
   test('the method is part of the match', () => {
