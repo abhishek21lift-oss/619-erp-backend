@@ -19,24 +19,29 @@ async function listRoster(orgId) {
 }
 
 /**
- * The newest follow-up per client that is still hiding them.
+ * The newest follow-up per client, whatever its `hide_until`.
+ *
+ * Visibility is the service's decision. Filtering by date *before*
+ * `DISTINCT ON` would skip a newer mark that has expired and resurrect an
+ * older, longer snooze behind it — hiding the client for weeks after the
+ * trainer's latest action ran out.
  *
  * `hide_until` is returned as text: a DATE arrives as a JS Date and
  * `String(date).slice(0, 10)` is not a calendar day. The service compares
  * day strings in studio time.
  */
-async function latestFollowups(orgId, today) {
+async function latestFollowups(orgId) {
   const { rows } = await pool.query(
     `SELECT * FROM (
        SELECT DISTINCT ON (client_id)
               client_id, outcome, to_char(hide_until, 'YYYY-MM-DD') AS hide_until,
               risk_score, note, created_at
          FROM pt_client_followups
-        WHERE organization_id = $1 AND hide_until >= $2::date
+        WHERE organization_id = $1
         ORDER BY client_id, created_at DESC
      ) latest
      ORDER BY hide_until, client_id`,
-    [orgId, today]
+    [orgId]
   );
   return rows;
 }

@@ -87,9 +87,22 @@ it('hides a contacted client until hide_until unless the score rose 15', async (
 it('returns a passed mark to the list when it still scores', async () => {
   repo.listRoster.mockResolvedValue([client()]);
   sweepRoster.mockResolvedValue({ clients: 1, clients_detail: [flagged()] });
-  repo.latestFollowups.mockResolvedValue([]); // repository filters hide_until >= today
+  repo.latestFollowups.mockResolvedValue([]); // no mark for this client
   const out = await buildChurnList('org-1');
   expect(out.rows).toHaveLength(1);
+});
+
+it('does not hide a client whose latest mark has expired', async () => {
+  repo.listRoster.mockResolvedValue([client()]);
+  sweepRoster.mockResolvedValue({ clients: 1, clients_detail: [flagged()] });
+  // The repository returns the newest mark whatever its date; a newer 7-day
+  // mark that ran out must not let an older, longer snooze hide the client.
+  repo.latestFollowups.mockResolvedValue([
+    { client_id: 'cl-1', outcome: 'contacted', hide_until: '2026-10-29', risk_score: 60 },
+  ]);
+  const out = await buildChurnList('org-1');
+  expect(out.rows).toHaveLength(1);
+  expect(out.handled).toHaveLength(0);
 });
 
 it('counts bands over visible and handled clients together', async () => {

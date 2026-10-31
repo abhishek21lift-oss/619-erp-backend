@@ -17,7 +17,7 @@ async function buildChurnList(orgId, { today = studioToday() } = {}) {
   const [roster, sweep, marks] = await Promise.all([
     repo.listRoster(orgId),
     sweepRoster(orgId, { today }),
-    repo.latestFollowups(orgId, today),
+    repo.latestFollowups(orgId),
   ]);
 
   const flagged = new Map((sweep.clients_detail || []).map((row) => [row.client_id, row]));
