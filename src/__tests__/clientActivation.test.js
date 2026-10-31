@@ -3,9 +3,10 @@
 // Two separate concerns, both here because both decide whether an account gets
 // created that should not have.
 //
-//   eligibility() is the product rule — a login is what somebody gets for
-//   having paid — and it is the only implementation of that rule. The trainer's
-//   button reads its answer, and the route re-checks it server-side.
+//   eligibility() is the product rule — a login needs a valid email and the
+//   trainer's activation, not payment — and it is the only implementation of
+//   that rule. The trainer's button reads its answer, and the route re-checks
+//   it server-side.
 //
 //   resolve() is the security rule. The token is the sole credential on an
 //   unauthenticated write surface, so "expired", "already used" and "never
@@ -28,21 +29,14 @@ const paidClient = (over = {}) => ({
 });
 
 describe('who may be given a login', () => {
-  it('allows a client who has paid and has an email', () => {
+  it('allows a client with a valid email, whether or not they have paid', () => {
     expect(invites.eligibility(paidClient()).ok).toBe(true);
-  });
-
-  it('refuses a client who has paid nothing', () => {
-    // The rule the whole feature exists for: access follows payment.
-    const out = invites.eligibility(paidClient({ paid_amount: '0.00' }));
-    expect(out.ok).toBe(false);
-    expect(out.reason).toBe('unpaid');
+    // Gym-only members and online clients being onboarded before their first
+    // payment still need the member app. The trainer's Activate is the gate.
+    expect(invites.eligibility(paidClient({ paid_amount: '0.00' })).ok).toBe(true);
   });
 
   it('allows a client part-way through an instalment plan', () => {
-    // Deliberately paid_amount > 0 and NOT balance_amount <= 0. Requiring a
-    // clear balance would lock out every client on instalments, which is most
-    // of them — they have paid, so they get in.
     const out = invites.eligibility(paidClient({ paid_amount: '2000.00', balance_amount: '3000.00' }));
     expect(out.ok).toBe(true);
   });
@@ -76,8 +70,7 @@ describe('who may be given a login', () => {
 
   it('gives every refusal a message a trainer can act on', () => {
     for (const c of [
-      paidClient({ paid_amount: 0 }), paidClient({ email: null }),
-      paidClient({ login_activated: true }), undefined,
+      paidClient({ email: null }), paidClient({ login_activated: true }), undefined,
     ]) {
       const out = invites.eligibility(c);
       expect(out.ok).toBe(false);

@@ -13,8 +13,9 @@
 //   • An admin invitation is issued by the platform operator and belongs to no
 //     studio. A client invitation is issued by a trainer and belongs to
 //     exactly one, so every read here is organization-scoped.
-//   • An admin invitation is unconditional. A client invitation may only be
-//     issued for somebody who has actually paid — see eligibility() below.
+//   • An admin invitation is unconditional. A client invitation needs a real
+//     email and the trainer's activation — payment and PT enrolment are not
+//     conditions. See eligibility() below.
 //
 // The raw token is returned once, goes into the email, and is never persisted.
 // Only SHA-256(raw) is stored.
@@ -63,15 +64,15 @@ function effectiveStatus(row) {
 /**
  * May this client be given a login?
  *
- * All four conditions, evaluated together and returned as a reason rather than
- * a boolean, because the trainer's screen explains why the button is not
- * available and a bare false cannot.
+ * Evaluated together and returned as a reason rather than a boolean, because
+ * the trainer's screen explains why the button is not available and a bare
+ * false cannot.
  *
- * The payment condition is the product rule the whole feature exists for: a
- * login is what somebody gets for having paid. `paid_amount > 0` rather than
- * `balance_amount <= 0` — a client part-way through an instalment plan has
- * paid and should have access; requiring a zero balance would lock out every
- * client on instalments, which is most of them.
+ * A login is access to the member app, not a receipt for a PT package. The
+ * only things it needs are an email the client can receive at and the
+ * trainer's explicit activation. Payment and PT enrolment used to be
+ * conditions, which meant a gym-only member, or an online client being
+ * onboarded before their first payment, had no way into the app at all.
  */
 function eligibility(client) {
   if (!client) return { ok: false, reason: 'not_found', message: 'Client not found.' };
@@ -81,9 +82,6 @@ function eligibility(client) {
   }
   if (!client.email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(client.email))) {
     return { ok: false, reason: 'no_email', message: 'Add a valid email address to this client first.' };
-  }
-  if (!(Number(client.paid_amount) > 0)) {
-    return { ok: false, reason: 'unpaid', message: 'A login can be created once the client has made a payment.' };
   }
   return { ok: true };
 }
