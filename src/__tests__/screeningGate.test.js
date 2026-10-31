@@ -236,3 +236,74 @@ describe('a provisionally enrolled client is pending until screening completes',
     expect((await screeningSummary('c1')).missing).toEqual(['informed_consent', 'parq']);
   });
 });
+
+describe('a client who never enrolled may still be given a plan (allowUnenrolled)', () => {
+  const unenrolled = { id: 'c1', status: 'pending', has_pt_term: false, ended: false };
+
+  test('complete screening lets an unenrolled client take a plan', async () => {
+    mockClient = unenrolled;
+    mockParq = cleanParq;
+    const { blocked, warnings } = await checkTrainingEligibility(req, 'c1', { action: 'assign_plan', allowUnenrolled: true });
+    expect(blocked).toBeNull();
+    expect(warnings).toEqual([]);
+  });
+
+  test('incomplete screening is still a hard 403', async () => {
+    mockClient = unenrolled;
+    mockParq = null;
+    mockConsent = { status: null, physician_block: false };
+    const { blocked } = await checkTrainingEligibility(req, 'c1', { allowUnenrolled: true });
+    expect(blocked.status).toBe(403);
+    expect(blocked.body).toMatchObject({ code: 'SCREENING_REQUIRED', missing: ['informed_consent', 'parq'] });
+  });
+
+  test('the medical hard stops still win on an unenrolled client', async () => {
+    mockClient = unenrolled;
+    mockParq = { ...cleanParq, risk_level: 'high', has_valid_clearance: false };
+    const { blocked } = await checkTrainingEligibility(req, 'c1', { allowUnenrolled: true });
+    expect(blocked.body.code).toBe('PARQ_BLOCKED');
+  });
+
+  test('a provisional enrolment with complete screening may take a plan', async () => {
+    mockClient = { ...unenrolled, has_pt_term: true };
+    mockParq = cleanParq;
+    expect((await checkTrainingEligibility(req, 'c1', { allowUnenrolled: true })).blocked).toBeNull();
+  });
+
+  test('a provisional enrolment with incomplete screening is SCREENING_REQUIRED', async () => {
+    mockClient = { ...unenrolled, has_pt_term: true };
+    mockParq = { ...cleanParq, answered_count: 3 };
+    mockConsent = { status: null, physician_block: false };
+    const { blocked } = await checkTrainingEligibility(req, 'c1', { allowUnenrolled: true });
+    expect(blocked.status).toBe(403);
+    expect(blocked.body.missing).toEqual(['informed_consent', 'parq']);
+  });
+
+  test('renew, frozen and inactive clients stay blocked', async () => {
+    for (const [over, expected] of [
+      [{ status: 'expired', ended: true }, 'TERM_EXPIRED'],
+      [{ status: 'frozen' }, 'CLIENT_FROZEN'],
+      [{ status: 'inactive' }, 'CLIENT_NOT_ACTIVE'],
+    ]) {
+      mockClient = { ...unenrolled, has_pt_term: true, ...over };
+      mockParq = cleanParq;
+      const { blocked } = await checkTrainingEligibility(req, 'c1', { allowUnenrolled: true });
+      expect(blocked.status).toBe(409);
+      expect(blocked.body.code).toBe(expected);
+    }
+  });
+
+  test('without the flag an unenrolled client is still refused', async () => {
+    mockClient = unenrolled;
+    mockParq = cleanParq;
+    expect((await checkTrainingEligibility(req, 'c1')).blocked.body.code).toBe('CLIENT_NOT_ENROLLED');
+  });
+
+  test('a never-enrolled client in a non-pending status stays blocked', async () => {
+    mockClient = { ...unenrolled, status: 'frozen' };
+    mockParq = cleanParq;
+    const { blocked } = await checkTrainingEligibility(req, 'c1', { allowUnenrolled: true });
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.code).toBe('CLIENT_NOT_ENROLLED');
+  });
+});

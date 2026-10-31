@@ -11,7 +11,9 @@
 //
 // The interview is optional (studio decision, Phase 2, 2026-10-02): it shows
 // as a step with its status and never blocks enrolment. Registration is the
-// prerequisite for the journey, not one of its steps.
+// prerequisite for the journey, not one of its steps. PT enrolment is optional
+// for a client who has never enrolled: the rest of intake — including a workout
+// plan — can be completed first, and strict screening still applies.
 
 const pool = require('../../db/pool');
 const { screeningSummary } = require('../../lib/screeningGate');
@@ -244,27 +246,37 @@ async function journey(orgId, clientId) {
     : c.status === 'pending' && c.has_pt_term
       ? 'PT enrolled — activation pending screening.'
       : undefined;
+  // A client who has never enrolled may complete the rest of intake (and be
+  // given a plan) first. Only the untouched, never-enrolled step is optional;
+  // a renewal or a block is never skippable.
+  const enrolmentOptional = !c.has_pt_term && enrolmentState === 'todo';
 
   // A plan can only be built for a client who may train. A provisional
   // enrolment (pending until screening completes) is done as a step but not
-  // yet trainable.
+  // yet trainable. A client who never enrolled is not "active", but with
+  // complete screening they may still be given a plan — the assign gate
+  // allows exactly that (allowUnenrolled), so this must agree with it.
   //
-  // `done` also requires canTrain. A plan row left active on a client whose
+  // `done` also requires mayPlan. A plan row left active on a client whose
   // term has ended used to mark this step complete, which removed every "next
   // step" button while /api/workouts/assign would still refuse them. The
   // journey and the gate have to answer the same question the same way.
   const canTrain = c.status === 'active' && !c.ended;
-  const programDesignState = c.has_active_plan && canTrain ? 'done'
-    : enrolmentState === 'done' && canTrain ? 'todo' : 'blocked';
+  const unenrolledReady = !c.has_pt_term && c.status === 'pending' && screening.complete === true;
+  const mayPlan = unenrolledReady || (enrolmentState === 'done' && canTrain);
+  const programDesignState = c.has_active_plan && mayPlan ? 'done'
+    : mayPlan ? 'todo' : 'blocked';
   const programDesignDetail = enrolmentState === 'renew'
     ? 'Renew the client\'s PT before assigning a plan.'
     : enrolmentState === 'blocked'
       ? (c.status === 'frozen'
         ? 'This client\'s membership is frozen. Unfreeze it before assigning a plan.'
         : 'This client is inactive. Reactivate them before assigning a plan.')
-      : enrolmentState !== 'done'
-        ? 'Enrol the client in PT before assigning a plan.'
-        : 'Activate the client (complete screening) before assigning a plan.';
+      : !c.has_pt_term
+        ? 'Complete the client\'s Informed Consent and PAR-Q before assigning a plan.'
+        : enrolmentState !== 'done'
+          ? 'Enrol the client in PT before assigning a plan.'
+          : 'Activate the client (complete screening) before assigning a plan.';
 
   const steps = [
     {
@@ -273,6 +285,7 @@ async function journey(orgId, clientId) {
     },
     {
       key: 'enrolment', state: enrolmentState,
+      ...(enrolmentOptional ? { optional: true } : {}),
       ...(enrolmentDetail ? { detail: enrolmentDetail } : {}),
     },
     { key: 'consent', state: consentState, ...(consentState === 'blocked' ? { detail: screening.block?.message } : {}) },
@@ -288,7 +301,9 @@ async function journey(orgId, clientId) {
       ...(programDesignState === 'blocked' ? { detail: programDesignDetail } : {}),
     },
   ];
-  const next = steps.find((s) => s.state !== 'done')?.key ?? null;
+  // The next step is the first outstanding one, except an optional enrolment
+  // a client may come back to. The optional interview is still offered.
+  const next = steps.find((s) => s.state !== 'done' && !(s.key === 'enrolment' && s.optional))?.key ?? null;
   return { steps, next, screening };
 }
 

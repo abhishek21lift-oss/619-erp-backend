@@ -225,6 +225,11 @@ async function isTrainingBlocked(clientId) {
 // (403 SCREENING_REQUIRED, with what is missing). Clients already enrolled or
 // renewed keep the warn-only behaviour above — the studio decided not to lock
 // out people who are training today (Phase 2, 2026-10-02).
+//
+// Plan assignment (and accepting a generated plan) is the one exception: with
+// `allowUnenrolled`, a pending client who never enrolled — or is provisionally
+// enrolled but not yet activated — may take a plan once screening is complete.
+// Booking, completing a session and logging a workout still require the term.
 
 const ELIGIBILITY_BLOCKS = {
   CLIENT_NOT_ENROLLED: 'This client is not enrolled in PT yet. Enrol them before assigning or starting training.',
@@ -284,10 +289,13 @@ function missingScreening(parq, consent) {
  * @param {object} [opts]
  * @param {boolean} [opts.requireActive=true]  false for fitness testing, which
  *        happens BEFORE enrolment in the intake journey
+ * @param {boolean} [opts.allowUnenrolled=false]  plan assignment: a client who
+ *        never enrolled (or is still provisionally pending) may take a plan
+ *        before the term is active. Screening is still strict.
  * @param {string} [opts.action]  audit label
  * @returns {Promise<{ blocked: null | { status, body }, warnings: string[], facts: object|null }>}
  */
-async function checkTrainingEligibility(req, clientId, { requireActive = true, action = 'training' } = {}) {
+async function checkTrainingEligibility(req, clientId, { requireActive = true, action = 'training', allowUnenrolled = false } = {}) {
   const facts = await loadClientFacts(require('./tenant-db').orgIdOf(req), clientId);
   if (!facts) {
     return { blocked: { status: 404, body: { error: 'Client not found', code: 'NOT_FOUND' } }, warnings: [], facts: null };
@@ -299,7 +307,15 @@ async function checkTrainingEligibility(req, clientId, { requireActive = true, a
   if (requireActive) {
     const code = statusBlock(facts);
     if (code === 'CLIENT_PENDING_ACTIVATION') {
-      pendingActivation = true;
+      // Plan assignment may proceed before activation, with complete screening.
+      pendingActivation = !allowUnenrolled;
+    } else if (code === 'CLIENT_NOT_ENROLLED') {
+      // Only a new, still-pending client may skip the term. A frozen or
+      // inactive record with no term is inconsistent and stays refused.
+      if (!allowUnenrolled || facts.status !== 'pending') {
+        await logActivity(req, 'training.blocked', 'pt_client', clientId, { reason: code.toLowerCase(), action });
+        return { blocked: { status: 409, body: { error: ELIGIBILITY_BLOCKS[code], code } }, warnings: [], facts };
+      }
     } else if (code) {
       await logActivity(req, 'training.blocked', 'pt_client', clientId, { reason: code.toLowerCase(), action });
       return { blocked: { status: 409, body: { error: ELIGIBILITY_BLOCKS[code], code } }, warnings: [], facts };
@@ -311,9 +327,10 @@ async function checkTrainingEligibility(req, clientId, { requireActive = true, a
     pendingActivation = true;
   }
 
-  // Strict screening for a client who has never been enrolled. The medical
-  // hard stops are checked first and win, because they say what to fix.
-  if (!facts.has_pt_term) {
+  // Strict screening for a client who has never been enrolled, and for a
+  // provisionally enrolled client being given a plan before activation. The
+  // medical hard stops are checked first and win, because they say what to fix.
+  if (!facts.has_pt_term || (allowUnenrolled && facts.has_pt_term && facts.status === 'pending')) {
     const { code, parq, consent } = await evaluate(clientId);
     if (!code) {
       const missing = missingScreening(parq, consent);
