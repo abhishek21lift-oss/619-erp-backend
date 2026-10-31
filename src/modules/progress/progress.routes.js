@@ -1255,12 +1255,7 @@ async function refreshLifestyleAnalysis(req, row) {
     .filter(([col, val]) => !sameStored(row[col], val));
   if (!changed.length) return row;
 
-  const params = [row.id];
-  const sets = changed.map(([col, val]) => { params.push(val); return `${col} = $${params.length}`; });
-  const org = orgWhere(req, params);
-  await pool.query(
-    `UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1${org}`, params
-  );
+  await assessmentsRepo.updateLifestyleScores(req, row.id, Object.fromEntries(changed));
   return { ...row, ...Object.fromEntries(changed) };
 }
 
@@ -1280,12 +1275,7 @@ router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
   if (!await clientInOrg(req, client_id)) {
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   }
-  const params = [client_id];
-  const org = orgWhere(req, params);
-  const { rows } = await pool.query(
-    `SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC, created_at DESC`,
-    params
-  );
+  const rows = await assessmentsRepo.listLifestyleAssessments(req, client_id);
   if (rows[0]) rows[0] = await refreshLifestyleAnalysis(req, rows[0]);
   return res.json({ data: rows });
 }));
@@ -1535,12 +1525,7 @@ async function refreshNutritionAnalysis(req, row) {
     .filter(([col, val]) => !sameStored(row[col], val));
   if (!changed.length) return row;
 
-  const params = [row.id];
-  const sets = changed.map(([col, val]) => { params.push(val); return `${col} = $${params.length}`; });
-  const org = orgWhere(req, params);
-  await pool.query(
-    `UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1${org}`, params
-  );
+  await assessmentsRepo.updateNutritionScores(req, row.id, Object.fromEntries(changed));
   return { ...row, ...Object.fromEntries(changed) };
 }
 
@@ -1557,12 +1542,7 @@ router.get('/nutrition-assessments', auth, wrap(async (req, res) => {
   if (!await clientInOrg(req, client_id)) {
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   }
-  const params = [client_id];
-  const org = orgWhere(req, params);
-  const { rows } = await pool.query(
-    `SELECT * FROM pt_nutrition_assessments WHERE client_id = $1${org} ORDER BY assessment_date DESC, created_at DESC`,
-    params
-  );
+  const rows = await assessmentsRepo.listNutritionAssessments(req, client_id);
   if (rows[0]) rows[0] = await refreshNutritionAnalysis(req, rows[0]);
   return res.json({ data: rows });
 }));
