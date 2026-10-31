@@ -204,7 +204,7 @@ async function notifyTrainer(inv) {
       inv.invited_by,
       'Client login activated',
       `${inv.pt_client_name || inv.client_name || 'A client'} has set their password and can now sign in.`,
-      `/clients/${inv.pt_client_id}`,
+      `/pt-os/clients/${inv.pt_client_id}`,
     ]
   );
 }
