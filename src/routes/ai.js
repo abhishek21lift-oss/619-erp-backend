@@ -163,9 +163,10 @@ async function buildClientContext(client_id, org) {
   try {
     // Parent-first authorization, mirroring loadAuthoritativeClient below:
     // confirm the client exists, is not deleted, and passes the tenant
-    // predicate BEFORE any child query executes. Same columns as before.
+    // predicate BEFORE any child query executes. `weight` is the enrollment
+    // fallback for an assessment saved without one.
     const clientRes = await pool.query(
-      'SELECT name, dob, gender FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
+      'SELECT name, dob, gender, weight FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
       [client_id, org]
     );
     const c = clientRes.rows[0];
@@ -184,12 +185,16 @@ async function buildClientContext(client_id, org) {
 
     const age    = c.dob ? Math.floor((Date.now() - new Date(c.dob).getTime()) / 31557600000) : null;
     const latest = assessRes.rows[0] || {};
+    const lastCheckin = checkinsRes.rows[0] || {};
+    // Same precedence as resolveDietInputs: newest assessment, then the
+    // enrollment weight, then the newest check-in.
+    const currentWeight = firstDefined(latest.weight, c.weight, lastCheckin.weight);
 
     const lines = [
       `Name: ${c.name}`,
       age ? `Age: ${age}` : '',
       c.gender ? `Gender: ${c.gender}` : '',
-      latest.weight ? `Current weight: ${latest.weight} kg` : '',
+      currentWeight != null ? `Current weight: ${currentWeight} kg` : '',
       latest.body_fat_pct ? `Body fat: ${latest.body_fat_pct}%` : '',
     ];
 
@@ -200,8 +205,7 @@ async function buildClientContext(client_id, org) {
       }).join(', ')}`);
     }
     if (checkinsRes.rows.length) {
-      const last = checkinsRes.rows[0];
-      lines.push(`Last weekly check-in: weight ${last.weight || 'N/A'} kg, mood ${last.mood || 'N/A'}, sleep ${last.sleep_hours || 'N/A'}h`);
+      lines.push(`Last weekly check-in: weight ${lastCheckin.weight || 'N/A'} kg, mood ${lastCheckin.mood || 'N/A'}, sleep ${lastCheckin.sleep_hours || 'N/A'}h`);
     }
 
     return lines.filter(Boolean).join('\n');

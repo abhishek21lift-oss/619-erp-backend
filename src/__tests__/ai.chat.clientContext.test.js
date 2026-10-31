@@ -59,7 +59,7 @@ const ASSESS_ROWS = [{ weight: 73.2, body_fat_pct: 22, chest_cm: null, waist_cm:
 const CHECKIN_ROWS = [{ weight: 73, mood: 'good', sleep_hours: 7, client_notes: 'ok', created_at: '2026-08-10' }];
 
 // The parent pt_clients gate buildClientContext must run FIRST.
-const PARENT_SQL = /SELECT name, dob, gender FROM pt_clients WHERE id=\$1 AND deleted_at IS NULL AND organization_id = \$2/;
+const PARENT_SQL = /SELECT name, dob, gender, weight FROM pt_clients WHERE id=\$1 AND deleted_at IS NULL AND organization_id = \$2/;
 const CHILD_TABLES = /pt_goals|pt_assessments|weekly_checkins/;
 
 function clientDispatch({ client = CLIENT_ROWS, goals = GOAL_ROWS, assess = ASSESS_ROWS, checkins = CHECKIN_ROWS } = {}) {
@@ -142,8 +142,34 @@ describe('POST /api/ai/chat — authorized client context', () => {
     expect(logger.warn).not.toHaveBeenCalledWith('ai_context_missing_client');
   });
 
-  it('no client_id means no client context, exactly as before', async () => {
-    pool.query.mockImplementation(clientDispatch());
+  // The assessment is the freshest measured weight, but it is not the only
+  // place one can live: an assessment saved without a weight used to leave the
+  // coach's prompt with no weight at all while the profile and check-in had it.
+  it('falls back to the client record, then the last check-in, when the assessment has no weight', async () => {
+    pool.query.mockImplementation(clientDispatch({
+      client: [{ ...CLIENT_ROWS[0], weight: 80 }],
+      assess: [{ ...ASSESS_ROWS[0], weight: null }],
+    }));
+    routedStream.mockImplementation(streamChunks(['ok']));
+    await request(app)
+      .post('/api/ai/chat')
+      .send({ message: 'hi', client_id: 'cli-1', conversation_id: 'conv-1' });
+    expect(systemPromptOf()).toContain('Current weight: 80 kg');
+
+    pool.query.mockReset();
+    pool.query.mockImplementation(clientDispatch({
+      client: [{ ...CLIENT_ROWS[0], weight: null }],
+      assess: [],
+      checkins: CHECKIN_ROWS,
+    }));
+    routedStream.mockReset().mockImplementation(streamChunks(['ok']));
+    await request(app)
+      .post('/api/ai/chat')
+      .send({ message: 'hi', client_id: 'cli-1', conversation_id: 'conv-1' });
+    expect(systemPromptOf()).toContain('Current weight: 73 kg');
+  });
+
+  it('no client_id means no client context, exactly as before', async () => {    pool.query.mockImplementation(clientDispatch());
     routedStream.mockImplementation(streamChunks(['hi']));
 
     const res = await request(app)

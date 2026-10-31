@@ -1031,6 +1031,10 @@ const strengthLogUpdateSchema = {
 router.patch('/strength-logs/:id', auth, requireTrainer, validate(strengthLogUpdateSchema), wrap(async (req, res) => {
   const existing = await strengthLogs.findLog(req, req.params.id);
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  // The fitness test is the source; this row is its read projection.
+  if (existing.assessment_id) {
+    return res.status(409).json({ error: { code: 'ASSESSMENT_LOG', message: 'This lift was recorded by a fitness test — edit the test instead.' } });
+  }
 
   const b = req.body;
   const m = { ...existing, ...Object.fromEntries(Object.entries(b).filter(([, v]) => v !== undefined)) };
@@ -1050,6 +1054,11 @@ router.patch('/strength-logs/:id', auth, requireTrainer, validate(strengthLogUpd
 }));
 
 router.delete('/strength-logs/:id', auth, requireTrainer, wrap(async (req, res) => {
+  const existing = await strengthLogs.findLog(req, req.params.id);
+  if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (existing.assessment_id) {
+    return res.status(409).json({ error: { code: 'ASSESSMENT_LOG', message: 'This lift was recorded by a fitness test — edit the test instead.' } });
+  }
   if (!await strengthLogs.deleteLog(req, req.params.id)) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.status(204).end();
 }));

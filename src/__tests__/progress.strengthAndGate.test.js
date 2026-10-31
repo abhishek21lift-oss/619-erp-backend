@@ -367,6 +367,22 @@ describe('PATCH / DELETE /progress/strength-logs/:id', () => {
     expect((await request(app()).delete('/api/progress/strength-logs/sl-x')).status).toBe(404);
     expect(mockQueries.find((q) => /^DELETE FROM strength_logs/i.test(q.sql)).sql).toMatch(/organization_id/);
   });
+
+  test('refuses to edit a lift recorded by a fitness test', async () => {
+    mockExistingLog = { ...existing, assessment_id: 'a1' };
+    const res = await request(app()).patch('/api/progress/strength-logs/sl-1').send({ weight_kg: 100 });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('ASSESSMENT_LOG');
+    expect(mockQueries.some((q) => /^UPDATE strength_logs/i.test(q.sql))).toBe(false);
+  });
+
+  test('refuses to delete a lift recorded by a fitness test', async () => {
+    mockExistingLog = { ...existing, assessment_id: 'a1' };
+    const res = await request(app()).delete('/api/progress/strength-logs/sl-1');
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('ASSESSMENT_LOG');
+    expect(mockQueries.some((q) => /^DELETE FROM strength_logs/i.test(q.sql))).toBe(false);
+  });
 });
 
 describe('referrals are derived on every read', () => {
