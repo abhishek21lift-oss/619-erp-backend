@@ -1312,3 +1312,26 @@ describe('workout/context: what the diet still needs', () => {
     expect(res.body.diet.missing).toEqual([]);
   });
 });
+
+describe('workout/context: the interview answer reaches the facts', () => {
+  test('a client whose only training-days answer is the interview is not blocked', async () => {
+    // The loader has always selected lifestyle_training_days; the resolver
+    // never read it, so this client was told their training days were missing
+    // and generation refused. The route test keeps the query alive.
+    mockQueries({
+      'FROM pt_clients WHERE id=$1': [{
+        ...CLIENT, sessions_per_week: null, preferred_training_days: null, frequency: null,
+      }],
+      'FROM pt_client_interviews WHERE client_id=$1': [{ lifestyle_training_days: 3 }],
+    });
+    const res = await request(app).get('/api/ai/workout/context/client-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.facts.training_days).toMatchObject({
+      value: 3,
+      source: 'pt_client_interviews.lifestyle_training_days',
+      origin: 'recorded',
+    });
+    expect(res.body.data_quality.blocking).not.toContain('training_days');
+  });
+});

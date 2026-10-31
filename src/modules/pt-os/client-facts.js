@@ -245,8 +245,8 @@ function sameValue(a, b) {
 function resolveClientFacts(ctx, stated = {}) {
   const {
     client = {}, profile = null, goals = [], latestAssessment = null,
-    latestCheckin = null, lifestyle = null, workoutAssignments = [],
-    studioEquipment = null,
+    latestCheckin = null, lifestyle = null, interviewLifestyle = null,
+    workoutAssignments = [], studioEquipment = null,
   } = ctx || {};
 
   const resolved = {
@@ -288,12 +288,14 @@ function resolveClientFacts(ctx, stated = {}) {
     ], text),
 
     // sessions_per_week is the typed column the enrolment form writes and the
-    // rest of the product already reads. The old resolver looked only at
-    // `frequency` — free text, rarely filled — and then took the browser's
-    // number, so a client enrolled as training three days a week was
-    // programmed for four.
+    // rest of the product already reads. The Client Interview's answer is the
+    // next best: a direct, structured "days a week I can really train" the
+    // client gave during onboarding. Counting the preferred weekdays and the
+    // free-text frequency follow, both being weaker derivations of the same
+    // question. A disagreement is reported rather than silently dropped.
     training_days: fromSources([
       ['pt_clients.sessions_per_week', client.sessions_per_week],
+      ['pt_client_interviews.lifestyle_training_days', interviewLifestyle?.lifestyle_training_days],
       ['pt_clients.preferred_training_days', countDays(client.preferred_training_days)],
       ['pt_clients.frequency', /^[1-7]$/.test(String(client.frequency ?? '')) ? client.frequency : null],
     ], (v) => {
