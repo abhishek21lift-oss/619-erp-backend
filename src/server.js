@@ -530,6 +530,9 @@ const IMAGE_JSON_PATHS = [
   ['POST', /^\/api\/pt-os\/informed-consent\/[^/]+\/sign$/],
   ['PATCH', /^\/api\/pt-os\/informed-consent\/[^/]+$/],
   ['POST', /^\/api\/pt-os\/parq\/forms\/[^/]+\/consent$/],
+  // The client's remote signing link posts the same two signatures from a
+  // phone, with no session — same reason, different door.
+  ['POST', /^\/api\/public\/form-signing\/[^/]+$/],
   // The member's own profile photo (client-portal.routes.js).
   ['POST', /^\/api\/me\/photo$/],
 ];
@@ -724,6 +727,9 @@ app.use('/api/public',            require('./routes/public'));
 // Read-only calendar subscription per trainer. Token-authenticated, no login:
 // calendar clients cannot send one. See routes/calendar-feed.js.
 app.use('/api/public',            require('./routes/calendar-feed'));
+// Remote screening: an online client signs their PAR-Q and consent on their
+// own phone, before they have a login. The single-use token IS the credential.
+app.use('/api/public/form-signing', require('./routes/form-signing'));
 
 // Public by design: an invited admin has no password yet, so nothing here can
 // require one. The single-use hashed token IS the credential — see
@@ -988,6 +994,9 @@ app.use('/api/messages',         auth, requireTrainer, require('./modules/client
 
 // Trainer-side control of client logins. Staff only, org-scoped.
 app.use('/api/client-login',     auth, requireTrainer, require('./routes/client-login'));
+// The trainer's side of remote screening: issue and send a one-time signing
+// link. See routes/form-links.js.
+app.use('/api/form-links',       auth, requireTrainer, require('./routes/form-links'));
 
 // ────────────────────────
 // BUSINESS FLOW ROUTES (v4 — Progress, Automation)
