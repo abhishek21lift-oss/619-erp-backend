@@ -67,6 +67,26 @@ jobs:
           echo "CI result:  ${{ github.event.workflow_run.conclusion || 'n/a (manual dispatch)' }}"
           echo "Commit:     ${{ github.event.workflow_run.head_sha || github.sha }}"
 
+      # ── Why there are three attempts, and why the waits poll ────────────
+      #
+      # The runner intermittently cannot reach the VPS at all:
+      #
+      #   2026/08/05 06:14:53 dial tcp ***:22: i/o timeout
+      #
+      # On 31 Oct 2026 the frontend's copy of this workflow lost the box on
+      # 22, 80 AND 443 for ~25 minutes while the box served HTTPS to everyone
+      # else — so this is the runner's egress, not an SSH filter.
+      #
+      # The old ladder waited 90s, 5min and 15min with `sleep`. Those waits are
+      # blind: they run to the end even after the box answers, so a 6-minute
+      # outage still cost 22 minutes, and the deploy started whenever the last
+      # sleep expired rather than when SSH came back. These steps poll 22 every
+      # 10s and return the moment it opens, so the retry starts within ~10s of
+      # recovery and the worst case (20 min of waiting) is unchanged.
+      #
+      # `continue-on-error` keeps each failure from ending the job; the last
+      # attempt has none, so it decides the outcome — and the diagnostic step
+      # below fires when the whole ladder fails, saying WHAT was unreachable.
       - name: Deploy to VPS via SSH
         id: attempt
         continue-on-error: true
@@ -75,14 +95,22 @@ jobs:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          timeout: 60s
+          # A healthy handshake completes in well under a second; 60s only
+          # made each failed attempt a full minute of dead time.
+          timeout: 20s
           command_timeout: 20m
           script_stop: true
           script: ${{ env.DEPLOY_SCRIPT }}
 
-      - name: Wait for the box to answer again
+      # Polls instead of sleeping: exits as soon as 22 answers, or after the
+      # budget so the next attempt reports the real error. Never fails the job.
+      - name: Wait for the box to answer again (up to 10 min)
         if: steps.attempt.outcome == 'failure'
-        run: sleep 90
+        run: |
+          for i in $(seq 1 60); do
+            timeout 5 bash -c "cat < /dev/null > /dev/tcp/${{ secrets.HOST }}/22" 2>/dev/null && exit 0
+            sleep 10
+          done
 
       - name: Deploy to VPS via SSH (retry 1)
         id: retry1
@@ -93,45 +121,28 @@ jobs:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          timeout: 60s
+          timeout: 20s
           command_timeout: 20m
           script_stop: true
           script: ${{ env.DEPLOY_SCRIPT }}
 
-      - name: Wait longer
+      - name: Wait longer (up to 10 min)
         if: steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
-        run: sleep 300
+        run: |
+          for i in $(seq 1 60); do
+            timeout 5 bash -c "cat < /dev/null > /dev/tcp/${{ secrets.HOST }}/22" 2>/dev/null && exit 0
+            sleep 10
+          done
 
+      # The last attempt has no continue-on-error: it decides the job.
       - name: Deploy to VPS via SSH (retry 2)
-        id: retry2
-        continue-on-error: true
         if: steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          timeout: 60s
-          command_timeout: 20m
-          script_stop: true
-          script: ${{ env.DEPLOY_SCRIPT }}
-
-      - name: Wait out a longer outage
-        if: >-
-          steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
-          && steps.retry2.outcome == 'failure'
-        run: sleep 900
-
-      - name: Deploy to VPS via SSH (retry 3)
-        if: >-
-          steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
-          && steps.retry2.outcome == 'failure'
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          timeout: 60s
+          timeout: 20s
           command_timeout: 20m
           script_stop: true
           script: ${{ env.DEPLOY_SCRIPT }}
