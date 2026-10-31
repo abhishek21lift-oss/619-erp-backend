@@ -23,6 +23,7 @@ const pool = require('../../db/pool');
 const portal = require('./client-portal.service');
 const messages = require('../client-messages/client-messages.service');
 const training = require('./member-training.service');
+const formChecks = require('../form-checks/form-check.service');
 const goals = require('./member-goals.service');
 const recap = require('./member-recap.service');
 const renewal = require('./member-renewal.service');
@@ -33,7 +34,7 @@ const { isTrainingBlocked } = require('../../lib/screeningGate');
 const { randomUUID } = require('crypto');
 const multer = require('multer');
 const { serveFile, saveFile, deleteFile } = require('../../lib/fileStorage');
-const { detectFileType, LOGO_IMAGES } = require('../../lib/fileSignatures');
+const { detectFileType, LOGO_IMAGES, FORM_VIDEOS } = require('../../lib/fileSignatures');
 const logger = require('../../lib/logger');
 
 /** Wrap an async handler so a rejection reaches the error middleware. */
@@ -384,6 +385,79 @@ router.delete('/progress-photos/:id', wrap(async (req, res) => {
       logger.warn({ err: err.message, url }, 'client-portal: progress photo file delete failed'));
   }
   res.status(204).end();
+}));
+
+// ── Form checks ──────────────────────────────────────────────────────────────
+//
+// A member records a lift and sends it to their trainer, who replies with
+// comments pinned to seconds in the clip. The member can see every check they
+// sent, its review state, and the trainer's comments — the whole point of
+// sending the video.
+//
+// Same rules as progress photos: the client id comes from the session, the
+// bytes decide the file type, and the row id is the storage key so /uploads
+// can confirm this member owns it. Videos are large, so the daily cap is five.
+const FORM_CHECK_DAILY_LIMIT = 5;
+
+const formCheckUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 60 * 1024 * 1024, files: 1 },
+  fileFilter(_req, file, cb) {
+    if (!/^video\/(mp4|quicktime)$/i.test(file.mimetype || '')) {
+      return cb(new portal.PortalInputError('Use an MP4 or MOV video.'));
+    }
+    cb(null, true);
+  },
+});
+
+router.get('/form-checks', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await formChecks.listForClient(clientId, orgId) });
+}));
+
+router.post('/form-checks', (req, res, next) => {
+  formCheckUpload.single('video')(req, res, (err) => {
+    if (!err) return next();
+    const message = err.code === 'LIMIT_FILE_SIZE'
+      ? 'That video is too large (60 MB at most). Trim it and try again.'
+      : err.message;
+    res.status(400).json({ error: { code: 'UPLOAD_REJECTED', message } });
+  });
+}, wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    if (!req.file) throw new portal.PortalInputError('Choose a video to upload.');
+
+    const exercise = String(req.body?.exercise ?? '').trim();
+    if (!exercise) throw new portal.PortalInputError('Name the lift in the video.');
+    if (exercise.length > 120) throw new portal.PortalInputError('Keep the lift name to 120 characters.');
+
+    const note = String(req.body?.note ?? '').trim();
+    if (note.length > 500) throw new portal.PortalInputError('Keep the note to 500 characters.');
+
+    const detected = detectFileType(req.file.buffer, FORM_VIDEOS);
+    if (!detected) throw new portal.PortalInputError('That file is not an MP4 or MOV video.');
+
+    if (await formChecks.uploadsToday(clientId, orgId) >= FORM_CHECK_DAILY_LIMIT) {
+      return res.status(429).json({
+        error: { code: 'RATE_LIMITED', message: 'That is plenty of videos for today — try again tomorrow.' },
+      });
+    }
+
+    const id = randomUUID();
+    const url = await saveFile('form-checks', `${id}.${detected.ext}`, req.file.buffer, detected.mime,
+      { organizationId: orgId, uploadedBy: req.user.id });
+
+    const row = await formChecks.createForClient({
+      id, orgId, clientId, exercise, note, videoUrl: url,
+    });
+    res.status(201).json({ data: row });
+  } catch (err) {
+    if (err instanceof portal.PortalInputError) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
+    }
+    throw err;
+  }
 }));
 
 // GET /api/me/achievements — records and streaks, counted from what was logged

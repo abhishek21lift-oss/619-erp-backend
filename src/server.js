@@ -968,6 +968,8 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 // Client self-booking, trainer side: weekly windows, time off, slot settings.
 // The client side lives under /api/me below.
 app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/availability.routes'));
+// Asynchronous form review: the trainer's queue and timestamped comments.
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/form-checks/form-check.routes'));
 
 // The client's own surfaces. Mirror image of the block above: requireClient
 // refuses anyone who is not a `member` linked to a client record, and every

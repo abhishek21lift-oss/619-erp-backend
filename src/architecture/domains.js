@@ -263,6 +263,9 @@ const DOMAINS = {
       'progress_retest_settings', 'progress_retest_schedules',
       'progress_reminder_deliveries', 'client_habit_logs',
       'client_habit_preferences', 'progress_insight_reviews',
+      // Asynchronous video form review (migration 248): the member's lift
+      // clip and the trainer's timestamped notes on it.
+      'pt_form_checks', 'pt_form_check_comments',
     ],
   },
 

@@ -85,30 +85,107 @@ async function saveFile(category, filename, buffer, contentType, meta = {}) {
   return `/uploads/${key}`;
 }
 
+// Content types for the formats this app stores. Needed on the disk path
+// because a stream, unlike res.sendFile(), has no filename to infer from.
+const MIME_BY_EXT = {
+  '.pdf': 'application/pdf',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+};
+
+/**
+ * Resolve a single `Range: bytes=…` header against a known size.
+ *
+ * Returns null when the header is absent or not a single byte range — the
+ * caller then serves the whole file, which is a valid response to `Range` and
+ * what a browser falls back to. Returns `{ unsatisfiable: true }` when the
+ * range is real but cannot be met, which must be a 416.
+ *
+ * Multiple ranges are deliberately not supported: no browser media element
+ * asks for them, and replying with the full file is correct enough.
+ */
+function parseByteRange(header, size) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(header ?? '').trim());
+  if (!m || (m[1] === '' && m[2] === '')) return null;
+  if (!Number.isFinite(size) || size <= 0) return null;
+
+  let start;
+  let end;
+  if (m[1] === '') {
+    const suffix = Number(m[2]);
+    if (!suffix) return { unsatisfiable: true };
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number(m[1]);
+    end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+  }
+  if (start >= size || start > end) return { unsatisfiable: true };
+  return { start, end };
+}
+
 /**
  * Streams the object at `key` (e.g. "parq/pdf/<id>.pdf") to an Express
  * response, from R2 or disk depending on configuration. Sends 404 if
  * missing; `key` must already be validated by the caller (no "..").
+ *
+ * `range` is the request's Range header. Media elements ask for byte ranges
+ * to seek; without this a video only plays start-to-finish from R2 (which
+ * answers the whole object) and seeking either fails or reloads it.
  */
-async function serveFile(key, res, { maxAgeSeconds } = {}) {
+async function serveFile(key, res, { maxAgeSeconds, range } = {}) {
+  res.set('Accept-Ranges', 'bytes');
+
   if (isR2Configured()) {
     try {
-      const result = await getS3Client().send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+      const command = { Bucket: R2_BUCKET, Key: key };
+      if (range) command.Range = range;
+      const result = await getS3Client().send(new GetObjectCommand(command));
       if (result.ContentType) res.type(result.ContentType);
+      if (result.ContentRange) {
+        res.status(206);
+        res.set('Content-Range', result.ContentRange);
+      }
+      if (result.ContentLength != null) res.set('Content-Length', String(result.ContentLength));
       if (maxAgeSeconds) res.set('Cache-Control', `public, max-age=${maxAgeSeconds}`);
       result.Body.pipe(res);
     } catch (err) {
-      if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) {
+      const status = err.$metadata?.httpStatusCode;
+      if (status === 416) return res.status(416).end();
+      if (err.name === 'NoSuchKey' || status === 404) {
         return res.status(404).json({ error: 'Not found' });
       }
       throw err;
     }
     return;
   }
+
   const filePath = path.join(UPLOADS_ROOT, key);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Not found' });
   if (maxAgeSeconds) res.set('Cache-Control', `public, max-age=${maxAgeSeconds}`);
-  res.sendFile(filePath);
+
+  const size = fs.statSync(filePath).size;
+  const type = MIME_BY_EXT[path.extname(filePath).toLowerCase()];
+  if (type) res.type(type);
+
+  const wanted = parseByteRange(range, size);
+  if (wanted?.unsatisfiable) {
+    res.set('Content-Range', `bytes */${size}`);
+    return res.status(416).end();
+  }
+  if (!wanted) {
+    res.set('Content-Length', String(size));
+    return fs.createReadStream(filePath).pipe(res);
+  }
+  res.status(206);
+  res.set('Content-Range', `bytes ${wanted.start}-${wanted.end}/${size}`);
+  res.set('Content-Length', String(wanted.end - wanted.start + 1));
+  fs.createReadStream(filePath, { start: wanted.start, end: wanted.end }).pipe(res);
 }
 
 /**
@@ -144,4 +221,6 @@ async function deleteFile(key) {
   storageLedger.recordDelete(key);
 }
 
-module.exports = { isR2Configured, saveFile, serveFile, getFileBuffer, deleteFile };
+module.exports = {
+  isR2Configured, saveFile, serveFile, getFileBuffer, deleteFile, parseByteRange,
+};
