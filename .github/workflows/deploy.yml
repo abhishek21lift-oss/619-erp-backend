@@ -39,14 +39,17 @@ env:
     export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "deploy: building $GIT_SHA"
     cd /opt/myptstudio
-    docker compose build --build-arg GIT_SHA="$GIT_SHA" --build-arg BUILD_TIME="$BUILD_TIME" backend
+    # The worker runs this same code. Rebuilding only the API left it on an
+    # older image, so reminder and queue jobs silently ran stale logic.
+    docker compose build --build-arg GIT_SHA="$GIT_SHA" --build-arg BUILD_TIME="$BUILD_TIME" backend worker
     echo "deploy: built; running migrations"
     docker compose run --rm --no-deps backend npm run migrate
-    echo "deploy: migrated; replacing container"
+    echo "deploy: migrated; replacing containers"
     docker compose rm -sf backend
-    docker compose up -d backend
-    echo "deploy: container started; verifying it serves $GIT_SHA"
+    docker compose up -d backend worker
+    echo "deploy: containers started; verifying the API serves $GIT_SHA"
     bash /opt/myptstudio/619-erp-backend/scripts/deploy/verify-serving.sh "$GIT_SHA" /opt/myptstudio backend http://127.0.0.1:5000/api/health /opt/myptstudio/.backend-deployed-sha
+    docker compose ps worker
 
 jobs:
   deploy:
