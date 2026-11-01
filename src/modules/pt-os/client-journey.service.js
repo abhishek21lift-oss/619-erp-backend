@@ -25,8 +25,11 @@ const INTERVIEW_FIELDS = Object.freeze([
   'lifestyle_occupation', 'lifestyle_sitting_hours', 'lifestyle_screen_time',
   'lifestyle_sleep_hours', 'lifestyle_meal_regularity', 'lifestyle_smoking',
   'lifestyle_alcohol', 'lifestyle_training_days',
+  // Migration 254 — the redesigned interview's own fields.
+  'job_details', 'occupation_other_details', 'previous_workout_experience',
+  'training_challenges', 'challenge_other', 'important_client_statements',
 ]);
-const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifestyle_occupation: 50, lifestyle_screen_time: 10, lifestyle_meal_regularity: 20, lifestyle_smoking: 20, lifestyle_alcohol: 20 });
+const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifestyle_occupation: 50, lifestyle_screen_time: 10, lifestyle_meal_regularity: 20, lifestyle_smoking: 20, lifestyle_alcohol: 20, occupation_other_details: 500, challenge_other: 500 });
 
 // Structured answers are enums or bounded numbers, and the database's CHECK
 // constraints reject a bad one — but as a 23514, which surfaced as a 500. The
@@ -44,6 +47,18 @@ const STRUCTURED = Object.freeze({
   lifestyle_smoking: { oneOf: ['never', 'occasionally', 'daily', 'former'] },
   lifestyle_alcohol: { oneOf: ['never', 'occasionally', 'weekly', 'frequently'] },
   lifestyle_training_days: { min: 0, max: 7, integer: true },
+  previous_workout_experience: { oneOf: ['never', 'beginner', 'intermediate', 'advanced'] },
+});
+
+// Multi-select answers: a list of canonical keys, not free text. The database
+// CHECK in migration 254 says the same thing; checking here turns a bad key
+// into a 400 with a field name instead of a 23514 that surfaces as a 500.
+const TRAINING_CHALLENGES = Object.freeze([
+  'time', 'work_schedule', 'motivation', 'confidence', 'pain_or_injury',
+  'fatigue', 'family', 'travel', 'nutrition', 'gym_access', 'cost', 'other',
+]);
+const ARRAY_RULES = Object.freeze({
+  training_challenges: { oneOf: TRAINING_CHALLENGES },
 });
 
 /** A structured answer, validated and normalised: enum as text, numbers as numbers. */
@@ -62,6 +77,21 @@ function structuredValue(key, raw) {
   return n;
 }
 
+/** A multi-select answer, validated, de-duplicated, and null when empty. */
+function arrayValue(key, raw) {
+  const rule = ARRAY_RULES[key];
+  if (raw === null || raw === '') return null;
+  if (!Array.isArray(raw)) throw new InterviewInputError(`${key} must be a list.`);
+  const list = [];
+  for (const item of raw) {
+    if (typeof item !== 'string' || !rule.oneOf.includes(item)) {
+      throw new InterviewInputError(`${key} must only contain: ${rule.oneOf.join(', ')}.`);
+    }
+    if (!list.includes(item)) list.push(item);
+  }
+  return list.length ? list : null;
+}
+
 class InterviewInputError extends Error {
   constructor(message, status = 400) { super(message); this.status = status; }
 }
@@ -72,6 +102,7 @@ function interviewFields(body = {}) {
   for (const key of INTERVIEW_FIELDS) {
     if (body[key] === undefined) continue;
     const raw = body[key];
+    if (ARRAY_RULES[key]) { out[key] = arrayValue(key, raw); continue; }
     if (raw === null || (typeof raw === 'string' && raw.trim() === '')) { out[key] = null; continue; }
     if (STRUCTURED[key]) { out[key] = structuredValue(key, raw); continue; }
     if (typeof raw !== 'string') throw new InterviewInputError(`${key} must be text.`);
@@ -90,12 +121,16 @@ function statusOf(body) {
   return body.status;
 }
 
-/** A completed interview has to say something (text or structured answers count, text only is sufficient). */
+/** A completed interview has to say something — any field, text, number, or a chosen challenge, counts. */
+function hasAnswer(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  return value != null && String(value).trim() !== '';
+}
+
 function assertCompletable(row) {
-  const lifestyleKeys = ['lifestyle_occupation','lifestyle_sitting_hours','lifestyle_screen_time','lifestyle_sleep_hours','lifestyle_meal_regularity','lifestyle_smoking','lifestyle_alcohol','lifestyle_training_days'];
-  const hasText = INTERVIEW_FIELDS.some((k) => row[k] && String(row[k]).trim() && !lifestyleKeys.includes(k));
-  const hasLifestyle = lifestyleKeys.some((k) => row[k] != null && (typeof row[k] === 'number' ? true : String(row[k]).trim() !== ''));
-  if (!hasText && !hasLifestyle) throw new InterviewInputError('Write down at least one answer before completing the interview.');
+  if (!INTERVIEW_FIELDS.some((key) => hasAnswer(row[key]))) {
+    throw new InterviewInputError('Write down at least one answer before completing the interview.');
+  }
 }
 
 async function clientExists(orgId, clientId) {

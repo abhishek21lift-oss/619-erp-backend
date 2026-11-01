@@ -14,7 +14,7 @@
 // a value this module cannot source is reported MISSING, with no third option.
 
 const {
-  resolveClientFacts, describeFacts, countDays, ageFromDob,
+  resolveClientFacts, describeFacts, describeInterview, countDays, ageFromDob,
   FIELDS, BLOCKING, STATED_SUPERSEDES,
 } = require('../modules/pt-os/client-facts');
 
@@ -166,7 +166,7 @@ describe('training frequency reads the column the rest of the product writes', (
     // never looked at it, so the one answer the client had given was reported
     // as missing — and training_days blocks generation.
     const ctx = bare();
-    ctx.interviewLifestyle = { lifestyle_training_days: 3 };
+    ctx.interview = { lifestyle_training_days: 3 };
     const { facts } = resolveClientFacts(ctx);
     expect(facts.training_days).toEqual({
       value: 3,
@@ -177,7 +177,7 @@ describe('training frequency reads the column the rest of the product writes', (
 
   test('a stored count still wins, and the interview answer is shown as a disagreement', () => {
     const ctx = bare({ sessions_per_week: 4 });
-    ctx.interviewLifestyle = { lifestyle_training_days: 2 };
+    ctx.interview = { lifestyle_training_days: 2 };
     const { facts } = resolveClientFacts(ctx);
     expect(facts.training_days.value).toBe(4);
     expect(facts.training_days.source).toBe('pt_clients.sessions_per_week');
@@ -356,5 +356,47 @@ describe('what the model is shown', () => {
     for (const invented of ['175', '75', 'male', 'beginner', 'general_fitness', '30']) {
       expect(text).not.toContain(invented);
     }
+  });
+});
+
+describe('the client interview, as the model reads it', () => {
+  test('says NOT RECORDED when no interview exists, and forbids inference', () => {
+    const text = describeInterview(null);
+    expect(text).toContain('CLIENT INTERVIEW: NOT RECORDED');
+    expect(text).toContain('Do not infer');
+  });
+
+  test('keeps the client\'s words apart from the trainer\'s summary', () => {
+    const text = describeInterview({
+      previous_workout_experience: 'beginner',
+      training_history: 'Two years of home workouts.',
+      job_details: 'Night shifts at a warehouse.',
+      training_challenges: ['time', 'work_schedule'],
+      challenge_other: null,
+      lifestyle_training_days: 3,
+      motivation: 'Keep up with my kids.',
+      important_client_statements: 'I have never stuck with a gym.',
+      notes: 'Very motivated; start with two short sessions.',
+    });
+    expect(text).toContain('CLIENT-STATED');
+    expect(text).toContain('Previous training experience: beginner');
+    expect(text).toContain('Training challenges: time, work schedule');
+    expect(text).toContain('Days a week they can train: 3');
+    expect(text).toContain('In the client\'s words: I have never stuck with a gym.');
+    // The trainer's judgement is under its own heading, not in the client block.
+    const trainerBlock = text.slice(text.indexOf('TRAINER\'S INTERVIEW NOTES'));
+    expect(trainerBlock).toContain('Very motivated');
+    expect(trainerBlock).not.toContain('Home workouts');
+  });
+
+  test('never presents the interview as medical clearance', () => {
+    const text = describeInterview({ notes: 'No pain reported.' });
+    expect(text).toContain('The interview is not medical clearance');
+    expect(text).toContain('PAR-Q');
+  });
+
+  test('an empty challenge list is not printed as an answer', () => {
+    const text = describeInterview({ training_challenges: [] });
+    expect(text).not.toContain('Training challenges:');
   });
 });
