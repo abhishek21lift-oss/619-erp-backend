@@ -176,6 +176,30 @@ const PARQ_UNLOCATED = Object.freeze({
   has_pain: 'current pain',
 });
 
+/**
+ * Questions the PAR-Q questionnaire asks after their detail toggles were
+ * removed from Past Medical History.
+ *
+ * StepPastHistory stopped rendering heart disease, asthma and joint problems
+ * because "the PAR-Q gatekeeper questions already ask them". They do — but
+ * nothing read the answers, so the constraint set said nothing about them.
+ * Q3/Q4/Q5 stay out on purpose: they are red flags that already gate training,
+ * not programme constraints.
+ *
+ * `legacyKey` is the past_history/current_health field the toggle used to
+ * write. When it is already set, the questionnaire answer adds no information
+ * and would only duplicate the referral. Q7 has no single legacy key (one
+ * answer covers four conditions), so it always reports.
+ */
+const PARQ_QUESTIONNAIRE = Object.freeze({
+  1: { kind: 'referral', evidence: 'q1', legacyKey: 'heart_disease', label: 'a heart condition' },
+  6: { kind: 'caution', evidence: 'q6', legacyKey: 'joint_problems', label: 'a joint problem' },
+  7: { kind: 'referral', evidence: 'q7', legacyKey: null, label: 'asthma, diabetes, epilepsy or high blood pressure' },
+  8: { kind: 'referral', evidence: 'q8', legacyKey: 'known_disease', label: 'a diagnosed condition' },
+  9: { kind: 'referral', evidence: 'q9', legacyKey: 'current_treatment', label: 'an injury or condition under treatment' },
+  10: { kind: 'referral', evidence: 'q10', legacyKey: null, label: 'another reason not to exercise' },
+});
+
 /** Mobility region name → the region key it constrains. */
 const MOBILITY_REGION_KEY = Object.freeze({
   Neck: 'neck',
@@ -340,6 +364,13 @@ function asObject(value) {
   return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
 }
 
+/** A JSONB array that may arrive parsed or as text holding one. */
+function asArray(value) {
+  if (!value) return [];
+  const raw = typeof value === 'string' ? safeParse(value) : value;
+  return Array.isArray(raw) ? raw : [];
+}
+
 /** A Postgres text[] or JSONB array, as a list of trimmed labels. */
 function asLabels(value) {
   if (!value) return [];
@@ -430,6 +461,31 @@ function buildConstraints({
       evidence: key,
       note: `${what} on file — a programming decision here would be a medical one; refer`,
     });
+  }
+
+  // ── PAR-Q gatekeeper questionnaire ───────────────────────────────────────
+  // The three toggles removed from Past Medical History are still asked as
+  // Q1/Q6/Q7. Read them here or the answer is collected and thrown away.
+  for (const a of asArray(parq?.parq_answers)) {
+    if (!a || !isYes(a.answer)) continue;
+    const q = PARQ_QUESTIONNAIRE[String(a.question_id)];
+    if (!q) continue;
+    if (q.legacyKey && (isYes(past[q.legacyKey]) || isYes(current[q.legacyKey]))) continue;
+    if (q.kind === 'caution') {
+      constraints.push(constraint({
+        verdict: VERDICTS.CAUTION,
+        region: null,
+        source: 'parq.parq_answers',
+        evidence: q.evidence,
+        note: `${q.label} reported; the questionnaire does not record which part of the body`,
+      }));
+    } else {
+      referrals.push({
+        source: 'parq.parq_answers',
+        evidence: q.evidence,
+        note: `${q.label} reported — a programming decision here would be a medical one; refer`,
+      });
+    }
   }
 
   // ── Mobility: the only source that reports pain as a present-tense fact ──

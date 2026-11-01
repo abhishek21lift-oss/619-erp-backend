@@ -186,6 +186,28 @@ describe('training frequency reads the column the rest of the product writes', (
     ]);
   });
 
+  test('the goal assessment fills in when enrolment recorded no count', () => {
+    // pt_goals.training_days_per_week was written by the Goal wizard and read
+    // by nothing. The trainer designed the week there; generation should not
+    // call the client's frequency missing while that answer sits on file.
+    const ctx = bare();
+    ctx.goals = [{ goal_type: 'hypertrophy', training_days_per_week: 4 }];
+    const { facts } = resolveClientFacts(ctx);
+    expect(facts.training_days).toEqual({
+      value: 4, source: 'pt_goals.training_days_per_week', origin: 'recorded',
+    });
+  });
+
+  test('enrolment still wins over the goal, and the goal is reported', () => {
+    const ctx = bare({ sessions_per_week: 3 });
+    ctx.goals = [{ training_days_per_week: 5 }];
+    const { facts } = resolveClientFacts(ctx);
+    expect(facts.training_days.value).toBe(3);
+    expect(facts.training_days.conflicts).toContainEqual({
+      source: 'pt_goals.training_days_per_week', value: 5,
+    });
+  });
+
   test('free-text frequency is used only when it is a plain 1-7', () => {
     expect(resolveClientFacts(bare({ frequency: '5' })).facts.training_days.value).toBe(5);
     expect(resolveClientFacts(bare({ frequency: 'thrice weekly' })).facts.training_days.origin).toBe('missing');
@@ -230,6 +252,27 @@ describe('equipment', () => {
     ctx.studioEquipment = 'Barbell, Cable, Machine, Dumbbell';
     const { facts } = resolveClientFacts(ctx, { equipment: 'dumbbells only today' });
     expect(facts.equipment).toEqual({ value: 'dumbbells only today', source: 'trainer', origin: 'stated' });
+  });
+
+  test('a preferred-day pattern on the goal is used when enrolment holds none', () => {
+    // pt_goals.preferred_training_days is TEXT[], so pg hands back an array.
+    const ctx = bare();
+    ctx.goals = [{ training_days_per_week: 3, preferred_training_days: ['Monday', 'Wednesday', 'Friday'] }];
+    expect(resolveClientFacts(ctx).facts.preferred_days).toEqual({
+      value: 'Monday, Wednesday, Friday',
+      source: 'pt_goals.preferred_training_days',
+      origin: 'recorded',
+    });
+  });
+
+  test('short and long weekday names are the same days, not a conflict', () => {
+    // Enrolment writes "Mon, Wed, Fri"; the Goal wizard writes the full names.
+    // Normalise before comparing or every client with both is flagged.
+    const ctx = bare({ preferred_training_days: 'Mon, Wed, Fri' });
+    ctx.goals = [{ preferred_training_days: 'Monday, Wednesday, Friday' }];
+    const { facts } = resolveClientFacts(ctx);
+    expect(facts.preferred_days.value).toBe('Monday, Wednesday, Friday');
+    expect(facts.preferred_days.conflicts).toBeUndefined();
   });
 
   test('keeps the exact weekdays the client is recorded to train', () => {

@@ -202,6 +202,64 @@ describe('PAR-Q', () => {
     expect(out.constraints).toHaveLength(0);
   });
 
+  it('reads the gatekeeper answers the past-history form no longer collects', () => {
+    // StepPastHistory stopped rendering heart disease, asthma and joint
+    // problems on the assumption that Q1/Q6/Q7 cover them. They do — but only
+    // if the questionnaire is read, which it was not.
+    const out = buildConstraints({
+      parq: parq({
+        parq_answers: [
+          { question_id: 1, answer: 'yes' },
+          { question_id: 6, answer: 'yes' },
+          { question_id: 7, answer: 'yes' },
+          { question_id: 8, answer: 'yes' },
+          { question_id: 9, answer: 'yes' },
+          { question_id: 10, answer: 'yes' },
+        ],
+      }),
+    });
+    expect(out.referrals.map((r) => r.evidence)).toEqual(['q1', 'q7', 'q8', 'q9', 'q10']);
+    expect(out.constraints).toEqual([
+      expect.objectContaining({
+        verdict: VERDICTS.CAUTION, region: null, source: 'parq.parq_answers', evidence: 'q6',
+      }),
+    ]);
+  });
+
+  it('does not repeat a questionnaire referral the toggles already record', () => {
+    // Legacy rows have both. Two referrals for one condition is noise a
+    // trainer has to read past.
+    const out = buildConstraints({
+      parq: parq({
+        past_history: { heart_disease: true, joint_problems: true, known_disease: true, current_treatment: true },
+        parq_answers: [
+          { question_id: 1, answer: 'yes' },
+          { question_id: 6, answer: 'yes' },
+          { question_id: 8, answer: 'yes' },
+          { question_id: 9, answer: 'yes' },
+        ],
+      }),
+    });
+    expect(out.referrals.map((r) => r.evidence).sort()).toEqual([
+      'current_treatment', 'heart_disease', 'known_disease',
+    ]);
+    expect(out.constraints.map((c) => c.evidence)).toEqual(['joint_problems']);
+  });
+
+  it('ignores questionnaire answers that are not yes', () => {
+    const out = buildConstraints({
+      parq: parq({
+        parq_answers: [
+          { question_id: 1, answer: 'no' },
+          { question_id: 7, answer: '' },
+          { question_id: 8 },
+        ],
+      }),
+    });
+    expect(out.referrals).toEqual([]);
+    expect(out.constraints).toEqual([]);
+  });
+
   it('covers every key the production forms hold', () => {
     // Keys observed on pt_parq_forms. One the module ignores is a question the
     // studio asks the client and then throws away.
