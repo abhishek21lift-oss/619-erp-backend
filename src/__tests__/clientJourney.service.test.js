@@ -115,10 +115,40 @@ describe('structured interview answers are checked before the database', () => {
     ['lifestyle_smoking', 'yes'],
     ['lifestyle_alcohol', 'often'],
     ['lifestyle_occupation', 'astronaut'],
+    ['previous_workout_experience', 'expert'],
+    ['training_challenges', 'time'],
+    ['training_challenges', ['time', 'sleeping']],
+    ['training_challenges', [1]],
   ])('rejects %s = %p with a 400 instead of a database error', async (key, value) => {
     const err = await attempt({ [key]: value }).catch((e) => e);
     expect(err).toBeInstanceOf(InterviewInputError);
     expect(err.status).toBe(400);
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it('accepts a challenge list, de-duplicated, and clears an empty one', async () => {
+    pool.query.mockResolvedValueOnce({ rowCount: 1 });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1' }] });
+    await attempt({ training_challenges: ['time', 'time', 'motivation'] });
+    expect(pool.query.mock.calls[1][1]).toEqual(expect.arrayContaining([['time', 'motivation']]));
+
+    pool.query.mockReset();
+    pool.query.mockResolvedValueOnce({ rowCount: 1 });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-2' }] });
+    await attempt({ training_challenges: [] });
+    // Empty list is "not answered", not an empty-array fact.
+    expect(pool.query.mock.calls[1][1].at(-1)).toBeNull();
+  });
+
+  it('completes on a challenge list alone, but still refuses an empty interview', async () => {
+    pool.query.mockResolvedValueOnce({ rowCount: 1 });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1', status: 'completed' }] });
+    const saved = await attempt({ status: 'completed', training_challenges: ['time'] });
+    expect(saved.status).toBe('completed');
+
+    pool.query.mockReset();
+    const err = await attempt({ status: 'completed', training_challenges: [] }).catch((e) => e);
+    expect(err).toBeInstanceOf(InterviewInputError);
     expect(pool.query).not.toHaveBeenCalled();
   });
 

@@ -37,7 +37,7 @@ const { buildChurnList } = require('../modules/pt-os/churn.service');
 const { normalisePlan, DietPlanError } = require('../modules/nutrition/ai-diet.service');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const {
-  resolveClientFacts, describeFacts, numInRange,
+  resolveClientFacts, describeFacts, describeInterview, numInRange,
 } = require('../modules/pt-os/client-facts');
 
 /**
@@ -52,7 +52,7 @@ const {
  * interpolates this client's own facts, so a hash would differ per client and
  * answer a question nobody asked.
  */
-const WORKOUT_PROMPT_VERSION = '2026-10-27.mpts';
+const WORKOUT_PROMPT_VERSION = '2026-11-01.interview';
 // Checking the plan the model returned against the rules that shaped it.
 const {
   auditPlan, scorePlan, buildRevisionInstruction, parseCritique, describeAudit,
@@ -412,7 +412,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRou
 
   const [
     profileRes, goalsRes, assessRes, checkinsRes,
-    lifestyleRes, interviewLifestyleRes, nutritionRes, workoutAssignRes, dietAssignRes, equipmentRes,
+    lifestyleRes, interviewRes, nutritionRes, workoutAssignRes, dietAssignRes, equipmentRes,
     ragChunks = [], exercises = [],
   ] = await Promise.all([
     pool.query(
@@ -431,8 +431,11 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRou
        FROM pt_lifestyle_assessments WHERE client_id=$1
        ORDER BY assessment_date DESC, created_at DESC LIMIT 1`, [client_id]),
     pool.query(
-      `SELECT lifestyle_occupation, lifestyle_screen_time, lifestyle_sleep_hours,
-              lifestyle_meal_regularity, lifestyle_smoking, lifestyle_alcohol, lifestyle_training_days
+      `SELECT status, created_at,
+              previous_workout_experience, training_history, job_details,
+              occupation_other_details, training_challenges, challenge_other,
+              lifestyle_training_days, lifestyle_sitting_hours, lifestyle_meal_regularity,
+              availability, motivation, preferences, important_client_statements, notes
        FROM pt_client_interviews WHERE client_id=$1
        ORDER BY (status = 'completed') DESC, created_at DESC LIMIT 1`, [client_id]),
     pool.query(
@@ -477,7 +480,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRou
     latestAssessment: assessRes.rows[0]    || null,
     latestCheckin:    checkinsRes.rows[0]  || null,
     lifestyle:        lifestyleRes.rows[0] || null,
-    interviewLifestyle: interviewLifestyleRes?.rows?.[0] || null,
+    interview:        interviewRes?.rows?.[0]    || null,
     nutrition:        nutritionRes.rows[0] || null,
     workoutAssignments: workoutAssignRes.rows,
     dietAssignments:  dietAssignRes.rows,
@@ -1252,6 +1255,8 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     // them: what already failed is a constraint on what to write next.
     ...(outcomes && outcomes.accepted ? [describeOutcomes(outcomes), ''] : []),
     describeFacts(facts),
+    '',
+    describeInterview(ctx.interview),
     `- Injuries / limitations: ${p.injuries || 'NOT RECORDED'}`,
   ];
   if (p.health_conditions) userPrompt.push(`- Health conditions: ${p.health_conditions}`);

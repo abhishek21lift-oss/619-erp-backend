@@ -249,7 +249,7 @@ function sameValue(a, b) {
 function resolveClientFacts(ctx, stated = {}) {
   const {
     client = {}, profile = null, goals = [], latestAssessment = null,
-    latestCheckin = null, lifestyle = null, interviewLifestyle = null,
+    latestCheckin = null, lifestyle = null, interview = null,
     workoutAssignments = [], studioEquipment = null,
   } = ctx || {};
 
@@ -302,7 +302,7 @@ function resolveClientFacts(ctx, stated = {}) {
     training_days: fromSources([
       ['pt_clients.sessions_per_week', client.sessions_per_week],
       ['pt_goals.training_days_per_week', goals[0]?.training_days_per_week],
-      ['pt_client_interviews.lifestyle_training_days', interviewLifestyle?.lifestyle_training_days],
+      ['pt_client_interviews.lifestyle_training_days', interview?.lifestyle_training_days],
       ['pt_clients.preferred_training_days', countDays(client.preferred_training_days)],
       ['pt_clients.frequency', /^[1-7]$/.test(String(client.frequency ?? '')) ? client.frequency : null],
     ], (v) => {
@@ -448,8 +448,82 @@ function describeFacts(facts) {
   return lines.join('\n');
 }
 
+/**
+ * The Client Interview, as the model is allowed to read it.
+ *
+ * The interview is a conversation, not evidence. Everything in the first block
+ * is what the CLIENT said — their own account of their training, work, limits
+ * and preferences — and the model must not restate it as a measured fact. The
+ * second block is the trainer's summary; it is the trainer's judgement and is
+ * labelled separately so the two can never be conflated.
+ *
+ * Nothing here is a clearance. PAR-Q answers and the medical clearance record
+ * remain authoritative, and the closing line says so explicitly — an interview
+ * that says "no pain" must never be read as permission to train through one.
+ */
+const CHALLENGE_LABEL = Object.freeze({
+  time: 'time',
+  work_schedule: 'work schedule',
+  motivation: 'motivation',
+  confidence: 'confidence',
+  pain_or_injury: 'pain or injury',
+  fatigue: 'fatigue',
+  family: 'family commitments',
+  travel: 'travel',
+  nutrition: 'nutrition',
+  gym_access: 'gym access',
+  cost: 'cost',
+  other: 'other',
+});
+
+function describeInterview(interview) {
+  const i = interview || {};
+  const clientLines = [];
+  const add = (label, value, max = 2000) => {
+    const v = text(value, max);
+    if (v) clientLines.push(`- ${label}: ${v}`);
+  };
+
+  add('Previous training experience', i.previous_workout_experience, 40);
+  add("Training history (the client's account)", i.training_history);
+  add('Work details', i.job_details);
+  add('Other occupation details', i.occupation_other_details, 500);
+  if (Array.isArray(i.training_challenges) && i.training_challenges.length) {
+    const labels = i.training_challenges.map((k) => CHALLENGE_LABEL[k] || k);
+    clientLines.push(`- Training challenges: ${labels.join(', ')}`);
+  }
+  add('Challenge detail', i.challenge_other, 500);
+  if (i.lifestyle_training_days !== null && i.lifestyle_training_days !== undefined && i.lifestyle_training_days !== '') {
+    clientLines.push(`- Days a week they can train: ${i.lifestyle_training_days}`);
+  }
+  add('Availability notes', i.availability, 1000);
+  add('Sitting hours a day', i.lifestyle_sitting_hours, 10);
+  add('Meal regularity', i.lifestyle_meal_regularity, 20);
+  add('Motivation', i.motivation);
+  add('Preferences', i.preferences, 1000);
+  add("In the client's words", i.important_client_statements);
+
+  const trainerNote = text(i.notes);
+  if (!clientLines.length && !trainerNote) {
+    return [
+      'CLIENT INTERVIEW: NOT RECORDED',
+      'No interview has been recorded for this client. Do not infer their history, work, barriers, or preferences; program conservatively and say which answer would change your choice.',
+    ].join('\n');
+  }
+
+  const lines = ['CLIENT INTERVIEW — CLIENT-STATED (the client\'s own intake answers; not verified fact):'];
+  lines.push(...(clientLines.length ? clientLines : ['- NOT RECORDED']));
+  lines.push('', 'TRAINER\'S INTERVIEW NOTES (the trainer\'s observations, not the client\'s words):');
+  lines.push(trainerNote ? `- Summary: ${trainerNote}` : '- NOT RECORDED');
+  lines.push(
+    '',
+    'The interview is not medical clearance. The PAR-Q and any medical clearance record remain authoritative; where they disagree with the interview, follow the clearance.',
+  );
+  return lines.join('\n');
+}
+
 module.exports = {
-  FIELDS, BLOCKING, STATED_SUPERSEDES, resolveClientFacts, describeFacts,
+  FIELDS, BLOCKING, STATED_SUPERSEDES, resolveClientFacts, describeFacts, describeInterview,
   // Exported for the tests that pin the parsing rather than the resolution.
   countDays, ageFromDob, numInRange, STATED_RANGE,
 };
