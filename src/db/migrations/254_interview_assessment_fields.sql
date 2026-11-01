@@ -52,7 +52,6 @@ BEGIN
             'pain_or_injury', 'fatigue', 'family', 'travel',
             'nutrition', 'gym_access', 'cost', 'other'
           ]::text[]
-        )
       );
   END IF;
 END $$;
