@@ -1090,6 +1090,24 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
     // term was written by this request or by an earlier provisional enrolment.
     activationPending = rows[0].status === 'pending' && (Boolean(existing.has_pt_term) || looksEnrolled);
 
+    // A term edit through this endpoint changes the CURRENT term, so the
+    // enrollment snapshot must move with it — otherwise the subscription
+    // history page keeps showing the price and dates the client was first
+    // enrolled at. Renewals are immutable history and are refused above
+    // (USE_RENEW), so only the one 'enrollment' row can be current.
+    if (TERM_FIELDS.some((k) => req.body[k] !== undefined)) {
+      await tx.query(`
+        UPDATE pt_client_subscriptions
+           SET plan_name = $2, start_date = $3, end_date = $4, duration_months = $5,
+               selling_price = $6, amount_paid = $7, balance_amount = $8, trainer_name = $9
+         WHERE client_id = $1 AND source = 'enrollment'
+      `, [
+        req.params.id, rows[0].package_type, rows[0].pt_start_date, rows[0].pt_end_date,
+        rows[0].duration_months, rows[0].final_amount, rows[0].paid_amount,
+        rows[0].balance_amount, rows[0].trainer_name,
+      ]);
+    }
+
     // Term history: unlike /clients/:id/renew, this endpoint (the actual
     // enrollment action — see the enroll page) never wrote a row into
     // pt_client_subscriptions, so a client's first term never appeared on

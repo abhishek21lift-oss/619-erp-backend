@@ -651,7 +651,16 @@ router.post('/reset-password', async (req, res) => {
 });
 
 // GET /api/auth/me
-router.get('/me', auth, (req, res) => {
+router.get('/me', (req, res, next) => {
+  // A caller holding neither cookie is a visitor, not an expired session.
+  // Answering 401 sent the app's 401 → refresh → retry path on every landing
+  // page visit, and the failed refresh then fired the "session expired"
+  // handler at somebody who was never signed in. A refresh cookie that is
+  // still present is the case that genuinely needs the 401, because that is
+  // what makes the app refresh and retry.
+  if (!req.cookies?.token && !req.cookies?.refresh_token) return res.json({ user: null });
+  next();
+}, auth, (req, res) => {
   res.json({ user: req.user });
 });
 

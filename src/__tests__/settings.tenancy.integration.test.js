@@ -44,8 +44,12 @@ if (process.env.CI && !DB_URL) {
   });
 }
 
-const ORG_A = '77777777-7777-4777-8777-777777777777';
-const ORG_B = '88888888-8888-4888-8888-888888888888';
+// Unique to this suite. The real-DB suites run in parallel against one
+// database, so a fixture org shared with another file can be deleted out from
+// under its trainers — and trainers.organization_id is ON DELETE SET NULL
+// against a NOT NULL column, so that delete raises instead of cleaning up.
+const ORG_A = '7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7b';
+const ORG_B = '7c7c7c7c-7c7c-4c7c-8c7c-7c7c7c7c7c7c';
 
 describeIf('settings tenancy, against a real database', () => {
   let db;

@@ -28,8 +28,8 @@ if (process.env.CI && !DB_URL) {
   });
 }
 
-const ORG_A = '77777777-7777-4777-8777-777777777777';
-const ORG_B = '88888888-8888-4888-8888-888888888888';
+const ORG_A = '71717171-7171-4171-8171-717171717171';
+const ORG_B = '72727272-7272-4272-8272-727272727272';
 const TODAY = new Date().toISOString().slice(0, 10);
 
 // Cleanup predicate for every row this suite creates.

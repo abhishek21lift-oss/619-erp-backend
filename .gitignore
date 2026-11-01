@@ -21,3 +21,6 @@ __pycache__/
 # agent skills
 .agents/
 skills-lock.json
+
+# local git worktrees — each holds a full copy of src/ and its tests
+.worktrees/

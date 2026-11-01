@@ -12,8 +12,8 @@ const { Pool } = require('pg');
 const DB_URL = process.env.RLS_TEST_DATABASE_URL;
 const describeIf = DB_URL ? describe : describe.skip;
 
-const ORG_A = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
-const ORG_B = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+const ORG_A = 'd1d1d1d1-1111-4111-8111-111111111111';
+const ORG_B = 'd2d2d2d2-2222-4222-8222-222222222222';
 
 if (DB_URL) {
   const tenantUrl = new URL(DB_URL);

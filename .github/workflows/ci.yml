@@ -101,7 +101,7 @@ jobs:
           RLS_PG_PORT: 5432
 
       - name: Run tests
-        run: npm test -- --passWithNoTests
+        run: npm test
 
   # ── Job 3: the seam between this repo and the WhatsApp gateway ─────
   #
