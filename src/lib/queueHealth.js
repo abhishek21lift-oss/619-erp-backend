@@ -77,14 +77,27 @@ function summarize(stats) {
   }
   const failed = stats.filter((s) => s === null).length;
   const backlog = stats.reduce((sum, s) => sum + (s.backlog || 0), 0);
+  const completed = stats.reduce((sum, s) => sum + (s.completed || 0), 0);
   const status = backlog > 0 ? 'degraded' : 'healthy';
   return {
     status,
     queues: stats.length,
     unreachable: failed,
     backlog,
+    // ── Liveness, not backlog ───────────────────────────────────────────
+    //
+    // Everything else here comes from BullMQ's Redis counters, which answer
+    // "is work queued" and never "is anything working it". A process with no
+    // worker at all reads exactly like an idle one: waiting 0, active 0.
+    //
+    // Completed jobs are retained for 24h (jobs/queue.js removeOnComplete),
+    // so a non-zero count here is the one field that proves a worker actually
+    // drained something recently. Zero is not a verdict on its own — a quiet
+    // hour looks the same — but zero completed WITH a non-zero waiting count
+    // is a dead worker, and before this field there was no way to ask.
+    completed,
     counts: stats.reduce((acc, s) => {
-      acc[s.name] = { waiting: s.waiting, active: s.active, delayed: s.delayed, failed: s.failed, paused: s.paused };
+      acc[s.name] = { waiting: s.waiting, active: s.active, delayed: s.delayed, completed: s.completed, failed: s.failed, paused: s.paused };
       return acc;
     }, {}),
   };
