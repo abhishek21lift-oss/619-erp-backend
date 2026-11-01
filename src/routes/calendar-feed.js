@@ -3,9 +3,9 @@
 // /api/public, because a calendar client cannot send a login form.
 //
 // The 32-byte token IS the credential. It is minted once, only shown to the
-// trainer, and never rotated by a settings update. It can be revoked by
-// clearing the row's token manually; a rotation endpoint can come later if
-// anyone asks.
+// trainer, and never rotated by a settings update — only by the explicit
+// rotation endpoint in availability.routes.js, because the trainer has already
+// subscribed a calendar to the URL.
 //
 // Times are emitted as floating local values (DTSTART:20261102T070000, no Z).
 // The stored time is the trainer's IST wall clock, so that is exactly what a
