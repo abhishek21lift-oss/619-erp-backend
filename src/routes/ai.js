@@ -116,6 +116,45 @@ function requireConfigured(req, res, next) {
 /* ─── Helpers ───────────────────────────────────────────────────────────── */
 const { extractJson } = require('../lib/ai/jsonExtract');
 
+/**
+ * Parse a structured generation, and on failure spend ONE bounded repair call
+ * instead of throwing the generation away.
+ *
+ * The old behaviour returned an error after the full token spend — the studio
+ * paid for a plan it never received. The repair re-sends the broken text as the
+ * assistant's own prior turn and asks for the same content as valid JSON. One
+ * attempt only: a model that emitted broken JSON once usually does it again,
+ * and the point is to stop the loss, not to loop on it.
+ *
+ * @returns {Promise<object|null>} the parsed plan, or null if both attempts fail.
+ */
+async function parseOrRepair({ req, intent_type, intent, system, user, raw, max_tokens, temperature = 0 }) {
+  const parsed = extractJson(raw);
+  if (parsed) return parsed;
+
+  logger.warn({ intent_type }, 'ai_parse_failed_repairing');
+  try {
+    const repaired = await meteredChat(req, intent_type, routedChat)({
+      intent,
+      temperature,
+      max_tokens,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+        { role: 'assistant', content: String(raw).slice(0, 24000) },
+        {
+          role: 'user',
+          content: 'That response was not valid JSON. Re-emit the complete content as a single valid JSON object only — no prose, no code fences. Preserve every field you wrote.',
+        },
+      ],
+    });
+    return extractJson(repaired?.content || '');
+  } catch (err) {
+    logger.warn({ intent_type, err: err.message }, 'ai_parse_repair_failed');
+    return null;
+  }
+}
+
 // Bounded history window for the AI Coach prompt. Long conversations must not
 // grow the model prompt without limit, so the chat handler sends only the most
 // recent messages (newest N, restored to chronological order) instead of the
@@ -1382,7 +1421,15 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     }
     if (step.value && typeof step.value === 'object') streamMeta = step.value;
 
-    let plan = extractJson(fullContent);
+    let plan = await parseOrRepair({
+      req,
+      intent_type: 'workout_repair',
+      intent: 'workout',
+      system: buildWorkoutSystemPrompt(),
+      user: userPromptText,
+      raw: fullContent,
+      max_tokens: 8000,
+    });
     if (!plan) {
       send({ type: 'error', message: 'Could not parse AI response as JSON' });
       res.end();
@@ -1839,7 +1886,15 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     }
     if (step.value && typeof step.value === 'object') streamMeta = step.value;
 
-    let plan = extractJson(fullContent);
+    let plan = await parseOrRepair({
+      req,
+      intent_type: 'diet_repair',
+      intent: 'diet',
+      system: buildDietSystemPrompt(trainerName),
+      user: userPromptText,
+      raw: fullContent,
+      max_tokens: 14000,
+    });
     if (!plan) {
       send({ type: 'error', message: 'Could not parse AI response as JSON' });
       res.end();
