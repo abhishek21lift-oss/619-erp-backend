@@ -104,8 +104,12 @@ const WEEKDAY_ALIASES = {
  * generator must not schedule three days when the trainer picked four.
  */
 function preferredDays(value) {
-  if (typeof value !== 'string') return null;
-  const tokens = value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  // Enrolment stores "Mon, Wed, Fri" in a TEXT column; the Goal wizard stores
+  // a TEXT[] of full names. Both are the same answer, so normalise the array
+  // into the form the rest of this function reads.
+  const raw = Array.isArray(value) ? value.join(', ') : value;
+  if (typeof raw !== 'string') return null;
+  const tokens = raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   if (!tokens.length) return null;
   const days = [];
   for (const token of tokens) {
@@ -288,13 +292,16 @@ function resolveClientFacts(ctx, stated = {}) {
     ], text),
 
     // sessions_per_week is the typed column the enrolment form writes and the
-    // rest of the product already reads. The Client Interview's answer is the
-    // next best: a direct, structured "days a week I can really train" the
-    // client gave during onboarding. Counting the preferred weekdays and the
-    // free-text frequency follow, both being weaker derivations of the same
-    // question. A disagreement is reported rather than silently dropped.
+    // rest of the product already reads. The Goal wizard's designed frequency
+    // is next: that is the trainer's own programme shape, written after the
+    // enrolment form and read by nothing until now. The Client Interview's
+    // answer follows — a direct, structured "days a week I can really train"
+    // the client gave during onboarding. Counting the preferred weekdays and
+    // the free-text frequency follow, both being weaker derivations of the
+    // same question. A disagreement is reported rather than silently dropped.
     training_days: fromSources([
       ['pt_clients.sessions_per_week', client.sessions_per_week],
+      ['pt_goals.training_days_per_week', goals[0]?.training_days_per_week],
       ['pt_client_interviews.lifestyle_training_days', interviewLifestyle?.lifestyle_training_days],
       ['pt_clients.preferred_training_days', countDays(client.preferred_training_days)],
       ['pt_clients.frequency', /^[1-7]$/.test(String(client.frequency ?? '')) ? client.frequency : null],
@@ -307,6 +314,7 @@ function resolveClientFacts(ctx, stated = {}) {
     // FIELDS because it is not an independent blocking fact — the count is.
     preferred_days: fromSources([
       ['pt_clients.preferred_training_days', preferredDays(client.preferred_training_days)],
+      ['pt_goals.preferred_training_days', preferredDays(goals[0]?.preferred_training_days)],
     ], text),
 
     // ── Equipment ────────────────────────────────────────────────────────

@@ -381,7 +381,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRou
               fitness_level, sleep_hours, stress_level, diet_preference
        FROM client_fitness_profiles WHERE client_id=$1 LIMIT 1`, [client_id]),
     pool.query(
-      'SELECT goal_type, target_weight, target_body_fat, notes FROM pt_goals WHERE client_id=$1 AND is_active=true ORDER BY created_at DESC LIMIT 3', [client_id]),
+      'SELECT goal_type, target_weight, target_body_fat, notes, training_days_per_week, preferred_training_days FROM pt_goals WHERE client_id=$1 AND is_active=true ORDER BY created_at DESC LIMIT 3', [client_id]),
     pool.query(
       'SELECT weight, body_fat_pct, bmi, chest_cm, waist_cm, hips_cm, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [client_id]),
     pool.query(

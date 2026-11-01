@@ -46,7 +46,7 @@ async function loadClientFactSources(clientId, organizationId) {
       [clientId],
     ),
     pool.query(
-      `SELECT goal_type
+      `SELECT goal_type, training_days_per_week, preferred_training_days
          FROM pt_goals WHERE client_id = $1 AND is_active = true
         ORDER BY created_at DESC LIMIT 3`,
       [clientId],
