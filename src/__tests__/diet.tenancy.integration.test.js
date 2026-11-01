@@ -41,8 +41,8 @@ if (process.env.CI && !DB_URL) {
   });
 }
 
-const ORG_A = '77777777-7777-4777-8777-777777777777';
-const ORG_B = '88888888-8888-4888-8888-888888888888';
+const ORG_A = '73737373-7373-4373-8373-737373737373';
+const ORG_B = '74747474-7474-4474-8474-747474747474';
 
 // The predicate the route builds when scope.applyFilter is true. Kept as one
 // string so a test cannot accidentally assert against a looser version of it

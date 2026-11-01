@@ -42,8 +42,8 @@ if (process.env.CI && !DB_URL) {
   });
 }
 
-const ORG_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-const ORG_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const ORG_A = 'a1a1a1a1-1111-4111-8111-111111111111';
+const ORG_B = 'a2a2a2a2-2222-4222-8222-222222222222';
 
 describeIf('automation tenancy, against a real database', () => {
   let owner;

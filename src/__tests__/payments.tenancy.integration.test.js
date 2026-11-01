@@ -27,8 +27,8 @@ if (process.env.CI && !DB_URL) {
   });
 }
 
-const ORG_A = '77777777-7777-4777-8777-777777777777';
-const ORG_B = '88888888-8888-4888-8888-888888888888';
+const ORG_A = '75757575-7575-4575-8575-757575757575';
+const ORG_B = '76767676-7676-4676-8676-767676767676';
 
 describeIf('payment tenancy, against a real database', () => {
   let db;

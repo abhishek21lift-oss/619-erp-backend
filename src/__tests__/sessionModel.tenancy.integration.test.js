@@ -28,8 +28,8 @@ if (process.env.CI && !DB_URL) {
   });
 }
 
-const ORG_A = '77777777-7777-4777-8777-777777777777';
-const ORG_B = '88888888-8888-4888-8888-888888888888';
+const ORG_A = '79797979-7979-4979-8979-797979797979';
+const ORG_B = '7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a';
 
 describeIf('session model tenancy, against a real database', () => {
   let db;
