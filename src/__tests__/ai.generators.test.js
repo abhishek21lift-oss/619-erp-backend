@@ -51,7 +51,7 @@ jest.mock('../lib/logger', () => ({ info: mockLogInfo, warn: mockLogWarn, error:
 const request = require('supertest');
 const express = require('express');
 const pool = require('../db/pool');
-const { routedStream } = require('../lib/ai/router');
+const { routedStream, routedChat } = require('../lib/ai/router');
 const { logUsage } = require('../lib/ai/usage');
 
 process.env.OPENROUTER_API_KEY = 'test-key';
@@ -201,6 +201,7 @@ const donePayloadOf = (text) => {
 beforeEach(() => {
   pool.query.mockReset();
   routedStream.mockReset();
+  routedChat.mockReset();
   logUsage.mockClear();
   mockLogInfo.mockClear();
   mockLogWarn.mockClear();
@@ -573,6 +574,27 @@ describe('streaming contract (both generators)', () => {
     expect(res.status).toBe(200);
     expect(res.text).toContain('Could not parse AI response as JSON');
     expect(res.text).not.toContain('"type":"done"');
+  });
+
+  // A parse failure used to end the request after the full token spend — the
+  // studio paid for a plan it never received. One bounded repair, then the
+  // plan ships.
+  test('spends one bounded repair when the stream is not valid JSON', async () => {
+    mockQueries({});
+    // No braces at all: genuinely unparseable, not merely truncated.
+    routedStream.mockReturnValue(streamChunks(['Sorry, here is your plan in prose.']));
+    routedChat.mockResolvedValue({
+      content: JSON.stringify(WORKOUT_PLAN), model: 'primary-model', usage: {},
+    });
+
+    const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('"type":"done"');
+    expect(res.text).toContain('"name":"Strength Builder"');
+    // The FIRST call after a parse failure is the repair, not a revision.
+    const repair = routedChat.mock.calls[0][0];
+    expect(repair.messages[repair.messages.length - 1].content).toMatch(/not valid JSON/i);
   });
 
   test('the fallback meta from routedStream is passed through to the client', async () => {
