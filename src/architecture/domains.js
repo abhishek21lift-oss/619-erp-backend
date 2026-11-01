@@ -144,6 +144,10 @@ const DOMAINS = {
       'pt_clients', 'client_fitness_profiles', 'pt_consent_records',
       'pt_family_medical_history', 'pt_medical_clearances',
       'pt_client_followups',
+      // The daily at-risk digest claim, one row per studio per day
+      // (migration 252). Same retention surface as the follow-up log above:
+      // who is at risk, and what the trainer did about it.
+      'churn_digest_deliveries',
     ],
   },
 

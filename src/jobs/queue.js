@@ -17,7 +17,7 @@ const { Queue } = require('bullmq');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 
-const QUEUE_NAMES = ['email', 'whatsapp', 'ai', 'notifications', 'membership-renewals', 'automation-sweep', 'progress-reminders'];
+const QUEUE_NAMES = ['email', 'whatsapp', 'ai', 'notifications', 'membership-renewals', 'automation-sweep', 'progress-reminders', 'churn-digests'];
 
 const DEFAULT_JOB_OPTIONS = {
   // Bounded retries with exponential backoff: 2s, 4s, 8s …
@@ -99,4 +99,5 @@ module.exports = {
   membershipRenewalsQueue: lazyQueue('membership-renewals'),
   automationSweepQueue: lazyQueue('automation-sweep'),
   progressRemindersQueue: lazyQueue('progress-reminders'),
+  churnDigestsQueue: lazyQueue('churn-digests'),
 };
