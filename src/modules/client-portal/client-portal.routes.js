@@ -33,7 +33,10 @@ const { generatePaymentReceiptPdf } = require('../../lib/paymentReceiptPdf');
 const { isTrainingBlocked } = require('../../lib/screeningGate');
 const { randomUUID } = require('crypto');
 const multer = require('multer');
-const { serveFile, saveFile, deleteFile } = require('../../lib/fileStorage');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { serveFile, saveFile, saveFileFromPath, deleteFile } = require('../../lib/fileStorage');
 const { detectFileType, LOGO_IMAGES, FORM_VIDEOS } = require('../../lib/fileSignatures');
 const logger = require('../../lib/logger');
 
@@ -399,8 +402,22 @@ router.delete('/progress-photos/:id', wrap(async (req, res) => {
 // can confirm this member owns it. Videos are large, so the daily cap is five.
 const FORM_CHECK_DAILY_LIMIT = 5;
 
+// A 60 MB video held in a Buffer occupies 60 MB of heap for the life of the
+// request, and a few concurrent uploads were enough to push the process over
+// its heap limit. Multer writes the part to a temp file instead; the first
+// bytes are sniffed from disk, the file is streamed to R2 (or moved into
+// uploads/), and the temp file is removed in a finally.
+const FORM_CHECK_TMP = path.join(os.tmpdir(), 'mpts-form-checks');
+
 const formCheckUpload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination(_req, _file, cb) {
+      fs.mkdir(FORM_CHECK_TMP, { recursive: true }, (err) => cb(err, FORM_CHECK_TMP));
+    },
+    filename(_req, _file, cb) {
+      cb(null, `${Date.now()}-${randomUUID()}`);
+    },
+  }),
   limits: { fileSize: 60 * 1024 * 1024, files: 1 },
   fileFilter(_req, file, cb) {
     if (!/^video\/(mp4|quicktime)$/i.test(file.mimetype || '')) {
@@ -425,6 +442,7 @@ router.post('/form-checks', (req, res, next) => {
   });
 }, wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
+  const tempPath = req.file?.path;
   try {
     if (!req.file) throw new portal.PortalInputError('Choose a video to upload.');
 
@@ -435,7 +453,12 @@ router.post('/form-checks', (req, res, next) => {
     const note = String(req.body?.note ?? '').trim();
     if (note.length > 500) throw new portal.PortalInputError('Keep the note to 500 characters.');
 
-    const detected = detectFileType(req.file.buffer, FORM_VIDEOS);
+    // 12 bytes are all any signature in fileSignatures.js looks at; 64 is
+    // plenty and one read.
+    const head = Buffer.alloc(64);
+    const fd = await fs.promises.open(tempPath, 'r');
+    try { await fd.read(head, 0, head.length, 0); } finally { await fd.close(); }
+    const detected = detectFileType(head, FORM_VIDEOS);
     if (!detected) throw new portal.PortalInputError('That file is not an MP4 or MOV video.');
 
     if (await formChecks.uploadsToday(clientId, orgId) >= FORM_CHECK_DAILY_LIMIT) {
@@ -445,7 +468,7 @@ router.post('/form-checks', (req, res, next) => {
     }
 
     const id = randomUUID();
-    const url = await saveFile('form-checks', `${id}.${detected.ext}`, req.file.buffer, detected.mime,
+    const url = await saveFileFromPath('form-checks', `${id}.${detected.ext}`, tempPath, detected.mime,
       { organizationId: orgId, uploadedBy: req.user.id });
 
     const row = await formChecks.createForClient({
@@ -457,6 +480,11 @@ router.post('/form-checks', (req, res, next) => {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
     }
     throw err;
+  } finally {
+    // On the disk path saveFileFromPath() moved the file already; force:true
+    // makes that a no-op. Every refusal path (bad bytes, rate limit, DB error)
+    // leaves nothing behind.
+    if (tempPath) await fs.promises.rm(tempPath, { force: true }).catch(() => {});
   }
 }));
 

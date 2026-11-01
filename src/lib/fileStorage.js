@@ -85,6 +85,52 @@ async function saveFile(category, filename, buffer, contentType, meta = {}) {
   return `/uploads/${key}`;
 }
 
+/**
+ * Same contract as saveFile(), but the bytes come from a file already on
+ * disk — a multer disk-storage temp file — so a large video is never held in
+ * memory. The caller owns `sourcePath`: it may delete it as soon as this
+ * resolves. On the local-disk path the file is moved, so the source is gone
+ * either way.
+ */
+async function saveFileFromPath(category, filename, sourcePath, contentType, meta = {}) {
+  const key = `${category}/${filename}`;
+  let bytes;
+
+  if (isR2Configured()) {
+    bytes = (await fs.promises.stat(sourcePath)).size;
+    await getS3Client().send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+      Body: fs.createReadStream(sourcePath),
+      ContentLength: bytes,
+      ContentType: contentType,
+    }));
+  } else {
+    const dir = path.join(UPLOADS_ROOT, category);
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, filename);
+    try {
+      await fs.promises.rename(sourcePath, dest);
+    } catch (err) {
+      // A temp dir on another filesystem cannot be renamed into uploads/.
+      if (err.code !== 'EXDEV') throw err;
+      await fs.promises.copyFile(sourcePath, dest);
+    }
+    bytes = (await fs.promises.stat(dest)).size;
+  }
+
+  storageLedger.record({
+    key,
+    bytes,
+    category,
+    contentType,
+    organizationId: meta.organizationId,
+    uploadedBy: meta.uploadedBy,
+  });
+
+  return `/uploads/${key}`;
+}
+
 // Content types for the formats this app stores. Needed on the disk path
 // because a stream, unlike res.sendFile(), has no filename to infer from.
 const MIME_BY_EXT = {
@@ -222,5 +268,5 @@ async function deleteFile(key) {
 }
 
 module.exports = {
-  isR2Configured, saveFile, serveFile, getFileBuffer, deleteFile, parseByteRange,
+  isR2Configured, saveFile, saveFileFromPath, serveFile, getFileBuffer, deleteFile, parseByteRange,
 };

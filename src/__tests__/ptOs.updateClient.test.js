@@ -125,6 +125,21 @@ describe('PATCH /pt-os/clients/:id with a zero price', () => {
   });
 });
 
+describe('the term snapshot follows a term edit', () => {
+  test('updates the single enrollment row, not the renewal history', async () => {
+    mockExistingRow = { final_amount: '1000', paid_amount: '0' };
+    const res = await request(app())
+      .patch('/api/pt-os/clients/c1')
+      .send(fullForm({ pt_start_date: '2026-11-01', pt_end_date: '2027-01-31', duration_months: 3 }));
+
+    expect(res.status).toBe(200);
+    const snapshot = queries.find((q) => /^UPDATE pt_client_subscriptions/i.test(q.sql));
+    expect(snapshot).toBeTruthy();
+    // Renewal rows are immutable history; only the enrollment row is current.
+    expect(snapshot.sql).toMatch(/source = 'enrollment'/);
+  });
+});
+
 describe('the validation that still has to hold', () => {
   test('a negative price is refused', async () => {
     const res = await request(app())
