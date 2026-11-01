@@ -31,62 +31,81 @@ const models = {
   get fallback()  { return settings.override('fallback')  || process.env.AI_FALLBACK_MODEL  || DEFAULTS.fallback; },
 };
 
-// Intent → tier routing table
+// Intent → tier routing table.
+//
+// Every intent a caller actually passes belongs here, spelled out. An intent
+// that is missing does not fail — `resolveModel` falls through to `primary` —
+// which is the right default but a terrible way to find out that a feature was
+// never routed on purpose.
 const INTENT_ROUTES = {
-  // Fitness — primary model (gpt-oss-120b)
-  chat:         'primary',
-  workout:      'primary',
-  diet:         'primary',
-  nutrition:    'primary',
-  fitness:      'primary',
-  assessment:   'primary',
-  progress:     'primary',
-  coaching:     'primary',
-  exercise:     'primary',
-  meal:         'primary',
-  goal:         'primary',
-  recovery:     'primary',
+  // Fitness — the strongest configured model.
+  chat:          'primary',
+  workout:       'primary',
+  diet:          'primary',
+  nutrition:     'primary',
+  fitness:       'primary',
+  fitness_testing: 'primary',
+  assessment:    'primary',
+  progress:      'primary',
+  coaching:      'primary',
+  exercise:      'primary',
+  meal:          'primary',
+  goal:          'primary',
+  recovery:      'primary',
+  coach:         'primary',
 
-  // Development — secondary model (poolside/laguna-m1)
-  code:         'secondary',
-  debug:        'secondary',
-  sql:          'secondary',
-  audit:        'secondary',
-  technical:    'secondary',
-  architecture: 'secondary',
-  refactor:     'secondary',
-  database:     'secondary',
+  // Client Assistant intents (lib/ai/agent/planner.js).
+  //
+  // `summary` used to be filed under business reporting, which is the
+  // fallback tier — openrouter/auto. analysis and lookup were never listed at
+  // all, so they fell through to primary. The result: "summarise this client"
+  // and "brief me" — the widest, most-read answers the assistant gives — were
+  // the only ones served by a different model each time, while every narrow
+  // lookup beside them got the fixed one. Same panel, same question, no way
+  // to reproduce a bad answer.
+  summary:       'primary',
+  analysis:      'primary',
+  lookup:        'primary',
 
-  // Business reporting — fallback model (nvidia/nemotron-3-ultra)
-  business:     'fallback',
-  insights:     'fallback',
-  report:       'fallback',
-  analytics:    'fallback',
-  summary:      'fallback',
+  // Data lookups and operational work — the stable model.
+  attendance:    'secondary',
+  checkin:       'secondary',
+  absent:        'secondary',
+  client:        'secondary',
+  member:        'secondary',
+  trainer:       'secondary',
+  session:       'secondary',
+  booking:       'secondary',
+  pt:            'secondary',
+  renew:         'secondary',
+  whatsapp:      'secondary',
+  notify:        'secondary',
+  communication: 'secondary',
+  ops:           'primary',
 
-  // Agent domain intents — mapped to appropriate model tiers
-  attendance:   'secondary',
-  checkin:      'secondary',
-  absent:       'secondary',
-  client:       'secondary',
-  member:       'secondary',
-  trainer:      'secondary',
-  session:      'secondary',
-  booking:      'secondary',
-  pt:           'secondary',
-  finance:      'fallback',
-  payment:      'fallback',
-  invoice:      'fallback',
-  dues:         'fallback',
-  subscription: 'fallback',
-  renew:        'secondary',
-  whatsapp:     'secondary',
-  notify:       'secondary',
-  communication:'secondary',
-  coach:        'primary',
-  retention:    'fallback',
-  revenue:      'fallback',
-  trend:        'fallback',
+  // Money. These were on the fallback tier — openrouter/auto — so a question
+  // about dues, an invoice or a subscription was answered by whichever model
+  // the router felt like that minute, and the weakest tier at that. A studio
+  // acts on those numbers. They get the same fixed model as any other lookup.
+  finance:       'secondary',
+  payment:       'secondary',
+  invoice:       'secondary',
+  dues:          'secondary',
+  subscription:  'secondary',
+
+  // Business reporting — the fallback tier, deliberately.
+  //
+  // openrouter/auto cannot be retired out from under us the way the previous
+  // free SKUs were, which took every one of these features down at once. The
+  // price is a model that varies per request; that is a trade this tier makes
+  // on availability, not an oversight.
+  business:      'fallback',
+  insights:      'fallback',
+  report:        'fallback',
+  analytics:     'fallback',
+  retention:     'fallback',
+  revenue:       'fallback',
+  trend:         'fallback',
 };
 
 function resolveModel(intent) {
