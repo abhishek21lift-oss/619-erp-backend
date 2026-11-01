@@ -122,6 +122,7 @@ async function startWorkers() {
   const { createNotificationsWorker } = require('./notifications.worker');
   const { createAutomationWorker, scheduleAutomationSweep } = require('./automation.worker');
   const { createProgressWorker, scheduleProgressSweep } = require('./progress.worker');
+  const { createChurnWorker, scheduleChurnDigest } = require('./churn.worker');
 
   const workers = [
     createEmailWorker(),
@@ -130,6 +131,7 @@ async function startWorkers() {
     createNotificationsWorker(),
     createAutomationWorker(),
     createProgressWorker(),
+    createChurnWorker(),
   ];
 
   // Caught, unlike the line above it, and deliberately not by changing that
@@ -149,6 +151,12 @@ async function startWorkers() {
     await scheduleProgressSweep();
   } catch (err) {
     logger.error({ err: err.message }, 'progress reminder cron not scheduled');
+  }
+
+  try {
+    await scheduleChurnDigest();
+  } catch (err) {
+    logger.error({ err: err.message }, 'churn digest cron not scheduled');
   }
 
   activeWorkers = workers;

@@ -109,6 +109,13 @@ const DEGRADATION = {
       + 'can skip a 30/14/7-day reminder. The overdue reminder still fires once.',
     source: 'workers/progress.worker.js upsertJobScheduler; no producer fallback exists',
   },
+  'churn-digests': {
+    mode: MODE.STOPPED,
+    impact: 'The daily at-risk digest does not run. Nothing is sent while Redis is down; '
+      + 'the sweep reads live churn scores each morning, so a missed day is a missed nudge, '
+      + 'not lost data — the next pass reports whatever is still at risk.',
+    source: 'workers/churn.worker.js upsertJobScheduler; no producer fallback exists',
+  },
 };
 
 /**

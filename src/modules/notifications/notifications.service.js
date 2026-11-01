@@ -267,6 +267,25 @@ const templates = {
       },
     };
   },
+  churn_digest: ({ name, count, client_names, more, link }) => {
+    // Trainer-facing; client_names is user-controlled text.
+    const total = Number(count) || 0;
+    const extra = Number(more) || 0;
+    const who = extra > 0 ? `${client_names} and ${extra} more` : client_names;
+    const title = total === 1 ? '1 client needs attention' : `${total} clients need attention`;
+    const lead = total === 1
+      ? 'one client is at high or critical risk today'
+      : `${total} clients are at high or critical risk today`;
+    const href = link || '/pt-os/clients/at-risk';
+    return {
+      title,
+      body: `Hi ${name}, ${lead}: ${who}. Open At-risk Clients to see why and what to do.`,
+      email: {
+        subject: title,
+        html: `<p>Hi ${escapeHtml(name)},</p><p>${escapeHtml(lead)}:</p><p><b>${escapeHtml(who)}</b></p><p><a href="${escapeHtml(href)}">Open At-risk Clients</a></p>`,
+      },
+    };
+  },
   class_reminder: ({ name, class_name, time }) => ({
     title: `${class_name} starts soon`,
     body: `Hi ${name}, reminder: ${class_name} at ${time}.`,
@@ -475,6 +494,30 @@ async function recipientFromTrainer(orgId, clientId) {
 }
 
 /**
+ * The studio's trainer, as a recipient for an org-level message.
+ *
+ * Distinct from recipientFromTrainer, which is per-client. The phone comes
+ * from the `trainers` row, not `users` — `users` has no phone column, and the
+ * WhatsApp channel addresses a handset. A studio with no trainer account is
+ * null, never a fallback lookup.
+ */
+async function recipientFromStudioTrainer(orgId) {
+  const { rows } = await pool.query(
+    `SELECT u.id AS user_id, u.name, u.email, t.mobile AS phone, u.organization_id
+       FROM users u
+       LEFT JOIN trainers t ON t.id = u.trainer_id
+      WHERE u.organization_id = $1
+        AND u.role = 'trainer'
+        AND u.is_active = TRUE
+        AND u.deleted_at IS NULL
+      ORDER BY u.created_at ASC
+      LIMIT 1`,
+    [orgId]
+  );
+  return rows[0] || null;
+}
+
+/**
  * Resolve a member into a recipient object with all contact info.
  */
 async function recipientFromMember(memberId) {
@@ -553,6 +596,6 @@ async function markAllRead(userId) {
 }
 
 module.exports = {
-  send, deliverChannel, processNotificationJob, recipientFromMember, recipientFromClient, recipientFromTrainer, inbox, markRead, markAllRead,
+  send, deliverChannel, processNotificationJob, recipientFromMember, recipientFromClient, recipientFromTrainer, recipientFromStudioTrainer, inbox, markRead, markAllRead,
   templates, channels, TRANSACTIONAL_NOTIFICATIONS,
 };
