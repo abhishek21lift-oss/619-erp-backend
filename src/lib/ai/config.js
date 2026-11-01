@@ -77,4 +77,25 @@ function keySource(env = process.env) {
   return null;
 }
 
-module.exports = { apiKey, baseUrl, isConfigured, configurationProblem, keySource };
+/**
+ * Which provider name the ERP actually points every request at.
+ *
+ * Derived from AI_BASE_URL — the one fact checkable at write time without a
+ * network probe. The column exists to answer "who served this"; hardcoding
+ * 'openrouter' made it a lie the moment a gateway took AI_BASE_URL's place.
+ * What the gateway says answered is a different question and rides in
+ * routed_via.
+ */
+function providerFromBase(env = process.env) {
+  let host = '';
+  try {
+    host = new URL(baseUrl(env)).host + '/';
+  } catch {
+    return 'openai_compatible';
+  }
+  return /(^|\.)openrouter\.ai(\/|$)/.test(host) ? 'openrouter' : 'openai_compatible';
+}
+
+module.exports = {
+  apiKey, baseUrl, isConfigured, configurationProblem, keySource, providerFromBase,
+};
