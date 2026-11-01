@@ -138,6 +138,21 @@ async function upsertSettings({
   return rows[0];
 }
 
+/**
+ * Replace the feed token. The old URL stops resolving on the next request, so
+ * the trainer must re-subscribe with the new one.
+ */
+async function rotateToken(orgId, trainerId, token) {
+  const { rows } = await pool.query(
+    `UPDATE trainer_booking_settings
+        SET ics_token = $3, updated_at = NOW()
+      WHERE organization_id = $1 AND trainer_id = $2
+      RETURNING ics_token`,
+    [orgId, trainerId, token],
+  );
+  return rows[0] || null;
+}
+
 /** The studio and trainer a calendar feed token belongs to, or null. */
 async function settingsByToken(token) {
   const { rows } = await pool.query(
@@ -166,5 +181,5 @@ async function feedSessions(orgId, trainerId) {
 
 module.exports = {
   windowsFor, timeOffFor, replaceWindows, bookedBetween,
-  insertTimeOff, removeTimeOff, upsertSettings, settingsByToken, feedSessions,
+  insertTimeOff, removeTimeOff, upsertSettings, rotateToken, settingsByToken, feedSessions,
 };

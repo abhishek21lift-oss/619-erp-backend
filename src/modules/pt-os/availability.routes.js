@@ -182,4 +182,20 @@ router.put('/booking-settings', wrap(async (req, res) => {
   res.json({ data: { ...DEFAULT_SETTINGS, ...saved } });
 }));
 
+// Rotation is separate from the settings PUT on purpose: the feed URL is a
+// credential the trainer has already handed to a calendar, so it must only
+// change when they ask for it.
+router.post('/booking-settings/calendar-token/rotate', wrap(async (req, res) => {
+  const trainerId = await trainerIdOf(req);
+  if (!trainerId) return bad(res, 400, 'NO_TRAINER', 'This studio has no trainer profile.');
+
+  const token = crypto.randomBytes(32).toString('hex');
+  const rotated = await repo.rotateToken(orgIdOf(req), trainerId, token);
+  if (!rotated) {
+    return bad(res, 404, 'CALENDAR_LINK_MISSING',
+      'Save booking settings once to create a calendar link.');
+  }
+  res.json({ data: { ics_token: rotated.ics_token } });
+}));
+
 module.exports = router;

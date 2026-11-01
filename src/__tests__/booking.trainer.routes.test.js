@@ -130,6 +130,35 @@ describe('PUT /api/pt-os/booking-settings', () => {
   });
 });
 
+describe('POST /api/pt-os/booking-settings/calendar-token/rotate', () => {
+  it('replaces the token and returns the new one', async () => {
+    pool.query.mockResolvedValue({ rows: [{ ics_token: 'c'.repeat(64) }] });
+
+    const res = await request(app)
+      .post('/api/pt-os/booking-settings/calendar-token/rotate')
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.ics_token).toBe('c'.repeat(64));
+    const [sql, params] = pool.query.mock.calls[0];
+    expect(sql).toMatch(/UPDATE trainer_booking_settings[\s\S]*SET ics_token = \$3/);
+    expect(params[0]).toBe('org-1');
+    expect(params[1]).toBe('t1');
+    expect(params[2]).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('refuses when no settings row exists to rotate', async () => {
+    pool.query.mockResolvedValue({ rows: [] });
+
+    const res = await request(app)
+      .post('/api/pt-os/booking-settings/calendar-token/rotate')
+      .send({});
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('CALENDAR_LINK_MISSING');
+  });
+});
+
 describe('GET /api/pt-os/booking-settings', () => {
   it('returns the documented defaults when the trainer never saved', async () => {
     const res = await request(app).get('/api/pt-os/booking-settings');
