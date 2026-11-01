@@ -102,7 +102,7 @@ async function ask({
   }
 
   // 2. Plan — deterministic, so cheap questions stay cheap and data-minimal.
-  const { tools: planned } = planTools(message);
+  const { tools: planned, matched } = planTools(message);
   const intent = planIntent(message);
 
   // The profile always runs. It is the authorisation payload in the legacy
@@ -224,6 +224,10 @@ async function ask({
   logger.info({
     requestId,
     intent,
+    // Did any planner rule match, or did this fall to DEFAULT_TOOLS? A run of
+    // false means users are asking phrasings no rule covers — the only signal
+    // that the deterministic planner needs a new rule.
+    planner_matched: matched,
     model: meta?.model,
     used_fallback: Boolean(meta?.used_fallback),
     tools_ok: okResults.length,
