@@ -1340,6 +1340,23 @@ runMigrationsWithRetry()
       );
     }
 
+    // AI conversation retention.
+    //
+    // ai_conversations held client injuries, PAR-Q answers and payment figures
+    // with nothing ever deleting a row. Same hourly cadence and bounded-batch
+    // reasoning as the sweep above.
+    {
+      const aiRetention = require('./lib/ai/retention');
+      const sweep = () => { aiRetention.prune(); };
+      setInterval(sweep, 60 * 60 * 1000).unref();
+      sweep();
+      logger.info(
+        { retention_days: Number(process.env.AI_CONVERSATION_RETENTION_DAYS)
+            || aiRetention.DEFAULT_RETENTION_DAYS },
+        'AI conversation retention active',
+      );
+    }
+
     // Command Center alerting. Without this the Alert Center only notices a
     // problem while somebody has the console open, which is the opposite of
     // what alerting is for — the point is being told when you are NOT looking.
