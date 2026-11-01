@@ -772,8 +772,8 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
 
     // Save assistant message
     await pool.query(
-      `INSERT INTO ai_messages (conversation_id, role, content, provider) VALUES ($1,'assistant',$2,'openrouter')`,
-      [convId, fullContent]
+      `INSERT INTO ai_messages (conversation_id, role, content, provider) VALUES ($1,'assistant',$2,$3)`,
+      [convId, fullContent, aiConfig.providerFromBase()]
     );
 
     // Update conversation timestamp
@@ -2776,7 +2776,7 @@ router.post('/test', auth, requireTrainer, requireConfigured, async (req, res) =
 router.get('/provider-settings', auth, requireTrainer, async (req, res) => {
   res.json({
     data: {
-      provider:   'openrouter',
+      provider:   aiConfig.providerFromBase(),
       configured: aiConfig.isConfigured(),
       // WHICH variable is live, never the key itself. The question during a
       // rotation is "which name is in play", and answering it has never
@@ -2787,7 +2787,7 @@ router.get('/provider-settings', auth, requireTrainer, async (req, res) => {
         secondary: models.secondary,
         fallback:  models.fallback,
       },
-      base_url: 'https://openrouter.ai/api/v1',
+      base_url: aiConfig.baseUrl(),
     },
   });
 });

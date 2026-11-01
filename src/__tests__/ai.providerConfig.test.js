@@ -19,7 +19,7 @@
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://u:p@127.0.0.1:1/none';
 
 const {
-  apiKey, baseUrl, isConfigured, configurationProblem, keySource,
+  apiKey, baseUrl, isConfigured, configurationProblem, keySource, providerFromBase,
 } = require('../lib/ai/config');
 
 describe('one answer to "is the provider configured"', () => {
@@ -197,5 +197,32 @@ describe('the router forwards the served model rather than discarding it', () =>
 
   it('reports both the served and the requested model', () => {
     expect(routerSrc).toMatch(/requested_model/);
+  });
+});
+
+describe('the provider column names the configured endpoint, not a constant', () => {
+  it('calls OpenRouter what it is', () => {
+    expect(providerFromBase({ AI_BASE_URL: 'https://openrouter.ai/api/v1' })).toBe('openrouter');
+  });
+
+  it('does not call a self-hosted gateway openrouter', () => {
+    expect(providerFromBase({ AI_BASE_URL: 'http://freellmapi:3000/v1' })).toBe('openai_compatible');
+  });
+
+  it('falls back to a name rather than throwing on a malformed base URL', () => {
+    expect(providerFromBase({ AI_BASE_URL: 'not a url' })).toBe('openai_compatible');
+  });
+
+  // A hardcoded literal here is the whole defect: the row answers "who served
+  // this" and could not, the moment AI_BASE_URL stopped pointing at OpenRouter.
+  const routeSrc = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'routes', 'ai.js'), 'utf8');
+
+  it('no longer writes a hardcoded provider into ai_messages', () => {
+    expect(routeSrc).not.toMatch(/VALUES \(\$1,'assistant',\$2,'openrouter'\)/);
+  });
+
+  it('reports the real base URL to the integrations page', () => {
+    expect(routeSrc).not.toMatch(/base_url: 'https:\/\/openrouter\.ai\/api\/v1'/);
   });
 });

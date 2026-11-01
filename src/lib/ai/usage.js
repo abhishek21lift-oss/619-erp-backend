@@ -5,22 +5,10 @@ const logger = require('../logger');
 
 /**
  * The provider column names what the ERP actually points every request at,
- * not what it wished it were. Hardcoded 'openrouter' was a lie the moment a
- * gateway took AI_BASE_URL's place: the column existed to answer "who served
- * this" and could not. Derived from the configured base — the one fact that
- * is checkable at insert time without a network probe (AI_BASE_URL is the
- * host lib/ai/openrouter.js calls). What the gateway says answered rides in
- * routed_via instead; the two are different questions.
+ * not what it wished it were. Derived in lib/ai/config.js — see
+ * providerFromBase() there for why.
  */
-function providerFromBase() {
-  let host = '';
-  try {
-    host = new URL(aiConfig.baseUrl()).host + '/';
-  } catch {
-    return 'openai_compatible';
-  }
-  return /(^|\.)openrouter\.ai(\/|$)/.test(host) ? 'openrouter' : 'openai_compatible';
-}
+const { providerFromBase } = aiConfig;
 
 /**
  * Log a completed AI request to the usage_log table.
