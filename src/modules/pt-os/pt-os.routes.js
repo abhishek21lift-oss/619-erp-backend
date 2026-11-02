@@ -118,6 +118,7 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
  * methods to a GROUP BY and one to a human.
  */
 const PAYMENT_METHODS = ['CASH', 'UPI', 'CARD', 'BANK_TRANSFER', 'SPLIT'];
+const EQUIPMENT_TYPES = ['full_gym', 'dumbbells', 'bodyweight', 'bands'];
 
 function orgWhere(req, params, col = 'organization_id') {
   const scope = tenantScope(req);
@@ -776,6 +777,7 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
        'emergency_contact_relationship','client_source',
        'goal','height','body_fat','health_conditions','injuries',
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week',
+       'session_minutes','equipment',
        'workout_experience_level','previous_trainer_experience',
        'agreement_accepted_at','agreement_signature','agreement_text',
        'payment_method',
@@ -872,6 +874,19 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
     if (!Number.isInteger(days) || days < 1 || days > 7) {
       return res.status(400).json({ error: { code: 'VALIDATION', field: 'sessions_per_week', message: 'sessions_per_week must be a whole number between 1 and 7.' } });
     }
+  }
+
+  if (body.session_minutes === '') body.session_minutes = null;
+  if (body.session_minutes !== undefined && body.session_minutes !== null) {
+    const minutes = Number(body.session_minutes);
+    if (!Number.isInteger(minutes) || minutes < 20 || minutes > 180) {
+      return res.status(400).json({ error: { code: 'VALIDATION', field: 'session_minutes', message: 'session_minutes must be a whole number between 20 and 180.' } });
+    }
+  }
+
+  if (body.equipment === '') body.equipment = null;
+  if (body.equipment !== undefined && body.equipment !== null && !EQUIPMENT_TYPES.includes(String(body.equipment))) {
+    return res.status(400).json({ error: { code: 'VALIDATION', field: 'equipment', message: `equipment must be one of: ${EQUIPMENT_TYPES.join(', ')}` } });
   }
 
   const wantsFinalAmount = req.body.final_amount !== undefined;

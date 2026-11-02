@@ -125,6 +125,45 @@ describe('PATCH /pt-os/clients/:id with a zero price', () => {
   });
 });
 
+describe('training availability', () => {
+  test('stores session length and equipment', async () => {
+    const res = await request(app())
+      .patch('/api/pt-os/clients/c1')
+      .send(fullForm({ session_minutes: 75, equipment: 'dumbbells' }));
+
+    expect(res.status).toBe(200);
+    expect(updateSql().params).toContain(75);
+    expect(updateSql().params).toContain('dumbbells');
+  });
+
+  test('refuses a session length outside 20-180', async () => {
+    const res = await request(app())
+      .patch('/api/pt-os/clients/c1')
+      .send(fullForm({ session_minutes: 10 }));
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/session_minutes/i);
+  });
+
+  test('refuses equipment outside the closed set', async () => {
+    const res = await request(app())
+      .patch('/api/pt-os/clients/c1')
+      .send(fullForm({ equipment: 'barbell' }));
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/equipment/i);
+  });
+
+  test('an empty session length or equipment clears the column', async () => {
+    const res = await request(app())
+      .patch('/api/pt-os/clients/c1')
+      .send(fullForm({ session_minutes: '', equipment: '' }));
+
+    expect(res.status).toBe(200);
+    expect(updateSql().params).toContain(null);
+  });
+});
+
 describe('the term snapshot follows a term edit', () => {
   test('updates the single enrollment row, not the renewal history', async () => {
     mockExistingRow = { final_amount: '1000', paid_amount: '0' };

@@ -25,6 +25,13 @@ const METHOD_LABELS = {
   SPLIT: 'Split Payment',
 };
 
+const EQUIPMENT_LABELS = {
+  full_gym: 'Full Gym',
+  dumbbells: 'Dumbbells Only',
+  bodyweight: 'Bodyweight',
+  bands: 'Resistance Bands',
+};
+
 function money(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return '—';
@@ -69,9 +76,11 @@ async function buildEnrollmentPdf(c, studioName = 'MY PT STUDIO') {
   drawLabelValue(doc, 'Duration:', c.duration_months ? `${c.duration_months} month(s)` : '—');
   drawLabelValue(doc, 'Training Mode:', c.training_mode);
   drawLabelValue(doc, 'Sessions / Week:', c.sessions_per_week);
+  drawLabelValue(doc, 'Session Length:', c.session_minutes ? `${c.session_minutes} minutes` : '—');
   drawLabelValue(doc, 'Training Days:', c.preferred_training_days);
   drawLabelValue(doc, 'Preferred Time:', c.preferred_workout_time);
   drawLabelValue(doc, 'Experience Level:', c.workout_experience_level);
+  drawLabelValue(doc, 'Equipment:', EQUIPMENT_LABELS[c.equipment] || c.equipment || '—');
 
   drawSectionHeading(doc, 'Payment');
   drawLabelValue(doc, 'Final / Selling Price:', money(c.final_amount));
@@ -101,4 +110,4 @@ async function buildEnrollmentPdf(c, studioName = 'MY PT STUDIO') {
   });
 }
 
-module.exports = { buildEnrollmentPdf, ageFrom, METHOD_LABELS };
+module.exports = { buildEnrollmentPdf, ageFrom, METHOD_LABELS, EQUIPMENT_LABELS };
