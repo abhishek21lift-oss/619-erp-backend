@@ -18,7 +18,8 @@ process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://u:p@127.0.0
 
 const fs = require('fs');
 const path = require('path');
-const { buildEnrollmentPdf, ageFrom, METHOD_LABELS } = require('../lib/ptEnrollmentPdf');
+const { PDFParse } = require('pdf-parse');
+const { buildEnrollmentPdf, ageFrom, METHOD_LABELS, EQUIPMENT_LABELS } = require('../lib/ptEnrollmentPdf');
 
 const ROUTES = path.join(__dirname, '..', 'modules', 'pt-os', 'pt-os.routes.js');
 const src = () => fs.readFileSync(ROUTES, 'utf8');
@@ -76,6 +77,46 @@ describe('the role boundary', () => {
     // profile (lib/studioTrainer.js), or the edit is refused.
     const body = src().slice(src().indexOf("router.patch('/clients/:id'"));
     expect(body.slice(0, body.indexOf('\n}));'))).toMatch(/resolveTrainerId\(pool, orgIdOf\(req\), req\.body\.trainer_id\)/);
+  });
+
+  test('the trainer can save session length and equipment', () => {
+    expect(allowlist()).toContain('session_minutes');
+    expect(allowlist()).toContain('equipment');
+  });
+});
+
+describe('training availability is a closed set', () => {
+  test('the route validates session length instead of storing any number', () => {
+    expect(src()).toMatch(/session_minutes must be a whole number between 20 and 180/);
+  });
+
+  test('the route validates equipment against the values the form offers', () => {
+    const m = src().match(/const EQUIPMENT_TYPES = \[([^\]]+)\]/);
+    expect(m).not.toBeNull();
+    const values = eval(`[${m[1]}]`);
+    expect(values).toEqual(['full_gym', 'dumbbells', 'bodyweight', 'bands']);
+    expect(src()).toMatch(/EQUIPMENT_TYPES\.includes\(String\(body\.equipment\)\)/);
+  });
+
+  test('every accepted equipment value has a label for the PDF', () => {
+    const m = src().match(/const EQUIPMENT_TYPES = \[([^\]]+)\]/);
+    for (const value of eval(`[${m[1]}]`)) {
+      expect(EQUIPMENT_LABELS[value]).toBeTruthy();
+    }
+  });
+});
+
+describe('migration 255', () => {
+  const migration = path.join(__dirname, '..', 'db', 'migrations', '255_client_training_availability.sql');
+
+  test('adds the two nullable columns and their checks', () => {
+    expect(fs.existsSync(migration)).toBe(true);
+    if (!fs.existsSync(migration)) return;
+    const sql = fs.readFileSync(migration, 'utf8');
+    expect(sql).toMatch(/ADD COLUMN IF NOT EXISTS session_minutes SMALLINT/);
+    expect(sql).toMatch(/BETWEEN 20 AND 180/);
+    expect(sql).toMatch(/ADD COLUMN IF NOT EXISTS equipment TEXT/);
+    expect(sql).toMatch(/full_gym.*dumbbells.*bodyweight.*bands/s);
   });
 });
 
@@ -146,6 +187,19 @@ describe('the generated document', () => {
     const buf = await buildEnrollmentPdf(CLIENT);
     expect(buf.slice(0, 4).toString()).toBe('%PDF');
     expect(buf.length).toBeGreaterThan(1000);
+  });
+
+  test('prints the session length and equipment', async () => {
+    const buf = await buildEnrollmentPdf({
+      ...CLIENT,
+      session_minutes: 75,
+      equipment: 'dumbbells',
+    });
+    const parser = new PDFParse({ data: buf });
+    const text = (await parser.getText()).text;
+    await parser.destroy();
+    expect(text).toContain('Session Length: 75 minutes');
+    expect(text).toContain('Equipment: Dumbbells Only');
   });
 
   test('survives a client with almost nothing filled in', async () => {
