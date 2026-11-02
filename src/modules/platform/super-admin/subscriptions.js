@@ -741,6 +741,12 @@ router.get('/subscription-requests', async (req, res, next) => {
 router.post('/subscription-requests/:id/approve', async (req, res, next) => {
   try {
     const result = await checkout.approve({ requestId: req.params.id, actor: checkoutActor(req) });
+
+    // The auth middleware caches the studio's user row for 30s. Without this,
+    // the trainer who just paid keeps getting 402 "trial expired" on every
+    // protected route until that entry expires.
+    invalidateUserCache();
+
     await audit(req, 'subscription_checkout_approved', 'organization',
       result.request.organization_id, {
         request_no: result.request.request_no, utr: result.request.utr,
