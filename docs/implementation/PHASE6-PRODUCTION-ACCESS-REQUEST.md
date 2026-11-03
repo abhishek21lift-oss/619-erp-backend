@@ -14,18 +14,25 @@ reviewed.
 
 | Item | Value |
 |---|---|
-| Access type | PostgreSQL role, `SELECT` only |
+| Access type | PostgreSQL role, `SELECT` only, `BYPASSRLS` |
 | Duration | One run, revoke after the artifacts are collected |
 | Transport | TLS required (`sslmode=require` or stricter) |
 | Output | Private directory outside the repository, mode 0700/0600, SHA-256 manifest |
 | Credentials | Supplied through env vars only, never committed or printed |
+
+**Why `BYPASSRLS`.** Every clinical table has row-level security enabled. A role
+without `BYPASSRLS` reads zero rows — silently, not as an error — so the audit
+would report zero conflicts and the schema gate would wrongly say
+`ELIGIBLE_FOR_REVIEW`. `BYPASSRLS` changes what the role may *see*; `SELECT`
+remains the only data privilege, and the role's sessions are forced read-only.
+The wrapper refuses to run if this attribute is missing.
 
 ## Role grants
 
 Run as a database owner. Replace `<db>` and the password placeholder.
 
 ```sql
-CREATE ROLE myptstudio_audit LOGIN PASSWORD '<generated-secret>';
+CREATE ROLE myptstudio_audit LOGIN PASSWORD '<generated-secret>' BYPASSRLS;
 ALTER ROLE myptstudio_audit SET default_transaction_read_only = on;
 
 GRANT CONNECT ON DATABASE <db> TO myptstudio_audit;
