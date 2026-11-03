@@ -38,6 +38,7 @@ const os = require('os');
 const path = require('path');
 const { serveFile, saveFile, saveFileFromPath, deleteFile } = require('../../lib/fileStorage');
 const { detectFileType, LOGO_IMAGES, FORM_VIDEOS } = require('../../lib/fileSignatures');
+const { logActivity } = require('../../lib/activityLog');
 const logger = require('../../lib/logger');
 
 /** Wrap an async handler so a rejection reaches the error middleware. */
@@ -181,28 +182,40 @@ router.get('/attendance', wrap(async (req, res) => {
 
 // ── GET /api/me/measurements ─────────────────────────────────────────────────
 //
-// Two columns, not SELECT *. `pt_os_measurements` is not defined in any
-// migration in this repo — it is created elsewhere and read by the client
-// snapshot — so the only columns anyone here can claim to know about are the
-// ones already read in production (see pt-os.routes.js, the weight trend).
-// A star select on a table whose full shape is unverified is how an internal
-// note ends up on a client's screen.
+// Fitness Testing owns the live body, so `pt_assessments` is the canonical
+// source and comes first. The older measurement log still holds real readings
+// for studios whose history only exists there, and it has no writer left; it
+// stays as a labelled fallback (`source: 'trainer'`). The member's own
+// check-in weights are the third source (`source: 'checkin'`), because a
+// member who reported their weight every week should not see "not recorded".
 //
-// No org clause: the column set is unverified, so an organization_id filter
-// might reference a column that does not exist and 500 the whole route. Scoping
-// on client_id alone is already sufficient — pt_clients.id is unique
-// platform-wide and comes from the session, never the request.
+// `pt_os_measurements` is not defined in any migration in this repo, so the
+// only columns read from it are the ones already read in production. Its rows
+// are scoped by client_id alone: the column set is unverified, so an
+// organization_id predicate could reference a column that does not exist.
+// `pt_clients.id` is unique platform-wide and comes from the session, never
+// the request. Assessments and check-ins are migration-defined and are scoped
+// by organization as well.
 //
-// The member's own check-in weights are included, marked source 'checkin'.
-// Without them a member who reported their weight every week still saw
-// "Weight: not recorded" on their dashboard, because only the trainer's
-// measurements were read. weekly_checkins IS migration-defined, so it is
-// scoped by organization as well.
+// The three sources are returned as they were recorded, not merged. A test and
+// a trainer measurement on the same day are two facts with two provenances;
+// hiding one would make the member's timeline disagree with the trainer's.
 router.get('/measurements', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
   const { rows } = await pool.query(
     `SELECT weight_kg, measured_at, source, body_fat_pct, chest_cm, waist_cm, hip_cm,
             arms_cm, thighs_cm, shoulders_cm FROM (
+       SELECT weight AS weight_kg,
+              assessment_date::timestamptz AS measured_at,
+              'assessment'::text AS source,
+              body_fat_pct, chest_cm, waist_cm, hips_cm AS hip_cm,
+              arms_cm, thighs_cm, NULL::numeric AS shoulders_cm
+         FROM pt_assessments
+        WHERE client_id = $1
+          AND organization_id = $2
+          AND COALESCE(weight, body_fat_pct, chest_cm, waist_cm, hips_cm,
+                       arms_cm, thighs_cm) IS NOT NULL
+       UNION ALL
        SELECT weight_kg, measured_at, 'trainer'::text AS source,
               body_fat_pct, chest_cm, waist_cm, hip_cm, arms_cm, thighs_cm, shoulders_cm
          FROM pt_os_measurements
@@ -215,7 +228,7 @@ router.get('/measurements', wrap(async (req, res) => {
          FROM weekly_checkins
         WHERE client_id = $1 AND organization_id = $2 AND weight IS NOT NULL
      ) m
-      ORDER BY measured_at DESC
+      ORDER BY measured_at DESC, source ASC
       LIMIT 200`,
     [clientId, orgId]
   );
@@ -248,7 +261,13 @@ router.patch('/profile', wrap(async (req, res) => {
   try {
     const saved = await portal.updateMyContact(clientId, orgId, req.body || {});
     if (!saved) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Profile not found.' } });
-    res.json({ data: saved });
+    const { changed, ...data } = saved;
+    if (changed) {
+      await logActivity(req, 'client.contact.update', 'pt_client', clientId, {
+        fields: ['mobile', 'whatsapp', 'address'].filter((field) => field in (req.body || {})),
+      });
+    }
+    res.json({ data });
   } catch (err) {
     if (err instanceof portal.PortalInputError) {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
@@ -264,6 +283,7 @@ router.post('/photo', wrap(async (req, res) => {
   try {
     const saved = await portal.setMyPhoto(clientId, orgId, req.body?.photo);
     if (!saved) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Profile not found.' } });
+    await logActivity(req, 'client.photo.update', 'pt_client', clientId, { photo_updated: true });
     res.json({ data: saved });
   } catch (err) {
     if (err instanceof portal.PortalInputError) {
@@ -277,6 +297,7 @@ router.delete('/photo', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
   const saved = await portal.setMyPhoto(clientId, orgId, null);
   if (!saved) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Profile not found.' } });
+  await logActivity(req, 'client.photo.update', 'pt_client', clientId, { photo_removed: true });
   res.json({ data: saved });
 }));
 

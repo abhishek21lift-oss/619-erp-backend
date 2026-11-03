@@ -107,8 +107,10 @@ describe('POST /api/ai/progress/analyze — bounded historical context (P2-1)', 
     const assessments = sqlAt(1);
     const checkins = sqlAt(3);
     const logs = sqlAt(4);
-    expect(assessments).toMatch(/ORDER BY created_at DESC LIMIT 20/);
-    expect(checkins).toMatch(/ORDER BY created_at DESC LIMIT 12/);
+    // Canonical ordering: the date the test/check-in describes outranks the
+    // day it was typed, so a backdated row cannot displace a newer body.
+    expect(assessments).toMatch(/ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 20/);
+    expect(checkins).toMatch(/ORDER BY week_start_date DESC NULLS LAST, created_at DESC LIMIT 12/);
     expect(logs).toMatch(/ORDER BY created_at DESC LIMIT 20/);
     // The bound is in the SQL, never a JS slice of an unbounded fetch.
     expect(assessments).not.toMatch(/created_at ASC/);
@@ -116,13 +118,13 @@ describe('POST /api/ai/progress/analyze — bounded historical context (P2-1)', 
     expect(logs).not.toMatch(/created_at ASC/);
   });
 
-  test('newest records are selected (ORDER BY created_at DESC)', async () => {
+  test('newest records are selected by content date, created_at as tiebreak', async () => {
     mockProgressDB();
     routedStream.mockReturnValue(streamJson({ summary: 'ok' }));
     await request(app).post('/api/ai/progress/analyze').send({ client_id: 'client-1' });
 
-    expect(sqlAt(1)).toMatch(/ORDER BY created_at DESC/);
-    expect(sqlAt(3)).toMatch(/ORDER BY created_at DESC/);
+    expect(sqlAt(1)).toMatch(/ORDER BY assessment_date DESC NULLS LAST, created_at DESC/);
+    expect(sqlAt(3)).toMatch(/ORDER BY week_start_date DESC NULLS LAST, created_at DESC/);
     expect(sqlAt(4)).toMatch(/ORDER BY created_at DESC/);
   });
 
@@ -155,7 +157,7 @@ describe('POST /api/ai/progress/analyze — bounded historical context (P2-1)', 
     const res = await request(app).post('/api/ai/progress/analyze').send({ client_id: 'client-1' });
     expect(res.status).toBe(200);
 
-    expect(sqlAt(3)).toMatch(/ORDER BY created_at DESC LIMIT 12/);
+    expect(sqlAt(3)).toMatch(/ORDER BY week_start_date DESC NULLS LAST, created_at DESC LIMIT 12/);
     const ctx = contextData();
     expect(ctx.weekly_checkins).toHaveLength(12);
     const prompt = userPrompt();

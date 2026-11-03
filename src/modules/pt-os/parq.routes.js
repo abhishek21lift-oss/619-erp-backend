@@ -41,11 +41,68 @@ const numOpt = () => z.coerce.number().optional().nullable();
 // PAR-Q risk rule — see ./parq-scoring.js.
 
 function calcBmi(weightKg, heightCm) {
+  if (weightKg == null || heightCm == null) return null;
   const w = Number(weightKg);
   const h = Number(heightCm);
   if (!Number.isFinite(w) || !Number.isFinite(h) || h <= 0) return null;
   const heightM = h / 100;
   return Math.round((w / (heightM * heightM)) * 10) / 10;
+}
+
+// ─── Medical JSONB ownership (D5, D6, D8–D14) ──────────────────────────────
+// PAR-Q owns the medical answers. The habit keys below were asked here before
+// Lifestyle/Nutrition/Interview became their owner: old rows keep them, but a
+// new write stores only the medical allow-list. On edit the allow-list is
+// merged into the stored object, so an old form's habit answers survive even
+// though the wizard can no longer re-enter them.
+const CURRENT_HEALTH_OWNED = new Set([
+  'known_disease', 'known_disease_details',
+  'activity_level', 'dietary_habits',
+  'caffeine', 'caffeine_details',
+  'medications', 'medications_details',
+  'supplements', 'supplements_details',
+  'steroids_ped', 'steroids_ped_details',
+  'recreational_drugs', 'recreational_drugs_details',
+  'current_treatment', 'current_treatment_details',
+  'has_pain', 'pain_scale', 'pain_location', 'pain_description',
+]);
+const CURRENT_HEALTH_MOVED = new Set([
+  'water_intake', 'alcohol', 'alcohol_details', 'smoking', 'smoking_details',
+  'tobacco', 'tobacco_details', 'nicotine', 'nicotine_details', 'sleep_hours',
+]);
+const PAST_HISTORY_OWNED = new Set([
+  'heart_disease', 'respiratory_disease', 'asthma', 'copd', 'tuberculosis',
+  'joint_problems', 'back_pain', 'neck_pain', 'knee_pain', 'shoulder_pain',
+  'hip_pain', 'previous_fractures', 'surgeries', 'hospitalization',
+  'exercise_history', 'work_posture', 'previous_injuries',
+  'previous_physiotherapy', 'previous_trainer', 'exercise_experience',
+]);
+const PAST_HISTORY_MOVED = new Set(['occupation', 'daily_sitting_hours']);
+
+/** Only the keys this module owns, or null when it owns none of them. */
+function medicalKeys(source, owned) {
+  if (source == null || typeof source !== 'object') return null;
+  const out = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (owned.has(key)) out[key] = value;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** Log, once per request, the legacy habit keys a caller still sent. */
+function logMovedHabitKeys(source, moved, event, context) {
+  if (source == null || typeof source !== 'object') return;
+  const fields = Object.keys(source).filter((key) => moved.has(key));
+  if (!fields.length) return;
+  logger.warn({
+    event, fields, ...context,
+  }, 'PAR-Q keeps legacy habit answers read-only; the supplied fields were not stored');
+}
+
+/** The stored object plus this request's medical keys; legacy keys are kept. */
+function mergeMedicalJson(existing, incoming, owned) {
+  if (incoming === null) return null;
+  return { ...(existing && typeof existing === 'object' ? existing : {}), ...(medicalKeys(incoming, owned) || {}) };
 }
 
 // A form leaves draft only with every question answered. The risk rule
@@ -353,7 +410,22 @@ router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema),
   }
   const analysis = computeParqAnalysis(b.parq_answers);
   const gateStatus = analysis.riskLevel === 'high' ? 'blocked' : 'cleared';
-  const bmi = b.bmi ?? calcBmi(b.weight_kg, b.height_cm);
+  // BMI is derived from the height and weight stored with the form. A caller
+  // cannot set it: a BMI that disagrees with the numbers beside it is a wrong
+  // medical record, and nothing on the page would show the disagreement.
+  if (b.bmi != null) {
+    logger.warn({
+      event: 'parq.bmi_ignored', client_id: b.client_id, user_id: req.user?.id ?? null,
+    }, 'PAR-Q BMI is derived from height and weight; the supplied value was ignored');
+  }
+  const bmi = calcBmi(b.weight_kg, b.height_cm);
+
+  logMovedHabitKeys(b.current_health, CURRENT_HEALTH_MOVED, 'parq.habit_field_ignored',
+    { route: 'POST /parq/forms', client_id: b.client_id, user_id: req.user?.id ?? null });
+  logMovedHabitKeys(b.past_history, PAST_HISTORY_MOVED, 'parq.habit_field_ignored',
+    { route: 'POST /parq/forms', client_id: b.client_id, user_id: req.user?.id ?? null });
+  const currentHealth = medicalKeys(b.current_health, CURRENT_HEALTH_OWNED);
+  const pastHistory = medicalKeys(b.past_history, PAST_HISTORY_OWNED);
 
   const tx = await pool.connect();
   let formId;
@@ -391,8 +463,8 @@ router.post('/parq/forms', auth, requireTrainer, validate(parqFormCreateSchema),
         b.full_name, b.gender || null, b.dob || null, b.mobile || null, b.email || null,
         b.emergency_contact || null, b.emergency_phone || null, b.blood_group || null,
         b.height_cm ?? null, b.weight_kg ?? null, bmi ?? null, b.trainer_name || null,
-        b.current_health ? JSON.stringify(b.current_health) : null,
-        b.past_history ? JSON.stringify(b.past_history) : null,
+        currentHealth ? JSON.stringify(currentHealth) : null,
+        pastHistory ? JSON.stringify(pastHistory) : null,
         JSON.stringify(b.parq_answers), analysis.yesCount,
         analysis.riskLevel, analysis.riskMessage,
         b.trainer_notes ? JSON.stringify(b.trainer_notes) : null,
@@ -434,7 +506,7 @@ router.patch('/parq/forms/:id', auth, requireTrainer, validate(parqFormUpdateSch
   const allowedScalar = [
     'assessment_date', 'full_name', 'gender', 'dob', 'mobile', 'email',
     'emergency_contact', 'emergency_phone', 'blood_group',
-    'height_cm', 'weight_kg', 'bmi', 'trainer_name',
+    'height_cm', 'weight_kg', 'trainer_name',
     'current_health', 'past_history', 'parq_answers', 'trainer_notes', 'status',
   ];
   const jsonFields = new Set(['current_health', 'past_history', 'parq_answers', 'trainer_notes']);
@@ -454,6 +526,20 @@ router.patch('/parq/forms/:id', auth, requireTrainer, validate(parqFormUpdateSch
     if (!existing) {
       await tx.query('ROLLBACK');
       return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+    }
+
+    // Medical answers only, merged into what is stored: the legacy habit keys
+    // an old form still renders are never dropped by an edit that does not
+    // ask about them.
+    if (b.current_health !== undefined) {
+      logMovedHabitKeys(b.current_health, CURRENT_HEALTH_MOVED, 'parq.habit_field_ignored',
+        { route: 'PATCH /parq/forms/:id', id, client_id: existing.client_id, user_id: req.user?.id ?? null });
+      b.current_health = mergeMedicalJson(existing.current_health, b.current_health, CURRENT_HEALTH_OWNED);
+    }
+    if (b.past_history !== undefined) {
+      logMovedHabitKeys(b.past_history, PAST_HISTORY_MOVED, 'parq.habit_field_ignored',
+        { route: 'PATCH /parq/forms/:id', id, client_id: existing.client_id, user_id: req.user?.id ?? null });
+      b.past_history = mergeMedicalJson(existing.past_history, b.past_history, PAST_HISTORY_OWNED);
     }
 
     const mergedAnswers = b.parq_answers !== undefined ? b.parq_answers : existing.parq_answers;
@@ -483,15 +569,19 @@ router.patch('/parq/forms/:id', auth, requireTrainer, validate(parqFormUpdateSch
     }
     if (nextStatus !== priorStatus) b.status = nextStatus;
 
-    let bmi;
-    if (b.bmi !== undefined) {
-      bmi = b.bmi;
-    } else if (b.height_cm !== undefined || b.weight_kg !== undefined) {
+    // Derived, never taken from the request. A height/weight change recomputes
+    // from the merged stored pair; otherwise the stored value — itself computed
+    // here — is kept, and an existing mismatched row is not silently rewritten.
+    if (b.bmi != null) {
+      logger.warn({
+        event: 'parq.bmi_ignored', form_id: id, client_id: existing.client_id, user_id: req.user?.id ?? null,
+      }, 'PAR-Q BMI is derived from height and weight; the supplied value was ignored');
+    }
+    let bmi = existing.bmi;
+    if (b.height_cm !== undefined || b.weight_kg !== undefined) {
       const mergedHeight = b.height_cm !== undefined ? b.height_cm : existing.height_cm;
       const mergedWeight = b.weight_kg !== undefined ? b.weight_kg : existing.weight_kg;
       bmi = calcBmi(mergedWeight, mergedHeight);
-    } else {
-      bmi = existing.bmi;
     }
 
     const sets = [];

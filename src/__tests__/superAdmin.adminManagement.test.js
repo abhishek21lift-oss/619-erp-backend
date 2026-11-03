@@ -1,3 +1,6 @@
+// The route module graph is large; four-shard CI can exceed Jest's 5 s default
+// before the first assertion. The isolated run takes under 1 s.
+jest.setTimeout(15000);
 jest.mock('../db/pool', () => ({ query: jest.fn() }));
 jest.mock('../lib/fileStorage', () => ({ saveFile: jest.fn() }));
 jest.mock('../middleware/auth', () => ({

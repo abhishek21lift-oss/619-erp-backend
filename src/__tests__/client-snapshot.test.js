@@ -28,16 +28,26 @@ describe('daysBetween', () => {
 });
 
 describe('weightSeries — weight lives in two tables', () => {
-  // A studio that only runs fitness tests has an empty measurement table.
-  // Reading one source reported "never measured" for a client measured eight
-  // times, which would then have raised a false alert.
-  it('merges both sources, newest first', () => {
+  // Fitness Testing owns the live body. The measurement log has no writer and
+  // a studio that only runs assessments has it empty — so it is a fallback,
+  // never a second series that can out-rank a newer test.
+  it('prefers assessments and ignores the legacy log when a test holds a weight', () => {
     const s = weightSeries({
       measurements: [{ measured_at: '2026-07-20T10:00:00Z', weight_kg: 79 }],
       assessments: [{ assessment_date: '2026-07-27', weight: 80 }, { assessment_date: '2026-06-01', weight: 84 }],
     });
     expect(s.map((r) => [r.on, r.kg])).toEqual([
-      ['2026-07-27', 80], ['2026-07-20', 79], ['2026-06-01', 84],
+      ['2026-07-27', 80], ['2026-06-01', 84],
+    ]);
+  });
+
+  it('falls back to the measurement log when no assessment holds a weight', () => {
+    const s = weightSeries({
+      measurements: [{ measured_at: '2026-07-20', weight_kg: 79 }, { measured_at: '2026-06-01', weight_kg: 82 }],
+      assessments: [{ assessment_date: '2026-07-27', weight: null }],
+    });
+    expect(s.map((r) => [r.on, r.kg])).toEqual([
+      ['2026-07-20', 79], ['2026-06-01', 82],
     ]);
   });
 

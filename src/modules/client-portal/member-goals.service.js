@@ -40,23 +40,30 @@ const round1 = (n) => Math.round(n * 10) / 10;
 
 // ── The records a goal is measured against ─────────────────────────────────
 
-/** Weight readings, oldest first: trainer measurements and check-in weigh-ins. */
+/** Weight readings, oldest first: fitness tests, trainer measurements and check-in weigh-ins. */
 async function weightSeries(clientId, orgId, db = pool) {
   const { rows } = await db.query(
     `SELECT d, kg FROM (
-       SELECT measured_at::date AS d, weight_kg::float AS kg
+       -- Fitness Testing owns the live body, so it is a source here and not
+       -- only the legacy measurement log a studio may never have written.
+       SELECT measured_at::date AS d, weight_kg::float AS kg, 0 AS src
          FROM pt_os_measurements
         WHERE client_id = $1 AND weight_kg IS NOT NULL
        UNION ALL
-       SELECT week_start_date AS d, weight::float
+       SELECT week_start_date AS d, weight::float AS kg, 1 AS src
          FROM weekly_checkins
         WHERE client_id = $1 AND organization_id = $2 AND weight IS NOT NULL
+       UNION ALL
+       SELECT assessment_date AS d, weight::float AS kg, 2 AS src
+         FROM pt_assessments
+        WHERE client_id = $1 AND organization_id = $2 AND weight IS NOT NULL
      ) m
-     ORDER BY d ASC
+     ORDER BY d ASC, src ASC
      LIMIT 500`,
     [clientId, orgId],
   );
-  // One reading per day; the later row of a day wins.
+  // One reading per day; a fitness test wins the day, then the member's own
+  // weigh-in, then the legacy measurement log.
   const byDay = new Map();
   for (const r of rows) byDay.set(ymd(r.d), Number(r.kg));
   return [...byDay.entries()].map(([date, kg]) => ({ date, value: kg }));

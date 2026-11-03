@@ -13,8 +13,10 @@ const { resolveTrainerId, trainerForOrg } = require('../../lib/studioTrainer');
 const { today: studioToday } = require('../../lib/appTime');
 const { hasPtTermSql, priorTermsPaidJoin, currentTermBalanceSql } = require('../../lib/ptTerm');
 const subscription = require('../../lib/subscription');
+const { rejectMovedFields } = require('../../lib/fieldOwnership');
 const { buildBrief } = require('./training-brief');
 const { sweepRoster } = require('./client-context');
+const { loadClientSources } = require('./authoritative-client');
 const { buildChurnList, markFollowup } = require('./churn.service');
 const { buildEnrollmentPdf } = require('../../lib/ptEnrollmentPdf');
 const { buildSnapshot } = require('./client-snapshot');
@@ -49,6 +51,21 @@ const CLIENT_SOURCES = [
   'Walk-in', 'Instagram', 'WhatsApp', 'Referral',
   'Existing Member', 'Google', 'Website', 'Other',
 ];
+
+// Facts this endpoint used to write that belong to another module: Fitness
+// Testing owns the live body (pt_clients.weight/height are only its cache),
+// Goal owns the goal, PAR-Q owns medical conditions and injuries, Lifestyle
+// owns occupation. The columns remain readable as legacy fallbacks; writing
+// them here is a 422 naming the module that does own them.
+const MOVED_CLIENT_FIELDS = {
+  goal: { owner: 'Goal', endpoint: 'POST/PATCH /api/progress/goals' },
+  height: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
+  weight: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
+  body_fat: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
+  health_conditions: { owner: 'PAR-Q', endpoint: 'POST/PATCH /api/pt-os/parq/forms' },
+  injuries: { owner: 'PAR-Q', endpoint: 'POST/PATCH /api/pt-os/parq/forms' },
+  occupation: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+};
 
 const ptClientCreateSchema = {
   body: z.object({
@@ -491,15 +508,15 @@ router.get('/clients/:id', auth, wrap(async (req, res) => {
 
 // ─── Create / enroll client in PT ───────────────────────────
 router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wrap(async (req, res) => {
+      if (rejectMovedFields(req, res, 'POST /clients', MOVED_CLIENT_FIELDS)) return;
       try {
         const {
           client_id, name, gender, mobile, email, dob,
           trainer_name: reqTrainerName, package_type, base_amount, discount,
           pt_start_date, pt_end_date, duration_months, monthly_pt_amount,
-          notes, weight,
-          goal, height, body_fat, health_conditions, injuries, sessions_per_week,
+          notes, sessions_per_week,
           pt_package_id,
-          whatsapp, occupation, emergency_contact, emergency_phone, address,
+          whatsapp, emergency_contact, emergency_phone, address,
           emergency_contact_relationship, client_source,
         } = req.body;
     // Only ever a trainer profile in this studio — see lib/studioTrainer.js.
@@ -561,13 +578,13 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
       const { rows: [newCli] } = await pool.query(`
         INSERT INTO pt_clients
           (name, gender, mobile, email, dob, status, joining_date,
-           whatsapp, occupation, emergency_contact, emergency_phone, address,
+           whatsapp, emergency_contact, emergency_phone, address,
            emergency_contact_relationship, client_source, organization_id)
-        VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8,$9,$10,$11,$12,$13)
         RETURNING id
       `, [
         name, gender || null, mobile || null, email || null, dob || null, pt_start_date || new Date(),
-        whatsapp || null, occupation || null, emergency_contact || null, emergency_phone || null, address || null,
+        whatsapp || null, emergency_contact || null, emergency_phone || null, address || null,
         emergency_contact_relationship || null, client_source || null,
         orgIdOf(req),
       ]);
@@ -635,47 +652,38 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
         pt_end_date       = COALESCE($10, pt_end_date),
         duration_months   = COALESCE($11, duration_months),
         notes             = COALESCE($12, notes),
-        weight            = COALESCE($13, weight),
-        goal              = COALESCE($14, goal),
-        height            = COALESCE($15, height),
-        body_fat          = COALESCE($16, body_fat),
-        health_conditions = COALESCE($17, health_conditions),
-        injuries          = COALESCE($18, injuries),
-        sessions_per_week = COALESCE($19, sessions_per_week),
+        sessions_per_week = COALESCE($13, sessions_per_week),
         -- Contact/identity fields used to be validated and then discarded on
         -- this path (only the INSERT stored them): a corrected phone number
         -- on an enrol-existing-client call 201'd into nothing.
-        mobile            = COALESCE($20, mobile),
-        email             = COALESCE($21, email),
-        gender            = COALESCE($22, gender),
-        dob               = COALESCE($23, dob),
-        whatsapp          = COALESCE($24, whatsapp),
-        occupation        = COALESCE($25, occupation),
-        emergency_contact = COALESCE($26, emergency_contact),
-        emergency_phone   = COALESCE($27, emergency_phone),
-        emergency_contact_relationship = COALESCE($28, emergency_contact_relationship),
-        address           = COALESCE($29, address),
-        client_source     = COALESCE($30, client_source),
+        mobile            = COALESCE($14, mobile),
+        email             = COALESCE($15, email),
+        gender            = COALESCE($16, gender),
+        dob               = COALESCE($17, dob),
+        whatsapp          = COALESCE($18, whatsapp),
+        emergency_contact = COALESCE($19, emergency_contact),
+        emergency_phone   = COALESCE($20, emergency_phone),
+        emergency_contact_relationship = COALESCE($21, emergency_contact_relationship),
+        address           = COALESCE($22, address),
+        client_source     = COALESCE($23, client_source),
         -- Promote to 'active' only once the client is actually enrolled in a
         -- package (has an end date, a charged amount, or a duration) AND their
         -- screening is complete. A name-only add stays 'pending', and a
         -- provisional enrolment stays 'pending' until maybeActivateClient
         -- promotes it (see lib/screeningGate).
-        status = COALESCE($32, status),
+        status = COALESCE($25, status),
         updated_at = NOW()
-      WHERE id = $1 AND deleted_at IS NULL AND organization_id = $31
+      WHERE id = $1 AND deleted_at IS NULL AND organization_id = $24
       RETURNING *
     `, [
       cid,
       trainer_id, resolvedTrainerName, resolvedPackageType,
       base_amount, discount, finalAmt, monthly_pt_amount,
       startDate, endDate, resolvedDurationMonths,
-      notes || null, weight != null ? Number(weight) : null,
-      goal || null, height != null ? Number(height) : null,
-      body_fat != null ? Number(body_fat) : null,
-      health_conditions || null, injuries || null, sessions_per_week ?? null,
+      notes || null,
+      sessions_per_week ?? null,
       mobile || null, email || null, gender || null, dob || null,
-      whatsapp || null, occupation || null, emergency_contact || null,
+      whatsapp || null, emergency_contact || null,
       emergency_phone || null, emergency_contact_relationship || null,
       address || null, client_source || null,
       orgIdOf(req),
@@ -690,12 +698,14 @@ router.post('/clients', auth, requireTrainer, validate(ptClientCreateSchema), wr
 
     await logActivity(req, 'client.create', 'pt_client', rows[0].id, rows[0]);
     const screening = await screeningSummary(rows[0].id);
-    res.status(201).json({ data: {
-      ...rows[0],
-      activation_pending: rows[0].status === 'pending' && (hadTerm || termPromotes),
-      screening_missing: screening.missing,
-      screening_block: screening.block,
-    } });
+    res.status(201).json({
+      data: {
+        ...rows[0],
+        activation_pending: rows[0].status === 'pending' && (hadTerm || termPromotes),
+        screening_missing: screening.missing,
+        screening_block: screening.block,
+      },
+    });
   } catch (err) {
     logger.error({ err: err.message, body: req.body, user: req.user?.id }, 'PT OS create client failed');
     throw err;
@@ -766,6 +776,7 @@ router.post('/clients/:id/renew', auth, requireTrainer, validate(renewSchema), w
 
 // ─── Update PT client ───────────────────────────────────────
 router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'PATCH /clients/:id', MOVED_CLIENT_FIELDS)) return;
   // The trainer owns the studio and may edit every field of their own
   // clients. Payment fields (final_amount, paid_amount) are handled separately
   // below — validated, with balance_amount recomputed server-side — rather
@@ -773,9 +784,8 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
   const allowed = ['package_type','base_amount','discount',
        'monthly_pt_amount','trainer_id','trainer_name','pt_start_date','pt_end_date',
        'duration_months','status','notes',
-       'name','email','mobile','gender','dob','address','weight','photo_url','emergency_contact','emergency_phone',
+       'name','email','mobile','gender','dob','address','photo_url','emergency_contact','emergency_phone',
        'emergency_contact_relationship','client_source',
-       'goal','height','body_fat','health_conditions','injuries',
        'training_mode','preferred_workout_time','preferred_training_days','sessions_per_week',
        'session_minutes','equipment',
        'workout_experience_level','previous_trainer_experience',
@@ -1217,12 +1227,14 @@ router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
   // this record already gets from the UPDATE ... RETURNING above.
   await logActivity(req, 'client.update', 'pt_client', rows[0].id, rows[0]);
   const screening = await screeningSummary(rows[0].id);
-  res.json({ data: {
-    ...rows[0],
-    activation_pending: activationPending,
-    screening_missing: screening.missing,
-    screening_block: screening.block,
-  } });
+  res.json({
+    data: {
+      ...rows[0],
+      activation_pending: activationPending,
+      screening_missing: screening.missing,
+      screening_block: screening.block,
+    },
+  });
 }));
 
 // ─── Client photo upload ────────────────────────────────────
@@ -1905,52 +1917,25 @@ router.get('/dashboard/ops', auth, wrap(async (req, res) => {
 // not a history — the history lives on its own screens.
 router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
   const clientId = req.params.id;
-  const params = [clientId];
-  const orgClause = orgWhere(req, params, 'c.organization_id');
 
-  const { rows: clientRows } = await pool.query(
-    `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes, c.workout_experience_level, c.organization_id
-       FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL ${orgClause}`,
-    params,
-  );
-  const client = clientRows[0];
-  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-
-  const one = (sql) => pool.query(sql, [clientId]).then((r) => r.rows[0] ?? null);
-
-  const [parq, assessment, posture, mobility, lifestyle, goal, assignment, sessions] = await Promise.all([
-    one(`SELECT * FROM pt_parq_forms WHERE client_id = $1 AND deleted_at IS NULL
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_assessments WHERE client_id = $1
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_posture_assessments WHERE client_id = $1
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_mobility_performance_assessments WHERE client_id = $1
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_goals WHERE client_id = $1 AND is_active = true
-          ORDER BY created_at DESC LIMIT 1`),
-    one(`SELECT wa.start_date, wa.progress_pct, wp.id AS plan_id, wp.name AS plan_name,
-                wp.duration_weeks,
-                (SELECT COUNT(DISTINCT we.day_of_week) FROM workout_exercises we
-                  WHERE we.workout_plan_id = wp.id AND we.week_number = 1)::int AS planned_days_count
-           FROM workout_assignments wa
-           JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-          WHERE wa.client_id = $1 AND wa.status = 'active'
-          ORDER BY wa.start_date DESC LIMIT 1`),
-    // Four weeks of the log, so "do they turn up" is answered from what was
-    // performed rather than from the plan's own progress field.
-    pool.query(
-      `SELECT status FROM workout_sessions
-        WHERE client_id = $1 AND session_date >= CURRENT_DATE - INTERVAL '28 days'`,
-      [clientId],
-    ).then((r) => r.rows),
-  ]);
+  // The shared loader owns the tenant gate and the canonical "latest"
+  // ordering, so this route and the coach AI read the same rows.
+  const sources = await loadClientSources(clientId, tenantScope(req).orgId, {
+    clinical: true, training: true, sessionDays: 28,
+  });
+  if (!sources) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
   res.json({
     data: buildBrief({
-      client, parq, assessment, posture, mobility, lifestyle, goal, assignment, recentSessions: sessions,
+      client: sources.client,
+      parq: sources.parq,
+      assessment: sources.latestAssessment,
+      posture: sources.posture,
+      mobility: sources.mobility,
+      lifestyle: sources.lifestyle,
+      goal: sources.goal,
+      assignment: sources.assignment,
+      recentSessions: sources.sessions,
     }),
   });
 }));
@@ -2059,42 +2044,26 @@ router.post('/clients/:id/coach', auth, aiLimiter, requireAiQuota(), wrap(async 
   const client = clientRows[0];
   if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
-  const many = (sql) => pool.query(sql, [clientId]).then((r) => r.rows);
-  const one = (sql) => many(sql).then((rows) => rows[0] ?? null);
-
-  const [lifestyle, measurements, assessments, goal, prRows, lastSession, parq, posture, mobility] =
-    await Promise.all([
-      one(`SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      many(`SELECT weight_kg, measured_at FROM pt_os_measurements
-             WHERE client_id = $1 AND weight_kg IS NOT NULL ORDER BY measured_at DESC LIMIT 12`),
-      many(`SELECT * FROM pt_assessments WHERE client_id = $1
-             ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 12`),
-      one(`SELECT * FROM pt_goals WHERE client_id = $1 AND is_active = true
-            ORDER BY created_at DESC LIMIT 1`),
-      many(`SELECT wse.exercise_name, s.weight_kg, s.reps, ws.session_date
-              FROM workout_sets s
-              JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
-              JOIN workout_sessions ws ON ws.id = wse.session_id
-             WHERE ws.client_id = $1 AND (s.is_pr_weight OR s.is_pr_reps OR s.is_pr_volume)
-             ORDER BY ws.session_date DESC LIMIT 60`),
-      one(`SELECT session_date, status FROM workout_sessions
-            WHERE client_id = $1 AND session_date <= CURRENT_DATE
-            ORDER BY session_date DESC LIMIT 1`),
-      one(`SELECT * FROM pt_parq_forms WHERE client_id = $1 AND deleted_at IS NULL
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_posture_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_mobility_performance_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    ]);
+  // Same canonical rows as the training brief and the snapshot, so the coach
+  // never argues with the card above it.
+  const sources = await loadClientSources(clientId, tenantScope(req).orgId, {
+    client, clinical: true, snapshot: true,
+  });
+  if (!sources) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
   const snapshot = buildSnapshot({
-    client, lifestyle, measurements, assessments, goal, prRows, lastSession,
+    client,
+    lifestyle: sources.lifestyle,
+    measurements: sources.measurements,
+    assessments: sources.assessments,
+    goal: sources.goal,
+    prRows: sources.prRows,
+    lastSession: sources.lastSession,
   });
   const brief = buildBrief({
-    client, parq, assessment: assessments[0] ?? null, posture, mobility, lifestyle, goal,
-    assignment: null, recentSessions: [],
+    client, parq: sources.parq, assessment: sources.latestAssessment,
+    posture: sources.posture, mobility: sources.mobility, lifestyle: sources.lifestyle,
+    goal: sources.goal, assignment: null, recentSessions: [],
   });
 
   const out = await generateCoach({

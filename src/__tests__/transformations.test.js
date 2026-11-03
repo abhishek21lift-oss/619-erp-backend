@@ -94,6 +94,16 @@ describe('a series, or nothing', () => {
 });
 
 describe('tenancy', () => {
+  it('reads fitness tests as well as the legacy measurement log', async () => {
+    answer([]);
+    await getTransformations({ applyFilter: true, orgId: ORG });
+    const [sql] = pool.query.mock.calls[0];
+    // Fitness Testing owns the live body. The legacy log is a fallback for a
+    // studio whose history only exists there.
+    expect(sql).toMatch(/FROM pt_assessments m/);
+    expect(sql).toMatch(/FROM pt_os_measurements m/);
+  });
+
   it('filters on the client, because the measurement row has no org of its own', async () => {
     // pt_os_measurements deliberately carries no organization_id (migration
     // 177: a child row reached only through its parent), so the predicate has

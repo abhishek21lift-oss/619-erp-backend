@@ -19,6 +19,8 @@
     "worker:all": "node src/workers/index.js",
     "lint": "eslint .",
     "migrate": "node src/db/migrate.js",
+    "guard:ownership": "node scripts/phase6-ownership-guard.js",
+    "audit:phase6": "node scripts/phase6-production-audit.js",
     "backfill:training-records": "node scripts/backfill-training-records.js",
     "verify:smtp": "node scripts/verify-smtp.js",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --forceExit",

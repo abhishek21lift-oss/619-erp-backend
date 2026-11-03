@@ -74,10 +74,10 @@ async function updateAssessment(id, organizationId, cols, client = null) {
   return rows[0];
 }
 
-/** Removes the test and the lifts it recorded. Returns false when not found. */
+/** Removes the test and the lifts it recorded. Returns the deleted row, or null. */
 async function deleteAssessment(req, id, client = null) {
   const found = await findAssessment(req, id);
-  if (!found) return false;
+  if (!found) return null;
   const own = !client;
   const c = client || await pool.connect();
   const orgId = orgIdOf(req);
@@ -86,7 +86,7 @@ async function deleteAssessment(req, id, client = null) {
     await c.query(`DELETE FROM strength_logs WHERE assessment_id = $1 AND organization_id = $2`, [id, orgId]);
     await c.query(`DELETE FROM pt_assessments WHERE id = $1 AND organization_id = $2`, [id, orgId]);
     if (own) await c.query('COMMIT');
-    return true;
+    return found;
   } catch (err) {
     if (own) await c.query('ROLLBACK').catch(() => {});
     throw err;
@@ -120,16 +120,36 @@ async function replaceAssessmentLifts(assessment, lifts, client = null) {
 
 /**
  * The latest measured body, onto the client record — the one place Enrollment,
- * the PAR-Q autofill and the profile read it from. Nothing wrote these
- * columns before, so all three showed blank.
+ * the PAR-Q autofill and the profile read it from.
+ *
+ * This is a CACHE of the latest test, not a second measurement. It used to be
+ * called with whatever row was just saved, so editing a 2024 test in 2026 set
+ * the client's current weight to the 2024 value. Deriving from
+ * (assessment_date DESC, created_at DESC, id DESC) makes the cache a pure
+ * function of the newest row: an older edit, or a backdated insert, cannot
+ * move it backwards.
+ *
+ * No row at all leaves the previous value untouched rather than nulling it —
+ * deleting the only test does not erase the last known body. The advisory lock
+ * serialises concurrent create/delete for one client while the caller's
+ * transaction is open; callers should pass their transaction when they have
+ * one.
  */
-async function updateClientBody(clientId, organizationId, weight, heightCm, client = null) {
-  if (weight == null && heightCm == null) return;
+async function syncClientBodyFromLatest(clientId, organizationId, client = null) {
   const c = client || pool;
+  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`client-body:${clientId}`]);
   await c.query(
-    `UPDATE pt_clients SET weight = COALESCE($3, weight), height = COALESCE($4, height)
-      WHERE id = $1 AND organization_id = $2`,
-    [clientId, organizationId, weight ?? null, heightCm ?? null]
+    `UPDATE pt_clients c
+        SET weight = latest.weight, height = latest.height_cm
+       FROM (
+         SELECT weight, height_cm
+           FROM pt_assessments
+          WHERE client_id = $1 AND organization_id = $2
+          ORDER BY assessment_date DESC, created_at DESC, id DESC
+          LIMIT 1
+       ) latest
+      WHERE c.id = $1 AND c.organization_id = $2`,
+    [clientId, organizationId]
   );
 }
 
@@ -146,6 +166,22 @@ async function latestNutritionHabits(clientId) {
     [clientId]
   );
   return rows[0] || {};
+}
+
+/**
+ * The latest submitted PAR-Q, which owns the client's medical conditions.
+ * A draft is not a confirmed screening, so it answers nothing here.
+ */
+async function latestParqMedical(clientId) {
+  const { rows } = await pool.query(
+    `SELECT current_health, past_history, parq_answers
+       FROM pt_parq_forms
+      WHERE client_id = $1 AND deleted_at IS NULL
+        AND status IN ('submitted', 'reviewed')
+      ORDER BY assessment_date DESC, created_at DESC LIMIT 1`,
+    [clientId]
+  );
+  return rows[0] || null;
 }
 
 /** Smoking and alcohol live in Lifestyle; Nutrition's risk reads them. */
@@ -218,6 +254,6 @@ async function deactivateOtherGoals(clientId, organizationId, keepId) {
 
 module.exports = {
   insertAssessment, findAssessment, updateAssessment, deleteAssessment, replaceAssessmentLifts,
-  updateClientBody, latestNutritionHabits, latestLifestyleHabits, deactivateOtherGoals,
+  syncClientBodyFromLatest, latestNutritionHabits, latestLifestyleHabits, latestParqMedical, deactivateOtherGoals,
   listLifestyleAssessments, listNutritionAssessments, updateLifestyleScores, updateNutritionScores,
 };

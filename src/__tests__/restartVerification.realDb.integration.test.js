@@ -34,7 +34,13 @@ describeIf('restart verification, against a real database', () => {
 
   beforeAll(async () => {
     pool = require('../db/pool');
+    // A long in-band run makes process.uptime() the whole jest run, so
+    // PROCESS_STARTED_AT lands more than the 5-minute verify deadline in the
+    // past and the synthetic request falls outside it. Production loads this
+    // module in a process that just booted; do the same here.
+    const uptime = jest.spyOn(process, 'uptime').mockReturnValue(0.001);
     v = require('../modules/command-center/restart-verification');
+    uptime.mockRestore();
     // activity_log.user_id references users; the operator must exist.
     await pool.query(`INSERT INTO users (id, name, email, password, role, is_active)
       VALUES ('rv-op', 'RV Operator', 'rv-op@test.invalid', '!x', 'super_admin', TRUE) ON CONFLICT (id) DO NOTHING`);

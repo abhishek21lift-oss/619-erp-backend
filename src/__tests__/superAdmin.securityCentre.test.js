@@ -4,6 +4,11 @@
 // that the filters they offer actually reach the SQL — a security dashboard
 // that quietly ignores a filter shows an operator a reassuring number about
 // the wrong set.
+//
+// The suite is mock-only, but the route module graph is large enough that a
+// four-shard CI run can exceed Jest's 5 s default before the first assertion.
+// The isolated run takes under 1 s; 15 s is a load allowance, not a slower test.
+jest.setTimeout(15000);
 jest.mock('../db/pool', () => ({ query: jest.fn() }));
 jest.mock('../lib/fileStorage', () => ({ saveFile: jest.fn() }));
 jest.mock('../middleware/auth', () => ({

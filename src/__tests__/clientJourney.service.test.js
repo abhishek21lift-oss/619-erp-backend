@@ -14,7 +14,7 @@ jest.mock('../lib/ptTerm', () => ({ hasPtTermSql: () => 'true' }));
 const pool = require('../db/pool');
 const { screeningSummary } = require('../lib/screeningGate');
 const {
-  journey, createInterview, InterviewInputError,
+  journey, createInterview, updateInterview, InterviewInputError,
 } = require('../modules/pt-os/client-journey.service');
 
 const ORG = '11111111-1111-1111-1111-111111111111';
@@ -109,12 +109,7 @@ describe('structured interview answers are checked before the database', () => {
     ['lifestyle_training_days', 3.5],
     ['lifestyle_training_days', 'five'],
     ['lifestyle_sitting_hours', 'abc'],
-    ['lifestyle_sleep_hours', 25],
-    ['lifestyle_screen_time', 'sometimes'],
     ['lifestyle_meal_regularity', 'sometimes'],
-    ['lifestyle_smoking', 'yes'],
-    ['lifestyle_alcohol', 'often'],
-    ['lifestyle_occupation', 'astronaut'],
     ['previous_workout_experience', 'expert'],
     ['training_challenges', 'time'],
     ['training_challenges', ['time', 'sleeping']],
@@ -162,8 +157,31 @@ describe('structured interview answers are checked before the database', () => {
   it('normalises numeric strings so the driver receives numbers', async () => {
     pool.query.mockResolvedValueOnce({ rowCount: 1 });
     pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1' }] });
-    await attempt({ lifestyle_sitting_hours: '3', lifestyle_sleep_hours: '7.5' });
+    await attempt({ lifestyle_sitting_hours: '3', lifestyle_training_days: '5' });
     const insertParams = pool.query.mock.calls[1][1];
-    expect(insertParams).toEqual(expect.arrayContaining([3, 7.5]));
+    expect(insertParams).toEqual(expect.arrayContaining([3, 5]));
+  });
+
+  it('ignores fields owned by Lifestyle instead of writing them here', async () => {
+    pool.query.mockResolvedValueOnce({ rowCount: 1 });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1' }] });
+    await attempt({
+      lifestyle_occupation: 'desk_job', lifestyle_screen_time: '<2', lifestyle_sleep_hours: 7,
+      lifestyle_smoking: 'never', lifestyle_alcohol: 'never',
+    });
+    const insertSql = pool.query.mock.calls[1][0];
+    for (const column of ['lifestyle_occupation', 'lifestyle_screen_time', 'lifestyle_sleep_hours',
+      'lifestyle_smoking', 'lifestyle_alcohol']) {
+      expect(insertSql).not.toContain(column);
+    }
+  });
+
+  it('still completes a legacy draft whose only answers are in moved columns', async () => {
+    pool.query.mockResolvedValueOnce({
+      rows: [{ id: 'interview-1', status: 'draft', lifestyle_occupation: 'desk_job' }],
+    });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1', status: 'completed' }] });
+    const saved = await updateInterview(ORG, 'interview-1', 'user-1', { status: 'completed' });
+    expect(saved.status).toBe('completed');
   });
 });

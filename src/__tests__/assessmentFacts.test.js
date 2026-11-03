@@ -2,7 +2,17 @@
 // One fact, one owner. Alcohol is asked in Lifestyle; a Nutrition row written
 // before that move still carries drinks-per-week. These pin which copy wins.
 
-const { resolveAlcohol, resolveNutritionHabits } = require('../modules/progress/assessment-facts');
+jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
+
+const logger = require('../lib/logger');
+const {
+  resolveAlcohol, resolveNutritionHabits, resolveMedicalConditions,
+} = require('../modules/progress/assessment-facts');
+
+const deprecatedReads = () => logger.info.mock.calls
+  .filter(([payload]) => payload && payload.event === 'ownership.deprecated_read');
+
+beforeEach(() => logger.info.mockClear());
 
 describe('alcohol has a single owner (Lifestyle)', () => {
   test('Lifestyle drinks win over a legacy Nutrition value', () => {
@@ -36,6 +46,45 @@ describe('alcohol has a single owner (Lifestyle)', () => {
       { alcohol_status: '', drinks_per_week: '' },
       { alcoholic_drinks_per_week: 3 },
     )).toEqual({ status: null, drinksPerWeek: 3 });
+  });
+});
+
+describe('medical conditions have a single owner (PAR-Q)', () => {
+  test('a submitted PAR-Q wins over the legacy Nutrition list', () => {
+    expect(resolveMedicalConditions(
+      {
+        current_health: { known_disease: false },
+        past_history: { heart_disease: true, asthma: false },
+        parq_answers: [{ question_id: 7, answer: 'no' }],
+      },
+      { medical_conditions: ['Diabetes'] },
+    )).toEqual(['Heart disease']);
+    expect(deprecatedReads()).toHaveLength(0);
+  });
+
+  test('a yes on the questionnaire is a condition even with no history toggle set', () => {
+    expect(resolveMedicalConditions(
+      { parq_answers: [{ question_id: 7, answer: 'yes' }] },
+      {},
+    )).toEqual(['Asthma, diabetes, epilepsy or high blood pressure']);
+  });
+
+  test('the legacy Nutrition list is read and logged only when no PAR-Q exists', () => {
+    expect(resolveMedicalConditions(null, { medical_conditions: ['Asthma'] }, { client_id: 'c1' }))
+      .toEqual(['Asthma']);
+    expect(deprecatedReads()).toHaveLength(1);
+    expect(deprecatedReads()[0][0]).toEqual(expect.objectContaining({
+      field: 'medical_conditions', owner: 'PAR-Q',
+      source: 'pt_nutrition_assessments.medical_conditions', client_id: 'c1',
+    }));
+  });
+
+  test('a PAR-Q that reports nothing is an answer, so the legacy list is not consulted', () => {
+    expect(resolveMedicalConditions(
+      { current_health: {}, past_history: {}, parq_answers: [] },
+      { medical_conditions: ['Asthma'] },
+    )).toEqual([]);
+    expect(deprecatedReads()).toHaveLength(0);
   });
 });
 

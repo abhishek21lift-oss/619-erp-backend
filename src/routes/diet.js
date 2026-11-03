@@ -5,6 +5,8 @@ const pool = require('../db/pool');
 const { auth, requireTrainer } = require('../middleware/auth');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { clientInOrg } = require('../lib/orgGuard');
+const logger = require('../lib/logger');
+const { movedFields } = require('../lib/fieldOwnership');
 const { parseStrict } = require('../lib/zodNumbers');
 const { cleanDate } = require('../lib/credentials');
 const { saveAiDietPlan, DietPlanError } = require('../modules/nutrition/ai-diet.service');
@@ -425,12 +427,38 @@ router.get('/fitness-profile/:clientId', auth, async (req, res, next) => {
       `SELECT * FROM client_fitness_profiles WHERE client_id=$1${orgGuard}`,
       [req.params.clientId, scope.orgId]
     );
+    if (rows[0]) {
+      logger.info({
+        event: 'ownership.deprecated_read',
+        field: 'fitness_profile',
+        owner: 'canonical client modules',
+        source: 'client_fitness_profiles',
+        client_id: req.params.clientId,
+      }, 'Read the legacy fitness profile because this endpoint still serves old rows');
+    }
     res.json(rows[0] || null);
   } catch (err) {
     if (err.message?.includes('does not exist')) return res.json(null);
     next(err);
   }
 });
+
+// Every column this table holds duplicates a fact another module owns. The
+// last writer is retired rather than left to keep a second copy in sync.
+const MOVED_FITNESS_PROFILE_FIELDS = {
+  goal: { owner: 'Goal', endpoint: 'POST/PATCH /api/progress/goals' },
+  goal_other: { owner: 'Goal', endpoint: 'POST/PATCH /api/progress/goals' },
+  height_cm: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
+  body_fat_pct: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
+  health_conditions: { owner: 'PAR-Q', endpoint: 'POST/PATCH /api/pt-os/parq/forms' },
+  injuries: { owner: 'Client Interview', endpoint: 'POST/PATCH /api/pt-os/clients/:id/interviews' },
+  emergency_contact: { owner: 'Add Client', endpoint: 'PATCH /api/pt-os/clients/:id' },
+  emergency_phone: { owner: 'Add Client', endpoint: 'PATCH /api/pt-os/clients/:id' },
+  fitness_level: { owner: 'Client enrolment', endpoint: 'PATCH /api/pt-os/clients/:id' },
+  sleep_hours: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  stress_level: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  diet_preference: { owner: 'Nutrition', endpoint: 'POST/PATCH /api/progress/nutrition-assessments' },
+};
 
 // PUT /api/diet/fitness-profile/:clientId
 // requireTrainer, not a self-check. The GET beside this one grew a `role ===
@@ -442,45 +470,39 @@ router.get('/fitness-profile/:clientId', auth, async (req, res, next) => {
 //
 // Gated rather than self-checked because no member surface calls this: the
 // client portal is /api/me, and the member app calls only api.me.* and UPI
-// payments. This is the trainer's intake form.
+// payments. This used to be the trainer's intake form.
+//
+// It now refuses every request, including an empty one. Running the old
+// upsert with a body of nulls would blank a legacy row this endpoint can no
+// longer fill — the same data loss the second writer was retired to prevent.
 router.put('/fitness-profile/:clientId', auth, requireTrainer, async (req, res, next) => {
   try {
-    const d = req.body;
     const clientId = req.params.clientId;
     if (!await clientInOrg(req, clientId))
       return res.status(404).json({ error: 'Client not found' });
 
-    const { rows } = await pool.query(`
-      INSERT INTO client_fitness_profiles (id, client_id, goal, goal_other,
-        height_cm, body_fat_pct, health_conditions, injuries,
-        emergency_contact, emergency_phone, fitness_level,
-        sleep_hours, stress_level, diet_preference, organization_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-      ON CONFLICT (client_id) DO UPDATE SET
-        goal = EXCLUDED.goal,
-        goal_other = EXCLUDED.goal_other,
-        height_cm = EXCLUDED.height_cm,
-        body_fat_pct = EXCLUDED.body_fat_pct,
-        health_conditions = EXCLUDED.health_conditions,
-        injuries = EXCLUDED.injuries,
-        emergency_contact = EXCLUDED.emergency_contact,
-        emergency_phone = EXCLUDED.emergency_phone,
-        fitness_level = EXCLUDED.fitness_level,
-        sleep_hours = EXCLUDED.sleep_hours,
-        stress_level = EXCLUDED.stress_level,
-        diet_preference = EXCLUDED.diet_preference,
-        organization_id = COALESCE(client_fitness_profiles.organization_id, EXCLUDED.organization_id),
-        updated_at = NOW()
-      RETURNING *`,
-      [randomUUID(), clientId, d.goal || null, d.goal_other || null,
-       d.height_cm ? parseFloat(d.height_cm) : null,
-       d.body_fat_pct ? parseFloat(d.body_fat_pct) : null,
-       Array.isArray(d.health_conditions) ? d.health_conditions : null,
-       d.injuries || null, d.emergency_contact || null, d.emergency_phone || null,
-       d.fitness_level || null, d.sleep_hours ? parseFloat(d.sleep_hours) : null,
-       d.stress_level || null, d.diet_preference || null, orgIdOf(req)]
-    );
-    res.json({ message: 'Fitness profile updated', profile: rows[0] });
+    const supplied = movedFields(req.body, MOVED_FITNESS_PROFILE_FIELDS);
+    // An empty (or null-only) body still names where everything moved, so an
+    // old form's clear-all gets an actionable answer rather than a 200.
+    const fields = supplied.length
+      ? supplied
+      : Object.entries(MOVED_FITNESS_PROFILE_FIELDS).map(([field, rule]) => ({ field, ...rule }));
+
+    logger.warn({
+      event: 'ownership.field_moved',
+      route: 'PUT /diet/fitness-profile/:clientId',
+      fields: fields.map((f) => f.field),
+      user_id: req.user?.id ?? null,
+      client_id: clientId,
+    }, 'A write to a field owned by another module was refused');
+
+    return res.status(422).json({
+      error: {
+        code: 'FIELD_MOVED',
+        message: 'client_fitness_profiles no longer has a writer. Save each field in the module that owns it.',
+        fields,
+      },
+    });
   } catch (err) {
     next(err);
   }

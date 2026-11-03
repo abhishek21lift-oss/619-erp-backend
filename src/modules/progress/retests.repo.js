@@ -215,6 +215,39 @@ async function advanceCycle({
 }
 
 /**
+ * The FK nulls baseline_assessment_id when its assessment is deleted. An open
+ * cycle timed from nothing cannot compare, so point it at the newest surviving
+ * test, or close it when the client has no test left at all.
+ */
+async function repairBaselineAfterDelete(orgId, clientId, userId = null) {
+  const { rows: [latest] } = await pool.query(
+    `SELECT id FROM pt_assessments
+      WHERE organization_id = $1 AND client_id = $2
+      ORDER BY assessment_date DESC, created_at DESC, id DESC LIMIT 1`,
+    [orgId, clientId]
+  );
+  const { rows: [open] } = await pool.query(
+    `SELECT id FROM progress_retest_schedules
+      WHERE organization_id = $1 AND client_id = $2
+        AND status IN ('upcoming','due','overdue','rescheduled')
+        AND baseline_assessment_id IS NULL
+      ORDER BY created_at DESC LIMIT 1`,
+    [orgId, clientId]
+  );
+  if (!open) return null;
+  if (!latest) return cancel(orgId, clientId, open.id, 'Baseline assessment deleted', userId);
+  const { rows } = await pool.query(
+    `UPDATE progress_retest_schedules
+        SET baseline_assessment_id = $4, updated_by = COALESCE($5, updated_by), updated_at = NOW()
+      WHERE id = $1 AND organization_id = $2 AND client_id = $3
+        AND status IN ('upcoming','due','overdue','rescheduled')
+      RETURNING *`,
+    [open.id, orgId, clientId, latest.id, userId || null]
+  );
+  return rows[0] || null;
+}
+
+/**
  * Move the open cycle. `rescheduled_from` keeps the first date that was
  * promised, even after several moves; the audit trail is the row history plus
  * updated_at, not a second table that can drift from it.
@@ -416,5 +449,5 @@ async function syncStatus(orgId, scheduleId, status) {
 module.exports = {
   getSettings, upsertSettings, orgTimezone, listAssessments, getAssessment,
   activeSchedule, listSchedules, getSchedule, createSchedule, completeSchedule, advanceCycle,
-  reschedule, cancel, rosterForOverview, openSchedulesForSweep, claimReminder, retryableReminders, markReminder, syncStatus,
+  reschedule, cancel, repairBaselineAfterDelete, rosterForOverview, openSchedulesForSweep, claimReminder, retryableReminders, markReminder, syncStatus,
 };

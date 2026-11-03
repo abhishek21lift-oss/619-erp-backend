@@ -18,8 +18,39 @@ const assessmentsRepo = require('./assessments.repo');
 const assessmentFacts = require('./assessment-facts');
 const retests = require('./retests.service');
 const logger = require('../../lib/logger');
-const { today: studioToday, mondayOf } = require('../../lib/appTime');
+const { logActivity } = require('../../lib/activityLog');
+const { today: studioToday, mondayOf, dbDate } = require('../../lib/appTime');
 const { optionalNumber } = require('../../lib/zodNumbers');
+const { rejectMovedFields } = require('../../lib/fieldOwnership');
+
+// Facts these forms used to write that another module owns. The columns stay
+// readable as legacy fallbacks; a supplied value is a 422 naming the owner.
+const MOVED_LIFESTYLE_FIELDS = {
+  workout_experience_level: { owner: 'Client enrolment', endpoint: 'POST/PATCH /api/pt-os/clients' },
+  food_preferences: { owner: 'Nutrition', endpoint: 'POST/PATCH /api/progress/nutrition-assessments' },
+  water_intake_liters: { owner: 'Nutrition', endpoint: 'POST/PATCH /api/progress/nutrition-assessments' },
+  meal_frequency: { owner: 'Nutrition', endpoint: 'POST/PATCH /api/progress/nutrition-assessments' },
+  breakfast_habit: { owner: 'Nutrition', endpoint: 'POST/PATCH /api/progress/nutrition-assessments' },
+  late_night_eating: { owner: 'Nutrition', endpoint: 'POST/PATCH /api/progress/nutrition-assessments' },
+  motivation_to_exercise: { owner: 'Goal', endpoint: 'POST/PATCH /api/progress/goals' },
+};
+
+const MOVED_NUTRITION_FIELDS = {
+  alcoholic_drinks_per_week: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  meal_timing_consistency: { owner: 'Client Interview', endpoint: 'POST/PATCH /api/pt-os/clients/:id/interviews' },
+  medical_conditions: { owner: 'PAR-Q', endpoint: 'POST/PATCH /api/pt-os/parq/forms' },
+};
+
+const MOVED_MOBILITY_FIELDS = {
+  sit_reach_cm: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
+};
+
+// The starting baseline is write-once evidence: the create route snapshots it
+// from the latest assessment, and an edit may not rewrite history.
+const MOVED_GOAL_STARTING_FIELDS = {
+  starting_weight: { owner: 'Goal baseline (create only)', endpoint: 'POST /api/progress/goals' },
+  starting_body_fat_pct: { owner: 'Goal baseline (create only)', endpoint: 'POST /api/progress/goals' },
+};
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
 // too; declaring it here as well means the guard travels with the router and
@@ -185,7 +216,9 @@ function assessmentAsBody(row) {
     const v = row[k];
     out[k] = ASSESSMENT_NUMERIC.includes(k) && v != null ? Number(v) : v;
   }
-  if (row.assessment_date) out.assessment_date = String(row.assessment_date instanceof Date ? row.assessment_date.toISOString() : row.assessment_date).slice(0, 10);
+  // dbDate, not toISOString(): a DATE is studio-local midnight, so in IST the
+  // ISO instant is the previous day and every edit silently re-dated the test.
+  if (row.assessment_date) out.assessment_date = dbDate(row.assessment_date);
   // A BMR the server suggested is re-derived from the new weight, not frozen.
   if (row.bmr_auto_suggested) out.bmr = null;
   return out;
@@ -491,7 +524,7 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
       ...result.cols, created_by: req.user.id, organization_id: orgIdOf(req),
     }, tx);
     await assessmentsRepo.replaceAssessmentLifts(row, result.lifts, tx);
-    await assessmentsRepo.updateClientBody(row.client_id, row.organization_id, result.cols.weight, result.cols.height_cm, tx);
+    await assessmentsRepo.syncClientBodyFromLatest(row.client_id, row.organization_id, tx);
     await tx.query('COMMIT');
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
@@ -541,7 +574,7 @@ router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdate
     await tx.query('BEGIN');
     row = await assessmentsRepo.updateAssessment(existing.id, orgIdOf(req), result.cols, tx);
     await assessmentsRepo.replaceAssessmentLifts(row, result.lifts, tx);
-    await assessmentsRepo.updateClientBody(row.client_id, row.organization_id, result.cols.weight, result.cols.height_cm, tx);
+    await assessmentsRepo.syncClientBodyFromLatest(row.client_id, row.organization_id, tx);
     await tx.query('COMMIT');
   } catch (err) {
     await tx.query('ROLLBACK').catch(() => {});
@@ -552,8 +585,48 @@ router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdate
   res.json({ data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety, ...(result.strengthWarning ? { strength_warning: result.strengthWarning } : {}) } });
 }));
 
+// Deleting a test used to be a hard, unlogged delete: the baseline and its
+// comparison history vanished with no actor trail, and the client's body cache
+// and re-test cycle kept pointing at the row that no longer existed. The audit
+// event is written after the delete commits (the row is gone, so the event is
+// the only evidence), then the cache and cycle are re-derived.
 router.delete('/assessments/:id', auth, requireTrainer, wrap(async (req, res) => {
-  if (!await assessmentsRepo.deleteAssessment(req, req.params.id)) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  const tx = await pool.connect();
+  let deleted;
+  try {
+    await tx.query('BEGIN');
+    deleted = await assessmentsRepo.deleteAssessment(req, req.params.id, tx);
+    if (!deleted) {
+      await tx.query('ROLLBACK');
+      return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+    }
+    await assessmentsRepo.syncClientBodyFromLatest(deleted.client_id, deleted.organization_id, tx);
+    await tx.query('COMMIT');
+  } catch (err) {
+    await tx.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    tx.release();
+  }
+
+  const assessmentDate = dbDate(deleted.assessment_date);
+  await logActivity(req, 'assessment.delete', 'pt_assessment', deleted.id, {
+    client_id: deleted.client_id,
+    assessment_number: deleted.assessment_number,
+    assessment_type: deleted.assessment_type,
+    assessment_date: assessmentDate,
+  });
+
+  try {
+    await retests.refreshAfterAssessmentDelete({
+      orgId: orgIdOf(req), clientId: deleted.client_id, userId: req.user.id,
+    });
+  } catch (err) {
+    // The delete is already committed; an unrepaired cycle must not turn a
+    // successful delete into a 500 the caller would retry.
+    logger.error({ err: err.message, assessmentId: deleted.id, clientId: deleted.client_id }, 'assessment re-test refresh failed');
+  }
+
   res.status(204).end();
 }));
 
@@ -680,21 +753,21 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
   }
   if (cleaned.rb && b.routine_blueprint != null) b.routine_blueprint = cleaned.rb;
 
-  // Starting weight/body-fat: prefer client-submitted (manual entry when no
-  // assessment exists yet), else snapshot the client's latest assessment.
-  let startingWeight = b.starting_weight ?? null;
-  let startingBodyFat = b.starting_body_fat_pct ?? null;
-  if (startingWeight == null || startingBodyFat == null) {
-    const { rows: aRows } = await pool.query(
-      'SELECT weight, body_fat_pct FROM pt_assessments WHERE client_id = $1 ORDER BY assessment_date DESC LIMIT 1',
-      [b.client_id]
-    );
-    const latest = aRows[0];
-    if (latest) {
-      if (startingWeight == null && latest.weight != null) startingWeight = parseFloat(latest.weight);
-      if (startingBodyFat == null && latest.body_fat_pct != null) startingBodyFat = parseFloat(latest.body_fat_pct);
-    }
-  }
+  // Starting weight/body-fat are write-once evidence: the latest Fitness test
+  // is the baseline. A manual value fills only a measure the assessments do
+  // not have, and an edit may never rewrite the snapshot (PATCH refuses it).
+  const { rows: [latest] } = await pool.query(
+    `SELECT
+       (SELECT weight FROM pt_assessments
+         WHERE client_id = $1 AND weight IS NOT NULL
+         ORDER BY assessment_date DESC, created_at DESC LIMIT 1) AS weight,
+       (SELECT body_fat_pct FROM pt_assessments
+         WHERE client_id = $1 AND body_fat_pct IS NOT NULL
+         ORDER BY assessment_date DESC, created_at DESC LIMIT 1) AS body_fat_pct`,
+    [b.client_id]
+  );
+  const startingWeight = latest?.weight != null ? parseFloat(latest.weight) : (b.starting_weight ?? null);
+  const startingBodyFat = latest?.body_fat_pct != null ? parseFloat(latest.body_fat_pct) : (b.starting_body_fat_pct ?? null);
 
   const analysis = computeGoalAnalysis({
     startingWeight, targetWeight: b.target_weight ?? null,
@@ -757,10 +830,11 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
 }));
 
 router.patch('/goals/:id', auth, validate(goalUpdateSchema), wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'PATCH /goals/:id', MOVED_GOAL_STARTING_FIELDS)) return;
   const allowed = [
     'goal_type', 'goal_other', 'goal_description', 'target_weight', 'target_body_fat', 'target_date', 'notes', 'is_active',
     'motivation_reason', 'priority_goal', 'motivation_level', 'commitment_level', 'biggest_challenges',
-    'lifestyle_readiness', 'starting_weight', 'starting_body_fat_pct',
+    'lifestyle_readiness',
     'status', 'training_days_per_week', 'preferred_training_days', 'training_split', 'routine_blueprint',
     'milestones', 'review_date', 'short_term_weeks', 'medium_term_weeks',
   ];
@@ -1168,7 +1242,7 @@ function clearHabitCounts(b) {
 // fill them in when this assessment has none of its own.
 async function withNutritionHabits(clientId, b) {
   const n = await assessmentsRepo.latestNutritionHabits(clientId);
-  return { ...b, ...assessmentFacts.resolveNutritionHabits(b, n) };
+  return { ...b, ...assessmentFacts.resolveNutritionHabits(b, n, { client_id: clientId }) };
 }
 
 // Shared by POST (create) and PATCH (update) so the Smart Lifestyle
@@ -1290,6 +1364,7 @@ router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
 }));
 
 router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAssessmentCreateSchema), wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'POST /lifestyle-assessments', MOVED_LIFESTYLE_FIELDS)) return;
   const b = clearHabitCounts(req.body);
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computeLifestyleAnalysis(await withNutritionHabits(b.client_id, b));
@@ -1299,40 +1374,37 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
        client_id, assessment_number, assessment_date,
        sleep_duration_hours, bed_time, wake_time, sleep_quality, sleep_category, sleep_score,
        stress_level, stress_score,
-       water_intake_liters, hydration_category, hydration_score,
+       hydration_category, hydration_score,
        occupation_type, daily_steps_bracket, activity_level, activity_score,
-       workout_experience_level, years_of_experience,
-       food_preferences,
-       meal_frequency, breakfast_habit, late_night_eating, nutrition_score,
+       years_of_experience,
+       nutrition_score,
        smoking_status, cigarettes_per_day, years_smoking, alcohol_status, drinks_per_week,
-       screen_time_bracket, travel_frequency, energy_level, motivation_to_exercise, recovery_quality, recovery_score,
+       screen_time_bracket, travel_frequency, energy_level, recovery_quality, recovery_score,
        sedentary_risk, recovery_risk, habit_risk_score, risk_factors, lifestyle_score, lifestyle_readiness,
        coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_lifestyle_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,$7,$8,
        $9,$10,
-       $11,$12,$13,
-       $14,$15,$16,$17,
-       $18,$19,
-       $20,
-       $21,$22,$23,$24,
-       $25,$26,$27,$28,$29,
-       $30,$31,$32,$33,$34,$35,
-       $36,$37,$38,$39,$40,$41,
-       $42::jsonb,$43,$44
+       $11,$12,
+       $13,$14,$15,$16,
+       $17,
+       $18,
+       $19,$20,$21,$22,$23,
+       $24,$25,$26,$27,$28,
+       $29,$30,$31,$32,$33,$34,
+       $35::jsonb,$36,$37
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || studioToday(),
       b.sleep_duration_hours ?? null, b.bed_time || null, b.wake_time || null, b.sleep_quality ?? null, analysis.sleepCategory, analysis.sleepScore,
       b.stress_level ?? null, analysis.stressScore,
-      b.water_intake_liters ?? null, analysis.hydrationCategory, analysis.hydrationScore,
+      analysis.hydrationCategory, analysis.hydrationScore,
       b.occupation_type || null, b.daily_steps_bracket || null, analysis.activityLevel, analysis.activityScore,
-      b.workout_experience_level || null, b.years_of_experience ?? null,
-      b.food_preferences && b.food_preferences.length ? b.food_preferences : null,
-      b.meal_frequency ?? null, b.breakfast_habit || null, b.late_night_eating ?? null, analysis.nutritionScore,
+      b.years_of_experience ?? null,
+      analysis.nutritionScore,
       b.smoking_status || null, b.cigarettes_per_day ?? null, b.years_smoking ?? null, b.alcohol_status || null, b.drinks_per_week ?? null,
-      b.screen_time_bracket || null, b.travel_frequency || null, b.energy_level ?? null, b.motivation_to_exercise ?? null, b.recovery_quality || null, analysis.recoveryScore,
+      b.screen_time_bracket || null, b.travel_frequency || null, b.energy_level ?? null, b.recovery_quality || null, analysis.recoveryScore,
       analysis.sedentaryRisk, analysis.recoveryRisk, analysis.habitRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.lifestyleScore, analysis.lifestyleReadiness,
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
@@ -1341,12 +1413,12 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
 }));
 
 router.patch('/lifestyle-assessments/:id', auth, validate(lifestyleAssessmentUpdateSchema), wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'PATCH /lifestyle-assessments/:id', MOVED_LIFESTYLE_FIELDS)) return;
   const allowed = [
     'assessment_date', 'sleep_duration_hours', 'bed_time', 'wake_time', 'sleep_quality', 'stress_level',
-    'water_intake_liters', 'occupation_type', 'daily_steps_bracket', 'workout_experience_level', 'years_of_experience',
-    'food_preferences', 'meal_frequency', 'breakfast_habit', 'late_night_eating',
+    'occupation_type', 'daily_steps_bracket', 'years_of_experience',
     'smoking_status', 'cigarettes_per_day', 'years_smoking', 'alcohol_status', 'drinks_per_week',
-    'screen_time_bracket', 'travel_frequency', 'energy_level', 'motivation_to_exercise', 'recovery_quality', 'coach_notes',
+    'screen_time_bracket', 'travel_frequency', 'energy_level', 'recovery_quality', 'coach_notes',
   ];
 
   // Scoped read before the write. Unscoped, this loaded — and the UPDATE below
@@ -1452,7 +1524,11 @@ async function computeNutritionAnalysis(clientId, b) {
   // again. A drinks-per-week on an older Nutrition row still counts when
   // Lifestyle has none.
   const lifestyle = await assessmentsRepo.latestLifestyleHabits(clientId);
-  const alcohol = assessmentFacts.resolveAlcohol(lifestyle, b);
+  const alcohol = assessmentFacts.resolveAlcohol(lifestyle, b, { client_id: clientId });
+  // PAR-Q owns medical conditions; this form keeps only the nutrition notes
+  // about them. A legacy list on the row still counts when no PAR-Q exists.
+  const parq = await assessmentsRepo.latestParqMedical(clientId);
+  const medicalConditions = assessmentFacts.resolveMedicalConditions(parq, b, { client_id: clientId });
 
   const dietQualityScore = nutritionScoring.calcDietQualityScore(
     b.foods_to_avoid ?? null, b.favourite_foods ?? null, b.cravings ?? null,
@@ -1469,7 +1545,7 @@ async function computeNutritionAnalysis(clientId, b) {
   const riskInputs = {
     proteinAssessment: protein.assessment, hydrationScore, digestiveHealthScore,
     cravings: b.cravings ?? null, cravingFrequency: b.craving_frequency ?? null,
-    medicalConditions: b.medical_conditions ?? null, medicalNotes: b.medical_notes ?? null,
+    medicalConditions, medicalNotes: b.medical_notes ?? null,
     alcoholStatus: alcohol.status, smokingStatus: lifestyle.smoking_status || null,
   };
   const nutritionRiskScore = nutritionScoring.calcNutritionRiskScore(riskInputs);
@@ -1557,6 +1633,7 @@ router.get('/nutrition-assessments', auth, wrap(async (req, res) => {
 }));
 
 router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAssessmentCreateSchema), wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'POST /nutrition-assessments', MOVED_NUTRITION_FIELDS)) return;
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = await computeNutritionAnalysis(b.client_id, b);
@@ -1570,10 +1647,10 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
        takes_supplements, supplements,
        digestive_issues,
        meals_per_day, breakfast_regularity, lunch_regularity, dinner_regularity, snacks_per_day,
-       late_night_eating, meal_timing_consistency, eating_out_frequency, weekend_eating_habits, eating_behaviours,
+       late_night_eating, eating_out_frequency, weekend_eating_habits, eating_behaviours,
        water_intake_liters, tea_cups_per_day, coffee_cups_per_day, soft_drinks_per_day, juices_per_day,
-       alcoholic_drinks_per_week, daily_fluid_intake_liters, cravings, craving_frequency,
-       meal_preparer, nutrition_budget, medical_conditions, medical_notes,
+       daily_fluid_intake_liters, cravings, craving_frequency,
+       meal_preparer, nutrition_budget, medical_notes,
        diet_quality_score, protein_score, protein_assessment, hydration_score, digestive_health_score,
        supplement_score, nutrition_risk_score, risk_factors, nutrition_score, nutrition_readiness,
        coach_notes, created_by, organization_id
@@ -1585,13 +1662,13 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
        $8,$9::jsonb,
        $10::jsonb,
        $11,$12,$13,$14,$15,
-       $16,$17,$18,$19,$20,
-       $21,$22,$23,$24,$25,
-       $26,$27,$28,$29,
-       $30,$31,$32,$33,
-       $34,$35,$36,$37,$38,
-       $39,$40,$41,$42,$43,
-       $44::jsonb,$45,$46
+       $16,$17,$18,$19,
+       $20,$21,$22,$23,$24,
+       $25,$26,$27,
+       $28,$29,$30,
+       $31,$32,$33,$34,$35,
+       $36,$37,$38,$39,$40,
+       $41::jsonb,$42,$43
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || studioToday(),
@@ -1603,11 +1680,11 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
       b.takes_supplements ?? null, b.supplements ? JSON.stringify(b.supplements) : null,
       b.digestive_issues ? JSON.stringify(b.digestive_issues) : null,
       b.meals_per_day ?? null, b.breakfast_regularity || null, b.lunch_regularity || null, b.dinner_regularity || null, b.snacks_per_day ?? null,
-      b.late_night_eating ?? null, b.meal_timing_consistency || null, b.eating_out_frequency || null, b.weekend_eating_habits || null,
+      b.late_night_eating ?? null, b.eating_out_frequency || null, b.weekend_eating_habits || null,
       b.eating_behaviours && b.eating_behaviours.length ? b.eating_behaviours : null,
       b.water_intake_liters ?? null, b.tea_cups_per_day ?? null, b.coffee_cups_per_day ?? null, b.soft_drinks_per_day ?? null, b.juices_per_day ?? null,
-      b.alcoholic_drinks_per_week ?? null, analysis.dailyFluidIntake, b.cravings && b.cravings.length ? b.cravings : null, b.craving_frequency || null,
-      b.meal_preparer || null, b.nutrition_budget || null, b.medical_conditions && b.medical_conditions.length ? b.medical_conditions : null, b.medical_notes || null,
+      analysis.dailyFluidIntake, b.cravings && b.cravings.length ? b.cravings : null, b.craving_frequency || null,
+      b.meal_preparer || null, b.nutrition_budget || null, b.medical_notes || null,
       analysis.dietQualityScore, analysis.proteinScore, analysis.proteinAssessment, analysis.hydrationScore, analysis.digestiveHealthScore,
       analysis.supplementScore, analysis.nutritionRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.nutritionScore, analysis.nutritionReadiness,
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
@@ -1617,6 +1694,7 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
 }));
 
 router.patch('/nutrition-assessments/:id', auth, validate(nutritionAssessmentUpdateSchema), wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'PATCH /nutrition-assessments/:id', MOVED_NUTRITION_FIELDS)) return;
   const allowed = [
     'assessment_date',
     'diet_preferences',
@@ -1625,10 +1703,10 @@ router.patch('/nutrition-assessments/:id', auth, validate(nutritionAssessmentUpd
     'takes_supplements', 'supplements',
     'digestive_issues',
     'meals_per_day', 'breakfast_regularity', 'lunch_regularity', 'dinner_regularity', 'snacks_per_day',
-    'late_night_eating', 'meal_timing_consistency', 'eating_out_frequency', 'weekend_eating_habits', 'eating_behaviours',
+    'late_night_eating', 'eating_out_frequency', 'weekend_eating_habits', 'eating_behaviours',
     'water_intake_liters', 'tea_cups_per_day', 'coffee_cups_per_day', 'soft_drinks_per_day', 'juices_per_day',
-    'alcoholic_drinks_per_week', 'cravings', 'craving_frequency',
-    'meal_preparer', 'nutrition_budget', 'medical_conditions', 'medical_notes', 'coach_notes',
+    'cravings', 'craving_frequency',
+    'meal_preparer', 'nutrition_budget', 'medical_notes', 'coach_notes',
   ];
 
   // Scoped read before the write, as on the lifestyle PATCH above.
@@ -1729,6 +1807,7 @@ router.get('/mobility-performance-assessments', auth, wrap(async (req, res) => {
 }));
 
 router.post('/mobility-performance-assessments', auth, requireTrainer, validate(mobilityPerformanceAssessmentCreateSchema), wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'POST /mobility-performance-assessments', MOVED_MOBILITY_FIELDS)) return;
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computeMobilityAnalysis(b);
@@ -1737,18 +1816,18 @@ router.post('/mobility-performance-assessments', auth, requireTrainer, validate(
     `INSERT INTO pt_mobility_performance_assessments (
        client_id, assessment_number, assessment_date,
        body_regions, mobility_tests,
-       grip_strength_kg, vertical_jump_cm, sit_reach_cm, balance_test_seconds, reaction_time_ms, performance_notes,
+       grip_strength_kg, vertical_jump_cm, balance_test_seconds, reaction_time_ms, performance_notes,
        mobility_score, mobility_category, created_by, organization_id
      ) VALUES (
        $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_mobility_performance_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3::jsonb,$4::jsonb,
-       $5,$6,$7,$8,$9,$10,
-       $11,$12,$13,$14
+       $5,$6,$7,$8,$9,
+       $10,$11,$12,$13
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || studioToday(),
       b.body_regions ? JSON.stringify(b.body_regions) : null, b.mobility_tests ? JSON.stringify(b.mobility_tests) : null,
-      b.grip_strength_kg ?? null, b.vertical_jump_cm ?? null, b.sit_reach_cm ?? null, b.balance_test_seconds ?? null, b.reaction_time_ms ?? null, b.performance_notes || null,
+      b.grip_strength_kg ?? null, b.vertical_jump_cm ?? null, b.balance_test_seconds ?? null, b.reaction_time_ms ?? null, b.performance_notes || null,
       analysis.mobilityScore, analysis.mobilityCategory, req.user.id, orgIdOf(req),
     ]
   ));
@@ -1756,6 +1835,7 @@ router.post('/mobility-performance-assessments', auth, requireTrainer, validate(
 }));
 
 router.patch('/mobility-performance-assessments/:id', auth, validate(mobilityPerformanceAssessmentUpdateSchema), wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'PATCH /mobility-performance-assessments/:id', MOVED_MOBILITY_FIELDS)) return;
   const allowed = [
     'assessment_date', 'body_regions', 'mobility_tests',
     'grip_strength_kg', 'vertical_jump_cm', 'sit_reach_cm', 'balance_test_seconds', 'reaction_time_ms', 'performance_notes',

@@ -47,6 +47,7 @@
 const pool = require('../../db/pool');
 const { buildBrief } = require('./training-brief');
 const { buildRecovery } = require('./recovery');
+const { loadClientSources, resolveLandmarks } = require('./authoritative-client');
 const { buildTrainingHistory, isoWeek } = require('./training-history');
 const { evaluate, equipmentFrom, weeklyMuscleSets, screenExercise } = require('./programming-rules');
 const { normaliseName } = require('./plan-critic');
@@ -66,7 +67,6 @@ const DEFAULT_WINDOW_WEEKS = 12;
  * whose log is later imported in bulk cannot turn one generation request into
  * an unbounded read.
  */
-const MAX_SETS = 2000;
 
 /**
  * Every row we hold about one client, and what it adds up to.
@@ -159,78 +159,44 @@ function programState(assignment, sessions = [], today = studioToday()) {
 }
 
 async function loadDigitalTwin(clientId, orgId, {
-  windowWeeks = DEFAULT_WINDOW_WEEKS, equipmentText = null, exercises = [],
+  windowWeeks = DEFAULT_WINDOW_WEEKS, equipmentText = null, exercises = [], sources = null,
 } = {}) {
-  const { rows: clientRows } = await pool.query(
-    `SELECT id, name, gender, dob, goal, injuries, notes, workout_experience_level,
-            health_conditions, organization_id
-       FROM pt_clients
-      WHERE id = $1 AND deleted_at IS NULL
-        AND organization_id = $2`,
-    [clientId, orgId],
-  );
-  const client = clientRows[0];
-  if (!client) return null;
-
   const weeks = Math.max(1, Math.min(104, Number(windowWeeks) || DEFAULT_WINDOW_WEEKS));
-  const one = (sql, params = [clientId]) => pool.query(sql, params).then((r) => r.rows[0] ?? null);
-  const many = (sql, params = [clientId]) => pool.query(sql, params).then((r) => r.rows);
 
-  const [parq, assessment, posture, mobility, lifestyle, goal, assignment, sessions, sets, checkins, landmarks] =
-    await Promise.all([
-      one(`SELECT * FROM pt_parq_forms WHERE client_id = $1 AND deleted_at IS NULL
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_posture_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_mobility_performance_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1
-            ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-      one(`SELECT * FROM pt_goals WHERE client_id = $1 AND is_active = true
-            ORDER BY created_at DESC LIMIT 1`),
-      one(`SELECT wa.start_date, wa.progress_pct, wp.id AS plan_id, wp.name AS plan_name,
-                  wp.duration_weeks,
-                  (SELECT COUNT(DISTINCT we.day_of_week) FROM workout_exercises we
-                    WHERE we.workout_plan_id = wp.id AND we.week_number = 1)::int AS planned_days_count
-             FROM workout_assignments wa
-             JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-            WHERE wa.client_id = $1 AND wa.status = 'active'
-            ORDER BY wa.start_date DESC LIMIT 1`),
-      many(
-        `SELECT status, session_date FROM workout_sessions
-          WHERE client_id = $1 AND session_date >= CURRENT_DATE - ($2 * INTERVAL '1 week')`,
-        [clientId, weeks],
-      ),
-      // The half of the loop nothing outside the workout log has ever read.
-      // target_muscle rides along so weekly volume needs no second query — the
-      // same key muscle_volume_landmarks and the analytics screen use. Null for
-      // a set whose exercise was typed free-hand, which is 29 of production's
-      // 408 completed sets, and reported rather than dropped.
-      many(
-        `SELECT wse.exercise_name, s.weight_kg, s.reps, s.rpe, s.rir, s.completed,
-                ws.session_date, e.target_muscle
-           FROM workout_sets s
-           JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
-           JOIN workout_sessions ws ON ws.id = wse.session_id
-           LEFT JOIN exercises e ON e.id = wse.exercise_id
-          WHERE ws.client_id = $1
-            AND ws.session_date >= CURRENT_DATE - ($2 * INTERVAL '1 week')
-          ORDER BY ws.session_date DESC
-          LIMIT ${MAX_SETS}`,
-        [clientId, weeks],
-      ),
-      many(`SELECT week_start_date, mood, sleep_hours, water_glasses,
-                   stress_level, energy_level, soreness_level
-              FROM weekly_checkins WHERE client_id = $1
-             ORDER BY week_start_date DESC LIMIT 12`),
-      resolveLandmarks(orgId),
-    ]);
+  // One loader, shared with the plan generators, the brief and the snapshot.
+  // A caller that already loaded the same client (workout/generate) passes its
+  // source bag so no table is read twice in one request.
+  const loaded = sources || await loadClientSources(clientId, orgId, {
+    clinical: true,
+    training: true,
+    sets: true,
+    checkins: true,
+    landmarks: true,
+    windowWeeks: weeks,
+  });
+  if (!loaded) return null;
+
+  const client = loaded.client;
+  const { parq, posture, mobility, lifestyle } = loaded;
+  const assessment = loaded.latestAssessment;
+  const goal = loaded.goal;
+  const assignment = loaded.assignment;
+  const sessions = loaded.sessions || [];
+  const sets = loaded.sets || [];
+  const checkins = loaded.checkins || [];
+  const landmarks = loaded.landmarks instanceof Map ? loaded.landmarks : await resolveLandmarks(orgId);
+
+  // The brief reports "last 4 weeks" and counted sessions from the whole
+  // training window — twelve weeks described as four. Filter before building.
+  const recentSessions = sessions.filter((s) => {
+    if (!s?.session_date) return false;
+    const on = new Date(s.session_date).getTime();
+    return Number.isFinite(on) && on >= Date.now() - 28 * 86400000;
+  });
 
   const brief = buildBrief({
     client, parq, assessment, posture, mobility, lifestyle, goal, assignment,
-    recentSessions: sessions,
+    recentSessions,
   });
   const recovery = buildRecovery(checkins);
   const history = buildTrainingHistory({
@@ -603,49 +569,6 @@ async function screenPlanExercises(names = [], { orgId, userId, screen } = {}) {
   return out;
 }
 
-/**
- * The studio's weekly set ranges per muscle, or the platform defaults.
- *
- * The same resolution workout-log.routes.js has always used for the analytics
- * screen: DISTINCT ON with the NULL organization sorted last, which expresses
- * "mine, else the shared one" in a single pass.
- *
- * Shared rather than re-derived because the programming engine and the
- * analytics screen must agree. The first version of programming-rules.js
- * hardcoded its own coarser ranges, so a studio that edited its landmarks in
- * the UI saw them honoured on one screen and ignored by the engine.
- *
- * Muscles with no row come back absent, and volumeLandmarks reports them as
- * unranged rather than judging them — six of the library's eighteen target
- * muscles are in that position today.
- */
-async function resolveLandmarks(orgId) {
-  const { rows } = await pool.query(
-    `SELECT DISTINCT ON (target_muscle) target_muscle, mev_sets, mrv_sets
-       FROM muscle_volume_landmarks
-      WHERE organization_id IS NULL OR ($1::uuid IS NOT NULL AND organization_id = $1)
-      ORDER BY target_muscle, organization_id NULLS LAST`,
-    [orgId || null],
-  );
-  // The table stores muscle names lowercase ("middle back"); the library
-  // spells them "Middle Back". Keyed on the library's spelling, because that
-  // is what the set rows carry.
-  const out = new Map();
-  for (const r of rows) {
-    out.set(titleCaseMuscle(r.target_muscle), { mev_sets: r.mev_sets, mrv_sets: r.mrv_sets });
-  }
-  return out;
-}
-
-/** "middle back" → "Middle Back", matching exercises.target_muscle. */
-function titleCaseMuscle(name) {
-  return String(name || '')
-    .trim()
-    .split(/\s+/)
-    .map((w) => (w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w))
-    .join(' ');
-}
-
 /** Verdict ordering, so the stricter of two matches wins. */
 const RANK_OF = Object.freeze({ allow: 0, caution: 1, block: 2 });
 
@@ -795,5 +718,4 @@ module.exports = {
   limitationsLine,
   adherenceInputs,
   DEFAULT_WINDOW_WEEKS,
-  MAX_SETS,
 };

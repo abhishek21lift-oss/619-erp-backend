@@ -8,12 +8,24 @@ const router = require('express').Router();
 const { auth, requireTrainer } = require('../../middleware/auth');
 const { orgIdOf } = require('../../lib/tenant-db');
 const { logActivity } = require('../../lib/activityLog');
+const { rejectMovedFields } = require('../../lib/fieldOwnership');
 const svc = require('./client-journey.service');
 
 router.use(auth, requireTrainer);
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const NOT_FOUND = { error: { code: 'NOT_FOUND', message: 'Client not found' } };
+
+// The Interview owns the quick screen only. These five were written here
+// before the Lifestyle assessment became their owner; the columns stay
+// readable, but a write is refused rather than silently dropped.
+const MOVED_INTERVIEW_FIELDS = {
+  lifestyle_occupation: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  lifestyle_screen_time: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  lifestyle_sleep_hours: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  lifestyle_smoking: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  lifestyle_alcohol: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+};
 
 /** An interview input error as a 4xx; anything else to the error handler. */
 function inputError(res, err) {
@@ -46,6 +58,7 @@ router.get('/clients/:id/interviews', wrap(async (req, res) => {
 
 // POST /pt-os/clients/:id/interviews — start (or record) an interview.
 router.post('/clients/:id/interviews', wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'POST /clients/:id/interviews', MOVED_INTERVIEW_FIELDS)) return;
   try {
     const row = await svc.createInterview(orgIdOf(req), req.params.id, req.user.id, req.body || {});
     if (!row) return res.status(404).json(NOT_FOUND);
@@ -58,6 +71,7 @@ router.post('/clients/:id/interviews', wrap(async (req, res) => {
 
 // PATCH /pt-os/interviews/:id — edit, or complete.
 router.patch('/interviews/:id', wrap(async (req, res) => {
+  if (rejectMovedFields(req, res, 'PATCH /interviews/:id', MOVED_INTERVIEW_FIELDS)) return;
   try {
     const row = await svc.updateInterview(orgIdOf(req), req.params.id, req.user.id, req.body || {});
     if (!row) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Interview not found' } });

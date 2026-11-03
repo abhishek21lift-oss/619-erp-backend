@@ -41,6 +41,12 @@ jobs:
         # CI immediately rather than being absorbed into a budget.
         run: npm run lint -- --max-warnings=0
 
+      # No database needed: this is a source scan against the committed
+      # baseline. It fails on a new retired-table read/write, a new direct AI
+      # client-fact query, or a baseline entry whose code has been removed.
+      - name: Phase 6 ownership guard
+        run: node scripts/phase6-ownership-guard.js
+
   # ── Job 2: Unit tests ──────────────────────────────────────────────
   test:
     name: Jest
@@ -55,6 +61,10 @@ jobs:
       # actually run in CI. Its own database, separate from test_619, stood up
       # by the step below.
       RLS_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rls_proof?sslmode=disable
+      # The production-shaped fixture the Phase 4 gate and the Phase 5
+      # reconciliation report run against. Built by the setup step below;
+      # both suites fail loudly in CI if this is unset.
+      PHASE4_SHAPE_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase4_shape?sslmode=disable
       # psql and node-postgres both read this; the service below is not on
       # trust auth.
       PGPASSWORD: postgres
@@ -99,6 +109,45 @@ jobs:
         env:
           RLS_PG_HOST: localhost
           RLS_PG_PORT: 5432
+
+      # Same real schema and migrations, then the synthetic Phase 4 population.
+      # The Phase 4 gate and the Phase 5 report are mandatory: without this
+      # database they fail rather than skip.
+      - name: Stand up the Phase 4/5 production-shape database
+        run: ./scripts/phase4-shape-setup.sh
+        env:
+          RLS_PG_HOST: localhost
+          RLS_PG_PORT: 5432
+
+      # Run the gate alone as well as inside `npm test`, so a skip or a deleted
+      # test file is a named red step instead of an absence.
+      - name: Phase 4 production-shape gate
+        run: npx jest src/__tests__/productionShape.phase4.realDb.integration.test.js --runInBand --forceExit --passWithNoTests=false
+        env:
+          NODE_OPTIONS: --experimental-vm-modules
+
+      # Read-only. Generates the field-level report and the review plan; the
+      # apply step is never run in CI.
+      - name: Phase 5 reconciliation report
+        run: >-
+          node scripts/phase5-reconcile-ownership.js
+          --url "$PHASE4_SHAPE_DATABASE_URL"
+          --json /tmp/phase5-report.json
+          --md /tmp/phase5-report.md
+          --plan /tmp/phase5-plan.json
+          --csv /tmp/phase5-review.csv
+
+      # The guarded wrapper is the only production entry point. Here it runs
+      # against the fixture to prove the read-only preflight, the decision
+      # register and the hash manifest before anyone points it at production.
+      - name: Phase 6 guarded audit (fixture proof)
+        run: >-
+          node scripts/phase6-production-audit.js
+          --url "$PHASE4_SHAPE_DATABASE_URL"
+          --confirm-host localhost
+          --acknowledge-production
+          --org a4a4a4a4-a4a4-4a4a-a4a4-a4a4a4a4a4a4
+          --out-dir /tmp/phase6-audit
 
       - name: Run tests
         run: npm test

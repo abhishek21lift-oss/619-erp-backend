@@ -1097,17 +1097,19 @@ async function getCheckinInsightInputs(clientId, scope = {}, limit = 12) {
  * returned the FIRST client in the array and printed an arbitrary member's
  * name under a trophy.
  *
- * The real series is pt_os_measurements: one row per measuring session,
- * carrying weight_kg and measured_at. First and latest of those is a
- * transformation; a single current weight never was.
+ * The real series is pt_assessments — Fitness Testing owns the live body —
+ * with pt_os_measurements kept as a legacy fallback for a studio whose
+ * history only exists there. One row per test or measuring session, carrying
+ * a date and a weight. First and latest of those is a transformation; a
+ * single current weight never was.
  *
  * ── Tenancy ────────────────────────────────────────────────────────────────
  *
  * pt_os_measurements deliberately has no organization_id — migration 177
  * records it as a child row reached only through its parent. So the tenant
- * predicate lives on the JOIN to pt_clients, and a measurement can only be
- * read through a client this caller already owns. There is no path here that
- * touches a measurement row without passing that filter first.
+ * predicate lives on the JOIN to pt_clients, which also scopes the assessment
+ * branch, and no reading can be read through a client this caller does not
+ * own. There is no path here that touches a reading without that filter.
  */
 async function getTransformations(scope = {}) {
   const params = [];
@@ -1116,18 +1118,34 @@ async function getTransformations(scope = {}) {
   orgClause = ` AND c.organization_id = $${params.length}`;
 
   const { rows } = await pool.query(
-    `WITH ranked AS (
+    `WITH readings AS (
+       SELECT m.client_id,
+              m.weight      AS weight_kg,
+              m.assessment_date::timestamptz AS measured_at,
+              0 AS src
+         FROM pt_assessments m
+        WHERE m.weight IS NOT NULL
+       UNION ALL
        SELECT m.client_id,
               m.weight_kg,
               m.measured_at,
-              ROW_NUMBER() OVER (PARTITION BY m.client_id ORDER BY m.measured_at ASC)  AS first_rn,
-              ROW_NUMBER() OVER (PARTITION BY m.client_id ORDER BY m.measured_at DESC) AS last_rn,
-              COUNT(*)    OVER (PARTITION BY m.client_id)                              AS n
+              1 AS src
          FROM pt_os_measurements m
+        WHERE m.weight_kg IS NOT NULL
+     ),
+     ranked AS (
+       SELECT m.client_id,
+              m.weight_kg,
+              m.measured_at,
+              ROW_NUMBER() OVER (PARTITION BY m.client_id
+                                 ORDER BY m.measured_at ASC, m.src ASC)  AS first_rn,
+              ROW_NUMBER() OVER (PARTITION BY m.client_id
+                                 ORDER BY m.measured_at DESC, m.src ASC) AS last_rn,
+              COUNT(*)    OVER (PARTITION BY m.client_id)                    AS n
+         FROM readings m
          JOIN pt_clients c ON c.id = m.client_id
         WHERE c.deleted_at IS NULL
-          AND c.status = 'active'
-          AND m.weight_kg IS NOT NULL${orgClause}
+          AND c.status = 'active'${orgClause}
      )
      SELECT c.id,
             c.client_id,

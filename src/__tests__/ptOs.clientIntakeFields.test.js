@@ -172,12 +172,17 @@ describe('POST /pt-os/clients stores the new intake fields', () => {
     expect(insertedValue('address')).toBeNull();
   });
 
-  test('occupation is still accepted — the column did not go away', async () => {
-    // The intake form stopped asking, but the lifestyle assessment still
-    // writes it and the training brief still reads it.
+  test('occupation is refused — Lifestyle owns it', async () => {
+    // The intake form stopped asking. The column stays readable (the lifestyle
+    // assessment writes it and the training brief reads it), but Add Client is
+    // no longer a second write path; it names the owner instead of dropping it.
     const res = await request(app()).post('/api/pt-os/clients').send(intake({ occupation: 'Teacher' }));
-    expect(res.status).toBe(201);
-    expect(insertedValue('occupation')).toBe('Teacher');
+    expect(res.status).toBe(422);
+    expect(res.body.error.code).toBe('FIELD_MOVED');
+    expect(res.body.error.fields).toContainEqual({
+      field: 'occupation', owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments',
+    });
+    expect(insertedValue('occupation')).toBeUndefined();
   });
 });
 

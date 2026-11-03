@@ -113,6 +113,14 @@ describeIf('/api/me against a real database', () => {
     await pool.query(
       `INSERT INTO pt_os_measurements (id, client_id, waist_cm, body_fat_pct, measured_at)
        VALUES ('me-int-meas', $1, 82.5, 21.4, NOW() - INTERVAL '3 days') ON CONFLICT (id) DO NOTHING`, [CLIENT]);
+    // The canonical owner: a fitness test, newer than the legacy measurement.
+    await pool.query(
+      `INSERT INTO pt_assessments
+         (id, client_id, organization_id, assessment_date, assessment_type,
+          weight, body_fat_pct, chest_cm, waist_cm, hips_cm, arms_cm, thighs_cm)
+       VALUES ('me-int-assess', $1, $2, CURRENT_DATE, 'follow_up',
+               74.2, 20.4, 96, 80, 98, 30, 55)
+       ON CONFLICT (id) DO NOTHING`, [CLIENT, ORG]);
     await pool.query(
       `INSERT INTO workout_sessions (id, client_id, session_date, program_name, workout_day,
                                      duration_minutes, status, notes, organization_id)
@@ -149,6 +157,7 @@ describeIf('/api/me against a real database', () => {
     await pool.query(`DELETE FROM pt_goals WHERE client_id = $1`, [CLIENT]);
     await pool.query(`DELETE FROM pt_parq_forms WHERE id = 'me-int-parq'`);
     await pool.query(`DELETE FROM pt_informed_consents WHERE id = 'me-int-consent'`);
+    await pool.query(`DELETE FROM pt_assessments WHERE id = 'me-int-assess'`);
     await pool.query(`DELETE FROM pt_os_measurements WHERE id = 'me-int-meas'`);
     await pool.query(`DELETE FROM user_profiles WHERE user_id = $1`, [TRAINER_USER]);
     await pool.query(`DELETE FROM users WHERE id = ANY($1)`, [[USER, TRAINER_USER]]);
@@ -274,6 +283,14 @@ describeIf('/api/me against a real database', () => {
     const { rows } = await pool.query('SELECT name, balance_amount FROM pt_clients WHERE id = $1', [CLIENT]);
     expect(rows[0].name).toBe('Mina');
     expect(Number(rows[0].balance_amount)).toBe(1500);
+
+    // A member's own edit is an auditable client-record change, just like the
+    // trainer's edit on the same row.
+    const { rows: audit } = await pool.query(
+      `SELECT new_data FROM activity_log
+        WHERE action = 'client.contact.update' AND entity_id = $1
+        ORDER BY created_at DESC LIMIT 1`, [CLIENT]);
+    expect(audit[0].new_data.fields).toEqual(['mobile', 'address']);
   });
 
   test('an invalid mobile is refused', async () => {
@@ -350,11 +367,35 @@ describeIf('/api/me against a real database', () => {
     });
   });
 
-  test('measurements carry body measurements as well as weight', async () => {
+  test('the canonical assessment comes first, with its body measurements', async () => {
+    const res = await request().get('/api/me/measurements');
+    const a = res.body.data.find((x) => x.source === 'assessment');
+    expect(a).toBeDefined();
+    expect({
+      weight: Number(a.weight_kg), fat: Number(a.body_fat_pct), chest: Number(a.chest_cm),
+      waist: Number(a.waist_cm), hip: Number(a.hip_cm), arms: Number(a.arms_cm), thighs: Number(a.thighs_cm),
+      shoulders: a.shoulders_cm,
+    }).toEqual({ weight: 74.2, fat: 20.4, chest: 96, waist: 80, hip: 98, arms: 30, thighs: 55, shoulders: null });
+    // Canonical is newest here; the legacy reading and the check-in follow it.
+    expect(res.body.data[0].source).toBe('assessment');
+  });
+
+  test('legacy measurements still reach the member, labelled as the trainer\'s', async () => {
     const res = await request().get('/api/me/measurements');
     const m = res.body.data.find((x) => x.source === 'trainer');
     expect(Number(m.waist_cm)).toBe(82.5);
     expect(Number(m.body_fat_pct)).toBe(21.4);
     expect(m.weight_kg).toBeNull();
+  });
+
+  test('measurements are scoped to the member asking', async () => {
+    asClient = CLIENT_2;
+    try {
+      const res = await request().get('/api/me/measurements');
+      expect(res.status).toBe(200);
+      expect(res.body.data).toEqual([]);
+    } finally {
+      asClient = CLIENT;
+    }
   });
 });

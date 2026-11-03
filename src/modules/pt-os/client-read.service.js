@@ -5,6 +5,7 @@ const { hasPtTermSql, priorTermsPaidJoin, currentTermBalanceSql } = require('../
 const { buildBrief } = require('./training-brief');
 const { buildSnapshot } = require('./client-snapshot');
 const { buildRecovery } = require('./recovery');
+const { loadClientSources } = require('./authoritative-client');
 const { screeningSummary } = require('../../lib/screeningGate');
 const svc = require('./pt-os.service');
 
@@ -81,9 +82,8 @@ async function getClientProfile(orgId, clientId) {
  * Returns alerts, goal card, PRs, coach prompts, and recovery.
  */
 async function getClientSnapshot(orgId, clientId) {
-  const visible = await findVisibleClient(orgId, clientId);
-  if (!visible) return null;
-
+  // The balance lives on a wider select than the shared loader issues, so it
+  // is read first and handed in; the loader then reads only the fact groups.
   const params = [clientId, orgId];
   const { rows: clientRows } = await pool.query(
     `SELECT c.id, c.name, c.pt_end_date, c.organization_id,
@@ -96,43 +96,22 @@ async function getClientSnapshot(orgId, clientId) {
   const client = clientRows[0];
   if (!client) return null;
 
-  const many = (sql) => pool.query(sql, [clientId]).then((r) => r.rows);
-  const one = (sql) => many(sql).then((rows) => rows[0] ?? null);
-
-  const [lifestyle, measurements, assessments, goal, prRows, lastSession, checkins] = await Promise.all([
-    one(`SELECT sleep_category, sleep_duration_hours, recovery_score, recovery_risk
-           FROM pt_lifestyle_assessments WHERE client_id = $1
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    many(`SELECT weight_kg, measured_at FROM pt_os_measurements
-           WHERE client_id = $1 AND weight_kg IS NOT NULL
-           ORDER BY measured_at DESC LIMIT 12`),
-    many(`SELECT weight, assessment_date FROM pt_assessments
-           WHERE client_id = $1 AND weight IS NOT NULL
-           ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 12`),
-    one(`SELECT goal_type, priority_goal, target_weight, starting_weight, target_date
-           FROM pt_goals WHERE client_id = $1 AND is_active = true
-          ORDER BY created_at DESC LIMIT 1`),
-    many(`SELECT wse.exercise_name, s.weight_kg, s.reps, ws.session_date
-            FROM workout_sets s
-            JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
-            JOIN workout_sessions ws ON ws.id = wse.session_id
-           WHERE ws.client_id = $1
-             AND (s.is_pr_weight OR s.is_pr_reps OR s.is_pr_volume)
-           ORDER BY ws.session_date DESC LIMIT 60`),
-    one(`SELECT session_date, status FROM workout_sessions
-           WHERE client_id = $1 AND session_date <= CURRENT_DATE
-           ORDER BY session_date DESC LIMIT 1`),
-    many(`SELECT week_start_date, mood, sleep_hours, water_glasses,
-                 stress_level, energy_level, soreness_level
-            FROM weekly_checkins WHERE client_id = $1
-           ORDER BY week_start_date DESC LIMIT 12`),
-  ]);
+  const sources = await loadClientSources(clientId, orgId, {
+    client, clinical: false, snapshot: true, checkins: true,
+  });
+  if (!sources) return null;
 
   return {
     ...buildSnapshot({
-      client, lifestyle, measurements, assessments, goal, prRows, lastSession,
+      client,
+      lifestyle: sources.lifestyle,
+      measurements: sources.measurements,
+      assessments: sources.assessments,
+      goal: sources.goal,
+      prRows: sources.prRows,
+      lastSession: sources.lastSession,
     }),
-    recovery: buildRecovery(checkins),
+    recovery: buildRecovery(sources.checkins),
   };
 }
 
@@ -141,50 +120,22 @@ async function getClientSnapshot(orgId, clientId) {
  * Returns the assembled brief from all assessment sources.
  */
 async function getClientTrainingBrief(orgId, clientId) {
-  const visible = await findVisibleClient(orgId, clientId);
-  if (!visible) return null;
-
-  const params = [clientId, orgId];
-  const { rows: clientRows } = await pool.query(
-    `SELECT c.id, c.name, c.gender, c.dob, c.goal, c.injuries, c.notes, c.workout_experience_level, c.organization_id
-       FROM pt_clients c WHERE c.id = $1 AND c.deleted_at IS NULL AND c.organization_id = $2`,
-    params
-  );
-  const client = clientRows[0];
-  if (!client) return null;
-
-  const one = (sql) => pool.query(sql, [clientId]).then((r) => r.rows[0] ?? null);
-
-  const [parq, assessment, posture, mobility, lifestyle, goal, assignment, sessions] = await Promise.all([
-    one(`SELECT * FROM pt_parq_forms WHERE client_id = $1 AND deleted_at IS NULL
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_assessments WHERE client_id = $1
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_posture_assessments WHERE client_id = $1
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_mobility_performance_assessments WHERE client_id = $1
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_lifestyle_assessments WHERE client_id = $1
-          ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1`),
-    one(`SELECT * FROM pt_goals WHERE client_id = $1 AND is_active = true
-          ORDER BY created_at DESC LIMIT 1`),
-    one(`SELECT wa.start_date, wa.progress_pct, wp.id AS plan_id, wp.name AS plan_name,
-                wp.duration_weeks,
-                (SELECT COUNT(DISTINCT we.day_of_week) FROM workout_exercises we
-                  WHERE we.workout_plan_id = wp.id AND we.week_number = 1)::int AS planned_days_count
-           FROM workout_assignments wa
-           JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-          WHERE wa.client_id = $1 AND wa.status = 'active'
-          ORDER BY wa.start_date DESC LIMIT 1`),
-    pool.query(
-      `SELECT status FROM workout_sessions
-         WHERE client_id = $1 AND session_date >= CURRENT_DATE - INTERVAL '28 days'`,
-      [clientId]
-    ).then((r) => r.rows),
-  ]);
+  // The shared loader is the tenant gate too: no row, no child read.
+  const sources = await loadClientSources(clientId, orgId, {
+    clinical: true, training: true, sessionDays: 28,
+  });
+  if (!sources) return null;
 
   return buildBrief({
-    client, parq, assessment, posture, mobility, lifestyle, goal, assignment, recentSessions: sessions,
+    client: sources.client,
+    parq: sources.parq,
+    assessment: sources.latestAssessment,
+    posture: sources.posture,
+    mobility: sources.mobility,
+    lifestyle: sources.lifestyle,
+    goal: sources.goal,
+    assignment: sources.assignment,
+    recentSessions: sources.sessions,
   });
 }
 
