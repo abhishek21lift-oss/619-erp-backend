@@ -153,11 +153,15 @@ function classifyWhrRisk(whr, gender) {
 }
 
 // ── Step 3: Body Composition ────────────────────────────────
-// Mifflin-St Jeor (1990).
+// Mifflin-St Jeor (1990). The equation is sex-specific; a client whose sex is
+// neither Male nor Female gets no automatic BMR rather than a confident value
+// from the wrong formula. A trainer may still enter one manually.
 function calcBmr(weightKg, heightCm, age, gender) {
   if (!weightKg || !heightCm || !age || !gender) return null;
+  const sex = sexOf(gender);
+  if (!sex) return null;
   const base = 10 * weightKg + 6.25 * heightCm - 5 * age;
-  return Math.round(gender === 'Male' ? base + 5 : base - 161);
+  return Math.round(sex === 'Male' ? base + 5 : base - 161);
 }
 
 function calcLeanBodyMass(weightKg, bodyFatPct) {

@@ -273,10 +273,11 @@ describe('workout/generate', () => {
     expect(res.status).toBe(200);
     const prompt = promptOf(routedStream.mock.calls[0][0]);
 
-    // profile.height_cm beats pt_clients.height; with no enrolment-level
+    // pt_clients.height is the cache the latest assessment maintains, so it
+    // beats the stale profile copy (158.5); with no enrolment-level
     // experience, profile.fitness_level beats the lifestyle assessment and
     // the body's 'advanced' claim.
-    expect(prompt).toContain('Height (cm): 158.5');
+    expect(prompt).toContain('Height (cm): 160');
     expect(prompt).toContain('Experience level: intermediate');
     expect(prompt).toContain('Injuries / limitations: left knee');
     expect(prompt).toContain('Health conditions: asthma');
@@ -449,10 +450,11 @@ describe('diet/generate', () => {
     const prompt = promptOf(call);
 
     // Database values win; the nutrition assessment outranks the lifestyle
-    // assessment, which outranks the fitness profile.
+    // assessment, which outranks the fitness profile. Height follows the
+    // assessment cache on pt_clients before the stale profile copy.
     expect(prompt).toContain(`Age: ${expectedAge()}`);
     expect(prompt).toContain('Weight: 71.3 kg');
-    expect(prompt).toContain('Height: 158.5 cm');
+    expect(prompt).toContain('Height: 160 cm');
     expect(prompt).toContain('Activity level: moderate');
     expect(prompt).toContain('Dietary preferences: vegetarian');
     expect(prompt).toContain('Allergies / intolerances: peanuts');

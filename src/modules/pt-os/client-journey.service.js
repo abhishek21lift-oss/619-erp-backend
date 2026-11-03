@@ -22,30 +22,30 @@ const { hasPtTermSql } = require('../../lib/ptTerm');
 const INTERVIEW_FIELDS = Object.freeze([
   'training_history', 'pain_and_injuries', 'lifestyle', 'motivation',
   'availability', 'preferences', 'notes',
-  'lifestyle_occupation', 'lifestyle_sitting_hours', 'lifestyle_screen_time',
-  'lifestyle_sleep_hours', 'lifestyle_meal_regularity', 'lifestyle_smoking',
-  'lifestyle_alcohol', 'lifestyle_training_days',
+  // The Interview owns the quick screen: sitting hours, meal regularity and
+  // training days. Sleep, smoking, alcohol, occupation and screen time belong
+  // to the Lifestyle assessment and are no longer writable here.
+  'lifestyle_sitting_hours', 'lifestyle_meal_regularity', 'lifestyle_training_days',
   // Migration 254 — the redesigned interview's own fields.
   'job_details', 'occupation_other_details', 'previous_workout_experience',
   'training_challenges', 'challenge_other', 'important_client_statements',
 ]);
-const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifestyle_occupation: 50, lifestyle_screen_time: 10, lifestyle_meal_regularity: 20, lifestyle_smoking: 20, lifestyle_alcohol: 20, occupation_other_details: 500, challenge_other: 500 });
+// Read-only legacy answers. A draft written before the move may hold only
+// these, and completing it must not be refused because its answers are in a
+// column this form no longer writes.
+const LEGACY_INTERVIEW_FIELDS = Object.freeze([
+  'lifestyle_occupation', 'lifestyle_screen_time', 'lifestyle_sleep_hours',
+  'lifestyle_smoking', 'lifestyle_alcohol',
+]);
+const INTERVIEW_READ_FIELDS = Object.freeze([...INTERVIEW_FIELDS, ...LEGACY_INTERVIEW_FIELDS]);
+const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifestyle_meal_regularity: 20, occupation_other_details: 500, challenge_other: 500 });
 
 // Structured answers are enums or bounded numbers, and the database's CHECK
 // constraints reject a bad one — but as a 23514, which surfaced as a 500. The
 // values are checked here first, so a bad answer is a 400 with a field name.
-const OCCUPATIONS = Object.freeze([
-  'desk_job', 'active_job', 'physical_labor', 'student', 'homemaker', 'driver',
-  'healthcare', 'police', 'fitness_professional', 'retired', 'other',
-]);
 const STRUCTURED = Object.freeze({
-  lifestyle_occupation: { oneOf: OCCUPATIONS },
   lifestyle_sitting_hours: { min: 0, max: 24 },
-  lifestyle_screen_time: { oneOf: ['<2', '2_4', '4_6', '6_8', '8_plus'] },
-  lifestyle_sleep_hours: { min: 0, max: 24 },
   lifestyle_meal_regularity: { oneOf: ['regular', 'irregular', 'inconsistent'] },
-  lifestyle_smoking: { oneOf: ['never', 'occasionally', 'daily', 'former'] },
-  lifestyle_alcohol: { oneOf: ['never', 'occasionally', 'weekly', 'frequently'] },
   lifestyle_training_days: { min: 0, max: 7, integer: true },
   previous_workout_experience: { oneOf: ['never', 'beginner', 'intermediate', 'advanced'] },
 });
@@ -128,7 +128,7 @@ function hasAnswer(value) {
 }
 
 function assertCompletable(row) {
-  if (!INTERVIEW_FIELDS.some((key) => hasAnswer(row[key]))) {
+  if (!INTERVIEW_READ_FIELDS.some((key) => hasAnswer(row[key]))) {
     throw new InterviewInputError('Write down at least one answer before completing the interview.');
   }
 }

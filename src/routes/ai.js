@@ -33,12 +33,14 @@ const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
 // The client's digital twin: the assessments, the screen and the logged sets
 // that this file could not see. See modules/pt-os/client-context.js.
 const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
+const { loadClientRow, loadClientSources } = require('../modules/pt-os/authoritative-client');
 const { buildChurnList } = require('../modules/pt-os/churn.service');
 const { normalisePlan, DietPlanError } = require('../modules/nutrition/ai-diet.service');
 const { checkScreeningGate } = require('../lib/screeningGate');
 const {
   resolveClientFacts, describeFacts, describeInterview, numInRange,
 } = require('../modules/pt-os/client-facts');
+const { resolveMedicalConditions } = require('../modules/progress/assessment-facts');
 
 /**
  * The workout prompt's version, frozen with every generation.
@@ -64,7 +66,7 @@ const {
 } = require('../modules/pt-os/programming-memory');
 const { describeOutcomes } = require('../modules/pt-os/plan-outcomes');
 // The studio's today, not the server's. Same clock every other pt-os read uses.
-const { today: studioToday } = require('../lib/appTime');
+const { today: studioToday, dbDate } = require('../lib/appTime');
 const {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -200,31 +202,23 @@ const PROGRESS_STRENGTH_LOGS_LIMIT = 20;
 async function buildClientContext(client_id, org) {
   if (!client_id) return '';
   try {
-    // Parent-first authorization, mirroring loadAuthoritativeClient below:
-    // confirm the client exists, is not deleted, and passes the tenant
-    // predicate BEFORE any child query executes. `weight` is the enrollment
-    // fallback for an assessment saved without one.
-    const clientRes = await pool.query(
-      'SELECT name, dob, gender, weight FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
-      [client_id, org]
-    );
-    const c = clientRes.rows[0];
-    if (!c) {
+    // One loader for the parent gate and the three rows this prompt uses. The
+    // org-scoped parent read runs first inside it, so a foreign, unknown or
+    // deleted client returns no row and never reaches a child table.
+    const sources = await loadClientSources(client_id, org, {
+      clinical: false, assessment: true, checkin: true,
+    });
+    if (!sources) {
       // Foreign, unknown, or deleted client — same empty-context behavior,
       // and no child queries. No client id or PII is logged.
       logger.warn('ai_context_missing_client');
       return '';
     }
 
-    const [goalsRes, assessRes, checkinsRes] = await Promise.all([
-      pool.query('SELECT goal_type, target_weight, target_body_fat, notes FROM pt_goals WHERE client_id=$1 AND is_active=true LIMIT 3', [client_id]),
-      pool.query('SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 2', [client_id]),
-      pool.query('SELECT weight, mood, sleep_hours, client_notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at DESC LIMIT 4', [client_id]),
-    ]);
-
+    const c = sources.client;
     const age    = c.dob ? Math.floor((Date.now() - new Date(c.dob).getTime()) / 31557600000) : null;
-    const latest = assessRes.rows[0] || {};
-    const lastCheckin = checkinsRes.rows[0] || {};
+    const latest = sources.latestAssessment || {};
+    const lastCheckin = sources.latestCheckin || {};
     // Same precedence as resolveDietInputs: newest assessment, then the
     // enrollment weight, then the newest check-in.
     const currentWeight = firstDefined(latest.weight, c.weight, lastCheckin.weight);
@@ -237,13 +231,13 @@ async function buildClientContext(client_id, org) {
       latest.body_fat_pct ? `Body fat: ${latest.body_fat_pct}%` : '',
     ];
 
-    if (goalsRes.rows.length) {
-      lines.push(`Goals: ${goalsRes.rows.map(g => {
+    if (sources.goals.length) {
+      lines.push(`Goals: ${sources.goals.map(g => {
         const target = g.target_weight ? `${g.target_weight} kg` : g.target_body_fat ? `${g.target_body_fat}% body fat` : 'no specific target';
         return `${g.goal_type} — ${target}`;
       }).join(', ')}`);
     }
-    if (checkinsRes.rows.length) {
+    if (sources.latestCheckin) {
       lines.push(`Last weekly check-in: weight ${lastCheckin.weight || 'N/A'} kg, mood ${lastCheckin.mood || 'N/A'}, sleep ${lastCheckin.sleep_hours || 'N/A'}h`);
     }
 
@@ -266,6 +260,18 @@ const ageFromDob = (dob) => {
 };
 
 const arrayToText = (arr) => (Array.isArray(arr) && arr.length ? arr.join(', ') : null);
+
+// A fallback read from a column another module owns is allowed, but it is
+// recorded: it says the canonical record is missing a fact the generator asks.
+function logLegacyRead(field, owner, source, clientId) {
+  logger.info({
+    event: 'ownership.deprecated_read',
+    field,
+    owner,
+    source,
+    client_id: clientId ?? null,
+  }, 'Read a fact from a legacy column because the owner has no answer');
+}
 
 // Authorized knowledge-base retrieval for the plan generators. Mirrors the AI
 // Coach chat path: a retrieval failure (embedding model cold, DB hiccup) is
@@ -402,69 +408,24 @@ async function retrieveExerciseLibrary({ organizationId, userId, limit = 1200 },
 //
 // `options.retrievalStats` (optional out-param) collects retrieval
 // latency/failure metadata for the ai_generate_rag_retrieval event.
-async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRoute = 'internal', withExerciseLibrary = false, exerciseUserId = null, ragUserId = null, retrievalStats = null } = {}) {
-  const { rows: clientRows } = await pool.query(
-    'SELECT * FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2',
-    [client_id, org]
-  );
-  const client = clientRows[0];
+async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRoute = 'internal', withExerciseLibrary = false, exerciseUserId = null, ragUserId = null, retrievalStats = null, withTwin = false } = {}) {
+  // Parent first — the same org-scoped gate the shared loader uses — so the
+  // knowledge-base reads below only ever run after the client is confirmed.
+  const client = await loadClientRow(client_id, org);
   if (!client) return null;
 
-  const [
-    profileRes, goalsRes, assessRes, checkinsRes,
-    lifestyleRes, interviewRes, nutritionRes, workoutAssignRes, dietAssignRes, equipmentRes,
-    ragChunks = [], exercises = [],
-  ] = await Promise.all([
-    pool.query(
-      `SELECT goal, goal_other, height_cm, body_fat_pct, health_conditions, injuries,
-              fitness_level, sleep_hours, stress_level, diet_preference
-       FROM client_fitness_profiles WHERE client_id=$1 LIMIT 1`, [client_id]),
-    pool.query(
-      'SELECT goal_type, target_weight, target_body_fat, notes, training_days_per_week, preferred_training_days FROM pt_goals WHERE client_id=$1 AND is_active=true ORDER BY created_at DESC LIMIT 3', [client_id]),
-    pool.query(
-      'SELECT weight, body_fat_pct, bmi, chest_cm, waist_cm, hips_cm, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [client_id]),
-    pool.query(
-      'SELECT weight, mood, sleep_hours, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at DESC LIMIT 1', [client_id]),
-    pool.query(
-      `SELECT activity_level, workout_experience_level, meal_frequency, sleep_duration_hours,
-              stress_level, food_preferences
-       FROM pt_lifestyle_assessments WHERE client_id=$1
-       ORDER BY assessment_date DESC, created_at DESC LIMIT 1`, [client_id]),
-    pool.query(
-      `SELECT status, created_at,
-              previous_workout_experience, training_history, job_details,
-              occupation_other_details, training_challenges, challenge_other,
-              lifestyle_training_days, lifestyle_sitting_hours, lifestyle_meal_regularity,
-              availability, motivation, preferences, important_client_statements, notes
-       FROM pt_client_interviews WHERE client_id=$1
-       ORDER BY (status = 'completed') DESC, created_at DESC LIMIT 1`, [client_id]),
-    pool.query(
-      `SELECT diet_preferences, food_allergies, foods_to_avoid, meals_per_day,
-              nutrition_budget, medical_conditions, medical_notes
-       FROM pt_nutrition_assessments WHERE client_id=$1
-       ORDER BY assessment_date DESC, created_at DESC LIMIT 1`, [client_id]),
-    pool.query(
-      `SELECT wp.name AS plan_name, wa.status, wa.start_date, wa.end_date
-       FROM workout_assignments wa LEFT JOIN workout_plans wp ON wp.id=wa.workout_plan_id
-       WHERE wa.client_id=$1 AND wa.status='active' ORDER BY wa.created_at DESC LIMIT 3`, [client_id]),
-    pool.query(
-      `SELECT dt.name AS template_name, da.status, da.start_date, da.end_date
-       FROM diet_assignments da LEFT JOIN diet_templates dt ON dt.id=da.diet_template_id
-       WHERE da.client_id=$1 AND da.status='active' ORDER BY da.created_at DESC LIMIT 3`, [client_id]),
-    // ── The studio's equipment ───────────────────────────────────────────
-    //
-    // No column on pt_clients records what a client can train with, and
-    // training_mode is Offline/Online/Hybrid — WHERE they train, not what they
-    // can lift with. So the authoritative answer, where there is one, is what
-    // the studio itself has, held in the org-scoped settings store the rest of
-    // the product already writes through.
-    //
-    // Org-scoped in the statement. A platform-wide caller (org null) matches
-    // no row and gets nothing, which is the correct answer: there is no one
-    // studio whose equipment to report.
-    pool.query(
-      `SELECT value FROM system_settings
-        WHERE organization_id = $1 AND key = 'studio_equipment' LIMIT 1`, [org]),
+  const [sources, ragChunks = [], exercises = []] = await Promise.all([
+    loadClientSources(client_id, org, {
+      client,
+      generator: true,
+      checkin: true,
+      // The digital twin needs the training window and check-in history; the
+      // summary and diet paths do not, so they do not pay for the reads.
+      training: withTwin,
+      sets: withTwin,
+      checkins: withTwin,
+      landmarks: withTwin,
+    }),
     ...(ragQuery
       ? [retrieveRagChunks(org, ragQuery, 'ai_client_context_rag_failed', retrievalStats, { route: ragRoute, userId: ragUserId })]
       : []),
@@ -473,21 +434,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRou
       : []),
   ]);
 
-  return {
-    client,
-    profile:          profileRes.rows[0]   || null,
-    goals:            goalsRes.rows,
-    latestAssessment: assessRes.rows[0]    || null,
-    latestCheckin:    checkinsRes.rows[0]  || null,
-    lifestyle:        lifestyleRes.rows[0] || null,
-    interview:        interviewRes?.rows?.[0]    || null,
-    nutrition:        nutritionRes.rows[0] || null,
-    workoutAssignments: workoutAssignRes.rows,
-    dietAssignments:  dietAssignRes.rows,
-    studioEquipment:  equipmentRes.rows[0]?.value || null,
-    ragChunks,
-    exercises,
-  };
+  return { ...sources, ragChunks, exercises };
 }
 
 // The workout prompt's NON-FACT context: the things that describe the
@@ -509,14 +456,26 @@ function resolveWorkoutExtras({ client, profile, goals, workoutAssignments }, bo
     ? Math.max(1, Math.ceil((new Date(active.end_date) - new Date(active.start_date)) / 604800000))
     : (Number(body.duration_weeks) || 8);
 
+  // Free-text limitations a trainer typed. Never defaulted to "none": the
+  // old `|| 'none'` printed a clean bill of health for every client nobody
+  // had ever written a note about. limitationsLine() adds the assessed
+  // screen to whatever this holds.
+  //
+  // The client row is read before the retired fitness profile: the profile
+  // used to win here, which meant the older of two notes beat the newer one.
+  const injuries = firstDefined(client.injuries, profile?.injuries);
+  if (client.injuries == null && profile?.injuries != null) {
+    logLegacyRead('injuries', 'Client Interview', 'client_fitness_profiles.injuries', client.id);
+  }
+  const healthConditions = firstDefined(client.health_conditions, arrayToText(profile?.health_conditions));
+  if (client.health_conditions == null && profile?.health_conditions != null) {
+    logLegacyRead('health_conditions', 'PAR-Q', 'client_fitness_profiles.health_conditions', client.id);
+  }
+
   return {
-    // Free-text limitations a trainer typed. Never defaulted to "none": the
-    // old `|| 'none'` printed a clean bill of health for every client nobody
-    // had ever written a note about. limitationsLine() adds the assessed
-    // screen to whatever this holds.
-    injuries: firstDefined(profile?.injuries, client.injuries),
+    injuries,
     duration_weeks: durationWeeks,
-    health_conditions: firstDefined(client.health_conditions, arrayToText(profile?.health_conditions)),
+    health_conditions: healthConditions,
     previous_trainer_experience: client.previous_trainer_experience === true,
     target: goals[0]?.target_weight ? `${goals[0].target_weight} kg`
       : (goals[0]?.target_body_fat ? `${goals[0].target_body_fat}% body fat` : null),
@@ -529,14 +488,41 @@ function resolveWorkoutExtras({ client, profile, goals, workoutAssignments }, bo
 // Same contract for the diet generator: DB-first, body fills gaps. Activity
 // level, dietary preference, allergies, budget and meal frequency all live in
 // the lifestyle/nutrition assessments when the studio recorded them.
-function resolveDietInputs({ client, profile, goals, latestAssessment, latestCheckin, lifestyle, nutrition, dietAssignments }, body) {
+function resolveDietInputs({ client, profile, goals, latestAssessment, latestCheckin, lifestyle, nutrition, dietAssignments, parqMedical }, body) {
+  // Canonical owners first: Goal for the goal, Fitness Testing for height and
+  // weight, PAR-Q for medical conditions. The profile and the other modules'
+  // copies are fallbacks for rows written before the move, and each fallback
+  // is logged.
   const latestWeight = firstDefined(latestAssessment?.weight, client.weight, latestCheckin?.weight);
-  const height       = firstDefined(profile?.height_cm, client.height);
-  const goal         = firstDefined(profile?.goal, client.goal, goals[0]?.goal_type);
-  const dietPrefs    = firstDefined(arrayToText(nutrition?.diet_preferences), arrayToText(lifestyle?.food_preferences), profile?.diet_preference);
+  if (latestAssessment?.weight == null && client.weight == null && latestCheckin?.weight != null) {
+    logLegacyRead('weight_kg', 'Fitness Testing', 'weekly_checkins.weight', client.id);
+  }
+  const height = firstDefined(latestAssessment?.height_cm, client.height, profile?.height_cm);
+  if (latestAssessment?.height_cm == null && client.height == null && profile?.height_cm != null) {
+    logLegacyRead('height_cm', 'Fitness Testing', 'client_fitness_profiles.height_cm', client.id);
+  }
+  const goal = firstDefined(goals[0]?.goal_type, profile?.goal, client.goal);
+  if (!goals[0]?.goal_type) {
+    if (profile?.goal != null) logLegacyRead('goal', 'Goal', 'client_fitness_profiles.goal', client.id);
+    else if (client.goal != null) logLegacyRead('goal', 'Goal', 'pt_clients.goal', client.id);
+  }
+  const nutritionPrefs = arrayToText(nutrition?.diet_preferences);
+  const lifestylePrefs = arrayToText(lifestyle?.food_preferences);
+  const dietPrefs    = firstDefined(nutritionPrefs, lifestylePrefs, profile?.diet_preference);
+  if (!nutritionPrefs && !lifestylePrefs && profile?.diet_preference != null) {
+    logLegacyRead('diet_preference', 'Nutrition', 'client_fitness_profiles.diet_preference', client.id);
+  }
   const allergies    = firstDefined(arrayToText(nutrition?.food_allergies));
   const mealsPerDay  = firstDefined(nutrition?.meals_per_day, lifestyle?.meal_frequency);
   const active       = dietAssignments[0] || null;
+  // Submitted/reviewed only: a draft answers nothing about medical conditions,
+  // so the legacy Nutrition list still fills the gap. `parq` (any status) is
+  // the twin/brief read, where a reported answer — even a draft — is caution.
+  const medicalConditions = arrayToText(resolveMedicalConditions(parqMedical, nutrition || {}, { client_id: client.id }));
+  const healthConditions = firstDefined(client.health_conditions, arrayToText(profile?.health_conditions));
+  if (client.health_conditions == null && profile?.health_conditions != null) {
+    logLegacyRead('health_conditions', 'PAR-Q', 'client_fitness_profiles.health_conditions', client.id);
+  }
 
   // A figure the trainer typed is bounded before it can become a calorie
   // target. `numInRange` is the same table the workout generator uses — see
@@ -563,8 +549,8 @@ function resolveDietInputs({ client, profile, goals, latestAssessment, latestChe
     // Bounded for the same reason: "40" meals a day is a prompt the model will
     // try to satisfy. Falls back to four, as it always did.
     meal_frequency: Number(mealsPerDay) || numInRange(body.meal_frequency, 'meal_frequency') || 4,
-    health_conditions: firstDefined(client.health_conditions, arrayToText(profile?.health_conditions)),
-    medical_conditions: arrayToText(nutrition?.medical_conditions),
+    health_conditions: healthConditions,
+    medical_conditions: medicalConditions,
     foods_to_avoid: arrayToText(nutrition?.foods_to_avoid),
     target: goals[0]?.target_weight ? `${goals[0].target_weight} kg`
       : (goals[0]?.target_body_fat ? `${goals[0].target_body_fat}% body fat` : null),
@@ -893,7 +879,7 @@ router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res)
   try {
     // No ragQuery and no withExerciseLibrary: this is a summary of the client,
     // not a generation, and retrieval is the expensive half.
-    ctx = await loadAuthoritativeClient(clientId, org);
+    ctx = await loadAuthoritativeClient(clientId, org, { withTwin: true });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_context_load_failed');
     return res.status(503).json({ error: 'Client context unavailable' });
@@ -908,7 +894,10 @@ router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res)
   // than as cleared.
   let twin = null;
   try {
-    twin = await loadDigitalTwin(clientId, org, { equipmentText: facts.equipment?.value ?? null });
+    twin = await loadDigitalTwin(clientId, org, {
+      equipmentText: facts.equipment?.value ?? null,
+      sources: ctx,
+    });
   } catch (err) {
     logger.warn({ err: err.message }, 'ai_workout_context_twin_failed');
   }
@@ -971,6 +960,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       withExerciseLibrary: true,
       exerciseUserId: req.user?.id,
       retrievalStats,
+      withTwin: true,
     });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_generate_load_failed');
@@ -1081,6 +1071,9 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       // default — the difference is that the prompt no longer CLAIMS a full gym.
       equipmentText: val('equipment'),
       exercises: ctx.exercises,
+      // The generator already loaded the same canonical rows for its prompt;
+      // the twin must read exactly those, not a second interpretation.
+      sources: ctx,
     });
   } catch (err) {
     logger.error({ err: err.message }, 'ai_workout_twin_load_failed');
@@ -2025,8 +2018,7 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
     // could fire — the response never surfaced them, but the guarantee rested
     // on ordering luck rather than sequence. A wrong-org client_id now stops
     // here, before any progress row is read.
-    const clientRes = await pool.query('SELECT name, dob, gender, pt_start_date FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2', [client_id, org]);
-    const client = clientRes.rows[0];
+    const client = await loadClientRow(client_id, org);
     if (!client) return res.status(404).json({ error: 'Client not found' });
 
     // ── The MPTS evidence gate ─────────────────────────────────────────────
@@ -2056,9 +2048,9 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
       // newest-first with LIMIT so the prompt cannot grow with the client's
       // entire history; the rows are reversed below to restore the
       // chronological order the model expects.
-      pool.query(`SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, thigh_right_cm, thigh_left_cm, arm_right_cm, arm_left_cm, bmi, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY created_at DESC LIMIT ${PROGRESS_ASSESSMENTS_LIMIT}`, [client_id]),
+      pool.query(`SELECT weight, body_fat_pct, chest_cm, waist_cm, hips_cm, thigh_right_cm, thigh_left_cm, arm_right_cm, arm_left_cm, bmi, assessment_date, created_at FROM pt_assessments WHERE client_id=$1 ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT ${PROGRESS_ASSESSMENTS_LIMIT}`, [client_id]),
       pool.query('SELECT goal_type, target_weight, target_body_fat, is_active, created_at FROM pt_goals WHERE client_id=$1 ORDER BY created_at DESC LIMIT 5', [client_id]),
-      pool.query(`SELECT weight, mood, sleep_hours, water_glasses, client_notes, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY created_at DESC LIMIT ${PROGRESS_CHECKINS_LIMIT}`, [client_id]),
+      pool.query(`SELECT weight, mood, sleep_hours, water_glasses, client_notes, week_start_date, created_at FROM weekly_checkins WHERE client_id=$1 ORDER BY week_start_date DESC NULLS LAST, created_at DESC LIMIT ${PROGRESS_CHECKINS_LIMIT}`, [client_id]),
       pool.query(`SELECT exercise_name, weight_kg, reps_done, created_at FROM strength_logs WHERE client_id=$1 ORDER BY created_at DESC LIMIT ${PROGRESS_STRENGTH_LOGS_LIMIT}`, [client_id]),
       pool.query(`SELECT COUNT(*) AS total_sessions, COUNT(*) FILTER (WHERE created_at >= NOW()-INTERVAL '30 days') AS sessions_30d FROM pt_sessions WHERE client_id=$1`, [client_id]),
       pool.query('SELECT COUNT(*) AS total_photos FROM progress_photos WHERE client_id=$1', [client_id]),
@@ -2101,7 +2093,10 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
     const weightHistory = assessRes.rows
       .filter((r) => r.weight !== null && r.weight !== undefined && r.weight !== '')
       .map((r) => ({
-        date: r.created_at instanceof Date ? r.created_at.toISOString().slice(0, 10) : String(r.created_at).slice(0, 10),
+        // The chart plots the day the measurement describes. `created_at` is
+        // the day it was typed and only stands in for a form saved without a
+        // test date.
+        date: dbDate(r.assessment_date || r.created_at),
         weight_kg: Number(r.weight),
       }))
       .filter((p) => p.date && Number.isFinite(p.weight_kg));
@@ -2216,18 +2211,17 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
     const assessment = assessRows[0];
     if (!assessment) return res.status(404).json({ error: 'Assessment not found' });
 
-    const [clientRes, previousRes] = await Promise.all([
+    const [client, previousRes] = await Promise.all([
       // Org-gated like the assessment above it: the client and the previous
       // assessment are reached through an org-checked row, but the predicates
       // below are what actually enforce the boundary on THESE reads.
-      pool.query('SELECT name, dob, gender FROM pt_clients WHERE id=$1 AND deleted_at IS NULL AND organization_id = $2', [assessment.client_id, org]),
+      loadClientRow(assessment.client_id, org),
       pool.query(
-        'SELECT * FROM pt_assessments WHERE client_id=$1 AND assessment_date < $2 AND organization_id = $3 ORDER BY assessment_date DESC LIMIT 1',
+        'SELECT * FROM pt_assessments WHERE client_id=$1 AND assessment_date < $2 AND organization_id = $3 ORDER BY assessment_date DESC NULLS LAST, created_at DESC LIMIT 1',
         [assessment.client_id, assessment.assessment_date, org]
       ),
     ]);
 
-    const client = clientRes.rows[0];
     if (!client) return res.status(404).json({ error: 'Client not found' });
 
     // ── The MPTS evidence gate ─────────────────────────────────────────────
@@ -2853,3 +2847,10 @@ router.get('/provider-settings', auth, requireTrainer, async (req, res) => {
 });
 
 module.exports = router;
+// Exported for the ownership proof: the real loader and resolvers are what the
+// generators use, so the test reads the same records they do rather than
+// rebuilding the precedence a second time.
+module.exports.loadAuthoritativeClient = loadAuthoritativeClient;
+module.exports.resolveClientFacts = resolveClientFacts;
+module.exports.resolveDietInputs = resolveDietInputs;
+module.exports.resolveWorkoutExtras = resolveWorkoutExtras;

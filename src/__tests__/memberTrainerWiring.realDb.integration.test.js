@@ -154,6 +154,14 @@ describeIf('member ↔ trainer wiring, against a real database', () => {
 
     const gone = await request().delete('/api/me/photo');
     expect(gone.body.data.photo_url).toBeNull();
+
+    const { rows: audit } = await pool.query(
+      `SELECT new_data FROM activity_log
+        WHERE action = 'client.photo.update' AND entity_id = $1
+        ORDER BY created_at ASC`, [CLIENT]);
+    expect(audit.map((r) => r.new_data)).toEqual(expect.arrayContaining([
+      { photo_updated: true }, { photo_removed: true },
+    ]));
   });
 
   it('lets the trainer read the member\'s own goals, and only in their own studio', async () => {

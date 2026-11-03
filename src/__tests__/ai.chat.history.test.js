@@ -273,11 +273,11 @@ describe('POST /api/ai/chat — bounded conversation history (F-5)', () => {
 
     // Two org-scoped pt_clients lookups run now: lib/orgGuard's ownership
     // check, which decides whether the client id may be PERSISTED on the
-    // conversation, and buildClientContext's parent gate, which decides
+    // conversation, and the shared loader's full parent read, which decides
     // whether the client's data may reach the prompt. This names the second —
     // the one this test is about — rather than taking whichever came first.
     const clientGate = pool.query.mock.calls.find(
-      ([sql]) => sql.includes('SELECT name, dob, gender, weight FROM pt_clients'));
+      ([sql]) => sql.includes('SELECT * FROM pt_clients WHERE id=$1'));
     expect(clientGate).toBeTruthy();
     expect(clientGate[0]).toContain('organization_id = $2');
     expect(clientGate[1]).toEqual(['cli-1', 'org-1']);

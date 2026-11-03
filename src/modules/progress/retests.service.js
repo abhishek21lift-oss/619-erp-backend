@@ -91,6 +91,15 @@ async function syncAfterAssessment({ orgId, clientId, assessment, userId = null 
   };
 }
 
+/**
+ * A deleted assessment may have been the open cycle's baseline. The FK has
+ * already nulled that link; re-point the cycle at the newest survivor, or
+ * close it when the client has no test left.
+ */
+async function refreshAfterAssessmentDelete({ orgId, clientId, userId = null }) {
+  return repo.repairBaselineAfterDelete(orgId, clientId, userId);
+}
+
 async function overview(orgId, clientId) {
   const timezone = await timezoneFor(orgId);
   const today = scheduling.todayInZone(timezone);
@@ -330,7 +339,7 @@ async function complete(orgId, clientId, scheduleId, assessmentId, userId = null
 }
 
 module.exports = {
-  DEFAULT_SETTINGS, syncAfterAssessment, overview, rosterOverview, comparisonFor, getSettings, saveSettings,
+  DEFAULT_SETTINGS, syncAfterAssessment, refreshAfterAssessmentDelete, overview, rosterOverview, comparisonFor, getSettings, saveSettings,
   startSchedule, reschedule, cancel, complete, timezoneFor, normalizeAssessment, normalizeSchedule,
   ROSTER_STATES,
 };

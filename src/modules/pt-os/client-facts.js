@@ -1,6 +1,7 @@
 'use strict';
 
 const { ageFromDob } = require('../../lib/age');
+const logger = require('../../lib/logger');
 
 /**
  * The client facts a workout generation is allowed to assert.
@@ -53,6 +54,34 @@ const FIELDS = [
 
 // Without these three a programme cannot be written, only invented.
 const BLOCKING = ['goal', 'experience_level', 'training_days'];
+
+/**
+ * Columns another module owns, by the fact they duplicate.
+ *
+ * A fallback read is expected on rows written before the move, but it is still
+ * worth seeing: it says the canonical record has no answer for a fact the
+ * generator needs, and names the copy that would have to be migrated before
+ * the column can be retired.
+ */
+const LEGACY_SOURCES = {
+  height_cm: [['client_fitness_profiles.height_cm', 'Fitness Testing']],
+  weight_kg: [['weekly_checkins.weight', 'Fitness Testing']],
+  goal: [
+    ['client_fitness_profiles.goal', 'Goal'],
+    ['pt_clients.goal', 'Goal'],
+  ],
+  experience_level: [['client_fitness_profiles.fitness_level', 'Client enrolment']],
+};
+
+function logLegacyRead(field, owner, source, clientId) {
+  logger.info({
+    event: 'ownership.deprecated_read',
+    field,
+    owner,
+    source,
+    client_id: clientId ?? null,
+  }, 'Read a fact from a legacy column because the owner has no answer');
+}
 
 /**
  * Fields where a trainer's statement for THIS generation beats the record.
@@ -209,14 +238,61 @@ function text(v, maxLength) {
 function fromSources(candidates, coerce) {
   let winner = null;
   const conflicts = [];
-  for (const [source, raw] of candidates) {
+  for (const [source, raw, at] of candidates) {
     const value = coerce(raw);
     if (value === null) continue;
-    if (!winner) { winner = { value, source, origin: 'recorded' }; continue; }
-    if (!sameValue(winner.value, value)) conflicts.push({ source, value });
+    const dated = dateOnly(at);
+    if (!winner) {
+      winner = { value, source, origin: 'recorded', ...(dated ? { at: dated } : {}) };
+      continue;
+    }
+    if (!sameValue(winner.value, value)) {
+      conflicts.push({ source, value, ...(dated ? { at: dated } : {}) });
+    }
   }
   if (!winner) return null;
   return conflicts.length ? { ...winner, conflicts } : winner;
+}
+
+// A fact older than this is still a fact, but the model is told it is old and
+// the trainer is told to confirm it. A 13-month-old weight is not today's.
+const STALE_AFTER_DAYS = 365;
+
+function dateOnly(value) {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(d.getTime()) ? d.toISOString().slice(0, 10) : null;
+}
+
+function ageInDays(at) {
+  const on = dateOnly(at);
+  if (!on) return null;
+  const days = Math.floor((Date.now() - new Date(`${on}T00:00:00Z`).getTime()) / 86_400_000);
+  return Number.isFinite(days) && days >= 0 ? days : null;
+}
+
+/** Carry the record's age on the fact, and whether it is past its useful life. */
+function withFreshness(fact) {
+  if (!fact?.at) return fact;
+  const ageDays = ageInDays(fact.at);
+  if (ageDays === null) return fact;
+  return { ...fact, age_days: ageDays, ...(ageDays > STALE_AFTER_DAYS ? { stale: true } : {}) };
+}
+
+/**
+ * The first usable timestamp on a row, as YYYY-MM-DD.
+ *
+ * Content date first, insertion time second — the same rule the SQL loaders
+ * order by. A form entered today about a test from six months ago is a
+ * six-month-old fact.
+ */
+function when(row, ...fields) {
+  if (!row) return null;
+  for (const field of fields) {
+    const at = dateOnly(row[field]);
+    if (at) return at;
+  }
+  return null;
 }
 
 /**
@@ -250,7 +326,7 @@ function resolveClientFacts(ctx, stated = {}) {
   const {
     client = {}, profile = null, goals = [], latestAssessment = null,
     latestCheckin = null, lifestyle = null, interview = null,
-    workoutAssignments = [], studioEquipment = null,
+    workoutAssignments = [], studioEquipment = null, studioEquipmentAt = null,
   } = ctx || {};
 
   const resolved = {
@@ -263,14 +339,18 @@ function resolveClientFacts(ctx, stated = {}) {
     ], text),
 
     weight_kg: fromSources([
-      ['pt_assessments.weight', latestAssessment?.weight],
-      ['pt_clients.weight', client.weight],
-      ['weekly_checkins.weight', latestCheckin?.weight],
+      ['pt_assessments.weight', latestAssessment?.weight, when(latestAssessment, 'assessment_date', 'created_at')],
+      ['pt_clients.weight', client.weight, when(client, 'updated_at')],
+      ['weekly_checkins.weight', latestCheckin?.weight, when(latestCheckin, 'week_start_date', 'created_at')],
     ], num),
 
+    // Fitness Testing owns the live measurement. `pt_clients.height` is the
+    // cache the assessment write maintains (D3), and the fitness profile is a
+    // legacy copy read only when both have no answer.
     height_cm: fromSources([
-      ['client_fitness_profiles.height_cm', profile?.height_cm],
-      ['pt_clients.height', client.height],
+      ['pt_assessments.height_cm', latestAssessment?.height_cm, when(latestAssessment, 'assessment_date', 'created_at')],
+      ['pt_clients.height', client.height, when(client, 'updated_at')],
+      ['client_fitness_profiles.height_cm', profile?.height_cm, when(profile, 'updated_at', 'created_at')],
     ], num),
 
     // The client's ACTIVE goal first. pt_goals is the dated record a trainer
@@ -280,15 +360,15 @@ function resolveClientFacts(ctx, stated = {}) {
     // goal after the trainer has set a new one wrote plans for who the client
     // was at sign-up. The older values are still reported as a disagreement.
     goal: fromSources([
-      ['pt_goals.goal_type', goals[0]?.goal_type],
-      ['client_fitness_profiles.goal', profile?.goal],
-      ['pt_clients.goal', client.goal],
+      ['pt_goals.goal_type', goals[0]?.goal_type, when(goals[0], 'updated_at', 'created_at')],
+      ['client_fitness_profiles.goal', profile?.goal, when(profile, 'updated_at', 'created_at')],
+      ['pt_clients.goal', client.goal, when(client, 'updated_at')],
     ], text),
 
     experience_level: fromSources([
-      ['pt_clients.workout_experience_level', client.workout_experience_level],
-      ['client_fitness_profiles.fitness_level', profile?.fitness_level],
-      ['pt_lifestyle_assessments.workout_experience_level', lifestyle?.workout_experience_level],
+      ['pt_clients.workout_experience_level', client.workout_experience_level, when(client, 'updated_at')],
+      ['client_fitness_profiles.fitness_level', profile?.fitness_level, when(profile, 'updated_at', 'created_at')],
+      ['pt_lifestyle_assessments.workout_experience_level', lifestyle?.workout_experience_level, when(lifestyle, 'assessment_date', 'created_at')],
     ], text),
 
     // sessions_per_week is the typed column the enrolment form writes and the
@@ -300,11 +380,11 @@ function resolveClientFacts(ctx, stated = {}) {
     // the free-text frequency follow, both being weaker derivations of the
     // same question. A disagreement is reported rather than silently dropped.
     training_days: fromSources([
-      ['pt_clients.sessions_per_week', client.sessions_per_week],
-      ['pt_goals.training_days_per_week', goals[0]?.training_days_per_week],
-      ['pt_client_interviews.lifestyle_training_days', interview?.lifestyle_training_days],
-      ['pt_clients.preferred_training_days', countDays(client.preferred_training_days)],
-      ['pt_clients.frequency', /^[1-7]$/.test(String(client.frequency ?? '')) ? client.frequency : null],
+      ['pt_clients.sessions_per_week', client.sessions_per_week, when(client, 'updated_at')],
+      ['pt_goals.training_days_per_week', goals[0]?.training_days_per_week, when(goals[0], 'updated_at', 'created_at')],
+      ['pt_client_interviews.lifestyle_training_days', interview?.lifestyle_training_days, when(interview, 'completed_at', 'updated_at', 'created_at')],
+      ['pt_clients.preferred_training_days', countDays(client.preferred_training_days), when(client, 'updated_at')],
+      ['pt_clients.frequency', /^[1-7]$/.test(String(client.frequency ?? '')) ? client.frequency : null, when(client, 'updated_at')],
     ], (v) => {
       const n = num(v);
       return n !== null && n >= 1 && n <= 7 ? n : null;
@@ -313,8 +393,8 @@ function resolveClientFacts(ctx, stated = {}) {
     // The companion to the count: which days, not just how many. Not part of
     // FIELDS because it is not an independent blocking fact — the count is.
     preferred_days: fromSources([
-      ['pt_clients.preferred_training_days', preferredDays(client.preferred_training_days)],
-      ['pt_goals.preferred_training_days', preferredDays(goals[0]?.preferred_training_days)],
+      ['pt_clients.preferred_training_days', preferredDays(client.preferred_training_days), when(client, 'updated_at')],
+      ['pt_goals.preferred_training_days', preferredDays(goals[0]?.preferred_training_days), when(goals[0], 'updated_at', 'created_at')],
     ], text),
 
     // ── Equipment ────────────────────────────────────────────────────────
@@ -330,14 +410,21 @@ function resolveClientFacts(ctx, stated = {}) {
     // equipmentFrom(), that default was quietly ungating equipment-restricted
     // exercises for clients who may own a resistance band.
     equipment: fromSources([
-      ['system_settings.studio_equipment', studioEquipment],
+      ['system_settings.studio_equipment', studioEquipment, when({ at: studioEquipmentAt }, 'at')],
     ], text),
   };
+
+  for (const [field, sources] of Object.entries(LEGACY_SOURCES)) {
+    const winner = resolved[field]?.source;
+    const legacy = sources.find(([source]) => source === winner);
+    if (legacy) logLegacyRead(field, legacy[1], legacy[0], client?.id);
+  }
 
   const facts = {};
   const recorded = [];
   const statedFields = [];
   const missing = [];
+  const stale = [];
   // Facts two authoritative sources disagree about. Precedence decided, and
   // said so — this is the record of what it decided against.
   const conflicting = [];
@@ -347,13 +434,17 @@ function resolveClientFacts(ctx, stated = {}) {
       && text(stated[field], STATED_TEXT_MAX) !== null;
     const hit = supersedable ? null : resolved[field];
     if (hit) {
-      facts[field] = hit;
-      recorded.push({ field, source: hit.source });
-      if (hit.conflicts) {
+      const fact = withFreshness(hit);
+      facts[field] = fact;
+      recorded.push({ field, source: fact.source, ...(fact.at ? { at: fact.at } : {}) });
+      if (fact.stale) {
+        stale.push({ field, source: fact.source, at: fact.at, age_days: fact.age_days });
+      }
+      if (fact.conflicts) {
         conflicting.push({
           field,
-          chosen: { source: hit.source, value: hit.value },
-          rejected: hit.conflicts,
+          chosen: { source: fact.source, value: fact.value },
+          rejected: fact.conflicts,
         });
       }
       continue;
@@ -380,7 +471,7 @@ function resolveClientFacts(ctx, stated = {}) {
   const weekdays = resolved.preferred_days;
   const weekdayCount = weekdays?.value ? weekdays.value.split(',').length : 0;
   facts.preferred_days = weekdays && weekdayCount === Number(facts.training_days?.value)
-    ? weekdays
+    ? withFreshness(weekdays)
     : { value: null, source: null, origin: 'missing' };
 
   const active = workoutAssignments[0] || null;
@@ -393,6 +484,10 @@ function resolveClientFacts(ctx, stated = {}) {
       stated: statedFields,
       missing,
       conflicting,
+      // Facts old enough that the model must be told, and the trainer must
+      // confirm, before either treats them as current.
+      stale,
+      as_of: new Date().toISOString().slice(0, 10),
       blocking: missing.filter((m) => m.blocking).map((m) => m.field),
       // Of the facts the prompt may state, how many came from the database.
       // Trainer statements deliberately do not count towards it: the number
@@ -418,6 +513,12 @@ function describeFacts(facts) {
     training_days: 'Training days per week', equipment: 'Available equipment',
   };
   const lines = ['CLIENT FACTS (from the studio\'s records):'];
+  const freshness = (f) => {
+    if (!f.at) return '';
+    const age = f.age_days == null ? '' : `, ${f.age_days} days ago`;
+    const stale = f.stale ? ' — STALE; confirm with the client before relying on it' : '';
+    return ` [recorded ${f.at}${age}${stale}]`;
+  };
   for (const field of FIELDS) {
     const f = facts[field];
     if (!f || f.origin === 'missing') {
@@ -426,9 +527,9 @@ function describeFacts(facts) {
       lines.push(`- ${LABEL[field]}: ${f.value} (stated by the trainer for this session, not on file)`);
     } else if (f.conflicts) {
       const others = f.conflicts.map((c) => `${c.value} in ${c.source}`).join(', ');
-      lines.push(`- ${LABEL[field]}: ${f.value} (from ${f.source}; DISPUTED — ${others})`);
+      lines.push(`- ${LABEL[field]}: ${f.value} (from ${f.source}; DISPUTED — ${others})${freshness(f)}`);
     } else {
-      lines.push(`- ${LABEL[field]}: ${f.value}`);
+      lines.push(`- ${LABEL[field]}: ${f.value}${freshness(f)}`);
     }
   }
   const days = facts.preferred_days;
@@ -443,6 +544,12 @@ function describeFacts(facts) {
     lines.push(
       '',
       'DISPUTED means two of the studio\'s own records disagree. The value shown first is the one the studio\'s precedence rule selected, and it is the one to program to. Do NOT pick a different one, do not average them, and do not decide which record is right — that is the trainer\'s call, not yours. Say in the plan that the disagreement exists and which value you programmed to.',
+    );
+  }
+  if (FIELDS.some((f) => facts[f]?.stale)) {
+    lines.push(
+      '',
+      'STALE means the record is more than a year old. Use it only as a starting point, say in the plan that it may no longer be current, and name the value that should be re-measured before the next block.',
     );
   }
   return lines.join('\n');

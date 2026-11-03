@@ -465,7 +465,7 @@ async function updateMyContact(clientId, orgId, body) {
       logger.warn({ err: err.message, clientId }, 'client-portal: contact change notification failed');
     }
   }
-  return { mobile: row.mobile, whatsapp: row.whatsapp, address: row.address };
+  return { mobile: row.mobile, whatsapp: row.whatsapp, address: row.address, changed: row.changed };
 }
 
 // ── The member's own profile photo ─────────────────────────────────────────

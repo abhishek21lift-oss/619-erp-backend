@@ -130,15 +130,16 @@ describe('POST /pt-os/clients — the body client_id is not a key to another stu
 
     const update = stmt(/UPDATE pt_clients SET/i);
     expect(update).toBeTruthy();
-    // $31, not $20: the contact-field columns added later shifted the org
-    // placeholder. What this pins is that the org binds the caller's studio,
-    // whatever its position.
-    expect(update.sql).toMatch(/WHERE id = \$1 AND deleted_at IS NULL AND organization_id = \$31/);
+    // The org binds the caller's studio, whatever its position. Placeholder
+    // numbers shift whenever a legacy column stops being written; what this
+    // pins is that the predicate exists and carries ORG_A.
+    const orgClause = update.sql.match(/WHERE id = \$1 AND deleted_at IS NULL AND organization_id = \$(\d+)/);
+    expect(orgClause).toBeTruthy();
+    expect(update.params[Number(orgClause[1]) - 1]).toBe(ORG_A);
     // The screening pre-read that enrolment now does is bound to the studio too.
     const termRead = stmt(/AS has_pt_term, c\.status FROM pt_clients c/i);
     expect(termRead.sql).toMatch(/c\.organization_id = \$2/);
     expect(termRead.params).toEqual([FOREIGN, ORG_A]);
-    expect(update.params[30]).toBe(ORG_A);
     expect(update.params).not.toContain(ORG_B);
   });
 

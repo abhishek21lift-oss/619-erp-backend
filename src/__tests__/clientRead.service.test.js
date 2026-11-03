@@ -51,6 +51,11 @@ const FOREIGN_CLIENT_ID = '33333333-3333-3333-3333-333333333333';
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // clearAllMocks does not drop queued mockResolvedValueOnce values. A test
+  // that changes the number of queries would otherwise leave a row for the
+  // next test's parent gate, which is how a "foreign client" test started
+  // seeing a client.
+  pool.query.mockReset();
 });
 
 describe('findVisibleClient', () => {
@@ -245,12 +250,11 @@ describe('getClientSnapshot', () => {
 
   it('calls buildSnapshot and buildRecovery with loaded rows for visible client', async () => {
     pool.query
-      .mockResolvedValueOnce({ rows: [{ id: CLIENT_ID, name: 'Test Client' }] }) // findVisibleClient
       .mockResolvedValueOnce({ rows: [{ id: CLIENT_ID, name: 'Test Client', pt_end_date: '2026-12-31', current_term_balance: 5000 }] }) // client row
       .mockResolvedValueOnce({ rows: [{ sleep_category: 'good', sleep_duration_hours: 8 }] }) // lifestyle
+      .mockResolvedValueOnce({ rows: [{ goal_type: 'weight_loss', target_weight: 65 }] }) // goal
       .mockResolvedValueOnce({ rows: [{ weight_kg: 70, measured_at: '2026-01-15' }] }) // measurements
       .mockResolvedValueOnce({ rows: [{ weight: 71, assessment_date: '2026-01-10' }] }) // assessments
-      .mockResolvedValueOnce({ rows: [{ goal_type: 'weight_loss', target_weight: 65 }] }) // goal
       .mockResolvedValueOnce({ rows: [{ exercise_name: 'Bench', weight_kg: 100, reps: 5, session_date: '2026-01-14' }] }) // prRows
       .mockResolvedValueOnce({ rows: [{ session_date: '2026-01-14', status: 'completed' }] }) // lastSession
       .mockResolvedValueOnce({ rows: [{ week_start_date: '2026-01-12', sleep_hours: 8 }] }); // checkins
@@ -290,16 +294,15 @@ describe('getClientTrainingBrief', () => {
 
   it('calls buildBrief with all assessment rows for visible client', async () => {
     pool.query
-      .mockResolvedValueOnce({ rows: [{ id: CLIENT_ID, name: 'Test Client' }] }) // findVisibleClient
-      .mockResolvedValueOnce({ rows: [{ id: CLIENT_ID, name: 'Test Client', gender: 'M', dob: '1990-01-01' }] }) // client
+      .mockResolvedValueOnce({ rows: [{ id: CLIENT_ID, name: 'Test Client', gender: 'M', dob: '1990-01-01' }] }) // parent + client
       .mockResolvedValueOnce({ rows: [{ risk_level: 'low' }] }) // parq
-      .mockResolvedValueOnce({ rows: [{ weight: 70 }] }) // assessment
       .mockResolvedValueOnce({ rows: [{ posture_risk_level: 'low' }] }) // posture
       .mockResolvedValueOnce({ rows: [{ mobility_score: 80 }] }) // mobility
       .mockResolvedValueOnce({ rows: [{ sleep_duration_hours: 8 }] }) // lifestyle
       .mockResolvedValueOnce({ rows: [{ goal_type: 'weight_loss' }] }) // goal
       .mockResolvedValueOnce({ rows: [{ plan_id: 'plan1', plan_name: 'Plan A' }] }) // assignment
-      .mockResolvedValueOnce({ rows: [{ status: 'completed' }] }); // sessions
+      .mockResolvedValueOnce({ rows: [{ status: 'completed' }] }) // sessions
+      .mockResolvedValueOnce({ rows: [{ weight: 70 }] }); // assessment
 
     buildBrief.mockReturnValue({ client: { id: CLIENT_ID }, sections: {}, missing: [], stale: [] });
 
@@ -369,7 +372,7 @@ describe('getClientPayments', () => {
 });
 
 describe('Organization scoping', () => {
-  it('every query includes organization_id predicate for client lookup', async () => {
+  it('every client lookup carries the organization predicate', async () => {
     pool.query.mockResolvedValue({ rows: [] });
 
     await findVisibleClient(ORG_ID, CLIENT_ID);
@@ -382,13 +385,14 @@ describe('Organization scoping', () => {
     await getClientAttendance(ORG_ID, CLIENT_ID);
     await getClientPayments(ORG_ID, CLIENT_ID);
 
-    // All calls should have gone through findVisibleClient which has the org predicate
-    const findVisibleCalls = pool.query.mock.calls.filter(call =>
-      call[0].includes('SELECT id, name FROM pt_clients')
+    // Every path either goes through findVisibleClient or the shared loader's
+    // parent read, and both bind the org id rather than interpolating it.
+    const clientCalls = pool.query.mock.calls.filter(call =>
+      call[0].includes('FROM pt_clients')
     );
-    expect(findVisibleCalls.length).toBeGreaterThanOrEqual(9);
+    expect(clientCalls.length).toBeGreaterThanOrEqual(9);
 
-    findVisibleCalls.forEach(call => {
+    clientCalls.forEach(call => {
       expect(call[0]).toContain('organization_id = $2');
       expect(call[1][1]).toBe(ORG_ID);
     });

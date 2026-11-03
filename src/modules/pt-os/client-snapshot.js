@@ -24,6 +24,7 @@
 // measured will change a programme that was working.
 
 const { today: studioToday, dbDate } = require('../../lib/appTime');
+const logger = require('../../lib/logger');
 
 /** Alerts, worst first. Ordering is a claim about what to look at, so it is fixed. */
 const SEVERITY_RANK = { critical: 0, warning: 1, info: 2 };
@@ -46,20 +47,37 @@ function daysBetween(from, to) {
 }
 
 /**
- * The weight series, newest first, from whichever table holds it.
+ * The weight series, newest first, from the canonical table.
  *
- * Weight is written in two places — the measurement log and the fitness test —
- * and a studio that only ever runs assessments has an empty measurement table.
- * Reading one would report "never measured" for a client measured eight times.
+ * Fitness Testing owns the live body. `pt_os_measurements` is the older
+ * measurement log: it still holds real readings, but it has no writer left and
+ * a studio that only runs assessments has it empty. Using both as one series
+ * let a stale log entry beat the latest test in `buildGoal`, so the coach card
+ * and the generator could disagree about the same client. Assessments win
+ * whenever they hold a weight; the log is a logged fallback for the studios
+ * whose history only exists there.
  */
-function weightSeries({ measurements = [], assessments = [] }) {
-  const rows = [
-    ...measurements.map((m) => ({ on: day(m.measured_at), kg: num(m.weight_kg), source: 'measurement' })),
-    ...assessments.map((a) => ({ on: day(a.assessment_date), kg: num(a.weight), source: 'assessment' })),
-  ].filter((r) => r.on && r.kg != null);
+function weightSeries({ measurements = [], assessments = [], clientId = null }) {
+  const fromAssessments = assessments
+    .map((a) => ({ on: day(a.assessment_date), kg: num(a.weight), source: 'assessment' }))
+    .filter((r) => r.on && r.kg != null)
+    .sort((a, b) => (a.on < b.on ? 1 : a.on > b.on ? -1 : 0));
+  if (fromAssessments.length) return fromAssessments;
 
-  rows.sort((a, b) => (a.on < b.on ? 1 : a.on > b.on ? -1 : 0));
-  return rows;
+  const fromMeasurements = measurements
+    .map((m) => ({ on: day(m.measured_at), kg: num(m.weight_kg), source: 'measurement' }))
+    .filter((r) => r.on && r.kg != null)
+    .sort((a, b) => (a.on < b.on ? 1 : a.on > b.on ? -1 : 0));
+  if (fromMeasurements.length) {
+    logger.info({
+      event: 'ownership.deprecated_read',
+      field: 'weight_kg',
+      owner: 'Fitness Testing',
+      source: 'pt_os_measurements.weight_kg',
+      client_id: clientId,
+    }, 'Read weight from the legacy measurement log because no assessment holds one');
+  }
+  return fromMeasurements;
 }
 
 /**
@@ -328,7 +346,7 @@ function buildSnapshot({
   client, lifestyle, measurements = [], assessments = [], goal,
   prRows = [], lastSession, today = studioToday(),
 }) {
-  const weights = weightSeries({ measurements, assessments });
+  const weights = weightSeries({ measurements, assessments, clientId: client?.id });
   const alerts = buildAlerts({ client, lifestyle, weights, lastSession, today });
   const goalCard = buildGoal({ goal, weights });
   const prs = buildPrs(prRows);
