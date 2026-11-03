@@ -47,7 +47,7 @@ describe('a fact is recorded, stated, or missing — never assumed', () => {
     }));
     expect(dq.blocking).toEqual([]);
     expect(dq.missing.map((m) => m.field).sort())
-      .toEqual(['age', 'equipment', 'gender', 'height_cm', 'weight_kg']);
+      .toEqual(['age', 'equipment', 'gender', 'height_cm', 'session_minutes', 'weight_kg']);
   });
 
   test('every resolved fact names the column it came from', () => {
@@ -222,6 +222,33 @@ describe('training frequency reads the column the rest of the product writes', (
   });
 });
 
+describe('session length', () => {
+  test('is read from the client record and reaches the prompt', () => {
+    const { facts } = resolveClientFacts(bare({ session_minutes: 45 }));
+    expect(facts.session_minutes).toEqual({
+      value: 45, source: 'pt_clients.session_minutes', origin: 'recorded',
+    });
+    expect(describeFacts(facts)).toContain('- Session length (minutes): 45');
+  });
+
+  test('a trainer can set today\'s length, within the column\'s bounds', () => {
+    const ctx = bare({ session_minutes: 60 });
+    expect(resolveClientFacts(ctx, { session_minutes: 45 }).facts.session_minutes)
+      .toEqual({ value: 45, source: 'trainer', origin: 'stated' });
+    // Out of range is missing, not a number nobody checked.
+    expect(resolveClientFacts(ctx, { session_minutes: 5 }).facts.session_minutes.origin)
+      .toBe('missing');
+    expect(resolveClientFacts(bare(), { session_minutes: 5 }).facts.session_minutes.origin)
+      .toBe('missing');
+  });
+
+  test('missing is stated as missing, never as a default session', () => {
+    const { facts } = resolveClientFacts(bare());
+    expect(facts.session_minutes.origin).toBe('missing');
+    expect(describeFacts(facts)).toContain('- Session length (minutes): NOT RECORDED');
+  });
+});
+
 describe('equipment', () => {
   // training_mode is Offline / Online / Hybrid — where a client trains, not
   // what they can lift with.
@@ -230,7 +257,26 @@ describe('equipment', () => {
     expect(facts.equipment.origin).toBe('missing');
   });
 
-  test('the studio\'s recorded equipment is the authoritative answer', () => {
+  test('the client\'s own recorded equipment beats the studio inventory', () => {
+    const ctx = bare({ equipment: 'dumbbells' });
+    ctx.studioEquipment = 'Barbell, Cable, Machine, Dumbbell';
+    expect(resolveClientFacts(ctx).facts.equipment).toMatchObject({
+      // The enum is mapped to the phrase the safety screen reads; "bands"
+      // matched nothing there, so a bands-only client was screened as
+      // unrestricted.
+      value: 'dumbbells',
+      source: 'pt_clients.equipment',
+      origin: 'recorded',
+      // The disagreement is still reported, not hidden.
+      conflicts: [{ source: 'system_settings.studio_equipment', value: 'Barbell, Cable, Machine, Dumbbell' }],
+    });
+    expect(resolveClientFacts(bare({ equipment: 'bands' })).facts.equipment.value)
+      .toBe('resistance bands');
+    expect(resolveClientFacts(bare({ equipment: 'full_gym' })).facts.equipment.value)
+      .toBe('full gym');
+  });
+
+  test('the studio\'s recorded equipment is the fallback when the client holds none', () => {
     const ctx = bare();
     ctx.studioEquipment = 'Barbell, Dumbbell, Cable';
     expect(resolveClientFacts(ctx).facts.equipment).toEqual({
@@ -240,13 +286,16 @@ describe('equipment', () => {
     });
   });
 
-  // ── The one field where a statement beats the record ────────────────────
+  // ── The fields where a statement beats the record ───────────────────────
   //
   // And it is an exception for a safety reason, not a convenience one. The
   // studio's list says what the gym owns; "dumbbells only today" says what is
   // actually available this session. Preferring the fuller list would ungate
   // exercises the trainer has just said cannot be done — the old "full gym"
   // default wearing a better hat.
+  //
+  // Session length is the same shape: the record says how long this client's
+  // sessions usually run; the trainer knows today's slot is 45 minutes.
   test('a trainer stating today\'s equipment narrows the studio list', () => {
     const ctx = bare();
     ctx.studioEquipment = 'Barbell, Cable, Machine, Dumbbell';
@@ -303,8 +352,8 @@ describe('equipment', () => {
     expect(facts.preferred_days.origin).toBe('missing');
   });
 
-  test('and that exception applies to equipment ALONE', () => {
-    expect(STATED_SUPERSEDES).toEqual(['equipment']);
+  test('and that exception applies to equipment and session length alone', () => {
+    expect(STATED_SUPERSEDES).toEqual(['equipment', 'session_minutes']);
     // The anti-fabrication rule is unchanged everywhere else: a request body
     // still cannot rewrite who the client is.
     const ctx = bare({ goal: 'fat_loss', workout_experience_level: 'advanced', sessions_per_week: 5, dob: '1990-01-01' });

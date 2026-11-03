@@ -447,11 +447,12 @@ describeIf('Phase 4 production-shape ownership, against a real database', () => 
       const { facts, data_quality: quality } = ai.resolveClientFacts(ctx);
 
       // Goal Assessment wins: pt_goals = muscle_gain; profile = endurance;
-      // enrolment cache = strength_gain.
-      expect(facts.goal.value).toBe('muscle_gain');
+      // enrolment cache = strength_gain. Both legacy names are reported
+      // canonicalised, which is the vocabulary the prompt and the plan use.
+      expect(facts.goal.value).toBe('hypertrophy');
       expect(facts.goal.conflicts).toEqual(expect.arrayContaining([
         expect.objectContaining({ source: 'client_fitness_profiles.goal', value: 'endurance' }),
-        expect.objectContaining({ source: 'pt_clients.goal', value: 'strength_gain' }),
+        expect.objectContaining({ source: 'pt_clients.goal', value: 'strength' }),
       ]));
       expect(quality.conflicting).toContainEqual(expect.objectContaining({ field: 'goal' }));
 

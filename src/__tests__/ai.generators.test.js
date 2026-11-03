@@ -150,9 +150,19 @@ function mockQueries(overrides = {}) {
     //
     // Every one defaults to no rows, which is the production-normal case —
     // 19 of 34 clients have no PAR-Q, 31 have no mobility or posture screen,
-    // and weekly_checkins is empty for the whole studio.
+    // and weekly_checkins is empty for the whole studio. The exception is the
+    // PAR-Q: generation now refuses an unscreened client without an explicit
+    // override, so the default here is a cleared screen and the clearance
+    // states themselves are covered by the clearance suites.
     'FROM pt_clients': overrides['FROM pt_clients WHERE id=$1'] ?? [CLIENT],
-    'FROM pt_parq_forms': [],
+    // The diet generator's own medical read asks for these three columns; it
+    // has no submitted PAR-Q in these fixtures, so the nutrition assessment
+    // keeps supplying medical conditions.
+    'SELECT current_health, past_history, parq_answers': [],
+    'FROM pt_parq_forms': [{
+      workout_gate_status: 'cleared', parq_answers: [],
+      past_history: {}, current_health: {},
+    }],
     'FROM pt_posture_assessments': [],
     'FROM pt_mobility_performance_assessments': [],
     'FROM pt_lifestyle_assessments': [],
@@ -231,7 +241,7 @@ describe('workout/generate', () => {
     expect(prompt).toContain('Gender: female');
     expect(prompt).toContain('Weight (kg): 71.3');    // latest assessment beats pt_clients.weight
     expect(prompt).toContain('Height (cm): 160');
-    expect(prompt).toContain('Goal: weight_loss');
+    expect(prompt).toContain('Goal: fat_loss'); // pt_clients.goal weight_loss, classified
     expect(prompt).toContain('Experience level: beginner');
     expect(prompt).toContain('Training days per week: 4'); // pt_clients.frequency
     expect(prompt).toContain('Goal target: 68 kg');        // active pt_goals
@@ -332,21 +342,18 @@ describe('workout/generate', () => {
     expect(routedStream).not.toHaveBeenCalled();
   });
 
-  test('an account with no organization generates for no studio (strict org filter)', async () => {
+  test('an account with no organization is refused before any query', async () => {
     // There used to be a "platform super admin, org filter off" case here: the
     // parent lookup was `($2::uuid IS NULL OR organization_id=$2)`, so a null
-    // org read any studio's client. The operator no longer reaches tenant
-    // routes at all (auth.js), and the lookup is now strict equality, which a
-    // null org never satisfies — the mock returns what the database would.
+    // org read any studio's client. The route now carries the same
+    // requireTrainer guard as the mount, so an account with no studio never
+    // reaches the handler at all — the strict-equality filter behind it is
+    // still asserted by the cross-tenant test above.
     mockUser = { id: 'u-no-org', role: 'trainer', organization_id: null };
-    mockQueries({ 'FROM pt_clients WHERE id=$1': [] });
     const res = await request(app).post('/api/ai/workout/generate').send(SPOOFED_BODY);
 
-    expect(res.status).toBe(404);
-    const [sql, params] = pool.query.mock.calls[0];
-    expect(sql).toContain('organization_id = $2');
-    expect(sql).not.toMatch(/IS NULL OR/);
-    expect(params[1]).toBeNull();
+    expect(res.status).toBe(403);
+    expect(pool.query).not.toHaveBeenCalled();
     expect(routedStream).not.toHaveBeenCalled();
   });
 
@@ -969,7 +976,7 @@ describe('workout quality & structure (prompt contract)', () => {
     expect(prompt).toContain('Muscle gain: hypertrophy-oriented volume and progression.');
     expect(prompt).toContain('Strength: strength-oriented loading, exercise selection, and progression.');
     // The client's actual goal is still the DB authority.
-    expect(prompt).toContain('Goal: weight_loss');
+    expect(prompt).toContain('Goal: fat_loss');
   });
 
   test('injury and health constraints must be respected, never ignored or invented', async () => {
@@ -1281,12 +1288,12 @@ describe('conflicting authoritative records', () => {
       .find((c) => c.field === 'goal');
     expect(goalConflict).toEqual({
       field: 'goal',
-      chosen: { source: 'pt_goals.goal_type', value: 'muscle_gain' },
+      chosen: { source: 'pt_goals.goal_type', value: 'hypertrophy' },
       rejected: [{ source: 'client_fitness_profiles.goal', value: 'fat_loss' }],
     });
 
     const prompt = routedStream.mock.calls[0][0].messages[1].content;
-    expect(prompt).toContain('Goal: muscle_gain (from pt_goals.goal_type; DISPUTED — fat_loss in client_fitness_profiles.goal)');
+    expect(prompt).toContain('Goal: hypertrophy (from pt_goals.goal_type; DISPUTED — fat_loss in client_fitness_profiles.goal)');
     expect(prompt).toContain('do not decide which record is right');
   });
 

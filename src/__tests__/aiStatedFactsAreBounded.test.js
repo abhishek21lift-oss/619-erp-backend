@@ -102,7 +102,7 @@ describe('a stated fact inside the range', () => {
   const ownRangedFields = FIELDS.filter((f) => f in STATED_RANGE);
 
   test('covers every numeric fact this module resolves', () => {
-    expect(ownRangedFields.sort()).toEqual(['age', 'height_cm', 'training_days', 'weight_kg']);
+    expect(ownRangedFields.sort()).toEqual(['age', 'height_cm', 'session_minutes', 'training_days', 'weight_kg']);
   });
 
   test.each(ownRangedFields)('%s is still marked as stated by the trainer', (field) => {

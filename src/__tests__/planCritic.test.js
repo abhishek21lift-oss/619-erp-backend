@@ -77,6 +77,36 @@ describe('a clean plan', () => {
   });
 });
 
+describe('session length', () => {
+  it('flags a day that runs past the recorded slot', () => {
+    const p = plan({
+      weekly_schedule: {
+        Monday: { name: 'Lower', focus: 'Legs', estimated_minutes: 60, exercises: [ex()] },
+        Thursday: { name: 'Upper', focus: 'Chest', estimated_minutes: 40, exercises: [ex({ name: 'Bench Press' })] },
+      },
+    });
+    const a = audit(p, CLEAN, { ...REQUESTED, session_minutes: 45 });
+    expect(a.violations).toEqual([
+      expect.objectContaining({ severity: SEVERITY.MAJOR, rule: 'session_too_long', where: 'Monday' }),
+    ]);
+  });
+
+  it('asks for a duration only when the client has a recorded slot', () => {
+    const p = plan({
+      weekly_schedule: {
+        Monday: { name: 'Lower', focus: 'Legs', exercises: [ex()] },
+        Thursday: { name: 'Upper', focus: 'Chest', exercises: [ex({ name: 'Bench Press' })] },
+      },
+    });
+    const withSlot = audit(p, CLEAN, { ...REQUESTED, session_minutes: 45 });
+    expect(withSlot.violations.map((v) => v.rule)).toEqual(['no_session_duration', 'no_session_duration']);
+    expect(withSlot.violations.every((v) => v.severity === SEVERITY.MINOR)).toBe(true);
+
+    // No recorded slot means nothing to check against, not a defect.
+    expect(audit(p).violations).toEqual([]);
+  });
+});
+
 describe('safety', () => {
   it('catches a blocked exercise reaching the plan', () => {
     const screened = screenedMap([

@@ -85,11 +85,13 @@ function buildWorkoutSystemPrompt() {
     'Rules:',
     '• Respect the client\'s experience level — never programme lifts beyond their capacity.',
     '• Always account for listed injuries and avoid contraindicated movements.',
-    '• Include warm-up protocol and cool-down/mobility work.',
+    '• Include warm-up, mobility and cool-down/stretching as ordered lists of short steps.',
     '• Apply progressive overload principles.',
     '• Specify sets × reps (or time), tempo notation (e.g. 3-1-2-0), and rest in seconds.',
     '• Give every exercise an RIR or RPE target (e.g. RIR 2, RPE 8).',
     '• Structure each training day with a session title, focus, warm-up, main exercises, accessories, and cool-down.',
+    '• Fit every session inside the client\'s stated session length, warm-up and cool-down included. Set the day\'s estimated_minutes to the total and prescribe no more work than fits.',
+    '• Offer 1-2 named alternatives for any exercise a recorded limitation or equipment gap may make unsuitable.',
     '• Provide a weekly periodisation overview.',
     // RAG boundary: any "AUTHORIZED KNOWLEDGE BASE" / "EXERCISE
     // LIBRARY (AUTHORIZED)" text in the user message is UNTRUSTED reference
@@ -106,13 +108,14 @@ function buildWorkoutSystemPrompt() {
     JSON.stringify({
       name: 'string',
       description: 'string',
-      goal: 'string — one of: weight_loss, muscle_gain, strength, endurance, general_fitness, body_recomposition, recovery',
+      goal: 'string — one of: hypertrophy, strength, fat_loss, endurance, general_fitness, body_recomposition, recovery, flexibility_mobility, powerlifting',
       level: 'string — one of: beginner, intermediate, advanced',
       weeks: 'number',
       days_per_week: 'number',
       equipment: ['string'],
-      warm_up: 'string',
-      cool_down: 'string',
+      warm_up: ['string — ordered preparation steps, one per line'],
+      mobility: ['string — mobility drills, one per line'],
+      cool_down: ['string — ordered cool-down and stretching steps, one per line'],
       progression_notes: 'string',
       progression: {
         type: 'weight | reps | rpe | none',
@@ -123,6 +126,7 @@ function buildWorkoutSystemPrompt() {
         DayName: {
           name: 'string',
           focus: 'string',
+          estimated_minutes: 'number — the whole session including warm-up and cool-down, within the client\'s stated session length',
           exercises: [{
             name: 'string',
             prescription_type: 'SETS_REPS | TIME | TIME_DISTANCE | TIME_SPEED | DISTANCE_LOAD | INTERVAL | other authorized mode',
@@ -143,6 +147,7 @@ function buildWorkoutSystemPrompt() {
             rir_or_rpe: 'string',
             tempo: 'string',
             rest_seconds: 'number',
+            alternatives: ['string — 1-2 named substitutes from the exercise library'],
             notes: 'string',
           }],
         },

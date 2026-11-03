@@ -112,6 +112,34 @@ describe('the prescription', () => {
     expect(parseRpe('as hard as possible')).toBeNull();
   });
 
+  it('keeps the RIR the coach wrote beside its RPE equivalent', () => {
+    // The old mapping stored only the converted 8, so a trainer reopening the
+    // plan could no longer tell whether 2 reps in reserve or RPE 8 was
+    // prescribed. Both now survive.
+    const row = one({ rir_or_rpe: 'RIR 2' });
+    expect(row.rpe).toBe(8);
+    expect(row.rir).toBe(2);
+    expect(one({ rir_or_rpe: 'RPE 8' }).rir).toBeNull();
+  });
+
+  it('keeps the load, warm-up sets and superset the generator prescribed', () => {
+    // These columns existed and the save ignored them, so a 4x5 at 80 kg with
+    // two ramp sets and a superset arrived as 4x5 at no weight.
+    const row = one({ target_weight: 80, warmup_sets: 2, superset_group: 'A' });
+    expect(row.target_weight).toBe(80);
+    expect(row.warmup_sets).toBe(2);
+    expect(row.superset_group).toBe('A');
+  });
+
+  it('keeps alternatives and coaching cues as written', () => {
+    const row = one({
+      alternatives: [{ name: 'Front Squat', reason: 'wrist pain' }],
+      coaching_cues: ['brace before descending', 'knees track out'],
+    });
+    expect(row.alternatives).toEqual([{ name: 'Front Squat', reason: 'wrist pain' }]);
+    expect(row.cues).toEqual(['brace before descending', 'knees track out']);
+  });
+
   it('carries a cardio prescription into config rather than faking reps', () => {
     const row = one({
       prescription_type: 'TIME_DISTANCE', sets: null, reps: null,
@@ -217,11 +245,27 @@ describe('the plan itself', () => {
   it('takes its shape from the generated plan', () => {
     const out = materialise(plan({ Monday: [ex()], Thursday: [ex()] }), resolver(['Barbell Squat']));
     expect(out.plan).toEqual({
-      name: 'Hypertrophy Block', goal: 'muscle_gain', difficulty: 'intermediate',
+      // The legacy goal the generator wrote classifies to the canonical one.
+      name: 'Hypertrophy Block', goal: 'hypertrophy', difficulty: 'intermediate',
       duration_weeks: 8, sessions_per_week: 2,
       description: 'x',
       progression_type: 'none', progression_amount: null, progression_every_weeks: 1,
+      warmup_protocol: null, mobility_protocol: null, cooldown_protocol: null,
     });
+  });
+
+  it('keeps structured warm-up and mobility blocks out of the description', () => {
+    // A warm-up is structured work, not a paragraph. It stays JSONB so the
+    // builder can edit one item without rewriting prose.
+    const out = materialise(plan({ Monday: [ex()] }, {
+      warm_up: ['5 min bike', 'band pull-aparts'],
+      mobility: { hip: '90/90, 2 min each side' },
+      cool_down: 'walk 5 min',
+    }), resolver(['Barbell Squat']));
+
+    expect(out.plan.warmup_protocol).toEqual(['5 min bike', 'band pull-aparts']);
+    expect(out.plan.mobility_protocol).toEqual({ hip: '90/90, 2 min each side' });
+    expect(out.plan.cooldown_protocol).toEqual(['walk 5 min']);
   });
 
   it('keeps the warm-up, cool-down and progression the model wrote', () => {
@@ -264,16 +308,29 @@ describe('the plan itself', () => {
     }
   });
 
-  it('normalises a goal and level the columns only accept in enum form', () => {
-    // The generator writes labels ("Weight Loss"); the columns take
-    // 'weight_loss' and reject the rest — which used to fail the whole accept
-    // on the CHECK constraint.
+  it('normalises a goal label onto the canonical vocabulary', () => {
+    // The generator writes labels ("Weight Loss"); the column takes an enum.
+    // The label classifies to fat_loss, not the legacy weight_loss spelling.
     const out = materialise(
       plan({ Monday: [ex()] }, { goal: 'Weight Loss', level: 'Advanced' }),
       resolver(['Barbell Squat']),
     );
-    expect(out.plan.goal).toBe('weight_loss');
+    expect(out.plan.goal).toBe('fat_loss');
     expect(out.plan.difficulty).toBe('advanced');
+  });
+
+  it('keeps powerlifting and mobility goals the old enum dropped', () => {
+    // pt_goals has accepted powerlifting and mobility all along, but the plan
+    // column did not, so plan-materialise nulled the goal that shaped the
+    // programme. Both are canonical now.
+    for (const [raw, want] of [
+      ['powerlifting', 'powerlifting'],
+      ['mobility', 'flexibility_mobility'],
+      ['hypertrophy', 'hypertrophy'],
+    ]) {
+      expect(materialise(plan({ Monday: [ex()] }, { goal: raw }),
+        resolver(['Barbell Squat'])).plan.goal).toBe(want);
+    }
   });
 
   it('keeps body recomposition, which the goal constraint now accepts', () => {

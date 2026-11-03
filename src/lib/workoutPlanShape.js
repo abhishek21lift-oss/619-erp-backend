@@ -8,14 +8,13 @@
  * hold, and this is the rule both the create and the edit path apply.
  */
 
-// Mirrors workout_plans_goal_check (migration 239) and
+// Mirrors workout_plans_goal_check (migration 259) and
 // workout_plans_difficulty_check (migration 006). Checked here as well so a
 // bad value is a 400 that names the field, not a constraint violation that
-// surfaces as a 500.
-const PLAN_GOALS = [
-  'weight_loss', 'muscle_gain', 'strength', 'endurance',
-  'general_fitness', 'body_recomposition', 'recovery',
-];
+// surfaces as a 500. Legacy names classify to canonical ones, so a caller
+// still sending `muscle_gain` or `strength_gain` is accepted and stored as
+// `hypertrophy` / `strength`.
+const { CANONICAL_GOALS, PLAN_GOALS, classifyGoal } = require('../modules/pt-os/goal-classification');
 const PLAN_DIFFICULTIES = ['beginner', 'intermediate', 'advanced'];
 
 // The progression engine's own ceiling (pt-os/progression MAX_WEEKS). The
@@ -29,8 +28,8 @@ const { MAX_WEEKS: WEEKS_MAX } = require('../modules/pt-os/progression');
  * Absent fields are fine — create has defaults and edit keeps what is stored.
  */
 function shapeError(d) {
-  if (d.goal != null && d.goal !== '' && !PLAN_GOALS.includes(d.goal)) {
-    return `goal must be one of: ${PLAN_GOALS.join(', ')}`;
+  if (d.goal != null && d.goal !== '' && !classifyGoal(d.goal)) {
+    return `goal must be one of: ${CANONICAL_GOALS.join(', ')}`;
   }
   if (d.difficulty != null && d.difficulty !== '' && !PLAN_DIFFICULTIES.includes(d.difficulty)) {
     return `difficulty must be one of: ${PLAN_DIFFICULTIES.join(', ')}`;

@@ -119,11 +119,15 @@ describe('normaliseWorkout', () => {
         { name: 'Skipped', sets: [] },
       ],
     });
+    const set = (over) => ({
+      weight_kg: null, reps: null, duration_seconds: null, distance_m: null,
+      rpe: null, rir: null, tempo: null, rest_seconds: null, notes: null, ...over,
+    });
     expect(w.exercises).toEqual([
-      { name: 'Row', sets: [{ weight_kg: 40, reps: 10, duration_seconds: null, distance_m: null }] },
-      { name: 'Plank', sets: [{ weight_kg: null, reps: null, duration_seconds: 60, distance_m: null }] },
+      { name: 'Row', notes: null, sets: [set({ weight_kg: 40, reps: 10 })] },
+      { name: 'Plank', notes: null, sets: [set({ duration_seconds: 60 })] },
       // A carry is a real set on distance alone; load with nothing done is not.
-      { name: "Farmer's Walk", sets: [{ weight_kg: 32, reps: null, duration_seconds: null, distance_m: 40 }] },
+      { name: "Farmer's Walk", notes: null, sets: [set({ weight_kg: 32, distance_m: 40 })] },
     ]);
   });
 

@@ -78,6 +78,17 @@ describe('tenant isolation — plans are scoped to the caller\'s studio', () => 
     expect(select).toMatch(/wp\.organization_id = \$/);
   });
 
+  it('refuses the plan list to a member — it carries every client\'s assignment', async () => {
+    // The list is not reference content: `assignments` names each active
+    // client, their progress, dates and status. A member account is inside
+    // the studio and passes the mount's feature gate, so only a role check
+    // stops it.
+    mockUser = MEMBER_A;
+    const res = await request(app).get('/api/workouts/plans');
+    expect(res.status).toBe(403);
+    expect(sqls().some((s) => /FROM workout_plans wp/.test(s))).toBe(false);
+  });
+
   it('scopes plan detail, and lets shared platform templates through', async () => {
     await request(app).get(`/api/workouts/plans/${PLAN}`);
     const select = sqls().find((s) => /SELECT wp\.\* FROM workout_plans/.test(s));
@@ -515,7 +526,8 @@ describe('cardio prescriptions cannot bypass validation through whole-plan write
     expect(res.status).toBe(201);
     const insert = pool.query.mock.calls.find(([sql]) => /INSERT INTO workout_exercises/.test(String(sql)));
     expect(insert).toBeDefined();
-    expect(JSON.parse(insert[1][14])).toEqual(validCardioConfig);
+    // Positional: config is the last of the prescription columns.
+    expect(JSON.parse(insert[1][18])).toEqual(validCardioConfig);
   });
 });
 

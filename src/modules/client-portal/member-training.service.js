@@ -74,10 +74,18 @@ function normaliseWorkout(body = {}) {
       // Carries, sled work and cardio are logged in metres; stored with its
       // unit because workout_sets refuses a distance without one.
       distance_m: boundedNumber(s?.distance_m, 0, 100000, 'Distance'),
+      // Effort and rest are what make a logged set comparable to the
+      // prescription. The trainer's log has always written them; this path
+      // dropped them, so an autoregulated set arrived as weight × reps only.
+      rpe: boundedNumber(s?.rpe, 0, 10, 'RPE'),
+      rir: boundedNumber(s?.rir, 0, 10, 'RIR', { integer: true }),
+      tempo: text(s?.tempo, 20),
+      rest_seconds: boundedNumber(s?.rest_seconds, 0, 3600, 'Rest', { integer: true }),
+      notes: text(s?.notes, 1000),
     })).filter((s) => (s.reps !== null && s.reps > 0)
       || (s.duration_seconds !== null && s.duration_seconds > 0)
       || (s.distance_m !== null && s.distance_m > 0));
-    return { name, sets };
+    return { name, notes: text(x?.notes, 1000), sets };
   }).filter((x) => x.sets.length > 0);
 
   if (exercises.length === 0) throw new TrainingInputError('Log at least one set');
@@ -270,9 +278,9 @@ async function logMyWorkout(clientId, orgId, userId, body) {
     for (const [i, x] of w.exercises.entries()) {
       const exerciseId = idOf.get(key(x.name)) ?? null;
       const { rows: ex } = await tx.query(
-        `INSERT INTO workout_session_exercises (session_id, exercise_id, exercise_name, sort_order)
-         VALUES ($1, $2, $3, $4) RETURNING id`,
-        [sessionId, exerciseId, x.name, i],
+        `INSERT INTO workout_session_exercises (session_id, exercise_id, exercise_name, sort_order, notes)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [sessionId, exerciseId, x.name, i, x.notes],
       );
       for (const [j, s] of x.sets.entries()) {
         // Sequential on purpose: each set is compared with the ones before it,
@@ -283,11 +291,14 @@ async function logMyWorkout(clientId, orgId, userId, body) {
         await tx.query(
           `INSERT INTO workout_sets (
              session_exercise_id, set_number, weight_kg, reps, duration_seconds, completed,
-             is_pr_weight, is_pr_reps, is_pr_volume, distance, distance_unit
-           ) VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7, $8, $9, $10)`,
+             is_pr_weight, is_pr_reps, is_pr_volume, distance, distance_unit,
+             rpe, rir, tempo, rest_seconds, notes
+           ) VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7, $8, $9, $10,
+                     $11, $12, $13, $14, $15)`,
           [ex[0].id, j + 1, s.weight_kg, s.reps, s.duration_seconds,
             flags.is_pr_weight, flags.is_pr_reps, flags.is_pr_volume,
-            s.distance_m ?? null, s.distance_m != null ? 'm' : null],
+            s.distance_m ?? null, s.distance_m != null ? 'm' : null,
+            s.rpe, s.rir, s.tempo, s.rest_seconds, s.notes],
         );
       }
     }

@@ -76,7 +76,9 @@ const DIET_PLAN = {
   meal_frequency: 5, meals: [{ name: 'Breakfast', time: '08:00', calories: 500 }],
   grocery_list: [], supplements: [], hydration_ml: 3000, notes: '',
 };
-const BODY = { client_id: 'client-1', mode: 'new' };
+// These tests are about citation grounding, so they take the explicit
+// trainer override the clearance gate requires for an unscreened client.
+const BODY = { client_id: 'client-1', mode: 'new', acknowledge_unscreened: true };
 
 function streamChunks(chunks, meta = META) {
   let i = 0;

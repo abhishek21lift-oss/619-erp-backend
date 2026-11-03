@@ -154,12 +154,20 @@ describe('PUT /plans/:id', () => {
 });
 
 describe('shapeError', () => {
-  it('knows the seven goals the database allows', () => {
+  it('knows the goals the database allows', () => {
+    // The canonical nine, plus the two legacy names existing rows carry.
     expect(PLAN_GOALS).toEqual([
-      'weight_loss', 'muscle_gain', 'strength', 'endurance',
-      'general_fitness', 'body_recomposition', 'recovery',
+      'hypertrophy', 'strength', 'fat_loss', 'endurance', 'general_fitness',
+      'body_recomposition', 'recovery', 'flexibility_mobility', 'powerlifting',
+      'weight_loss', 'muscle_gain',
     ]);
     for (const g of PLAN_GOALS) expect(shapeError({ goal: g })).toBeNull();
+  });
+
+  it('accepts the studio goal names that classify onto a canonical goal', () => {
+    for (const g of ['strength_gain', 'mobility', 'marathon_prep', 'Weight Loss']) {
+      expect(shapeError({ goal: g })).toBeNull();
+    }
   });
 
   it('holds weeks to whole numbers within the progression engine\'s range', () => {

@@ -128,6 +128,50 @@ function weekOfRow(row) {
 }
 
 /**
+ * Whether a linear plan schedules a deload on this week.
+ *
+ * Opt-in: NULL `deload_every_weeks` means never, which is every plan written
+ * before migration 260 and keeps its behaviour exactly. A deload on week 0 or
+ * week 1 would be the first week of the programme, so the cadence starts at
+ * the first multiple of N at or after week 2.
+ */
+function isDeloadWeek(plan, week) {
+  const every = Math.floor(Number(plan?.deload_every_weeks));
+  const w = Math.max(1, Math.floor(Number(week) || 1));
+  if (!Number.isFinite(every) || every < 2) return false;
+  return w % every === 0;
+}
+
+/**
+ * Reduce one week's prescription for a deload.
+ *
+ * Load comes down by the plan's own percentage (70% when unset), and effort
+ * comes down with it. Reps and sets stay: a deload is the same programme at
+ * less cost, not a different one. A row with no weight has no percentage to
+ * take, so only its RPE moves.
+ */
+function applyDeload(exercise, plan, week) {
+  if (!isDeloadWeek(plan, week)) return exercise;
+  const pct = Number(plan?.deload_intensity_pct);
+  const factor = Number.isFinite(pct) && pct >= 30 && pct <= 100 ? pct / 100 : 0.7;
+  const out = { ...exercise, is_deload: true, deload_pct: Math.round(factor * 100) };
+  if (out.target_weight != null) {
+    out.target_weight = Math.max(0, Math.round(Number(out.target_weight) * factor * 4) / 4);
+  }
+  if (out.rpe != null) {
+    out.rpe = Math.max(1, Math.round((Number(out.rpe) - 2) * 10) / 10);
+  }
+  return out;
+}
+
+/** The phase label a block plan stores for a week, or null for a linear plan. */
+function phaseOf(plan, week) {
+  if (!Array.isArray(plan?.block_phases)) return null;
+  return plan.block_phases.find((entry) => Number(entry?.week) === Number(week)) || null;
+}
+
+
+/**
  * Which week the prescription for `week` is built from.
  *
  * The nearest week at or before it that has real rows — week 1 at worst,
@@ -160,6 +204,19 @@ function resolveWeek(rows, plan, week) {
   const w = Math.max(1, Math.floor(Number(week) || 1));
   const anchor = anchorWeekFor(rows, w);
   const base = rows.filter((r) => weekOfRow(r) === anchor);
+  const isBlock = plan?.periodization_model === 'powerlifting_block';
+  const phase = phaseOf(plan, w);
+  const shape = (exercises, source) => ({
+    exercises: isBlock
+      // A block's weeks are all stored as anchors: their prescription already
+      // includes the phase's intensity and any deload, so applying a second
+      // linear rule on top would reduce a deload twice.
+      ? exercises.map((r) => ({ ...r, progression_steps: 0, is_deload: !!phase?.is_deload }))
+      : exercises.map((r) => applyDeload(r, plan, w)),
+    source,
+    anchor_week: anchor,
+    phase,
+  });
 
   // The week IS the anchor: these rows are the prescription, not a starting
   // point for one. Week 1 is the exception only in what it is called — its
@@ -167,18 +224,13 @@ function resolveWeek(rows, plan, week) {
   // same thing.
   if (anchor === w) {
     const source = w === 1 ? 'derived' : 'override';
-    return {
-      exercises: base.map((r) => ({ ...r, progression_steps: 0 })),
-      source,
-      anchor_week: anchor,
-    };
+    return shape(base, source);
   }
 
-  return {
-    exercises: base.map((r) => applyProgression(r, plan, w, anchor)),
-    source: 'derived',
-    anchor_week: anchor,
-  };
+  return shape(
+    base.map((r) => applyProgression(r, plan, w, anchor)),
+    'derived',
+  );
 }
 
 /**
@@ -223,5 +275,6 @@ function counterpartOf(rows, exercise) {
 }
 
 module.exports = {
-  weekOf, programmeWeek, stepsFor, applyProgression, resolveWeek, anchorWeekFor, previewWeeks, MAX_WEEKS,
+  weekOf, programmeWeek, stepsFor, applyProgression, applyDeload, isDeloadWeek,
+  resolveWeek, anchorWeekFor, previewWeeks, phaseOf, MAX_WEEKS,
 };

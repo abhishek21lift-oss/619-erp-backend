@@ -297,6 +297,15 @@ function describeTwin(twin) {
   L.push('SAFETY SCREEN (decided by rule, not by you — do not overrule it):');
   L.push(`- Medical clearance: ${rules.gate.status}`
     + (rules.gate.assessed_on ? ` (PAR-Q ${rules.gate.assessed_on})` : ' — no PAR-Q on file'));
+  if (rules.gate.status === 'conditional') {
+    L.push('- CONDITIONAL CLEARANCE — these restrictions bind the programme:');
+    for (const r of rules.gate.restrictions || []) L.push(`  · ${r}`);
+    L.push('- Work within these restrictions. Do not programme around them or assume they have been resolved.');
+  } else if (rules.gate.status === 'unknown') {
+    L.push('- NOBODY HAS CLEARED THIS CLIENT. This generation is proceeding only under an'
+      + ' explicit trainer override. Programme conservatively and say plainly which'
+      + ' screening value would change your choices.');
+  }
 
   const located = rules.constraints.filter((c) => c.region);
   if (located.length) {
@@ -399,6 +408,38 @@ function describeTwin(twin) {
 
   if (brief.missing.length) {
     L.push('', `NOT ASSESSED — you may recommend measuring these, but must not describe them: ${brief.missing.join(', ')}.`);
+  }
+
+  // ── Capacity: what they can currently DO, not what they weigh ───────────
+  //
+  // The generator used to know a client's goal, injuries and logged sets, and
+  // nothing about the fitness test the studio had already run. A programme for
+  // someone with a measured low aerobic capacity and a high strength score is
+  // not the programme for the reverse. Scores are reported with the studio's
+  // own category beside them so a number never arrives without its scale.
+  const capacity = brief.sections.capacity;
+  if (capacity?.present) {
+    const lines = [];
+    const addCapacity = (label, part, extra = null) => {
+      if (!part || (part.score == null && part.category == null)) return;
+      const score = part.score != null ? `${part.score}/100` : 'score not computed';
+      lines.push(`- ${label}: ${score}${part.category ? ` (${part.category})` : ''}${extra ? `, ${extra}` : ''}.`);
+    };
+    if (capacity.overall != null) lines.push(`- Overall fitness: ${capacity.overall}/100.`);
+    addCapacity('Strength', capacity.strength,
+      capacity.strength.percentile != null ? `K11 percentile ${capacity.strength.percentile}` : null);
+    addCapacity('Cardio', capacity.cardio,
+      capacity.cardio.vo2_max != null ? `VO2 max ${capacity.cardio.vo2_max}` : null);
+    addCapacity('Endurance', capacity.endurance);
+    addCapacity('Flexibility/mobility', capacity.flexibility);
+
+    if (lines.length) {
+      L.push('', `CAPACITY — fitness test on ${capacity.as_of || 'an unrecorded date'}:`);
+      L.push(...lines);
+      L.push('- Programme to these measured capacities. Do not describe an untested quality as strong or weak.');
+    } else {
+      L.push('', `CAPACITY — a fitness test is on file (${capacity.as_of || 'date unrecorded'}) but no scored components were recorded, so it cannot guide programming.`);
+    }
   }
 
   // ── Age is a fact about the evidence ─────────────────────────────────────

@@ -293,7 +293,7 @@ describeIf('AI client context Phase 3, against a real database', () => {
         expect.objectContaining({ source: 'pt_clients.weight', value: 88 }),
         expect.objectContaining({ source: 'weekly_checkins.weight', value: 73 }),
       ]));
-      expect(facts.goal.value).toBe('muscle_gain');
+      expect(facts.goal.value).toBe('hypertrophy');
       expect(facts.goal.conflicts).toEqual(expect.arrayContaining([
         expect.objectContaining({ source: 'client_fitness_profiles.goal', value: 'endurance' }),
         expect.objectContaining({ source: 'pt_clients.goal', value: 'general_fitness' }),

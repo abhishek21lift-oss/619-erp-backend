@@ -213,4 +213,70 @@ describe('authoritative screening gate in workout/generate', () => {
     // Model should not be called because stored gate blocks
     expect(routedStream).not.toHaveBeenCalled();
   });
+
+  it('escalates an unscreened client instead of generating silently', async () => {
+    mockDb();
+    checkScreeningGate.mockResolvedValue({ blocked: null, warnings: [] });
+    loadDigitalTwin.mockResolvedValueOnce({
+      ...MOCK_TWIN,
+      rules: {
+        ...MOCK_TWIN.rules,
+        may_program: false,
+        gate: { status: 'unknown', cleared: false, may_program: false, restrictions: [] },
+      },
+    });
+
+    const res = await request(app).post('/api/ai/workout/generate').send(BODY);
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('CLEARANCE_REQUIRED');
+    expect(res.body.gate).toBe('unknown');
+    expect(routedStream).not.toHaveBeenCalled();
+  });
+
+  it('generates for an unscreened client only under an explicit trainer override', async () => {
+    mockDb();
+    checkScreeningGate.mockResolvedValue({ blocked: null, warnings: [] });
+    loadDigitalTwin.mockResolvedValueOnce({
+      ...MOCK_TWIN,
+      rules: {
+        ...MOCK_TWIN.rules,
+        may_program: false,
+        gate: { status: 'unknown', cleared: false, may_program: false, restrictions: [] },
+      },
+    });
+
+    const res = await request(app).post('/api/ai/workout/generate')
+      .send({ ...BODY, acknowledge_unscreened: true });
+
+    expect(res.status).toBe(200);
+    expect(routedStream).toHaveBeenCalled();
+    const done = doneOf(res.text);
+    expect(done.clearance.status).toBe('unknown');
+  });
+
+  it('carries a conditional clearance and its restrictions into the response', async () => {
+    mockDb();
+    checkScreeningGate.mockResolvedValue({ blocked: null, warnings: [] });
+    loadDigitalTwin.mockResolvedValueOnce({
+      ...MOCK_TWIN,
+      rules: {
+        ...MOCK_TWIN.rules,
+        may_program: true,
+        gate: {
+          status: 'conditional',
+          cleared: false,
+          may_program: true,
+          restrictions: ['PAR-Q question 7 answered yes: knee pain'],
+        },
+      },
+    });
+
+    const res = await request(app).post('/api/ai/workout/generate').send(BODY);
+
+    expect(res.status).toBe(200);
+    const done = doneOf(res.text);
+    expect(done.clearance.status).toBe('conditional');
+    expect(done.clearance.restrictions).toEqual(['PAR-Q question 7 answered yes: knee pain']);
+  });
 });
