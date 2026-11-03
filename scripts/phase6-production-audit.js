@@ -58,6 +58,27 @@ const REQUIRED_TABLES = [
   'pt_os_measurements', 'client_fitness_profiles',
 ];
 
+// Every table the analyzers read, not just the ones that must exist. The
+// RLS guard below has to cover the whole read set: a hidden consent or
+// strength-log table silently drops whole checks from the report.
+const AUDIT_TABLES = [
+  ...REQUIRED_TABLES,
+  'pt_consent_records', 'pt_informed_consents',
+  'pt_mobility_performance_assessments', 'strength_logs',
+];
+
+// A role sees every row when it is superuser, has BYPASSRLS, or owns the
+// table and the table does not FORCE row security. Anything else is filtered
+// by policy — and an audit that counts filtered rows reports zeros, then
+// tells the schema gate ELIGIBLE_FOR_REVIEW. That false green is what this
+// refuses. Kept pure so it is testable without a second database role.
+function rlsHiddenTables(tables, role) {
+  return tables
+    .filter((t) => t.rowsecurity
+      && !(role.superuser || role.bypassrls || (t.is_owner && !t.force_row_security)))
+    .map((t) => t.relname);
+}
+
 function arg(argv, name, fallback = null) {
   const i = argv.indexOf(`--${name}`);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : fallback;
@@ -135,6 +156,18 @@ async function preflight(url) {
     const { rows: [tables] } = await db.query(
       `SELECT ${REQUIRED_TABLES.map((t) => `to_regclass('public.${t}') AS ${t}`).join(',\n              ')}`,
     );
+    const { rows: rlsTables } = await db.query(
+      `SELECT c.relname,
+              c.relrowsecurity AS rowsecurity,
+              c.relforcerowsecurity AS force_row_security,
+              pg_get_userbyid(c.relowner) = current_user AS is_owner
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ANY($1)`,
+      [AUDIT_TABLES],
+    );
     await db.query('ROLLBACK');
 
     if (state.read_only !== 'on') {
@@ -147,6 +180,18 @@ async function preflight(url) {
     if (missing.length) {
       throw new Error(`Refusing to audit: missing expected table(s): ${missing.join(', ')}. Wrong database?`);
     }
+    const hidden = rlsHiddenTables(rlsTables, {
+      superuser: privileges.rolsuper,
+      bypassrls: privileges.rolbypassrls,
+    });
+    if (hidden.length) {
+      throw new Error(
+        `Refusing to audit: row-level security would hide rows from role "${state.role}" `
+        + `in ${hidden.length} table(s) (${hidden.join(', ')}). Grant BYPASSRLS to this `
+        + 'read-only role — SELECT stays the only data privilege it needs. Without it the '
+        + 'report counts zero and the schema gate wrongly reads ELIGIBLE_FOR_REVIEW.',
+      );
+    }
     return {
       ...state,
       in_recovery: recovery.in_recovery,
@@ -154,6 +199,7 @@ async function preflight(url) {
       role_createrole: privileges.rolcreaterole,
       role_bypassrls: privileges.rolbypassrls,
       tables_present: REQUIRED_TABLES.length,
+      rls_checked_tables: rlsTables.length,
     };
   } finally {
     await db.end().catch(() => {});
@@ -373,7 +419,7 @@ async function main() {
   console.log(`Manifest: ${manifestFile}`);
 }
 
-module.exports = { parseOptions, preflight, isLoopback };
+module.exports = { parseOptions, preflight, isLoopback, rlsHiddenTables };
 
 if (require.main === module) {
   main().catch((err) => {
