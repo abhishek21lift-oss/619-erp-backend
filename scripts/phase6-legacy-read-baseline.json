@@ -1,0 +1,172 @@
+{
+  "phase": 6,
+  "generated_at": "2026-11-03",
+  "note": "Every entry is a retained dependency with an owner, a reason and a sunset condition. A new unregistered read or write fails CI. An entry whose read/write has been removed also fails CI, so this file cannot rot.",
+  "legacy_writes": [
+    {
+      "file": "src/modules/progress/assessments.repo.js",
+      "source": "pt_clients.weight",
+      "owner": "Fitness Testing",
+      "reason": "Deliberate cache sync: derive pt_clients.weight from the newest owned assessment after a create or delete.",
+      "sunset": "When every consumer reads pt_assessments directly and the cache column is retired."
+    },
+    {
+      "file": "src/modules/progress/assessments.repo.js",
+      "source": "pt_clients.height",
+      "owner": "Fitness Testing",
+      "reason": "Deliberate cache sync: derive pt_clients.height from the newest owned assessment after a create or delete.",
+      "sunset": "When every consumer reads pt_assessments directly and the cache column is retired."
+    }
+  ],
+  "legacy_reads": [
+    {
+      "file": "src/modules/client-portal/client-portal.routes.js",
+      "source": "pt_os_measurements",
+      "owner": "Fitness Testing",
+      "reason": "Member measurement timeline keeps the historical trainer log as a labelled third source; the table has no writer and no migration definition.",
+      "sunset": "After a read-only row-by-row comparison with pt_assessments proves the rows are copied or empty, and one release has been observed without a read."
+    },
+    {
+      "file": "src/modules/client-portal/member-goals.service.js",
+      "source": "pt_os_measurements",
+      "owner": "Fitness Testing",
+      "reason": "Member goal progress accepts a legacy trainer measurement when no owned assessment or check-in exists.",
+      "sunset": "After a read-only row-by-row comparison with pt_assessments proves the rows are copied or empty, and one release has been observed without a read."
+    },
+    {
+      "file": "src/modules/pt-os/authoritative-client.js",
+      "source": "pt_os_measurements",
+      "owner": "Fitness Testing",
+      "reason": "Profile snapshot weight history still includes the historical trainer log.",
+      "sunset": "After a read-only row-by-row comparison with pt_assessments proves the rows are copied or empty, and one release has been observed without a read."
+    },
+    {
+      "file": "src/modules/pt-os/authoritative-client.js",
+      "source": "client_fitness_profiles",
+      "owner": "Client enrolment / Goal",
+      "reason": "Generator group loads the retired fitness profile as a fallback for rows written before field ownership moved.",
+      "sunset": "After a targeted read-only audit of the profile-only columns shows no non-null profile-only fact and the generator resolves entirely from owned records."
+    },
+    {
+      "file": "src/modules/pt-os/client-facts.js",
+      "source": "client_fitness_profiles",
+      "owner": "Client enrolment / Goal",
+      "reason": "Named legacy fallback registry; every use is logged as ownership.deprecated_read.",
+      "sunset": "When a targeted read-only audit of the profile-only columns shows the fallback never wins for a live client."
+    },
+    {
+      "file": "src/modules/pt-os/client-snapshot.js",
+      "source": "pt_os_measurements",
+      "owner": "Fitness Testing",
+      "reason": "Trainer profile screen shows the historical trainer measurement series beside owned assessments.",
+      "sunset": "After a read-only row-by-row comparison with pt_assessments proves the rows are copied or empty, and one release has been observed without a read."
+    },
+    {
+      "file": "src/modules/pt-os/pt-os.routes.js",
+      "source": "pt_os_measurements",
+      "owner": "Fitness Testing",
+      "reason": "Trainer client profile and measurement panel read the historical trainer log.",
+      "sunset": "After a read-only row-by-row comparison with pt_assessments proves the rows are copied or empty, and one release has been observed without a read."
+    },
+    {
+      "file": "src/modules/pt-os/pt-os.service.js",
+      "source": "pt_os_measurements",
+      "owner": "Fitness Testing",
+      "reason": "Progress aggregation unions the historical trainer log with owned assessments.",
+      "sunset": "After a read-only row-by-row comparison with pt_assessments proves the rows are copied or empty, and one release has been observed without a read."
+    },
+    {
+      "file": "src/modules/pt-os/workout-generator.repo.js",
+      "source": "client_fitness_profiles",
+      "owner": "Client enrolment / Goal",
+      "reason": "Workout generator fact source still loads the retired fitness profile before the shared resolver decides precedence.",
+      "sunset": "When the generator route switches to the authoritative-client generator group."
+    },
+    {
+      "file": "src/routes/ai.js",
+      "source": "client_fitness_profiles",
+      "owner": "Client enrolment / Goal",
+      "reason": "Diet/workout prompt fallbacks log and read the retired fitness profile only when the owned record has no answer.",
+      "sunset": "When a targeted read-only audit of the profile-only columns shows the fallback never wins for a live client."
+    },
+    {
+      "file": "src/routes/diet.js",
+      "source": "client_fitness_profiles",
+      "owner": "Client enrolment / Goal",
+      "reason": "Legacy fitness-profile endpoint still serves old rows to the diet screen and logs every read.",
+      "sunset": "When the endpoint returns 410 after a targeted read-only audit of the profile-only columns confirms no client depends on it."
+    }
+  ],
+  "ai_direct_reads": [
+    {
+      "file": "src/routes/ai.js",
+      "source": "pt_assessments",
+      "owner": "Fitness Testing",
+      "reason": "Progress analysis needs a bounded assessment history that the canonical loader does not expose; ordering matches the owner rule.",
+      "sunset": "When authoritative-client exposes a bounded history group for progress analysis."
+    },
+    {
+      "file": "src/routes/ai.js",
+      "source": "pt_goals",
+      "owner": "Goal",
+      "reason": "Progress analysis reads the last five goal rows, including inactive history, which the active-goal loader intentionally omits.",
+      "sunset": "Same as the assessment history."
+    },
+    {
+      "file": "src/routes/ai.js",
+      "source": "weekly_checkins",
+      "owner": "Weekly check-in",
+      "reason": "Progress analysis needs bounded check-in history; ordering matches the owner rule.",
+      "sunset": "Same as the assessment history."
+    },
+    {
+      "file": "src/routes/ai.js",
+      "source": "strength_logs",
+      "owner": "Strength Tracking",
+      "reason": "Progress analysis needs bounded strength history; ordering matches the owner rule.",
+      "sunset": "Same as the assessment history."
+    },
+    {
+      "file": "src/lib/ai/tools.js",
+      "source": "pt_clients.goal",
+      "owner": "Goal",
+      "reason": "find_client returns the legacy goal text with a client lookup; it is a display fallback, not a programming input.",
+      "sunset": "When find_client resolves goal from the active pt_goals row or drops the field."
+    },
+    {
+      "file": "src/modules/pt-os/workout-generator.repo.js",
+      "source": "pt_goals",
+      "owner": "Goal",
+      "reason": "Generator loads the active goal rows for the shared fact resolver; it is the repo layer for this surface, not a second resolver.",
+      "sunset": "When the generator route switches to the authoritative-client generator group."
+    },
+    {
+      "file": "src/modules/pt-os/workout-generator.repo.js",
+      "source": "pt_lifestyle_assessments",
+      "owner": "Lifestyle",
+      "reason": "Generator loads the latest lifestyle experience value for the shared fact resolver.",
+      "sunset": "Same as the generator route switch."
+    },
+    {
+      "file": "src/modules/pt-os/workout-generator.repo.js",
+      "source": "pt_clients.goal",
+      "owner": "Goal",
+      "reason": "Legacy fallback read by the shared fact resolver; logged when it wins.",
+      "sunset": "After the production audit shows no client depends on the legacy goal text."
+    },
+    {
+      "file": "src/modules/pt-os/workout-generator.repo.js",
+      "source": "pt_clients.injuries",
+      "owner": "PAR-Q / Interview",
+      "reason": "Legacy free-text limitation fallback; the assessed PAR-Q screen is added ahead of it.",
+      "sunset": "After the production audit shows no client depends on the legacy injury text."
+    },
+    {
+      "file": "src/modules/pt-os/workout-generator.repo.js",
+      "source": "pt_clients.workout_experience_level",
+      "owner": "Client enrolment",
+      "reason": "Enrolment-owned value loaded for the shared fact resolver; this is the owner column, not a duplicate.",
+      "sunset": "Keep until enrolment moves the value to a dedicated fact table."
+    }
+  ]
+}
