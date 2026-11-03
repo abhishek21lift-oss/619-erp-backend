@@ -5,12 +5,15 @@ const pool = require('../db/pool');
 const { auth, requireTrainer } = require('../middleware/auth');
 const { checkTrainingEligibility } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
-const { resolveWeek, previewWeeks, MAX_WEEKS } = require('../modules/pt-os/progression');
+const { resolveWeek, previewWeeks, phaseOf, MAX_WEEKS } = require('../modules/pt-os/progression');
 const { markAccepted, acceptGeneration } = require('../modules/pt-os/programming-memory');
 const { validateCardioPlanConfig } = require('../modules/pt-os/cardio');
 const logger = require('../lib/logger');
 const { today: studioToday } = require('../lib/appTime');
 const { shapeError, syncAssignmentEnds } = require('../lib/workoutPlanShape');
+const { retireOthers, retireAssignment, patchAssignment } = require('../modules/pt-os/assignment-lifecycle');
+const { classifyGoal } = require('../modules/pt-os/goal-classification');
+const { findVisibleExercise } = require('../lib/exercise-access');
 
 // '/api/workouts/exercises' and '/exercises/meta' were here: read-only
 // duplicates of /api/exercises kept for older clients. There are none — the
@@ -97,12 +100,29 @@ function num(value, fallback = null) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-/** The six columns migration 136 added, read from a request body. */
+/** The prescription columns the builder and the AI save both write. */
 function exerciseParams(ex) {
   return [
-    num(ex.target_weight), ex.tempo ?? null, num(ex.rpe), num(ex.warmup_sets),
-    ex.superset_group ?? null, ex.config ? JSON.stringify(ex.config) : null,
+    num(ex.target_weight), ex.tempo ?? null, num(ex.rpe), num(ex.rir),
+    num(ex.warmup_sets), ex.superset_group ?? null,
+    ex.alternatives ? JSON.stringify(ex.alternatives) : null,
+    ex.cues ? JSON.stringify(ex.cues) : null,
+    ex.config ? JSON.stringify(ex.config) : null,
   ];
+}
+
+/**
+ * A session protocol is JSONB: an array or object is stored as written, and a
+ * plain string becomes a one-line array. Empty means "not recorded", never an
+ * empty block the UI has to special-case.
+ */
+function protocolJson(value) {
+  if (Array.isArray(value)) return value.length ? JSON.stringify(value) : null;
+  if (value && typeof value === 'object') {
+    return Object.keys(value).length ? JSON.stringify(value) : null;
+  }
+  const s = typeof value === 'string' ? value.trim() : '';
+  return s ? JSON.stringify([s]) : null;
 }
 
 /**
@@ -146,10 +166,16 @@ const EXERCISE_SELECT = `
   e.exercise_type, e.prescription_mode_primary, e.prescription_mode_allowed,
   e.movement_pattern, e.mechanic,
   we.day_of_week, we.week_number, we.sort_order, we.sets, we.reps, we.rest_seconds, we.notes,
-  we.target_weight, we.tempo, we.rpe, we.warmup_sets, we.superset_group, we.config`;
+  we.target_weight, we.tempo, we.rpe, we.rir, we.warmup_sets, we.superset_group,
+  we.alternatives, we.cues, we.config`;
 
 // GET /api/workouts/plans
-router.get('/plans', auth, async (req, res, next) => {
+//
+// Staff-only. The payload carries an `assignments` aggregate — every active
+// client's id, name, progress, dates and status — so `auth` alone (plus the
+// mount's feature gate, which a member satisfies) let a member enumerate the
+// studio's roster. Members read their own programme through /api/me/workout.
+router.get('/plans', auth, requireTrainer, async (req, res, next) => {
   try {
     const { goal, client_id } = req.query;
     const conds = ['wp.deleted_at IS NULL AND wp.is_active = true'];
@@ -220,7 +246,8 @@ router.get('/plans', auth, async (req, res, next) => {
           'rest_seconds', we.rest_seconds,
           'day_of_week', we.day_of_week, 'sort_order', we.sort_order, 'notes', we.notes,
           'target_weight', we.target_weight, 'tempo', we.tempo, 'rpe', we.rpe,
-          'warmup_sets', we.warmup_sets, 'superset_group', we.superset_group, 'config', we.config
+          'rir', we.rir, 'warmup_sets', we.warmup_sets, 'superset_group', we.superset_group,
+          'alternatives', we.alternatives, 'cues', we.cues, 'config', we.config
         ) ORDER BY we.day_of_week, we.sort_order)
         FROM workout_exercises we
         LEFT JOIN exercises e ON e.id = we.exercise_id
@@ -320,8 +347,8 @@ async function materialiseWeek(client, planId, plan, day, week) {
 
   const { rows: allWeeks } = await client.query(
     `SELECT id, exercise_id, day_of_week, week_number, sort_order, sets, reps,
-            rest_seconds, notes, target_weight, tempo, rpe, warmup_sets,
-            superset_group, config
+            rest_seconds, notes, target_weight, tempo, rpe, rir, warmup_sets,
+            superset_group, alternatives, cues, config
        FROM workout_exercises
       WHERE workout_plan_id = $1 AND day_of_week = $2
       ORDER BY sort_order`,
@@ -335,14 +362,15 @@ async function materialiseWeek(client, planId, plan, day, week) {
   await client.query(
     `INSERT INTO workout_exercises (id, workout_plan_id, exercise_id, day_of_week,
        week_number, sort_order, sets, reps, rest_seconds, notes,
-       target_weight, tempo, rpe, warmup_sets, superset_group, config)
+       target_weight, tempo, rpe, rir, warmup_sets, superset_group,
+       alternatives, cues, config)
      SELECT gen_random_uuid()::text, $1, r.exercise_id, $2, $3, r.sort_order,
             r.sets, r.reps, r.rest_seconds, r.notes, r.target_weight, r.tempo,
-            r.rpe, r.warmup_sets, r.superset_group, r.config
+            r.rpe, r.rir, r.warmup_sets, r.superset_group, r.alternatives, r.cues, r.config
        FROM jsonb_to_recordset($4::jsonb) AS r(
          exercise_id text, sort_order int, sets int, reps int, rest_seconds int,
-         notes text, target_weight numeric, tempo text, rpe numeric,
-         warmup_sets int, superset_group text, config jsonb)`,
+         notes text, target_weight numeric, tempo text, rpe numeric, rir numeric,
+         warmup_sets int, superset_group text, alternatives jsonb, cues jsonb, config jsonb)`,
     [planId, day, week, JSON.stringify(exercises.map((ex) => ({
       exercise_id: ex.exercise_id,
       sort_order: ex.sort_order,
@@ -353,8 +381,11 @@ async function materialiseWeek(client, planId, plan, day, week) {
       target_weight: ex.target_weight,
       tempo: ex.tempo,
       rpe: ex.rpe,
+      rir: ex.rir,
       warmup_sets: ex.warmup_sets,
       superset_group: ex.superset_group,
+      alternatives: ex.alternatives ?? null,
+      cues: ex.cues ?? null,
       config: ex.config ?? null,
     })))]
   );
@@ -450,6 +481,7 @@ router.get('/plans/:id', auth, requireTrainer, async (req, res, next) => {
       return res.json({
         ...plan,
         week: requestedWeek,
+        phase: phaseOf(plan, requestedWeek),
         week_source: source,
         anchor_week: anchor,
         override_weeks: overrideWeeks,
@@ -481,6 +513,7 @@ router.get('/plans/:id', auth, requireTrainer, async (req, res, next) => {
     res.json({
       ...plan,
       week: 1,
+      phase: phaseOf(plan, 1),
       week_source: 'base',
       anchor_week: 1,
       override_weeks: overrideWeeks,
@@ -525,6 +558,10 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       orgId: orgIdOf(req),
       userId: req.user.id,
       name: typeof name === 'string' && name.trim() ? name.trim() : null,
+      // The default is one current programme: accepting a proposal retires
+      // whatever the client was on. `keep_existing` is the trainer's explicit
+      // "run both".
+      keepExisting: req.body?.keep_existing === true,
       // Accepting assigns the plan, so it passes the same gate as /assign.
       gate: (clientId) => checkTrainingEligibility(req, clientId, { action: 'accept_plan', allowUnenrolled: true }),
     });
@@ -560,6 +597,15 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
           violations: out.violations,
         });
       }
+      if (out.reason === 'invalid_plan') {
+        // The proposal is not structurally a workout. Saving it would produce
+        // a plan that silently holds fewer days than it claims.
+        return res.status(422).json({
+          error: 'This proposal is not a valid workout and cannot be saved',
+          code: 'INVALID_PLAN',
+          errors: out.errors,
+        });
+      }
       return res.status(404).json({ error: 'Generation not found' });
     }
 
@@ -567,6 +613,7 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       generation_id: generationId, plan_id: out.plan_id,
       saved: out.saved, unresolved: out.unresolved.length,
       assigned: out.assigned, other_active: out.other_active_assignments,
+      retired: out.retired_assignments,
     }, 'workout_plan_saved_from_generation');
 
     // `unresolved` is part of the success payload, not an error. About one
@@ -589,6 +636,10 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       // session log still picks the one scheduled for the day.
       assigned: out.assigned,
       assignment_id: out.assignment_id,
+      // How many earlier programmes this save retired so the new one is the
+      // client's current block. Non-zero is normal; the UI says so instead of
+      // leaving the trainer to wonder where the old plan went.
+      retired_assignments: out.retired_assignments,
       other_active_assignments: out.other_active_assignments,
       screening_warnings: out.screening_warnings,
     });
@@ -616,9 +667,12 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
     const id = randomUUID();
     const { rows } = await pool.query(`
       INSERT INTO workout_plans (id, name, description, goal, difficulty,
-        duration_weeks, sessions_per_week, is_template, created_by, organization_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [id, d.name.trim(), d.description || null, d.goal || 'general_fitness',
+        duration_weeks, sessions_per_week, is_template, created_by, organization_id,
+        warmup_protocol, mobility_protocol, cooldown_protocol,
+        periodization_model, split_name, block_phases,
+        deload_every_weeks, deload_intensity_pct)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+      [id, d.name.trim(), d.description || null, classifyGoal(d.goal) || 'general_fitness',
        d.difficulty || 'beginner', parseInt(d.duration_weeks) || 4,
        // is_template is TRUE only when asked for. Absent used to mean TRUE, and
        // the New programme sheet never sent it — so every client programme a
@@ -627,7 +681,14 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
        // Stamps the owning studio (migration 106). NULL only for a platform
        // operator authoring a template that every studio should see — the same
        // meaning the seeded rows carry.
-       orgIdOf(req)]
+       orgIdOf(req),
+       protocolJson(d.warmup_protocol ?? d.warm_up),
+       protocolJson(d.mobility_protocol ?? d.mobility),
+       protocolJson(d.cooldown_protocol ?? d.cool_down),
+       d.periodization_model === 'powerlifting_block' ? 'powerlifting_block' : null,
+       d.split_name || null,
+       Array.isArray(d.block_phases) && d.block_phases.length ? JSON.stringify(d.block_phases) : null,
+       num(d.deload_every_weeks), num(d.deload_intensity_pct)]
     );
 
     // Add exercises if provided
@@ -635,11 +696,12 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
       for (const ex of d.exercises) {
         await pool.query(`
           INSERT INTO workout_exercises (id, workout_plan_id, exercise_id, day_of_week,
-            sort_order, sets, reps, rest_seconds, notes,
-            target_weight, tempo, rpe, warmup_sets, superset_group, config)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+            week_number, sort_order, sets, reps, rest_seconds, notes,
+            target_weight, tempo, rpe, rir, warmup_sets, superset_group,
+            alternatives, cues, config)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
           [randomUUID(), id, ex.exercise_id, num(ex.day_of_week, 1),
-           num(ex.sort_order, 0), num(ex.sets, 3), num(ex.reps, 12),
+           num(ex.week_number, 1), num(ex.sort_order, 0), num(ex.sets, 3), num(ex.reps, 12),
            num(ex.rest_seconds, 60), ex.notes || null, ...exerciseParams(ex)]
         );
       }
@@ -718,15 +780,30 @@ router.put('/plans/:id', auth, requireTrainer, async (req, res, next) => {
         -- 'none'. That is the point: a rule with no amount cannot be stored.
         progression_amount = CASE WHEN $8::text IS NULL THEN progression_amount ELSE $9 END,
         progression_every_weeks = COALESCE($10, progression_every_weeks),
+        warmup_protocol = COALESCE($11::jsonb, warmup_protocol),
+        mobility_protocol = COALESCE($12::jsonb, mobility_protocol),
+        cooldown_protocol = COALESCE($13::jsonb, cooldown_protocol),
+        periodization_model = COALESCE($14, periodization_model),
+        split_name = COALESCE($15, split_name),
+        block_phases = COALESCE($16::jsonb, block_phases),
+        deload_every_weeks = COALESCE($17, deload_every_weeks),
+        deload_intensity_pct = COALESCE($18, deload_intensity_pct),
         updated_at = NOW()
       WHERE id = $7 RETURNING *`,
-      [d.name || null, d.description ?? null, d.goal || null, d.difficulty || null,
+      [d.name || null, d.description ?? null, d.goal ? classifyGoal(d.goal) : null, d.difficulty || null,
        d.duration_weeks ? parseInt(d.duration_weeks) : null,
        d.sessions_per_week ? parseInt(d.sessions_per_week) : null, req.params.id,
        d.progression_type || null,
        d.progression_amount === undefined || d.progression_amount === null || d.progression_amount === ''
          ? null : Number(d.progression_amount),
-       d.progression_every_weeks ? parseInt(d.progression_every_weeks) : null]
+       d.progression_every_weeks ? parseInt(d.progression_every_weeks) : null,
+       protocolJson(d.warmup_protocol ?? d.warm_up),
+       protocolJson(d.mobility_protocol ?? d.mobility),
+       protocolJson(d.cooldown_protocol ?? d.cool_down),
+       d.periodization_model === 'powerlifting_block' ? 'powerlifting_block' : null,
+       d.split_name || null,
+       Array.isArray(d.block_phases) && d.block_phases.length ? JSON.stringify(d.block_phases) : null,
+       num(d.deload_every_weeks), num(d.deload_intensity_pct)]
     );
 
     if (Array.isArray(d.exercises)) {
@@ -734,11 +811,12 @@ router.put('/plans/:id', auth, requireTrainer, async (req, res, next) => {
       for (const ex of d.exercises) {
         await client.query(`
           INSERT INTO workout_exercises (id, workout_plan_id, exercise_id, day_of_week,
-            sort_order, sets, reps, rest_seconds, notes,
-            target_weight, tempo, rpe, warmup_sets, superset_group, config)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+            week_number, sort_order, sets, reps, rest_seconds, notes,
+            target_weight, tempo, rpe, rir, warmup_sets, superset_group,
+            alternatives, cues, config)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
           [randomUUID(), req.params.id, ex.exercise_id, num(ex.day_of_week, 1),
-           num(ex.sort_order, 0), num(ex.sets, 3), num(ex.reps, 12),
+           num(ex.week_number, 1), num(ex.sort_order, 0), num(ex.sets, 3), num(ex.reps, 12),
            num(ex.rest_seconds, 60), ex.notes || null, ...exerciseParams(ex)]
         );
       }
@@ -889,6 +967,12 @@ router.post('/plans/:id/exercises', auth, requireTrainer, async (req, res, next)
 
     const ex = req.body;
     if (!ex.exercise_id) return res.status(400).json({ error: 'exercise_id required' });
+    // The id is client-supplied: it must name an exercise this studio can see,
+    // not merely one that exists. Archived and other tenants' rows are both a
+    // 404 here, because neither is programable by this caller.
+    if (!(await findVisibleExercise(ex.exercise_id, orgIdOf(req), client))) {
+      return res.status(404).json({ error: 'Exercise not found' });
+    }
     const configErrors = cardioConfigErrors(ex.config);
     if (configErrors) {
       return res.status(400).json({ error: 'Invalid cardio prescription', details: configErrors });
@@ -909,11 +993,12 @@ router.post('/plans/:id/exercises', auth, requireTrainer, async (req, res, next)
     const { rows } = await client.query(`
       INSERT INTO workout_exercises (id, workout_plan_id, exercise_id, day_of_week,
         week_number, sort_order, sets, reps, rest_seconds, notes,
-        target_weight, tempo, rpe, warmup_sets, superset_group, config)
-      VALUES ($1,$2,$3,$4,$15,
+        target_weight, tempo, rpe, rir, warmup_sets, superset_group,
+        alternatives, cues, config)
+      VALUES ($1,$2,$3,$4,$18,
         COALESCE((SELECT MAX(sort_order) + 1 FROM workout_exercises
-                   WHERE workout_plan_id = $2 AND day_of_week = $4 AND week_number = $15), 0),
-        $5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                   WHERE workout_plan_id = $2 AND day_of_week = $4 AND week_number = $18), 0),
+        $5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
       RETURNING id`,
       [randomUUID(), req.params.id, ex.exercise_id, day,
        num(ex.sets, 3), num(ex.reps, 12), num(ex.rest_seconds, 60), ex.notes || null,
@@ -962,8 +1047,11 @@ router.patch('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, re
       target_weight: (v) => num(v),
       tempo: (v) => v ?? null,
       rpe: (v) => num(v),
+      rir: (v) => num(v),
       warmup_sets: (v) => num(v),
       superset_group: (v) => v ?? null,
+      alternatives: (v) => (v == null ? null : JSON.stringify(v)),
+      cues: (v) => (v == null ? null : JSON.stringify(v)),
       config: (v) => (v == null ? null : JSON.stringify(v)),
     };
 
@@ -991,6 +1079,13 @@ router.patch('/plans/:id/exercises/:rowId', auth, requireTrainer, async (req, re
     if (!plan) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Workout plan not found' });
+    }
+    // Changing which exercise a row points at is the same trust boundary as
+    // adding one: the new id must be visible to this studio.
+    if ('exercise_id' in req.body
+      && !(await findVisibleExercise(req.body.exercise_id, orgIdOf(req), client))) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Exercise not found' });
     }
     await lockPlan(client, req.params.id);
 
@@ -1328,45 +1423,158 @@ router.post('/assign', auth, requireTrainer, async (req, res, next) => {
     const { blocked, warnings } = await checkTrainingEligibility(req, d.client_id, { action: 'assign_plan', allowUnenrolled: true });
     if (blocked) return res.status(blocked.status).json(blocked.body);
 
-    const { rows } = await pool.query(`
-      INSERT INTO workout_assignments (id, workout_plan_id, client_id, trainer_id,
-        start_date, end_date, status, notes, organization_id)
-      -- The end date is the programme's own length unless the caller set one:
-      -- start + weeks − 1 day. It was always NULL, so a 4-week plan stayed
-      -- "active" — on the Today roster, linked by every logged session —
-      -- for as long as nobody remembered to retire it.
-      VALUES ($1,$2,$3,$4,$5,
-              COALESCE($6::date, $5::date + ($10::int * 7 - 1)),
-              $7,$8,$9)
-      -- Keyed on (plan, client) since 197. It used to include status, which
-      -- made status part of row identity: re-assigning a plan to a client
-      -- whose row had been paused found no conflict and inserted a SECOND
-      -- row, leaving one client holding two assignments for one plan. That is
-      -- the condition that made a programme invisible on the dashboard (#127),
-      -- so the key had to narrow before status could ever move.
-      --
-      -- Re-assigning therefore REVIVES the existing row rather than forking
-      -- it: a client who lapsed and came back gets their programme, its
-      -- progress and its notes, not a blank second copy.
-      ON CONFLICT (workout_plan_id, client_id)
-      DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date,
-        end_date = EXCLUDED.end_date,
-        organization_id = COALESCE(workout_assignments.organization_id, EXCLUDED.organization_id), updated_at = NOW()
-      WHERE workout_assignments.organization_id IS NULL
-         OR workout_assignments.organization_id = EXCLUDED.organization_id
-      RETURNING *`,
-      [randomUUID(), d.workout_plan_id, d.client_id, req.user.trainer_id || null,
-       // The studio's today, not UTC's: before 05:30 in India that was
-       // yesterday, and the programme's week 1 began a day early.
-       d.start_date || studioToday(),
-       d.end_date || null, 'active', d.notes || null, orgIdOf(req),
-       Number(planRows[0].duration_weeks) || null]
-    );
-    res.status(201).json({ message: 'Plan assigned', assignment: rows[0], screening_warnings: warnings });
+    // One live programme per client. Until this, assigning a new block left
+    // the previous one `active` too, and every read that asked "which
+    // programme is this client on" had to guess. The insert and the retirement
+    // are one transaction: a retirement that lands without the new assignment
+    // would leave the client with nothing.
+    //
+    // `keep_existing: true` is the deliberate escape hatch for a trainer who
+    // really is running two blocks side by side. It is opt-in because the
+    // accidental second assignment was the common case, not the exception.
+    const client = await pool.connect();
+    let rows;
+    let retired = 0;
+    try {
+      await client.query('BEGIN');
+      ({ rows } = await client.query(`
+        INSERT INTO workout_assignments (id, workout_plan_id, client_id, trainer_id,
+          start_date, end_date, status, notes, organization_id)
+        -- The end date is the programme's own length unless the caller set one:
+        -- start + weeks − 1 day. It was always NULL, so a 4-week plan stayed
+        -- "active" — on the Today roster, linked by every logged session —
+        -- for as long as nobody remembered to retire it.
+        VALUES ($1,$2,$3,$4,$5,
+                COALESCE($6::date, $5::date + ($10::int * 7 - 1)),
+                $7,$8,$9)
+        -- Keyed on (plan, client) since 197. It used to include status, which
+        -- made status part of row identity: re-assigning a plan to a client
+        -- whose row had been paused found no conflict and inserted a SECOND
+        -- row, leaving one client holding two assignments for one plan. That is
+        -- the condition that made a programme invisible on the dashboard (#127),
+        -- so the key had to narrow before status could ever move.
+        --
+        -- Re-assigning therefore REVIVES the existing row rather than forking
+        -- it: a client who lapsed and came back gets their programme, its
+        -- progress and its notes, not a blank second copy.
+        ON CONFLICT (workout_plan_id, client_id)
+        DO UPDATE SET status = 'active', start_date = EXCLUDED.start_date,
+          end_date = EXCLUDED.end_date,
+          retired_at = NULL, retire_reason = NULL,
+          organization_id = COALESCE(workout_assignments.organization_id, EXCLUDED.organization_id), updated_at = NOW()
+        WHERE workout_assignments.organization_id IS NULL
+           OR workout_assignments.organization_id = EXCLUDED.organization_id
+        RETURNING *`,
+        [randomUUID(), d.workout_plan_id, d.client_id, req.user.trainer_id || null,
+         // The studio's today, not UTC's: before 05:30 in India that was
+         // yesterday, and the programme's week 1 began a day early.
+         d.start_date || studioToday(),
+         d.end_date || null, 'active', d.notes || null, orgIdOf(req),
+         Number(planRows[0].duration_weeks) || null]
+      ));
+      if (!rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Assignment belongs to another studio' });
+      }
+      if (d.keep_existing !== true) {
+        ({ retired } = await retireOthers(client, {
+          clientId: d.client_id,
+          orgId: orgIdOf(req),
+          exceptId: rows[0].id,
+          reason: 'replaced',
+        }));
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+    res.status(201).json({
+      message: 'Plan assigned',
+      assignment: rows[0],
+      retired_assignments: retired,
+      screening_warnings: warnings,
+    });
   } catch (err) {
     if (err.message?.includes('does not exist')) return res.status(400).json({ error: 'Tables not ready. Run migrations.' });
     next(err);
   }
+});
+
+// POST /api/workouts/assignments/:id/retire
+//
+// End a programme without deleting it. The row keeps its plan, dates, progress
+// and notes; `retired_at` records when it stopped and `retire_reason` records
+// why, which is the difference between "finished the block" and "replaced by
+// the next one" that the history was previously unable to tell apart.
+router.post('/assignments/:id/retire', auth, requireTrainer, async (req, res, next) => {
+  try {
+    const status = req.body?.status || 'completed';
+    if (!['completed', 'cancelled', 'paused'].includes(status)) {
+      return res.status(400).json({ error: 'status must be completed, cancelled or paused' });
+    }
+    const scope = tenantScope(req);
+    const row = await retireAssignment(pool, {
+      id: req.params.id,
+      orgId: scope.orgId,
+      status,
+      reason: req.body?.reason || null,
+    });
+    if (!row) return res.status(404).json({ error: 'Assignment not found' });
+    res.json({ message: 'Assignment retired', assignment: row });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/workouts/assignments/:id
+//
+// Edit the lifecycle fields a trainer actually changes: dates, notes and
+// status. Re-activating a programme makes it current again, so it retires the
+// client's other live assignments unless `keep_existing` says otherwise —
+// the same rule POST /assign applies, in the same transaction.
+router.patch('/assignments/:id', auth, requireTrainer, async (req, res, next) => {
+  const d = req.body || {};
+  const allowed = ['active', 'completed', 'paused', 'cancelled'];
+  if (d.status !== undefined && !allowed.includes(d.status)) {
+    return res.status(400).json({ error: `status must be one of ${allowed.join(', ')}` });
+  }
+  const fields = ['status', 'start_date', 'end_date', 'notes'];
+  if (!fields.some((k) => d[k] !== undefined)) {
+    return res.status(400).json({ error: 'Nothing to update' });
+  }
+
+  const reactivating = d.status === 'active';
+  const scope = tenantScope(req);
+  const client = await pool.connect();
+  let row;
+  let retired = 0;
+  try {
+    await client.query('BEGIN');
+    row = await patchAssignment(client, { id: req.params.id, orgId: scope.orgId, fields: d });
+    if (!row) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Assignment not found' });
+    }
+    if (reactivating && d.keep_existing !== true) {
+      ({ retired } = await retireOthers(client, {
+        clientId: row.client_id,
+        orgId: scope.orgId,
+        exceptId: row.id,
+        reason: 'replaced',
+      }));
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    next(err);
+    return;
+  } finally {
+    client.release();
+  }
+  res.json({ message: 'Assignment updated', assignment: row, retired_assignments: retired });
 });
 
 // PUT /api/workouts/assignments/:id/progress

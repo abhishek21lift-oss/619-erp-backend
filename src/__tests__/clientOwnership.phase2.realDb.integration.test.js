@@ -288,7 +288,7 @@ describeIf('client data ownership Phase 2, against a real database', () => {
       logger.info.mockClear();
       let ctx = await ai.loadAuthoritativeClient(clientId, ORG);
       let { facts } = ai.resolveClientFacts(ctx);
-      expect(facts.goal).toMatchObject({ value: 'muscle_gain', source: 'pt_goals.goal_type' });
+      expect(facts.goal).toMatchObject({ value: 'hypertrophy', source: 'pt_goals.goal_type' });
       expect(legacyRead('goal', clientId)).toBe(false);
 
       await pool.query('DELETE FROM pt_goals WHERE client_id = $1', [clientId]);

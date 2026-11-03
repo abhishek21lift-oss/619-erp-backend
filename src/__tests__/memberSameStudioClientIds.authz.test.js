@@ -76,10 +76,14 @@ describe('a member cannot name another client of their own studio', () => {
     expect(res.status).not.toBe(403);
   });
 
-  it('the workouts plan library stays readable to a member without a client_id', async () => {
+  it('the workouts plan library is trainer-only', async () => {
     const router = require('../routes/workouts');
-    const res = await request(appFor('/api/workouts', router)).get('/api/workouts/plans');
-    expect(res.status).not.toBe(403);
+    const memberRes = await request(appFor('/api/workouts', router)).get('/api/workouts/plans');
+    expect(memberRes.status).toBe(403);
+
+    mockCurrentUser = TRAINER;
+    const trainerRes = await request(appFor('/api/workouts', router)).get('/api/workouts/plans');
+    expect(trainerRes.status).not.toBe(403);
   });
 });
 

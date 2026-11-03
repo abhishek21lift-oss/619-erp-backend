@@ -61,7 +61,7 @@ describe('GET /api/me/workout', () => {
   it("groups the current week's exercises by day, carrying the last written week forward", async () => {
     mockResponder = (sql) => {
       if (/FROM workout_assignments/.test(sql)) {
-        return { rows: [{ assignment_id: 'as1', plan_id: 'p1', name: 'Base Phase', start_date: '2026-09-02', duration_weeks: 8 }] };
+        return { rows: [{ assignment_id: 'as1', plan_id: 'p1', name: 'Base Phase', start_date: '2026-09-02', duration_weeks: 8, status: 'active' }] };
       }
       return {
         rows: [
@@ -78,6 +78,23 @@ describe('GET /api/me/workout', () => {
     expect(plan.current_week).toBe(4);
     expect(plan.days.map((d) => d.day_of_week)).toEqual([1, 3]);
     expect(plan.days[0].exercises[0]).toMatchObject({ name: 'Squat', sets: 4 });
+  });
+
+  it('returns ONE programme when legacy data has several active assignments', async () => {
+    mockResponder = (sql) => {
+      if (/FROM workout_assignments/.test(sql)) {
+        return {
+          rows: [
+            { assignment_id: 'newer', plan_id: 'p2', name: 'Strength', status: 'active', start_date: '2026-09-10', created_at: '2026-09-10T00:00:00Z' },
+            { assignment_id: 'today', plan_id: 'p1', name: 'Base', status: 'active', start_date: '2026-09-01', created_at: '2026-09-01T00:00:00Z', prescribes_dow: true },
+          ],
+        };
+      }
+      return { rows: [{ workout_plan_id: 'p1', week_number: 1, day_of_week: 3, sort_order: 0, name: 'Squat', sets: 3, reps: 5 }] };
+    };
+    const res = await request(app).get('/api/me/workout').expect(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].assignment_id).toBe('today');
   });
 });
 

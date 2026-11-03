@@ -37,6 +37,7 @@
 // is testable directly.
 
 const { planExercises, normaliseName, REPS_TYPES } = require('./plan-critic');
+const { classifyGoal } = require('./goal-classification');
 
 /** 1 = Monday, matching workout_exercises.day_of_week and the builder's tabs. */
 const DAYS = Object.freeze({
@@ -73,11 +74,6 @@ const num = (v) => {
 
 const text = (v) => (typeof v === 'string' ? v.trim() : '');
 
-/** The values the goal and difficulty columns accept (migrations 239 and 006). */
-const GOALS = Object.freeze([
-  'weight_loss', 'muscle_gain', 'strength', 'endurance',
-  'general_fitness', 'body_recomposition', 'recovery',
-]);
 const LEVELS = Object.freeze(['beginner', 'intermediate', 'advanced']);
 
 /**
@@ -171,6 +167,25 @@ function descriptionFor(plan) {
 }
 
 /**
+ * A protocol block as JSONB: an array or object the generator wrote, or a
+ * plain sentence wrapped into a one-item list so every reader sees a list.
+ * Empty means "not specified", not "an empty block".
+ */
+function protocolFor(value) {
+  if (Array.isArray(value)) return value.length ? value : null;
+  if (value && typeof value === 'object') return Object.keys(value).length ? value : null;
+  const t = text(value);
+  return t ? [t] : null;
+}
+
+/** Per-exercise lists (alternatives, cues), kept as written. */
+function listFor(value) {
+  if (Array.isArray(value)) return value.length ? value : null;
+  const t = text(value);
+  return t ? [t] : null;
+}
+
+/**
  * The generator's progression rule, in the form workout_plans accepts.
  *
  * A type without a positive amount violates the column's own CHECK, so a
@@ -233,6 +248,8 @@ function materialise(plan, resolver = new Map()) {
     const isSetsReps = isRepsType(ex.prescription_type);
     const sort = nextSort.get(day) ?? 0;
     nextSort.set(day, sort + 1);
+    const effort = parseEffort(ex.rir_or_rpe);
+    const warmup = num(ex.warmup_sets);
 
     rows.push({
       exercise_id: hit.id,
@@ -244,8 +261,16 @@ function materialise(plan, resolver = new Map()) {
       reps: isSetsReps ? parseReps(ex.reps) : SINGLE_BOUT,
       rest_seconds: num(ex.rest_seconds),
       tempo: text(ex.tempo) || null,
-      // The generator writes "RIR 2" or "RPE 8"; the column holds a number.
-      rpe: parseRpe(ex.rir_or_rpe),
+      // The generator writes "RIR 2" or "RPE 8". Both columns are kept: `rpe`
+      // is the 1-10 equivalent existing readers use, `rir` is the scale the
+      // coach actually wrote. Collapsing them lost which one was prescribed.
+      rpe: effort.rpe,
+      rir: effort.rir,
+      target_weight: num(ex.target_weight ?? ex.weight),
+      warmup_sets: warmup !== null && warmup >= 0 && warmup <= 20 ? Math.round(warmup) : null,
+      superset_group: text(ex.superset_group) || null,
+      alternatives: listFor(ex.alternatives),
+      cues: listFor(ex.cues ?? ex.coaching_cues),
       notes: notesFor(ex),
       config: configFor(ex),
     });
@@ -255,13 +280,23 @@ function materialise(plan, resolver = new Map()) {
     plan: {
       name: text(plan?.name) || 'AI programme',
       description: descriptionFor(plan),
-      goal: enumText(plan?.goal, GOALS),
+      // The generator writes any of the fourteen goal names the studio uses;
+      // the column takes the canonical nine plus the two legacy values. This
+      // used to be a seven-value enum test, so powerlifting and hypertrophy
+      // became NULL on save.
+      goal: classifyGoal(plan?.goal),
       difficulty: enumText(plan?.level, LEVELS),
       duration_weeks: num(plan?.weeks),
       // Counted from the rows that will actually be written. A model that
       // claims four days but names two unresolvable ones leaves a two-day
       // programme, and the plan must not advertise a frequency it does not have.
       sessions_per_week: new Set(rows.map((r) => r.day_of_week)).size,
+      // Session-level blocks the generator was asked for. Kept as JSONB
+      // rather than folded into `description`: a warm-up is structured work,
+      // and a trainer editing one should not have to edit a paragraph.
+      warmup_protocol: protocolFor(plan?.warmup_protocol ?? plan?.warm_up),
+      mobility_protocol: protocolFor(plan?.mobility_protocol ?? plan?.mobility),
+      cooldown_protocol: protocolFor(plan?.cooldown_protocol ?? plan?.cool_down),
       ...progressionFor(plan),
     },
     exercises: rows,
@@ -276,24 +311,33 @@ function materialise(plan, resolver = new Map()) {
 }
 
 /**
- * RPE from "RPE 8", "RIR 2", or a bare number.
+ * Effort from "RPE 8", "RIR 2", or a bare number.
  *
- * RIR is inverted onto the RPE scale — 2 reps in reserve is RPE 8 — because
- * the column is named rpe and storing a 2 in it would read as a trivially
- * easy set rather than a hard one.
+ * RIR is also inverted onto the RPE scale — 2 reps in reserve is RPE 8 —
+ * because `rpe` predates the separate `rir` column and existing readers
+ * expect one 1-10 number. `rir` keeps the original, so nothing is guessed
+ * back out of the conversion.
  */
-function parseRpe(value) {
+function parseEffort(value) {
   const t = text(value);
-  if (!t) return null;
+  if (!t) return { rpe: null, rir: null };
   const m = t.match(/(\d+(?:\.\d+)?)/);
-  if (!m) return null;
+  if (!m) return { rpe: null, rir: null };
   const n = Number(m[1]);
-  if (!Number.isFinite(n)) return null;
-  if (/rir/i.test(t)) return Math.min(10, Math.max(1, 10 - n));
-  return n >= 1 && n <= 10 ? n : null;
+  if (!Number.isFinite(n)) return { rpe: null, rir: null };
+  if (/rir/i.test(t)) {
+    const rir = n >= 0 && n <= 10 ? n : null;
+    return { rpe: rir === null ? null : Math.min(10, Math.max(1, 10 - rir)), rir };
+  }
+  return { rpe: n >= 1 && n <= 10 ? n : null, rir: null };
+}
+
+function parseRpe(value) {
+  return parseEffort(value).rpe;
 }
 
 module.exports = {
-  materialise, dayNumber, parseReps, parseRpe, notesFor, configFor,
+  materialise, dayNumber, parseReps, parseRpe, parseEffort, notesFor, configFor,
+  protocolFor, listFor,
   DAYS, WEEK_ONE, SINGLE_BOUT, CONFIG_FIELDS,
 };

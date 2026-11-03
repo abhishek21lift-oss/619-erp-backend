@@ -235,6 +235,34 @@ function auditPlan(plan, { screened = new Map(), requested = {} } = {}) {
     });
   }
 
+  // ── Session length: does each day fit the slot? ─────────────────────────
+  //
+  // The trainer books 45 minutes and the model writes 75. The model's own
+  // `estimated_minutes` is the only duration signal in the output, so it is
+  // checked rather than trusted — and its absence is reported too, because a
+  // session with no stated length cannot be checked against anything.
+  const slot = num(requested.session_minutes);
+  for (const [day, session] of Object.entries(plan?.weekly_schedule || {})) {
+    const minutes = num(session?.estimated_minutes);
+    // Only demand a duration when a slot was actually recorded — an older
+    // plan with no recorded session length is not missing anything.
+    if (minutes === null && slot !== null) {
+      violations.push({
+        severity: SEVERITY.MINOR,
+        rule: 'no_session_duration',
+        where: day,
+        detail: `${day} does not state its estimated session length`,
+      });
+    } else if (slot !== null && minutes !== null && minutes > slot) {
+      violations.push({
+        severity: SEVERITY.MAJOR,
+        rule: 'session_too_long',
+        where: day,
+        detail: `${day} is planned for ${minutes} minutes; the client's session is ${slot}`,
+      });
+    }
+  }
+
   if (!text(plan?.warm_up)) {
     violations.push({ severity: SEVERITY.MAJOR, rule: 'no_warm_up', detail: 'no warm-up protocol' });
   }

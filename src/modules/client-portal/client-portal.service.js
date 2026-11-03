@@ -15,6 +15,7 @@ const { today, dbDate, mondayOf } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
 const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
 const { programmeWeek, resolveWeek } = require('../pt-os/progression');
+const { pickCurrent } = require('../pt-os/assignment-lifecycle');
 
 const MOODS = ['great', 'good', 'okay', 'tired', 'stressed'];
 
@@ -69,23 +70,42 @@ function weekNumberSince(startYmd, nowYmd) {
  * one day of a later week — showed that one day and hid the rest.
  */
 async function myWorkout(clientId, orgId) {
-  const { rows: assignments } = await pool.query(
+  const now = today();
+  // 1 = Monday … 7 = Sunday, the convention every day_of_week column uses.
+  const dow = ((new Date(`${now}T00:00:00Z`).getUTCDay() + 6) % 7) + 1;
+  const { rows: live } = await pool.query(
     `SELECT a.id AS assignment_id, a.start_date, a.end_date, a.progress_pct,
+            a.status, a.created_at,
             p.id AS plan_id, p.name, p.description, p.goal, p.difficulty,
             p.duration_weeks, p.sessions_per_week,
-            p.progression_type, p.progression_amount, p.progression_every_weeks
+            p.progression_type, p.progression_amount, p.progression_every_weeks,
+            p.periodization_model, p.block_phases,
+            EXISTS (
+              SELECT 1 FROM workout_exercises we
+               WHERE we.workout_plan_id = a.workout_plan_id
+                 AND we.day_of_week = $3
+            ) AS prescribes_dow
        FROM workout_assignments a
        JOIN workout_plans p ON p.id = a.workout_plan_id AND p.deleted_at IS NULL
       WHERE a.client_id = $1 AND a.organization_id = $2 AND a.status = 'active'
       ORDER BY a.start_date DESC NULLS LAST, a.created_at DESC
       LIMIT 5`,
-    [clientId, orgId],
+    [clientId, orgId, dow],
   );
+
+  // ONE programme. The schema allows several active rows (the unique key is
+  // plan+client), so legacy data and a deliberate keep_existing both produce
+  // them. Showing all of them gave a member two overlapping programmes with no
+  // indication which one their trainer meant. The resolver prefers the
+  // assignment that prescribes today, then the newest.
+  const current = pickCurrent(live, { today: now, prescribesDow: dow });
+  const assignments = current ? [current] : [];
   if (assignments.length === 0) return [];
 
   const { rows: exercises } = await pool.query(
     `SELECT we.workout_plan_id, we.exercise_id, we.day_of_week, we.week_number, we.sort_order,
-            we.sets, we.reps, we.rest_seconds, we.target_weight, we.tempo, we.rpe,
+            we.sets, we.reps, we.rest_seconds, we.target_weight, we.tempo, we.rpe, we.rir,
+            we.warmup_sets, we.superset_group, we.alternatives, we.cues,
             we.notes, we.config, e.name, e.equipment, e.video_url, e.image_url, e.gif_url,
             e.prescription_mode_primary
        FROM workout_exercises we
@@ -95,7 +115,6 @@ async function myWorkout(clientId, orgId) {
     [assignments.map((a) => a.plan_id)],
   );
 
-  const now = today();
   return assignments.map((a) => {
     const week = programmeWeek(a.start_date, now, a.duration_weeks);
 
@@ -109,23 +128,37 @@ async function myWorkout(clientId, orgId) {
 
     const days = [...rowsByDay.entries()]
       .sort(([x], [y]) => x - y)
-      .map(([day_of_week, rows]) => ({
-        day_of_week,
-        exercises: resolveWeek(rows, a, week).exercises
-          .sort((x, y) => (x.sort_order ?? 0) - (y.sort_order ?? 0))
-          .map((x) => ({
-            exercise_id: x.exercise_id ?? null,
-            name: x.name || 'Exercise',
-            sets: x.sets, reps: x.reps, rest_seconds: x.rest_seconds,
-            target_weight: x.target_weight != null ? Number(x.target_weight) : null,
-            tempo: x.tempo, rpe: x.rpe != null ? Number(x.rpe) : null, notes: x.notes,
-            // How the member logs it (load × reps, hold, carry, time …) and the
-            // time/distance targets the builder keeps in config.
-            tracking_mode: x.config?.tracking_mode || x.prescription_mode_primary || null,
-            ...timedTargets(x.config),
-            equipment: x.equipment, media_url: x.gif_url || x.image_url || null, video_url: x.video_url,
-          })),
-      }))
+      .map(([day_of_week, rows]) => {
+        const resolved = resolveWeek(rows, a, week);
+        const day = {
+          day_of_week,
+          exercises: resolved.exercises
+            .sort((x, y) => (x.sort_order ?? 0) - (y.sort_order ?? 0))
+            .map((x) => ({
+              exercise_id: x.exercise_id ?? null,
+              name: x.name || 'Exercise',
+              sets: x.sets, reps: x.reps, rest_seconds: x.rest_seconds,
+              target_weight: x.target_weight != null ? Number(x.target_weight) : null,
+              tempo: x.tempo, rpe: x.rpe != null ? Number(x.rpe) : null,
+              rir: x.rir != null ? Number(x.rir) : null,
+              warmup_sets: x.warmup_sets != null ? Number(x.warmup_sets) : null,
+              superset_group: x.superset_group ?? null,
+              alternatives: x.alternatives ?? null,
+              cues: x.cues ?? null,
+              is_deload: x.is_deload === true,
+              notes: x.notes,
+              // How the member logs it (load × reps, hold, carry, time …) and the
+              // time/distance targets the builder keeps in config.
+              tracking_mode: x.config?.tracking_mode || x.prescription_mode_primary || null,
+              ...timedTargets(x.config),
+              equipment: x.equipment, media_url: x.gif_url || x.image_url || null, video_url: x.video_url,
+            })),
+        };
+        // Absent on linear plans: the payload is unchanged unless a block
+        // actually has a phase for this week.
+        if (resolved.phase) day.phase = resolved.phase;
+        return day;
+      })
       // A week the trainer emptied for a day (a deload that drops it) is a rest
       // day in that week, not a day with nothing on it.
       .filter((d) => d.exercises.length > 0);

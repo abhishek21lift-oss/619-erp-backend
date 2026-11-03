@@ -139,9 +139,15 @@ beforeEach(() => {
 });
 
 describe('an unscreened client', () => {
-  it('is never described to the model as having no injuries', async () => {
+  it('is refused until the trainer overrides, and then never described as uninjured', async () => {
     mockDb({});
-    const res = await request(app).post('/api/ai/workout/generate').send(BODY);
+    const refused = await request(app).post('/api/ai/workout/generate').send(BODY);
+    expect(refused.status).toBe(409);
+    expect(refused.body.code).toBe('CLEARANCE_REQUIRED');
+    expect(routedStream).not.toHaveBeenCalled();
+
+    const res = await request(app).post('/api/ai/workout/generate')
+      .send({ ...BODY, acknowledge_unscreened: true });
 
     expect(res.status).toBe(200);
     const prompt = promptOf();
@@ -151,12 +157,13 @@ describe('an unscreened client', () => {
     expect(prompt).toContain('NOBODY HAS SCREENED THIS CLIENT');
   });
 
-  it('still gets a programme, because refusing would break the feature for most of the roster', async () => {
-    // 19 of 34 production clients have no PAR-Q. Blocking them outright would
-    // take a working feature away from more than half the studio on day one,
-    // so generation proceeds and the prompt carries the warning instead.
+  it('gets a programme only under the explicit override, which the response records', async () => {
+    // 19 of 34 production clients have no PAR-Q. Refusing silently would take
+    // a working feature away from more than half the roster, so the trainer
+    // can take the decision explicitly — and the prompt carries the warning.
     mockDb({});
-    const res = await request(app).post('/api/ai/workout/generate').send(BODY);
+    const res = await request(app).post('/api/ai/workout/generate')
+      .send({ ...BODY, acknowledge_unscreened: true });
     expect(res.status).toBe(200);
     expect(doneOf(res.text).screen.screened).toBe(false);
   });
@@ -168,10 +175,11 @@ describe('a client the studio did not clear', () => {
     const res = await request(app).post('/api/ai/workout/generate').send(BODY);
 
     // Someone looked at this client and said not yet. Generating anyway would
-    // be this route overruling the trainer who filled the form in.
+    // be this route overruling the trainer who filled the form in. Every
+    // explicit non-clearance collapses to the blocked state.
     expect(res.status).toBe(409);
     expect(res.body.code).toBe('NOT_CLEARED');
-    expect(res.body.gate).toBe('referred');
+    expect(res.body.gate).toBe('blocked');
     expect(routedStream).not.toHaveBeenCalled();
   });
 });

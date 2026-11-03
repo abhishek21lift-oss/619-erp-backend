@@ -2,6 +2,7 @@
 
 const { ageFromDob } = require('../../lib/age');
 const logger = require('../../lib/logger');
+const { classifyGoal } = require('./goal-classification');
 
 /**
  * The client facts a workout generation is allowed to assert.
@@ -49,7 +50,7 @@ const logger = require('../../lib/logger');
 
 const FIELDS = [
   'age', 'gender', 'weight_kg', 'height_cm',
-  'goal', 'experience_level', 'training_days', 'equipment',
+  'goal', 'experience_level', 'training_days', 'session_minutes', 'equipment',
 ];
 
 // Without these three a programme cannot be written, only invented.
@@ -102,7 +103,7 @@ function logLegacyRead(field, owner, source, clientId) {
  * the exception runs towards caution. It is still recorded as `stated`, so
  * nothing downstream mistakes it for the studio's standing inventory.
  */
-const STATED_SUPERSEDES = ['equipment'];
+const STATED_SUPERSEDES = ['equipment', 'session_minutes'];
 
 /**
  * How many training days `preferred_training_days` names.
@@ -185,6 +186,10 @@ const STATED_RANGE = {
   weight_kg: [20, 400],
   height_cm: [90, 260],
   training_days: [1, 7],
+  // pt_clients.session_minutes CHECK (migration 255). The enrolment form
+  // offers 30/45/60/75/90; the wider bound is for a trainer typing a session
+  // length the form does not list.
+  session_minutes: [20, 180],
   // Not one of this module's own FIELDS — the diet generator's, which shares
   // the table so both prompts refuse the same impossible values. "40 meals a
   // day" is a prompt the model will try to satisfy.
@@ -209,6 +214,24 @@ function text(v, maxLength) {
   const s = String(v).trim();
   if (!s) return null;
   return maxLength && s.length > maxLength ? null : s;
+}
+
+/**
+ * pt_clients.equipment stores four enum values, not free text (migration 255).
+ * The safety screen matches free-text equipment names, and "bands" matches
+ * nothing it knows, so map the enum onto the phrase that screen reads. A
+ * trainer's own words pass through unchanged.
+ */
+const EQUIPMENT_LABEL = Object.freeze({
+  full_gym: 'full gym',
+  dumbbells: 'dumbbells',
+  bodyweight: 'bodyweight',
+  bands: 'resistance bands',
+});
+
+function equipmentText(v) {
+  const s = text(v, STATED_TEXT_MAX);
+  return s ? (EQUIPMENT_LABEL[s.toLowerCase()] ?? s) : null;
 }
 
 /**
@@ -363,7 +386,7 @@ function resolveClientFacts(ctx, stated = {}) {
       ['pt_goals.goal_type', goals[0]?.goal_type, when(goals[0], 'updated_at', 'created_at')],
       ['client_fitness_profiles.goal', profile?.goal, when(profile, 'updated_at', 'created_at')],
       ['pt_clients.goal', client.goal, when(client, 'updated_at')],
-    ], text),
+    ], classifyGoal),
 
     experience_level: fromSources([
       ['pt_clients.workout_experience_level', client.workout_experience_level, when(client, 'updated_at')],
@@ -399,19 +422,27 @@ function resolveClientFacts(ctx, stated = {}) {
 
     // ── Equipment ────────────────────────────────────────────────────────
     //
-    // No column on pt_clients records this, and `training_mode` is
-    // Offline / Online / Hybrid — WHERE a client trains, not what they can
-    // lift with. The authoritative answer, where a studio has recorded one,
-    // is the studio's own equipment list in the org-scoped settings store.
+    // pt_clients.equipment is the client's own answer, added in migration 255;
+    // the studio's org-scoped inventory is the fallback for rows written
+    // before it. `training_mode` is Offline / Online / Hybrid — WHERE a client
+    // trains, not what they can lift with, so it is not a source.
     //
-    // Still missing when the studio has not recorded it, and MISSING is the
-    // only honest answer then: the old default claimed "full gym" for every
-    // client alive, and because equipment feeds the safety screen through
-    // equipmentFrom(), that default was quietly ungating equipment-restricted
-    // exercises for clients who may own a resistance band.
+    // Still missing when neither is recorded, and MISSING is the only honest
+    // answer then: the old default claimed "full gym" for every client alive,
+    // and because equipment feeds the safety screen through equipmentFrom(),
+    // that default was quietly ungating equipment-restricted exercises for
+    // clients who may own a resistance band.
     equipment: fromSources([
+      ['pt_clients.equipment', equipmentText(client.equipment), when(client, 'updated_at')],
       ['system_settings.studio_equipment', studioEquipment, when({ at: studioEquipmentAt }, 'at')],
     ], text),
+
+    // The planned length of one PT session. The prompt needs it to stop
+    // prescribing an 80-minute programme into a 45-minute slot; the
+    // deterministic generator uses it to cap the exercise count.
+    session_minutes: fromSources([
+      ['pt_clients.session_minutes', client.session_minutes, when(client, 'updated_at')],
+    ], num),
   };
 
   for (const [field, sources] of Object.entries(LEGACY_SOURCES)) {
@@ -510,7 +541,8 @@ function describeFacts(facts) {
   const LABEL = {
     age: 'Age', gender: 'Gender', weight_kg: 'Weight (kg)',
     height_cm: 'Height (cm)', goal: 'Goal', experience_level: 'Experience level',
-    training_days: 'Training days per week', equipment: 'Available equipment',
+    training_days: 'Training days per week', session_minutes: 'Session length (minutes)',
+    equipment: 'Available equipment',
   };
   const lines = ['CLIENT FACTS (from the studio\'s records):'];
   const freshness = (f) => {

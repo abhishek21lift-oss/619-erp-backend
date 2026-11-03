@@ -244,6 +244,7 @@ const DOMAINS = {
       'muscles', 'muscle_volume_landmarks', 'equipment_types',
       'workout_plans', 'workout_exercises', 'workout_assignments',
       'workout_sessions', 'workout_session_exercises', 'workout_sets',
+      'workout_training_maxes',
       'strength_logs',
     ],
   },

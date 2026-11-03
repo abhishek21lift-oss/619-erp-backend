@@ -35,9 +35,11 @@ const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
 const { planExercises, normaliseName } = require('./plan-critic');
 const { materialise } = require('./plan-materialise');
+const { validateProposedPlan } = require('./workout-validation');
 const { resolveExerciseNames } = require('./client-context');
 const { outcomeOf, summariseOutcomes } = require('./plan-outcomes');
 const { dbDate, today: studioToday } = require('../../lib/appTime');
+const { retireOthers } = require('./assignment-lifecycle');
 
 /** Times a trainer must do the same thing before it reads as a preference. */
 const MIN_REPEATS_FOR_PATTERN = 2;
@@ -288,7 +290,7 @@ function describeMemory(memory) {
  * to the request by the route; it runs after the generation is found and
  * before anything is written, and a block stops the save.
  */
-async function acceptGeneration({ generationId, orgId, userId, name = null, gate = null } = {}) {
+async function acceptGeneration({ generationId, orgId, userId, name = null, gate = null, keepExisting = false } = {}) {
   if (!generationId) return { ok: false, reason: 'no_generation' };
 
   const { rows } = await pool.query(
@@ -323,6 +325,13 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
   }
 
   const proposed = generation.proposed_plan || {};
+  // Structural check before anything is resolved or written. Materialise is
+  // forgiving by design, so without this a malformed proposal could become a
+  // saved plan with fewer days than it claims.
+  const validation = validateProposedPlan(proposed);
+  if (!validation.ok) {
+    return { ok: false, reason: 'invalid_plan', errors: validation.errors };
+  }
   // Custom library rows are visible to their creator. The proposal is resolved
   // against the library as the trainer who GENERATED it saw it; using the
   // accepting trainer's id made another trainer's custom exercises vanish.
@@ -344,6 +353,7 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
   const startedOn = studioToday();
   let wasAssigned = false;
   let otherActive = 0;
+  let retired = 0;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -352,13 +362,17 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
       `INSERT INTO workout_plans
          (id, name, description, goal, difficulty, duration_weeks, sessions_per_week,
           progression_type, progression_amount, progression_every_weeks,
+          warmup_protocol, mobility_protocol, cooldown_protocol,
           is_template, is_active, created_by, organization_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false, true, $11, $12)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, true, $14, $15)`,
       [planId, name || built.plan.name, built.plan.description,
         built.plan.goal, built.plan.difficulty,
         built.plan.duration_weeks, built.plan.sessions_per_week,
         built.plan.progression_type, built.plan.progression_amount,
         built.plan.progression_every_weeks,
+        built.plan.warmup_protocol ? JSON.stringify(built.plan.warmup_protocol) : null,
+        built.plan.mobility_protocol ? JSON.stringify(built.plan.mobility_protocol) : null,
+        built.plan.cooldown_protocol ? JSON.stringify(built.plan.cooldown_protocol) : null,
         userId || null, orgId || null],
     );
 
@@ -366,11 +380,16 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
       await client.query(
         `INSERT INTO workout_exercises
            (id, workout_plan_id, exercise_id, day_of_week, week_number, sort_order,
-            sets, reps, rest_seconds, notes, tempo, rpe, config)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+            sets, reps, rest_seconds, notes, tempo, rpe, rir,
+            target_weight, warmup_sets, superset_group, alternatives, cues, config)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
         [randomUUID(), planId, ex.exercise_id, ex.day_of_week, ex.week_number, ex.sort_order,
           ex.sets ?? 3, ex.reps ?? 10, ex.rest_seconds ?? 60, ex.notes,
-          ex.tempo, ex.rpe, ex.config ? JSON.stringify(ex.config) : null],
+          ex.tempo, ex.rpe, ex.rir,
+          ex.target_weight, ex.warmup_sets, ex.superset_group,
+          ex.alternatives ? JSON.stringify(ex.alternatives) : null,
+          ex.cues ? JSON.stringify(ex.cues) : null,
+          ex.config ? JSON.stringify(ex.config) : null],
       );
     }
 
@@ -393,10 +412,15 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
     // assignment is exactly the state described above, and half-committing it
     // would recreate the bug one row at a time.
     //
-    // It ADDS an assignment and retires nothing. Silently completing whatever
-    // the client is already on would be the system overwriting a programme a
-    // trainer chose, which this engine does not do — so the count of what else
-    // is active comes back in the result for the trainer to act on instead.
+    // It ADDS an assignment and, by default, retires whatever the client was
+    // already on. Leaving the old block active made "which programme is this
+    // client on" ambiguous: the Today roster, the member portal and the session
+    // log each resolved it differently. A trainer who really is running two
+    // blocks side by side passes keep_existing, and the old rows stay live.
+    //
+    // Same transaction as the plan and the stamp: a plan that exists with no
+    // assignment is exactly the state described above, and half-committing it
+    // would recreate the bug one row at a time.
     let assigned = false;
     if (orgId) {
       // The programme's own length, start + weeks − 1 day — the same rule
@@ -415,15 +439,22 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
                  $4, $5, 'active', $6)`,
         [assignmentId, planId, generation.client_id, startedOn, endOn, orgId],
       );
+      if (!keepExisting) {
+        ({ retired } = await retireOthers(client, {
+          clientId: generation.client_id,
+          orgId,
+          exceptId: assignmentId,
+          reason: 'replaced',
+          today: startedOn,
+        }));
+      }
       assigned = true;
     }
 
-    // How many OTHER programmes this client is already on. Counted on the
-    // same live window the Today roster and the session auto-link use — an
-    // assignment whose end date has passed is not something they are "on".
-    // The log still picks one automatically (the live assignment that
-    // prescribes the date, newest first); this count is context for the
-    // trainer, not a warning that attribution has become manual.
+    // How many OTHER programmes this client is still on, after retirement.
+    // Counted on the same live window the Today roster and the session
+    // auto-link use — an assignment whose end date has passed is not something
+    // they are "on". Non-zero now means the trainer explicitly kept them.
     const { rows: others } = await client.query(
       `SELECT COUNT(*)::int AS n
          FROM workout_assignments
@@ -470,6 +501,10 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
     // assigned to is the failure this endpoint used to have silently.
     assignment_id: wasAssigned ? assignmentId : null,
     assigned: wasAssigned,
+    // Programmes the save retired to make this one current. Non-zero is the
+    // normal case for a client who was already on a block; the UI says so
+    // rather than leaving the trainer to wonder where the old plan went.
+    retired_assignments: retired,
     other_active_assignments: otherActive,
     screening_warnings: screeningWarnings,
   };

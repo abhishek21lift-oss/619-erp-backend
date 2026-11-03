@@ -51,6 +51,9 @@ jest.mock('../../db/pool', () => ({
   }),
   connect: jest.fn(async () => ({
     query: jest.fn(async (sql, params) => {
+      // Transaction control carries no answers: the queue is for statements
+      // that read or write rows.
+      if (/^\s*(BEGIN|COMMIT|ROLLBACK)\b/i.test(String(sql))) return { rows: [], rowCount: 0 };
       mockLog.push({ sql: String(sql).replace(/\s+/g, ' ').trim(), params: params || [] });
       return mockAnswer(String(sql));
     }),

@@ -54,6 +54,7 @@
 // and the layer above must be able to tell them apart.
 
 const { dbDate } = require('../../lib/appTime');
+const clearance = require('./clearance');
 
 /** Severities, worst first. A rule may raise a verdict, never lower one. */
 const VERDICTS = Object.freeze({ BLOCK: 'block', CAUTION: 'caution', ALLOW: 'allow' });
@@ -544,17 +545,28 @@ function buildConstraints({
   return {
     // ── The hard gate ─────────────────────────────────────────────────────
     //
-    // Three states, not two. A studio that has cleared the client says so on
+    // Four states, not two. A studio that has cleared the client says so on
     // the form; a studio that has not run a PAR-Q has not cleared anybody, and
     // `unknown` must not read as `cleared` anywhere downstream. That is the
     // difference between "we checked" and "nobody asked", and it is exactly
     // the distinction a default would erase.
-    gate: {
-      status: parq ? (str(parq.workout_gate_status) || 'unknown') : 'unknown',
-      cleared: Boolean(parq) && str(parq.workout_gate_status) === 'cleared',
-      risk_level: parq ? (str(parq.risk_level) || null) : null,
-      assessed_on: parq?.assessment_date ? dbDate(parq.assessment_date) : null,
-    },
+    //
+    // `conditional` is a clearance with recorded restrictions: programming may
+    // proceed, but only while carrying those restrictions forward. It is not
+    // the same decision as `cleared`, and the boolean `cleared` below stays
+    // false for it so no existing caller silently upgrades it.
+    gate: (() => {
+      const d = clearance.decision({ parq });
+      return {
+        status: d.status,
+        cleared: d.status === 'cleared',
+        may_program: d.may_program,
+        requires_ack: d.requires_ack,
+        restrictions: d.restrictions,
+        risk_level: parq ? (str(parq.risk_level) || null) : null,
+        assessed_on: parq?.assessment_date ? dbDate(parq.assessment_date) : null,
+      };
+    })(),
     constraints,
     referrals,
     experience,
@@ -862,7 +874,7 @@ function evaluate({
     // A programme must not be generated at all for a client the studio has not
     // cleared. Returned as a flag rather than thrown, because the caller needs
     // to tell the trainer WHY nothing was generated, and an exception loses it.
-    may_program: screen.gate.cleared,
+    may_program: screen.gate.may_program,
     constraints: screen.constraints,
     referrals: screen.referrals,
     // Constraints with no region attached. They reach the trainer as text

@@ -260,7 +260,6 @@ describe('editing week 4', () => {
 
 describe('previewWeeks with the real week rows', () => {
   const rows = [...BASE, ...WEEK4];
-
   it('shows the edited week, not where the rule would have gone', () => {
     const weeks = previewWeeks(BASE[0], PLAN_WEIGHT, 6, rows);
     expect(weeks[3]).toMatchObject({ week: 4, target_weight: 45 });
@@ -281,5 +280,84 @@ describe('previewWeeks with the real week rows', () => {
     expect(weeks[3].target_weight).toBe(30);          // slot 0 is bench now
     const removed = previewWeeks(BASE[1], PLAN_WEIGHT, 5, [...BASE, ...soloWeek4]);
     expect(removed[3].target_weight).toBe(30);        // matched by exercise_id
+  });
+});
+
+// ── Deloads and blocks ─────────────────────────────────────────────────────
+//
+// A deload is a week the plan reduces on purpose. It must be visible as such
+// (the member and trainer screens label it) and it must not compound with the
+// progression rule: reducing an already-reduced load twice is how a deload
+// becomes a week off.
+describe('deload cadence', () => {
+  const PLAN_DELOAD = { ...PLAN_WEIGHT, deload_every_weeks: 4, deload_intensity_pct: 70 };
+
+  it('is off unless the plan opts in', () => {
+    expect(resolveWeek(BASE, PLAN_WEIGHT, 4).exercises[0].is_deload).toBeUndefined();
+    expect(resolveWeek(BASE, PLAN_WEIGHT, 4).exercises[0].target_weight).toBe(67.5);
+  });
+
+  it('lands on the cadence week and says so', () => {
+    const { exercises } = resolveWeek(BASE, PLAN_DELOAD, 4);
+    expect(exercises[0].is_deload).toBe(true);
+    expect(exercises[0].deload_pct).toBe(70);
+    // Progression first (60 + 3 × 2.5 = 67.5), then the deload: 47.25 → 47.25.
+    expect(exercises[0].target_weight).toBe(47.25);
+    expect(exercises[0].rpe).toBe(5);
+    // A week that is not the cadence week is untouched.
+    expect(resolveWeek(BASE, PLAN_DELOAD, 5).exercises[0].is_deload).toBeUndefined();
+  });
+
+  it('keeps the same programme: reps and sets do not change', () => {
+    const { exercises } = resolveWeek(BASE, PLAN_DELOAD, 4);
+    expect(exercises[0].reps).toBe(8);
+    expect(exercises[0].sets).toBeUndefined(); // the fixture has none
+  });
+
+  it('uses 70% when the plan does not name a percentage', () => {
+    const plan = { ...PLAN_WEIGHT, deload_every_weeks: 4 };
+    expect(resolveWeek(BASE, plan, 4).exercises[0].target_weight).toBe(47.25);
+  });
+
+  it('moves only effort for a bodyweight row with no load', () => {
+    const pushup = [{ ...BASE[0], target_weight: null, rpe: 8 }];
+    const { exercises } = resolveWeek(pushup, PLAN_DELOAD, 4);
+    expect(exercises[0].target_weight).toBeNull();
+    expect(exercises[0].rpe).toBe(6);
+  });
+});
+
+describe('powerlifting block weeks', () => {
+  const PLAN_BLOCK = {
+    progression_type: 'block',
+    periodization_model: 'powerlifting_block',
+    block_phases: [
+      { week: 1, phase: 'base', label: 'Base', is_deload: false },
+      { week: 4, phase: 'base', label: 'Base', is_deload: true },
+    ],
+  };
+  // Every block week is stored as its own anchor: the prescription already
+  // carries the phase and the deload.
+  const BLOCK_ROWS = [
+    { ...BASE[0], week_number: 1, target_weight: 130, rpe: 6.5 },
+    { ...BASE[0], id: 'b4', week_number: 4, target_weight: 110, rpe: 6 },
+  ];
+
+  it('returns the stored week and its phase label', () => {
+    const week4 = resolveWeek(BLOCK_ROWS, PLAN_BLOCK, 4);
+    expect(week4.anchor_week).toBe(4);
+    expect(week4.phase).toMatchObject({ phase: 'base', is_deload: true });
+    expect(week4.exercises[0].target_weight).toBe(110);
+    expect(week4.exercises[0].is_deload).toBe(true);
+  });
+
+  it('does not apply a second deload on top of a stored deload week', () => {
+    const plan = { ...PLAN_BLOCK, deload_every_weeks: 4, deload_intensity_pct: 50 };
+    const week4 = resolveWeek(BLOCK_ROWS, plan, 4);
+    expect(week4.exercises[0].target_weight).toBe(110);
+  });
+
+  it('carries no phase for a linear plan', () => {
+    expect(resolveWeek(BASE, PLAN_WEIGHT, 4).phase).toBeNull();
   });
 });

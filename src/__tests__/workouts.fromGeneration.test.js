@@ -259,6 +259,25 @@ describe('what it refuses', () => {
     expect(sqls().some((s) => /INSERT INTO workout_plans/.test(s))).toBe(false);
     expect(pool.connect).not.toHaveBeenCalled();
   });
+
+  it('refuses a proposal that is not structurally a workout', async () => {
+    mockDb({
+      generation: {
+        id: 'gen-1', client_id: 'cl-1', accepted_plan_id: null,
+        proposed_plan: { name: 'Empty', weeks: 8, weekly_schedule: {} },
+      },
+    });
+
+    const res = await post();
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('INVALID_PLAN');
+    expect(res.body.errors).toContainEqual({
+      path: 'weekly_schedule',
+      message: 'must name at least one training day',
+    });
+    expect(sqls().some((s) => /INSERT INTO workout_plans/.test(s))).toBe(false);
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
 });
 
 describe('the proposal has to actually reach the client', () => {
@@ -305,14 +324,21 @@ describe('the proposal has to actually reach the client', () => {
     expect(assign).toMatch(/SELECT trainer_id FROM pt_clients/);
   });
 
-  it('adds an assignment and retires nothing', async () => {
-    await post();
+  it('retires the programme the client was already on, by default', async () => {
+    const res = await post();
     const all = sqls();
-    // The engine never overwrites a programme a trainer chose. Anything that
-    // completed or cancelled the client's existing assignments would be this
-    // system deciding for them.
-    expect(all.some((s) => /UPDATE workout_assignments/.test(s))).toBe(false);
+    // One current programme per client. Leaving the previous block active made
+    // "which programme is this client on" ambiguous: Today, the member portal
+    // and the session log each resolved it differently.
+    expect(all.some((s) => /UPDATE workout_assignments/.test(s) && /retired_at = NOW\(\)/.test(s))).toBe(true);
     expect(all.some((s) => /DELETE FROM workout_assignments/.test(s))).toBe(false);
+    expect(res.body.retired_assignments).toBe(1);
+  });
+
+  it('leaves the previous programme live when the trainer keeps both', async () => {
+    const res = await post({ generation_id: 'gen-1', keep_existing: true });
+    expect(sqls().some((s) => /retired_at = NOW\(\)/.test(s))).toBe(false);
+    expect(res.body.retired_assignments).toBe(0);
   });
 
   it('ends the programme when its weeks run out, in studio days', async () => {
@@ -330,10 +356,10 @@ describe('the proposal has to actually reach the client', () => {
     expect(params[4]).toBe('2026-12-10');   // + 8 weeks − 1 day
   });
 
-  it('tells the trainer what else the client is already on', async () => {
-    // Above zero, the session log can no longer auto-link this client to one
-    // plan — it links only when there is exactly one active assignment — so
-    // attribution becomes theirs to make by hand. They are told, not guessed for.
+  it('reports the programmes the trainer chose to keep', async () => {
+    // keep_existing is the deliberate two-block case. The count is what the
+    // trainer has to manage; the default path retires the others and reports
+    // zero here.
     pool.query.mockImplementation((sql) => {
       const s = String(sql);
       if (/FROM ai_workout_generations/.test(s)) {
@@ -345,7 +371,7 @@ describe('the proposal has to actually reach the client', () => {
       return Promise.resolve({ rows: [], rowCount: 1 });
     });
 
-    const res = await post();
+    const res = await post({ generation_id: 'gen-1', keep_existing: true });
     expect(res.body.other_active_assignments).toBe(4);
   });
 

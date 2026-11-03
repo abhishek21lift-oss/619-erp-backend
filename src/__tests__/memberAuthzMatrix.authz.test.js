@@ -133,7 +133,6 @@ const MEMBER_MAY = {
   'GET /api/exercises/recent': "The caller's OWN recently-used exercises, keyed by user id.",
   'POST /api/exercises/1/favorite': "Favourites a library exercise FOR THE CALLER; the row is keyed by their own user id.",
   'POST /api/exercises/1/use': "Records that the caller used an exercise, keyed by their own user id. Drives /recent above.",
-  'GET /api/workouts/plans': 'The plan LIST, which is org-scoped reference content. The single-plan read beside it now requires staff.',
   'GET /api/features/': 'Studio feature flags, read by FeaturesProvider in the root layout for every role. Studio configuration, not client or staff data.',
 
   // ── AI surfaces that self-scope by user id. ──────────────────────────────

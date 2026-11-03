@@ -40,14 +40,21 @@ function poolRows() {
 }
 
 /**
- * The four reads the route makes before the exercise pool: the client, then
- * the three records the shared fact resolver also consults.
+ * The reads the route makes before the exercise pool: the client, the three
+ * records the shared fact resolver also consults, then the two screening
+ * reads (latest PAR-Q and latest consent). Empty rows mean "nothing on file",
+ * which is not a hard stop.
  */
-function queueSources({ client = clientRow(), profile = null, goals = [], lifestyle = null } = {}) {
+function queueSources({
+  client = clientRow(), profile = null, goals = [], lifestyle = null,
+  parq = null, consent = null,
+} = {}) {
   pool.query.mockResolvedValueOnce({ rows: client ? [client] : [] });
   pool.query.mockResolvedValueOnce({ rows: profile ? [profile] : [] });
   pool.query.mockResolvedValueOnce({ rows: goals });
   pool.query.mockResolvedValueOnce({ rows: lifestyle ? [lifestyle] : [] });
+  pool.query.mockResolvedValueOnce({ rows: parq ? [parq] : [] });
+  pool.query.mockResolvedValueOnce({ rows: consent ? [consent] : [] });
 }
 
 test('scopes the client lookup to the caller\'s organization', async () => {
@@ -202,4 +209,160 @@ test('a request can supply a fact the record does not hold', async () => {
   expect(res.status).toBe(200);
   expect(res.body.data.draft.goal).toBe('strength');
   expect(res.body.data.draft.experience).toBe('beginner');
+});
+
+// ── The week the client actually trains ────────────────────────────────────
+//
+// The draft used to be one session and the save path wrote sessions_per_week:
+// 1 for every programme. The record now supplies the frequency and the
+// weekdays, and a request may plan a different block on purpose.
+test('builds one session per recorded training day, on the recorded weekdays', async () => {
+  queueSources({
+    client: clientRow({
+      sessions_per_week: 3,
+      preferred_training_days: 'Mon, Wed, Fri',
+    }),
+  });
+  pool.query.mockResolvedValueOnce({ rows: poolRows() });
+
+  const res = await request(app).post(`/api/pt-os/clients/${CLIENT}/workout-generator/preview`).send({});
+  expect(res.status).toBe(200);
+  const { draft } = res.body.data;
+  expect(draft.daysPerWeek).toBe(3);
+  expect(draft.sessions).toHaveLength(3);
+  expect(draft.sessions.map((s) => s.day_of_week)).toEqual([1, 3, 5]);
+  expect(draft.sessions.map((s) => s.day_name)).toEqual(['Monday', 'Wednesday', 'Friday']);
+  // The first session is still the top-level draft, for old callers.
+  expect(draft.mainWork).toEqual(draft.sessions[0].mainWork);
+});
+
+test('fits the session inside the recorded slot instead of prescribing past it', async () => {
+  queueSources({
+    client: clientRow({ sessions_per_week: 1, session_minutes: 30 }),
+  });
+  pool.query.mockResolvedValueOnce({ rows: poolRows() });
+
+  const res = await request(app).post(`/api/pt-os/clients/${CLIENT}/workout-generator/preview`).send({});
+  expect(res.status).toBe(200);
+  const { draft } = res.body.data;
+  expect(draft.sessionMinutes).toBe(30);
+  expect(draft.sessions[0].estimated_minutes).toBeLessThanOrEqual(30);
+  // 30 minutes leaves no room for the goal's default 10-minute conditioning.
+  expect(draft.sessions[0].conditioning).toBeNull();
+});
+
+test('refuses to draft for a client whose screening is a hard stop', async () => {
+  queueSources({ consent: { status: 'revoked', physician_block: false } });
+
+  const res = await request(app).post(`/api/pt-os/clients/${CLIENT}/workout-generator/preview`).send({});
+  expect(res.status).toBe(403);
+  expect(res.body.error.code).toBe('NOT_CLEARED');
+  // No pool read for a session that cannot be trained.
+  expect(sqls().some((s) => /FROM exercises e/.test(s))).toBe(false);
+});
+
+// ── Powerlifting blocks ────────────────────────────────────────────────────
+//
+// A block is not a week with a label: the preview returns every week, each
+// main lift is a percentage of the trainer's max, and the phases run in
+// order. These pin the route wiring — the arithmetic itself is tested in
+// powerlifting.test.js.
+test('returns a whole powerlifting block, loaded from the training maxes', async () => {
+  queueSources({ client: clientRow({ goal: 'powerlifting' }) });
+  pool.query.mockResolvedValueOnce({ rows: poolRows() });
+  pool.query.mockResolvedValueOnce({ rows: [{ exercise_id: 'squat', training_max_kg: '200' }] });
+
+  const res = await request(app).post(`/api/pt-os/clients/${CLIENT}/workout-generator/preview`).send({
+    periodization: 'powerlifting_block',
+    blockWeeks: 12,
+    daysPerWeek: 2,
+  });
+  expect(res.status).toBe(200);
+  const { draft, validation } = res.body.data;
+  expect(draft.periodization.model).toBe('powerlifting_block');
+  expect(draft.periodization.block_weeks).toBe(12);
+  expect(draft.periodization.weeks).toHaveLength(12);
+  expect(draft.periodization.phases.map((p) => p.phase))
+    .toEqual(['base', 'strength', 'intensification', 'peaking', 'taper']);
+  // Week one is still the top-level draft, for callers that read one week.
+  expect(draft.sessions).toEqual(draft.periodization.weeks[0].sessions);
+
+  const squatWeek1 = draft.sessions[0].mainWork.find((e) => e.id === 'squat');
+  expect(squatWeek1.prescription.target_weight).toBe(130); // 65% of 200
+  expect(squatWeek1.prescription.basis).toBe('training_max');
+
+  // The lift with no max is prescribed by RPE and named in the warnings.
+  const benchWeek1 = draft.sessions[0].mainWork.find((e) => e.id === 'bench');
+  expect(benchWeek1.prescription.target_weight).toBeNull();
+  expect(benchWeek1.prescription.basis).toBe('rpe');
+  expect(draft.periodization.missing_training_maxes.map((m) => m.exercise_id)).toContain('bench');
+  expect(draft.warnings.join(' ')).toMatch(/No training max recorded/);
+  expect(validation.ok).toBe(true);
+});
+
+test('falls back to a generic week when the pool has no competition lift', async () => {
+  queueSources({ client: clientRow({ goal: 'powerlifting' }) });
+  pool.query.mockResolvedValueOnce({
+    rows: [{ id: 'legpress', name: 'Leg Press', mechanic: 'compound', movementPattern: 'Squat', primaryMuscle: 'Quadriceps', equipment: 'Machine', category: 'Strength', difficulty: 'intermediate' }],
+  });
+  pool.query.mockResolvedValueOnce({ rows: [] }); // training maxes
+
+  const res = await request(app).post(`/api/pt-os/clients/${CLIENT}/workout-generator/preview`).send({
+    periodization: 'powerlifting_block',
+    blockWeeks: 12,
+  });
+  expect(res.status).toBe(200);
+  expect(res.body.data.draft.periodization).toBeUndefined();
+  expect(res.body.data.draft.mainWork.length).toBeGreaterThan(0);
+});
+
+// ── Training maxes ─────────────────────────────────────────────────────────
+test('lists training maxes with an e1RM suggestion that is never applied', async () => {
+  pool.query.mockResolvedValueOnce({ rows: [clientRow()] });       // client
+  pool.query.mockResolvedValueOnce({ rows: [{ exercise_id: 'squat', training_max_kg: '150', source: 'manual' }] });
+  pool.query.mockResolvedValueOnce({ rows: poolRows() });          // library pool
+  pool.query.mockResolvedValueOnce({
+    rows: [{ exercise_id: 'squat', weight_kg: '150', reps: 5, rpe: '8', session_date: '2026-10-01' }],
+  });
+
+  const res = await request(app).get(`/api/pt-os/clients/${CLIENT}/training-maxes`);
+  expect(res.status).toBe(200);
+  const { lifts } = res.body.data;
+  const squat = lifts.find((l) => l.exercise_id === 'squat');
+  expect(squat.training_max_kg).toBe(150);
+  expect(squat.best_e1rm_kg).toBe(175); // 150 × (1 + 5/30)
+  expect(squat.suggestion.applied).toBe(false);
+  expect(squat.suggestion.suggested_kg).toBe(157.5); // 90% of e1RM, rounded
+
+  // A competition lift with no max still gets a suggestion from the sets.
+  const bench = lifts.find((l) => l.exercise_id === 'bench');
+  expect(bench.training_max_kg).toBeNull();
+  expect(bench.suggestion.suggested_kg).toBeNull();
+});
+
+test('sets a training max for this org only, and upserts rather than duplicates', async () => {
+  pool.query.mockResolvedValueOnce({ rows: [clientRow()] });
+  pool.query.mockResolvedValueOnce({ rows: [{ id: 'squat', name: 'Back Squat', movementPattern: 'Squat' }] });
+  pool.query.mockResolvedValueOnce({
+    rows: [{ exercise_id: 'squat', training_max_kg: '200', source: 'manual' }],
+  });
+
+  const res = await request(app)
+    .put(`/api/pt-os/clients/${CLIENT}/training-maxes/squat`)
+    .send({ training_max_kg: 200, source_e1rm_kg: 220 });
+  expect(res.status).toBe(200);
+  expect(res.body.data.training_max_kg).toBe('200');
+
+  const insert = sqls().find((s) => /INSERT INTO workout_training_maxes/.test(s));
+  expect(insert).toMatch(/ON CONFLICT \(client_id, exercise_id\) DO UPDATE/);
+  const exerciseQuery = sqls().find((s) => /FROM exercises/.test(s));
+  expect(exerciseQuery).toMatch(/organization_id IS NULL OR organization_id = \$2/);
+});
+
+test('rejects a training max that is not a load', async () => {
+  const res = await request(app)
+    .put(`/api/pt-os/clients/${CLIENT}/training-maxes/squat`)
+    .send({ training_max_kg: 0 });
+  expect(res.status).toBe(400);
+  expect(pool.query).not.toHaveBeenCalled();
 });

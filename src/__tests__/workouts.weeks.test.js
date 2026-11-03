@@ -46,6 +46,10 @@ function runQuery(sqlRaw, params = []) {
 
   if (/^SELECT wp\.\* FROM workout_plans/i.test(sql)) return { rows: [PLAN_ROW], rowCount: 1 };
   if (/FROM workout_plans wp WHERE/i.test(sql)) return { rows: [PLAN_ROW], rowCount: 1 };
+  // Every exercise id is visible in this fake; the access rule has its own test.
+  if (/^SELECT id, name, movement_pattern AS "movementPattern" FROM exercises/i.test(sql)) {
+    return { rows: [{ id: params[0], name: 'Test exercise' }], rowCount: 1 };
+  }
   if (/FOR UPDATE/i.test(sql)) return { rows: [{ id: PLAN }], rowCount: 1 };
 
   // materialiseWeek: has this week been written yet?
@@ -74,13 +78,14 @@ function runQuery(sqlRaw, params = []) {
   // Plain add.
   if (/^INSERT INTO workout_exercises/i.test(sql)) {
     const [id, planId, exerciseId, day, sets, reps, rest, notes,
-      targetWeight, tempo, rpe, warmupSets, supersetGroup, config, week] = params;
+      targetWeight, tempo, rpe, rir, warmupSets, supersetGroup,
+      alternatives, cues, config, week] = params;
     const siblings = rows.filter((r) => r.day_of_week === day && r.week_number === week);
     rows.push({
       id, workout_plan_id: planId, exercise_id: exerciseId, day_of_week: day,
       week_number: week, sets, reps, rest_seconds: rest, notes,
-      target_weight: targetWeight, tempo, rpe, warmup_sets: warmupSets,
-      superset_group: supersetGroup, config,
+      target_weight: targetWeight, tempo, rpe, rir, warmup_sets: warmupSets,
+      superset_group: supersetGroup, alternatives, cues, config,
       sort_order: siblings.length ? Math.max(...siblings.map((r) => r.sort_order)) + 1 : 0,
     });
     return { rows: [{ id }], rowCount: 1 };

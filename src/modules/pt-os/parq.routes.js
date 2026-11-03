@@ -144,7 +144,7 @@ const answersChanged = (before, after) => {
 // clearance later must flip a previously-blocked form to cleared.
 async function recomputeGateStatus(pool, formId) {
   const { rows: formRows } = await pool.query(
-    'SELECT risk_level, client_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL', [formId]
+    'SELECT risk_level, status, client_id FROM pt_parq_forms WHERE id = $1 AND deleted_at IS NULL', [formId]
   );
   const form = formRows[0];
   if (!form) return null;
@@ -157,6 +157,11 @@ async function recomputeGateStatus(pool, formId) {
       `SELECT ${validClearanceSql('$1')} AS ok`, [formId]
     );
     gateStatus = clearanceRows[0]?.ok ? 'cleared' : 'blocked';
+  } else if (form.risk_level === 'medium' && form.status !== 'reviewed') {
+    // A "yes" answer the trainer has not reviewed is not a clearance. It is a
+    // conditional one: training may continue under the recorded restrictions,
+    // but the open question must stay visible until it is reviewed.
+    gateStatus = 'conditional';
   } else {
     gateStatus = 'cleared';
   }

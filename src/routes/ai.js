@@ -937,7 +937,7 @@ router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res)
   });
 });
 
-router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
+router.post('/workout/generate', auth, requireTrainer, requireConfigured, async (req, res) => {
   const { client_id } = req.body || {};
   if (!client_id) return res.status(400).json({ error: 'client_id is required' });
 
@@ -1159,14 +1159,30 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
   const adapting = program.active && !program.expired && mode === 'adapt';
 
   const gateStatus = twin.rules.gate.status;
-  if (!twin.rules.may_program && gateStatus !== 'unknown') {
-    logger.warn({ req_id: req.id, gate: gateStatus }, 'ai_workout_generate_gate_blocked');
-    return res.status(409).json({
-      error: 'Client is not cleared to train',
-      code: 'NOT_CLEARED',
-      gate: gateStatus,
-      message: `The PAR-Q gate for this client reads "${gateStatus}". Resolve it before generating a programme.`,
-    });
+  const acknowledgeUnscreened = req.body?.acknowledge_unscreened === true;
+  if (!twin.rules.may_program) {
+    if (gateStatus === 'unknown' && acknowledgeUnscreened) {
+      // No PAR-Q exists. The trainer has explicitly taken the decision to
+      // generate anyway; that decision is recorded, and the prompt still says
+      // in capitals that nobody screened this client.
+      logger.warn({ req_id: req.id, client_id, gate: gateStatus }, 'ai_workout_generate_unscreened_override');
+    } else if (gateStatus === 'unknown') {
+      logger.warn({ req_id: req.id, gate: gateStatus }, 'ai_workout_generate_clearance_required');
+      return res.status(409).json({
+        error: 'This client has no health screening on file',
+        code: 'CLEARANCE_REQUIRED',
+        gate: gateStatus,
+        message: 'Complete the PAR-Q, or send acknowledge_unscreened: true to generate under an explicit trainer override.',
+      });
+    } else {
+      logger.warn({ req_id: req.id, gate: gateStatus }, 'ai_workout_generate_gate_blocked');
+      return res.status(409).json({
+        error: 'Client is not cleared to train',
+        code: 'NOT_CLEARED',
+        gate: gateStatus,
+        message: `The PAR-Q gate for this client reads "${gateStatus}". Resolve it before generating a programme.`,
+      });
+    }
   }
 
   // What the generator used to say for every client alive: "none", taken from
@@ -1346,9 +1362,13 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
     ...(val('preferred_days')
       ? [`The client's recorded training weekdays are ${val('preferred_days')}. Use exactly these weekdays as the weekly_schedule keys.`]
       : []),
+    ...(val('session_minutes')
+      ? [`Each session must fit within ${val('session_minutes')} minutes including warm-up and cool-down. Set every day's estimated_minutes to that total, and do not prescribe more work than fits.`]
+      : []),
     '',
     'SESSION STRUCTURE:',
     'Each training day must contain: a session title, the training focus, a warm-up, main exercises, accessories, and cool-down/recovery guidance when appropriate.',
+    'Include mobility work where the client\'s screen or training history calls for it, and name 1-2 alternatives for any exercise a recorded limitation or equipment gap may make unsuitable.',
     '',
     'EVERY EXERCISE:',
     'For every exercise, specify: the name, its order in the session, sets, reps or a rep range, an RIR or RPE target, the rest period, and tempo when the Exercise Library or knowledge provides one for strength work.',
@@ -1448,6 +1468,7 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       training_days: val('training_days'),
       duration_weeks: p.duration_weeks,
       weekdays: val('preferred_days'),
+      session_minutes: val('session_minutes'),
     };
     const auditWith = async (candidate) => {
       const screened = await screenPlanExercises(
@@ -1672,6 +1693,10 @@ router.post('/workout/generate', auth, requireConfigured, async (req, res) => {
       // consent not completed, etc.). The action proceeds, but the UI surfaces
       // these so the trainer knows what paperwork is missing.
       screening_warnings: screening.warnings,
+      // The clearance state the plan was generated under, and the restrictions
+      // a conditional clearance binds the programme to. Sent with the plan so
+      // the trainer approving it sees the same state the rules enforced.
+      clearance: twin.rules.gate,
       // What this generation was: a new block, or the next weeks of one the
       // client is already training. Without it a saved plan cannot say which
       // it was, and the ledger cannot answer why a week-4 client received a
