@@ -632,6 +632,80 @@ const SPORTS_LABEL = Object.freeze({
   previously: 'Previously',
   currently: 'Currently',
 });
+const WORK_TYPE_LABEL = Object.freeze({
+  desk: 'Desk-based',
+  on_feet: 'On feet',
+  physical: 'Physical labour',
+  mixed: 'Mixed',
+  shifts: 'Shift work',
+  field: 'On the road / field',
+  other: 'Other',
+});
+const HOURS_BAND_LABEL = Object.freeze({
+  under_4: 'Under 4 hours',
+  '4_6': '4–6 hours',
+  '6_8': '6–8 hours',
+  '8_10': '8–10 hours',
+  '10_plus': '10+ hours',
+  varies: 'Varies',
+});
+const ACTIVITY_LABEL = Object.freeze({
+  mostly_seated: 'Mostly seated',
+  light: 'Lightly active',
+  moderately_active: 'Moderately active',
+  very_active: 'Very active',
+});
+const TRAINING_DURATION_LABEL = Object.freeze({
+  none: 'None yet',
+  under_3_months: 'Under 3 months',
+  '3_6_months': '3–6 months',
+  '6_12_months': '6–12 months',
+  '1_2_years': '1–2 years',
+  '2_plus_years': '2+ years',
+});
+const SPORTS_PLAYED_LABEL = Object.freeze({
+  cricket: 'Cricket', football: 'Football', badminton: 'Badminton', tennis: 'Tennis',
+  table_tennis: 'Table tennis', basketball: 'Basketball', volleyball: 'Volleyball',
+  hockey: 'Hockey', athletics: 'Athletics', swimming: 'Swimming', cycling: 'Cycling',
+  running: 'Running', boxing: 'Boxing', martial_arts: 'Martial arts', gymnastics: 'Gymnastics',
+  rowing: 'Rowing', golf: 'Golf', squash: 'Squash', dance: 'Dance', other: 'Other',
+});
+const ACTIVITIES_LABEL = Object.freeze({
+  walking: 'Walking', running: 'Running', cycling: 'Cycling', swimming: 'Swimming',
+  gym_weights: 'Gym weights', cardio_machines: 'Cardio machines', home_workouts: 'Home workouts',
+  yoga: 'Yoga', pilates: 'Pilates', martial_arts: 'Martial arts', dance: 'Dance',
+  sports: 'Sports', physical_job: 'Physical job', none: 'None',
+});
+const PREFERENCES_LABEL = Object.freeze({
+  free_weights: 'Free weights', machines: 'Machines', bodyweight: 'Bodyweight', cardio: 'Cardio',
+  hiit: 'HIIT', yoga: 'Yoga', pilates: 'Pilates', stretching: 'Stretching', outdoors: 'Outdoors',
+  group_classes: 'Group classes', home_workouts: 'Home workouts', sports: 'Sports',
+  no_preference: 'No preference',
+});
+const GOAL_LABEL = Object.freeze({
+  fat_loss: 'Fat loss', muscle_gain: 'Muscle gain', body_recomposition: 'Body recomposition',
+  strength_gain: 'Strength gain', endurance: 'Endurance', general_fitness: 'General fitness',
+  mobility: 'Mobility', athletic_performance: 'Athletic performance', medical_fitness: 'Medical fitness',
+  wedding_transformation: 'Wedding transformation', senior_fitness: 'Senior fitness',
+});
+const MOTIVATION_LABEL = Object.freeze({
+  health: 'Health', appearance: 'Appearance', energy: 'Energy', confidence: 'Confidence',
+  strength: 'Strength', event: 'Upcoming event', doctor_advice: 'Doctor advice', family: 'Family',
+  accountability: 'Accountability', stress: 'Stress', sport: 'Sport', habit: 'Habit',
+});
+const ATTITUDE_LABEL = Object.freeze({
+  motivated: 'Motivated', neutral: 'Neutral', anxious: 'Anxious', resistant: 'Resistant',
+});
+const LEVEL_LABEL = Object.freeze({ low: 'Low', medium: 'Medium', high: 'High' });
+const COMMITMENT_LABEL = Object.freeze({ low: 'Low', moderate: 'Moderate', high: 'High' });
+const COACHING_LABEL = Object.freeze({ strict: 'Strict', supportive: 'Supportive', balanced: 'Balanced' });
+const TRAINING_LEVEL_LABEL = Object.freeze({ beginner: 'Beginner', intermediate: 'Intermediate', advanced: 'Advanced' });
+
+/** A stored key list as human labels, dropping anything unrecognised. */
+function labelsFrom(value, map) {
+  if (!Array.isArray(value) || !value.length) return '';
+  return value.map((key) => map[key] || key).join(', ');
+}
 
 function describeInterview(interview) {
   const i = interview || {};
@@ -642,11 +716,19 @@ function describeInterview(interview) {
   };
 
   add('Previous training experience', i.previous_workout_experience, 40);
+  add('Training duration', TRAINING_DURATION_LABEL[i.training_duration] || i.training_duration, 40);
   add("Training history (the client's account)", i.training_history);
   add('Sport participation', SPORTS_LABEL[i.sports_participation] || i.sports_participation, 40);
-  add('Occupation', OCCUPATION_LABEL[i.occupation_type] || i.occupation_type, 60);
+  add('Sports played', labelsFrom(i.sports_played, SPORTS_PLAYED_LABEL));
+  add('Previous physical activities', labelsFrom(i.previous_activities, ACTIVITIES_LABEL));
+  add('Exercise preferences', labelsFrom(i.exercise_preferences, PREFERENCES_LABEL));
+  add('Occupation', text(i.occupation_title, 120) || OCCUPATION_LABEL[i.occupation_type] || i.occupation_type, 120);
+  add('Work type', WORK_TYPE_LABEL[i.work_type] || i.work_type, 60);
+  add('Working hours', HOURS_BAND_LABEL[i.work_hours_band] || i.work_hours_band, 40);
   add('Work details', i.job_details);
   add('Other occupation details', i.occupation_other_details, 500);
+  add('Sitting hours a day', i.lifestyle_sitting_hours, 10);
+  add('Daily activity', ACTIVITY_LABEL[i.daily_activity_level] || i.daily_activity_level, 40);
   if (Array.isArray(i.training_challenges) && i.training_challenges.length) {
     const labels = i.training_challenges.map((k) => CHALLENGE_LABEL[k] || k);
     clientLines.push(`- Training challenges: ${labels.join(', ')}`);
@@ -656,17 +738,29 @@ function describeInterview(interview) {
     clientLines.push(`- Days a week they can train: ${i.lifestyle_training_days}`);
   }
   add('Availability notes', i.availability, 1000);
-  add('Sitting hours a day', i.lifestyle_sitting_hours, 10);
   add('Meal regularity', i.lifestyle_meal_regularity, 20);
-  add('Motivation', i.motivation);
+  add('Fitness goals', labelsFrom(i.fitness_goals, GOAL_LABEL));
+  add('Motivation', labelsFrom(i.motivation_factors, MOTIVATION_LABEL));
+  add('Motivation notes', i.motivation);
   if (i.programme_readiness !== null && i.programme_readiness !== undefined) {
     clientLines.push(`- Programme readiness (1–10): ${i.programme_readiness}`);
   }
   add('Preferences', i.preferences, 1000);
   add("In the client's words", i.important_client_statements);
 
+  const trainerLines = [];
+  const addTrainer = (label, value, max = 120) => {
+    const v = text(value, max);
+    if (v) trainerLines.push(`- ${label}: ${v}`);
+  };
+  addTrainer('Client attitude', ATTITUDE_LABEL[i.client_attitude] || i.client_attitude);
+  addTrainer('Confidence', LEVEL_LABEL[i.confidence_level] || i.confidence_level);
+  addTrainer('Commitment', COMMITMENT_LABEL[i.commitment_level] || i.commitment_level);
+  addTrainer('Coaching preference', COACHING_LABEL[i.coaching_preference] || i.coaching_preference);
+  addTrainer('Initial training level', TRAINING_LEVEL_LABEL[i.initial_training_level] || i.initial_training_level);
+
   const trainerNote = text(i.notes);
-  if (!clientLines.length && !trainerNote) {
+  if (!clientLines.length && !trainerNote && !trainerLines.length) {
     return [
       'CLIENT INTERVIEW: NOT RECORDED',
       'No interview has been recorded for this client. Do not infer their history, work, barriers, or preferences; program conservatively and say which answer would change your choice.',
@@ -676,7 +770,8 @@ function describeInterview(interview) {
   const lines = ['CLIENT INTERVIEW — CLIENT-STATED (the client\'s own intake answers; not verified fact):'];
   lines.push(...(clientLines.length ? clientLines : ['- NOT RECORDED']));
   lines.push('', 'TRAINER\'S INTERVIEW NOTES (the trainer\'s observations, not the client\'s words):');
-  lines.push(trainerNote ? `- Summary: ${trainerNote}` : '- NOT RECORDED');
+  if (trainerNote) trainerLines.unshift(`- Summary: ${trainerNote}`);
+  lines.push(...(trainerLines.length ? trainerLines : ['- NOT RECORDED']));
   lines.push(
     '',
     'The interview is not medical clearance. The PAR-Q and any medical clearance record remain authoritative; where they disagree with the interview, follow the clearance.',
