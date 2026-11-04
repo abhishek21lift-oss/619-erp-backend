@@ -302,7 +302,8 @@ describe('getClientTrainingBrief', () => {
       .mockResolvedValueOnce({ rows: [{ goal_type: 'weight_loss' }] }) // goal
       .mockResolvedValueOnce({ rows: [{ plan_id: 'plan1', plan_name: 'Plan A' }] }) // assignment
       .mockResolvedValueOnce({ rows: [{ status: 'completed' }] }) // sessions
-      .mockResolvedValueOnce({ rows: [{ weight: 70 }] }); // assessment
+      .mockResolvedValueOnce({ rows: [{ weight: 70 }] }) // assessment
+      .mockResolvedValueOnce({ rows: [{ occupation_type: 'desk_job' }] }); // interview
 
     buildBrief.mockReturnValue({ client: { id: CLIENT_ID }, sections: {}, missing: [], stale: [] });
 
@@ -315,6 +316,7 @@ describe('getClientTrainingBrief', () => {
       posture: expect.any(Object),
       mobility: expect.any(Object),
       lifestyle: expect.any(Object),
+      interview: expect.objectContaining({ occupation_type: 'desk_job' }),
       goal: expect.any(Object),
       assignment: expect.any(Object),
       recentSessions: expect.any(Array),
