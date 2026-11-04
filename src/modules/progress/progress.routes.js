@@ -644,10 +644,22 @@ const futureDate = () => z.string().optional().nullable().refine(
   { message: 'Target date must be today or later' }
 );
 
+// Secondary goals ride on the primary goal record. They are deliberately not
+// extra pt_goals rows: one active goal per client is enforced by is_active and
+// deactivateOtherGoals(), and member self-service goals live in member_goals.
+const secondaryGoalSchema = z.object({
+  id: z.string().max(64).optional().nullable(),
+  title: z.string().min(1).max(200),
+  goal_type: z.enum(GOAL_TYPES).optional().nullable(),
+  description: text(1000),
+  target_date: futureDate(),
+});
+
 const goalFields = {
   goal_type: z.enum(GOAL_TYPES),
   goal_other: text(200),
   goal_description: text(2000),
+  secondary_goals: z.array(secondaryGoalSchema).max(8).optional().nullable(),
   target_weight: numIn(25, 300), target_body_fat: numIn(3, 60),
   target_date: futureDate(),
   priority_goal: text(50),
@@ -786,7 +798,7 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
        goal_difficulty, estimated_duration_weeks, recommended_pt_duration_months,
        estimated_weekly_rate_kg, safe_weekly_rate_kg, risk_factors,
        status, training_days_per_week, preferred_training_days, training_split, routine_blueprint, milestones, review_date, short_term_weeks, medium_term_weeks,
-       created_by, organization_id
+       created_by, organization_id, secondary_goals
      ) VALUES (
        $1,$2,$3,$4,$5,$6,$7,$8,
        $9,$10,$11,$12,$13,
@@ -795,7 +807,7 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
        $18,$19,$20,
        $21,$22,$23,
        $24,$25,$26::text[],$27,$28::jsonb,$29::jsonb,$30,$31,$32,
-       $33,$34
+       $33,$34,$35::jsonb
      ) RETURNING *`,
     [
       b.client_id, b.goal_type, b.goal_other || null, b.goal_description || null,
@@ -816,6 +828,7 @@ router.post('/goals', auth, validate(goalCreateSchema), wrap(async (req, res) =>
       b.short_term_weeks ?? 8,
       b.medium_term_weeks ?? 12,
       req.user.id, orgIdOf(req),
+      b.secondary_goals && b.secondary_goals.length ? JSON.stringify(b.secondary_goals) : null,
     ]
   );
   // Keep is_active in sync with status for backward compat.
@@ -836,7 +849,7 @@ router.patch('/goals/:id', auth, validate(goalUpdateSchema), wrap(async (req, re
     'motivation_reason', 'priority_goal', 'motivation_level', 'commitment_level', 'biggest_challenges',
     'lifestyle_readiness',
     'status', 'training_days_per_week', 'preferred_training_days', 'training_split', 'routine_blueprint',
-    'milestones', 'review_date', 'short_term_weeks', 'medium_term_weeks',
+    'milestones', 'review_date', 'short_term_weeks', 'medium_term_weeks', 'secondary_goals',
   ];
 
   const scope = tenantScope(req);
@@ -858,7 +871,7 @@ router.patch('/goals/:id', auth, validate(goalUpdateSchema), wrap(async (req, re
   for (const key of allowed) {
     if (req.body[key] !== undefined) {
       let val = req.body[key];
-      if ((key === 'lifestyle_readiness' || key === 'routine_blueprint' || key === 'milestones') && val != null) val = JSON.stringify(val);
+      if ((key === 'lifestyle_readiness' || key === 'routine_blueprint' || key === 'milestones' || key === 'secondary_goals') && val != null) val = JSON.stringify(val);
       params.push(val); sets.push(`${key} = $${params.length}`);
     }
   }
