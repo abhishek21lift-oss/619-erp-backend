@@ -51,6 +51,7 @@ router.get('/stats', async (req, res, next) => {
       SELECT
         COUNT(*) FILTER (WHERE status = 'active')        AS active,
         COALESCE(SUM(sent_count), 0)                     AS total_sent,
+        COALESCE(SUM(open_count), 0)                     AS total_opened,
         COALESCE(SUM(conversions), 0)                    AS conversions,
         CASE WHEN COALESCE(SUM(sent_count), 0) = 0 THEN 0
           ELSE ROUND(SUM(conversions)::NUMERIC / SUM(sent_count) * 100, 1)
