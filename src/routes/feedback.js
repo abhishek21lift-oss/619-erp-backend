@@ -59,6 +59,7 @@ router.get('/stats', async (req, res, next) => {
         COUNT(*) FILTER (WHERE status = 'resolved')     AS resolved,
         ROUND(AVG(rating)::NUMERIC, 1)                  AS avg_rating,
         COUNT(*) FILTER (WHERE rating >= 4)             AS positive,
+        COUNT(*) FILTER (WHERE rating = 3)              AS neutral,
         COUNT(*) FILTER (WHERE rating <= 2)             AS negative,
         CASE WHEN COUNT(rating) = 0 THEN 0
           ELSE ROUND(

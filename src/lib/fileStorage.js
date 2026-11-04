@@ -115,6 +115,7 @@ async function saveFileFromPath(category, filename, sourcePath, contentType, met
       // A temp dir on another filesystem cannot be renamed into uploads/.
       if (err.code !== 'EXDEV') throw err;
       await fs.promises.copyFile(sourcePath, dest);
+      await fs.promises.rm(sourcePath, { force: true });
     }
     bytes = (await fs.promises.stat(dest)).size;
   }
