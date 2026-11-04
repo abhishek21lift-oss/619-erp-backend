@@ -155,9 +155,9 @@ describe('structured interview answers are checked before the database', () => {
 
   it.each([1, 10, '7'])('accepts programme_readiness = %p', async (value) => {
     pool.query.mockResolvedValueOnce({ rowCount: 1 });
-    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1', programme_readiness: Number(value) }] });
-    const saved = await attempt({ programme_readiness: value });
-    expect(saved.programme_readiness).toBe(Number(value));
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1' }] });
+    await attempt({ programme_readiness: value });
+    expect(pool.query.mock.calls[1][1]).toEqual(expect.arrayContaining([Number(value)]));
   });
 
   it('completes on programme_readiness alone', async () => {

@@ -54,9 +54,9 @@ const CLIENT_SOURCES = [
 
 // Facts this endpoint used to write that belong to another module: Fitness
 // Testing owns the live body (pt_clients.weight/height are only its cache),
-// Goal owns the goal, PAR-Q owns medical conditions and injuries, Lifestyle
-// owns occupation. The columns remain readable as legacy fallbacks; writing
-// them here is a 422 naming the module that does own them.
+// Goal owns the goal, PAR-Q owns medical conditions and injuries, Client
+// Interview owns occupation. The columns remain readable as legacy fallbacks;
+// writing them here is a 422 naming the module that does own them.
 const MOVED_CLIENT_FIELDS = {
   goal: { owner: 'Goal', endpoint: 'POST/PATCH /api/progress/goals' },
   height: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
