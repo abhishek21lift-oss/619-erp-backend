@@ -614,6 +614,24 @@ const CHALLENGE_LABEL = Object.freeze({
   cost: 'cost',
   other: 'other',
 });
+const OCCUPATION_LABEL = Object.freeze({
+  desk_job: 'Desk job',
+  active_job: 'Active job',
+  physical_labor: 'Physical labor',
+  student: 'Student',
+  homemaker: 'Homemaker',
+  driver: 'Driver',
+  healthcare: 'Healthcare',
+  police: 'Police',
+  fitness_professional: 'Fitness professional',
+  retired: 'Retired',
+  other: 'Other',
+});
+const SPORTS_LABEL = Object.freeze({
+  never: 'Never',
+  previously: 'Previously',
+  currently: 'Currently',
+});
 
 function describeInterview(interview) {
   const i = interview || {};
@@ -625,6 +643,8 @@ function describeInterview(interview) {
 
   add('Previous training experience', i.previous_workout_experience, 40);
   add("Training history (the client's account)", i.training_history);
+  add('Sport participation', SPORTS_LABEL[i.sports_participation] || i.sports_participation, 40);
+  add('Occupation', OCCUPATION_LABEL[i.occupation_type] || i.occupation_type, 60);
   add('Work details', i.job_details);
   add('Other occupation details', i.occupation_other_details, 500);
   if (Array.isArray(i.training_challenges) && i.training_challenges.length) {
@@ -639,6 +659,9 @@ function describeInterview(interview) {
   add('Sitting hours a day', i.lifestyle_sitting_hours, 10);
   add('Meal regularity', i.lifestyle_meal_regularity, 20);
   add('Motivation', i.motivation);
+  if (i.programme_readiness !== null && i.programme_readiness !== undefined) {
+    clientLines.push(`- Programme readiness (1–10): ${i.programme_readiness}`);
+  }
   add('Preferences', i.preferences, 1000);
   add("In the client's words", i.important_client_statements);
 

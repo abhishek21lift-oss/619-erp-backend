@@ -266,7 +266,7 @@ function textFrom(value) {
  * Defaults to now, so no caller changes.
  */
 function buildBrief({
-  client, parq, assessment, posture, mobility, lifestyle, goal, assignment, recentSessions = [],
+  client, parq, assessment, posture, mobility, lifestyle, interview, goal, assignment, recentSessions = [],
   today = new Date(),
 }) {
   const sections = {};
@@ -383,7 +383,12 @@ function buildBrief({
     sleep_hours: num(lifestyle.sleep_duration_hours),
     sleep_quality: lifestyle.sleep_quality ?? null,
     stress_level: lifestyle.stress_level ?? null,
-    occupation_type: lifestyle.occupation_type ?? null,
+    mental_health_perception: lifestyle.mental_health_perception ?? null,
+    // An old row (or an older server) may have no array. Report "none
+    // recorded" as an empty list, never as a key the panel has to guess at.
+    stress_management_techniques: Array.isArray(lifestyle.stress_management_techniques)
+      ? lifestyle.stress_management_techniques : [],
+    occupation_type: interview?.occupation_type ?? lifestyle.occupation_type ?? null,
     activity_level: lifestyle.activity_level ?? null,
     daily_steps: lifestyle.daily_steps_bracket ?? null,
     energy_level: lifestyle.energy_level ?? null,

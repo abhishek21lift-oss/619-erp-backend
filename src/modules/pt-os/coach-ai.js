@@ -72,6 +72,12 @@ function buildFacts({ snapshot, brief, client }) {
     L.push('', 'LIFESTYLE ASSESSMENT:');
     L.push(`- Sleep ${s.lifestyle.sleep_hours ?? '?'} h, quality ${s.lifestyle.sleep_quality ?? '?'}`);
     L.push(`- Stress ${s.lifestyle.stress_level ?? '?'}, recovery ${s.lifestyle.recovery_quality ?? '?'}`);
+    if (s.lifestyle.mental_health_perception != null) {
+      L.push(`- Mental wellbeing ${s.lifestyle.mental_health_perception}/10`);
+    }
+    if (Array.isArray(s.lifestyle.stress_management_techniques) && s.lifestyle.stress_management_techniques.length) {
+      L.push(`- Stress management: ${s.lifestyle.stress_management_techniques.join(', ')}`);
+    }
   }
 
   if (s.limitations?.present) {
