@@ -74,8 +74,9 @@ describe('Lifestyle — interview occupation snapshot', () => {
     const res = await request(app).post('/api/progress/lifestyle-assessments')
       .send({ client_id: CLIENT, occupation_type: 'retired', daily_steps_bracket: '5000_8000' });
     expect(res.status).toBe(201);
-    expect(mockQueries.find((q) => /INSERT INTO pt_lifestyle_assessments/i.test(q.text)).params)
-      .toContain('desk_job');
+    const params = mockQueries.find((q) => /INSERT INTO pt_lifestyle_assessments/i.test(q.text)).params;
+    expect(params).toContain('desk_job');
+    expect(params).not.toContain('retired');
   });
 
   it('keeps the legacy value when there is no interview occupation', async () => {
