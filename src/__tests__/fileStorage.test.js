@@ -53,4 +53,18 @@ describe('saveFileFromPath (local disk)', () => {
       uploadedBy: 'usr-1',
     });
   });
+
+  it('still moves the temp file when uploads/ is on another filesystem (EXDEV)', async () => {
+    const rename = jest.spyOn(fs.promises, 'rename')
+      .mockRejectedValueOnce(Object.assign(new Error('cross-device'), { code: 'EXDEV' }));
+    try {
+      const url = await fileStorage.saveFileFromPath(category, 'exdev.mp4', source, 'video/mp4');
+
+      expect(url).toBe(`/uploads/${category}/exdev.mp4`);
+      expect(fs.existsSync(source)).toBe(false);
+      expect(fs.readFileSync(path.join(UPLOADS_ROOT, category, 'exdev.mp4'))).toEqual(body);
+    } finally {
+      rename.mockRestore();
+    }
+  });
 });
