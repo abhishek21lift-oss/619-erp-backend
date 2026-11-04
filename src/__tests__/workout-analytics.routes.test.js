@@ -109,6 +109,38 @@ describe('GET /workout-log/analytics', () => {
   });
 });
 
+describe('GET /workout-log/sessions', () => {
+  it('rejects a malformed range instead of passing it to a ::date cast', async () => {
+    for (const bad of ['nope', '2026-02-30', '2026-13-01']) {
+      const res = await request(app())
+        .get(`/api/pt-os/workout-log/sessions?client_id=c-1&from=${bad}`).expect(400);
+      expect(res.body.error.code).toBe('INVALID_DATE');
+    }
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it('rejects a backwards range', async () => {
+    const res = await request(app())
+      .get('/api/pt-os/workout-log/sessions?client_id=c-1&from=2026-02-01&to=2026-01-01')
+      .expect(400);
+    expect(res.body.error.code).toBe('INVALID_DATE_RANGE');
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it('applies inclusive bounds, measured volume and the 400-row cap', async () => {
+    await request(app())
+      .get('/api/pt-os/workout-log/sessions?client_id=c-1&from=2025-01-01&to=2025-12-31&limit=9999')
+      .expect(200);
+    const sql = find(/FROM workout_sessions ws/);
+    expect(sql).toMatch(/ws\.session_date >= \$3::date/);
+    expect(sql).toMatch(/ws\.session_date <= \$4::date/);
+    expect(sql).toMatch(/SUM\(s\.weight_kg \* s\.reps\)/);
+    expect(pool.query.mock.calls[0][1]).toEqual([
+      'c-1', ORG, '2025-01-01', '2025-12-31', 400, 0,
+    ]);
+  });
+});
+
 describe('landmarks', () => {
   it('prefers the studio row over the shared default', async () => {
     await request(app()).get('/api/pt-os/workout-log/landmarks').expect(200);

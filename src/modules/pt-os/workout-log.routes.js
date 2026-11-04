@@ -128,26 +128,56 @@ const setUpdateSchema = {
 
 // ─── Sessions ───────────────────────────────────────────────
 
-// GET /workout-log/sessions?client_id=&limit=&offset=
+// GET /workout-log/sessions?client_id=&limit=&offset=&from=&to=
+// from/to are inclusive ISO dates. The workout log's range filter asks for a
+// year at a time; the cap bounds the payload, and the UI states when it was
+// hit rather than pretending the range held exactly that many sessions.
 router.get('/workout-log/sessions', auth, wrap(async (req, res) => {
   const { client_id, limit, offset } = req.query;
   if (!client_id) return res.status(400).json({ error: { code: 'MISSING_CLIENT_ID' } });
-  const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 400);
   const off = Math.max(parseInt(offset, 10) || 0, 0);
+
+  const isoDate = (value) => {
+    if (value == null || value === '') return null;
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return undefined;
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value
+      ? value
+      : undefined;
+  };
+  const from = isoDate(req.query.from);
+  const to = isoDate(req.query.to);
+  if (from === undefined || to === undefined) {
+    return res.status(400).json({ error: { code: 'INVALID_DATE', message: 'from and to must be ISO dates' } });
+  }
+  if (from && to && from > to) {
+    return res.status(400).json({ error: { code: 'INVALID_DATE_RANGE', message: 'from must not be after to' } });
+  }
 
   const scope = tenantScope(req);
   const params = [client_id];
   let orgClause = '';
   params.push(scope.orgId); orgClause = ` AND ws.organization_id = $${params.length}`;
+  let rangeClause = '';
+  if (from) { params.push(from); rangeClause += ` AND ws.session_date >= $${params.length}::date`; }
+  if (to) { params.push(to); rangeClause += ` AND ws.session_date <= $${params.length}::date`; }
   params.push(lim, off);
   const { rows } = await pool.query(
     `SELECT ws.*,
             (SELECT COUNT(*) FROM workout_session_exercises wse WHERE wse.session_id = ws.id) AS exercise_count,
             (SELECT COUNT(*) FROM workout_sets s
                JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
-              WHERE wse.session_id = ws.id AND s.completed = true) AS completed_set_count
+              WHERE wse.session_id = ws.id AND s.completed = true) AS completed_set_count,
+            -- Volume for THIS session, so a date range's total is measured
+            -- from exactly the rows it returned rather than from volume-summary
+            -- buckets whose week may start before the range.
+            COALESCE((SELECT SUM(s.weight_kg * s.reps)
+                        FROM workout_sets s
+                        JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+                       WHERE wse.session_id = ws.id AND s.completed = true), 0) AS volume
        FROM workout_sessions ws
-      WHERE ws.client_id = $1${orgClause}
+      WHERE ws.client_id = $1${orgClause}${rangeClause}
       ORDER BY ws.session_date DESC, ws.created_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}`,
     params
@@ -628,9 +658,10 @@ router.get('/workout-log/today', auth, wrap(async (req, res) => {
           // a programme that ran past its end and nobody renewed.
           programme_week: r.programme_week != null ? Number(r.programme_week) : null,
           duration_weeks: r.duration_weeks != null ? Number(r.duration_weeks) : null,
-          // 'HH:MM', or null when nobody has said when. Only a booked slot or
-          // an enrolment preference carries one; a programme names a weekday,
-          // never an hour.
+          // 'HH:MM', or null when nobody has said when. A booked slot carries
+          // its own time; a programme day falls back to the client's saved
+          // preferred_workout_time, because the programme itself names a
+          // weekday and never an hour.
           start_time: r.start_time ? String(r.start_time).slice(0, 5) : null,
           source,
           // A rest day is a real answer, not a missing one: the client is here
