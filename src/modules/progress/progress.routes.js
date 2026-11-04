@@ -1185,6 +1185,16 @@ const LIFESTYLE_OCCUPATION_TYPES = [
   'driver', 'healthcare', 'police', 'fitness_professional', 'retired', 'other',
 ];
 
+async function latestInterviewOccupation(orgId, clientId) {
+  const { rows } = await pool.query(
+    `SELECT occupation_type FROM pt_client_interviews
+      WHERE client_id = $1 AND organization_id = $2 AND occupation_type IS NOT NULL
+      ORDER BY (status = 'completed') DESC, created_at DESC LIMIT 1`,
+    [clientId, orgId],
+  );
+  return rows[0]?.occupation_type || null;
+}
+
 const LIFESTYLE_STRESS_MANAGEMENT_TECHNIQUES = [
   'exercise', 'meditation', 'breathing', 'social_support', 'journaling',
   'therapy', 'hobbies', 'spirituality', 'medication', 'nature', 'none', 'other',
@@ -1383,7 +1393,11 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
   if (rejectMovedFields(req, res, 'POST /lifestyle-assessments', MOVED_LIFESTYLE_FIELDS)) return;
   const b = clearHabitCounts(req.body);
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-  const analysis = computeLifestyleAnalysis(await withNutritionHabits(b.client_id, b));
+  const interviewOccupation = await latestInterviewOccupation(orgIdOf(req), b.client_id);
+  const occupationType = interviewOccupation ?? b.occupation_type ?? null;
+  const analysis = computeLifestyleAnalysis(
+    await withNutritionHabits(b.client_id, { ...b, occupation_type: occupationType }),
+  );
 
   const { rows } = await withNumberLock(`lifestyle:${b.client_id}`, (tx) => tx.query(
     `INSERT INTO pt_lifestyle_assessments (
@@ -1418,7 +1432,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
       b.sleep_duration_hours ?? null, b.bed_time || null, b.wake_time || null, b.sleep_quality ?? null, analysis.sleepCategory, analysis.sleepScore,
       b.stress_level ?? null, analysis.stressScore,
       analysis.hydrationCategory, analysis.hydrationScore,
-      b.occupation_type || null, b.daily_steps_bracket || null, analysis.activityLevel, analysis.activityScore,
+      occupationType, b.daily_steps_bracket || null, analysis.activityLevel, analysis.activityScore,
       b.years_of_experience ?? null,
       analysis.nutritionScore,
       b.smoking_status || null, b.cigarettes_per_day ?? null, b.years_smoking ?? null, b.alcohol_status || null, b.drinks_per_week ?? null,
@@ -1436,7 +1450,7 @@ router.patch('/lifestyle-assessments/:id', auth, validate(lifestyleAssessmentUpd
   const allowed = [
     'assessment_date', 'sleep_duration_hours', 'bed_time', 'wake_time', 'sleep_quality', 'stress_level',
     'mental_health_perception', 'stress_management_techniques',
-    'occupation_type', 'daily_steps_bracket', 'years_of_experience',
+    'daily_steps_bracket', 'years_of_experience',
     'smoking_status', 'cigarettes_per_day', 'years_smoking', 'alcohol_status', 'drinks_per_week',
     'screen_time_bracket', 'travel_frequency', 'energy_level', 'recovery_quality', 'coach_notes',
   ];
@@ -1459,10 +1473,17 @@ router.patch('/lifestyle-assessments/:id', auth, validate(lifestyleAssessmentUpd
       params.push(val); sets.push(`${key} = $${params.length}`);
     }
   }
+  const interviewOccupation = await latestInterviewOccupation(orgIdOf(req), existing.client_id);
+  const occupationType = interviewOccupation
+    ?? (body.occupation_type !== undefined ? body.occupation_type : existing.occupation_type)
+    ?? null;
+  if (interviewOccupation != null || body.occupation_type !== undefined || sets.length > 0) {
+    params.push(occupationType); sets.push(`occupation_type = $${params.length}`);
+  }
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
 
   const merged = { ...existing, ...body };
-  const analysis = computeLifestyleAnalysis(await withNutritionHabits(existing.client_id, lifestyleAnalysisInput(merged)));
+  const analysis = computeLifestyleAnalysis(await withNutritionHabits(existing.client_id, { ...lifestyleAnalysisInput(merged), occupation_type: occupationType }));
 
   for (const [col, val] of Object.entries(lifestyleAnalysisColumns(analysis))) {
     params.push(val); sets.push(`${col} = $${params.length}`);
