@@ -1921,7 +1921,7 @@ router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
   // The shared loader owns the tenant gate and the canonical "latest"
   // ordering, so this route and the coach AI read the same rows.
   const sources = await loadClientSources(clientId, tenantScope(req).orgId, {
-    clinical: true, training: true, sessionDays: 28,
+    clinical: true, training: true, interview: true, sessionDays: 28,
   });
   if (!sources) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
@@ -1933,6 +1933,7 @@ router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
       posture: sources.posture,
       mobility: sources.mobility,
       lifestyle: sources.lifestyle,
+      interview: sources.interview,
       goal: sources.goal,
       assignment: sources.assignment,
       recentSessions: sources.sessions,
@@ -2047,7 +2048,7 @@ router.post('/clients/:id/coach', auth, aiLimiter, requireAiQuota(), wrap(async 
   // Same canonical rows as the training brief and the snapshot, so the coach
   // never argues with the card above it.
   const sources = await loadClientSources(clientId, tenantScope(req).orgId, {
-    client, clinical: true, snapshot: true,
+    client, clinical: true, snapshot: true, interview: true,
   });
   if (!sources) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
@@ -2063,6 +2064,7 @@ router.post('/clients/:id/coach', auth, aiLimiter, requireAiQuota(), wrap(async 
   const brief = buildBrief({
     client, parq: sources.parq, assessment: sources.latestAssessment,
     posture: sources.posture, mobility: sources.mobility, lifestyle: sources.lifestyle,
+    interview: sources.interview,
     goal: sources.goal, assignment: null, recentSessions: [],
   });
 

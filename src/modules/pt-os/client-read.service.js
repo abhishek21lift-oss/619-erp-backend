@@ -122,7 +122,7 @@ async function getClientSnapshot(orgId, clientId) {
 async function getClientTrainingBrief(orgId, clientId) {
   // The shared loader is the tenant gate too: no row, no child read.
   const sources = await loadClientSources(clientId, orgId, {
-    clinical: true, training: true, sessionDays: 28,
+    clinical: true, training: true, interview: true, sessionDays: 28,
   });
   if (!sources) return null;
 
@@ -133,6 +133,7 @@ async function getClientTrainingBrief(orgId, clientId) {
     posture: sources.posture,
     mobility: sources.mobility,
     lifestyle: sources.lifestyle,
+    interview: sources.interview,
     goal: sources.goal,
     assignment: sources.assignment,
     recentSessions: sources.sessions,

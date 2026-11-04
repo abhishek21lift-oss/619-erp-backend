@@ -169,6 +169,7 @@ async function loadDigitalTwin(clientId, orgId, {
   const loaded = sources || await loadClientSources(clientId, orgId, {
     clinical: true,
     training: true,
+    interview: true,
     sets: true,
     checkins: true,
     landmarks: true,
@@ -195,7 +196,7 @@ async function loadDigitalTwin(clientId, orgId, {
   });
 
   const brief = buildBrief({
-    client, parq, assessment, posture, mobility, lifestyle, goal, assignment,
+    client, parq, assessment, posture, mobility, lifestyle, interview: loaded.interview, goal, assignment,
     recentSessions,
   });
   const recovery = buildRecovery(checkins);

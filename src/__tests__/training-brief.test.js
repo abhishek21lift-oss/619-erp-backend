@@ -278,6 +278,27 @@ describe('training experience has one owner', () => {
   });
 });
 
+describe('the interview owns occupation', () => {
+  const lifestyle = { assessment_date: '2026-07-01', occupation_type: 'student' };
+
+  it('prefers the interview occupation and falls back to the lifestyle snapshot', () => {
+    const withInterview = buildBrief({
+      client: CLIENT,
+      lifestyle,
+      interview: { occupation_type: 'desk_job' },
+    });
+    expect(withInterview.sections.lifestyle.occupation_type).toBe('desk_job');
+
+    const withoutInterview = buildBrief({ client: CLIENT, lifestyle });
+    expect(withoutInterview.sections.lifestyle.occupation_type).toBe('student');
+  });
+
+  it('reports null when neither source has an occupation', () => {
+    const brief = buildBrief({ client: CLIENT, lifestyle: { assessment_date: '2026-07-01' } });
+    expect(brief.sections.lifestyle.occupation_type).toBeNull();
+  });
+});
+
 describe('ageFrom', () => {
   it('is null rather than NaN for a missing or unusable dob', () => {
     expect(ageFrom(null)).toBeNull();
