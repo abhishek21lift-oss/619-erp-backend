@@ -264,9 +264,11 @@ describe('the order is the clock', () => {
 
   it('puts timed rows before untimed ones', () => {
     // Nobody has said when an untimed row is, so it cannot be interleaved
-    // honestly with rows that have a real time.
-    expect(order).toContain('(r.start_time IS NULL)');
-    expect(order).toContain('r.start_time');
+    // honestly with rows that have a real time. The COALESCE carries the
+    // client's saved usual hour onto a programme day; only a row with
+    // neither a booking nor a saved hour is untimed.
+    expect(order).toContain('(COALESCE(r.start_time, ${ROSTER_PREFERRED_TIME}) IS NULL)');
+    expect(order).toContain('COALESCE(r.start_time, ${ROSTER_PREFERRED_TIME})');
   });
 
   it('sinks rest days to the bottom', () => {
@@ -282,29 +284,42 @@ describe('the order is the clock', () => {
     // Order of the ORDER BY terms is the whole behaviour: a rest day with no
     // time would otherwise land among the untimed programme rows instead of
     // at the end.
-    expect(order.indexOf('r.source_rank = 2')).toBeLessThan(order.indexOf('(r.start_time IS NULL)'));
+    expect(order.indexOf('r.source_rank = 2')).toBeLessThan(order.indexOf('(COALESCE(r.start_time, ${ROSTER_PREFERRED_TIME}) IS NULL)'));
   });
 });
 
 describe('the enrolment time is parsed, not string-sorted', () => {
+  const parser = SRC.slice(SRC.indexOf('function preferredWorkoutTime'));
   it('handles both formats the enrolment form writes', () => {
     // The dropdown writes '6:00 AM'; the custom field is an
     // <input type="time"> and writes '06:00'. As strings '1:00 PM' sorts
     // before '5:00 AM', which would put the afternoon slot first.
-    expect(SRC).toContain("to_timestamp(trim(c2.preferred_workout_time), 'HH12:MI AM')::time");
-    expect(SRC).toContain('c2.preferred_workout_time::time');
+    expect(parser).toContain("to_timestamp(trim(${alias}.preferred_workout_time), 'HH12:MI AM')::time");
+    expect(parser).toContain('${alias}.preferred_workout_time::time');
   });
 
   it('yields NULL for anything else', () => {
     // Somebody typing "Morning" must sort last, not reorder their neighbours.
-    const parse = SRC.slice(SRC.indexOf('const PREFERRED_TIME'));
-    expect(parse.slice(0, 700)).toContain('ELSE NULL');
+    expect(parser.slice(0, 700)).toContain('ELSE NULL');
   });
 
   it('keeps the other two sources on the same type', () => {
     // A text column mixed into a union with TIME ones would compare as text
     // again and undo the parsing.
     expect(rosterQuery()).toContain('NULL::time');
+  });
+
+  it('parses the outer client row too, so a programme day has a time', () => {
+    // The programme arm carries no hour, so a programmed client had none on
+    // Today's Session even when their saved preferred_workout_time said when
+    // they arrive. The outer fallback carries it through; a booked time still
+    // wins because COALESCE only fills a NULL.
+    expect(SRC).toContain("preferredWorkoutTime('c2')");
+    expect(SRC).toContain("preferredWorkoutTime('c')");
+    const q = rosterQuery();
+    expect(q).toContain('COALESCE(r.start_time, ${ROSTER_PREFERRED_TIME}) AS start_time');
+    const order = q.slice(q.indexOf('ORDER BY'));
+    expect(order).toContain('COALESCE(r.start_time, ${ROSTER_PREFERRED_TIME})');
   });
 });
 

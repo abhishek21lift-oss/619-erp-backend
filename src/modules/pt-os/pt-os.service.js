@@ -416,6 +416,28 @@ async function expireEndedTerms({ today = studioToday() } = {}) {
  *
  * Returns { date, dow, dayToken, rows }. Callers shape their own response.
  */
+/**
+ * Parse pt_clients.preferred_workout_time in whichever format the enrolment
+ * form wrote it. `alias` is the pt_clients alias in the calling query.
+ *
+ * The dropdown writes '6:00 AM' while its custom field is an <input
+ * type="time"> that writes '06:00'. As strings, '1:00 PM' < '5:00 AM' — the
+ * afternoon slot sorts before the dawn one — and slicing five characters off
+ * '5:00 AM' yields '5:00 '. Anything matching neither shape — including an
+ * out-of-range hour or minute — becomes NULL so it sorts last rather than
+ * corrupting the order of the rows around it or failing the whole read.
+ */
+function preferredWorkoutTime(alias) {
+  return `
+    CASE
+      WHEN ${alias}.preferred_workout_time ~* '^(0?[1-9]|1[0-2]):[0-5][0-9]\\s*(AM|PM)$'
+        THEN to_timestamp(trim(${alias}.preferred_workout_time), 'HH12:MI AM')::time
+      WHEN ${alias}.preferred_workout_time ~ '^([01]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$'
+        THEN ${alias}.preferred_workout_time::time
+      ELSE NULL
+    END`;
+}
+
 async function getTodayRoster({ date, scope = {} } = {}) {
   const d = (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) ? date : studioToday();
   // ISO weekday: Postgres ISODOW gives Monday=1, matching
@@ -435,22 +457,13 @@ async function getTodayRoster({ date, scope = {} } = {}) {
   // against a local one.
   params.push(scope.orgId);
 
-  // pt_clients.preferred_workout_time is free text holding TWO formats, and
-  // sorting it as text is nonsense: the enrolment form's dropdown writes
-  // '6:00 AM' while its custom field is an <input type="time"> that writes
-  // '06:00'. As strings, '1:00 PM' < '5:00 AM' — the afternoon slot sorts
-  // before the dawn one — and slicing five characters off '5:00 AM' yields
-  // '5:00 '. Both are parsed to a real TIME here, and anything that matches
-  // neither shape becomes NULL so it sorts last rather than corrupting the
-  // order of the rows around it.
-  const PREFERRED_TIME = `
-    CASE
-      WHEN c2.preferred_workout_time ~* '^[0-9]{1,2}:[0-9]{2}\\s*(AM|PM)$'
-        THEN to_timestamp(trim(c2.preferred_workout_time), 'HH12:MI AM')::time
-      WHEN c2.preferred_workout_time ~ '^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$'
-        THEN c2.preferred_workout_time::time
-      ELSE NULL
-    END`;
+  // The same parser, now for the outer client row. The programme arm names a
+  // weekday and carries no hour, so a programmed client fell out of clock order
+  // and "Today's Session" had no time to show even when the client's saved
+  // preferred_workout_time said exactly when they arrive. Booked time still
+  // wins; the saved preference is only a fallback.
+  const PREFERRED_TIME = preferredWorkoutTime('c2');
+  const ROSTER_PREFERRED_TIME = preferredWorkoutTime('c');
 
   const { rows } = await pool.query(
     `WITH candidates AS (
@@ -538,7 +551,7 @@ async function getTodayRoster({ date, scope = {} } = {}) {
         GROUP BY client_id
      )
      SELECT r.client_id,
-            r.start_time,
+            COALESCE(r.start_time, ${ROSTER_PREFERRED_TIME}) AS start_time,
             r.source_rank,
             c.name               AS client_name,
             -- Carried so the AI Coach card can MESSAGE an unbooked client
@@ -639,8 +652,8 @@ async function getTodayRoster({ date, scope = {} } = {}) {
            SELECT 1 FROM workout_exercises we
             WHERE we.workout_plan_id = wp.id AND we.day_of_week = $2
               AND we.week_number = plan_effective_week(wp.id, wa.start_date, $1::date, $2))),
-        (r.start_time IS NULL),
-        r.start_time,
+        (COALESCE(r.start_time, ${ROSTER_PREFERRED_TIME}) IS NULL),
+        COALESCE(r.start_time, ${ROSTER_PREFERRED_TIME}),
         c.name`,
     params
   );
@@ -741,6 +754,10 @@ async function getOpsSummary(scope = {}) {
       plan_id: r.plan_id,
       plan_name: r.plan_name,
       planned_exercises: Number(r.planned_exercises),
+      // The saved usual training time, so the coach card can say when this
+      // client arrives instead of claiming there is no calendar slot. Null
+      // means none was ever set, which is a different answer.
+      start_time: r.start_time ? String(r.start_time).slice(0, 5) : null,
     }))
     .sort((a, b) => String(a.client_name || '').localeCompare(String(b.client_name || '')))
     .slice(0, 25);

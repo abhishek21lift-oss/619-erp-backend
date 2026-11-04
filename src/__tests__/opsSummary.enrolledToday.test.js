@@ -205,15 +205,25 @@ describe('the programme panel is derived, not a second query', () => {
     // column away, and the claim is now checkable rather than assumed.
     expect(SRC).toMatch(/c\.mobile\s+AS client_mobile/);
     const block = SRC.slice(SRC.indexOf('const today_unscheduled = roster.rows'));
-    expect(block.slice(0, 800)).toContain('client_mobile: r.client_mobile');
+    expect(block.slice(0, 1000)).toContain('client_mobile: r.client_mobile');
+  });
+
+  it('carries the saved usual time, so the coach card stops claiming no slot', () => {
+    // The card's unbooked insight said "no slot on the calendar" for every
+    // programmed client. Their saved preferred_workout_time was already on the
+    // row; the panel simply did not publish it. Null is a real answer too —
+    // no time was ever set — so the field is mapped, not defaulted.
+    const block = SRC.slice(SRC.indexOf('const today_unscheduled = roster.rows'));
+    expect(block.slice(0, 1000)).toContain('start_time: r.start_time');
+    expect(block.slice(0, 1000)).toContain('slice(0, 5)');
   });
 
   it('still sorts by name and caps the list', () => {
     // The roster is in clock order; this panel reads in name order and shows
     // at most 25, as it always did.
     const block = SRC.slice(SRC.indexOf('const today_unscheduled = roster.rows'));
-    expect(block.slice(0, 800)).toMatch(/localeCompare/);
-    expect(block.slice(0, 800)).toMatch(/\.slice\(0, 25\)/);
+    expect(block.slice(0, 1000)).toMatch(/localeCompare/);
+    expect(block.slice(0, 1000)).toMatch(/\.slice\(0, 25\)/);
   });
 });
 
