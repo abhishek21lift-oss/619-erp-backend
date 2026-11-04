@@ -64,7 +64,7 @@ const MOVED_CLIENT_FIELDS = {
   body_fat: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
   health_conditions: { owner: 'PAR-Q', endpoint: 'POST/PATCH /api/pt-os/parq/forms' },
   injuries: { owner: 'PAR-Q', endpoint: 'POST/PATCH /api/pt-os/parq/forms' },
-  occupation: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  occupation: { owner: 'Client Interview', endpoint: 'POST /api/pt-os/clients/:id/interviews' },
 };
 
 const ptClientCreateSchema = {

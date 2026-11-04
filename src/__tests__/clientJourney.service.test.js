@@ -114,6 +114,12 @@ describe('structured interview answers are checked before the database', () => {
     ['training_challenges', 'time'],
     ['training_challenges', ['time', 'sleeping']],
     ['training_challenges', [1]],
+    ['occupation_type', 'astronaut'],
+    ['sports_participation', 'sometimes'],
+    ['programme_readiness', 0],
+    ['programme_readiness', 11],
+    ['programme_readiness', 7.5],
+    ['programme_readiness', 'very ready'],
   ])('rejects %s = %p with a 400 instead of a database error', async (key, value) => {
     const err = await attempt({ [key]: value }).catch((e) => e);
     expect(err).toBeInstanceOf(InterviewInputError);
@@ -133,6 +139,32 @@ describe('structured interview answers are checked before the database', () => {
     await attempt({ training_challenges: [] });
     // Empty list is "not answered", not an empty-array fact.
     expect(pool.query.mock.calls[1][1].at(-1)).toBeNull();
+  });
+
+  it('stores the interview occupation, sport history and programme readiness', async () => {
+    pool.query.mockResolvedValueOnce({ rowCount: 1 });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1' }] });
+    await attempt({
+      occupation_type: 'desk_job',
+      sports_participation: 'previously',
+      programme_readiness: '8',
+    });
+    const params = pool.query.mock.calls[1][1];
+    expect(params).toEqual(expect.arrayContaining(['desk_job', 'previously', 8]));
+  });
+
+  it.each([1, 10, '7'])('accepts programme_readiness = %p', async (value) => {
+    pool.query.mockResolvedValueOnce({ rowCount: 1 });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1', programme_readiness: Number(value) }] });
+    const saved = await attempt({ programme_readiness: value });
+    expect(saved.programme_readiness).toBe(Number(value));
+  });
+
+  it('completes on programme_readiness alone', async () => {
+    pool.query.mockResolvedValueOnce({ rowCount: 1 });
+    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1', status: 'completed' }] });
+    const saved = await attempt({ status: 'completed', programme_readiness: 8 });
+    expect(saved.status).toBe('completed');
   });
 
   it('completes on a challenge list alone, but still refuses an empty interview', async () => {

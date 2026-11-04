@@ -23,9 +23,11 @@ const INTERVIEW_FIELDS = Object.freeze([
   'training_history', 'pain_and_injuries', 'lifestyle', 'motivation',
   'availability', 'preferences', 'notes',
   // The Interview owns the quick screen: sitting hours, meal regularity and
-  // training days. Sleep, smoking, alcohol, occupation and screen time belong
-  // to the Lifestyle assessment and are no longer writable here.
+  // training days. Sleep, smoking, alcohol and screen time belong to the
+  // Lifestyle assessment and are no longer writable here; occupation is asked
+  // here as occupation_type instead.
   'lifestyle_sitting_hours', 'lifestyle_meal_regularity', 'lifestyle_training_days',
+  'occupation_type', 'sports_participation', 'programme_readiness',
   // Migration 254 — the redesigned interview's own fields.
   'job_details', 'occupation_other_details', 'previous_workout_experience',
   'training_challenges', 'challenge_other', 'important_client_statements',
@@ -43,11 +45,20 @@ const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifesty
 // Structured answers are enums or bounded numbers, and the database's CHECK
 // constraints reject a bad one — but as a 23514, which surfaced as a 500. The
 // values are checked here first, so a bad answer is a 400 with a field name.
+const OCCUPATION_TYPES = Object.freeze([
+  'desk_job', 'active_job', 'physical_labor', 'student', 'homemaker',
+  'driver', 'healthcare', 'police', 'fitness_professional', 'retired', 'other',
+]);
+const SPORTS_PARTICIPATION = Object.freeze(['never', 'previously', 'currently']);
+
 const STRUCTURED = Object.freeze({
   lifestyle_sitting_hours: { min: 0, max: 24 },
   lifestyle_meal_regularity: { oneOf: ['regular', 'irregular', 'inconsistent'] },
   lifestyle_training_days: { min: 0, max: 7, integer: true },
   previous_workout_experience: { oneOf: ['never', 'beginner', 'intermediate', 'advanced'] },
+  occupation_type: { oneOf: OCCUPATION_TYPES },
+  sports_participation: { oneOf: SPORTS_PARTICIPATION },
+  programme_readiness: { min: 1, max: 10, integer: true },
 });
 
 // Multi-select answers: a list of canonical keys, not free text. The database
