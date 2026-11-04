@@ -255,48 +255,6 @@ describe('training experience has one owner', () => {
     const brief = buildBrief({ client: CLIENT, lifestyle });
     expect(brief.sections.lifestyle.experience_level).toBeNull();
   });
-
-  it('carries the mental-health and stress-management answers', () => {
-    const brief = buildBrief({
-      client: CLIENT,
-      lifestyle: {
-        ...lifestyle,
-        mental_health_perception: 7,
-        stress_management_techniques: ['exercise', 'therapy'],
-      },
-    });
-
-    expect(brief.sections.lifestyle.mental_health_perception).toBe(7);
-    expect(brief.sections.lifestyle.stress_management_techniques).toEqual(['exercise', 'therapy']);
-  });
-
-  it('reports no techniques rather than a missing key when the row has none', () => {
-    const brief = buildBrief({ client: CLIENT, lifestyle });
-
-    expect(brief.sections.lifestyle.mental_health_perception).toBeNull();
-    expect(brief.sections.lifestyle.stress_management_techniques).toEqual([]);
-  });
-});
-
-describe('the interview owns occupation', () => {
-  const lifestyle = { assessment_date: '2026-07-01', occupation_type: 'student' };
-
-  it('prefers the interview occupation and falls back to the lifestyle snapshot', () => {
-    const withInterview = buildBrief({
-      client: CLIENT,
-      lifestyle,
-      interview: { occupation_type: 'desk_job' },
-    });
-    expect(withInterview.sections.lifestyle.occupation_type).toBe('desk_job');
-
-    const withoutInterview = buildBrief({ client: CLIENT, lifestyle });
-    expect(withoutInterview.sections.lifestyle.occupation_type).toBe('student');
-  });
-
-  it('reports null when neither source has an occupation', () => {
-    const brief = buildBrief({ client: CLIENT, lifestyle: { assessment_date: '2026-07-01' } });
-    expect(brief.sections.lifestyle.occupation_type).toBeNull();
-  });
 });
 
 describe('ageFrom', () => {

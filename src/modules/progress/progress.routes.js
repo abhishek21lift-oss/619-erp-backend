@@ -1185,30 +1185,6 @@ const LIFESTYLE_OCCUPATION_TYPES = [
   'driver', 'healthcare', 'police', 'fitness_professional', 'retired', 'other',
 ];
 
-async function latestInterviewOccupation(orgId, clientId) {
-  const { rows } = await pool.query(
-    `SELECT occupation_type FROM pt_client_interviews
-      WHERE client_id = $1 AND organization_id = $2 AND occupation_type IS NOT NULL
-      ORDER BY (status = 'completed') DESC, created_at DESC LIMIT 1`,
-    [clientId, orgId],
-  );
-  return rows[0]?.occupation_type || null;
-}
-
-const LIFESTYLE_STRESS_MANAGEMENT_TECHNIQUES = [
-  'exercise', 'meditation', 'breathing', 'social_support', 'journaling',
-  'therapy', 'hobbies', 'spirituality', 'medication', 'nature', 'none', 'other',
-];
-
-// `none` is an answer, not a technique: it cannot stand beside another key.
-// The UI clears the others when it is picked; this is the API's half.
-const stressManagementTechniques = z.array(z.enum(LIFESTYLE_STRESS_MANAGEMENT_TECHNIQUES))
-  .max(12)
-  .refine((v) => !(v.includes('none') && v.length > 1), {
-    message: "Selecting 'none' excludes every other technique",
-  })
-  .optional().nullable();
-
 const lifestyleAssessmentCreateSchema = {
   body: z.object({
     client_id: z.string(),
@@ -1218,8 +1194,6 @@ const lifestyleAssessmentCreateSchema = {
     sleep_quality: intIn(1, 10),
 
     stress_level: intIn(1, 10),
-    mental_health_perception: intIn(1, 10),
-    stress_management_techniques: stressManagementTechniques,
 
     water_intake_liters: numIn(0, 10),
 
@@ -1393,11 +1367,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
   if (rejectMovedFields(req, res, 'POST /lifestyle-assessments', MOVED_LIFESTYLE_FIELDS)) return;
   const b = clearHabitCounts(req.body);
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
-  const interviewOccupation = await latestInterviewOccupation(orgIdOf(req), b.client_id);
-  const occupationType = interviewOccupation ?? b.occupation_type ?? null;
-  const analysis = computeLifestyleAnalysis(
-    await withNutritionHabits(b.client_id, { ...b, occupation_type: occupationType }),
-  );
+  const analysis = computeLifestyleAnalysis(await withNutritionHabits(b.client_id, b));
 
   const { rows } = await withNumberLock(`lifestyle:${b.client_id}`, (tx) => tx.query(
     `INSERT INTO pt_lifestyle_assessments (
@@ -1411,8 +1381,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
        smoking_status, cigarettes_per_day, years_smoking, alcohol_status, drinks_per_week,
        screen_time_bracket, travel_frequency, energy_level, recovery_quality, recovery_score,
        sedentary_risk, recovery_risk, habit_risk_score, risk_factors, lifestyle_score, lifestyle_readiness,
-       coach_notes, created_by, organization_id,
-       mental_health_perception, stress_management_techniques
+       coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_lifestyle_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,$7,$8,
@@ -1424,22 +1393,20 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
        $19,$20,$21,$22,$23,
        $24,$25,$26,$27,$28,
        $29,$30,$31,$32,$33,$34,
-       $35::jsonb,$36,$37,
-       $38,$39
+       $35::jsonb,$36,$37
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || studioToday(),
       b.sleep_duration_hours ?? null, b.bed_time || null, b.wake_time || null, b.sleep_quality ?? null, analysis.sleepCategory, analysis.sleepScore,
       b.stress_level ?? null, analysis.stressScore,
       analysis.hydrationCategory, analysis.hydrationScore,
-      occupationType, b.daily_steps_bracket || null, analysis.activityLevel, analysis.activityScore,
+      b.occupation_type || null, b.daily_steps_bracket || null, analysis.activityLevel, analysis.activityScore,
       b.years_of_experience ?? null,
       analysis.nutritionScore,
       b.smoking_status || null, b.cigarettes_per_day ?? null, b.years_smoking ?? null, b.alcohol_status || null, b.drinks_per_week ?? null,
       b.screen_time_bracket || null, b.travel_frequency || null, b.energy_level ?? null, b.recovery_quality || null, analysis.recoveryScore,
       analysis.sedentaryRisk, analysis.recoveryRisk, analysis.habitRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.lifestyleScore, analysis.lifestyleReadiness,
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
-      b.mental_health_perception ?? null, b.stress_management_techniques ?? null,
     ]
   ));
   res.status(201).json({ data: rows[0] });
@@ -1449,8 +1416,7 @@ router.patch('/lifestyle-assessments/:id', auth, validate(lifestyleAssessmentUpd
   if (rejectMovedFields(req, res, 'PATCH /lifestyle-assessments/:id', MOVED_LIFESTYLE_FIELDS)) return;
   const allowed = [
     'assessment_date', 'sleep_duration_hours', 'bed_time', 'wake_time', 'sleep_quality', 'stress_level',
-    'mental_health_perception', 'stress_management_techniques',
-    'daily_steps_bracket', 'years_of_experience',
+    'occupation_type', 'daily_steps_bracket', 'years_of_experience',
     'smoking_status', 'cigarettes_per_day', 'years_smoking', 'alcohol_status', 'drinks_per_week',
     'screen_time_bracket', 'travel_frequency', 'energy_level', 'recovery_quality', 'coach_notes',
   ];
@@ -1473,17 +1439,10 @@ router.patch('/lifestyle-assessments/:id', auth, validate(lifestyleAssessmentUpd
       params.push(val); sets.push(`${key} = $${params.length}`);
     }
   }
-  const interviewOccupation = await latestInterviewOccupation(orgIdOf(req), existing.client_id);
-  const occupationType = interviewOccupation
-    ?? (body.occupation_type !== undefined ? body.occupation_type : existing.occupation_type)
-    ?? null;
-  if (interviewOccupation != null || body.occupation_type !== undefined || sets.length > 0) {
-    params.push(occupationType); sets.push(`occupation_type = $${params.length}`);
-  }
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
 
   const merged = { ...existing, ...body };
-  const analysis = computeLifestyleAnalysis(await withNutritionHabits(existing.client_id, { ...lifestyleAnalysisInput(merged), occupation_type: occupationType }));
+  const analysis = computeLifestyleAnalysis(await withNutritionHabits(existing.client_id, lifestyleAnalysisInput(merged)));
 
   for (const [col, val] of Object.entries(lifestyleAnalysisColumns(analysis))) {
     params.push(val); sets.push(`${col} = $${params.length}`);

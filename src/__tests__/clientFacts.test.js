@@ -424,9 +424,6 @@ describe('the client interview, as the model reads it', () => {
       challenge_other: null,
       lifestyle_training_days: 3,
       motivation: 'Keep up with my kids.',
-      occupation_type: 'desk_job',
-      sports_participation: 'previously',
-      programme_readiness: 8,
       important_client_statements: 'I have never stuck with a gym.',
       notes: 'Very motivated; start with two short sessions.',
     });
@@ -434,9 +431,6 @@ describe('the client interview, as the model reads it', () => {
     expect(text).toContain('Previous training experience: beginner');
     expect(text).toContain('Training challenges: time, work schedule');
     expect(text).toContain('Days a week they can train: 3');
-    expect(text).toContain('Occupation: Desk job');
-    expect(text).toContain('Sport participation: Previously');
-    expect(text).toContain('Programme readiness (1–10): 8');
     expect(text).toContain('In the client\'s words: I have never stuck with a gym.');
     // The trainer's judgement is under its own heading, not in the client block.
     const trainerBlock = text.slice(text.indexOf('TRAINER\'S INTERVIEW NOTES'));
@@ -453,7 +447,5 @@ describe('the client interview, as the model reads it', () => {
   test('an empty challenge list is not printed as an answer', () => {
     const text = describeInterview({ training_challenges: [] });
     expect(text).not.toContain('Training challenges:');
-    expect(text).not.toContain('Occupation:');
-    expect(text).not.toContain('Programme readiness');
   });
 });

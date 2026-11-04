@@ -81,32 +81,6 @@ describe('buildFacts — the prompt carries the gaps, not just the readings', ()
     expect(() => buildFacts({ snapshot: null, brief: null, client: null })).not.toThrow();
     expect(buildFacts({ snapshot: null, brief: null, client: null })).toContain('NOT MEASURED');
   });
-
-  it('prints the mental-health and stress-management answers when present', () => {
-    const f = buildFacts({
-      snapshot: SNAPSHOT,
-      brief: {
-        ...BRIEF,
-        sections: {
-          ...BRIEF.sections,
-          lifestyle: {
-            ...BRIEF.sections.lifestyle,
-            mental_health_perception: 7,
-            stress_management_techniques: ['exercise', 'therapy'],
-          },
-        },
-      },
-      client: CLIENT,
-    });
-
-    expect(f).toContain('Mental wellbeing 7/10');
-    expect(f).toContain('Stress management: exercise, therapy');
-  });
-
-  it('does not invent either line when the answers are absent', () => {
-    expect(facts).not.toContain('Mental wellbeing');
-    expect(facts).not.toContain('Stress management');
-  });
 });
 
 describe('SYSTEM_PROMPT — the rules that matter are stated', () => {

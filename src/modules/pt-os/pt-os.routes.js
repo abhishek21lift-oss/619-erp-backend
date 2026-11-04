@@ -54,9 +54,9 @@ const CLIENT_SOURCES = [
 
 // Facts this endpoint used to write that belong to another module: Fitness
 // Testing owns the live body (pt_clients.weight/height are only its cache),
-// Goal owns the goal, PAR-Q owns medical conditions and injuries, Client
-// Interview owns occupation. The columns remain readable as legacy fallbacks;
-// writing them here is a 422 naming the module that does own them.
+// Goal owns the goal, PAR-Q owns medical conditions and injuries, Lifestyle
+// owns occupation. The columns remain readable as legacy fallbacks; writing
+// them here is a 422 naming the module that does own them.
 const MOVED_CLIENT_FIELDS = {
   goal: { owner: 'Goal', endpoint: 'POST/PATCH /api/progress/goals' },
   height: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
@@ -64,7 +64,7 @@ const MOVED_CLIENT_FIELDS = {
   body_fat: { owner: 'Fitness Testing', endpoint: 'POST/PATCH /api/progress/assessments' },
   health_conditions: { owner: 'PAR-Q', endpoint: 'POST/PATCH /api/pt-os/parq/forms' },
   injuries: { owner: 'PAR-Q', endpoint: 'POST/PATCH /api/pt-os/parq/forms' },
-  occupation: { owner: 'Client Interview', endpoint: 'POST /api/pt-os/clients/:id/interviews' },
+  occupation: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
 };
 
 const ptClientCreateSchema = {
@@ -1921,7 +1921,7 @@ router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
   // The shared loader owns the tenant gate and the canonical "latest"
   // ordering, so this route and the coach AI read the same rows.
   const sources = await loadClientSources(clientId, tenantScope(req).orgId, {
-    clinical: true, training: true, interview: true, sessionDays: 28,
+    clinical: true, training: true, sessionDays: 28,
   });
   if (!sources) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
@@ -1933,7 +1933,6 @@ router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
       posture: sources.posture,
       mobility: sources.mobility,
       lifestyle: sources.lifestyle,
-      interview: sources.interview,
       goal: sources.goal,
       assignment: sources.assignment,
       recentSessions: sources.sessions,
@@ -2048,7 +2047,7 @@ router.post('/clients/:id/coach', auth, aiLimiter, requireAiQuota(), wrap(async 
   // Same canonical rows as the training brief and the snapshot, so the coach
   // never argues with the card above it.
   const sources = await loadClientSources(clientId, tenantScope(req).orgId, {
-    client, clinical: true, snapshot: true, interview: true,
+    client, clinical: true, snapshot: true,
   });
   if (!sources) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
 
@@ -2064,7 +2063,6 @@ router.post('/clients/:id/coach', auth, aiLimiter, requireAiQuota(), wrap(async 
   const brief = buildBrief({
     client, parq: sources.parq, assessment: sources.latestAssessment,
     posture: sources.posture, mobility: sources.mobility, lifestyle: sources.lifestyle,
-    interview: sources.interview,
     goal: sources.goal, assignment: null, recentSessions: [],
   });
 
