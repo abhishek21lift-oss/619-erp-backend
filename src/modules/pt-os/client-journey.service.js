@@ -31,13 +31,6 @@ const INTERVIEW_FIELDS = Object.freeze([
   // Migration 254 — the redesigned interview's own fields.
   'job_details', 'occupation_other_details', 'previous_workout_experience',
   'training_challenges', 'challenge_other', 'important_client_statements',
-  // Migration 264 — selection-based answers. The older free-text columns
-  // above stay writable so historical answers can still be corrected.
-  'occupation_title', 'work_type', 'work_hours_band', 'daily_activity_level',
-  'training_duration', 'sports_played', 'previous_activities',
-  'exercise_preferences', 'fitness_goals', 'motivation_factors',
-  'client_attitude', 'confidence_level', 'commitment_level',
-  'coaching_preference', 'initial_training_level',
 ]);
 // Read-only legacy answers. A draft written before the move may hold only
 // these, and completing it must not be refused because its answers are in a
@@ -47,7 +40,7 @@ const LEGACY_INTERVIEW_FIELDS = Object.freeze([
   'lifestyle_smoking', 'lifestyle_alcohol',
 ]);
 const INTERVIEW_READ_FIELDS = Object.freeze([...INTERVIEW_FIELDS, ...LEGACY_INTERVIEW_FIELDS]);
-const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifestyle_meal_regularity: 20, occupation_other_details: 500, challenge_other: 500, occupation_title: 120 });
+const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifestyle_meal_regularity: 20, occupation_other_details: 500, challenge_other: 500 });
 
 // Structured answers are enums or bounded numbers, and the database's CHECK
 // constraints reject a bad one — but as a 23514, which surfaced as a 500. The
@@ -58,16 +51,6 @@ const OCCUPATION_TYPES = Object.freeze([
 ]);
 const SPORTS_PARTICIPATION = Object.freeze(['never', 'previously', 'currently']);
 
-const WORK_TYPES = Object.freeze(['desk', 'on_feet', 'physical', 'mixed', 'shifts', 'field', 'other']);
-const WORK_HOURS_BANDS = Object.freeze(['under_4', '4_6', '6_8', '8_10', '10_plus', 'varies']);
-const ACTIVITY_LEVELS = Object.freeze(['mostly_seated', 'light', 'moderately_active', 'very_active']);
-const TRAINING_DURATIONS = Object.freeze(['none', 'under_3_months', '3_6_months', '6_12_months', '1_2_years', '2_plus_years']);
-const CLIENT_ATTITUDES = Object.freeze(['motivated', 'neutral', 'anxious', 'resistant']);
-const LEVELS = Object.freeze(['low', 'medium', 'high']);
-const COMMITMENT_LEVELS = Object.freeze(['low', 'moderate', 'high']);
-const COACHING_PREFERENCES = Object.freeze(['strict', 'supportive', 'balanced']);
-const TRAINING_LEVELS = Object.freeze(['beginner', 'intermediate', 'advanced']);
-
 const STRUCTURED = Object.freeze({
   lifestyle_sitting_hours: { min: 0, max: 24 },
   lifestyle_meal_regularity: { oneOf: ['regular', 'irregular', 'inconsistent'] },
@@ -76,15 +59,6 @@ const STRUCTURED = Object.freeze({
   occupation_type: { oneOf: OCCUPATION_TYPES },
   sports_participation: { oneOf: SPORTS_PARTICIPATION },
   programme_readiness: { min: 1, max: 10, integer: true },
-  work_type: { oneOf: WORK_TYPES },
-  work_hours_band: { oneOf: WORK_HOURS_BANDS },
-  daily_activity_level: { oneOf: ACTIVITY_LEVELS },
-  training_duration: { oneOf: TRAINING_DURATIONS },
-  client_attitude: { oneOf: CLIENT_ATTITUDES },
-  confidence_level: { oneOf: LEVELS },
-  commitment_level: { oneOf: COMMITMENT_LEVELS },
-  coaching_preference: { oneOf: COACHING_PREFERENCES },
-  initial_training_level: { oneOf: TRAINING_LEVELS },
 });
 
 // Multi-select answers: a list of canonical keys, not free text. The database
@@ -94,39 +68,8 @@ const TRAINING_CHALLENGES = Object.freeze([
   'time', 'work_schedule', 'motivation', 'confidence', 'pain_or_injury',
   'fatigue', 'family', 'travel', 'nutrition', 'gym_access', 'cost', 'other',
 ]);
-const SPORTS = Object.freeze([
-  'cricket', 'football', 'badminton', 'tennis', 'table_tennis',
-  'basketball', 'volleyball', 'hockey', 'athletics', 'swimming',
-  'cycling', 'running', 'boxing', 'martial_arts', 'gymnastics',
-  'rowing', 'golf', 'squash', 'dance', 'other',
-]);
-const PREVIOUS_ACTIVITIES = Object.freeze([
-  'walking', 'running', 'cycling', 'swimming', 'gym_weights',
-  'cardio_machines', 'home_workouts', 'yoga', 'pilates',
-  'martial_arts', 'dance', 'sports', 'physical_job', 'none',
-]);
-const EXERCISE_PREFERENCES = Object.freeze([
-  'free_weights', 'machines', 'bodyweight', 'cardio', 'hiit',
-  'yoga', 'pilates', 'stretching', 'outdoors', 'group_classes',
-  'home_workouts', 'sports', 'no_preference',
-]);
-const FITNESS_GOALS = Object.freeze([
-  'fat_loss', 'muscle_gain', 'body_recomposition', 'strength_gain',
-  'endurance', 'general_fitness', 'mobility', 'athletic_performance',
-  'medical_fitness', 'wedding_transformation', 'senior_fitness',
-]);
-const MOTIVATION_FACTORS = Object.freeze([
-  'health', 'appearance', 'energy', 'confidence', 'strength',
-  'event', 'doctor_advice', 'family', 'accountability', 'stress',
-  'sport', 'habit',
-]);
 const ARRAY_RULES = Object.freeze({
   training_challenges: { oneOf: TRAINING_CHALLENGES },
-  sports_played: { oneOf: SPORTS },
-  previous_activities: { oneOf: PREVIOUS_ACTIVITIES },
-  exercise_preferences: { oneOf: EXERCISE_PREFERENCES },
-  fitness_goals: { oneOf: FITNESS_GOALS },
-  motivation_factors: { oneOf: MOTIVATION_FACTORS },
 });
 
 /** A structured answer, validated and normalised: enum as text, numbers as numbers. */

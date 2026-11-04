@@ -120,19 +120,6 @@ describe('structured interview answers are checked before the database', () => {
     ['programme_readiness', 11],
     ['programme_readiness', 7.5],
     ['programme_readiness', 'very ready'],
-    ['work_type', 'hybrid'],
-    ['work_hours_band', '12'],
-    ['daily_activity_level', 'sedentary'],
-    ['training_duration', '10_years'],
-    ['client_attitude', 'eager'],
-    ['confidence_level', 'very_high'],
-    ['commitment_level', 'medium'],
-    ['coaching_preference', 'tough'],
-    ['initial_training_level', 'expert'],
-    ['sports_played', 'cricket'],
-    ['sports_played', ['cricket', 'curling']],
-    ['fitness_goals', ['fat_loss', 'sleep']],
-    ['motivation_factors', ['money']],
   ])('rejects %s = %p with a 400 instead of a database error', async (key, value) => {
     const err = await attempt({ [key]: value }).catch((e) => e);
     expect(err).toBeInstanceOf(InterviewInputError);
@@ -164,43 +151,6 @@ describe('structured interview answers are checked before the database', () => {
     });
     const params = pool.query.mock.calls[1][1];
     expect(params).toEqual(expect.arrayContaining(['desk_job', 'previously', 8]));
-  });
-
-  it('stores the selection-based interview answers as canonical keys', async () => {
-    pool.query.mockResolvedValueOnce({ rowCount: 1 });
-    pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1' }] });
-    await attempt({
-      occupation_title: 'Software engineer',
-      occupation_type: 'desk_job',
-      work_type: 'desk',
-      work_hours_band: '8_10',
-      daily_activity_level: 'mostly_seated',
-      training_duration: '1_2_years',
-      sports_played: ['cricket', 'cricket'],
-      previous_activities: ['gym_weights'],
-      exercise_preferences: ['free_weights'],
-      fitness_goals: ['fat_loss'],
-      motivation_factors: ['health'],
-      client_attitude: 'motivated',
-      confidence_level: 'high',
-      commitment_level: 'moderate',
-      coaching_preference: 'balanced',
-      initial_training_level: 'beginner',
-    });
-    const [sql, params] = pool.query.mock.calls[1];
-    for (const column of [
-      'occupation_title', 'work_type', 'work_hours_band', 'daily_activity_level',
-      'training_duration', 'sports_played', 'previous_activities', 'exercise_preferences',
-      'fitness_goals', 'motivation_factors', 'client_attitude', 'confidence_level',
-      'commitment_level', 'coaching_preference', 'initial_training_level',
-    ]) {
-      expect(sql).toContain(column);
-    }
-    expect(params).toEqual(expect.arrayContaining([
-      'Software engineer', 'desk_job', 'desk', '8_10', 'mostly_seated', '1_2_years',
-      ['cricket'], ['gym_weights'], ['free_weights'], ['fat_loss'], ['health'],
-      'motivated', 'high', 'moderate', 'balanced', 'beginner',
-    ]));
   });
 
   it.each([1, 10, '7'])('accepts programme_readiness = %p', async (value) => {
