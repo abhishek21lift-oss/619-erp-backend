@@ -1185,6 +1185,20 @@ const LIFESTYLE_OCCUPATION_TYPES = [
   'driver', 'healthcare', 'police', 'fitness_professional', 'retired', 'other',
 ];
 
+const LIFESTYLE_STRESS_MANAGEMENT_TECHNIQUES = [
+  'exercise', 'meditation', 'breathing', 'social_support', 'journaling',
+  'therapy', 'hobbies', 'spirituality', 'medication', 'nature', 'none', 'other',
+];
+
+// `none` is an answer, not a technique: it cannot stand beside another key.
+// The UI clears the others when it is picked; this is the API's half.
+const stressManagementTechniques = z.array(z.enum(LIFESTYLE_STRESS_MANAGEMENT_TECHNIQUES))
+  .max(12)
+  .refine((v) => !(v.includes('none') && v.length > 1), {
+    message: "Selecting 'none' excludes every other technique",
+  })
+  .optional().nullable();
+
 const lifestyleAssessmentCreateSchema = {
   body: z.object({
     client_id: z.string(),
@@ -1194,6 +1208,8 @@ const lifestyleAssessmentCreateSchema = {
     sleep_quality: intIn(1, 10),
 
     stress_level: intIn(1, 10),
+    mental_health_perception: intIn(1, 10),
+    stress_management_techniques: stressManagementTechniques,
 
     water_intake_liters: numIn(0, 10),
 
@@ -1381,7 +1397,8 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
        smoking_status, cigarettes_per_day, years_smoking, alcohol_status, drinks_per_week,
        screen_time_bracket, travel_frequency, energy_level, recovery_quality, recovery_score,
        sedentary_risk, recovery_risk, habit_risk_score, risk_factors, lifestyle_score, lifestyle_readiness,
-       coach_notes, created_by, organization_id
+       coach_notes, created_by, organization_id,
+       mental_health_perception, stress_management_techniques
      ) VALUES (
        $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_lifestyle_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,$7,$8,
@@ -1393,7 +1410,8 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
        $19,$20,$21,$22,$23,
        $24,$25,$26,$27,$28,
        $29,$30,$31,$32,$33,$34,
-       $35::jsonb,$36,$37
+       $35::jsonb,$36,$37,
+       $38,$39
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || studioToday(),
@@ -1407,6 +1425,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
       b.screen_time_bracket || null, b.travel_frequency || null, b.energy_level ?? null, b.recovery_quality || null, analysis.recoveryScore,
       analysis.sedentaryRisk, analysis.recoveryRisk, analysis.habitRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.lifestyleScore, analysis.lifestyleReadiness,
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
+      b.mental_health_perception ?? null, b.stress_management_techniques ?? null,
     ]
   ));
   res.status(201).json({ data: rows[0] });
@@ -1416,6 +1435,7 @@ router.patch('/lifestyle-assessments/:id', auth, validate(lifestyleAssessmentUpd
   if (rejectMovedFields(req, res, 'PATCH /lifestyle-assessments/:id', MOVED_LIFESTYLE_FIELDS)) return;
   const allowed = [
     'assessment_date', 'sleep_duration_hours', 'bed_time', 'wake_time', 'sleep_quality', 'stress_level',
+    'mental_health_perception', 'stress_management_techniques',
     'occupation_type', 'daily_steps_bracket', 'years_of_experience',
     'smoking_status', 'cigarettes_per_day', 'years_smoking', 'alcohol_status', 'drinks_per_week',
     'screen_time_bracket', 'travel_frequency', 'energy_level', 'recovery_quality', 'coach_notes',
