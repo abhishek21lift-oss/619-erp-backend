@@ -341,10 +341,30 @@ async function notifyTrainer(clientId, orgId, s) {
   );
 }
 
+/**
+ * The member's active PT session packages. `session_balance` has no row-level
+ * tenancy of its own beyond organization_id, and its client_id once pointed at
+ * the dropped legacy `clients` table — migration 174 backfilled org from
+ * pt_clients, so an old row that does not resolve simply does not appear.
+ * Rows created from the trainer's session-balance page always resolve.
+ */
+async function mySessionBalance(clientId, orgId) {
+  const { rows } = await pool.query(
+    `SELECT package_name, total_sessions, used_sessions, remaining_sessions,
+            start_date::text AS start_date, end_date::text AS end_date, status
+       FROM session_balance
+      WHERE client_id = $1 AND organization_id = $2 AND status = 'active'
+      ORDER BY end_date NULLS LAST, created_at`,
+    [clientId, orgId],
+  );
+  return rows;
+}
+
 module.exports = {
   TrainingInputError,
   normaliseWorkout,
   lastPerformance,
   logMyWorkout,
   DAILY_LIMIT,
+  mySessionBalance,
 };
