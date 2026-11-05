@@ -105,7 +105,14 @@ function clientInfo(req) {
 
 async function ensureSchema() {
   if (!schemaReady) {
-    schemaReady = pool.query(`
+    // The serving role (app_tenant) has no DDL rights, and Postgres checks
+    // CREATE privilege before it checks whether the table already exists — so
+    // the bare `CREATE TABLE IF NOT EXISTS` below was refused on every fresh
+    // process and took GET /api/profile/me down with it. Migrations own the
+    // schema; the create is only for a database that predates migration 132.
+    schemaReady = pool.query('SELECT to_regclass(\'public.user_profiles\') AS t').then(({ rows }) => {
+      if (rows[0] && rows[0].t) return undefined;
+      return pool.query(`
       CREATE TABLE IF NOT EXISTS user_profiles (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         phone TEXT,
@@ -134,6 +141,7 @@ async function ensureSchema() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    });
   }
   await schemaReady;
 }
