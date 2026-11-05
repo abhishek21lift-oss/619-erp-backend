@@ -27,6 +27,8 @@ const formChecks = require('../form-checks/form-check.service');
 const goals = require('./member-goals.service');
 const recap = require('./member-recap.service');
 const renewal = require('./member-renewal.service');
+const requests = require('./member-requests.service');
+const privacy = require('./member-privacy.service');
 const memberCoach = require('./member-coach.service');
 const { trainerOfClient, TRAINER_SPECIALISATION_SQL } = require('../../lib/memberTrainer');
 const { generatePaymentReceiptPdf } = require('../../lib/paymentReceiptPdf');
@@ -39,6 +41,7 @@ const path = require('path');
 const { serveFile, saveFile, saveFileFromPath, deleteFile } = require('../../lib/fileStorage');
 const { detectFileType, LOGO_IMAGES, FORM_VIDEOS } = require('../../lib/fileSignatures');
 const { logActivity } = require('../../lib/activityLog');
+const { today } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
 
 /** Wrap an async handler so a rejection reaches the error middleware. */
@@ -181,58 +184,11 @@ router.get('/attendance', wrap(async (req, res) => {
 }));
 
 // ── GET /api/me/measurements ─────────────────────────────────────────────────
-//
-// Fitness Testing owns the live body, so `pt_assessments` is the canonical
-// source and comes first. The older measurement log still holds real readings
-// for studios whose history only exists there, and it has no writer left; it
-// stays as a labelled fallback (`source: 'trainer'`). The member's own
-// check-in weights are the third source (`source: 'checkin'`), because a
-// member who reported their weight every week should not see "not recorded".
-//
-// `pt_os_measurements` is not defined in any migration in this repo, so the
-// only columns read from it are the ones already read in production. Its rows
-// are scoped by client_id alone: the column set is unverified, so an
-// organization_id predicate could reference a column that does not exist.
-// `pt_clients.id` is unique platform-wide and comes from the session, never
-// the request. Assessments and check-ins are migration-defined and are scoped
-// by organization as well.
-//
-// The three sources are returned as they were recorded, not merged. A test and
-// a trainer measurement on the same day are two facts with two provenances;
-// hiding one would make the member's timeline disagree with the trainer's.
+// The three sources and the reasoning behind scoping each one live in
+// client-portal.service.js, so the export reads exactly what this route returns.
 router.get('/measurements', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
-  const { rows } = await pool.query(
-    `SELECT weight_kg, measured_at, source, body_fat_pct, chest_cm, waist_cm, hip_cm,
-            arms_cm, thighs_cm, shoulders_cm FROM (
-       SELECT weight AS weight_kg,
-              assessment_date::timestamptz AS measured_at,
-              'assessment'::text AS source,
-              body_fat_pct, chest_cm, waist_cm, hips_cm AS hip_cm,
-              arms_cm, thighs_cm, NULL::numeric AS shoulders_cm
-         FROM pt_assessments
-        WHERE client_id = $1
-          AND organization_id = $2
-          AND COALESCE(weight, body_fat_pct, chest_cm, waist_cm, hips_cm,
-                       arms_cm, thighs_cm) IS NOT NULL
-       UNION ALL
-       SELECT weight_kg, measured_at, 'trainer'::text AS source,
-              body_fat_pct, chest_cm, waist_cm, hip_cm, arms_cm, thighs_cm, shoulders_cm
-         FROM pt_os_measurements
-        WHERE client_id = $1
-          AND COALESCE(weight_kg, body_fat_pct, chest_cm, waist_cm, hip_cm,
-                       arms_cm, thighs_cm, shoulders_cm) IS NOT NULL
-       UNION ALL
-       SELECT weight, week_start_date::timestamptz, 'checkin',
-              NULL, NULL, NULL, NULL, NULL, NULL, NULL
-         FROM weekly_checkins
-        WHERE client_id = $1 AND organization_id = $2 AND weight IS NOT NULL
-     ) m
-      ORDER BY measured_at DESC, source ASC
-      LIMIT 200`,
-    [clientId, orgId]
-  );
-  res.json({ data: rows });
+  res.json({ data: await portal.myMeasurements(clientId, orgId) });
 }));
 
 // ── My programme, my diet, my weekly check-ins ─────────────────────────────
@@ -656,6 +612,52 @@ router.get('/payments/:id/receipt', wrap(async (req, res) => {
   res.type('application/pdf');
   res.set('Content-Disposition', `inline; filename="receipt-${payment.payment_ref || String(payment.id).slice(0, 8)}.pdf"`);
   res.send(pdf);
+}));
+
+// ── Pause and deletion requests ─────────────────────────────────────────────
+// Both only notify the trainer. Nothing about the plan or the account changes
+// until a person acts on it, so there is no state to read back beyond "is a
+// request still waiting?".
+
+// GET /api/me/pause — whether a pause request is still waiting
+router.get('/pause', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await requests.myPause(clientId, orgId) });
+}));
+
+// POST /api/me/pause/request — ask the trainer to pause the plan
+router.post('/pause/request', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    res.json({ data: await requests.requestPause(clientId, orgId, req.body || {}) });
+  } catch (err) {
+    if (!inputError(res, err, requests.RequestError)) throw err;
+  }
+}));
+
+// GET /api/me/deletion — whether a deletion request is still waiting
+router.get('/deletion', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await requests.myDeletion(clientId, orgId) });
+}));
+
+// POST /api/me/deletion/request — ask the studio to delete the account
+router.post('/deletion/request', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    res.json({ data: await requests.requestDeletion(clientId, orgId) });
+  } catch (err) {
+    if (!inputError(res, err, requests.RequestError)) throw err;
+  }
+}));
+
+// GET /api/me/export — everything the studio holds about the member
+router.get('/export', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  const data = await privacy.exportEverything(clientId, orgId, req.user.id);
+  res.set('Cache-Control', 'private, no-store');
+  res.set('Content-Disposition', `attachment; filename="my-pt-studio-data-${today()}.json"`);
+  res.json({ data });
 }));
 
 module.exports = router;
