@@ -521,6 +521,12 @@ router.get('/sessions', wrap(async (req, res) => {
   res.json({ data: await portal.mySessions(clientId, orgId) });
 }));
 
+// GET /api/me/session-balance — PT session packages the member still holds
+router.get('/session-balance', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  res.json({ data: await training.mySessionBalance(clientId, orgId) });
+}));
+
 // GET /api/me/checkins — recent weekly check-ins, and which week is "this week"
 router.get('/checkins', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
