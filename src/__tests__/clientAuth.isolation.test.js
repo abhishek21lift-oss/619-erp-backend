@@ -201,4 +201,16 @@ describe('the client portal reads only the caller', () => {
     expect(sql).not.toMatch(/c\.notes/);
     expect(sql).not.toMatch(/SELECT\s+\*/i);
   });
+
+  it('carries the studio contact details on the member profile', async () => {
+    // The member's own read is the only place these appear. The columns are the
+    // studio's, so a SELECT * or a wider join would expose more than intended.
+    pool.query.mockResolvedValue({ rows: [{ id: 'ptc-1' }] });
+    await request(portalApp(CLIENT_USER)).get('/api/me/profile');
+
+    const [sql] = pool.query.mock.calls[0];
+    expect(sql).toMatch(/o\.phone AS studio_phone/);
+    expect(sql).toMatch(/o\.address AS studio_address/);
+    expect(sql).toMatch(/o\.hours AS studio_hours/);
+  });
 });

@@ -99,7 +99,8 @@ router.get('/profile', wrap(async (req, res) => {
             tu.name AS trainer_name,
             up.avatar_url AS trainer_photo,
             ${TRAINER_SPECIALISATION_SQL} AS trainer_specialization,
-            o.name AS studio_name, o.logo_url AS studio_logo
+            o.name AS studio_name, o.logo_url AS studio_logo,
+            o.phone AS studio_phone, o.address AS studio_address, o.hours AS studio_hours
        FROM pt_clients c
        LEFT JOIN LATERAL (${trainerOfClient('c')}) tu ON TRUE
        LEFT JOIN user_profiles up ON up.user_id = tu.id
