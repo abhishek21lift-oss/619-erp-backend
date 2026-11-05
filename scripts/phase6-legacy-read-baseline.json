@@ -20,7 +20,7 @@
   ],
   "legacy_reads": [
     {
-      "file": "src/modules/client-portal/client-portal.routes.js",
+      "file": "src/modules/client-portal/client-portal.service.js",
       "source": "pt_os_measurements",
       "owner": "Fitness Testing",
       "reason": "Member measurement timeline keeps the historical trainer log as a labelled third source; the table has no writer and no migration definition.",
