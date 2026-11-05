@@ -33,11 +33,13 @@ const { runSweep } = require('../modules/automation/automation.sweep');
 const { runRecovery } = require('../modules/automation/automation.recovery');
 const { expireEndedTerms } = require('../modules/pt-os/pt-os.service');
 const { runSessionReminders } = require('../modules/pt-os/session-reminders');
+const { runFeedbackReminders } = require('../modules/session-feedback/feedback-reminders');
 
 const SWEEP_JOB_ID = 'automation-daily-sweep';
 const RECOVERY_JOB_ID = 'automation-orphan-recovery';
 const TERM_EXPIRY_JOB_ID = 'pt-term-expiry';
 const SESSION_REMINDERS_JOB_ID = 'pt-session-reminders';
+const FEEDBACK_REMINDERS_JOB_ID = 'pt-feedback-reminders';
 
 /**
  * When the sweep runs.
@@ -81,6 +83,15 @@ const DEFAULT_TERM_EXPIRY_CRON = '5 * * * *';
  */
 const DEFAULT_SESSION_REMINDERS_CRON = '*/15 * * * *';
 
+/**
+ * When the pending-feedback nudge runs.
+ *
+ * Once a day, after the automation sweep, so a client is never woken by it.
+ * The sweep itself is idempotent per request; the daily schedule is about
+ * being polite, not about correctness.
+ */
+const DEFAULT_FEEDBACK_REMINDERS_CRON = '45 3 * * *';
+
 async function processSweepJob(job) {
   if (job.name === 'daily') return runSweep();
   if (job.name === 'recovery') return runRecovery();
@@ -92,6 +103,11 @@ async function processSweepJob(job) {
   if (job.name === 'session-reminders') {
     const out = await runSessionReminders();
     logger.info({ sent: out.sent, skipped: out.skipped }, 'pt session reminders completed');
+    return out;
+  }
+  if (job.name === 'feedback-reminders') {
+    const out = await runFeedbackReminders();
+    logger.info({ scanned: out.scanned, sent: out.sent, skipped: out.skipped }, 'feedback reminders completed');
     return out;
   }
   throw new Error(`Unknown automation job: ${job.name}`);
@@ -208,12 +224,26 @@ async function scheduleAutomationSweep() {
     }
   ), 5000);
 
-  logger.info({ cron, recoveryCron, termExpiryCron, remindersCron }, 'automation sweep cron scheduled');
+  const feedbackCron = process.env.PT_FEEDBACK_REMINDERS_CRON || DEFAULT_FEEDBACK_REMINDERS_CRON;
+  await withTimeout(automationSweepQueue.upsertJobScheduler(
+    FEEDBACK_REMINDERS_JOB_ID,
+    { pattern: feedbackCron },
+    {
+      name: 'feedback-reminders',
+      data: {},
+      // One reminder per request is the notification's ref_id check, so the
+      // next morning is the retry.
+      opts: { attempts: 1, removeOnComplete: true, removeOnFail: true },
+    }
+  ), 5000);
+
+  logger.info({ cron, recoveryCron, termExpiryCron, remindersCron, feedbackCron }, 'automation sweep cron scheduled');
   return {
     sweep: { jobSchedulerId: SWEEP_JOB_ID },
     recovery: { jobSchedulerId: RECOVERY_JOB_ID },
     termExpiry: { jobSchedulerId: TERM_EXPIRY_JOB_ID },
     sessionReminders: { jobSchedulerId: SESSION_REMINDERS_JOB_ID },
+    feedbackReminders: { jobSchedulerId: FEEDBACK_REMINDERS_JOB_ID },
     jobSchedulerId: SWEEP_JOB_ID,
   };
 }
@@ -242,8 +272,10 @@ module.exports = {
   RECOVERY_JOB_ID,
   TERM_EXPIRY_JOB_ID,
   SESSION_REMINDERS_JOB_ID,
+  FEEDBACK_REMINDERS_JOB_ID,
   DEFAULT_SWEEP_CRON,
   DEFAULT_RECOVERY_CRON,
   DEFAULT_TERM_EXPIRY_CRON,
   DEFAULT_SESSION_REMINDERS_CRON,
+  DEFAULT_FEEDBACK_REMINDERS_CRON,
 };
