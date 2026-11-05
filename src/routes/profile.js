@@ -16,6 +16,7 @@ const { syncTrainerName } = require('../lib/memberTrainer');
 const { detectFileType, PROFILE_IMAGES, LOGO_IMAGES } = require('../lib/fileSignatures');
 const { auth, requireTrainer, invalidateUserCache } = require('../middleware/auth');
 const studioBranding = require('../lib/studioBranding');
+const studioDetails = require('../lib/studioDetails');
 const { logActivity } = require('../lib/activityLog');
 const recovery = require('../lib/mfaRecoveryCodes');
 const logger = require('../lib/logger');
@@ -496,6 +497,49 @@ router.delete('/studio-logo', requireTrainer, async (req, res, next) => {
     invalidateUserCache();
     await logActivity(req, 'profile.studio_logo.remove', 'organization', orgId);
     res.json({ logoUrl: null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Studio contact details ───────────────────────────────────────────────────
+// What a member sees when they need to call or visit. Free text; the cap is
+// there so a card cannot be pushed off the screen, not to validate a format.
+const STUDIO_FIELDS = [
+  { body: 'phone', col: 'phone', max: 20 },
+  { body: 'address', col: 'address', max: 300 },
+  { body: 'hours', col: 'hours', max: 120 },
+];
+
+function studioInput(body) {
+  const out = {};
+  for (const f of STUDIO_FIELDS) {
+    const raw = body[f.body];
+    if (raw === undefined || raw === null) { out[f.col] = null; continue; }
+    const v = String(raw).trim();
+    if (v.length > f.max) return { error: `${f.body} is too long (${f.max} characters max)` };
+    out[f.col] = v || null;
+  }
+  return { value: out };
+}
+
+router.get('/studio', requireTrainer, async (req, res, next) => {
+  try {
+    res.json(await studioDetails.getStudio(pool, req.user.organization_id));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// A whole-block replace: an omitted field is an erased field. The trainer's
+// card always sends all three, so a partial body is a bug, not a PATCH.
+router.put('/studio', requireTrainer, async (req, res, next) => {
+  try {
+    const parsed = studioInput(req.body || {});
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const saved = await studioDetails.setStudio(pool, req.user.organization_id, parsed.value);
+    await logActivity(req, 'profile.studio.update', 'organization', req.user.organization_id);
+    res.json(saved);
   } catch (err) {
     next(err);
   }
