@@ -791,10 +791,64 @@ async function deleteMyPhoto(clientId, orgId, userId, photoId) {
   return rows[0] ? rows[0].photo_url : null;
 }
 
+// ── Measurements ────────────────────────────────────────────────────────────
+//
+// Fitness Testing owns the live body, so `pt_assessments` is the canonical
+// source and comes first. The older measurement log still holds real readings
+// for studios whose history only exists there, and it has no writer left; it
+// stays as a labelled fallback (`source: 'trainer'`). The member's own
+// check-in weights are the third source (`source: 'checkin'`), because a
+// member who reported their weight every week should not see "not recorded".
+//
+// `pt_os_measurements` is not defined in any migration in this repo, so the
+// only columns read from it are the ones already read in production. Its rows
+// are scoped by client_id alone: the column set is unverified, so an
+// organization_id predicate could reference a column that does not exist.
+// `pt_clients.id` is unique platform-wide and comes from the session, never
+// the request. Assessments and check-ins are migration-defined and are scoped
+// by organization as well.
+//
+// The three sources are returned as they were recorded, not merged. A test and
+// a trainer measurement on the same day are two facts with two provenances;
+// hiding one would make the member's timeline disagree with the trainer's.
+async function myMeasurements(clientId, orgId) {
+  const { rows } = await pool.query(
+    `SELECT weight_kg, measured_at, source, body_fat_pct, chest_cm, waist_cm, hip_cm,
+            arms_cm, thighs_cm, shoulders_cm FROM (
+       SELECT weight AS weight_kg,
+              assessment_date::timestamptz AS measured_at,
+              'assessment'::text AS source,
+              body_fat_pct, chest_cm, waist_cm, hips_cm AS hip_cm,
+              arms_cm, thighs_cm, NULL::numeric AS shoulders_cm
+         FROM pt_assessments
+        WHERE client_id = $1
+          AND organization_id = $2
+          AND COALESCE(weight, body_fat_pct, chest_cm, waist_cm, hips_cm,
+                       arms_cm, thighs_cm) IS NOT NULL
+       UNION ALL
+       SELECT weight_kg, measured_at, 'trainer'::text AS source,
+              body_fat_pct, chest_cm, waist_cm, hip_cm, arms_cm, thighs_cm, shoulders_cm
+         FROM pt_os_measurements
+        WHERE client_id = $1
+          AND COALESCE(weight_kg, body_fat_pct, chest_cm, waist_cm, hip_cm,
+                       arms_cm, thighs_cm, shoulders_cm) IS NOT NULL
+       UNION ALL
+       SELECT weight, week_start_date::timestamptz, 'checkin',
+              NULL, NULL, NULL, NULL, NULL, NULL, NULL
+         FROM weekly_checkins
+        WHERE client_id = $1 AND organization_id = $2 AND weight IS NOT NULL
+     ) m
+      ORDER BY measured_at DESC, source ASC
+      LIMIT 200`,
+    [clientId, orgId],
+  );
+  return rows;
+}
+
 module.exports = {
   myAchievements, weekStreaks,
   myPhotos, normalisePhotoMeta, photoUploadsToday, insertMyPhoto, deleteMyPhoto, PHOTO_TYPES, PHOTO_DAILY_LIMIT,
   updateMyContact, normaliseContact, setMyPhoto, parseMyPhoto, myForms, myConsentPdfKey,
-  myWorkout, myDiet, myCheckins, upsertMyCheckin, mySessions,
+  myWorkout, myDiet, myCheckins, upsertMyCheckin, mySessions, myMeasurements,
   normaliseCheckin, mondayOf, weekNumberSince, PortalInputError, MOODS,
 };
