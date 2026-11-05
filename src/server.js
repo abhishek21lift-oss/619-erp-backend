@@ -976,6 +976,8 @@ app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/
 app.use('/api/pt-os',            auth, requireTrainer, require('./modules/pt-os/availability.routes'));
 // Asynchronous form review: the trainer's queue and timestamped comments.
 app.use('/api/pt-os',            auth, requireTrainer, require('./modules/form-checks/form-check.routes'));
+// Post-session feedback: ratings, trainer analytics and low-rating review.
+app.use('/api/pt-os',            auth, requireTrainer, require('./modules/session-feedback/feedback.routes').trainer);
 
 // The client's own surfaces. Mirror image of the block above: requireClient
 // refuses anyone who is not a `member` linked to a client record, and every
@@ -986,6 +988,9 @@ app.use('/api/me',               auth, requireClient, require('./modules/client-
 // The client's own booking: free slots, book, reschedule, cancel. Identity is
 // req.user.pt_client_id; no route takes a client or trainer id.
 app.use('/api/me',               auth, requireClient, require('./modules/client-portal/client-booking.routes'));
+// The client's own post-session feedback: requests and the one submission.
+// No route takes a client id; identity is req.user.pt_client_id.
+app.use('/api/me',               auth, requireClient, require('./modules/session-feedback/feedback.routes').member);
 
 // The studio's side of member ↔ studio messaging. The member's side is
 // /api/me/messages above; this one takes a client id, so it is trainer-only and

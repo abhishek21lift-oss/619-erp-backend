@@ -33,6 +33,7 @@ const { renewClient, addMonthsIso } = require('./renewal.service');
 const { genReceiptNo } = require('../../db/receipts');
 const { checkTrainingEligibility, screeningSummary, screeningGaps } = require('../../lib/screeningGate');
 const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
+const feedback = require('../session-feedback/feedback.service');
 
 /**
  * Where a client found the studio.
@@ -1779,6 +1780,11 @@ router.patch('/sessions/:id', auth, wrap(async (req, res) => {
   }
   if (!sets.length) return res.status(400).json({ error: 'No fields to update' });
 
+  // The one transition that creates the client's feedback request. Computed
+  // from the row read above, not from the request alone: a PATCH that repeats
+  // status='completed' is not a second completion.
+  const completing = b.status === 'completed' && current.status !== 'completed';
+
   if (b.start_time !== undefined || b.duration_minutes !== undefined) {
     const mergedStart = b.start_time ?? existingRows[0].start_time;
     const mergedDuration = b.duration_minutes ?? existingRows[0].duration_minutes;
@@ -1788,12 +1794,55 @@ router.patch('/sessions/:id', auth, wrap(async (req, res) => {
     }
   }
   sets.push('updated_at = NOW()');
+  // Stamped on the transition and never moved afterwards: it is the moment the
+  // client is asked to rate, not the moment the row was last edited.
+  if (completing) sets.push('completed_at = COALESCE(completed_at, NOW())');
   params.push(scope.orgId);
-  const { rows } = await pool.query(
-    `UPDATE pt_sessions SET ${sets.join(', ')} WHERE id = $1 AND deleted_at IS NULL AND organization_id = $${params.length} RETURNING *`,
-    params
-  );
+
+  const applyUpdate = async () => {
+    const result = await pool.query(
+      `UPDATE pt_sessions SET ${sets.join(', ')} WHERE id = $1 AND deleted_at IS NULL AND organization_id = $${params.length} RETURNING *`,
+      params
+    );
+    const session = result.rows[0];
+    if (!session || !completing) return result;
+
+    // The request and the client's notification share this transaction when
+    // the tenant session is enforced (pool.withTenantSession pins one
+    // connection). Both inserts are independently deduped — UNIQUE(session_id)
+    // and the notification's ref_id check — so a retried completion cannot
+    // leave a second request or notify the client twice.
+    const request = await feedback.createRequest(pool, {
+      orgId: scope.orgId,
+      sessionId: session.id,
+      clientId: session.client_id,
+      trainerId: session.trainer_id,
+      completedAt: session.completed_at || new Date(),
+    });
+    if (request) {
+      await feedback.notifyMemberOfRequest(pool, {
+        clientId: session.client_id,
+        orgId: scope.orgId,
+        feedbackId: request.id,
+        sessionTitle: session.title,
+      });
+    }
+    return result;
+  };
+
+  // …and a plain pg.Pool (the real-DB integration suites mock the pool module
+  // with one) has no scoped-session helper. Both inserts are independently
+  // deduped, so running them outside a shared transaction is still safe.
+  const runComplete = () => (pool.withTenantSession ? pool.withTenantSession(applyUpdate) : applyUpdate());
+  const { rows } = completing ? await runComplete() : await applyUpdate();
   if (!rows[0]) return res.status(404).json({ error: 'Session not found' });
+  if (completing) {
+    await logActivity(req, 'session.complete', 'pt_session', rows[0].id, {
+      client_id: rows[0].client_id,
+      session_date: rows[0].session_date,
+      completed_at: rows[0].completed_at,
+    });
+  }
   res.json({ data: rows[0] });
 }));
 
