@@ -132,10 +132,13 @@ router.post('/', auth, validate(paymentSchemas.create), async (req, res, next) =
       notes: d.notes || null,
       paymentRef: null,
       incentive: 'trainer_rate',
+      idempotencyKey: d.idempotency_key ?? null,
     });
     if (result.notFound) return res.status(404).json({ error: 'Client not found' });
 
-    res.status(201).json({ message: 'Payment recorded', payment: result.payment });
+    // 200 on a replay: the payment it names was created by the first request.
+    res.status(result.replayed ? 200 : 201)
+      .json({ message: result.replayed ? 'Payment already recorded' : 'Payment recorded', payment: result.payment });
   } catch (err) {
     logger.error({ err: err.message }, 'Payment error');
     next(err);

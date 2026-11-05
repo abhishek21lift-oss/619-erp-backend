@@ -123,6 +123,9 @@ const paymentSchemas = {
       notes: z.string().max(500).optional().nullable(),
       plan_id: z.string().optional().nullable(),
       trainer_id: z.string().optional().nullable(),
+      // A retry of the same payment sends the same key; see 250 and
+      // lib/ptPayments. Optional so existing clients keep working.
+      idempotency_key: z.string().trim().min(1).max(100).optional(),
     }),
   },
 };

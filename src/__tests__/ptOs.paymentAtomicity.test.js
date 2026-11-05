@@ -98,6 +98,13 @@ describe('POST /api/pt-os/payments — the ledger and the balance move together'
     expect(lockAt).toBeLessThan(insertAt);
   });
 
+  it('passes the idempotency key into the ledger row', async () => {
+    await post({ client_id: 'c1', amount: 500, idempotency_key: 'k-pt-1' }).expect(201);
+
+    const call = mockClient.query.mock.calls.find(([sql]) => /INSERT INTO pt_payments/i.test(String(sql)));
+    expect(call[1][11]).toBe('k-pt-1');
+  });
+
   it('rolls back and writes nothing when the balance update fails', async () => {
     // The exact failure the transaction exists for: the ledger row is already
     // inserted when the second statement dies. Without BEGIN/ROLLBACK that

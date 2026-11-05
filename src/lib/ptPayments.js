@@ -29,6 +29,9 @@
  *      written and payment_received is raised, keyed on the payment's own id.
  *      A rolled-back payment must not be logged or message anyone, and
  *      neither side effect may be able to fail a payment.
+ *   6. A caller-supplied idempotency key is enforced by a unique index. A
+ *      replay returns the committed row and moves no balance, logs nothing
+ *      and messages nobody a second time.
  *
  * The two genuinely different policies stay the caller's choice, explicitly:
  *   • incentive: an amount the caller computed, or the trainer's rate;
@@ -57,12 +60,14 @@ const DEFAULT_INCENTIVE_RATE = 0.5;
  * @param {string|null} [p.notes]
  * @param {string|null} [p.paymentRef]    the caller's reference; null → a receipt number
  * @param {string|null} [p.trainerId]     preferred trainer; ignored unless it is this studio's
+ * @param {string|null} [p.idempotencyKey] caller-generated per payment attempt; a replay returns the first row
  * @param {{ amount: number } | 'trainer_rate'} p.incentive
- * @returns {Promise<{ notFound: true } | { payment: object }>}
+ * @returns {Promise<{ notFound: true } | { payment: object, replayed: boolean }>}
  */
 async function recordPtPayment(req, p) {
   const tx = await pool.connect();
-  const paymentId = randomUUID();
+  let paymentId = randomUUID();
+  let replayed = false;
   // The tenant the row is filed under. With a client it is the client row's
   // own organization — the tenant anchor — rather than anything taken from
   // the request; the lock below already refuses a client outside the caller's
@@ -106,15 +111,41 @@ async function recordPtPayment(req, p) {
       ? Math.min(p.amount, Math.max(0, Number(client.balance_amount) || 0))
       : null;
 
-    await tx.query(
+    const insertSql =
       `INSERT INTO pt_payments (id, client_id, trainer_id, amount, incentive_amt,
-         payment_method, payment_ref, date, notes, organization_id, balance_applied)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [paymentId, p.clientId || null, trainer?.id ?? null, p.amount, incentiveAmt,
-       p.method ?? null, paymentRef, p.date, p.notes ?? null, orgId, balanceApplied],
-    );
+         payment_method, payment_ref, date, notes, organization_id, balance_applied,
+         idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`;
+    const insertParams = [paymentId, p.clientId || null, trainer?.id ?? null, p.amount,
+      incentiveAmt, p.method ?? null, paymentRef, p.date, p.notes ?? null, orgId,
+      balanceApplied, p.idempotencyKey ?? null];
 
-    if (client) {
+    if (p.idempotencyKey) {
+      // The unique index on (organization_id, idempotency_key) decides, not
+      // the screen's disabled button. A conflict means this exact request
+      // already committed: take that row and skip the balance move and the
+      // side effects below, or a retry credits the client twice.
+      const { rows } = await tx.query(
+        `${insertSql}
+         ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+         DO NOTHING
+         RETURNING id`,
+        insertParams,
+      );
+      if (!rows[0]) {
+        const existing = await tx.query(
+          'SELECT id FROM pt_payments WHERE organization_id=$1 AND idempotency_key=$2',
+          [orgId, p.idempotencyKey],
+        );
+        if (!existing.rows[0]) throw new Error('idempotency conflict without a payment row');
+        paymentId = existing.rows[0].id;
+        replayed = true;
+      }
+    } else {
+      await tx.query(insertSql, insertParams);
+    }
+
+    if (client && !replayed) {
       await tx.query(
         `UPDATE pt_clients SET
            paid_amount = paid_amount + $1,
@@ -145,17 +176,20 @@ async function recordPtPayment(req, p) {
   );
   const payment = rows[0];
 
-  // After COMMIT, each on its own connection (see the header, rule 5).
-  await logActivity(req, 'payment.create', 'pt_payment', paymentId, payment);
-  if (p.clientId) {
-    await automation.paymentReceived(req, {
-      clientId: p.clientId,
-      amount: p.amount,
-      eventKey: paymentId,
-    });
+  // After COMMIT, each on its own connection (see the header, rule 5). A
+  // replay already had its log line and message on the first request.
+  if (!replayed) {
+    await logActivity(req, 'payment.create', 'pt_payment', paymentId, payment);
+    if (p.clientId) {
+      await automation.paymentReceived(req, {
+        clientId: p.clientId,
+        amount: p.amount,
+        eventKey: paymentId,
+      });
+    }
   }
 
-  return { payment };
+  return { payment, replayed };
 }
 
 module.exports = { recordPtPayment, DEFAULT_INCENTIVE_RATE };

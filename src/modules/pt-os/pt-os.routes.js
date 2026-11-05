@@ -1820,7 +1820,7 @@ router.get('/payments', auth, wrap(async (req, res) => {
 const PT_PAYMENT_METHODS = new Set(['CASH', 'UPI', 'CARD', 'BANK_TRANSFER']);
 
 router.post('/payments', auth, wrap(async (req, res) => {
-  const { client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes } = req.body;
+  const { client_id, trainer_id, amount, incentive_amt, payment_method, payment_ref, date, notes, idempotency_key } = req.body;
 
   // `Number(amount) || 0` recorded a ₹0 payment for a blank, a whitespace
   // string, or anything unparseable — a ledger row that moves no balance,
@@ -1855,6 +1855,18 @@ router.post('/payments', auth, wrap(async (req, res) => {
     });
   }
 
+  // A retry of the same payment sends the same key; the database enforces it
+  // (migration 266). Optional, so an existing client keeps working.
+  if (idempotency_key != null
+      && (typeof idempotency_key !== 'string' || !idempotency_key.trim() || idempotency_key.length > 100)) {
+    return res.status(400).json({
+      error: {
+        code: 'VALIDATION',
+        message: 'idempotency_key must be a non-empty string of at most 100 characters',
+      },
+    });
+  }
+
   // The write — client lock, ledger row, balance, receipt number, activity
   // log, and payment_received after COMMIT — is lib/ptPayments.js, shared with
   // Finance → Record Payment (POST /api/payments) so the two paths cannot
@@ -1876,12 +1888,13 @@ router.post('/payments', auth, wrap(async (req, res) => {
     paymentRef: payment_ref || null,
     trainerId: trainer_id || null,
     incentive: { amount: incentive_amt ?? 0 },
+    idempotencyKey: idempotency_key || null,
   });
   if (result.notFound) {
     return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   }
 
-  res.status(201).json({ data: result.payment });
+  res.status(result.replayed ? 200 : 201).json({ data: result.payment });
 }));
 
 // ─── Operations Summary (today's sessions, renewals, dues) ──────────────────
