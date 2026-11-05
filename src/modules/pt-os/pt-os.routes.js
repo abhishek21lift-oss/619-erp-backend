@@ -1830,7 +1830,11 @@ router.patch('/sessions/:id', auth, wrap(async (req, res) => {
     return result;
   };
 
-  const { rows } = completing ? await pool.withTenantSession(applyUpdate) : await applyUpdate();
+  // …and a plain pg.Pool (the real-DB integration suites mock the pool module
+  // with one) has no scoped-session helper. Both inserts are independently
+  // deduped, so running them outside a shared transaction is still safe.
+  const runComplete = () => (pool.withTenantSession ? pool.withTenantSession(applyUpdate) : applyUpdate());
+  const { rows } = completing ? await runComplete() : await applyUpdate();
   if (!rows[0]) return res.status(404).json({ error: 'Session not found' });
   if (completing) {
     await logActivity(req, 'session.complete', 'pt_session', rows[0].id, {
