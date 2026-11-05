@@ -22,6 +22,9 @@ const CLIENT_A = 'ptc-aaa';
 
 // Every statement issued on the transaction client, in order.
 const mockTxLog = [];
+// Keys the mocked INSERT has already accepted, so ON CONFLICT behaves like the
+// partial unique index in migration 266.
+const mockInsertedKeys = new Set();
 // Rows the mocked SELECT ... FOR UPDATE returns for the client lookup.
 let mockClientRow;
 let mockTrainerRow;
@@ -43,6 +46,19 @@ const mockTxClient = {
     if (/FROM trainers WHERE id = \$1 AND organization_id = \$2/i.test(text)) {
       return { rows: mockTrainerRow ? [mockTrainerRow] : [], rowCount: mockTrainerRow ? 1 : 0 };
     }
+    // The ledger insert. With a key it returns a row, or none when the index
+    // would have rejected it; without a key it is the old blind insert.
+    if (/^INSERT INTO pt_payments/i.test(text)) {
+      const key = params[11];
+      if (!key) return { rows: [], rowCount: 0 };
+      const scoped = `${params[9]}|${key}`;
+      if (mockInsertedKeys.has(scoped)) return { rows: [], rowCount: 0 };
+      mockInsertedKeys.add(scoped);
+      return { rows: [{ id: params[0] }], rowCount: 1 };
+    }
+    if (/SELECT id FROM pt_payments WHERE organization_id=\$1 AND idempotency_key=\$2/i.test(text)) {
+      return { rows: [{ id: 'pay-existing' }], rowCount: 1 };
+    }
     if (/UPDATE pt_payments SET deleted_at/i.test(text)) {
       return { rows: mockDeletedPtPayment ? [mockDeletedPtPayment] : [], rowCount: mockDeletedPtPayment ? 1 : 0 };
     }
@@ -58,6 +74,9 @@ jest.mock('../db/pool', () => ({
 
 jest.mock('../db/receipts', () => ({ genReceiptNo: jest.fn(async () => 'RCPT-0001') }));
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
+// Side effects after COMMIT: asserted, not performed.
+jest.mock('../lib/activityLog', () => ({ logActivity: jest.fn(async () => {}) }));
+jest.mock('../modules/automation/automation.triggers', () => ({ paymentReceived: jest.fn(async () => {}) }));
 
 let mockUser;
 jest.mock('../middleware/auth', () => ({
@@ -69,6 +88,8 @@ jest.mock('../middleware/auth', () => ({
 const express = require('express');
 const request = require('supertest');
 const { errorHandler } = require('../middleware/errorHandler');
+const { logActivity } = require('../lib/activityLog');
+const automation = require('../modules/automation/automation.triggers');
 
 function app() {
   const a = express();
@@ -85,8 +106,11 @@ const validBody = (over = {}) => ({ client_id: CLIENT_A, amount: 5000, date: '20
 
 beforeEach(() => {
   mockTxLog.length = 0;
+  mockInsertedKeys.clear();
   mockTxClient.query.mockClear();
   mockTxClient.release.mockClear();
+  logActivity.mockClear();
+  automation.paymentReceived.mockClear();
   mockClientRow = { id: CLIENT_A, organization_id: ORG_A, trainer_id: 'trn-1', name: 'A Client' };
   mockTrainerRow = { id: 'trn-1', incentive_rate: 0.4 };
   mockDeletedPtPayment = null;
@@ -266,6 +290,47 @@ describe('POST /api/payments — the write itself', () => {
     await request(app()).post('/api/payments').send(validBody());
     expect(mockTxClient.release).toHaveBeenCalledTimes(1);
   });
+
+  // Payments audit, P1-7: a retry after a committed write used to credit the
+  // client twice. The key is the database's guarantee, not the button's.
+  test('the same idempotency key records one payment and fires its side effects once', async () => {
+    const body = validBody({ idempotency_key: 'retry-key-1' });
+
+    const first = await request(app()).post('/api/payments').send(body);
+    const second = await request(app()).post('/api/payments').send(body);
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(200);
+    expect(sqlAt(/INSERT INTO pt_payments/i)).toHaveLength(2);
+    expect(sqlAt(/UPDATE pt_clients SET paid_amount/i)).toHaveLength(1);
+    expect(logActivity).toHaveBeenCalledTimes(1);
+    expect(automation.paymentReceived).toHaveBeenCalledTimes(1);
+  });
+
+  test('a different key is a different payment', async () => {
+    const first = await request(app()).post('/api/payments').send(validBody({ idempotency_key: 'key-a' }));
+    const second = await request(app()).post('/api/payments').send(validBody({ idempotency_key: 'key-b' }));
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    expect(sqlAt(/UPDATE pt_clients SET paid_amount/i)).toHaveLength(2);
+  });
+
+  test('the key reaches the INSERT, so the unique index can enforce it', async () => {
+    await request(app()).post('/api/payments').send(validBody({ idempotency_key: 'k-9' }));
+
+    const [ins] = sqlAt(/INSERT INTO pt_payments/i);
+    expect(ins.sql).toMatch(/ON CONFLICT \(organization_id, idempotency_key\)/i);
+    expect(ins.params[11]).toBe('k-9');
+  });
+
+  test('a keyless request keeps the old blind insert', async () => {
+    await request(app()).post('/api/payments').send(validBody());
+
+    const [ins] = sqlAt(/INSERT INTO pt_payments/i);
+    expect(ins.sql).not.toMatch(/ON CONFLICT/i);
+    expect(ins.params[11]).toBeNull();
+  });
 });
 
 describe('DELETE /api/payments/:id', () => {
@@ -323,7 +388,7 @@ describe('balance_applied', () => {
     expect(res.status).toBe(201);
     const [ins] = sqlAt(/INSERT INTO pt_payments/i);
     expect(ins.sql).toMatch(/balance_applied/);
-    expect(ins.params[ins.params.length - 1]).toBe(1000);
+    expect(ins.params[10]).toBe(1000);
   });
 
   test('deleting that payment restores 1000, not 1500', async () => {
