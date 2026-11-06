@@ -2394,7 +2394,7 @@ router.post('/posture/analyze', auth, requireTrainer, requireConfigured, async (
     if (evidence.status !== 'ok') {
       const refuse = grounding.insufficientEvidenceResponse('POSTURAL analysis', evidence);
       logger.warn({
-        req_id: req.id, intent: 'posture', grounding: evidence.status,
+        req_id: req.id, intent: 'assessment', grounding: evidence.status,
         corpus_version: evidence.corpusVersion,
       }, 'ai_generate_mpts_gate_blocked');
       return res.status(refuse.httpStatus).json(refuse.body);

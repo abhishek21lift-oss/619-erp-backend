@@ -7,10 +7,10 @@
 const fs = require('fs');
 const path = require('path');
 
-const MIGRATION = path.join(__dirname, '..', 'db', 'migrations', '268_posture_assessment_upgrade.sql');
+const MIGRATION = path.join(__dirname, '..', 'db', 'migrations', '269_posture_assessment_upgrade.sql');
 const ROUTES = path.join(__dirname, '..', 'modules', 'progress', 'progress.routes.js');
 
-describe('migration 268 — postural assessment upgrade', () => {
+describe('migration 269 — postural assessment upgrade', () => {
   const sql = fs.readFileSync(MIGRATION, 'utf8');
 
   it.each([
