@@ -73,6 +73,7 @@ const {
   buildDietSystemPrompt,
   buildProgressSystemPrompt,
   buildFitnessTestingSystemPrompt,
+  buildPostureSystemPrompt,
   buildBusinessSystemPrompt,
 } = require('../lib/ai/prompts/system');
 
@@ -2357,6 +2358,138 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
     }
     try {
       res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Fitness testing analysis failed. Please try again.' })}\n\n`);
+    } catch { /* ignore write errors on closed connection */ }
+  } finally {
+    if (stopHeartbeat) stopHeartbeat();
+    try { if (!res.writableEnded) res.end(); } catch { /* ignore */ }
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   5b. POSTURAL INSIGHTS
+   POST /api/ai/posture/analyze
+   Suggestions only. Nothing returned here is written to the assessment; the
+   trainer adds individual items to the corrective plan explicitly.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const postureStringList = (v, cap = 30) => (Array.isArray(v) ? v.slice(0, cap).map((x) => String(x).slice(0, 120)) : []);
+
+router.post('/posture/analyze', auth, requireTrainer, requireConfigured, async (req, res) => {
+  const { client_id, observations, muscle_imbalances, trainer_notes } = req.body || {};
+  if (!client_id) return res.status(400).json({ error: 'client_id is required' });
+
+  let stopHeartbeat = null;
+  try {
+    const org = orgParam(req);
+    const client = await loadClientRow(client_id, org);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+
+    // Methodology interpretation, so it grounds against the approved corpus or
+    // refuses exactly like the other assessment analyses.
+    const evidence = await grounding.assembleEvidence({
+      organizationId: org,
+      userId: req.user?.id,
+      route: 'posture.analyze',
+      query: 'MY PT STUDIO methodology for postural screening, corrective exercise selection, mobility and activation prescription, and re-assessment',
+    });
+    if (evidence.status !== 'ok') {
+      const refuse = grounding.insufficientEvidenceResponse('POSTURAL analysis', evidence);
+      logger.warn({
+        req_id: req.id, intent: 'posture', grounding: evidence.status,
+        corpus_version: evidence.corpusVersion,
+      }, 'ai_generate_mpts_gate_blocked');
+      return res.status(refuse.httpStatus).json(refuse.body);
+    }
+
+    // Only known fields reach the prompt. Anything else in the request body is
+    // not model input, whatever it claims to be.
+    const contextData = {
+      client: { name: client.name },
+      observations: {
+        anterior: postureStringList(observations?.front),
+        lateral: postureStringList(observations?.side),
+        posterior: postureStringList(observations?.back),
+      },
+      other_notes: {
+        front: String(observations?.frontNotes || '').slice(0, 1000),
+        side: String(observations?.sideNotes || '').slice(0, 1000),
+        back: String(observations?.backNotes || '').slice(0, 1000),
+        general: String(observations?.generalNotes || '').slice(0, 1000),
+      },
+      confirmed_muscle_findings: Array.isArray(muscle_imbalances)
+        ? muscle_imbalances.slice(0, 40).map((m) => ({
+          muscle: String(m?.muscle || '').slice(0, 80),
+          status: m?.status === 'tight' || m?.status === 'weak' ? m.status : 'normal',
+          side: ['left', 'right', 'bilateral'].includes(m?.side) ? m.side : null,
+          notes: String(m?.notes || '').slice(0, 500),
+        }))
+        : [],
+      trainer_notes: String(trainer_notes || '').slice(0, 3000),
+    };
+
+    const userPrompt = `Review the following postural screen and suggest a corrective plan for the trainer to approve:\n\n${JSON.stringify(contextData, null, 2)}\n\nAUTHORIZED KNOWLEDGE BASE:\n${evidence.chunks.map((c, i) => `[${i + 1}] (${c.title}) ${c.content}`).join('\n')}`;
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    stopHeartbeat = startSseHeartbeat(res);
+    const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
+    let fullContent = '';
+    let streamMeta = { model: models.primary, tier: 'primary', used_fallback: false };
+
+    const it = routedStream({
+      intent: 'assessment',
+      messages: [
+        { role: 'system', content: buildPostureSystemPrompt() },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.4,
+      max_tokens: 4000,
+    })[Symbol.asyncIterator]();
+
+    let step;
+    while (!(step = await it.next()).done) {
+      if (typeof step.value === 'string') {
+        if (step.value.startsWith('\n\n[Retrying')) fullContent = '';
+        else fullContent += step.value;
+      }
+      res.write(': ping\n\n');
+    }
+    if (step.value && typeof step.value === 'object') streamMeta = step.value;
+
+    const analysis = extractJson(fullContent);
+    if (!analysis) {
+      send({ type: 'error', message: 'Could not parse AI response' });
+      res.end();
+      return;
+    }
+
+    const citationCheck = grounding.validateGroundedOutput(analysis, evidence);
+    grounding.sanitizeCitations(analysis, citationCheck);
+
+    logUsage({
+      user_id: req.user.id,
+      model: streamMeta.model,
+      intent_type: 'assessment',
+      organization_id: req.user?.organization_id ?? null,
+      routed_via: streamMeta.routed_via ?? null,
+      ...usageFields(streamMeta.usage, fullContent),
+      latency_ms: streamMeta.latency_ms ?? 0,
+      used_fallback: streamMeta.used_fallback,
+    }).catch(() => {});
+
+    send({ type: 'done', data: analysis, grounding: grounding.groundingBlock(evidence, citationCheck), model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
+  } catch (err) {
+    logger.error({ err: err.message }, 'ai_posture_analyze_error');
+    if (!res.headersSent) {
+      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+      return res.status(503).json({ error: 'Postural analysis failed', message: publicAiMessage(err) });
+    }
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Postural analysis failed. Please try again.' })}\n\n`);
     } catch { /* ignore write errors on closed connection */ }
   } finally {
     if (stopHeartbeat) stopHeartbeat();
