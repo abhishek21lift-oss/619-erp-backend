@@ -31,7 +31,7 @@ const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./
 const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
 // Shared with the member app's self-logged workouts (client-portal).
 const {
-  recomputeAssignmentProgress, computePrFlags, startSession, SessionStartError,
+  recomputeAssignmentProgress, computePrFlags, startSession, getSessionState, SessionStartError,
 } = require('./workout-log.service');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
@@ -399,12 +399,8 @@ router.patch('/workout-log/sessions/:id', auth, requireTrainer, validate(session
   // "Finish Workout" is not a second completion.
   let before = null;
   if (b.status === 'completed') {
-    const { rows: current } = await pool.query(
-      `SELECT status, source FROM workout_sessions WHERE id = $1 AND organization_id = $2`,
-      [id, scope.orgId]
-    );
-    if (!current[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-    before = current[0];
+    before = await getSessionState(pool, { orgId: scope.orgId, sessionId: id });
+    if (!before) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   }
   const createsFeedback = Boolean(
     before && before.status !== 'completed' && before.source === 'studio'
