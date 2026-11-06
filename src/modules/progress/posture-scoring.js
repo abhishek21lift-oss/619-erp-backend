@@ -15,7 +15,7 @@ function clamp(n, min, max) {
 
 // Scoliosis is weighted higher — it's the one deviation on this list that's
 // a genuine referral flag rather than just a coaching cue.
-const ISSUE_WEIGHT = { Scoliosis: 15 };
+const ISSUE_WEIGHT = { Scoliosis: 15, 'Possible Scoliosis': 15 };
 const DEFAULT_ISSUE_WEIGHT = 8;
 
 function calcPostureRiskScore(frontIssues, sideIssues, backIssues) {
@@ -38,7 +38,7 @@ function classifyRisk(score) {
 // above says so, and now the result does too.
 function calcPostureReferrals(frontIssues, sideIssues, backIssues) {
   const all = [...(frontIssues || []), ...(sideIssues || []), ...(backIssues || [])];
-  return all.includes('Scoliosis')
+  return all.includes('Scoliosis') || all.includes('Possible Scoliosis')
     ? ['Suspected scoliosis — refer for a medical assessment before loading the spine.']
     : [];
 }

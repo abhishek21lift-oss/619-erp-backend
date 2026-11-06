@@ -45,6 +45,9 @@ describe('image bodies are allowed on exactly the paths that carry one', () => {
     expect(matches('/api/pt-os/informed-consent/xyz-9', 'PATCH')).toBe(true);
     // Remote signing posts the same signature from a phone with no session.
     expect(matches(`/api/public/form-signing/${'a'.repeat(64)}`)).toBe(true);
+    // Three cropped view photographs in one posture-assessment save.
+    expect(matches('/api/progress/posture-assessments')).toBe(true);
+    expect(matches('/api/progress/posture-assessments/pa-1', 'PATCH')).toBe(true);
   });
 
   test('the method is part of the match', () => {
@@ -69,6 +72,8 @@ describe('image bodies are allowed on exactly the paths that carry one', () => {
       '/api/pt-os/parq/forms/f-1/consent/extra',
       '/api/auth/login',
       '/api/clients/abc-123/photo',           // the deleted legacy route
+      '/api/progress/posture-assessments/pa-1', // POST to the item path is not a save
+      '/api/progress/posture-assessments/pa-1/photo',
     ].filter(matches);
     expect(outsiders).toEqual([]);
   });

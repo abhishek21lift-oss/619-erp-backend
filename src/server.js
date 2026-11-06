@@ -527,6 +527,9 @@ const imageJson = express.json({ limit: '4mb' });
 const IMAGE_JSON_PATHS = [
   ['POST', /^\/api\/pt-os\/clients\/[^/]+\/photo$/],
   ['POST', /^\/api\/progress\/progress-photos$/],
+  // A posture assessment can carry three view photographs in one save.
+  ['POST', /^\/api\/progress\/posture-assessments$/],
+  ['PATCH', /^\/api\/progress\/posture-assessments\/[^/]+$/],
   ['POST', /^\/api\/pt-os\/informed-consent\/[^/]+\/sign$/],
   ['PATCH', /^\/api\/pt-os\/informed-consent\/[^/]+$/],
   ['POST', /^\/api\/pt-os\/parq\/forms\/[^/]+\/consent$/],
