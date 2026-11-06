@@ -213,4 +213,28 @@ describe('GET /workout-log/sessions/:id — prescription contract', () => {
     expect(res.body.data.summary.total_volume).toBe(0);
     expect(res.body.data.summary.total_reps).toBe(0);
   });
+
+  it('exposes the plan identity and row ids for plan sync', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rows: [{
+        id: 's-1', workout_assignment_id: 'wa-1',
+        workout_day: 'Monday', session_date: '2026-11-06',
+      }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{
+        plan_id: 'plan-1', plan_name: 'PPL', duration_weeks: 4,
+        progression_type: 'none', progression_amount: 0,
+        progression_every_weeks: 1, start_date: '2026-11-06',
+      }] })
+      .mockResolvedValueOnce({ rows: [{
+        row_id: 'we-1', exercise_id: 'ex-1', name: 'Bench Press',
+        sets: 3, reps: 8, rest_seconds: 90, sort_order: 0, week_number: 1,
+      }] });
+
+    const res = await request(app()).get('/api/pt-os/workout-log/sessions/s-1').expect(200);
+
+    expect(res.body.data.planned.plan_id).toBe('plan-1');
+    expect(res.body.data.planned.day_of_week).toBe(1);
+    expect(res.body.data.planned.exercises[0].row_id).toBe('we-1');
+  });
 });
