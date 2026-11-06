@@ -48,6 +48,8 @@ describe('pending feedback reminders', () => {
     const scan = queries[0];
     expect(scan.sql).toMatch(/f\.status = 'pending'/);
     expect(scan.sql).toMatch(/f\.completed_at < NOW\(\) - \(\$1::int \* INTERVAL '1 hour'\)/);
+    expect(scan.sql).toMatch(/LEFT JOIN workout_sessions ws/);
+    expect(scan.sql).toMatch(/COALESCE\(s\.title, ws\.program_name\) AS session_title/);
     expect(scan.params).toEqual([REMIND_AFTER_HOURS]);
     expect(REMIND_AFTER_HOURS).toBe(24);
   });

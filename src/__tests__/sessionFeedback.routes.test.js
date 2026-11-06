@@ -75,6 +75,17 @@ describe('member feedback routes', () => {
     expect(allParams()).not.toContain(OTHER_CLIENT);
   });
 
+  it('reads a request through whichever session source owns it', async () => {
+    mockRespond = () => ({ rows: [], rowCount: 0 });
+    await request(member()).get('/api/feedback');
+
+    const list = mockQueries[0];
+    expect(list.sql).toMatch(/LEFT JOIN pt_sessions s/);
+    expect(list.sql).toMatch(/LEFT JOIN workout_sessions ws/);
+    expect(list.sql).toMatch(/COALESCE\(s\.title, ws\.program_name\) AS session_title/);
+    expect(list.sql).toMatch(/COALESCE\(s\.session_date, ws\.session_date\) AS session_date/);
+  });
+
   it('submits once and stores the weighted score', async () => {
     mockRespond = (q) => {
       if (/^UPDATE pt_session_feedback/i.test(q.sql)) {
@@ -90,6 +101,7 @@ describe('member feedback routes', () => {
     expect(update.sql).toMatch(/client_id = \$2/);
     expect(update.sql).toMatch(/organization_id = \$3/);
     expect(update.sql).toMatch(/status = 'pending'/);
+    expect(update.sql).toMatch(/COALESCE\(f\.session_id, f\.workout_session_id\) AS session_id/);
     expect(update.params).toContain(CLIENT_A);
     expect(update.params).toContain(ORG_A);
   });

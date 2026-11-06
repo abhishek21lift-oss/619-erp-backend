@@ -77,7 +77,7 @@ const notificationInsert = () => queries.find((q) => /^INSERT INTO notifications
 beforeEach(() => {
   queries.length = 0;
   mockCreated = [{ id: FEEDBACK, session_id: SESSION, client_id: CLIENT }];
-  mockCurrentSession = { status: 'scheduled', client_id: CLIENT, start_time: '10:00:00', duration_minutes: 60 };
+  mockCurrentSession = { status: 'scheduled', client_id: CLIENT, start_time: '10:00:00', duration_minutes: 60, session_date: '2026-11-05' };
   mockUser = { id: 'u1', role: 'trainer', name: 'Owner', organization_id: ORG };
 });
 
@@ -95,7 +95,8 @@ describe('completing a session creates one feedback request', () => {
     expect(insert).toBeTruthy();
     expect(insert.sql).toMatch(/ON CONFLICT \(session_id\) DO NOTHING/);
     expect(insert.sql).toMatch(/organization_id, session_id, client_id, trainer_id, completed_at/);
-    expect(insert.params).toEqual([ORG, SESSION, CLIENT, 'tr-1', '2026-11-06T10:00:00.000Z']);
+    expect(insert.sql).toMatch(/JOIN workout_sessions ws/);
+    expect(insert.params).toEqual([ORG, SESSION, CLIENT, 'tr-1', '2026-11-06T10:00:00.000Z', '2026-11-05']);
 
     const notify = notificationInsert();
     expect(notify).toBeTruthy();
