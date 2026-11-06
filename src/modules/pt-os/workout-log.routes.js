@@ -20,6 +20,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { calc1RM } = require('../progress/fitness-scoring');
 const { checkTrainingEligibility } = require('../../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../../lib/tenant-db');
+const feedback = require('../session-feedback/feedback.service');
 // The canonical Today rule. This adapter serialises it; it does not
 // re-implement it — see pt-os.service.getTodayRoster.
 const svc = require('./pt-os.service');
@@ -30,7 +31,7 @@ const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./
 const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
 // Shared with the member app's self-logged workouts (client-portal).
 const {
-  recomputeAssignmentProgress, computePrFlags, startSession, SessionStartError,
+  recomputeAssignmentProgress, computePrFlags, startSession, getSessionState, SessionStartError,
 } = require('./workout-log.service');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
@@ -392,14 +393,63 @@ router.patch('/workout-log/sessions/:id', auth, requireTrainer, validate(session
   if (!sets.length) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
   sets.push('updated_at = NOW()');
   const scope = tenantScope(req);
+
+  // Completion is the one write that asks the client for feedback. The
+  // previous state decides whether this is a real transition: a retried
+  // "Finish Workout" is not a second completion.
+  let before = null;
+  if (b.status === 'completed') {
+    before = await getSessionState(pool, { orgId: scope.orgId, sessionId: id });
+    if (!before) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  }
+  const createsFeedback = Boolean(
+    before && before.status !== 'completed' && before.source === 'studio'
+  );
+
   let whereGuard = '';
   params.push(scope.orgId); whereGuard = ` AND organization_id = $${params.length}`;
-  const { rows } = await pool.query(`UPDATE workout_sessions SET ${sets.join(', ')} WHERE id = $1${whereGuard} RETURNING *`, params);
-  if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-  if (b.status !== undefined && rows[0].workout_assignment_id) {
-    await recomputeAssignmentProgress(rows[0].workout_assignment_id, scope.orgId);
+
+  const applyUpdate = async () => {
+    const result = await pool.query(
+      `UPDATE workout_sessions SET ${sets.join(', ')} WHERE id = $1${whereGuard} RETURNING *`,
+      params
+    );
+    const session = result.rows[0];
+    if (!session || !createsFeedback) return result;
+
+    // Same transaction when the tenant session is enforced, so the completion
+    // and the client's prompt land together. The request is deduped by
+    // UNIQUE(workout_session_id) and the notification by ref_id.
+    const request = await feedback.createWorkoutRequest(pool, {
+      orgId: scope.orgId,
+      workoutSessionId: session.id,
+      clientId: session.client_id,
+      trainerId: session.trainer_id,
+      completedAt: session.updated_at || new Date(),
+      sessionDate: session.session_date,
+    });
+    if (request) {
+      await feedback.notifyMemberOfRequest(pool, {
+        clientId: session.client_id,
+        orgId: scope.orgId,
+        feedbackId: request.id,
+        sessionTitle: session.program_name,
+      });
+    }
+    return result;
+  };
+
+  // A plain pg.Pool has no scoped-session helper; both inserts are
+  // independently deduped, so outside a transaction is still safe.
+  const result = createsFeedback && pool.withTenantSession
+    ? await pool.withTenantSession(applyUpdate)
+    : await applyUpdate();
+  const session = result.rows[0];
+  if (!session) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (b.status !== undefined && session.workout_assignment_id) {
+    await recomputeAssignmentProgress(session.workout_assignment_id, scope.orgId);
   }
-  res.json({ data: rows[0] });
+  res.json({ data: session });
 }));
 
 // DELETE /workout-log/sessions/:id

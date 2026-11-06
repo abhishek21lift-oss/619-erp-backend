@@ -1,5 +1,7 @@
 'use strict';
-// Post-session feedback: one request per completed PT session.
+// Post-session feedback: one request per completed PT or trainer-led workout
+// session. A row points at exactly one source: pt_sessions (booked) or
+// workout_sessions (finished in the Workout Log).
 //
 // Identity rules, same shape as client-portal:
 //   · the member's client id and organization come from req.user, never the
@@ -17,37 +19,76 @@ const { scoreFeedback, weightsFromEnv } = require('../../lib/sessionFeedback');
 const LOW_RATING = 3;
 
 const LIST_COLUMNS = `
-  f.id, f.session_id, f.client_id, f.trainer_id, f.completed_at, f.status,
+  f.id, f.session_id, f.workout_session_id, f.client_id, f.trainer_id,
+  f.completed_at, f.status,
   f.trainer_behaviour, f.form_technique, f.workout_intensity,
   f.motivation_guidance, f.overall_stars, f.additional_feedback,
   f.score, f.submitted_at,
-  s.title AS session_title, s.session_date,
+  COALESCE(s.title, ws.program_name) AS session_title,
+  COALESCE(s.session_date, ws.session_date) AS session_date,
   s.start_time::text AS start_time,
   c.name AS client_name,
   t.name AS trainer_name`;
 
 const FROM_JOINS = `
   FROM pt_session_feedback f
-  JOIN pt_sessions s ON s.id = f.session_id
+  LEFT JOIN pt_sessions s ON s.id = f.session_id AND s.organization_id = f.organization_id
+  LEFT JOIN workout_sessions ws ON ws.id = f.workout_session_id AND ws.organization_id = f.organization_id
   JOIN pt_clients c ON c.id = f.client_id
   LEFT JOIN trainers t ON t.id = f.trainer_id`;
 
 /**
- * Create the pending request for a completed session.
+ * Create the pending request for a completed booked session.
  *
  * ON CONFLICT is the one-request rule: completion retried, or two completion
- * handlers racing, still leave one row. Returns the row when this call created
- * it, and null when a request already existed — the caller uses that to decide
- * whether to notify.
+ * handlers racing, still leave one row. The NOT EXISTS guard is the cross-source
+ * rule: a prompt already waiting for a workout on the same client and day is
+ * enough; the client does not need a second one from My Schedule.
+ *
+ * Returns the row when this call created it, and null when a request already
+ * existed — the caller uses that to decide whether to notify.
  */
-async function createRequest(db, { orgId, sessionId, clientId, trainerId, completedAt }) {
+async function createRequest(db, { orgId, sessionId, clientId, trainerId, completedAt, sessionDate }) {
   const { rows } = await db.query(
     `INSERT INTO pt_session_feedback
        (organization_id, session_id, client_id, trainer_id, completed_at)
-     VALUES ($1, $2, $3, $4, $5)
+     SELECT $1, $2, $3, $4, $5
+      WHERE NOT EXISTS (
+        SELECT 1
+          FROM pt_session_feedback f
+          JOIN workout_sessions ws ON ws.id = f.workout_session_id
+                                   AND ws.organization_id = f.organization_id
+         WHERE f.organization_id = $1 AND f.client_id = $3
+           AND ws.session_date = $6::date
+      )
      ON CONFLICT (session_id) DO NOTHING
      RETURNING id, session_id, client_id`,
-    [orgId, sessionId, clientId, trainerId || null, completedAt]
+    [orgId, sessionId, clientId, trainerId || null, completedAt, sessionDate]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * The same request, for a trainer-led workout-log session. The mirror of
+ * createRequest: one row per workout_session_id, suppressed when a booked
+ * session on the same client and day already has a pending feedback row.
+ */
+async function createWorkoutRequest(db, { orgId, workoutSessionId, clientId, trainerId, completedAt, sessionDate }) {
+  const { rows } = await db.query(
+    `INSERT INTO pt_session_feedback
+       (organization_id, workout_session_id, client_id, trainer_id, completed_at)
+     SELECT $1, $2, $3, $4, $5
+      WHERE NOT EXISTS (
+        SELECT 1
+          FROM pt_session_feedback f
+          JOIN pt_sessions s ON s.id = f.session_id
+                            AND s.organization_id = f.organization_id
+         WHERE f.organization_id = $1 AND f.client_id = $3
+           AND s.session_date = $6::date
+      )
+     ON CONFLICT (workout_session_id) DO NOTHING
+     RETURNING id, workout_session_id, client_id`,
+    [orgId, workoutSessionId, clientId, trainerId || null, completedAt, sessionDate]
   );
   return rows[0] || null;
 }
@@ -141,7 +182,8 @@ async function submitFeedback({ feedbackId, clientId, orgId, answers }) {
             updated_at = NOW()
       WHERE f.id = $1 AND f.client_id = $2 AND f.organization_id = $3
         AND f.status = 'pending'
-      RETURNING f.id, f.session_id, f.status, f.score, f.submitted_at`,
+      RETURNING f.id, COALESCE(f.session_id, f.workout_session_id) AS session_id,
+                f.status, f.score, f.submitted_at`,
     [
       feedbackId, clientId, orgId,
       answers.trainer_behaviour, answers.form_technique, answers.workout_intensity,
@@ -275,10 +317,13 @@ async function getForTrainer(orgId, feedbackId) {
 /** Pending requests older than `hours`, for the reminder sweep. */
 async function pendingOlderThan(hours) {
   const { rows } = await pool.query(
-    `SELECT f.id, f.organization_id, f.session_id, f.client_id,
-            s.title AS session_title, s.session_date, u.id AS user_id
+    `SELECT f.id, f.organization_id, f.session_id, f.workout_session_id, f.client_id,
+            COALESCE(s.title, ws.program_name) AS session_title,
+            COALESCE(s.session_date, ws.session_date) AS session_date,
+            u.id AS user_id
        FROM pt_session_feedback f
-       JOIN pt_sessions s ON s.id = f.session_id
+       LEFT JOIN pt_sessions s ON s.id = f.session_id AND s.organization_id = f.organization_id
+       LEFT JOIN workout_sessions ws ON ws.id = f.workout_session_id AND ws.organization_id = f.organization_id
        LEFT JOIN users u ON u.pt_client_id = f.client_id AND u.deleted_at IS NULL
       WHERE f.status = 'pending'
         AND f.completed_at < NOW() - ($1::int * INTERVAL '1 hour')
@@ -313,6 +358,7 @@ async function remind(db, row) {
 module.exports = {
   LOW_RATING,
   createRequest,
+  createWorkoutRequest,
   notifyMemberOfRequest,
   notifyLowRating,
   listForClient,

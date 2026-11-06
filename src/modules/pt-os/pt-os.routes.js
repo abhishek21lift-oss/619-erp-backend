@@ -1818,6 +1818,7 @@ router.patch('/sessions/:id', auth, wrap(async (req, res) => {
       clientId: session.client_id,
       trainerId: session.trainer_id,
       completedAt: session.completed_at || new Date(),
+      sessionDate: session.session_date,
     });
     if (request) {
       await feedback.notifyMemberOfRequest(pool, {

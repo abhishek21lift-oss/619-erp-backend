@@ -261,9 +261,18 @@ async function computePrFlags(client, { clientId, orgId, exerciseId, exerciseNam
   };
 }
 
+/** Current status/source of a workout-log session in this studio, or null. */
+async function getSessionState(db, { orgId, sessionId }) {
+  const { rows } = await db.query(
+    `SELECT status, source FROM workout_sessions WHERE id = $1 AND organization_id = $2`,
+    [sessionId, orgId]
+  );
+  return rows[0] || null;
+}
+
 module.exports = {
   recomputeAssignmentProgress, computePrFlags, startSession, closeStaleSessions,
-  abandonEmptyStaleSessions, SessionStartError,
+  abandonEmptyStaleSessions, getSessionState, SessionStartError,
   // exported for tests
   requestDate, weekdayOf,
 };
