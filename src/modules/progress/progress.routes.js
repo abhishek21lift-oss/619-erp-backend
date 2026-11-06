@@ -22,6 +22,7 @@ const { logActivity } = require('../../lib/activityLog');
 const { today: studioToday, mondayOf, dbDate } = require('../../lib/appTime');
 const { optionalNumber } = require('../../lib/zodNumbers');
 const { rejectMovedFields } = require('../../lib/fieldOwnership');
+const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
 
 // Facts these forms used to write that another module owns. The columns stay
 // readable as legacy fallbacks; a supplied value is a 422 naming the owner.
@@ -1871,15 +1872,71 @@ router.patch('/mobility-performance-assessments/:id', auth, validate(mobilityPer
   res.json({ data: withMobilityReferrals(rows[0]) });
 }));
 
+const postureExerciseSchema = z.object({
+  exercise: z.string().max(120),
+  target_muscle: text(120),
+  region: text(60),
+  duration: text(60),
+  sets: text(20),
+  reps: text(20),
+  hold: text(40),
+  resistance: text(60),
+  tempo: text(40),
+  rest: text(40),
+  frequency: text(60),
+  instructions: text(1000),
+});
+
+const postureCorrectivePlanSchema = z.object({
+  mobility: z.array(postureExerciseSchema).max(30).optional().nullable(),
+  activation: z.array(postureExerciseSchema).max(30).optional().nullable(),
+  strengthening: z.array(postureExerciseSchema).max(30).optional().nullable(),
+  recommendations: z.object({
+    general: text(2000),
+    modifications: text(2000),
+    precautions: text(2000),
+    follow_up: text(2000),
+    additional: text(2000),
+  }).optional().nullable(),
+}).optional().nullable();
+
+const postureMuscleFindingSchema = z.object({
+  muscle: z.string().max(80),
+  status: z.enum(['normal', 'tight', 'weak']),
+  side: z.enum(['left', 'right', 'bilateral']).optional().nullable(),
+  notes: text(500),
+});
+
 const postureAssessmentCreateSchema = {
   body: z.object({
     client_id: z.string(),
     assessment_date: pastDate(),
+    assessment_type: z.enum(['initial', 'follow_up', 're_assessment', 'progress']).optional().nullable(),
+    status: z.enum(['draft', 'completed']).optional(),
 
-    front_issues: textList(60, 20),
-    side_issues: textList(60, 20),
-    back_issues: textList(60, 20),
+    front_issues: textList(80, 30),
+    side_issues: textList(80, 30),
+    back_issues: textList(80, 30),
     other_issue_notes: text(1000),
+    view_notes: z.object({
+      front: text(1000), side: text(1000), back: text(1000),
+    }).optional().nullable(),
+
+    // A cropped data URL is validated by signature and size in the handler —
+    // a string that merely claims to be an image is not stored.
+    front_photo_url: z.string().max(1500000).optional().nullable(),
+    side_photo_url: z.string().max(1500000).optional().nullable(),
+    back_photo_url: z.string().max(1500000).optional().nullable(),
+
+    muscle_imbalances: z.array(postureMuscleFindingSchema).max(40).optional().nullable(),
+    corrective_plan: postureCorrectivePlanSchema,
+    assessment_summary: z.object({
+      primary_concern: text(1000),
+      secondary_concern: text(1000),
+      trainer_assessment: text(3000),
+      client_recommendations: text(3000),
+    }).optional().nullable(),
+    resolved_findings: textList(80, 40),
 
     coach_notes: coachNotesSchema,
   }),
@@ -1895,6 +1952,29 @@ function computePostureAnalysis(b) {
   return { postureRiskScore, postureRiskLevel };
 }
 
+/** Re-labels a stored photo with its detected MIME type, or rejects it. */
+function posturePhoto(value) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  return parseClientPhoto(value);
+}
+
+function postureJson(value) {
+  return value === undefined ? undefined : (value == null ? null : JSON.stringify(value));
+}
+
+// Photos are deliberately absent from the list payload: a client with twenty
+// assessments would otherwise ship up to twenty megabytes of base64 to draw a
+// history screen that only needs dates and counts. The single-record read below
+// is what the editor and the report use.
+const POSTURE_LIST_COLUMNS = `id, client_id, organization_id, assessment_number, assessment_date,
+  assessment_type, status, front_issues, side_issues, back_issues, other_issue_notes,
+  posture_risk_score, posture_risk_level, view_notes, muscle_imbalances, corrective_plan,
+  assessment_summary, resolved_findings, coach_notes, created_by, created_at, updated_at, completed_at,
+  (front_photo_url IS NOT NULL) AS has_front_photo,
+  (side_photo_url IS NOT NULL) AS has_side_photo,
+  (back_photo_url IS NOT NULL) AS has_back_photo`;
+
 router.get('/posture-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
@@ -1905,43 +1985,81 @@ router.get('/posture-assessments', auth, wrap(async (req, res) => {
   params.push(scope.orgId); where.push(`organization_id = $${params.length}`);
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
-    `SELECT * FROM pt_posture_assessments ${whereSql} ORDER BY assessment_date DESC`, params
+    `SELECT ${POSTURE_LIST_COLUMNS} FROM pt_posture_assessments ${whereSql}
+      ORDER BY assessment_date DESC, created_at DESC`, params
   );
   res.json({ data: rows.map(withPostureReferrals) });
+}));
+
+router.get('/posture-assessments/:id', auth, wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT * FROM pt_posture_assessments WHERE id = $1 AND organization_id = $2',
+    [req.params.id, tenantScope(req).orgId]
+  );
+  if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  res.json({ data: withPostureReferrals(rows[0]) });
 }));
 
 router.post('/posture-assessments', auth, requireTrainer, validate(postureAssessmentCreateSchema), wrap(async (req, res) => {
   const b = req.body;
   if (!await clientInOrg(req, b.client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const analysis = computePostureAnalysis(b);
+  const status = b.status || 'completed';
+  let photos;
+  try {
+    photos = {
+      front: posturePhoto(b.front_photo_url),
+      side: posturePhoto(b.side_photo_url),
+      back: posturePhoto(b.back_photo_url),
+    };
+  } catch (err) {
+    if (err instanceof PhotoInputError) return res.status(400).json({ error: { code: 'INVALID_PHOTO', message: err.message } });
+    throw err;
+  }
 
   const { rows } = await withNumberLock(`posture:${b.client_id}`, (tx) => tx.query(
     `INSERT INTO pt_posture_assessments (
-       client_id, assessment_number, assessment_date,
-       front_issues, side_issues, back_issues, other_issue_notes,
+       client_id, assessment_number, assessment_date, assessment_type, status, completed_at,
+       front_issues, side_issues, back_issues, other_issue_notes, view_notes,
+       front_photo_url, side_photo_url, back_photo_url,
+       muscle_imbalances, corrective_plan, assessment_summary, resolved_findings,
        posture_risk_score, posture_risk_level,
        coach_notes, created_by, organization_id
      ) VALUES (
-       $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_posture_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
-       $3,$4,$5,$6,
-       $7,$8,
-       $9::jsonb,$10,$11
+       $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_posture_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),$3,$4,$5,
+       $6,$7,$8,$9,$10::jsonb,
+       $11,$12,$13,
+       $14::jsonb,$15::jsonb,$16::jsonb,$17,
+       $18,$19,
+       $20::jsonb,$21,$22
      ) RETURNING *`,
     [
-      b.client_id, b.assessment_date || studioToday(),
+      b.client_id, b.assessment_date || studioToday(), b.assessment_type || null, status,
+      status === 'completed' ? new Date() : null,
       b.front_issues && b.front_issues.length ? b.front_issues : null,
       b.side_issues && b.side_issues.length ? b.side_issues : null,
       b.back_issues && b.back_issues.length ? b.back_issues : null,
-      b.other_issue_notes || null,
+      b.other_issue_notes || null, postureJson(b.view_notes) ?? null,
+      photos.front ?? null, photos.side ?? null, photos.back ?? null,
+      postureJson(b.muscle_imbalances) ?? null,
+      postureJson(b.corrective_plan) ?? null,
+      postureJson(b.assessment_summary) ?? null,
+      b.resolved_findings && b.resolved_findings.length ? b.resolved_findings : null,
       analysis.postureRiskScore, analysis.postureRiskLevel,
-      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
+      postureJson(b.coach_notes) ?? null, req.user.id, orgIdOf(req),
     ]
   ));
   res.status(201).json({ data: withPostureReferrals(rows[0]) });
 }));
 
 router.patch('/posture-assessments/:id', auth, validate(postureAssessmentUpdateSchema), wrap(async (req, res) => {
-  const allowed = ['assessment_date', 'front_issues', 'side_issues', 'back_issues', 'other_issue_notes', 'coach_notes'];
+  const allowed = [
+    'assessment_date', 'assessment_type', 'front_issues', 'side_issues', 'back_issues',
+    'other_issue_notes', 'view_notes', 'front_photo_url', 'side_photo_url', 'back_photo_url',
+    'muscle_imbalances', 'corrective_plan', 'assessment_summary', 'resolved_findings', 'coach_notes',
+  ];
+  const jsonColumns = new Set(['view_notes', 'muscle_imbalances', 'corrective_plan', 'assessment_summary', 'coach_notes']);
+  const photoColumns = new Set(['front_photo_url', 'side_photo_url', 'back_photo_url']);
 
   const scope = tenantScope(req);
   const guard = ' AND organization_id = $2';
@@ -1955,8 +2073,27 @@ router.patch('/posture-assessments/:id', auth, validate(postureAssessmentUpdateS
   const sets = []; const params = [req.params.id];
   for (const key of allowed) {
     if (req.body[key] !== undefined) {
-      const val = key === 'coach_notes' && req.body[key] != null ? JSON.stringify(req.body[key]) : req.body[key];
+      let val;
+      if (photoColumns.has(key)) {
+        try { val = posturePhoto(req.body[key]); }
+        catch (err) {
+          if (err instanceof PhotoInputError) return res.status(400).json({ error: { code: 'INVALID_PHOTO', message: err.message } });
+          throw err;
+        }
+      } else if (jsonColumns.has(key)) {
+        val = postureJson(req.body[key]);
+      } else {
+        val = req.body[key];
+      }
       params.push(val); sets.push(`${key} = $${params.length}`);
+    }
+  }
+  if (req.body.status !== undefined) {
+    params.push(req.body.status); sets.push(`status = $${params.length}`);
+    if (req.body.status === 'completed') {
+      sets.push('completed_at = COALESCE(completed_at, NOW())');
+    } else {
+      sets.push('completed_at = NULL');
     }
   }
   if (sets.length === 0) return res.status(400).json({ error: { code: 'NO_FIELDS' } });
