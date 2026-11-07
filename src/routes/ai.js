@@ -438,6 +438,20 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRou
   return { ...sources, ragChunks, exercises };
 }
 
+/**
+ * What the record says about limitations, plus what the trainer stated for
+ * this session. Never a substitution: the request body is untrusted, so it may
+ * only make the screen MORE cautious. The duplicate check is case-insensitive
+ * so a re-typed note does not appear twice in the prompt.
+ */
+function mergeStatedInjury(recorded, stated) {
+  const base = arrayToText(recorded) || (typeof recorded === 'string' ? recorded.trim() : '');
+  const extra = typeof stated === 'string' ? stated.trim().slice(0, 500) : '';
+  if (!extra) return base || null;
+  if (!base) return extra;
+  return base.toLowerCase().includes(extra.toLowerCase()) ? base : `${base}; ${extra}`;
+}
+
 // The workout prompt's NON-FACT context: the things that describe the
 // engagement rather than the person.
 //
@@ -453,9 +467,14 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRou
 // active assignment's own length wins when there is one.
 function resolveWorkoutExtras({ client, profile, goals, workoutAssignments }, body) {
   const active = workoutAssignments[0] || null;
+  // An active block's own length still wins — a request body may not rewrite
+  // the programme the client is on. Where there is no active block, a stated
+  // length is clamped to a year: the body is untrusted and a 9999-week block
+  // is a typo, not a plan.
+  const statedWeeks = Math.round(Number(body?.duration_weeks));
   const durationWeeks = active?.start_date && active?.end_date
     ? Math.max(1, Math.ceil((new Date(active.end_date) - new Date(active.start_date)) / 604800000))
-    : (Number(body.duration_weeks) || 8);
+    : (Number.isFinite(statedWeeks) && statedWeeks > 0 ? Math.min(52, statedWeeks) : 8);
 
   // Free-text limitations a trainer typed. Never defaulted to "none": the
   // old `|| 'none'` printed a clean bill of health for every client nobody
@@ -464,10 +483,16 @@ function resolveWorkoutExtras({ client, profile, goals, workoutAssignments }, bo
   //
   // The client row is read before the retired fitness profile: the profile
   // used to win here, which meant the older of two notes beat the newer one.
-  const injuries = firstDefined(client.injuries, profile?.injuries);
+  //
+  // A note the trainer typed for THIS session is ADDED to what the record
+  // already says, never substituted for it. Dropping a recorded injury because
+  // somebody typed a new one is the one direction that ends with a
+  // contraindicated lift; adding one can only make the screen more cautious.
+  const recordedInjuries = firstDefined(client.injuries, profile?.injuries);
   if (client.injuries == null && profile?.injuries != null) {
     logLegacyRead('injuries', 'Client Interview', 'client_fitness_profiles.injuries', client.id);
   }
+  const injuries = mergeStatedInjury(recordedInjuries, body?.injuries);
   const healthConditions = firstDefined(client.health_conditions, arrayToText(profile?.health_conditions));
   if (client.health_conditions == null && profile?.health_conditions != null) {
     logLegacyRead('health_conditions', 'PAR-Q', 'client_fitness_profiles.health_conditions', client.id);
