@@ -2,7 +2,6 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const jwt    = require('jsonwebtoken');
 // otplib v13 removed the `authenticator` singleton that v12 exported and
 // replaced it with these functions. Verification now returns a RESULT OBJECT
 // ({ valid, delta, ... }), not a boolean — reading it as a boolean would make
@@ -13,109 +12,21 @@ const { verifySync } = require('otplib');
 const pool   = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, invalidateUserCache } = require('../middleware/auth');
-const { ALL_ROLES, TENANT_ROLES } = require('../middleware/rbac');
 const platformAuth = require('../middleware/platformAuth');
 const { validate } = require('../middleware/validate');
 const { authSchemas } = require('../lib/validation');
 // Security Centre: one row per attempt. Fire-and-forget by design — see
 // lib/loginEvents.js. Nothing below awaits it, and it cannot fail a login.
 const loginEvents = require('../lib/loginEvents');
+const {
+  setTokenCookie, clearSessionCookies, signAccessToken,
+  issueRefreshToken, bodyTokensAllowed, sessionUserPayload,
+} = require('../lib/authSession');
+const { normalisePortal, portalProblem } = require('../lib/authPortal');
 const recovery = require('../lib/mfaRecoveryCodes');
 const { sendPasswordReset } = require('../lib/email');
 
 const isSecure = process.env.NODE_ENV !== 'development';
-
-const ACCESS_TOKEN_TTL_MS  = 15 * 60 * 1000;          // 15 minutes
-const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-function setTokenCookie(res, token) {
-  res.cookie('token', token, {
-    httpOnly: true,
-    secure: isSecure,
-    sameSite: 'strict',
-    maxAge: ACCESS_TOKEN_TTL_MS,
-    path: '/',
-  });
-}
-
-function setRefreshCookie(res, rawToken) {
-  res.cookie('refresh_token', rawToken, {
-    httpOnly: true,
-    secure: isSecure,
-    sameSite: 'strict',
-    maxAge: REFRESH_TOKEN_TTL_MS,
-    path: '/api/auth',
-  });
-}
-
-/**
- * Mint an access token for `userId` on a given plane.
- *
- * Every access token in this file goes through here so that the audience
- * cannot be forgotten at one of the four mint sites. `audience` is null for a
- * legacy session being refreshed (migration 162), and a null claim is omitted
- * rather than written, so those tokens keep exactly the shape they had.
- */
-function signAccessToken(userId, tokenVersion, audience) {
-  const payload = { id: userId, token_version: tokenVersion };
-  if (audience) payload.aud = audience;
-  return jwt.sign(payload, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN || '15m',
-  });
-}
-
-/**
- * May this response carry the session tokens in its JSON body?
- *
- * Only for a caller that is not a browser. A browser already holds both
- * tokens as httpOnly cookies — set on this same response — and a copy in the
- * body is the one place page script can read them, so any XSS could lift a
- * seven-day refresh token. The web app never reads it (its login call is
- * typed `{ user }`), and the Android app is a WebView of the same origin, so
- * it rides the cookies too.
- *
- * `Origin` is the signal because browsers attach it to every POST and page
- * script cannot remove it (a forbidden header name). Scripts, the E2E API
- * suite and any native client send none, and keep the body tokens they use
- * today.
- */
-function bodyTokensAllowed(req) {
-  return !req.headers.origin;
-}
-
-async function issueRefreshToken(res, userId, audience = null) {
-  const rawToken = crypto.randomBytes(48).toString('hex');
-  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
-  // The audience rides on the refresh token because it is a property of the
-  // SESSION, and the refresh token is the only part of a session that outlives
-  // fifteen minutes. See migration 162.
-  //
-  // Falls back to the pre-162 shape on undefined_column. Migrations run at
-  // boot, so this window is narrow, but it covers the deployment where the new
-  // code is live for the seconds before its migration lands — and the cost of
-  // not covering it is that nobody can sign in during those seconds.
-  try {
-    await pool.query(
-      'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, audience) VALUES ($1, $2, $3, $4)',
-      [userId, tokenHash, expiresAt, audience]
-    );
-  } catch (err) {
-    if (err && err.code === '42703') {
-      await pool.query(
-        'INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
-        [userId, tokenHash, expiresAt]
-      );
-    } else {
-      throw err;
-    }
-  }
-  setRefreshCookie(res, rawToken);
-  // Returned (not just cookied) so mobile/native clients — which don't share
-  // a browser cookie jar — can store it themselves and send it back via
-  // Authorization header / request body instead of a cookie.
-  return rawToken;
-}
 
 async function revokeRefreshToken(rawToken) {
   if (!rawToken) return;
@@ -220,72 +131,23 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // session's AUDIENCE — a token minted here may drive the control plane, a
     // token minted at the studio door may not, whatever role the account
     // holds. See middleware/platformAuth.js.
-    const requestedPortal = req.body.portal;
-    const portal = requestedPortal === 'member' ? 'member'
-      : requestedPortal === 'platform' ? 'platform'
-        : 'trainer';
-    const isMemberAccount = user.role === 'member';
-    const isPlatformAccount = user.role === 'super_admin';
-
-    // An account that holds none of the three roles — or a studio role with no
-    // studio — gets no session at all. The database constraints (migration
-    // 208) make such a row impossible; this keeps a session from ever being
-    // minted for one that slipped through, rather than relying on every guard
-    // downstream to notice.
-    if (!ALL_ROLES.includes(user.role)
-        || (TENANT_ROLES.includes(user.role) && !user.organization_id)) {
-      logger.error({ userId: user.id }, 'login refused: account role/tenant is misconfigured');
-      return res.status(403).json({ error: { code: 'ACCOUNT_MISCONFIGURED', message: 'This account cannot sign in. Contact support.' } });
-    }
-
-    if (portal === 'platform' && !isPlatformAccount) {
-      loginEvents.record(req, {
-        outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
-        userId: user.id, orgId: user.organization_id,
-      });
-      return res.status(403).json({
-        error: { code: 'WRONG_PORTAL', portal: isMemberAccount ? 'member' : 'trainer',
-          message: 'This is the Command Center sign-in. Use your studio login.' },
-      });
-    }
-
-    // A platform operator at the studio door.
-    //
-    // Refused only once PLATFORM_SESSION_ENFORCE is on, and the flag is what
-    // makes this shippable: today the operator signs in at /login like anyone
-    // else, and turning that into a 403 on deploy would lock them out of the
-    // console with an error they cannot clear. Until the flag flips they get a
-    // tenant-audience session here, which already cannot reach the control
-    // plane — so the boundary is real before the refusal is.
-    if (portal === 'trainer' && isPlatformAccount && platformAuth.sessionEnforced()) {
-      loginEvents.record(req, {
-        outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
-        userId: user.id, orgId: user.organization_id,
-      });
-      return res.status(403).json({
-        error: { code: 'WRONG_PORTAL', portal: 'platform',
-          message: 'This is the studio sign-in. Use the Command Center to sign in as the platform operator.' },
-      });
-    }
-
-    if (portal === 'member' && !isMemberAccount) {
-      loginEvents.record(req, {
-        outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
-        userId: user.id, orgId: user.organization_id,
-      });
-      return res.status(403).json({
-        error: { code: 'WRONG_PORTAL', portal: 'trainer',
-          message: 'This is the member sign-in. Use Trainer Login for your studio account.' },
-      });
-    }
-    if (portal === 'trainer' && isMemberAccount) {
-      loginEvents.record(req, {
-        outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
-        userId: user.id, orgId: user.organization_id,
-      });
-      return res.status(403).json({
-        error: { code: 'WRONG_PORTAL', portal: 'member',
-          message: 'This is the studio sign-in. Use Member Login for your client account.' },
+    const portal = normalisePortal(req.body.portal);
+    const problem = portalProblem(user, portal);
+    if (problem) {
+      if (problem.code === 'ACCOUNT_MISCONFIGURED') {
+        logger.error({ userId: user.id }, 'login refused: account role/tenant is misconfigured');
+      } else {
+        loginEvents.record(req, {
+          outcome: loginEvents.OUTCOMES.WRONG_PORTAL, email,
+          userId: user.id, orgId: user.organization_id,
+        });
+      }
+      return res.status(problem.status).json({
+        error: {
+          code: problem.code,
+          ...(problem.portal ? { portal: problem.portal } : {}),
+          message: problem.message,
+        },
       });
     }
 
@@ -417,21 +279,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // and send them back via `Authorization: Bearer <token>` (already
     // supported by the auth middleware) and a `refresh_token` body field.
     res.json({
-      user: {
-        id:                user.id,
-        name:              user.name,
-        email:             user.email,
-        role:              user.role,
-        trainer_id:        user.trainer_id,
-        pt_client_id:      user.pt_client_id,
-        organization_id:       user.organization_id,
-        organization_name:     user.organization_name,
-        organization_logo_url: user.organization_logo_url,
-        is_founder:            Boolean(user.is_founder),
-        founder_number:        user.founder_number ?? null,
-        avatar_url:            user.avatar_url ?? null,
-        mfaSetupRequired,
-      },
+      user: sessionUserPayload(user, { mfaSetupRequired }),
       ...(bodyTokensAllowed(req) ? { token, refresh_token: refreshToken } : {}),
     });
 
@@ -446,8 +294,7 @@ router.post('/logout', async function(req, res) {
   // Mobile clients have no refresh_token cookie to read — accept it from
   // the body as a fallback so they can revoke their session too.
   await revokeRefreshToken(req.cookies?.refresh_token || req.body?.refresh_token);
-  res.clearCookie('token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/' });
-  res.clearCookie('refresh_token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/api/auth' });
+  clearSessionCookies(res);
   res.json({ message: 'Logged out' });
 });
 

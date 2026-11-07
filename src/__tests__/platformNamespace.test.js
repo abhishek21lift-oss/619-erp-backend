@@ -90,8 +90,7 @@ describe('every session token declares its plane', () => {
   // somebody makes here, in a file about the boundary, rather than something
   // that slips in unnoticed. The count assertion below is what forces that.
   const MINTERS = [
-    ['routes/auth.js', null],                                   // both planes — the door decides
-    ['routes/auth-google.js', 'AUD_TENANT'],                    // studio door
+    ['lib/authSession.js', null],                                   // both planes — the caller decides
     ['routes/auth-webauthn.js', 'AUD_TENANT'],                  // studio door (passkey)
     ['modules/platform/super-admin/impersonation.js', 'AUD_TENANT'], // operator entering a studio
   ];
@@ -100,11 +99,17 @@ describe('every session token declares its plane', () => {
     expect(code(read(...file.split('/')))).toMatch(new RegExp(`aud:\\s*${aud}`));
   });
 
-  it('routes/auth.js routes every mint through one helper that takes the audience', () => {
-    // Four mint sites in that file — login, refresh, password change, and the
-    // refresh-token rotation beside it. A helper means the audience cannot be
-    // forgotten at one of them.
-    const src = code(read('routes', 'auth.js'));
+  it('routes/auth-google.js mints its session on the tenant plane', () => {
+    const src = code(read('routes', 'auth-google.js'));
+    expect(src).toMatch(/signAccessToken\(user\.id, user\.token_version, AUD_TENANT\)/);
+    expect(src).toMatch(/issueRefreshToken\(res, user\.id, AUD_TENANT\)/);
+  });
+
+  it('every door routes its mint through one helper that takes the audience', () => {
+    // Four mint sites in the auth routes — login, refresh, password change,
+    // and the refresh-token rotation beside it. One helper means the audience
+    // cannot be forgotten at one of them.
+    const src = code(read('lib', 'authSession.js'));
     expect(src).toMatch(/function signAccessToken\(userId, tokenVersion, audience\)/);
     expect(src).toMatch(/if \(audience\) payload\.aud = audience/);
   });
@@ -152,7 +157,8 @@ describe('the audience survives a refresh', () => {
   const src = code(read('routes', 'auth.js'));
 
   it('stores the plane on the refresh token', () => {
-    expect(src).toMatch(/INSERT INTO refresh_tokens \(user_id, token_hash, expires_at, audience\)/);
+    expect(code(read('lib', 'authSession.js')))
+      .toMatch(/INSERT INTO refresh_tokens \(user_id, token_hash, expires_at, audience\)/);
   });
 
   it('reads it back rather than re-deciding', () => {
@@ -167,7 +173,7 @@ describe('the audience survives a refresh', () => {
   it('still works on a database that has not applied migration 162', () => {
     // Migrations run at boot, so the window is narrow — but during it, nobody
     // being able to sign in is a worse outcome than an unlabelled session.
-    expect(src).toMatch(/42703/);
+    expect(code(read('lib', 'authSession.js'))).toMatch(/42703/);
   });
 });
 
