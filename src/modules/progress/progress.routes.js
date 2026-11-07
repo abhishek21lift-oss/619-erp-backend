@@ -385,7 +385,7 @@ function computeAssessment(b, age, gender, opts = {}) {
   // priority is technique. This is a warning, not a new safety gate; existing
   // vitals/medical stops remain the only blockers.
   const beginnerStrengthWarning = opts.beginner && (b.strength_exercise || b.strength_exercise_2)
-    ? 'K11 guidance: beginners should not perform an initial maximal 1RM test — prioritise movement technique. Record a comfortable submaximal set (8–12 reps) in Strength Tracking instead.'
+    ? 'Beginners should not perform an initial maximal 1RM test — prioritise movement technique. Record a comfortable submaximal set (8–12 reps) in Strength Tracking instead.'
     : null;
 
   // ── Step 6: Endurance (two tests, combined into one averaged score) ──

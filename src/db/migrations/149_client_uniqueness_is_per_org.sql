@@ -52,7 +52,7 @@
 -- roster (the product writes pt_clients), and without an organization_id column
 -- its uniqueness cannot be scoped anyway. Making it per-org is part of giving
 -- that table a tenant boundary at all — a separate change, and only worth doing
--- if the table is ever revived. See BACKEND-FRONTEND-AUDIT.md §4.0.
+-- if the table is ever revived. See docs/audits/BACKEND-FRONTEND-AUDIT.md §4.0.
 --
 -- ── Two incidental corrections to the pt_clients indexes ─────────────────────
 --

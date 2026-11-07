@@ -2113,6 +2113,9 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
       checkins: checkinsRes.rows.length,
       strength_logs: strengthRes.rows.length,
       goals: goalsRes.rows.length,
+      // COUNT(*) arrives as a string; keep the client contract numeric.
+      sessions: Number(attRes.rows[0]?.total_sessions || 0),
+      photos: Number(photosRes.rows[0]?.total_photos || 0),
     };
     // A null weight is "no reading", not 0 kg — Number(null) is 0, which
     // would plant a false zero on the chart. Drop nulls before coercing.

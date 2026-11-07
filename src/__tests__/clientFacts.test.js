@@ -450,6 +450,46 @@ describe('the client interview, as the model reads it', () => {
     expect(text).toContain('PAR-Q');
   });
 
+  test('describes selection answers and keeps free-text notes beside them', () => {
+    const text = describeInterview({
+      occupation_title: 'Software engineer',
+      work_type: 'desk',
+      work_hours_band: '8_10',
+      daily_activity_level: 'mostly_seated',
+      training_duration: '2_plus_years',
+      sports_played: ['cricket'],
+      previous_activities: ['gym_weights'],
+      exercise_preferences: ['free_weights'],
+      fitness_goals: ['fat_loss'],
+      motivation_factors: ['health'],
+      preferences: 'Avoids running.',
+      motivation: 'Wants to keep up with the kids.',
+      client_attitude: 'motivated',
+      confidence_level: 'high',
+      commitment_level: 'moderate',
+      coaching_preference: 'balanced',
+      initial_training_level: 'beginner',
+    });
+    expect(text).toContain('Occupation: Software engineer');
+    expect(text).toContain('Work type: Desk-based');
+    expect(text).toContain('Working hours: 8–10 hours');
+    expect(text).toContain('Daily activity: Mostly seated');
+    expect(text).toContain('Training duration: 2+ years');
+    expect(text).toContain('Sports played: Cricket');
+    expect(text).toContain('Previous physical activities: Gym weights');
+    expect(text).toContain('Exercise preferences: Free weights');
+    expect(text).toContain('Preferences: Avoids running.');
+    expect(text).toContain('Fitness goals: Fat loss');
+    expect(text).toContain('Motivation: Health');
+    expect(text).toContain('Motivation notes: Wants to keep up with the kids.');
+    const trainerBlock = text.slice(text.indexOf('TRAINER\'S INTERVIEW NOTES'));
+    expect(trainerBlock).toContain('Client attitude: Motivated');
+    expect(trainerBlock).toContain('Confidence: High');
+    expect(trainerBlock).toContain('Commitment: Moderate');
+    expect(trainerBlock).toContain('Coaching preference: Balanced');
+    expect(trainerBlock).toContain('Initial training level: Beginner');
+  });
+
   test('an empty challenge list is not printed as an answer', () => {
     const text = describeInterview({ training_challenges: [] });
     expect(text).not.toContain('Training challenges:');

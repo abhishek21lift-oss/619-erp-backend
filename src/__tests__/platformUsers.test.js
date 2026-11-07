@@ -151,6 +151,8 @@ describe('status filters', () => {
     ['active', /u\.deleted_at IS NULL AND u\.is_active = true/],
     ['inactive', /u\.deleted_at IS NULL AND u\.is_active = false/],
     ['deleted', /u\.deleted_at IS NOT NULL/],
+    ['dormant', /u\.deleted_at IS NULL AND u\.last_login < NOW\(\) - INTERVAL '90 days'/],
+    ['never', /u\.deleted_at IS NULL AND u\.last_login IS NULL/],
   ])('%s narrows the query', async (status, pattern) => {
     await request(app).get(`/api/platform/users?status=${status}`);
     expect(sqlOf()).toMatch(pattern);

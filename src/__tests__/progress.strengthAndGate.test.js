@@ -225,7 +225,7 @@ describe('K11 strength norms are applied and persisted', () => {
     mockClient = { gender: 'Male', dob: dobForAge(30), workout_experience_level: 'beginner' };
     const res = await request(app()).post('/api/progress/assessments').send(body);
     expect(res.status).toBe(201);
-    expect(res.body.screening_warnings).toEqual([expect.stringMatching(/beginners should not perform an initial maximal 1RM/)]);
+    expect(res.body.screening_warnings).toEqual([expect.stringMatching(/Beginners should not perform an initial maximal 1RM/)]);
     // A warning, not a gate: the row is still written.
     expect(assessmentCols().strength_category).toBe('Well Above Average');
   });

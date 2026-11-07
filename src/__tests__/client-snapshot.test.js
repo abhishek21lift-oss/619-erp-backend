@@ -224,6 +224,16 @@ describe('coach — derived, never generated', () => {
     expect(three.find((c) => c.id === 'plateau')).toBeTruthy();
   });
 
+  it('calls the top row a heaviest set, not a strongest lift', () => {
+    // Absolute kg is not comparable across exercises: a 55 kg cable fly sorts
+    // above a 50 kg squat. The copy must not flatter that into "strongest".
+    const out = buildCoach({
+      lifestyle: null, weights: [], goal: { present: false }, alerts: [],
+      prs: [{ exercise: 'Cable Fly', weight_kg: 55, reps: 12, achieved_on: '2026-07-20' }],
+    });
+    expect(out.find((c) => c.id === 'strength').text).toBe('Heaviest set logged: Cable Fly 55 kg × 12.');
+  });
+
   it('does not raise a plateau for a client who is moving', () => {
     const out = buildCoach({
       weights: [{ kg: 76, on: '2026-07-27' }, { kg: 78, on: '2026-07-01' }, { kg: 79, on: '2026-06-01' }],

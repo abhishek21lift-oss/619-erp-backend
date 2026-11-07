@@ -103,6 +103,7 @@ describe('super-admin API — the H-03 split', () => {
     'GET /activity',
     'GET /ai/by-model',
     'GET /ai/by-studio',
+    'GET /ai/health',
     'GET /ai/knowledge',
     'GET /ai/overview',
     'GET /ai/routing',

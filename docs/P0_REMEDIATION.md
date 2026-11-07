@@ -16,8 +16,8 @@ session's configured PR tracking. All remediation commits land there.
 specific "B-, conditional NO-GO" audit this remediation prompt describes
 (searched both repos for `mark-all-paid`, `leave_requests`, `super-admin`
 hash language, `BYPASSRLS`, `NO-GO` — no hits). The repos do carry other,
-different audit docs (`BACKEND-FRONTEND-AUDIT.md`,
-`619-erp-frontend/AUDIT-REPORT.md`, `FULLSTACK-AUDIT.md`) covering different
+different audit docs (`docs/audits/BACKEND-FRONTEND-AUDIT.md`,
+`619-erp-frontend/docs/audits/AUDIT-REPORT.md`, `619-erp-frontend/docs/audits/FULLSTACK-AUDIT.md`) covering different
 findings. Per the remediation prompt's own rule ("do not blindly trust the
 previous audit — verify every finding against the current code"), every
 item below was independently re-derived by reading the live route, service,

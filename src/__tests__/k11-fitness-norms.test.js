@@ -292,7 +292,7 @@ describe('K11 flexibility battery norm', () => {
     const d = flexibility.deriveFlexibility(battery(), { age: 30, gender: 'Male' });
     expect(d.tests.sit_and_reach.norm.category).toBe('Average');
     expect(d.tests.sit_and_reach.norm.table_version).toBeTruthy();
-    expect(d.tests.sit_and_reach.norm.message).toMatch(/K11/);
+    expect(d.tests.sit_and_reach.norm.message).toBe('Age/sex sit-and-reach norm');
   });
 
   test('without context the norm is unavailable, but a stored norm is preserved', () => {

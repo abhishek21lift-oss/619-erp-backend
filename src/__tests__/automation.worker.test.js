@@ -16,6 +16,10 @@ const mockRunReminders = jest.fn();
 jest.mock('../modules/pt-os/session-reminders', () => ({
   runSessionReminders: (...a) => mockRunReminders(...a),
 }));
+const mockRunFeedbackReminders = jest.fn();
+jest.mock('../modules/session-feedback/feedback-reminders', () => ({
+  runFeedbackReminders: (...a) => mockRunFeedbackReminders(...a),
+}));
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn() }));
 
 const mockUpsert = jest.fn();
@@ -32,10 +36,12 @@ beforeEach(() => {
   mockUpsert.mockResolvedValue({});
   mockExpire.mockResolvedValue({ expired: 0, paused: 0, clientIds: [] });
   mockRunReminders.mockResolvedValue({ sent: 0, skipped: 0 });
+  mockRunFeedbackReminders.mockResolvedValue({ scanned: 0, sent: 0, skipped: 0 });
   delete process.env.AUTOMATION_SWEEP_CRON;
   delete process.env.AUTOMATION_RECOVERY_CRON;
   delete process.env.PT_TERM_EXPIRY_CRON;
   delete process.env.PT_SESSION_REMINDERS_CRON;
+  delete process.env.PT_FEEDBACK_REMINDERS_CRON;
 });
 
 describe('job routing', () => {
@@ -66,8 +72,9 @@ describe('cron registration', () => {
     expect(ids).toEqual([
       worker.SWEEP_JOB_ID, worker.RECOVERY_JOB_ID,
       worker.TERM_EXPIRY_JOB_ID, worker.SESSION_REMINDERS_JOB_ID,
+      worker.FEEDBACK_REMINDERS_JOB_ID,
     ]);
-    expect(new Set(ids).size).toBe(4);
+    expect(new Set(ids).size).toBe(5);
     // Distinct ids, or the second upsert would overwrite the first and one of
     // the two passes would simply stop existing.
     expect(worker.SWEEP_JOB_ID).not.toBe(worker.RECOVERY_JOB_ID);
@@ -78,7 +85,7 @@ describe('cron registration', () => {
     // under a name processSweepJob does not handle throws on every fire.
     await worker.scheduleAutomationSweep();
     const names = mockUpsert.mock.calls.map(([, , opts]) => opts.name);
-    expect(names).toEqual(['daily', 'recovery', 'term-expiry', 'session-reminders']);
+    expect(names).toEqual(['daily', 'recovery', 'term-expiry', 'session-reminders', 'feedback-reminders']);
     for (const name of names) {
       await expect(worker.processSweepJob({ name })).resolves.toBeDefined();
     }

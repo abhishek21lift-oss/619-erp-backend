@@ -483,7 +483,7 @@ function buildProgressionPrescription(input) {
       || input.frequencyPerWeek > K11_FITT_REFERENCE.frequencyPerWeek.max)
   ) {
     warnings.push(
-      `${input.frequencyPerWeek} sessions/week is outside the K11 FITT reference of `
+      `${input.frequencyPerWeek} sessions/week is outside the FITT reference of `
       + `${K11_FITT_REFERENCE.frequencyPerWeek.min}-${K11_FITT_REFERENCE.frequencyPerWeek.max}.`,
     );
   }
@@ -493,7 +493,7 @@ function buildProgressionPrescription(input) {
       || input.minutesPerSession > K11_FITT_REFERENCE.mainWorkMinutes.max)
   ) {
     warnings.push(
-      `${input.minutesPerSession} min is outside the K11 FITT main-work reference of `
+      `${input.minutesPerSession} min is outside the FITT main-work reference of `
       + `${K11_FITT_REFERENCE.mainWorkMinutes.min}-${K11_FITT_REFERENCE.mainWorkMinutes.max} min.`,
     );
   }
@@ -531,7 +531,7 @@ function buildFittPrescription(input) {
 
   if (!isCardioCalculationMethod(input.method)) errors.push('Choose the MHR or Karvonen method.');
   const band = getK11IntensityBand(input.intensity);
-  if (!band) errors.push('Choose a valid K11 intensity.');
+  if (!band) errors.push('Choose a valid intensity.');
 
   const frequencyError = validateFrequencyPerWeek(input.frequencyPerWeek);
   if (frequencyError) errors.push(frequencyError);
@@ -556,7 +556,7 @@ function buildFittPrescription(input) {
       || input.frequencyPerWeek > K11_FITT_REFERENCE.frequencyPerWeek.max)
   ) {
     warnings.push(
-      `${input.frequencyPerWeek} sessions/week is outside the K11 FITT reference of `
+      `${input.frequencyPerWeek} sessions/week is outside the FITT reference of `
       + `${K11_FITT_REFERENCE.frequencyPerWeek.min}-${K11_FITT_REFERENCE.frequencyPerWeek.max}.`,
     );
   }
@@ -566,7 +566,7 @@ function buildFittPrescription(input) {
       || input.mainWorkMinutes > K11_FITT_REFERENCE.mainWorkMinutes.max)
   ) {
     warnings.push(
-      `${input.mainWorkMinutes} min is outside the K11 FITT main-work reference of `
+      `${input.mainWorkMinutes} min is outside the FITT main-work reference of `
       + `${K11_FITT_REFERENCE.mainWorkMinutes.min}-${K11_FITT_REFERENCE.mainWorkMinutes.max} min.`,
     );
   }
@@ -693,7 +693,7 @@ function validateCardioPlanConfig(config) {
       errors.push(`cardio_method "${config.cardio_method}" must use the "${expectedBasis}" basis.`);
     }
   }
-  if (!isCardioIntensity(config.cardio_intensity)) errors.push('cardio_intensity must be a K11 intensity.');
+  if (!isCardioIntensity(config.cardio_intensity)) errors.push('cardio_intensity must be a valid intensity.');
   if (validateFrequencyPerWeek(config.cardio_frequency_per_week) != null) {
     errors.push(validateFrequencyPerWeek(config.cardio_frequency_per_week));
   }

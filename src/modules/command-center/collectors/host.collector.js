@@ -5,7 +5,7 @@
 //
 // ── Why this needs no mounts ────────────────────────────────────────────────
 //
-// COMMAND-CENTER-PLAN.md §2 planned `/proc:/host/proc` and `/sys:/host/sys`
+// docs/implementation/COMMAND-CENTER-PLAN.md §2 planned `/proc:/host/proc` and `/sys:/host/sys`
 // bind mounts for this. They are not needed for these numbers. The files read
 // here are not namespaced by Docker (without lxcfs, which this stack does not
 // run): /proc/stat, /proc/meminfo, /proc/loadavg and /proc/uptime inside a

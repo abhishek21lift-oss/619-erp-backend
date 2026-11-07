@@ -428,7 +428,7 @@ function describeTwin(twin) {
     };
     if (capacity.overall != null) lines.push(`- Overall fitness: ${capacity.overall}/100.`);
     addCapacity('Strength', capacity.strength,
-      capacity.strength.percentile != null ? `K11 percentile ${capacity.strength.percentile}` : null);
+      capacity.strength.percentile != null ? `Percentile ${capacity.strength.percentile}` : null);
     addCapacity('Cardio', capacity.cardio,
       capacity.cardio.vo2_max != null ? `VO2 max ${capacity.cardio.vo2_max}` : null);
     addCapacity('Endurance', capacity.endurance);

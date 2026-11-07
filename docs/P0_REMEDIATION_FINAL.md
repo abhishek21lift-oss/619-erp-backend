@@ -34,8 +34,8 @@ No document in either repository matched the "grade B−, conditional NO-GO"
 audit this remediation was written against — searched both repos for
 `mark-all-paid`, `leave_requests`, the super-admin hash language, `BYPASSRLS`
 and `NO-GO`. The repos carry *other*, different audit documents
-(`BACKEND-FRONTEND-AUDIT.md`, `619-erp-frontend/AUDIT-REPORT.md`,
-`FULLSTACK-AUDIT.md`) covering different findings.
+(`docs/audits/BACKEND-FRONTEND-AUDIT.md`, `619-erp-frontend/docs/audits/AUDIT-REPORT.md`,
+`619-erp-frontend/docs/audits/FULLSTACK-AUDIT.md`) covering different findings.
 
 So every item below was **re-derived from the current code, schema and live
 database**, per the remediation's own rule not to trust the prior audit. That

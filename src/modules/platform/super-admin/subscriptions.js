@@ -20,7 +20,8 @@ router.get('/subscriptions', async (req, res, next) => {
              o.created_at, p.name AS plan_name,
              (SELECT count(*) FROM pt_clients c WHERE c.organization_id = o.id AND c.deleted_at IS NULL)::int AS client_count,
              req.created_at AS requested_at, req.plan_code AS requested_plan_code,
-             req.direction AS requested_direction, rp.name AS requested_plan_name
+             req.direction AS requested_direction, rp.name AS requested_plan_name,
+             fr.created_at AS frozen_at, fr.reason AS frozen_reason
         FROM organizations o
         LEFT JOIN subscription_plans p ON p.code = o.plan_code
         -- Latest pending ask, whether it's a first activation or a plan
@@ -35,6 +36,15 @@ router.get('/subscriptions', async (req, res, next) => {
            ORDER BY e.created_at DESC LIMIT 1
         ) req ON true
         LEFT JOIN subscription_plans rp ON rp.code = req.plan_code
+        -- Why a studio is frozen, not just that it is. The latest freeze event
+        -- carries "manual", "trial_expired", or the operator's own reason, and
+        -- its timestamp is the only date a frozen row can honestly show.
+        LEFT JOIN LATERAL (
+          SELECT e.created_at, e.data->>'reason' AS reason
+            FROM subscription_events e
+           WHERE e.organization_id = o.id AND e.event = 'frozen'
+           ORDER BY e.created_at DESC LIMIT 1
+        ) fr ON true
        ORDER BY o.created_at DESC`);
 
     const withState = studios.map((s) => {
@@ -568,9 +578,18 @@ router.post('/organizations/:id/subscription/freeze', async (req, res, next) => 
 // POST /organizations/:id/subscription/reactivate — comp un-freeze (no payment).
 router.post('/organizations/:id/subscription/reactivate', async (req, res, next) => {
   try {
-    await subscription.reactivate(req.params.id, { id: req.user.id, name: req.user.name });
+    // Comp reactivation grants access with no payment; an unexplained one is
+    // not auditable, so the reason is required (same rule as per-studio flags).
+    const reason = String(req.body?.reason || '').trim();
+    if (!reason) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'A reason is required to reactivate without payment.' } });
+    }
+    if (reason.length > 500) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Reason must be 500 characters or fewer.' } });
+    }
+    await subscription.reactivate(req.params.id, { id: req.user.id, name: req.user.name }, reason);
     invalidateUserCache();
-    await audit(req, 'subscription_reactivated', 'organization', req.params.id, {});
+    await audit(req, 'subscription_reactivated', 'organization', req.params.id, { reason });
     res.json({ data: { id: req.params.id, subscription_status: 'active' } });
   } catch (err) { next(err); }
 });

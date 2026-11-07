@@ -243,7 +243,7 @@ describe('progress analyze grounded companions', () => {
     // httpSSE buffers the stream; the test client reads the final text.
     const doneLine = res.text.split('\n').find((l) => l.includes('"done"'));
     const payload = JSON.parse(doneLine.replace(/^data: /, ''));
-    expect(payload.data_counts).toEqual({ assessments: 3, checkins: 1, strength_logs: 0, goals: 1 });
+    expect(payload.data_counts).toEqual({ assessments: 3, checkins: 1, strength_logs: 0, goals: 1, sessions: 30, photos: 0 });
     // Null-weight row dropped, pg numerics coerced, chronological order kept.
     expect(payload.weight_history).toEqual([
       { date: '2026-08-01', weight_kg: 70 },

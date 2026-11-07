@@ -12,6 +12,8 @@ const {
 const aiQuota = require('../../../lib/aiQuota');
 const aiSettings = require('../../../lib/ai/settings');
 const { models: aiModels, DEFAULTS: AI_DEFAULTS } = require('../../../lib/ai/models');
+const aiConfig = require('../../../lib/ai/config');
+const { pingModel } = require('../../../lib/ai/openrouter');
 
 const AI_MAX_DAYS = 365;
 function aiDays(v, dflt = 30) {
@@ -468,6 +470,46 @@ router.put('/ai/routing', async (req, res, next) => {
     res.json({ data: rows[0] });
   } catch (err) { next(err); }
 });
+
+// ── GET /ai/health ───────────────────────────────────────────────────────────
+// One short completion per tier, exactly as the studio integrations page used
+// to do. That page no longer exposes it: model routing and provider health are
+// platform concerns, and a studio owner cannot act on a failing model anyway.
+// Studio AI features are untouched — this only moves who can run the check.
+router.get('/ai/health', async (req, res, next) => {
+  try {
+    if (!aiConfig.isConfigured()) {
+      return res.json({
+        data: {
+          configured: false,
+          reason: aiConfig.configurationProblem(),
+          // Same shape as the configured branch so the console can render
+          // one list without special-casing strings vs objects.
+          models: {
+            primary:   { model: aiModels.primary,   status: 'unconfigured' },
+            secondary: { model: aiModels.secondary, status: 'unconfigured' },
+            fallback:  { model: aiModels.fallback,  status: 'unconfigured' },
+          },
+        },
+      });
+    }
+
+    const [primary, secondary, fallback] = await Promise.all([
+      pingModel(aiModels.primary),
+      pingModel(aiModels.secondary),
+      pingModel(aiModels.fallback),
+    ]);
+
+    res.json({
+      data: {
+        configured: true,
+        models: { primary, secondary, fallback },
+        overall: [primary, secondary, fallback].some((m) => m.status === 'ok') ? 'ok' : 'degraded',
+      },
+    });
+  } catch (err) { next(err); }
+});
+
 // ── PUT|DELETE /organizations/:id/ai-limit ───────────────────────────────────
 router.put('/organizations/:id/ai-limit', async (req, res, next) => {
   try {

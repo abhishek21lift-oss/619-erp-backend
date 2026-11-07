@@ -6,7 +6,7 @@
 -- The companion to 193. That migration retired the training domain's session
 -- half after production answered which of the two logging stacks was real;
 -- this one retires the authoring half for the same reason, measured the same
--- way. Together they close the Training OS cutover that TRAINING-OS.md §4 left
+-- way. Together they close the Training OS cutover that docs/implementation/TRAINING-OS.md §4 left
 -- open — in the direction the data chose, not the one the plan assumed.
 --
 -- ── Two ways to author a workout, and only one of them reaches a client ─────

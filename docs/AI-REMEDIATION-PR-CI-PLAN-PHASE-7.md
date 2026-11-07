@@ -77,7 +77,7 @@ fresh worktrees are cheaper than archaeology. Branches on other local worktrees
 forms system (schemas + guardrails) / payments+balance+UPI / cardio calculator /
 programme builder / attendance & weekly check-in / enrol+profile pages / portfolio —
 plus `??` tests + specs matching those clusters, `scripts/form-audit/justifications.mjs`,
-`FORM_SYSTEM_AUDIT.md`. Ambiguous junk: `?? .git-artifacts/` — leave alone (do not commit).
+`619-erp-frontend/docs/audits/FORM_SYSTEM_AUDIT.md`. Ambiguous junk: `?? .git-artifacts/` — leave alone (do not commit).
 
 **Same-file collisions between remediation and user work: none in any repo**
 (verified by inspection) → file-level application onto a clean branch suffices;

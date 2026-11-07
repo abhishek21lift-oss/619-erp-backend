@@ -245,11 +245,13 @@ function buildGoal({ goal, weights }) {
 }
 
 /**
- * The best lift on each of the main movements.
+ * The heaviest set logged on each of the main movements.
  *
  * One row per exercise — a trainer wants "what does their bench look like
- * now", not every set that ever set a record. Heaviest first, because that is
- * the number they will be asked for.
+ * now", not every set that ever set a record. Sorted by absolute kg, because
+ * that is the number they will be asked for. Absolute kg is not comparable
+ * across exercises (a 55 kg cable fly is not "stronger" than a 50 kg squat),
+ * so nothing here is called a strongest lift.
  */
 function buildPrs(rows, { limit = 6 } = {}) {
   const best = new Map();
@@ -323,7 +325,7 @@ function buildCoach({ lifestyle, weights, goal, prs, alerts }) {
     const top = prs[0];
     out.push({
       id: 'strength', tone: 'good',
-      text: `${top.exercise} is their strongest lift on record at ${top.weight_kg} kg${top.reps ? ` × ${top.reps}` : ''}.`,
+      text: `Heaviest set logged: ${top.exercise} ${top.weight_kg} kg${top.reps ? ` × ${top.reps}` : ''}.`,
       because: `Workout log · ${top.achieved_on}`,
     });
   }

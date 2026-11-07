@@ -572,9 +572,9 @@ async function freeze(orgId, actor, reason) {
 }
 
 // Comp reactivation (no payment) — un-freeze a studio back to active.
-async function reactivate(orgId, actor) {
+async function reactivate(orgId, actor, reason) {
   await pool.query(`UPDATE organizations SET subscription_status='active', cancelled_at=NULL, updated_at=now() WHERE id=$1`, [orgId]);
-  await logEvent(pool, orgId, 'reactivated', {}, actor);
+  await logEvent(pool, orgId, 'reactivated', { reason: reason || 'comp' }, actor);
 }
 
 async function cancelSubscription(orgId, actor) {

@@ -6,6 +6,7 @@
 // complete.
 jest.mock('../db/pool', () => ({ query: jest.fn() }));
 jest.mock('../lib/fileStorage', () => ({ saveFile: jest.fn() }));
+jest.mock('../lib/ai/openrouter', () => ({ pingModel: jest.fn() }));
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = { id: 'op-1', name: 'Owner', role: 'super_admin' }; next(); },
   requireTrainer: (...a) => jest.requireActual('../middleware/rbac').requireTrainer(...a),
@@ -282,5 +283,51 @@ describe('per-studio limits', () => {
     pool.query.mockResolvedValueOnce({ rows: [] });
     const res = await request(app()).delete('/api/super-admin/organizations/o1/ai-limit');
     expect(res.status).toBe(404);
+  });
+});
+
+describe('model health', () => {
+  const { pingModel } = require('../lib/ai/openrouter');
+  const savedKey = process.env.AI_API_KEY;
+  const savedOpenRouter = process.env.OPENROUTER_API_KEY;
+
+  beforeEach(() => {
+    pingModel.mockReset();
+    process.env.AI_API_KEY = 'test-key';
+    delete process.env.OPENROUTER_API_KEY;
+  });
+
+  afterAll(() => {
+    if (savedKey === undefined) delete process.env.AI_API_KEY; else process.env.AI_API_KEY = savedKey;
+    if (savedOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = savedOpenRouter;
+  });
+
+  it('pings every tier and reports the overall state', async () => {
+    pingModel
+      .mockResolvedValueOnce({ model: 'primary/model', status: 'ok', latency_ms: 12 })
+      .mockResolvedValueOnce({ model: 'secondary/model', status: 'error', error: 'no endpoint', latency_ms: 40 })
+      .mockResolvedValueOnce({ model: 'fallback/model', status: 'ok', latency_ms: 8 });
+
+    const res = await request(app()).get('/api/super-admin/ai/health');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.configured).toBe(true);
+    expect(res.body.data.overall).toBe('ok');
+    expect(res.body.data.models.secondary.error).toBe('no endpoint');
+    expect(pingModel).toHaveBeenCalledTimes(3);
+  });
+
+  it('makes no provider call when the key is missing, and says why', async () => {
+    delete process.env.AI_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+
+    const res = await request(app()).get('/api/super-admin/ai/health');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.configured).toBe(false);
+    expect(res.body.data.reason).toMatch(/AI_API_KEY/);
+    expect(res.body.data.models.primary.status).toBe('unconfigured');
+    expect(pingModel).not.toHaveBeenCalled();
   });
 });

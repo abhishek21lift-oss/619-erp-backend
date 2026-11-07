@@ -25,7 +25,7 @@ const ZERO_POINT_INCHES = 15;
 const HAMSTRINGS_REFERENCE = Object.freeze({
   min_deg: 70,
   max_deg: 80,
-  note: 'Reference range from the supplied K11 protocol',
+  note: 'Reference range from the supplied protocol',
 });
 const NORM_UNAVAILABLE = Object.freeze({
   table_version: null,
@@ -195,7 +195,7 @@ function deriveSitAndReach(raw, context = {}) {
     ? {
       table_version: K11_SIT_AND_REACH_TABLE_VERSION,
       category,
-      message: 'K11 age/sex sit-and-reach norm',
+      message: 'Age/sex sit-and-reach norm',
     }
     : (!contextProvided && storedCategory
       ? {

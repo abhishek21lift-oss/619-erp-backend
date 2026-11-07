@@ -50,7 +50,7 @@ function intParam(value, fallback, max) {
 //
 //   q          name or email, case-insensitive substring
 //   role       exact role, or 'platform' for the operators
-//   status     active | inactive | deleted
+//   status     active | inactive | deleted | dormant | never
 //   org        organization id — the ONLY way to scope to one studio here
 //   limit/offset
 //
@@ -87,6 +87,10 @@ router.get('/users', async (req, res, next) => {
     if (status === 'deleted') where.push('u.deleted_at IS NOT NULL');
     else if (status === 'inactive') where.push('u.deleted_at IS NULL AND u.is_active = false');
     else if (status === 'active') where.push('u.deleted_at IS NULL AND u.is_active = true');
+    // The two engagement states the summary card reports. They are filters on
+    // the same clock as dormant_90d, so "2 dormant" in the card has a list.
+    else if (status === 'dormant') where.push("u.deleted_at IS NULL AND u.last_login < NOW() - INTERVAL '90 days'");
+    else if (status === 'never') where.push('u.deleted_at IS NULL AND u.last_login IS NULL');
 
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
