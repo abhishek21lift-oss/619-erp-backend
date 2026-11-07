@@ -233,6 +233,44 @@ describe('the exercise screen', () => {
     expect(prompt).toContain('knee (caution, from parq.past_history)');
     expect(prompt).toContain('joint problems');
   });
+
+  it('adds a limitation the trainer typed for this session', async () => {
+    // The form offers a free-text field for exactly this, and the body used to
+    // be read for equipment and duration but never for injuries — so a trainer
+    // typed "left shoulder pain", the page accepted it, and the plan was
+    // written as though nobody had said anything.
+    mockDb({
+      parq: [{ workout_gate_status: 'cleared', past_history: {}, current_health: {} }],
+      exercises: [SQUAT],
+    });
+    await request(app).post('/api/ai/workout/generate').send({ ...BODY, injuries: 'left shoulder pain' });
+
+    expect(promptOf()).toContain('left shoulder pain');
+  });
+
+  it('keeps the recorded limitation and adds the stated one to it', () => {
+    // Substitution would be the dangerous direction: a body-supplied note must
+    // never erase what the client's record already says.
+    const { resolveWorkoutExtras } = require('../routes/ai');
+    const out = resolveWorkoutExtras({
+      client: { id: 'client-1', injuries: 'left knee', health_conditions: null },
+      profile: null,
+      goals: [],
+      workoutAssignments: [],
+    }, { injuries: 'left shoulder pain' });
+
+    expect(out.injuries).toBe('left knee; left shoulder pain');
+  });
+
+  it('clamps a stated block length to a year', () => {
+    const { resolveWorkoutExtras } = require('../routes/ai');
+    const out = resolveWorkoutExtras({
+      client: { id: 'client-1', injuries: null, health_conditions: null },
+      profile: null, goals: [], workoutAssignments: [],
+    }, { duration_weeks: 9999 });
+
+    expect(out.duration_weeks).toBe(52);
+  });
 });
 
 describe('the training history', () => {
