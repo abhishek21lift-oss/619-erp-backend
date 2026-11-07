@@ -1365,6 +1365,24 @@ runMigrationsWithRetry()
       );
     }
 
+    // WhatsApp webhook ledger retention.
+    //
+    // Every verified gateway event is claimed in whatsapp_webhook_events so a
+    // redelivery is answered "duplicate". The gateway's outbox retries for
+    // minutes, but nothing deleted the claims, so the ledger grew forever.
+    // Same hourly cadence and bounded batches as the sweeps above.
+    {
+      const webhookRetention = require('./lib/whatsappWebhookRetention');
+      const sweep = () => { webhookRetention.prune(); };
+      setInterval(sweep, 60 * 60 * 1000).unref();
+      sweep();
+      logger.info(
+        { retention_days: Number(process.env.WA_WEBHOOK_EVENT_RETENTION_DAYS)
+            || webhookRetention.DEFAULT_RETENTION_DAYS },
+        'WhatsApp webhook retention active',
+      );
+    }
+
     // Command Center alerting. Without this the Alert Center only notices a
     // problem while somebody has the console open, which is the opposite of
     // what alerting is for — the point is being told when you are NOT looking.
