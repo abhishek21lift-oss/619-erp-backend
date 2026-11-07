@@ -59,11 +59,17 @@ router.post('/google-login', async (req, res) => {
     let user;
     try {
       const { rows } = await pool.query(
-        // organization_id is selected only so the login event carries studio
-        // attribution; without it Google sign-ins would be invisible to the
-        // Security Centre's per-studio filter. Nothing else here reads it.
-        `SELECT id, name, email, role, token_version, trainer_id, member_id, is_active, organization_id
-           FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true AND deleted_at IS NULL`,
+        // Same session shape as POST /login. The client adopts this object as
+        // the signed-in user without fetching /api/auth/me, so a partial user
+        // made the shell fall back to "PT Studio" and a generic mark.
+        `SELECT u.id, u.name, u.email, u.role, u.token_version, u.trainer_id,
+                u.member_id, u.pt_client_id, u.is_active, u.organization_id,
+                o.name AS organization_name, o.logo_url AS organization_logo_url,
+                o.is_founder, o.founder_number, up.avatar_url
+           FROM users u
+           LEFT JOIN organizations o ON o.id = u.organization_id
+           LEFT JOIN user_profiles up ON up.user_id = u.id
+          WHERE LOWER(u.email) = LOWER($1) AND u.is_active = true AND u.deleted_at IS NULL`,
         [email]
       );
       user = rows[0];
@@ -118,6 +124,12 @@ router.post('/google-login', async (req, res) => {
         role:       user.role,
         trainer_id: user.trainer_id,
         pt_client_id:  user.pt_client_id,
+        organization_id:       user.organization_id,
+        organization_name:     user.organization_name,
+        organization_logo_url: user.organization_logo_url,
+        is_founder:            Boolean(user.is_founder),
+        founder_number:        user.founder_number ?? null,
+        avatar_url:            user.avatar_url ?? null,
       },
     });
   } catch (err) {
