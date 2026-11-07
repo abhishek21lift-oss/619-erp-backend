@@ -160,6 +160,14 @@ services:
       AI_RAG_TOP_K: ${AI_RAG_TOP_K:-}
       AI_RAG_SIMILARITY_THRESHOLD: ${AI_RAG_SIMILARITY_THRESHOLD:-}
       AI_SETTINGS_REFRESH_MS: ${AI_SETTINGS_REFRESH_MS:-}
+      # ── WhatsApp gateway ──────────────────────────────────────────────────
+      # Compose forwards ONLY the variables named here. Without these the api
+      # answers 503 GATEWAY_NOT_CONFIGURED; blank defaults keep the integration
+      # optional so a box with no gateway still starts.
+      WA_GATEWAY_URL: ${WA_GATEWAY_URL:-}
+      WA_GATEWAY_KEY: ${WA_GATEWAY_KEY:-}
+      WA_WEBHOOK_SECRET: ${WA_WEBHOOK_SECRET:-}
+      WA_GATEWAY_TIMEOUT_MS: ${WA_GATEWAY_TIMEOUT_MS:-10000}
     depends_on:
       redis:
         condition: service_healthy
@@ -239,6 +247,13 @@ services:
       AI_ALLOW_DATA_COLLECTION: ${AI_ALLOW_DATA_COLLECTION:-}
       AI_USAGE_FIELDS_MODE: ${AI_USAGE_FIELDS_MODE:-}
       AI_USD_TO_INR: ${AI_USD_TO_INR:-}
+      # ── WhatsApp gateway ──────────────────────────────────────────────────
+      # The worker is the process that actually sends, so it needs the same
+      # gateway configuration the api has. Blank = optional, as on the api.
+      WA_GATEWAY_URL: ${WA_GATEWAY_URL:-}
+      WA_GATEWAY_KEY: ${WA_GATEWAY_KEY:-}
+      WA_WEBHOOK_SECRET: ${WA_WEBHOOK_SECRET:-}
+      WA_GATEWAY_TIMEOUT_MS: ${WA_GATEWAY_TIMEOUT_MS:-10000}
     depends_on:
       redis:
         condition: service_healthy
