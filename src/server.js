@@ -700,6 +700,7 @@ app.use('/api/', apiLimiter);
 const LOGIN_PATHS = [
   '/api/auth/login', '/api/v1/auth/login',
   '/api/auth/google-login', '/api/v1/auth/google-login',
+  '/api/auth/google-link', '/api/v1/auth/google-link',
 ];
 for (const p of LOGIN_PATHS) {
   app.use(p, loginIdentityLimiter);

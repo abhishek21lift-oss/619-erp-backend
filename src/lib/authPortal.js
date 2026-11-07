@@ -1,0 +1,87 @@
+'use strict';
+// Which door an account may use. One copy, so the password, Google and any
+// future password-equivalent route cannot disagree about it.
+//
+// The rule is enforced server-side after the credential is proven: the pages
+// merely LOOKING separate is not separation, because the same POST works from
+// either page or from curl.
+
+const { ALL_ROLES, TENANT_ROLES } = require('../middleware/rbac');
+const platformAuth = require('../middleware/platformAuth');
+
+function normalisePortal(raw) {
+  if (raw === 'member') return 'member';
+  if (raw === 'platform') return 'platform';
+  return 'trainer';
+}
+
+/**
+ * @returns null when the account may use this door, otherwise the exact
+ * response the route should send. `portal` is present only for WRONG_PORTAL.
+ */
+function portalProblem(user, portal) {
+  const isMemberAccount = user.role === 'member';
+  const isPlatformAccount = user.role === 'super_admin';
+
+  // An account that holds none of the three roles — or a studio role with no
+  // studio — gets no session at all. The database constraints (migration 208)
+  // make such a row impossible; this keeps a session from ever being minted
+  // for one that slipped through, rather than relying on every guard
+  // downstream to notice.
+  if (!ALL_ROLES.includes(user.role)
+      || (TENANT_ROLES.includes(user.role) && !user.organization_id)) {
+    return {
+      status: 403,
+      code: 'ACCOUNT_MISCONFIGURED',
+      message: 'This account cannot sign in. Contact support.',
+    };
+  }
+
+  if (portal === 'platform' && !isPlatformAccount) {
+    return {
+      status: 403,
+      code: 'WRONG_PORTAL',
+      portal: isMemberAccount ? 'member' : 'trainer',
+      message: 'This is the Command Center sign-in. Use your studio login.',
+    };
+  }
+
+  // A platform operator at the studio door.
+  //
+  // Refused only once PLATFORM_SESSION_ENFORCE is on, and the flag is what
+  // makes this shippable: today the operator signs in at /login like anyone
+  // else, and turning that into a 403 on deploy would lock them out of the
+  // console with an error they cannot clear. Until the flag flips they get a
+  // tenant-audience session here, which already cannot reach the control
+  // plane — so the boundary is real before the refusal is.
+  if (portal === 'trainer' && isPlatformAccount && platformAuth.sessionEnforced()) {
+    return {
+      status: 403,
+      code: 'WRONG_PORTAL',
+      portal: 'platform',
+      message: 'This is the studio sign-in. Use the Command Center to sign in as the platform operator.',
+    };
+  }
+
+  if (portal === 'member' && !isMemberAccount) {
+    return {
+      status: 403,
+      code: 'WRONG_PORTAL',
+      portal: 'trainer',
+      message: 'This is the member sign-in. Use Trainer Login for your studio account.',
+    };
+  }
+
+  if (portal === 'trainer' && isMemberAccount) {
+    return {
+      status: 403,
+      code: 'WRONG_PORTAL',
+      portal: 'member',
+      message: 'This is the studio sign-in. Use Member Login for your client account.',
+    };
+  }
+
+  return null;
+}
+
+module.exports = { normalisePortal, portalProblem };
