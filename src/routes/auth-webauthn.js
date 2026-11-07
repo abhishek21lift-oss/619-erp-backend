@@ -675,11 +675,17 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
     );
 
     const { rows: users } = await pool.query(
-      // organization_id is selected only so the login event carries studio
-      // attribution; without it passkey sign-ins would be invisible to the
-      // Security Centre's per-studio filter. Nothing else on this path reads it.
-      `SELECT id, name, email, role, trainer_id, pt_client_id, token_version, organization_id
-       FROM users WHERE id = $1 AND is_active = true AND deleted_at IS NULL`,
+      // Same session shape as POST /login. The client adopts this object as the
+      // signed-in user without fetching /api/auth/me, so omitting the studio
+      // fields here made the shell fall back to "PT Studio", a generic mark,
+      // and no billing link until a hard reload.
+      `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.pt_client_id, u.token_version,
+              u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
+              o.is_founder, o.founder_number, up.avatar_url
+         FROM users u
+         LEFT JOIN organizations o ON o.id = u.organization_id
+         LEFT JOIN user_profiles up ON up.user_id = u.id
+        WHERE u.id = $1 AND u.is_active = true AND u.deleted_at IS NULL`,
       [cred.user_id]
     );
     if (!users.length) {
@@ -711,6 +717,12 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
       user: {
         id: user.id, name: user.name, email: user.email,
         role: user.role, trainer_id: user.trainer_id, pt_client_id: user.pt_client_id,
+        organization_id: user.organization_id,
+        organization_name: user.organization_name,
+        organization_logo_url: user.organization_logo_url,
+        is_founder: Boolean(user.is_founder),
+        founder_number: user.founder_number ?? null,
+        avatar_url: user.avatar_url ?? null,
       },
     });
   } catch (err) { next(err); }
