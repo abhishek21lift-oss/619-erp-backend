@@ -443,19 +443,20 @@ async function markFailed(orgId, logId, { reason, provider }) {
 /**
  * Record why an attempt failed, WITHOUT moving the row off 'queued'.
  *
- * The worker calls this between attempts. The distinction from markFailed is
- * the whole point: 'queued' is what makes the next attempt re-send, because
- * processAutomationJob refuses to send a row whose status has already moved.
- * Marking the row failed on the first attempt is what silently disabled the
- * retry budget — see the comment there.
+ * The worker calls this between attempts, and the webhook calls it when the
+ * gateway reports a failure it says is retryable. The distinction from
+ * markFailed is the whole point: 'queued' is what makes the next attempt
+ * re-send, because processAutomationJob refuses to send a row whose status has
+ * already moved. Marking the row failed on the first attempt is what silently
+ * disabled the retry budget — see the comment there.
  *
  * Bound to `status = 'queued'` so it cannot pull a row backwards: if a receipt
  * or a concurrent send moved the row on while this attempt was in flight, the
  * write does nothing rather than stamping a failure reason on a message the
  * client has already received.
  */
-async function noteAttemptFailure(orgId, logId, reason) {
-  const { rowCount } = await pool.query(
+async function noteAttemptFailure(orgId, logId, reason, { client = pool } = {}) {
+  const { rowCount } = await client.query(
     `UPDATE communication_logs
         SET failure_reason = $3
       WHERE id = $1 AND organization_id = $2 AND status = 'queued'`,
@@ -534,12 +535,20 @@ async function recordEventOutcome(eventId, subject, applied, { client = pool } =
   return rowCount;
 }
 
-/** A gateway-reported send failure, matched on the id the ERP chose. */
+/**
+ * A gateway-reported send failure, matched on the id the ERP chose.
+ *
+ * Only a row still awaiting its outcome may become failed. 'sent' is excluded
+ * alongside the terminal statuses because events and retries are not ordered:
+ * attempt 1's failure can arrive after attempt 2 succeeded, and rewriting that
+ * row failed would erase a message the client actually received.
+ */
 async function markFailedByClientId(orgId, logId, reason, { client = pool } = {}) {
   const { rowCount } = await client.query(
     `UPDATE communication_logs
         SET status = 'failed', failure_reason = $3
-      WHERE id = $1 AND organization_id = $2 AND status <> 'delivered' AND status <> 'read'`,
+      WHERE id = $1 AND organization_id = $2
+        AND status NOT IN ('sent', 'delivered', 'read', 'suppressed')`,
     [logId, orgId, reason]
   );
   return rowCount;

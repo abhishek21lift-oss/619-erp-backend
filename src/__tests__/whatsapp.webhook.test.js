@@ -579,10 +579,48 @@ describe('delivery receipts', () => {
     // accepted — so client_message_id is the only id both sides share.
     await post(makeEvent({
       event_type: 'whatsapp.message.failed',
-      payload: { client_message_id: 'log-1', reason_code: 'send_failed', will_retry: true },
+      payload: { client_message_id: 'log-1', reason_code: 'send_failed', will_retry: false },
     }));
     const [update] = logUpdates();
     expect(update.params).toEqual(['log-1', ORG, 'send_failed']);
+  });
+
+  test('a retryable failure leaves the row queued for the retry', async () => {
+    // `will_retry` is the gateway's advice, and the retry it advises belongs to
+    // this ERP's BullMQ job. Marking the row failed here made
+    // processAutomationJob skip the next attempt as already_failed, so one
+    // transient send error permanently dropped the message.
+    await post(makeEvent({
+      event_type: 'whatsapp.message.failed',
+      payload: { client_message_id: 'log-1', reason_code: 'send_failed', will_retry: true },
+    }));
+
+    const [update] = logUpdates();
+    expect(update.sql).not.toMatch(/status\s*=\s*'failed'/i);
+    expect(update.sql).toMatch(/status\s*=\s*'queued'/i);
+    expect(update.params).toEqual(['log-1', ORG, 'send_failed']);
+  });
+
+  test('a permanent failure marks the row failed', async () => {
+    await post(makeEvent({
+      event_type: 'whatsapp.message.failed',
+      payload: { client_message_id: 'log-1', reason_code: 'recipient_not_on_whatsapp', will_retry: false },
+    }));
+
+    const [update] = logUpdates();
+    expect(update.sql).toMatch(/status\s*=\s*'failed'/i);
+  });
+
+  test('a late failure cannot overwrite a message that has since been sent', async () => {
+    // Events and retries are not ordered. Attempt 1's failure can arrive after
+    // attempt 2 succeeded; the row must stay 'sent', not be rewritten failed.
+    await post(makeEvent({
+      event_type: 'whatsapp.message.failed',
+      payload: { client_message_id: 'log-1', reason_code: 'send_failed', will_retry: false },
+    }));
+
+    const [update] = logUpdates();
+    expect(update.sql).toMatch(/status NOT IN \('sent', 'delivered', 'read', 'suppressed'\)/);
   });
 
   test('a sent event changes nothing, because the worker already recorded it', async () => {

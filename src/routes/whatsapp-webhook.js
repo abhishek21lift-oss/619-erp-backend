@@ -114,9 +114,15 @@ async function applyMessageEvent(eventType, payload, tenantId, occurredAt, clien
   if (kind === 'failed') {
     const logId = payload.client_message_id;
     if (!logId) return { applied: 0, subject: null };
-    const applied = await repo.markFailedByClientId(
-      tenantId, logId, payload.reason_code || 'gateway_failed', { client }
-    );
+    const reason = payload.reason_code || 'gateway_failed';
+
+    // `will_retry` is the gateway's advice for the ERP's own BullMQ retry, not
+    // a promise that it will retry. Marking the row failed here made the next
+    // attempt skip it as already_failed, so one transient send error dropped
+    // the message for good. The reason is still recorded; the status is not.
+    const applied = payload.will_retry
+      ? await repo.noteAttemptFailure(tenantId, logId, reason, { client })
+      : await repo.markFailedByClientId(tenantId, logId, reason, { client });
     return { applied, subject: logId };
   }
 
