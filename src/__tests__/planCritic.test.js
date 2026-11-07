@@ -270,6 +270,24 @@ describe('structure', () => {
     expect(a.violations.find((v) => v.rule === 'no_warm_up').severity).toBe(SEVERITY.MAJOR);
     expect(a.violations.find((v) => v.rule === 'no_cool_down').severity).toBe(SEVERITY.MINOR);
   });
+
+  it('reads an ordered protocol list as a protocol, not as missing', () => {
+    // The prompt asks for warm_up/cool_down as arrays of steps, so a compliant
+    // plan arrives as a list. A string-only check called every one of them
+    // missing and spent a revision trying to fix what was already correct.
+    const a = audit(plan({
+      warm_up: ['5 min bike', 'band pull-aparts'],
+      cool_down: ['box breathing', 'hip flexor stretch'],
+    }));
+    expect(a.violations.find((v) => v.rule === 'no_warm_up')).toBeUndefined();
+    expect(a.violations.find((v) => v.rule === 'no_cool_down')).toBeUndefined();
+  });
+
+  it('still calls an empty protocol list missing', () => {
+    const a = audit(plan({ warm_up: [], cool_down: [''] }));
+    expect(a.violations.find((v) => v.rule === 'no_warm_up')).toBeTruthy();
+    expect(a.violations.find((v) => v.rule === 'no_cool_down')).toBeTruthy();
+  });
 });
 
 describe('completeness', () => {

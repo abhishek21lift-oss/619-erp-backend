@@ -108,7 +108,16 @@ const num = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
-const text = (v) => (typeof v === 'string' ? v.trim() : '');
+const text = (v) => {
+  // The prompt asks for warm_up / mobility / cool_down as ordered lists of
+  // steps, so a compliant plan sends an array. Treating only strings as text
+  // called every compliant plan "no warm-up" and spent its one revision
+  // fixing something that was already right.
+  if (Array.isArray(v)) {
+    return v.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean).join('\n');
+  }
+  return typeof v === 'string' ? v.trim() : '';
+};
 
 /**
  * Every exercise in the plan, flattened, keeping where it came from.
