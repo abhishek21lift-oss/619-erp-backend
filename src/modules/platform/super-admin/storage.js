@@ -143,19 +143,36 @@ router.get('/storage/by-studio', async (req, res, next) => {
 // Bytes accounted per day, by upload date. Not a running total of what is
 // stored: a day's figure is what arrived that day, so a spike is visible
 // instead of being flattened into a rising line.
+//
+// On a continuous date spine, like /ai/trend. A day with no uploads has to
+// render as a zero — dropped days let the chart interpolate across the gap and
+// draw a flat line through what were actually empty days (or, worse, make a
+// gap in coverage look like steady traffic).
 router.get('/storage/trend', async (req, res, next) => {
   try {
     const days = storageDays(req.query.days);
     const { rows } = await pool.query(
-      `SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day,
-              COALESCE(SUM(bytes), 0)::bigint                       AS bytes,
-              count(*)::int                                         AS objects
-         FROM storage_objects
-        WHERE created_at >= now() - ($1 || ' days')::interval
-          AND deleted_at IS NULL
-        GROUP BY 1
-        ORDER BY 1`,
-      [String(days)]
+      `WITH spine AS (
+         SELECT generate_series(
+           date_trunc('day', now()) - (($1::int - 1) || ' days')::interval,
+           date_trunc('day', now()), '1 day'
+         )::date AS day
+       ),
+       d AS (
+         SELECT date_trunc('day', created_at)::date AS day,
+                COALESCE(SUM(bytes), 0)::bigint     AS bytes,
+                count(*)::int                       AS objects
+           FROM storage_objects
+          WHERE created_at >= date_trunc('day', now()) - (($1::int - 1) || ' days')::interval
+            AND deleted_at IS NULL
+          GROUP BY 1
+       )
+       SELECT to_char(s.day, 'YYYY-MM-DD') AS day,
+              COALESCE(d.bytes, 0)::bigint AS bytes,
+              COALESCE(d.objects, 0)       AS objects
+         FROM spine s LEFT JOIN d ON d.day = s.day
+        ORDER BY s.day`,
+      [days]
     );
     res.json({ data: rows.map((r) => ({ ...r, bytes: Number(r.bytes) })) });
   } catch (err) { next(err); }
