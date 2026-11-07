@@ -133,6 +133,35 @@ describe('the api service', () => {
   });
 });
 
+describe('the WhatsApp gateway wiring', () => {
+  const { raw } = readCompose();
+  const WA_VARS = [
+    'WA_GATEWAY_URL',
+    'WA_GATEWAY_KEY',
+    'WA_WEBHOOK_SECRET',
+    'WA_GATEWAY_TIMEOUT_MS',
+  ];
+
+  it.each(['api', 'worker'])('%s forwards the gateway variables', (svc) => {
+    // Compose forwards only the variables an `environment:` line names. Without
+    // these the api answers 503 GATEWAY_NOT_CONFIGURED and the worker fails
+    // every send with NOT_CONFIGURED — WhatsApp is dead, with an honest error.
+    const block = serviceBlock(raw, svc);
+    expect(WA_VARS.filter((key) => !block.includes(key))).toEqual([]);
+  });
+
+  it('keeps the gateway optional, so the backend still starts without it', () => {
+    // `${VAR:-}` not `${VAR}`: a required variable here would abort
+    // `docker compose up` on every box that has no gateway.
+    for (const svc of ['api', 'worker']) {
+      const block = serviceBlock(raw, svc);
+      for (const key of WA_VARS) {
+        expect(block).toMatch(new RegExp(`${key}: \\$\\{${key}:-`));
+      }
+    }
+  });
+});
+
 describe('the redis service', () => {
   const { raw } = readCompose();
   const redis = serviceBlock(raw, 'redis');
