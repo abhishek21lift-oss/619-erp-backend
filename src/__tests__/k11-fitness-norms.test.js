@@ -73,25 +73,26 @@ const PUSHUP_AGES = {
 // [percentile, minimum repetitions], highest percentile first.
 const CURLUP_NORMS = {
   Male: {
-    '20-29': [[90, 75], [80, 56], [60, 31], [50, 27], [40, 23], [20, 13]],
-    '30-39': [[90, 75], [80, 69], [60, 36], [50, 31], [40, 26], [20, 13]],
-    '40-49': [[90, 75], [80, 75], [60, 51], [50, 39], [40, 31], [20, 21]],
-    '50-59': [[90, 74], [80, 60], [60, 35], [50, 27], [40, 23], [20, 13]],
-    '60-69': [[90, 53], [80, 33], [60, 19], [50, 16], [40, 9], [20, 0]],
+    '20-29': [[90, 75], [80, 56], [70, 41], [60, 31], [50, 27], [40, 23], [30, 20], [20, 13], [10, 4]],
+    '30-39': [[90, 75], [80, 69], [70, 46], [60, 36], [50, 31], [40, 26], [30, 19], [20, 13], [10, 0]],
+    '40-49': [[90, 75], [80, 75], [70, 67], [60, 51], [50, 39], [40, 31], [30, 26], [20, 21], [10, 13]],
+    '50-59': [[90, 74], [80, 60], [70, 45], [60, 35], [50, 27], [40, 23], [30, 19], [20, 13], [10, 0]],
+    '60-69': [[90, 53], [80, 33], [70, 26], [60, 19], [50, 16], [40, 9], [30, 6], [20, 0], [10, 0]],
   },
   Female: {
-    '20-29': [[90, 70], [80, 45], [60, 32], [50, 27], [40, 21], [20, 12]],
-    '30-39': [[90, 55], [80, 43], [60, 28], [50, 21], [40, 15], [20, 0]],
-    '40-49': [[90, 50], [80, 42], [60, 28], [50, 25], [40, 20], [20, 5]],
-    '50-59': [[90, 48], [80, 30], [60, 16], [50, 9], [40, 2], [20, 0]],
-    '60-69': [[90, 50], [80, 30], [60, 19], [50, 9], [40, 3], [20, 0]],
+    '20-29': [[90, 70], [80, 45], [70, 37], [60, 32], [50, 27], [40, 21], [30, 17], [20, 12], [10, 12]],
+    '30-39': [[90, 55], [80, 43], [70, 34], [60, 28], [50, 21], [40, 15], [30, 12], [20, 0], [10, 0]],
+    '40-49': [[90, 50], [80, 42], [70, 33], [60, 28], [50, 25], [40, 20], [30, 14], [20, 5], [10, 5]],
+    '50-59': [[90, 48], [80, 30], [70, 23], [60, 16], [50, 9], [40, 2], [30, 0], [20, 0], [10, 0]],
+    '60-69': [[90, 50], [80, 30], [70, 24], [60, 19], [50, 9], [40, 3], [30, 0], [20, 0], [10, 0]],
   },
 };
 
 const CURLUP_CATEGORY = {
-  90: 'Well Above Average', 80: 'Above Average',
+  90: 'Well Above Average', 80: 'Above Average', 70: 'Above Average',
   60: 'Average', 50: 'Average',
-  40: 'Below Average', 20: 'Well Below Average',
+  40: 'Below Average', 30: 'Below Average',
+  20: 'Well Below Average', 10: 'Well Below Average',
 };
 
 // [minimum raw inches, category], highest category first. K11 prints integer
@@ -99,23 +100,25 @@ const CURLUP_CATEGORY = {
 // and anything below the lowest floor is Well Below Average.
 const SIT_AND_REACH_NORMS = {
   Male: {
-    '18-25': [[22, 'Excellent'], [18, 'Good'], [15, 'Average'], [13, 'Below Average']],
-    '26-35': [[21, 'Excellent'], [17, 'Good'], [14, 'Average'], [11, 'Below Average']],
-    '36-45': [[21, 'Excellent'], [16, 'Good'], [13, 'Average'], [11, 'Below Average']],
-    '46-55': [[19, 'Excellent'], [14, 'Good'], [11, 'Average'], [9, 'Below Average']],
-    '56-65': [[17, 'Excellent'], [13, 'Good'], [9, 'Average'], [7, 'Below Average']],
+    '18-25': [[20, 'Excellent'], [18, 'Good'], [15, 'Average'], [13, 'Below Average']],
+    '26-35': [[19, 'Excellent'], [17, 'Good'], [14, 'Average'], [11, 'Below Average']],
+    '36-45': [[19, 'Excellent'], [16, 'Good'], [13, 'Average'], [11, 'Below Average']],
+    '46-55': [[17, 'Excellent'], [14, 'Good'], [11, 'Average'], [9, 'Below Average']],
+    '56-65': [[15, 'Excellent'], [13, 'Good'], [9, 'Average'], [7, 'Below Average']],
+    '66+': [[15, 'Excellent'], [12, 'Good'], [9, 'Average'], [7, 'Below Average']],
   },
   Female: {
-    '18-25': [[24, 'Excellent'], [20, 'Good'], [18, 'Average'], [16, 'Below Average']],
-    '26-35': [[23, 'Excellent'], [20, 'Good'], [17, 'Average'], [15, 'Below Average']],
-    '36-45': [[22, 'Excellent'], [18, 'Good'], [16, 'Average'], [14, 'Below Average']],
-    '46-55': [[21, 'Excellent'], [17, 'Good'], [14, 'Average'], [12, 'Below Average']],
-    '56-65': [[20, 'Excellent'], [16, 'Good'], [14, 'Average'], [11, 'Below Average']],
+    '18-25': [[22, 'Excellent'], [20, 'Good'], [18, 'Average'], [16, 'Below Average']],
+    '26-35': [[21, 'Excellent'], [20, 'Good'], [17, 'Average'], [15, 'Below Average']],
+    '36-45': [[21, 'Excellent'], [18, 'Good'], [16, 'Average'], [14, 'Below Average']],
+    '46-55': [[19, 'Excellent'], [17, 'Good'], [14, 'Average'], [12, 'Below Average']],
+    '56-65': [[17, 'Excellent'], [16, 'Good'], [14, 'Average'], [11, 'Below Average']],
+    '66+': [[17, 'Excellent'], [16, 'Good'], [14, 'Average'], [11, 'Below Average']],
   },
 };
 
 const SIT_AND_REACH_AGES = {
-  '18-25': [18, 25], '26-35': [26, 35], '36-45': [36, 45], '46-55': [46, 55], '56-65': [56, 65],
+  '18-25': [18, 25], '26-35': [26, 35], '36-45': [36, 45], '46-55': [46, 55], '56-65': [56, 65], '66+': [66, 90],
 };
 
 const quadSide = (over = {}) => ({
@@ -196,7 +199,11 @@ describe('K11 push-up norms', () => {
     expect(fitness.classifyEndurance('Push Up Test', 30, 'Male', 70)).toBeNull();
     expect(fitness.classifyEndurance('Push Up Test', 30, 'Male', null)).toBeNull();
     expect(fitness.classifyEndurance('Push Up Test', 30, null, 30)).toBeNull();
-    expect(fitness.classifyEndurance('Push Up Test', 0, 'Male', 30)).toBeNull();
+    expect(fitness.classifyEndurance('Push Up Test', -1, 'Male', 30)).toBeNull();
+  });
+
+  test('zero reps is Poor', () => {
+    expect(fitness.classifyEndurance('Push Up Test', 0, 'Male', 30)).toBe('Poor');
   });
 });
 
@@ -208,16 +215,16 @@ describe('K11 curl-up norms', () => {
           // Two rows can share a floor (e.g. male 40–49 has 75 at the 90th
           // and 80th percentiles); the higher percentile owns that value.
           if (rows.find(([, m]) => m === minimum)[0] !== percentile) continue;
-          // A zero result is "not performed", not a 20th-percentile score.
-          if (minimum <= 0) continue;
           test(`${sex} age ${age}: ${minimum} reaches the ${percentile}th percentile`, () => {
             expect(fitness.classifyEndurance('Curl Up Test', minimum, sex, age)).toBe(CURLUP_CATEGORY[percentile]);
           });
         }
-        const floor = rows[rows.length - 1][1];
-        test(`${sex} age ${age}: below the 20th percentile is Well Below Average`, () => {
-          expect(fitness.classifyEndurance('Curl Up Test', floor > 0 ? floor - 1 : 1, sex, age)).toBe('Well Below Average');
-        });
+        if (!rows.some(([, minimum]) => minimum === 0)) {
+          const floor = rows[rows.length - 1][1];
+          test(`${sex} age ${age}: below the 10th percentile is Well Below Average`, () => {
+            expect(fitness.classifyEndurance('Curl Up Test', floor - 1, sex, age)).toBe('Well Below Average');
+          });
+        }
       }
     }
   }
@@ -227,7 +234,12 @@ describe('K11 curl-up norms', () => {
     expect(fitness.classifyEndurance('Curl Up Test', 30, 'Male', 70)).toBeNull();
     expect(fitness.classifyEndurance('Curl Up Test', 30, 'Male', null)).toBeNull();
     expect(fitness.classifyEndurance('Curl Up Test', 30, null, 30)).toBeNull();
-    expect(fitness.classifyEndurance('Curl Up Test', 0, 'Male', 30)).toBeNull();
+    expect(fitness.classifyEndurance('Curl Up Test', -1, 'Male', 30)).toBeNull();
+  });
+
+  test('zero reps is scored, not "not performed"', () => {
+    expect(fitness.classifyEndurance('Curl Up Test', 0, 'Male', 20)).toBe('Well Below Average');
+    expect(fitness.classifyEndurance('Curl Up Test', 0, 'Female', 50)).toBe('Below Average');
   });
 });
 
@@ -259,9 +271,8 @@ describe('K11 sit-and-reach norms', () => {
     }
   }
 
-  test('outside 18–65, or without a usable sex/age, no category', () => {
+  test('under 18, or without a usable sex/age, no category', () => {
     expect(fitness.classifySitAndReach(20, 17, 'Male')).toBeNull();
-    expect(fitness.classifySitAndReach(20, 66, 'Male')).toBeNull();
     expect(fitness.classifySitAndReach(20, null, 'Male')).toBeNull();
     expect(fitness.classifySitAndReach(20, 30, null)).toBeNull();
     expect(fitness.classifySitAndReach(20, 30, 'Other')).toBeNull();
@@ -308,6 +319,6 @@ describe('K11 flexibility battery norm', () => {
 
 describe('K11 formula bundle', () => {
   test('version 5', () => {
-    expect(fitness.FITNESS_SCORING_VERSION).toBe('5');
+    expect(fitness.FITNESS_SCORING_VERSION).toBe('6');
   });
 });

@@ -181,12 +181,14 @@ describe('anthropometric norm labels', () => {
       client: CLIENT,
       assessment: {
         assessment_date: '2026-07-01', weight: 80, height_cm: 175, bmi: 26.1,
-        bmi_category: 'Obese', waist_cm: 92, waist_risk: 'Above low-risk threshold',
+        bmi_category: 'Obese', waist_cm: 92, waist_iliac_cm: 95,
+        waist_risk: 'Above low-risk threshold',
         waist_hip_ratio: 0.98, whr_risk: 'Above low-risk threshold',
       },
     });
     expect(brief.sections.body).toMatchObject({
       bmi_category: 'Obese',
+      waist_iliac_cm: 95,
       waist_risk: 'Above low-risk threshold',
       whr_risk: 'Above low-risk threshold',
     });
@@ -210,7 +212,7 @@ describe('K11 strength percentiles', () => {
       assessment: {
         assessment_date: '2026-07-01',
         strength_score_computed: 80,
-        strength_category: 'Well Above Average',
+        strength_category: 'Above Average',
         strength_test_data: JSON.stringify({
           test1: { k11_percentile: 80, k11_age_band: '30-39', strength_ratio: 1.17 },
           test2: { k11_percentile: 30 },
@@ -218,7 +220,7 @@ describe('K11 strength percentiles', () => {
       },
     });
     expect(brief.sections.capacity.strength).toEqual({
-      score: 80, category: 'Well Above Average', percentile: 80, percentile_2: 30,
+      score: 80, category: 'Above Average', percentile: 80, percentile_2: 30,
     });
   });
 

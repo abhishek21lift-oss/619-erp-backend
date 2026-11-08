@@ -224,7 +224,9 @@ describe('FITT prescription', () => {
     expect(result.value.warnings.join(' ')).toMatch(/unclassified/i);
     expect(cardio.classifyCardioModality('Running')).toBe('weight-bearing-high-impact');
     expect(cardio.classifyCardioModality('Elliptical')).toBe('weight-bearing-low-impact');
-    expect(cardio.classifyCardioModality('Cycling')).toBe('non-weight-bearing');
+    expect(cardio.classifyCardioModality('Stationary Bike')).toBe('weight-bearing-low-impact');
+    expect(cardio.classifyCardioModality('Cycling')).toBe('weight-bearing-low-impact');
+    expect(cardio.classifyCardioModality('Rowing')).toBe('non-weight-bearing');
     expect(cardio.classifyCardioModality('Mystery machine')).toBeNull();
   });
 

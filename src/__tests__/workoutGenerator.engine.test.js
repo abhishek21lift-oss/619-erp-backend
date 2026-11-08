@@ -70,7 +70,7 @@ test('conditioning carries FITT structure without inventing a target heart rate'
     frequencyPerWeek: 3,
     timeMinutes: 20,
     intensity: 'moderate',
-    modalityCategory: 'non-weight-bearing',
+    modalityCategory: 'weight-bearing-low-impact',
     programType: 'continuous-liss',
     basis: 'application-default',
   });

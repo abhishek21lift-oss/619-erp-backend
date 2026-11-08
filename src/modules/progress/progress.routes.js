@@ -286,10 +286,10 @@ function computeAssessment(b, age, gender, opts = {}) {
   // catch. The reading itself, the measurements and flexibility are still
   // recorded.
   if (vitalsSafety.level === 'stop' && exertion) {
-    const code = bpCategory === 'Hypertensive Crisis' || bpCategory === 'Hypertension Stage 2' || bpCategory === 'Hypotension'
+    const code = bpCategory === 'Hypertensive Crisis' || bpCategory === 'Hypertension Stage 2'
       ? 'BP_UNSAFE'
-      : spo2Category === 'Critical' ? 'SPO2_UNSAFE'
-        : rhrCategory === 'High' || rhrCategory === 'Low' ? 'RHR_UNSAFE' : 'VITALS_UNSAFE';
+      : spo2Category === 'Moderate Hypoxia' || spo2Category === 'Severe Hypoxia' ? 'SPO2_UNSAFE'
+        : rhrCategory === 'High' ? 'RHR_UNSAFE' : 'VITALS_UNSAFE';
     return { error: { status: 400, code,
       message: `${vitalsSafety.reasons[0]} Cardio, strength and endurance tests cannot be recorded. Refer for medical clearance where indicated.` } };
   }
@@ -306,10 +306,12 @@ function computeAssessment(b, age, gender, opts = {}) {
   const bmi = scoring.calcBmi(b.weight, b.height_cm);
   const waistHipRatio = scoring.calcWhr(b.waist_cm, b.hips_cm);
   // Norms only where the recorded sex supports them. Waist risk comes from
-  // waist_cm (the narrowest-waist site), never the separate iliac reading.
+  // waist_iliac_cm, the umbilicus/iliac landmark the supplied table names,
+  // never the narrowest-waist reading used by WHR.
   const bmiCategory = scoring.classifyBmi(bmi);
-  const waistRisk = scoring.classifyWaistRisk(b.waist_cm ?? null, gender);
+  const waistRisk = scoring.classifyWaistRisk(b.waist_iliac_cm ?? null, gender);
   const whrRisk = scoring.classifyWhrRisk(waistHipRatio, gender);
+  const bodyFatCategory = scoring.classifyBodyFat(b.body_fat_pct ?? null, gender);
 
   // ── Step 3: Body Composition ──
   const leanBodyMass = scoring.calcLeanBodyMass(b.weight, b.body_fat_pct);
@@ -453,10 +455,11 @@ function computeAssessment(b, age, gender, opts = {}) {
     : priorNotes) || null;
 
   return {
-    bpUnsafe: bpCategory === 'Hypertensive Crisis' || bpCategory === 'Hypertension Stage 2' || bpCategory === 'Hypotension',
+    bpUnsafe: bpCategory === 'Hypertensive Crisis' || bpCategory === 'Hypertension Stage 2',
     vitalsSafety,
     strengthWarning: beginnerStrengthWarning,
     lifts,
+    bodyFatCategory,
     cols: {
       assessment_type: b.assessment_type || 'initial',
       assessment_date: b.assessment_date || studioToday(),
@@ -544,7 +547,7 @@ router.post('/assessments', auth, requireTrainer, validate(assessmentCreateSchem
     logger.error({ err: err.message, assessmentId: row.id, clientId: row.client_id }, 'assessment re-test sync failed');
   }
   res.status(201).json({
-    data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety },
+    data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety, body_fat_category: result.bodyFatCategory },
     screening_warnings: result.strengthWarning ? [...screeningWarnings, result.strengthWarning] : screeningWarnings,
     retest,
     ...(retestError ? { retest_error: retestError } : {}),
@@ -583,7 +586,7 @@ router.patch('/assessments/:id', auth, requireTrainer, validate(assessmentUpdate
     throw err;
   }
   tx.release();
-  res.json({ data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety, ...(result.strengthWarning ? { strength_warning: result.strengthWarning } : {}) } });
+  res.json({ data: { ...row, bp_unsafe: result.bpUnsafe, vitals_safety: result.vitalsSafety, body_fat_category: result.bodyFatCategory, ...(result.strengthWarning ? { strength_warning: result.strengthWarning } : {}) } });
 }));
 
 // Deleting a test used to be a hard, unlogged delete: the baseline and its

@@ -26,6 +26,7 @@
 /** Sections a brief can carry, in the order a trainer would want to read them. */
 const SECTIONS = ['readiness', 'body', 'capacity', 'limitations', 'lifestyle', 'goal', 'history'];
 const { ageFromDob: ageFrom } = require('../../lib/age');
+const { classifyWaistRisk } = require('../progress/fitness-scoring');
 
 /**
  * How old a section may be before it is reported as stale, in days.
@@ -296,7 +297,10 @@ function buildBrief({
     body_fat_pct: num(assessment.body_fat_pct),
     lean_mass_kg: num(assessment.lean_body_mass_kg),
     waist_cm: num(assessment.waist_cm),
-    waist_risk: assessment.waist_risk ?? null,
+    waist_iliac_cm: num(assessment.waist_iliac_cm),
+    // Regraded here: rows saved before the landmark change stored a label
+    // computed from the narrowest waist.
+    waist_risk: classifyWaistRisk(num(assessment.waist_iliac_cm), client?.gender ?? null),
     waist_hip_ratio: num(assessment.waist_hip_ratio),
     whr_risk: assessment.whr_risk ?? null,
     resting_hr: num(assessment.resting_heart_rate),

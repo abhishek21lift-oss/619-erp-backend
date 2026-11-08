@@ -5,6 +5,7 @@
 // Every insight names the recorded evidence and its period. Recommendations
 // are suggestions for the trainer to review, never an automatic program change:
 // `auto_apply` is always false and `requires_trainer_review` is always true.
+const { classifyBp, classifySpo2 } = require('./fitness-scoring');
 
 function fmt(n, unit = '') {
   if (n == null) return '—';
@@ -111,29 +112,33 @@ function buildInsights({ comparison = null, analytics = null, schedule = null, g
 
     const systolic = metric(comparison, 'bp_systolic');
     const diastolic = metric(comparison, 'bp_diastolic');
-    if (systolic?.latest_value != null && diastolic?.latest_value != null) {
-      const crisis = systolic.latest_value >= 180 || diastolic.latest_value >= 120;
-      const stage2 = systolic.latest_value >= 140 || diastolic.latest_value >= 90;
-      if (crisis) {
+    if (systolic?.latest_value != null || diastolic?.latest_value != null) {
+      // Shared dual-criteria classifier, so the insight and the assessment
+      // cannot disagree about the band.
+      const bpCategory = classifyBp(systolic?.latest_value ?? null, diastolic?.latest_value ?? null);
+      const reading = systolic?.latest_value != null && diastolic?.latest_value != null
+        ? `${systolic.latest_value}/${diastolic.latest_value}`
+        : systolic?.latest_value != null ? `${systolic.latest_value} systolic` : `${diastolic.latest_value} diastolic`;
+      if (bpCategory === 'Hypertensive Crisis') {
         out.push(base({
           key: 'bp_crisis_reading', type: 'observation', severity: 'high',
           title: 'Latest resting blood pressure is in the hypertensive crisis range',
-          detail: `The latest recorded reading was ${systolic.latest_value}/${diastolic.latest_value} mmHg. This is a recorded reading, not a diagnosis.`,
+          detail: `The latest recorded reading was ${reading} mmHg. This is a recorded reading, not a diagnosis.`,
           evidence: {
             metric: 'bp_systolic/bp_diastolic',
-            latest: [systolic.latest_value, diastolic.latest_value],
+            latest: [systolic.latest_value, diastolic?.latest_value ?? null],
             assessment_date: comparison.latest?.assessment_date,
           },
           recommendation: 'Stop exertion testing and advise urgent medical assessment. Follow the studio screening policy.',
         }));
-      } else if (stage2) {
+      } else if (bpCategory === 'Hypertension Stage 2') {
         out.push(base({
           key: 'bp_high_reading', type: 'observation', severity: 'high',
-          title: 'Latest resting blood pressure reading is elevated',
-          detail: `The latest recorded reading was ${systolic.latest_value}/${diastolic.latest_value} mmHg. This is a recorded reading, not a diagnosis.`,
+          title: 'Latest resting blood pressure is at hypertension stage 2',
+          detail: `The latest recorded reading was ${reading} mmHg. This is a recorded reading, not a diagnosis.`,
           evidence: {
             metric: 'bp_systolic/bp_diastolic',
-            latest: [systolic.latest_value, diastolic.latest_value],
+            latest: [systolic.latest_value, diastolic?.latest_value ?? null],
             assessment_date: comparison.latest?.assessment_date,
           },
           recommendation: 'Follow the studio screening policy and advise the client to have the reading reviewed by a qualified clinician.',
@@ -142,16 +147,25 @@ function buildInsights({ comparison = null, analytics = null, schedule = null, g
     }
 
     const spo2 = metric(comparison, 'resting_spo2');
-    if (spo2?.latest_value != null && spo2.latest_value < 95) {
-      out.push(base({
-        key: 'spo2_low_reading', type: 'observation', severity: spo2.latest_value < 90 ? 'high' : 'attention',
-        title: `Latest resting SpO₂ is ${spo2.latest_value < 90 ? 'critically low' : 'below the normal range'}`,
-        detail: `The latest recorded reading was ${fmt(spo2.latest_value, '%')}. This is a recorded reading, not a diagnosis.`,
-        evidence: { metric: 'resting_spo2', latest: spo2.latest_value, assessment_date: comparison.latest?.assessment_date },
-        recommendation: spo2.latest_value < 90
-          ? 'Do not proceed with exertion testing; seek medical assessment.'
-          : 'Recheck after rest and monitor for breathlessness before exertion testing.',
-      }));
+    if (spo2?.latest_value != null) {
+      // Shared four-tier classifier, so the insight and the assessment cannot
+      // disagree about the band.
+      const spo2Category = classifySpo2(spo2.latest_value);
+      if (spo2Category && spo2Category !== 'Normal') {
+        const severe = spo2Category === 'Severe Hypoxia';
+        const moderate = spo2Category === 'Moderate Hypoxia';
+        out.push(base({
+          key: 'spo2_low_reading', type: 'observation', severity: severe || moderate ? 'high' : 'attention',
+          title: `Latest resting SpO₂ is ${severe ? 'severely low' : moderate ? 'moderately low' : 'mildly low'}`,
+          detail: `The latest recorded reading was ${fmt(spo2.latest_value, '%')}. This is a recorded reading, not a diagnosis.`,
+          evidence: { metric: 'resting_spo2', latest: spo2.latest_value, assessment_date: comparison.latest?.assessment_date },
+          recommendation: severe
+            ? 'Medical emergency: halt all physical testing and arrange immediate medical evaluation and oxygen therapy.'
+            : moderate
+              ? 'Halt physical testing and seek medical advice.'
+              : 'Monitor closely and recheck after rest; cold hands, nail polish or movement can falsely lower the reading.',
+        }));
+      }
     }
 
     const rhr = metric(comparison, 'resting_heart_rate');
@@ -161,7 +175,9 @@ function buildInsights({ comparison = null, analytics = null, schedule = null, g
         title: `Latest resting heart rate is ${rhr.latest_value < 40 ? 'below 40' : 'above 100'} bpm`,
         detail: `The latest recorded reading was ${fmt(rhr.latest_value, 'bpm')}. This is a recorded reading, not a diagnosis.`,
         evidence: { metric: 'resting_heart_rate', latest: rhr.latest_value, assessment_date: comparison.latest?.assessment_date },
-        recommendation: 'Reassess at rest and follow the studio screening policy before exertion testing.',
+        recommendation: rhr.latest_value > 100
+          ? 'If the reading is consistently above 100 bpm, physician evaluation is required before training.'
+          : 'Confirm the client is a trained athlete; if not, refer to a medical doctor to rule out underlying cardiac issues.',
       }));
     }
 
