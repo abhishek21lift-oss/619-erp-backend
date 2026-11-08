@@ -114,13 +114,16 @@ describeIf('/api/me against a real database', () => {
       `INSERT INTO pt_os_measurements (id, client_id, waist_cm, body_fat_pct, measured_at)
        VALUES ('me-int-meas', $1, 82.5, 21.4, NOW() - INTERVAL '3 days') ON CONFLICT (id) DO NOTHING`, [CLIENT]);
     // The canonical owner: a fitness test, newer than the legacy measurement.
+    // studioToday(), not CURRENT_DATE: CI's Postgres runs in UTC, so after
+    // 18:30 UTC the check-in is already dated on the next studio day and
+    // would sort above an assessment dated CURRENT_DATE.
     await pool.query(
       `INSERT INTO pt_assessments
          (id, client_id, organization_id, assessment_date, assessment_type,
           weight, body_fat_pct, chest_cm, waist_cm, hips_cm, arms_cm, thighs_cm)
-       VALUES ('me-int-assess', $1, $2, CURRENT_DATE, 'follow_up',
+       VALUES ('me-int-assess', $1, $2, $3, 'follow_up',
                74.2, 20.4, 96, 80, 98, 30, 55)
-       ON CONFLICT (id) DO NOTHING`, [CLIENT, ORG]);
+       ON CONFLICT (id) DO NOTHING`, [CLIENT, ORG, studioToday()]);
     await pool.query(
       `INSERT INTO workout_sessions (id, client_id, session_date, program_name, workout_day,
                                      duration_minutes, status, notes, organization_id)
