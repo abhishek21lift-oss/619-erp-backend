@@ -67,14 +67,33 @@ describe('anthropometric norms (MPTS adult Asian bands)', () => {
     expect(fitness.classifyWhrRisk(whr, gender)).toBe(expected);
   });
 
+  test.each([
+    [2, 'Male', 'Essential Fat'], [5, 'Male', 'Essential Fat'],
+    [5.1, 'Male', 'Athletic / Ideal'], [14.9, 'Male', 'Athletic / Ideal'],
+    [15, 'Male', 'Acceptable / Average'], [20, 'Male', 'Acceptable / Average'],
+    [20.1, 'Male', 'Above Ideal Range'], [25, 'Male', 'Above Ideal Range'],
+    [25.1, 'Male', 'Overfat / High Risk'],
+    [7, 'Female', 'Essential Fat'], [8, 'Female', 'Essential Fat'],
+    [12, 'Female', 'Essential Fat'],
+    [12.1, 'Female', 'Athletic / Ideal'], [19.9, 'Female', 'Athletic / Ideal'],
+    [20, 'Female', 'Acceptable / Average'], [25, 'Female', 'Acceptable / Average'],
+    [25.1, 'Female', 'Above Ideal Range'], [30, 'Female', 'Above Ideal Range'],
+    [30.1, 'Female', 'Overfat / High Risk'],
+    [22, 'male', 'Above Ideal Range'],
+  ])('classifyBodyFat(%p%%, %s) → %s', (bodyFat, gender, expected) => {
+    expect(fitness.classifyBodyFat(bodyFat, gender)).toBe(expected);
+  });
+
   test('no sex-specific category without a supported sex', () => {
     for (const gender of [null, undefined, 'Other']) {
       expect(fitness.classifyWaistRisk(85, gender)).toBeNull();
       expect(fitness.classifyWhrRisk(0.9, gender)).toBeNull();
+      expect(fitness.classifyBodyFat(22, gender)).toBeNull();
     }
     for (const value of [null, NaN, Infinity, 0, -1]) {
       expect(fitness.classifyWaistRisk(value, 'Male')).toBeNull();
       expect(fitness.classifyWhrRisk(value, 'Male')).toBeNull();
+      expect(fitness.classifyBodyFat(value, 'Male')).toBeNull();
     }
   });
 });
@@ -168,25 +187,47 @@ describe('vitals norms (BP, resting heart rate, SpO₂)', () => {
   test.each([
     [85, 55, 'Hypotension'],
     [89, 60, 'Hypotension'],
+    [110, 55, 'Hypotension'],
     [90, 60, 'Normal'],
+    [110, 75, 'Normal'],
+    [118, 59, 'Hypotension'],
     [119, 79, 'Normal'],
+    // 80 is printed in both "Normal 60–80" and "Stage 1 80–89"; the
+    // higher-risk row wins.
+    [118, 80, 'Hypertension Stage 1'],
+    [118, 85, 'Hypertension Stage 1'],
+    [118, 90, 'Hypertension Stage 2'],
+    // Crisis diastolic is ">120" exactly as printed, so 120 is stage 2.
+    [118, 120, 'Hypertension Stage 2'],
+    [118, 121, 'Hypertensive Crisis'],
+    // 120 is printed in both "Normal 90–120" and "Elevated 120–129".
+    [120, 70, 'Elevated'],
     [120, 79, 'Elevated'],
-    [129, 79, 'Elevated'],
     [120, 80, 'Hypertension Stage 1'],
+    [125, 75, 'Elevated'],
+    [125, 85, 'Hypertension Stage 1'],
+    [129, 79, 'Elevated'],
     [130, 79, 'Hypertension Stage 1'],
-    [139, 89, 'Hypertension Stage 1'],
-    [140, 89, 'Hypertension Stage 2'],
-    [139, 90, 'Hypertension Stage 2'],
-    [179, 119, 'Hypertension Stage 2'],
-    [180, 119, 'Hypertensive Crisis'],
-    [179, 120, 'Hypertensive Crisis'],
-    [160, 58, 'Hypertension Stage 2'],
     [135, 55, 'Hypotension'],
+    [135, 85, 'Hypertension Stage 1'],
+    [135, 89, 'Hypertension Stage 1'],
+    [135, 90, 'Hypertension Stage 2'],
+    [139, 85, 'Hypertension Stage 1'],
+    [140, 80, 'Hypertension Stage 2'],
+    [140, 85, 'Hypertension Stage 2'],
+    [160, 55, 'Hypertension Stage 2'],
+    [170, 120, 'Hypertension Stage 2'],
+    [179, 119, 'Hypertension Stage 2'],
+    [180, 70, 'Hypertensive Crisis'],
+    [180, 80, 'Hypertensive Crisis'],
+    [85, 95, 'Hypertension Stage 2'],
     [125, null, 'Elevated'],
+    [110, null, null],
     [85, null, 'Hypotension'],
     [150, null, 'Hypertension Stage 2'],
     [185, null, 'Hypertensive Crisis'],
-    [null, 125, 'Hypertensive Crisis'],
+    [null, 121, 'Hypertensive Crisis'],
+    [null, 95, 'Hypertension Stage 2'],
     [null, 70, null],
   ])('classifyBp(%p, %p) → %p', (systolic, diastolic, category) => {
     expect(fitness.classifyBp(systolic, diastolic)).toBe(category);
@@ -199,20 +240,30 @@ describe('vitals norms (BP, resting heart rate, SpO₂)', () => {
     expect(fitness.classifyRhr(rhr)).toBe(category);
   });
 
-  test.each([[89, 'Critical'], [90, 'Mildly Low'], [94, 'Mildly Low'], [95, 'Normal'], [100, 'Normal']])(
-    'classifySpo2(%p) → %s', (spo2, category) => {
-      expect(fitness.classifySpo2(spo2)).toBe(category);
-    },
-  );
+  test.each([
+    [84, 'Severe Hypoxia'], [85, 'Severe Hypoxia'], [86, 'Moderate Hypoxia'],
+    [89, 'Moderate Hypoxia'], [90, 'Moderate Hypoxia'], [91, 'Mild Hypoxia'],
+    [94, 'Mild Hypoxia'], [95, 'Normal'], [100, 'Normal'],
+  ])('classifySpo2(%p) → %s', (spo2, category) => {
+    expect(fitness.classifySpo2(spo2)).toBe(category);
+  });
 
   const safety = (over = {}) => fitness.assessVitalsSafety({
     systolic: 118, diastolic: 70, restingHeartRate: 72, restingSpo2: 98, athlete: false, ...over,
   });
 
-  test('stage 2, crisis and hypotension stop exertion', () => {
+  test('stage 2 and crisis stop exertion, including a diastolic-only trigger', () => {
     expect(safety({ systolic: 160, diastolic: 95 }).level).toBe('stop');
     expect(safety({ systolic: 185, diastolic: 95 }).level).toBe('stop');
-    expect(safety({ systolic: 85, diastolic: 55 }).level).toBe('stop');
+    expect(safety({ systolic: 118, diastolic: 95 }).level).toBe('stop');
+    expect(safety({ systolic: 118, diastolic: 121 }).level).toBe('stop');
+  });
+
+  test('hypotension cautions with the table\'s symptom guidance', () => {
+    const low = safety({ systolic: 85, diastolic: 55 });
+    expect(low.level).toBe('caution');
+    expect(low.requiresMedicalClearance).toBe(false);
+    expect(low.reasons[0]).toMatch(/dizziness|fainting/i);
   });
 
   test('stage 1 and elevated are caution, not stop', () => {
@@ -220,17 +271,31 @@ describe('vitals norms (BP, resting heart rate, SpO₂)', () => {
     expect(safety({ systolic: 125, diastolic: 75 }).level).toBe('caution');
   });
 
-  test('RHR and SpO₂ stops', () => {
-    expect(safety({ restingHeartRate: 110 }).level).toBe('stop');
-    expect(safety({ restingHeartRate: 38 }).level).toBe('stop');
+  test('applies the image RHR guidance', () => {
+    const high = safety({ restingHeartRate: 110 });
+    expect(high.level).toBe('stop');
+    expect(high.reasons[0]).toMatch(/physician evaluation/i);
+
+    // 60–100 is the supplied wider population range, considered non-pathological.
+    expect(safety({ restingHeartRate: 85 })).toMatchObject({ level: 'safe', reasons: [] });
+
+    const low = safety({ restingHeartRate: 38 });
+    expect(low.level).toBe('caution');
+    expect(low.reasons[0]).toMatch(/refer.*medical doctor/i);
+
     expect(safety({ restingSpo2: 88 }).level).toBe('stop');
+    expect(safety({ restingSpo2: 90 }).level).toBe('stop');
+    expect(safety({ restingSpo2: 84 }).level).toBe('stop');
+    expect(safety({ restingSpo2: 84 }).reasons[0]).toMatch(/emergency|oxygen/i);
     expect(safety({ restingSpo2: 92 }).level).toBe('caution');
   });
 
-  test('an athlete\'s 40–50 bpm is context, not a flag', () => {
-    expect(safety({ restingHeartRate: 45, athlete: true }).level).toBe('safe');
+  test('an athlete\'s low bpm is context, not a stop', () => {
+    for (const bpm of [45, 38]) {
+      expect(safety({ restingHeartRate: bpm, athlete: true }).level).toBe('safe');
+      expect(safety({ restingHeartRate: bpm, athlete: true }).athleteLowRhr).toBe(true);
+    }
     expect(safety({ restingHeartRate: 45, athlete: false }).level).toBe('caution');
-    expect(safety({ restingHeartRate: 45, athlete: true }).athleteLowRhr).toBe(true);
   });
 
   test('a normal reading is safe', () => {

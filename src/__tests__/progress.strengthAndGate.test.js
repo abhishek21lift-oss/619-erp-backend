@@ -135,34 +135,40 @@ describe('POST /progress/assessments', () => {
 });
 
 describe('anthropometric classifications are persisted', () => {
-  const body = { client_id: 'c1', weight: 80, height_cm: 175, waist_cm: 92, waist_iliac_cm: 74, hips_cm: 94 };
+  const body = {
+    client_id: 'c1', weight: 80, height_cm: 175, waist_cm: 92, waist_iliac_cm: 74,
+    hips_cm: 94, body_fat_pct: 22,
+  };
 
   beforeEach(() => {
     mockClient = { gender: 'Male', dob: '1998-04-12', workout_experience_level: 'intermediate' };
   });
 
-  test('stores the Asian BMI band and sex-specific waist/WHR risk from waist_cm', async () => {
+  test('stores the Asian BMI band and sex-specific waist/WHR/body-fat risk from their own landmarks', async () => {
     const res = await request(app()).post('/api/progress/assessments').send(body);
     expect(res.status).toBe(201);
     const cols = assessmentCols();
     expect(cols.bmi).toBe(26.1);
     expect(cols.bmi_category).toBe('Obese');
-    // If the 74 cm iliac reading had been substituted, this would be Low risk.
-    expect(cols.waist_risk).toBe('Above low-risk threshold');
+    // Waist risk uses the iliac landmark; 92 cm would be above the cut-off.
+    expect(cols.waist_risk).toBe('Low risk');
     expect(cols.whr_risk).toBe('Above low-risk threshold');
     expect(cols.waist_iliac_cm).toBe(74);
     expect(cols.waist_hip_ratio).toBe(0.98);
+    // Male 22% falls in the range the supplied table leaves between its
+    // Acceptable and Overfat rows.
+    expect(res.body.data.body_fat_category).toBe('Above Ideal Range');
   });
 
-  test('missing waist_cm is never replaced by waist_iliac_cm', async () => {
+  test('missing waist_iliac_cm leaves waist risk unclassified but still computes WHR from waist_cm', async () => {
     const res = await request(app()).post('/api/progress/assessments')
-      .send({ ...body, waist_cm: undefined });
+      .send({ ...body, waist_iliac_cm: undefined });
     expect(res.status).toBe(201);
     const cols = assessmentCols();
-    expect(cols.waist_cm).toBeNull();
+    expect(cols.waist_iliac_cm).toBeNull();
     expect(cols.waist_risk).toBeNull();
-    expect(cols.waist_hip_ratio).toBeNull();
-    expect(cols.whr_risk).toBeNull();
+    expect(cols.waist_hip_ratio).toBe(0.98);
+    expect(cols.whr_risk).toBe('Above low-risk threshold');
   });
 
   test('unsupported sex leaves waist/WHR unclassified but still bands BMI', async () => {
@@ -193,9 +199,10 @@ describe('K11 strength norms are applied and persisted', () => {
     expect(res.status).toBe(201);
     const cols = assessmentCols();
     // 80 kg × 5 reps Epley = 93.3 kg; 93.3 / 80 kg = 1.17. Male 30–39
-    // bench is 80th at 1.12 and 90th at 1.24, so this is 80th.
-    expect(cols.strength_category).toBe('Well Above Average');
-    expect(cols.strength_score_computed).toBe(90);
+    // bench is 80th at 1.12 and 90th at 1.24, so this is 80th — the supplied
+    // table places the 80th percentile in Above Average (70–80%).
+    expect(cols.strength_category).toBe('Above Average');
+    expect(cols.strength_score_computed).toBe(70);
     expect(storedStrength().test1).toMatchObject({
       k11_percentile: 80, k11_age_band: '30-39', strength_ratio: 1.17,
     });
@@ -227,7 +234,7 @@ describe('K11 strength norms are applied and persisted', () => {
     expect(res.status).toBe(201);
     expect(res.body.screening_warnings).toEqual([expect.stringMatching(/beginners should not perform an initial maximal 1RM/)]);
     // A warning, not a gate: the row is still written.
-    expect(assessmentCols().strength_category).toBe('Well Above Average');
+    expect(assessmentCols().strength_category).toBe('Above Average');
   });
 
   test('an intermediate client gets no beginner warning', async () => {
@@ -289,10 +296,12 @@ describe('unsafe resting blood pressure stops exertion tests', () => {
     expect(mockQueries.some((q) => /INSERT INTO pt_assessments/i.test(q.sql))).toBe(false);
   });
 
-  test('hypotension with a cardio test is refused', async () => {
+  test('hypotension is a caution with symptom guidance, not a block', async () => {
     const res = await request(app()).post('/api/progress/assessments')
       .send({ client_id: 'c1', bp_systolic: 85, bp_diastolic: 55, cardio_test_type: 'YMCA 3-Minute Step Test' });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(201);
+    expect(res.body.data.vitals_safety.level).toBe('caution');
+    expect(res.body.data.vitals_safety.reasons[0]).toMatch(/dizziness|fainting/i);
   });
 
   test('a hypertensive crisis reading is refused', async () => {

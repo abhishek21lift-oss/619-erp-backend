@@ -50,7 +50,7 @@ const NORMS = {
 };
 
 const CATEGORY_BY_PERCENTILE = {
-  90: 'Well Above Average', 80: 'Well Above Average',
+  90: 'Well Above Average', 80: 'Above Average',
   70: 'Above Average', 60: 'Above Average',
   50: 'Average',
   40: 'Below Average', 30: 'Below Average',
@@ -58,7 +58,7 @@ const CATEGORY_BY_PERCENTILE = {
 };
 
 const SCORE_BY_PERCENTILE = {
-  90: 90, 80: 90, 70: 70, 60: 70, 50: 60, 40: 40, 30: 40, 20: 20, 10: 20,
+  90: 90, 80: 70, 70: 70, 60: 70, 50: 60, 40: 40, 30: 40, 20: 20, 10: 20,
 };
 
 const BAND_AGES = {
@@ -110,7 +110,7 @@ describe('K11 strength — percentile and category stay separate', () => {
       return fitness.classifyStrengthDetail(ratioAt(row[1]), 100, 'Bench Press', 'Male', 25);
     };
     expect(at(90)).toMatchObject({ category: 'Well Above Average', percentile: 90 });
-    expect(at(80)).toMatchObject({ category: 'Well Above Average', percentile: 80 });
+    expect(at(80)).toMatchObject({ category: 'Above Average', percentile: 80 });
     expect(at(70)).toMatchObject({ category: 'Above Average', percentile: 70 });
     expect(at(60)).toMatchObject({ category: 'Above Average', percentile: 60 });
     expect(at(50)).toMatchObject({ category: 'Average', percentile: 50 });

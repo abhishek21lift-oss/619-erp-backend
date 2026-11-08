@@ -7,40 +7,40 @@ const fitness = require('../modules/progress/fitness-scoring');
 const MALE_18_25 = [
   [78, 'Excellent'], [79, 'Good'], [89, 'Good'], [90, 'Above Average'], [99, 'Above Average'],
   [100, 'Average'], [105, 'Average'], [106, 'Below Average'], [116, 'Below Average'],
-  [117, 'Poor'], [128, 'Poor'], [129, 'Very Poor'], [220, 'Very Poor'],
+  [117, 'Poor'], [128, 'Poor'], [129, 'Poor'], [220, 'Poor'],
 ];
 const MALE_26_35 = [
   [80, 'Excellent'], [81, 'Good'], [89, 'Good'], [90, 'Above Average'], [99, 'Above Average'],
   [100, 'Average'], [107, 'Average'], [108, 'Below Average'], [117, 'Below Average'],
-  [118, 'Poor'], [128, 'Poor'], [129, 'Very Poor'],
+  [118, 'Poor'], [128, 'Poor'], [129, 'Poor'],
 ];
 const MALE_36_45 = [
   [82, 'Excellent'], [83, 'Good'], [96, 'Good'], [97, 'Above Average'], [103, 'Above Average'],
   [104, 'Average'], [112, 'Average'], [113, 'Below Average'], [119, 'Below Average'],
-  [120, 'Poor'], [130, 'Poor'], [131, 'Very Poor'],
+  [120, 'Poor'], [130, 'Poor'], [131, 'Poor'],
 ];
 const MALE_46_55 = [
   [86, 'Excellent'], [87, 'Good'], [97, 'Good'], [98, 'Above Average'], [105, 'Above Average'],
   [106, 'Average'], [116, 'Average'], [117, 'Below Average'], [122, 'Below Average'],
-  [123, 'Poor'], [132, 'Poor'], [133, 'Very Poor'],
+  [123, 'Poor'], [132, 'Poor'], [133, 'Poor'],
 ];
 
-// Female norms publish no Very Poor row: everything above the Poor ceiling is
-// unclassified, never shifted into an invented band.
+// Poor is the open-ended top category, not a closed band with an invented
+// Very Poor row above it.
 const FEMALE_18_25 = [
   [84, 'Excellent'], [85, 'Good'], [98, 'Good'], [99, 'Above Average'], [108, 'Above Average'],
   [109, 'Average'], [117, 'Average'], [118, 'Below Average'], [126, 'Below Average'],
-  [127, 'Poor'], [140, 'Poor'], [141, null],
+  [127, 'Poor'], [140, 'Poor'], [141, 'Poor'],
 ];
 const FEMALE_26_35 = [
   [87, 'Excellent'], [88, 'Good'], [99, 'Good'], [100, 'Above Average'], [111, 'Above Average'],
   [112, 'Average'], [119, 'Average'], [120, 'Below Average'], [126, 'Below Average'],
-  [127, 'Poor'], [138, 'Poor'], [139, null],
+  [127, 'Poor'], [138, 'Poor'], [139, 'Poor'],
 ];
 const FEMALE_36_45 = [
   [89, 'Excellent'], [90, 'Good'], [102, 'Good'], [103, 'Above Average'], [110, 'Above Average'],
   [111, 'Average'], [118, 'Average'], [119, 'Below Average'], [128, 'Below Average'],
-  [129, 'Poor'], [140, 'Poor'], [141, null],
+  [129, 'Poor'], [140, 'Poor'], [141, 'Poor'],
 ];
 // The published female 46–55 row reads "Excellent <94" then "Good 95–104".
 // 94 bpm is not in either band, so it is not classified. This is a source
@@ -48,7 +48,7 @@ const FEMALE_36_45 = [
 const FEMALE_46_55 = [
   [93, 'Excellent'], [94, null], [95, 'Good'], [104, 'Good'], [105, 'Above Average'],
   [115, 'Above Average'], [116, 'Average'], [120, 'Average'], [121, 'Below Average'],
-  [126, 'Below Average'], [127, 'Poor'], [135, 'Poor'], [136, null],
+  [126, 'Below Average'], [127, 'Poor'], [135, 'Poor'], [136, 'Poor'],
 ];
 
 const GROUPS = [
@@ -97,10 +97,11 @@ describe('K11 YMCA step-test recovery HR norms', () => {
     }
   });
 
-  test('never invents the missing female Very Poor band', () => {
+  test('keeps readings above the printed Poor floor in the open-ended Poor band', () => {
     for (const age of [18, 26, 36, 46]) {
-      expect(fitness.classifyStepTestRecovery(200, age, 'Female')).toBeNull();
+      expect(fitness.classifyStepTestRecovery(200, age, 'Female')).toBe('Poor');
     }
+    expect(fitness.classifyStepTestRecovery(220, 18, 'Male')).toBe('Poor');
   });
 });
 
@@ -118,6 +119,6 @@ describe('K11 category scoring', () => {
   });
 
   test('bumps the formula-bundle version for the changed classifier', () => {
-    expect(fitness.FITNESS_SCORING_VERSION).toBe('5');
+    expect(fitness.FITNESS_SCORING_VERSION).toBe('6');
   });
 });

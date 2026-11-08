@@ -9,7 +9,7 @@
 // Persisting it per assessment requires the approval-gated migration described
 // in F10 (new nullable `scoring_formula_version` column on pt_assessments);
 // until then this is documentation only and legacy rows are treated as unknown.
-const FITNESS_SCORING_VERSION = '5';
+const FITNESS_SCORING_VERSION = '6';
 
 function round(n, decimals = 1) {
   const f = 10 ** decimals;
@@ -17,20 +17,21 @@ function round(n, decimals = 1) {
 }
 
 // ── Step 1: Vitals ─────────────────────────────────────────
-// AHA blood-pressure bands plus resting heart rate and SpO₂. Classification is
-// clinical description only; the exercise-safety decision lives in
-// assessVitalsSafety below. A single reading is never a diagnosis.
+// The studio's blood-pressure table (systolic OR diastolic criteria), plus
+// resting heart rate and SpO₂. When the two numbers fall in different rows the
+// more actionable row wins: stage 2 outranks hypotension, hypotension outranks
+// stage 1. A boundary printed in two rows takes the higher-risk one (120
+// systolic → Elevated, 80 diastolic → Stage 1), and crisis diastolic is >120
+// exactly as printed. Classification is clinical description only; the
+// exercise-safety decision lives in assessVitalsSafety below.
 function classifyBp(systolic, diastolic) {
   if (systolic == null && diastolic == null) return null;
-  // Highest-risk band wins when the two numbers disagree: 185/70 is crisis,
-  // 160/58 is stage 2, 135/55 is hypotension.
-  if ((systolic != null && systolic >= 180) || (diastolic != null && diastolic >= 120)) return 'Hypertensive Crisis';
+  if ((systolic != null && systolic >= 180) || (diastolic != null && diastolic > 120)) return 'Hypertensive Crisis';
   if ((systolic != null && systolic >= 140) || (diastolic != null && diastolic >= 90)) return 'Hypertension Stage 2';
   if ((systolic != null && systolic < 90) || (diastolic != null && diastolic < 60)) return 'Hypotension';
   if ((systolic != null && systolic >= 130) || (diastolic != null && diastolic >= 80)) return 'Hypertension Stage 1';
-  // One number cannot establish "normal": only the high bands are safe to
-  // name from a single systolic value.
   if (systolic != null && systolic >= 120 && (diastolic == null || diastolic < 80)) return 'Elevated';
+  // One number is still a reading, but it cannot establish "normal".
   if (systolic == null || diastolic == null) return null;
   return 'Normal';
 }
@@ -45,10 +46,14 @@ function classifyRhr(rhr) {
   return 'High';
 }
 
+// The supplied SpO₂ table: 95–100 normal, 91–94 mild hypoxia, 86–90 moderate,
+// ≤85 severe. The table prints "<85" and leaves 85 itself undefined; 85 is
+// treated as severe, the safer of the two adjacent rows.
 function classifySpo2(spo2) {
   if (spo2 == null || !Number.isFinite(spo2)) return null;
-  if (spo2 < 90) return 'Critical';
-  if (spo2 < 95) return 'Mildly Low';
+  if (spo2 <= 85) return 'Severe Hypoxia';
+  if (spo2 <= 90) return 'Moderate Hypoxia';
+  if (spo2 < 95) return 'Mild Hypoxia';
   return 'Normal';
 }
 
@@ -65,45 +70,40 @@ function assessVitalsSafety(v) {
   };
 
   const bp = classifyBp(v.systolic, v.diastolic);
-  const bpKnown = v.systolic != null || v.diastolic != null;
   if (bp === 'Hypertensive Crisis') {
-    stop('Blood pressure is in the hypertensive crisis range (≥180/120 mmHg). Stop testing and arrange urgent medical assessment.');
+    stop('Blood pressure is in the hypertensive crisis range (≥180/>120 mmHg). Halt all physical testing and arrange immediate medical assessment.');
   } else if (bp === 'Hypertension Stage 2') {
-    stop('Blood pressure is at hypertension stage 2 (≥140/90 mmHg). Exertion testing requires medical clearance.');
+    stop('Blood pressure is at hypertension stage 2 (≥140/90 mmHg). Physician clearance is required before exertion testing; avoid high-intensity straining and heavy loads.');
   } else if (bp === 'Hypotension') {
-    stop('Blood pressure is low (<90/60 mmHg). Exertion testing requires medical clearance.');
+    caution('Blood pressure is low (<90/60 mmHg). Check for dizziness or fainting and avoid sudden postural changes before testing.');
   } else if (bp === 'Hypertension Stage 1') {
-    caution('Blood pressure is at hypertension stage 1 (130–139/80–89 mmHg). Rest 5–10 minutes and recheck before exertion testing.');
+    caution('Blood pressure is at hypertension stage 1 (130–139/80–89 mmHg). Medical advice is suggested; rest 5–10 minutes and recheck, and regulate exercise intensity carefully.');
   } else if (bp === 'Elevated') {
-    caution('Blood pressure is elevated (120–129/<80 mmHg). Rest 5–10 minutes and recheck.');
+    caution('Blood pressure is elevated (120–129/<80 mmHg). Rest 5–10 minutes and recheck; lifestyle modification is advised.');
   }
 
   const rhr = classifyRhr(v.restingHeartRate);
   if (rhr === 'High') {
-    stop('Resting heart rate is above 100 bpm. Do not start exertion testing; reassess and refer if it persists.');
-  } else if (rhr === 'Low') {
-    if (v.restingHeartRate != null && v.restingHeartRate < 40) {
-      stop('Resting heart rate is below 40 bpm. Do not start exertion testing without medical review.');
-    } else if (!v.athlete) {
-      caution('Resting heart rate is below 60 bpm. Confirm the client is well; for a trained athlete this can be normal.');
-    }
-  } else if (rhr === 'High Normal') {
-    caution('Resting heart rate is 81–100 bpm. Recheck after 5 minutes of rest.');
+    stop('Resting heart rate is above 100 bpm. Reassess at rest; if it remains above 100, physician evaluation is required before training.');
+  } else if (rhr === 'Low' && !v.athlete) {
+    caution('Resting heart rate is below 60 bpm in a non-athlete. Refer to a medical doctor to rule out underlying cardiac issues before training.');
   }
 
   const spo2 = classifySpo2(v.restingSpo2);
-  if (spo2 === 'Critical') {
-    stop('Resting SpO₂ is below 90%. Do not start exertion testing; seek medical assessment.');
-  } else if (spo2 === 'Mildly Low') {
-    caution('Resting SpO₂ is 90–94%. Recheck after rest and monitor for breathlessness.');
+  if (spo2 === 'Severe Hypoxia') {
+    stop('Resting SpO₂ is 85% or below. Medical emergency — halt all physical testing and arrange immediate medical evaluation and oxygen therapy.');
+  } else if (spo2 === 'Moderate Hypoxia') {
+    stop('Resting SpO₂ is 86–90%. Halt physical testing and seek medical advice.');
+  } else if (spo2 === 'Mild Hypoxia') {
+    caution('Resting SpO₂ is 91–94% (borderline low). Monitor closely and recheck after rest; cold hands, nail polish or movement can falsely lower the reading.');
   }
 
   return {
     level,
     reasons,
     requiresMedicalClearance: level === 'stop',
-    repeatBp: bpKnown && bp !== 'Normal',
-    athleteLowRhr: Boolean(v.athlete) && rhr === 'Low' && (v.restingHeartRate ?? 0) >= 40,
+    repeatBp: bp != null && bp !== 'Normal',
+    athleteLowRhr: Boolean(v.athlete) && rhr === 'Low',
   };
 }
 
@@ -128,21 +128,18 @@ function classifyBmi(bmi) {
   return 'Obese';
 }
 
-// The published waist and WHR norms define only the low-risk side. A reading
-// at or above the cut-off is described as such — never promoted to an invented
-// "moderate" or "high" risk band.
-//
-// Waist circumference is the narrowest-waist measurement (`waist_cm`), the
-// same field the WHR formula uses. The iliac-crest measurement is a separate
-// landmark and is never substituted when `waist_cm` is missing.
+// The supplied waist-circumference table measures at the greatest anterior
+// extension, usually the umbilicus/directly above the iliac crest — the
+// `waist_iliac_cm` field. WHR keeps the narrowest-waist landmark its own table
+// specifies. Each risk label is calculated from the landmark that table names.
 const WAIST_LOW_RISK_CM = { Male: 90, Female: 80 };
 const WHR_LOW_RISK = { Male: 0.95, Female: 0.86 };
 
-function classifyWaistRisk(waistCm, gender) {
-  if (waistCm == null || !Number.isFinite(waistCm) || waistCm <= 0) return null;
+function classifyWaistRisk(waistIliacCm, gender) {
+  if (waistIliacCm == null || !Number.isFinite(waistIliacCm) || waistIliacCm <= 0) return null;
   const g = sexOf(gender);
   if (!g) return null;
-  return waistCm < WAIST_LOW_RISK_CM[g] ? 'Low risk' : 'Above low-risk threshold';
+  return waistIliacCm < WAIST_LOW_RISK_CM[g] ? 'Low risk' : 'Above low-risk threshold';
 }
 
 function classifyWhrRisk(whr, gender) {
@@ -150,6 +147,29 @@ function classifyWhrRisk(whr, gender) {
   const g = sexOf(gender);
   if (!g) return null;
   return whr < WHR_LOW_RISK[g] ? 'Low risk' : 'Above low-risk threshold';
+}
+
+// Body-fat bands from the supplied K11 table. The table leaves male 20–25% and
+// female 25–30% undefined between Acceptable and Overfat, so that range gets a
+// descriptive "Above Ideal Range" label rather than an invented health risk.
+// Readings below the printed essential range also show as Essential Fat; the
+// table defines no lower band.
+function classifyBodyFat(bodyFatPct, gender) {
+  if (bodyFatPct == null || !Number.isFinite(bodyFatPct) || bodyFatPct <= 0) return null;
+  const g = sexOf(gender);
+  if (!g) return null;
+  if (g === 'Male') {
+    if (bodyFatPct <= 5) return 'Essential Fat';
+    if (bodyFatPct < 15) return 'Athletic / Ideal';
+    if (bodyFatPct <= 20) return 'Acceptable / Average';
+    if (bodyFatPct <= 25) return 'Above Ideal Range';
+    return 'Overfat / High Risk';
+  }
+  if (bodyFatPct <= 12) return 'Essential Fat';
+  if (bodyFatPct < 20) return 'Athletic / Ideal';
+  if (bodyFatPct <= 25) return 'Acceptable / Average';
+  if (bodyFatPct <= 30) return 'Above Ideal Range';
+  return 'Overfat / High Risk';
 }
 
 // ── Step 3: Body Composition ────────────────────────────────
@@ -278,56 +298,51 @@ function classifyVo2Max(vo2, age, gender) {
   return 'Very Poor';
 }
 
-// YMCA 3-Minute Step Test. K11 publishes recovery heart-rate norms by age and
-// sex for ages 18–55 only, with no VO2max conversion. Bands below are the
-// published whole-bpm ranges, written as closed integer intervals exactly as
-// printed: `<79` becomes 40–78, `79–89` stays 79–89, and male `>128` becomes
-// 129–220 (the physiological guard). Two source gaps are preserved rather than
-// papered over:
-//   • female tables print no Very Poor row, so values above the Poor ceiling
-//     (140 / 138 / 140 / 135 by age group) return no category;
-//   • the female 46–55 row jumps from "Excellent <94" to "Good 95–104", so
-//     94 bpm is in neither band and returns no category.
-// A non-integer reading is not one of the published whole-bpm bands either.
+// YMCA 3-Minute Step Test. K11 publishes six rating categories — Excellent,
+// Good, Above Average, Average, Below Average, Poor — by age and sex for ages
+// 18–55 only, with no VO2max conversion. Bands below are the published
+// whole-bpm ranges, written as closed integer intervals exactly as printed:
+// `<79` becomes 40–78, `79–89` stays 79–89. Poor is the open-ended top
+// category, so it runs to 220 (the physiological guard). One source gap is
+// preserved rather than papered over: the female 46–55 row jumps from
+// "Excellent <94" to "Good 95–104", so 94 bpm is in neither band and returns
+// no category. A non-integer reading is not one of the published whole-bpm
+// bands either.
 const YMCA_STEP_RECOVERY_NORMS = {
   Male: {
     '18-25': [
       ['Excellent', 40, 78], ['Good', 79, 89], ['Above Average', 90, 99],
-      ['Average', 100, 105], ['Below Average', 106, 116], ['Poor', 117, 128],
-      ['Very Poor', 129, 220],
+      ['Average', 100, 105], ['Below Average', 106, 116], ['Poor', 117, 220],
     ],
     '26-35': [
       ['Excellent', 40, 80], ['Good', 81, 89], ['Above Average', 90, 99],
-      ['Average', 100, 107], ['Below Average', 108, 117], ['Poor', 118, 128],
-      ['Very Poor', 129, 220],
+      ['Average', 100, 107], ['Below Average', 108, 117], ['Poor', 118, 220],
     ],
     '36-45': [
       ['Excellent', 40, 82], ['Good', 83, 96], ['Above Average', 97, 103],
-      ['Average', 104, 112], ['Below Average', 113, 119], ['Poor', 120, 130],
-      ['Very Poor', 131, 220],
+      ['Average', 104, 112], ['Below Average', 113, 119], ['Poor', 120, 220],
     ],
     '46-55': [
       ['Excellent', 40, 86], ['Good', 87, 97], ['Above Average', 98, 105],
-      ['Average', 106, 116], ['Below Average', 117, 122], ['Poor', 123, 132],
-      ['Very Poor', 133, 220],
+      ['Average', 106, 116], ['Below Average', 117, 122], ['Poor', 123, 220],
     ],
   },
   Female: {
     '18-25': [
       ['Excellent', 40, 84], ['Good', 85, 98], ['Above Average', 99, 108],
-      ['Average', 109, 117], ['Below Average', 118, 126], ['Poor', 127, 140],
+      ['Average', 109, 117], ['Below Average', 118, 126], ['Poor', 127, 220],
     ],
     '26-35': [
       ['Excellent', 40, 87], ['Good', 88, 99], ['Above Average', 100, 111],
-      ['Average', 112, 119], ['Below Average', 120, 126], ['Poor', 127, 138],
+      ['Average', 112, 119], ['Below Average', 120, 126], ['Poor', 127, 220],
     ],
     '36-45': [
       ['Excellent', 40, 89], ['Good', 90, 102], ['Above Average', 103, 110],
-      ['Average', 111, 118], ['Below Average', 119, 128], ['Poor', 129, 140],
+      ['Average', 111, 118], ['Below Average', 119, 128], ['Poor', 129, 220],
     ],
     '46-55': [
       ['Excellent', 40, 93], ['Good', 95, 104], ['Above Average', 105, 115],
-      ['Average', 116, 120], ['Below Average', 121, 126], ['Poor', 127, 135],
+      ['Average', 116, 120], ['Below Average', 121, 126], ['Poor', 127, 220],
     ],
   },
 };
@@ -415,7 +430,7 @@ const K11_STRENGTH_NORMS = {
 };
 
 const K11_PERCENTILE_CATEGORY = {
-  90: 'Well Above Average', 80: 'Well Above Average',
+  90: 'Well Above Average', 80: 'Above Average',
   70: 'Above Average', 60: 'Above Average',
   50: 'Average',
   40: 'Below Average', 30: 'Below Average',
@@ -489,25 +504,26 @@ const K11_PUSHUP_NORMS = {
 // Each row is [percentile, minimum repetitions], highest percentile first.
 const K11_CURLUP_NORMS = {
   Male: {
-    '20-29': [[90, 75], [80, 56], [60, 31], [50, 27], [40, 23], [20, 13]],
-    '30-39': [[90, 75], [80, 69], [60, 36], [50, 31], [40, 26], [20, 13]],
-    '40-49': [[90, 75], [80, 75], [60, 51], [50, 39], [40, 31], [20, 21]],
-    '50-59': [[90, 74], [80, 60], [60, 35], [50, 27], [40, 23], [20, 13]],
-    '60-69': [[90, 53], [80, 33], [60, 19], [50, 16], [40, 9], [20, 0]],
+    '20-29': [[90, 75], [80, 56], [70, 41], [60, 31], [50, 27], [40, 23], [30, 20], [20, 13], [10, 4]],
+    '30-39': [[90, 75], [80, 69], [70, 46], [60, 36], [50, 31], [40, 26], [30, 19], [20, 13], [10, 0]],
+    '40-49': [[90, 75], [80, 75], [70, 67], [60, 51], [50, 39], [40, 31], [30, 26], [20, 21], [10, 13]],
+    '50-59': [[90, 74], [80, 60], [70, 45], [60, 35], [50, 27], [40, 23], [30, 19], [20, 13], [10, 0]],
+    '60-69': [[90, 53], [80, 33], [70, 26], [60, 19], [50, 16], [40, 9], [30, 6], [20, 0], [10, 0]],
   },
   Female: {
-    '20-29': [[90, 70], [80, 45], [60, 32], [50, 27], [40, 21], [20, 12]],
-    '30-39': [[90, 55], [80, 43], [60, 28], [50, 21], [40, 15], [20, 0]],
-    '40-49': [[90, 50], [80, 42], [60, 28], [50, 25], [40, 20], [20, 5]],
-    '50-59': [[90, 48], [80, 30], [60, 16], [50, 9], [40, 2], [20, 0]],
-    '60-69': [[90, 50], [80, 30], [60, 19], [50, 9], [40, 3], [20, 0]],
+    '20-29': [[90, 70], [80, 45], [70, 37], [60, 32], [50, 27], [40, 21], [30, 17], [20, 12], [10, 12]],
+    '30-39': [[90, 55], [80, 43], [70, 34], [60, 28], [50, 21], [40, 15], [30, 12], [20, 0], [10, 0]],
+    '40-49': [[90, 50], [80, 42], [70, 33], [60, 28], [50, 25], [40, 20], [30, 14], [20, 5], [10, 5]],
+    '50-59': [[90, 48], [80, 30], [70, 23], [60, 16], [50, 9], [40, 2], [30, 0], [20, 0], [10, 0]],
+    '60-69': [[90, 50], [80, 30], [70, 24], [60, 19], [50, 9], [40, 3], [30, 0], [20, 0], [10, 0]],
   },
 };
 
 const K11_CURLUP_PERCENTILE_CATEGORY = {
-  90: 'Well Above Average', 80: 'Above Average',
+  90: 'Well Above Average', 80: 'Above Average', 70: 'Above Average',
   60: 'Average', 50: 'Average',
-  40: 'Below Average', 20: 'Well Below Average',
+  40: 'Below Average', 30: 'Below Average',
+  20: 'Well Below Average', 10: 'Well Below Average',
 };
 
 function enduranceAgeBand(age) {
@@ -523,9 +539,9 @@ function enduranceAgeBand(age) {
  * or sex means no category, never a default row.
  */
 function classifyEndurance(testType, value, gender, age) {
-  // A zero or negative result is not a performed test — never classify it as
-  // "Poor" (20), which would masquerade as a real (bad) score.
-  if (value == null || !Number.isFinite(value) || value <= 0) return null;
+  // A negative result is not a performed test. Zero is a real result and is
+  // scored by the tables; an empty field arrives as null, not 0.
+  if (value == null || !Number.isFinite(value) || value < 0) return null;
   const g = sexOf(gender);
   const band = enduranceAgeBand(age);
   if (!g || !band) return null;
@@ -549,33 +565,36 @@ function classifyEndurance(testType, value, gender, age) {
 // [minimum printed range value, category], highest first; below the lowest
 // floor is Well Below Average. The source prints integer ranges with gaps, so
 // the minimum of each printed range is used as that category's floor.
-const K11_SIT_AND_REACH_TABLE_VERSION = 'k11-2026.01-sit-and-reach';
+const K11_SIT_AND_REACH_TABLE_VERSION = 'k11-2026.02-sit-and-reach';
 const K11_SIT_AND_REACH_NORMS = {
   Male: {
-    '18-25': [[22, 'Excellent'], [18, 'Good'], [15, 'Average'], [13, 'Below Average']],
-    '26-35': [[21, 'Excellent'], [17, 'Good'], [14, 'Average'], [11, 'Below Average']],
-    '36-45': [[21, 'Excellent'], [16, 'Good'], [13, 'Average'], [11, 'Below Average']],
-    '46-55': [[19, 'Excellent'], [14, 'Good'], [11, 'Average'], [9, 'Below Average']],
-    '56-65': [[17, 'Excellent'], [13, 'Good'], [9, 'Average'], [7, 'Below Average']],
+    '18-25': [[20, 'Excellent'], [18, 'Good'], [15, 'Average'], [13, 'Below Average']],
+    '26-35': [[19, 'Excellent'], [17, 'Good'], [14, 'Average'], [11, 'Below Average']],
+    '36-45': [[19, 'Excellent'], [16, 'Good'], [13, 'Average'], [11, 'Below Average']],
+    '46-55': [[17, 'Excellent'], [14, 'Good'], [11, 'Average'], [9, 'Below Average']],
+    '56-65': [[15, 'Excellent'], [13, 'Good'], [9, 'Average'], [7, 'Below Average']],
+    '66+': [[15, 'Excellent'], [12, 'Good'], [9, 'Average'], [7, 'Below Average']],
   },
   Female: {
-    '18-25': [[24, 'Excellent'], [20, 'Good'], [18, 'Average'], [16, 'Below Average']],
-    '26-35': [[23, 'Excellent'], [20, 'Good'], [17, 'Average'], [15, 'Below Average']],
-    '36-45': [[22, 'Excellent'], [18, 'Good'], [16, 'Average'], [14, 'Below Average']],
-    '46-55': [[21, 'Excellent'], [17, 'Good'], [14, 'Average'], [12, 'Below Average']],
-    '56-65': [[20, 'Excellent'], [16, 'Good'], [14, 'Average'], [11, 'Below Average']],
+    '18-25': [[22, 'Excellent'], [20, 'Good'], [18, 'Average'], [16, 'Below Average']],
+    '26-35': [[21, 'Excellent'], [20, 'Good'], [17, 'Average'], [15, 'Below Average']],
+    '36-45': [[21, 'Excellent'], [18, 'Good'], [16, 'Average'], [14, 'Below Average']],
+    '46-55': [[19, 'Excellent'], [17, 'Good'], [14, 'Average'], [12, 'Below Average']],
+    '56-65': [[17, 'Excellent'], [16, 'Good'], [14, 'Average'], [11, 'Below Average']],
+    '66+': [[17, 'Excellent'], [16, 'Good'], [14, 'Average'], [11, 'Below Average']],
   },
 };
 
 function sitAndReachAgeBand(age) {
   if (age == null || !Number.isFinite(age)) return null;
   const whole = Math.floor(age);
-  if (whole < 18 || whole > 65) return null;
+  if (whole < 18) return null;
   if (whole <= 25) return '18-25';
   if (whole <= 35) return '26-35';
   if (whole <= 45) return '36-45';
   if (whole <= 55) return '46-55';
-  return '56-65';
+  if (whole <= 65) return '56-65';
+  return '66+';
 }
 
 function classifySitAndReach(inches, age, gender) {
@@ -690,6 +709,7 @@ module.exports = {
   classifyBmi,
   classifyWaistRisk,
   classifyWhrRisk,
+  classifyBodyFat,
   calcBmr,
   calcLeanBodyMass,
   calcFatMass,
