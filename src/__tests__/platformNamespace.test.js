@@ -102,7 +102,7 @@ describe('every session token declares its plane', () => {
   it('routes/auth-google.js mints its session on the tenant plane', () => {
     const src = code(read('routes', 'auth-google.js'));
     expect(src).toMatch(/signAccessToken\(user\.id, user\.token_version, AUD_TENANT\)/);
-    expect(src).toMatch(/issueRefreshToken\(res, user\.id, AUD_TENANT\)/);
+    expect(src).toMatch(/issueRefreshToken\(res, user\.id, AUD_TENANT, portal, \{ mirrorLegacy: true \}\)/);
   });
 
   it('every door routes its mint through one helper that takes the audience', () => {
@@ -163,11 +163,11 @@ describe('the audience survives a refresh', () => {
 
   it('reads it back rather than re-deciding', () => {
     expect(src).toMatch(/SELECT rt\.user_id, rt\.audience/);
-    expect(src).toMatch(/signAccessToken\(user_id, token_version, audience\)/);
+    expect(src).toMatch(/signAccessToken\(user_id, token_version, newAudience\)/);
   });
 
   it('re-issues the rotated refresh token on the same plane', () => {
-    expect(src).toMatch(/issueRefreshToken\(res, user_id, audience\)/);
+    expect(src).toMatch(/issueRefreshToken\(res, user_id, newAudience, tokenPortal, \{ mirrorLegacy \}\)/);
   });
 
   it('still works on a database that has not applied migration 162', () => {

@@ -9,6 +9,34 @@
 const { ALL_ROLES, TENANT_ROLES } = require('../middleware/rbac');
 const platformAuth = require('../middleware/platformAuth');
 
+/**
+ * The portal a session belongs to.
+ *
+ * The audience is the plane (platform vs studio), and the role splits the two
+ * tenant doors. Legacy tokens with no audience are placed by role, which is
+ * exactly how they behaved before audiences existed.
+ */
+function portalForSession(user, aud) {
+  if (aud === platformAuth.AUD_PLATFORM) return 'platform';
+  return user && user.role === 'member' ? 'member' : 'trainer';
+}
+
+/**
+ * May this session drive this portal?
+ *
+ * Checked for cookie sessions after the token verifies and the user row loads,
+ * so a token copied from one portal's cookie into another's is refused. It is
+ * not the authorization gate — role guards still run — it stops the cookie
+ * namespace from being a way around the door the token was minted at.
+ */
+function portalMatchesSession(portal, user, aud) {
+  if (!user) return false;
+  if (portal === 'platform') return user.role === 'super_admin' && aud !== platformAuth.AUD_TENANT;
+  if (portal === 'member') return user.role === 'member' && aud !== platformAuth.AUD_PLATFORM;
+  if (portal === 'trainer') return user.role !== 'member' && aud !== platformAuth.AUD_PLATFORM;
+  return false;
+}
+
 function normalisePortal(raw) {
   if (raw === 'member') return 'member';
   if (raw === 'platform') return 'platform';
@@ -84,4 +112,4 @@ function portalProblem(user, portal) {
   return null;
 }
 
-module.exports = { normalisePortal, portalProblem };
+module.exports = { normalisePortal, portalProblem, portalForSession, portalMatchesSession };

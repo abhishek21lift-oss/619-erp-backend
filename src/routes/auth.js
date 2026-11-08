@@ -19,14 +19,13 @@ const { authSchemas } = require('../lib/validation');
 // lib/loginEvents.js. Nothing below awaits it, and it cannot fail a login.
 const loginEvents = require('../lib/loginEvents');
 const {
-  setTokenCookie, clearSessionCookies, signAccessToken,
+  setAccessCookie, clearPortalCookies, clearLegacyCookies, signAccessToken,
   issueRefreshToken, bodyTokensAllowed, sessionUserPayload,
+  requestPortal, portalCookieNames, legacyRefreshMatches,
 } = require('../lib/authSession');
-const { normalisePortal, portalProblem } = require('../lib/authPortal');
+const { normalisePortal, portalProblem, portalForSession } = require('../lib/authPortal');
 const recovery = require('../lib/mfaRecoveryCodes');
 const { sendPasswordReset } = require('../lib/email');
-
-const isSecure = process.env.NODE_ENV !== 'development';
 
 async function revokeRefreshToken(rawToken) {
   if (!rawToken) return;
@@ -265,10 +264,10 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
       return res.status(500).json({ error: 'Token generation failed. Contact administrator.' });
     }
 
-    setTokenCookie(res, token);
+    setAccessCookie(res, portal, token, { mirrorLegacy: true });
     let refreshToken;
     try {
-      refreshToken = await issueRefreshToken(res, user.id, audience);
+      refreshToken = await issueRefreshToken(res, user.id, audience, portal, { mirrorLegacy: true });
     } catch (rfErr) {
       logger.warn({ err: rfErr.message }, 'refresh_token issue failed (non-critical, table may not exist yet)');
     }
@@ -293,19 +292,48 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
 router.post('/logout', async function(req, res) {
   // Mobile clients have no refresh_token cookie to read — accept it from
   // the body as a fallback so they can revoke their session too.
-  await revokeRefreshToken(req.cookies?.refresh_token || req.body?.refresh_token);
-  clearSessionCookies(res);
+  //
+  // Only the named portal's session is revoked and cleared. The legacy pair is
+  // cleared only when it is the mirror of that same session, so signing out of
+  // one door cannot end another door's pre-migration session.
+  const portal = requestPortal(req);
+  const ownRefresh = portal ? req.cookies?.[portalCookieNames(portal).refresh] : null;
+  const rawToken = (portal ? ownRefresh : req.cookies?.refresh_token) || req.body?.refresh_token;
+  await revokeRefreshToken(rawToken);
+  clearPortalCookies(res, portal, {
+    legacy: portal ? legacyRefreshMatches(req, portal) : true,
+  });
   res.json({ message: 'Logged out' });
 });
 
 // POST /api/auth/refresh — exchange a valid refresh token for a new access token (token rotation)
 router.post('/refresh', async (req, res) => {
-  const rawToken = req.cookies?.refresh_token || req.body?.refresh_token;
+  // The portal selects the cookie namespace. When it is named, only that
+  // namespace is read first; the legacy pair is a migration fallback, and its
+  // session is still checked against the named portal below.
+  const requestedPortal = requestPortal(req);
+  const names = requestedPortal ? portalCookieNames(requestedPortal) : null;
+  const portalCookie = names ? req.cookies?.[names.refresh] : null;
+  const legacyCookie = req.cookies?.refresh_token;
+
+  let rawToken = portalCookie;
+  let source = portalCookie ? 'portal' : null;
+  if (!rawToken && legacyCookie) { rawToken = legacyCookie; source = 'legacy'; }
+  if (!rawToken && req.body?.refresh_token) { rawToken = req.body.refresh_token; source = 'body'; }
   // Body tokens only for a cookieless, non-browser caller. A browser that has
   // lost its cookie but replays a refresh token from the body still gets
   // cookies only — see bodyTokensAllowed.
-  const isMobile = !req.cookies?.refresh_token && bodyTokensAllowed(req);
+  const isMobile = source === 'body' && bodyTokensAllowed(req);
   if (!rawToken) return res.status(401).json({ error: 'No refresh token' });
+
+  // Clear only what this request could have authenticated with. A failed
+  // cross-portal probe must not clear the other portal's live session — and
+  // the legacy pair is only one of the portals' mirror, so it is cleared only
+  // when it was attributable to this door.
+  const clearRejected = ({ legacy = source === 'legacy' } = {}) => {
+    if (requestedPortal) clearPortalCookies(res, requestedPortal, { legacy });
+    else if (legacy) clearLegacyCookies(res);
+  };
 
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   try {
@@ -316,10 +344,15 @@ router.post('/refresh', async (req, res) => {
     // token lifetime. Coalesced through a column check so this still runs on a
     // database that has not applied 162 (the value is then always NULL, i.e.
     // legacy, which is what such a database's sessions genuinely are).
+    //
+    // role and organization_id are here to place the session at its door:
+    // trainer and member share the tenant audience, so the audience alone
+    // cannot tell those two apart.
     let rows;
     try {
       ({ rows } = await pool.query(
-        `SELECT rt.user_id, rt.audience, u.token_version, u.is_active, u.deleted_at
+        `SELECT rt.user_id, rt.audience, u.role, u.organization_id,
+                u.token_version, u.is_active, u.deleted_at
            FROM refresh_tokens rt
            JOIN users u ON u.id = rt.user_id
           WHERE rt.token_hash = $1
@@ -331,7 +364,8 @@ router.post('/refresh', async (req, res) => {
     } catch (err) {
       if (err && err.code === '42703') {
         ({ rows } = await pool.query(
-          `SELECT rt.user_id, NULL::text AS audience, u.token_version, u.is_active, u.deleted_at
+          `SELECT rt.user_id, NULL::text AS audience, u.role, u.organization_id,
+                  u.token_version, u.is_active, u.deleted_at
              FROM refresh_tokens rt
              JOIN users u ON u.id = rt.user_id
             WHERE rt.token_hash = $1
@@ -346,11 +380,34 @@ router.post('/refresh', async (req, res) => {
     }
 
     if (!rows[0] || !rows[0].is_active || rows[0].deleted_at) {
-      res.clearCookie('refresh_token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/api/auth' });
+      clearRejected();
       return res.status(401).json({ error: 'Invalid or expired refresh token' });
     }
 
     const { user_id, token_version, audience } = rows[0];
+    const tokenPortal = portalForSession(rows[0], audience ?? null);
+
+    // A token minted at one door cannot be refreshed at another. The cookie
+    // names already keep the namespaces apart; this catches a copied value.
+    // The legacy mirror is not cleared here: it may belong to the door the
+    // token actually came from, and a probe at the wrong door must not sign
+    // that door out.
+    if (requestedPortal && requestedPortal !== tokenPortal) {
+      clearRejected({ legacy: false });
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
+
+    const problem = portalProblem(rows[0], tokenPortal);
+    if (problem) {
+      clearRejected();
+      return res.status(problem.status).json({
+        error: {
+          code: problem.code,
+          ...(problem.portal ? { portal: problem.portal } : {}),
+          message: problem.message,
+        },
+      });
+    }
 
     // Rotate: claim the old token, then issue new ones.
     //
@@ -365,13 +422,21 @@ router.post('/refresh', async (req, res) => {
       [tokenHash]
     );
     if (claim.rowCount !== 1) {
-      res.clearCookie('refresh_token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/api/auth' });
+      clearRejected();
       return res.status(401).json({ error: 'Invalid or expired refresh token' });
     }
 
-    const newAccessToken = signAccessToken(user_id, token_version, audience);
-    setTokenCookie(res, newAccessToken);
-    const newRefreshToken = await issueRefreshToken(res, user_id, audience);
+    // Never downgrade a platform session: the portal decides the audience, and
+    // a legacy null audience is upgraded to tenant only for a tenant door.
+    const newAudience = tokenPortal === 'platform'
+      ? platformAuth.AUD_PLATFORM
+      : platformAuth.AUD_TENANT;
+    const mirrorLegacy = source !== 'portal'
+      || !!(requestedPortal && legacyRefreshMatches(req, requestedPortal));
+
+    const newAccessToken = signAccessToken(user_id, token_version, newAudience);
+    setAccessCookie(res, tokenPortal, newAccessToken, { mirrorLegacy });
+    const newRefreshToken = await issueRefreshToken(res, user_id, newAudience, tokenPortal, { mirrorLegacy });
 
     res.json(isMobile ? { ok: true, token: newAccessToken, refresh_token: newRefreshToken } : { ok: true });
   } catch (err) {
@@ -505,7 +570,22 @@ router.get('/me', (req, res, next) => {
   // handler at somebody who was never signed in. A refresh cookie that is
   // still present is the case that genuinely needs the 401, because that is
   // what makes the app refresh and retry.
-  if (!req.cookies?.token && !req.cookies?.refresh_token) return res.json({ user: null });
+  //
+  // Per portal: another portal's session is not this portal's session. A
+  // member visiting the studio's landing page must not be treated as an
+  // expired trainer. The legacy pair gets `legacy: true` instead of a 401 so
+  // the app can perform the one-time migration without signing anybody out.
+  const portal = requestPortal(req);
+  if (portal) {
+    const n = portalCookieNames(portal);
+    const own = req.cookies?.[n.access] || req.cookies?.[n.refresh];
+    if (!own) {
+      if (req.cookies?.token || req.cookies?.refresh_token) return res.json({ user: null, legacy: true });
+      return res.json({ user: null });
+    }
+  } else if (!req.cookies?.token && !req.cookies?.refresh_token) {
+    return res.json({ user: null });
+  }
   next();
 }, auth, (req, res) => {
   res.json({ user: req.user });
@@ -586,12 +666,14 @@ async function changePasswordHandler(req, res) {
     // reachable from a password form, and silently downgrading it would sign
     // the operator out of the console for changing their password.
     const sessionAud = platformAuth.sessionAudience(req);
+    const portal = portalForSession(req.user, sessionAud);
+    const mirrorLegacy = legacyRefreshMatches(req, portal);
     const newToken = signAccessToken(req.user.id, updated[0].token_version, sessionAud);
-    setTokenCookie(res, newToken);
+    setAccessCookie(res, portal, newToken, { mirrorLegacy });
     // The caller's old refresh token was revoked by the statement above, along
     // with every other session's. This issues the replacement that keeps THIS
     // browser signed in.
-    try { await issueRefreshToken(res, req.user.id, sessionAud); } catch { /* non-critical */ }
+    try { await issueRefreshToken(res, req.user.id, sessionAud, portal, { mirrorLegacy }); } catch { /* non-critical */ }
     res.json({ message: 'Password changed successfully' });
   } catch (err) {
     logger.error({ err: err.message }, 'Change password error');

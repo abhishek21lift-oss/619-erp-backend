@@ -6,6 +6,8 @@ const { resolveOrgId } = require('./tenant');
 const { runWithTenantContext } = require('../lib/tenant-context');
 const { platformSessionBlocked, TENANT_SESSION_REQUIRED, isTenantPlanePath } = require('./platformAuth');
 const { ROLES, TENANT_ROLES, ALL_ROLES } = require('./rbac');
+const { accessTokenFor } = require('../lib/authSession');
+const { portalMatchesSession } = require('../lib/authPortal');
 
 // Defaults to ON in production for security. Explicitly set to 'off' to disable
 // (staged rollout only). See TENANT-RLS-PLAN.md and server.js startup validation.
@@ -81,11 +83,15 @@ setInterval(() => {
 
 async function auth(req, res, next) {
   let token = null;
+  let cookiePortal = null;
   const header = req.headers.authorization;
   if (header && header.startsWith('Bearer ')) {
+    // A bearer token names its own identity; portal cookies do not apply.
     token = header.slice(7);
-  } else if (req.cookies && req.cookies.token) {
-    token = req.cookies.token;
+  } else {
+    const resolved = accessTokenFor(req);
+    token = resolved.token;
+    cookiePortal = resolved.portal;
   }
 
   if (!token) {
@@ -159,6 +165,16 @@ async function auth(req, res, next) {
     if (user.token_version !== decoded.token_version) {
       return res.status(401).json({ error: 'Session expired, please log in again' });
     }
+
+    // The cookie namespace and the session must agree. Without this, a token
+    // copied from one portal's cookie into another's would be accepted here
+    // and only refused later — or not at all on a shared route such as
+    // /api/profile. Role guards are still the authorization gate; this keeps
+    // the namespace from being a second, weaker door.
+    if (cookiePortal && !portalMatchesSession(cookiePortal, user, decoded.aud ?? null)) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    req.portal = cookiePortal;
 
     req.user = user;
 

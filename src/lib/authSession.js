@@ -15,29 +15,88 @@ const isSecure = process.env.NODE_ENV !== 'development';
 const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;          // 15 minutes
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-function setTokenCookie(res, token) {
-  res.cookie('token', token, {
-    httpOnly: true,
-    secure: isSecure,
-    sameSite: 'strict',
-    maxAge: ACCESS_TOKEN_TTL_MS,
-    path: '/',
-  });
+// One cookie namespace per door, so three sessions can share a browser.
+//
+// `token`/`refresh_token` remain as a mirror of the most recent login. They
+// are read only when the caller names no portal, which is what lets an
+// installed app or a session minted before this change keep working while the
+// new cookies are rolled out.
+const PORTALS = ['trainer', 'member', 'platform'];
+
+function isPortal(value) {
+  return PORTALS.includes(value);
 }
 
-function setRefreshCookie(res, rawToken) {
-  res.cookie('refresh_token', rawToken, {
-    httpOnly: true,
-    secure: isSecure,
-    sameSite: 'strict',
-    maxAge: REFRESH_TOKEN_TTL_MS,
-    path: '/api/auth',
-  });
+function portalCookieNames(portal) {
+  return { access: `${portal}_token`, refresh: `${portal}_refresh` };
 }
 
-function clearSessionCookies(res) {
-  res.clearCookie('token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/' });
-  res.clearCookie('refresh_token', { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/api/auth' });
+/** The portal named by the caller. A SELECTOR, never an authorization fact. */
+function headerPortal(req) {
+  const raw = String((req.headers && req.headers['x-portal']) || '').toLowerCase();
+  return isPortal(raw) ? raw : null;
+}
+
+/** The portal whose cookies are present, when exactly one namespace is. */
+function cookiePortal(cookies) {
+  const found = PORTALS.filter((portal) => {
+    const n = portalCookieNames(portal);
+    return !!(cookies && (cookies[n.access] || cookies[n.refresh]));
+  });
+  return found.length === 1 ? found[0] : null;
+}
+
+function requestPortal(req) {
+  return headerPortal(req) || cookiePortal(req.cookies);
+}
+
+function legacyRefreshMatches(req, portal) {
+  const own = req.cookies && req.cookies[portalCookieNames(portal).refresh];
+  return !!(own && req.cookies.refresh_token === own);
+}
+
+/**
+ * The access token to verify, and the portal namespace it came from.
+ *
+ * With a named portal, the legacy cookie is a migration fallback only: it is
+ * still checked against that portal after the user row is loaded.
+ */
+function accessTokenFor(req) {
+  const portal = requestPortal(req);
+  if (portal) {
+    return {
+      token: (req.cookies && (req.cookies[portalCookieNames(portal).access] || req.cookies.token)) || null,
+      portal,
+    };
+  }
+  return { token: (req.cookies && req.cookies.token) || null, portal: null };
+}
+
+const ACCESS_COOKIE = { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/' };
+const REFRESH_COOKIE = { httpOnly: true, secure: isSecure, sameSite: 'strict', path: '/api/auth' };
+
+function setAccessCookie(res, portal, token, { maxAgeMs = ACCESS_TOKEN_TTL_MS, mirrorLegacy = false } = {}) {
+  res.cookie(portalCookieNames(portal).access, token, { ...ACCESS_COOKIE, maxAge: maxAgeMs });
+  if (mirrorLegacy) res.cookie('token', token, { ...ACCESS_COOKIE, maxAge: maxAgeMs });
+}
+
+function setRefreshCookie(res, portal, rawToken, mirrorLegacy) {
+  res.cookie(portalCookieNames(portal).refresh, rawToken, { ...REFRESH_COOKIE, maxAge: REFRESH_TOKEN_TTL_MS });
+  if (mirrorLegacy) res.cookie('refresh_token', rawToken, { ...REFRESH_COOKIE, maxAge: REFRESH_TOKEN_TTL_MS });
+}
+
+function clearLegacyCookies(res) {
+  res.clearCookie('token', ACCESS_COOKIE);
+  res.clearCookie('refresh_token', REFRESH_COOKIE);
+}
+
+function clearPortalCookies(res, portal, { legacy = false } = {}) {
+  if (portal) {
+    const n = portalCookieNames(portal);
+    res.clearCookie(n.access, ACCESS_COOKIE);
+    res.clearCookie(n.refresh, REFRESH_COOKIE);
+  }
+  if (legacy) clearLegacyCookies(res);
 }
 
 /**
@@ -76,7 +135,7 @@ function bodyTokensAllowed(req) {
   return !req.headers.origin;
 }
 
-async function issueRefreshToken(res, userId, audience = null) {
+async function issueRefreshToken(res, userId, audience = null, portal = 'trainer', { mirrorLegacy = true } = {}) {
   const rawToken = crypto.randomBytes(48).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
@@ -103,11 +162,26 @@ async function issueRefreshToken(res, userId, audience = null) {
       throw err;
     }
   }
-  setRefreshCookie(res, rawToken);
+  setRefreshCookie(res, portal, rawToken, mirrorLegacy);
   // Returned (not just cookied) so mobile/native clients — which don't share
   // a browser cookie jar — can store it themselves and send it back via
   // Authorization header / request body instead of a cookie.
   return rawToken;
+}
+
+/**
+ * Revoke every live refresh token for a user.
+ *
+ * Bumping users.token_version kills access tokens, but refresh rows are a
+ * separate mechanism and were never consulted for it — left live, another
+ * device can mint a fresh access token for up to the refresh token's seven-day
+ * lifetime.
+ */
+async function revokeRefreshTokensForUser(userId) {
+  await pool.query(
+    'UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL',
+    [userId]
+  );
 }
 
 /**
@@ -136,11 +210,18 @@ function sessionUserPayload(user, extra = {}) {
 module.exports = {
   ACCESS_TOKEN_TTL_MS,
   REFRESH_TOKEN_TTL_MS,
-  setTokenCookie,
+  PORTALS,
+  portalCookieNames,
+  requestPortal,
+  legacyRefreshMatches,
+  accessTokenFor,
+  setAccessCookie,
   setRefreshCookie,
-  clearSessionCookies,
+  clearLegacyCookies,
+  clearPortalCookies,
   signAccessToken,
   issueRefreshToken,
+  revokeRefreshTokensForUser,
   bodyTokensAllowed,
   sessionUserPayload,
 };
