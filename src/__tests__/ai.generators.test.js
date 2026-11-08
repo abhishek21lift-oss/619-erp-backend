@@ -236,6 +236,8 @@ describe('workout/generate', () => {
     const call = routedStream.mock.calls[0][0];
     const prompt = promptOf(call);
 
+    expect(call.signal).toBeInstanceOf(AbortSignal); // disconnect can stop the stream
+
     // Database values, not the browser's.
     expect(prompt).toContain(`Age: ${expectedAge()}`);
     expect(prompt).toContain('Gender: female');
@@ -455,6 +457,8 @@ describe('diet/generate', () => {
     expect(res.status).toBe(200);
     const call = routedStream.mock.calls[0][0];
     const prompt = promptOf(call);
+
+    expect(call.signal).toBeInstanceOf(AbortSignal); // disconnect can stop the stream
 
     // Database values win; the nutrition assessment outranks the lifestyle
     // assessment, which outranks the fitness profile. Height follows the

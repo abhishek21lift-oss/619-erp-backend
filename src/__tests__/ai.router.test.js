@@ -256,6 +256,53 @@ describe('routedStream fallback order', () => {
   });
 });
 
+describe('only retryable provider failures fall back', () => {
+  it('does not ask a fallback model when the request itself is rejected (400)', async () => {
+    const err = Object.assign(new Error('invalid request'), { status: 400 });
+    chatCompletion.mockRejectedValueOnce(err);
+
+    await expect(routedChat({ intent: 'chat', messages: [] })).rejects.toBe(err);
+    expect(chatCompletion).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not ask a fallback model on an auth failure (401)', async () => {
+    const err = Object.assign(new Error('invalid key'), { status: 401 });
+    chatCompletion.mockRejectedValueOnce(err);
+
+    await expect(routedChat({ intent: 'chat', messages: [] })).rejects.toBe(err);
+    expect(chatCompletion).toHaveBeenCalledTimes(1);
+  });
+
+  it('fell back on a rate limit (429)', async () => {
+    chatCompletion
+      .mockRejectedValueOnce(Object.assign(new Error('rate limited'), { status: 429 }))
+      .mockResolvedValueOnce(okResult({ model: 'vendor/s' }));
+
+    const res = await routedChat({ intent: 'chat', messages: [] });
+
+    expect(chatCompletion.mock.calls.map((c) => c[0].model)).toEqual(['vendor/p', 'vendor/s']);
+    expect(res).toMatchObject({ tier: 'secondary', used_fallback: true });
+  });
+
+  it('fell back on an upstream failure (500)', async () => {
+    chatCompletion
+      .mockRejectedValueOnce(Object.assign(new Error('upstream down'), { status: 500 }))
+      .mockResolvedValueOnce(okResult({ model: 'vendor/s' }));
+
+    await routedChat({ intent: 'chat', messages: [] });
+
+    expect(chatCompletion).toHaveBeenCalledTimes(2);
+  });
+
+  it('streaming: rethrows a non-retryable error without a fallback model', async () => {
+    const err = Object.assign(new Error('invalid request'), { status: 400 });
+    streamCompletion.mockImplementationOnce(() => rejectGen(err));
+
+    await expect(drain(routedStream({ intent: 'chat', messages: [] }))).rejects.toBe(err);
+    expect(streamCompletion).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('no secrets in logs', () => {
   it('fallback logs never carry the API key or authorization header', async () => {
     chatCompletion

@@ -36,13 +36,13 @@ beforeEach(() => pool.query.mockReset());
 
 describe('the prompt distinguishes three grounding states', () => {
   it('ok: cites the studio documents that were retrieved', () => {
-    const p = buildCoachSystemPrompt(null, '[1] (Refund SOP) 14 days.', '', 'ok');
+    const p = buildCoachSystemPrompt({ grounding: 'ok', hasKnowledge: true });
     expect(p).toContain("Reference material from this studio's own documents");
     expect(p).not.toMatch(/could NOT be searched/);
   });
 
   it('no_match: says nothing matched, and scopes that claim to documents', () => {
-    const p = buildCoachSystemPrompt(null, '', '', 'no_match');
+    const p = buildCoachSystemPrompt({ grounding: 'no_match' });
     expect(p).toMatch(/No uploaded policy\/SOP document matched/);
     expect(p).not.toMatch(/could NOT be searched/);
   });
@@ -50,14 +50,14 @@ describe('the prompt distinguishes three grounding states', () => {
   it('unavailable: forbids claiming the studio has no such document', () => {
     // The whole point. During an outage the model previously received the
     // no_match text, which tells it the base was consulted and was empty.
-    const p = buildCoachSystemPrompt(null, '', '', 'unavailable');
+    const p = buildCoachSystemPrompt({ grounding: 'unavailable' });
     expect(p).toMatch(/could NOT be searched/);
     expect(p).toMatch(/Do not say the studio has no document/);
     expect(p).not.toMatch(/No uploaded policy\/SOP document matched/);
   });
 
   it('defaults to no_match, so an un-migrated caller cannot claim an outage', () => {
-    const p = buildCoachSystemPrompt(null, '', '');
+    const p = buildCoachSystemPrompt();
     expect(p).toMatch(/No uploaded policy\/SOP document matched/);
   });
 });

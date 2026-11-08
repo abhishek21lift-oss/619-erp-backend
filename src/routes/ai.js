@@ -23,6 +23,7 @@ const { pingModel }                    = require('../lib/ai/openrouter');
 const { models, INTENT_ROUTES }        = require('../lib/ai/models');
 const { logUsage, getUserUsage, getModelStats } = require('../lib/ai/usage');
 const { usageFields, meteredChat } = require('../lib/ai/metering');
+const { newFenceId, buildContextBlock, neutralise } = require('../lib/ai/agent/untrustedContext');
 const { retrieveContext }              = require('../lib/ai/knowledgeBase');
 // MPTS grounding enforcement: evidence assembly, insufficient-evidence gate
 // and the deterministic citation validator whose contract every gated
@@ -30,6 +31,7 @@ const { retrieveContext }              = require('../lib/ai/knowledgeBase');
 const grounding = require('../lib/ai/grounding');
 const { runTools }                     = require('../lib/ai/tools');
 const { startSseHeartbeat }            = require('../lib/sse-heartbeat');
+const { abortOnClose }                 = require('../lib/sse-abort');
 // The client's digital twin: the assessments, the screen and the logged sets
 // that this file could not see. See modules/pt-os/client-context.js.
 const { loadDigitalTwin, describeTwin, limitationsLine, screenPlanExercises } = require('../modules/pt-os/client-context');
@@ -665,6 +667,10 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
   // self-clears once the response ends.
   const stopHeartbeat = startSseHeartbeat(res);
 
+  // The reader closed the tab or lost the network: stop generating and bill
+  // nothing. The streaming layer already understands AbortSignal.
+  const clientAbort = abortOnClose(res);
+
   const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
   try {
@@ -742,7 +748,6 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     const knowledgeCtx = knowledgeChunks
       .map((c, i) => `[${i + 1}] (${c.title}) ${c.content}`)
       .join('\n\n');
-
     // Tool-calling: pattern-match the message against this studio's own live
     // data (members, attendance, revenue, dues, trainers, exercises) — see
     // lib/ai/tools.js for why this is app-layer routing rather than
@@ -761,11 +766,38 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       toolCtx = "[Live data] This studio's live records could not be read just now. Say so plainly if the question needs them — do not estimate or recall figures.";
     }
 
-    const systemPrompt = buildCoachSystemPrompt(clientCtx, knowledgeCtx, toolCtx, chatGrounding);
+    // Everything below came out of the database, a retrieved document or a
+    // tool. It is fenced with a per-request nonce and delivered as a USER
+    // message, so none of it inherits the system role's authority.
+    const contextBlock = buildContextBlock([
+      clientCtx ? { label: 'client context', tool: 'client_profile', data: clientCtx } : null,
+      knowledgeCtx ? { label: 'studio documents', tool: 'knowledge_search', data: knowledgeCtx } : null,
+      toolCtx ? { label: 'live studio records', tool: 'live_data', data: toolCtx } : null,
+    ].filter(Boolean), newFenceId());
+
+    const systemPrompt = buildCoachSystemPrompt({
+      grounding: chatGrounding,
+      hasClient: Boolean(clientCtx),
+      hasKnowledge: knowledgeChunks.length > 0,
+      hasTools: Boolean(toolCtx),
+    });
+
+    // Assistant turns are replayed neutralised: a previous answer may have
+    // quoted a malicious note verbatim, and replaying that quote unfenced
+    // would smuggle it back outside the fence that contained it.
+    const history = histRes.rows.map((r) => r.role === 'assistant'
+      ? { role: 'assistant', content: neutralise(r.content, '') }
+      : { role: 'user', content: r.content });
+    if (contextBlock) {
+      const at = history.length && history[history.length - 1].role === 'user'
+        ? history.length - 1
+        : history.length;
+      history.splice(at, 0, { role: 'user', content: contextBlock });
+    }
 
     const messages = [
       { role: 'system', content: systemPrompt },
-      ...histRes.rows.map(r => ({ role: r.role, content: r.content })),
+      ...history,
     ];
 
     send({ type: 'start', conversation_id: convId });
@@ -799,7 +831,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     // usage was logged as zero prompt tokens and an estimated completion.
     let chatMeta = null;
     try {
-      const it = routedStream({ intent: 'chat', messages, temperature: 0.75, max_tokens: 1024 })[Symbol.asyncIterator]();
+      const it = routedStream({ intent: 'chat', messages, temperature: 0.75, max_tokens: 1024, signal: clientAbort.signal })[Symbol.asyncIterator]();
       let step;
       while (!(step = await it.next()).done) {
         const chunk = step.value;
@@ -819,8 +851,19 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       }
       chatMeta = step.value || null;
     } catch (streamErr) {
+      if (clientAbort.signal.aborted || streamErr?.code === 'AI_ABORTED') {
+        logger.info({ conversation_id: convId }, 'ai_chat_client_disconnected');
+        return;
+      }
       send({ type: 'error', message: publicAiMessage(streamErr) });
       res.end();
+      return;
+    }
+
+    // Disconnected after the last token but before the ledger write: nobody
+    // saw a completed answer, so do not persist or bill one.
+    if (clientAbort.signal.aborted) {
+      logger.info({ conversation_id: convId }, 'ai_chat_client_disconnected');
       return;
     }
 
@@ -862,7 +905,7 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     send({ type: 'error', message: publicAiMessage(err) });
   } finally {
     stopHeartbeat();
-    if (!res.writableEnded) res.end();
+    if (!res.writableEnded && !res.destroyed) res.end();
   }
 });
 
@@ -1435,6 +1478,8 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
 
   const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
+  const clientAbort = abortOnClose(res);
+
   try {
     let fullContent = '';
     let streamMeta  = { model: models.primary, tier: 'primary', used_fallback: false };
@@ -1447,6 +1492,7 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
       ],
       temperature: 0.6,
       max_tokens:  8000,
+      signal:      clientAbort.signal,
     })[Symbol.asyncIterator]();
 
     let step;
@@ -1464,6 +1510,9 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
       res.write(': ping\n\n'); // keeps Render connection alive
     }
     if (step.value && typeof step.value === 'object') streamMeta = step.value;
+
+    // Nobody is reading. Skip the parse, audit, revision and ledger entirely.
+    if (clientAbort.signal.aborted) return;
 
     let plan = await parseOrRepair({
       req,
@@ -1759,15 +1808,19 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
       },
     });
   } catch (err) {
-    logger.error({ err: err.message }, 'ai_workout_generate_error');
-    if (!res.headersSent) {
-      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-      return res.status(503).json({ error: 'AI workout generation failed', message: publicAiMessage(err) });
+    if (clientAbort.signal.aborted) {
+      logger.info({ req_id: req.id }, 'ai_workout_client_disconnected');
+    } else {
+      logger.error({ err: err.message }, 'ai_workout_generate_error');
+      if (!res.headersSent) {
+        if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+        return res.status(503).json({ error: 'AI workout generation failed', message: publicAiMessage(err) });
+      }
+      send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI workout generation failed. Please try again.' });
     }
-    send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI workout generation failed. Please try again.' });
   } finally {
     stopHeartbeat();
-    if (!res.writableEnded) res.end();
+    if (!res.writableEnded && !res.destroyed) res.end();
   }
 });
 
@@ -1898,6 +1951,8 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
 
   const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
+  const clientAbort = abortOnClose(res);
+
   try {
     const trainerName = req.user?.name || '';
     let fullContent = '';
@@ -1917,6 +1972,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       // the "Could not parse AI response as JSON" failure was simply running
       // out of budget mid-object before ever reaching the closing brace.
       max_tokens:  14000,
+      signal:      clientAbort.signal,
     })[Symbol.asyncIterator]();
 
     let step;
@@ -1934,6 +1990,8 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       res.write(': ping\n\n');
     }
     if (step.value && typeof step.value === 'object') streamMeta = step.value;
+
+    if (clientAbort.signal.aborted) return;
 
     let plan = await parseOrRepair({
       req,
@@ -2033,15 +2091,19 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       },
     });
   } catch (err) {
-    logger.error({ err: err.message }, 'ai_diet_generate_error');
-    if (!res.headersSent) {
-      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-      return res.status(503).json({ error: 'AI diet generation failed', message: publicAiMessage(err) });
+    if (clientAbort.signal.aborted) {
+      logger.info({ req_id: req.id }, 'ai_diet_client_disconnected');
+    } else {
+      logger.error({ err: err.message }, 'ai_diet_generate_error');
+      if (!res.headersSent) {
+        if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+        return res.status(503).json({ error: 'AI diet generation failed', message: publicAiMessage(err) });
+      }
+      send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI diet generation failed. Please try again.' });
     }
-    send({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'AI diet generation failed. Please try again.' });
   } finally {
     stopHeartbeat();
-    if (!res.writableEnded) res.end();
+    if (!res.writableEnded && !res.destroyed) res.end();
   }
 });
 
@@ -2057,6 +2119,7 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
   // happens only after the client-authorization gate passes. The finally
   // guards on null, so the early 404/validation paths never touch a timer.
   let stopHeartbeat = null;
+  let clientAbort = null;
 
   try {
     // Tenant isolation: verify the client belongs to the caller's org before
@@ -2171,6 +2234,7 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
     // per-chunk ': ping' comments in the stream loop below only start once
     // the model is actually producing tokens.
     stopHeartbeat = startSseHeartbeat(res);
+    clientAbort = abortOnClose(res);
 
     const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
@@ -2185,6 +2249,7 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
       ],
       temperature: 0.4,
       max_tokens:  4000,
+      signal:      clientAbort.signal,
     })[Symbol.asyncIterator]();
 
     let step;
@@ -2228,18 +2293,22 @@ router.post('/progress/analyze', auth, requireTrainer, requireConfigured, async 
 
     send({ type: 'done', data: analysis, data_counts: dataCounts, weight_history: weightHistory, grounding: grounding.groundingBlock(evidence, citationCheck), model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
-    logger.error({ err: err.message }, 'ai_progress_analyze_error');
-    // Headers may or may not have been sent yet depending on where the error occurred
-    if (!res.headersSent) {
-      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-      return res.status(503).json({ error: 'Progress analysis failed', message: publicAiMessage(err) });
+    if (clientAbort?.signal.aborted) {
+      logger.info({ req_id: req.id }, 'ai_progress_client_disconnected');
+    } else {
+      logger.error({ err: err.message }, 'ai_progress_analyze_error');
+      // Headers may or may not have been sent yet depending on where the error occurred
+      if (!res.headersSent) {
+        if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+        return res.status(503).json({ error: 'Progress analysis failed', message: publicAiMessage(err) });
+      }
+      try {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Progress analysis failed. Please try again.' })}\n\n`);
+      } catch { /* ignore write errors on closed connection */ }
     }
-    try {
-      res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Progress analysis failed. Please try again.' })}\n\n`);
-    } catch { /* ignore write errors on closed connection */ }
   } finally {
     if (stopHeartbeat) stopHeartbeat();
-    try { if (!res.writableEnded) res.end(); } catch { /* ignore */ }
+    try { if (!res.writableEnded && !res.destroyed) res.end(); } catch { /* ignore */ }
   }
 });
 
@@ -2255,6 +2324,7 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
   // happens only after the org-scoped assessment gate passes. The finally
   // guards on null, so the early 404/validation paths never touch a timer.
   let stopHeartbeat = null;
+  let clientAbort = null;
 
   try {
     // Tenant isolation: the assessment must belong to the caller's org. A
@@ -2321,6 +2391,7 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
     // per-chunk ': ping' comments in the stream loop below only start once
     // the model is actually producing tokens.
     stopHeartbeat = startSseHeartbeat(res);
+    clientAbort = abortOnClose(res);
 
     const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
@@ -2335,6 +2406,7 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
       ],
       temperature: 0.4,
       max_tokens:  4000,
+      signal:      clientAbort.signal,
     })[Symbol.asyncIterator]();
 
     let step;
@@ -2378,18 +2450,22 @@ router.post('/fitness-testing/analyze', auth, requireConfigured, async (req, res
 
     send({ type: 'done', data: analysis, grounding: grounding.groundingBlock(evidence, citationCheck), model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
-    logger.error({ err: err.message }, 'ai_fitness_testing_analyze_error');
-    // Headers may or may not have been sent yet depending on where the error occurred
-    if (!res.headersSent) {
-      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-      return res.status(503).json({ error: 'Fitness testing analysis failed', message: publicAiMessage(err) });
+    if (clientAbort?.signal.aborted) {
+      logger.info({ req_id: req.id }, 'ai_fitness_testing_client_disconnected');
+    } else {
+      logger.error({ err: err.message }, 'ai_fitness_testing_analyze_error');
+      // Headers may or may not have been sent yet depending on where the error occurred
+      if (!res.headersSent) {
+        if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+        return res.status(503).json({ error: 'Fitness testing analysis failed', message: publicAiMessage(err) });
+      }
+      try {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Fitness testing analysis failed. Please try again.' })}\n\n`);
+      } catch { /* ignore write errors on closed connection */ }
     }
-    try {
-      res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Fitness testing analysis failed. Please try again.' })}\n\n`);
-    } catch { /* ignore write errors on closed connection */ }
   } finally {
     if (stopHeartbeat) stopHeartbeat();
-    try { if (!res.writableEnded) res.end(); } catch { /* ignore */ }
+    try { if (!res.writableEnded && !res.destroyed) res.end(); } catch { /* ignore */ }
   }
 });
 
@@ -2406,6 +2482,7 @@ router.post('/posture/analyze', auth, requireTrainer, requireConfigured, async (
   if (!client_id) return res.status(400).json({ error: 'client_id is required' });
 
   let stopHeartbeat = null;
+  let clientAbort = null;
   try {
     const org = orgParam(req);
     const client = await loadClientRow(client_id, org);
@@ -2463,6 +2540,7 @@ router.post('/posture/analyze', auth, requireTrainer, requireConfigured, async (
     res.flushHeaders();
 
     stopHeartbeat = startSseHeartbeat(res);
+    clientAbort = abortOnClose(res);
     const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
     let fullContent = '';
@@ -2476,6 +2554,7 @@ router.post('/posture/analyze', auth, requireTrainer, requireConfigured, async (
       ],
       temperature: 0.4,
       max_tokens: 4000,
+      signal: clientAbort.signal,
     })[Symbol.asyncIterator]();
 
     let step;
@@ -2511,17 +2590,21 @@ router.post('/posture/analyze', auth, requireTrainer, requireConfigured, async (
 
     send({ type: 'done', data: analysis, grounding: grounding.groundingBlock(evidence, citationCheck), model: streamMeta.model, tier: streamMeta.tier, used_fallback: streamMeta.used_fallback });
   } catch (err) {
-    logger.error({ err: err.message }, 'ai_posture_analyze_error');
-    if (!res.headersSent) {
-      if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
-      return res.status(503).json({ error: 'Postural analysis failed', message: publicAiMessage(err) });
+    if (clientAbort?.signal.aborted) {
+      logger.info({ req_id: req.id }, 'ai_posture_client_disconnected');
+    } else {
+      logger.error({ err: err.message }, 'ai_posture_analyze_error');
+      if (!res.headersSent) {
+        if (err.code === 'NOT_CONFIGURED') return res.status(501).json({ error: err.message });
+        return res.status(503).json({ error: 'Postural analysis failed', message: publicAiMessage(err) });
+      }
+      try {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Postural analysis failed. Please try again.' })}\n\n`);
+      } catch { /* ignore write errors on closed connection */ }
     }
-    try {
-      res.write(`data: ${JSON.stringify({ type: 'error', message: err.code === 'NOT_CONFIGURED' ? err.message : 'Postural analysis failed. Please try again.' })}\n\n`);
-    } catch { /* ignore write errors on closed connection */ }
   } finally {
     if (stopHeartbeat) stopHeartbeat();
-    try { if (!res.writableEnded) res.end(); } catch { /* ignore */ }
+    try { if (!res.writableEnded && !res.destroyed) res.end(); } catch { /* ignore */ }
   }
 });
 

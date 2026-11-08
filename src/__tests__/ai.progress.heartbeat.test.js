@@ -126,6 +126,7 @@ describe('POST /api/ai/progress/analyze — heartbeat lifecycle (P2-2)', () => {
     const streamOrder = routedStream.mock.invocationCallOrder[0];
     expect(gateOrder).toBeLessThan(heartbeatOrder);
     expect(heartbeatOrder).toBeLessThan(streamOrder);
+    expect(routedStream.mock.calls[0][0].signal).toBeInstanceOf(AbortSignal);
   });
 
   test('the heartbeat is armed before the model produces its first token', async () => {

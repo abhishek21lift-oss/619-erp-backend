@@ -288,7 +288,7 @@ describe('POST /api/ai/chat — bounded conversation history (F-5)', () => {
       ([sql]) => sql.includes('SELECT 1 FROM pt_clients'));
     expect(ownership).toBeTruthy();
     expect(ownership[1]).toEqual(['cli-1', 'org-1']);
-    expect(historyMessages().map(m => m.content)).toEqual(['msg-1', 'msg-2', 'msg-3', 'Q4']);
+    expect(historyMessages().map((m) => m.content).filter((c) => !c.includes('<untrusted-data'))).toEqual(['msg-1', 'msg-2', 'msg-3', 'Q4']);
   });
 
   it('TEST 12: the configured/default history limit is actually respected', async () => {
