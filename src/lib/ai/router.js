@@ -27,6 +27,20 @@ function abortedError() {
   return err;
 }
 
+// A different model is worth trying when the failure was the provider's
+// capacity, not the request itself. 404 is included because providers use it
+// for a retired model ("no endpoints found") — the next model is a real
+// candidate. 400/401/403/422 mean retrying elsewhere only hides the problem
+// and spends twice. Errors with no HTTP status are transport failures.
+const RETRYABLE_STATUS = new Set([404, 408, 409, 425, 429]);
+function isRetryable(err) {
+  if (!err || err.code === 'AI_ABORTED') return false;
+  if (err.code === 'TIMEOUT') return true;
+  const status = Number(err.status);
+  if (!Number.isFinite(status)) return true;
+  return RETRYABLE_STATUS.has(status) || status >= 500;
+}
+
 function buildAllModelsFailed(primaryErr, attempts) {
   const final = new Error('AI service temporarily unavailable — all models failed');
   final.code = 'ALL_MODELS_FAILED';
@@ -54,6 +68,14 @@ async function routedChat({ intent, messages, temperature, max_tokens, timeout }
     const result = await chatCompletion({ model, messages, temperature, max_tokens, timeout });
     return { ...result, intent, tier, used_fallback: false };
   } catch (primaryErr) {
+    if (!isRetryable(primaryErr)) {
+      logger.warn(
+        { model, tier, intent, status: primaryErr.status ?? null, code: primaryErr.code ?? null },
+        'ai_primary_not_retryable'
+      );
+      throw primaryErr;
+    }
+
     logger.warn({ model, tier, intent, err: primaryErr.message }, 'ai_primary_failed');
 
     const attempts = [{ model, tier, err: primaryErr }];
@@ -63,6 +85,13 @@ async function routedChat({ intent, messages, temperature, max_tokens, timeout }
         logger.info({ model: step.model, tier: step.tier, intent }, 'ai_fallback_success');
         return { ...result, intent, tier: step.tier, used_fallback: true, original_error: primaryErr.message };
       } catch (fbErr) {
+        if (!isRetryable(fbErr)) {
+          logger.warn(
+            { model: step.model, tier: step.tier, status: fbErr.status ?? null, code: fbErr.code ?? null },
+            'ai_fallback_not_retryable'
+          );
+          throw fbErr;
+        }
         attempts.push({ model: step.model, tier: step.tier, err: fbErr });
         logger.error({ model: step.model, tier: step.tier, err: fbErr.message }, 'ai_fallback_failed');
       }
@@ -130,6 +159,13 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
     // the truth; do not pass a misleading provider error to the caller.
     if (signal?.aborted) throw abortedError();
     if (primaryErr?.code === 'AI_ABORTED') throw primaryErr;
+    if (!isRetryable(primaryErr)) {
+      logger.warn(
+        { model, tier, intent, status: primaryErr.status ?? null, code: primaryErr.code ?? null },
+        'ai_stream_primary_not_retryable'
+      );
+      throw primaryErr;
+    }
 
     logger.warn({ model, tier, intent, err: primaryErr.message }, 'ai_stream_primary_failed');
 
@@ -158,6 +194,13 @@ async function* routedStream({ intent, messages, temperature, max_tokens, timeou
         // Caller aborted during fallback — rethrow immediately
         if (signal?.aborted) throw abortedError();
         if (fbErr?.code === 'AI_ABORTED') throw fbErr;
+        if (!isRetryable(fbErr)) {
+          logger.warn(
+            { model: step.model, tier: step.tier, status: fbErr.status ?? null, code: fbErr.code ?? null },
+            'ai_stream_fallback_not_retryable'
+          );
+          throw fbErr;
+        }
         attempts.push({ model: step.model, tier: step.tier, err: fbErr });
         logger.error({ model: step.model, tier: step.tier, err: fbErr.message }, 'ai_stream_fallback_failed');
       }

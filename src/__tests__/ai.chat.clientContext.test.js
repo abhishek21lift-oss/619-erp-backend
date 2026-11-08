@@ -85,7 +85,10 @@ const streamChunks = (chunks) => jest.fn().mockImplementation(async function* ()
   for (const c of chunks) yield c;
 });
 
-const systemPromptOf = () => routedStream.mock.calls[0][0].messages[0].content;
+// Every message the model receives: system instructions plus the fenced
+// context block and history. Context assertions must look at both, because
+// retrieved data deliberately no longer lives in the system prompt.
+const modelText = () => routedStream.mock.calls[0][0].messages.map((m) => m.content).join('\n');
 
 beforeEach(() => {
   pool.query.mockReset();
@@ -125,9 +128,9 @@ describe('POST /api/ai/chat — authorized client context', () => {
     // Tenant parameter bound to the parent gate.
     expect(calls[parentIdx][1]).toEqual(['cli-1', 'org-1']);
 
-    // Context contents unchanged for an authorized client.
-    const prompt = systemPromptOf();
-    expect(prompt).toContain('Current client context:');
+    // Context contents unchanged for an authorized client, now fenced as data.
+    const prompt = modelText();
+    expect(prompt).toContain('source="client context"');
     expect(prompt).toContain('Name: Ratnam Yadav');
     expect(prompt).toContain('Age:');
     expect(prompt).toContain('Gender: Male');
@@ -156,7 +159,7 @@ describe('POST /api/ai/chat — authorized client context', () => {
     await request(app)
       .post('/api/ai/chat')
       .send({ message: 'hi', client_id: 'cli-1', conversation_id: 'conv-1' });
-    expect(systemPromptOf()).toContain('Current weight: 80 kg');
+    expect(modelText()).toContain('Current weight: 80 kg');
 
     pool.query.mockReset();
     pool.query.mockImplementation(clientDispatch({
@@ -168,7 +171,7 @@ describe('POST /api/ai/chat — authorized client context', () => {
     await request(app)
       .post('/api/ai/chat')
       .send({ message: 'hi', client_id: 'cli-1', conversation_id: 'conv-1' });
-    expect(systemPromptOf()).toContain('Current weight: 73 kg');
+    expect(modelText()).toContain('Current weight: 73 kg');
   });
 
   it('no client_id means no client context, exactly as before', async () => {    pool.query.mockImplementation(clientDispatch());
@@ -179,7 +182,7 @@ describe('POST /api/ai/chat — authorized client context', () => {
       .send({ message: 'hello', conversation_id: 'conv-1' });
 
     expect(res.status).toBe(200);
-    expect(systemPromptOf()).not.toContain('Current client context:');
+    expect(modelText()).not.toContain('source="client context"');
     const sqls = pool.query.mock.calls.map(([s]) => s);
     expect(sqls.some((s) => CHILD_TABLES.test(s))).toBe(false); // no children without a client to authorize
   });
@@ -197,8 +200,8 @@ describe('POST /api/ai/chat — clients that fail the parent gate', () => {
     expect(res.status).toBe(200); // chat still answers, without client context
     const sqls = pool.query.mock.calls.map(([s]) => s);
     expect(sqls.some((s) => CHILD_TABLES.test(s))).toBe(false);
-    expect(systemPromptOf()).not.toContain('Current client context:');
-    expect(systemPromptOf()).not.toContain('Ratnam');
+    expect(modelText()).not.toContain('source="client context"');
+    expect(modelText()).not.toContain('Ratnam');
 
     // The gate still bound the tenant parameter before rejecting.
     const parentCall = pool.query.mock.calls.find(([s]) => PARENT_SQL.test(s));
@@ -220,7 +223,7 @@ describe('POST /api/ai/chat — clients that fail the parent gate', () => {
     expect(res.status).toBe(200);
     const sqls = pool.query.mock.calls.map(([s]) => s);
     expect(sqls.some((s) => CHILD_TABLES.test(s))).toBe(false);
-    expect(systemPromptOf()).not.toContain('Current client context:');
+    expect(modelText()).not.toContain('source="client context"');
     expect(logger.warn).toHaveBeenCalledWith('ai_context_missing_client');
   });
 
@@ -256,7 +259,7 @@ describe('POST /api/ai/chat — clients that fail the parent gate', () => {
     expect(parentCall[0]).not.toMatch(/IS NULL OR/);
     const sqls = pool.query.mock.calls.map(([s]) => s);
     expect(sqls.some((s) => CHILD_TABLES.test(s))).toBe(false);
-    expect(systemPromptOf()).not.toContain('Current client context:');
+    expect(modelText()).not.toContain('source="client context"');
   });
 });
 
@@ -270,8 +273,8 @@ describe('POST /api/ai/chat — no cross-tenant leakage', () => {
       .send({ message: 'tell me about them', client_id: 'foreign-cli', conversation_id: 'conv-1' });
 
     // Prompt: no client context section at all.
-    const prompt = systemPromptOf();
-    expect(prompt).not.toContain('Current client context:');
+    const prompt = modelText();
+    expect(prompt).not.toContain('source="client context"');
 
     // RAG and tools receive only the user's message — never the client_id or
     // any client data (they have no client handle in the chat contract).
