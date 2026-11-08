@@ -61,6 +61,7 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
+const { requestPortal, portalCookieNames } = require('../lib/authSession');
 
 const isProd = process.env.NODE_ENV === 'production';
 const WINDOW_MS = 15 * 60 * 1000;
@@ -130,7 +131,10 @@ function identityOf(req) {
  * stops an anonymous flood from being free.
  */
 function deviceOf(req) {
-  const raw = (req.cookies && req.cookies.refresh_token) || (req.body && req.body.refresh_token);
+  const portal = requestPortal(req);
+  const raw = portal
+    ? (req.cookies && req.cookies[portalCookieNames(portal).refresh]) || (req.body && req.body.refresh_token)
+    : (req.cookies && req.cookies.refresh_token) || (req.body && req.body.refresh_token);
   return raw ? `d:${hashKey(raw)}` : `ip:${ipKeyGenerator(req.ip)}`;
 }
 

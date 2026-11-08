@@ -16,6 +16,7 @@ const { tenantScope } = require('../lib/tenant-db');
 const logger   = require('../lib/logger');
 const loginEvents = require('../lib/loginEvents');
 const { AUD_TENANT } = require('../middleware/platformAuth');
+const { setAccessCookie } = require('../lib/authSession');
 const rateLimit = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
 
@@ -353,15 +354,10 @@ function wauthn() {
   return _wauthn;
 }
 
-function setTokenCookie(res, token) {
-  res.cookie('token', token, {
-    httpOnly: true,
-    secure: isProd,
-    sameSite: 'strict',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-    path: '/',
-  });
-}
+// The staff passkey door is a studio door, so its access cookie lives in the
+// trainer namespace. Kept at the legacy 7-day lifetime this route has always
+// used; see the session note in lib/authSession.js.
+const STAFF_PASSKEY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // userID for WebAuthn must be a Uint8Array in @simplewebauthn/server v13+.
 // Passing a string throws "String values for `userID` are no longer supported".
@@ -700,7 +696,7 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
-    setTokenCookie(res, token);
+    setAccessCookie(res, 'trainer', token, { maxAgeMs: STAFF_PASSKEY_TTL_MS, mirrorLegacy: true });
 
     pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]).catch(() => {});
     loginEvents.record(req, {

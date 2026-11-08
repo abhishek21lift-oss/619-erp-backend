@@ -467,7 +467,9 @@ app.use(cors({
   // No tenant header. A request's organization is read from the session
   // (req.user.organization_id) and nothing the browser sends can name it —
   // see lib/tenant-db.js.
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  // X-Portal selects WHICH portal cookie a request speaks as; it never grants
+  // access on its own (the session's role and audience are still enforced).
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Portal'],
 }));
 
 // ────────────────────────

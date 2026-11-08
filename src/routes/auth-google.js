@@ -22,7 +22,7 @@ const loginEvents = require('../lib/loginEvents');
 const { verifyGoogleCredential } = require('../lib/googleIdentity');
 const { normalisePortal, portalProblem } = require('../lib/authPortal');
 const {
-  setTokenCookie, signAccessToken, issueRefreshToken,
+  setAccessCookie, signAccessToken, issueRefreshToken,
   bodyTokensAllowed, sessionUserPayload,
 } = require('../lib/authSession');
 const { AUD_TENANT } = require('../middleware/platformAuth');
@@ -69,11 +69,12 @@ function deny(res, status, code, message, extra = {}) {
 }
 
 async function issueSession(req, res, user) {
+  const portal = normalisePortal(req.body.portal);
   const token = signAccessToken(user.id, user.token_version, AUD_TENANT);
-  setTokenCookie(res, token);
+  setAccessCookie(res, portal, token, { mirrorLegacy: true });
   let refreshToken;
   try {
-    refreshToken = await issueRefreshToken(res, user.id, AUD_TENANT);
+    refreshToken = await issueRefreshToken(res, user.id, AUD_TENANT, portal, { mirrorLegacy: true });
   } catch (err) {
     logger.warn({ err: err.message }, 'refresh_token issue failed (non-critical, table may not exist yet)');
   }

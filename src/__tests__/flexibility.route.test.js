@@ -118,7 +118,7 @@ describe('POST /progress/assessments — K11 battery', () => {
     expect(stored.tests.quadriceps.sides_interpretation).toEqual({ left: 'Normal', right: 'Normal' });
     expect(stored.tests.sit_and_reach.score_inches).toBe(1); // 16 in − 15 in zero point
     expect(stored.tests.sit_and_reach.norm.category).toBe('Good'); // male 36, 16 in
-    expect(stored.tests.sit_and_reach.norm.table_version).toBe('k11-2026.01-sit-and-reach');
+    expect(stored.tests.sit_and_reach.norm.table_version).toBe('k11-2026.02-sit-and-reach');
     expect(stored.tests.sit_and_reach.norm.message).toBe('K11 age/sex sit-and-reach norm');
     expect(stored.assessor_id).toBe('u1'); // from the session, never the body
     expect(stored.override).toEqual({ used: false, reason: null, by: null, at: null });

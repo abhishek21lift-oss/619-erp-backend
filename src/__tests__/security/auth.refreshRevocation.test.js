@@ -116,7 +116,7 @@ jest.mock('../../db/pool', () => ({
       );
       if (!t) return { rows: [] };
       const u = mockUsers[t.user_id];
-      return { rows: [{ user_id: t.user_id, token_version: u.token_version, is_active: true, deleted_at: null }] };
+      return { rows: [{ user_id: t.user_id, role: u.role, organization_id: u.organization_id, token_version: u.token_version, is_active: true, deleted_at: null }] };
     }
 
     // reset-password: find the user by reset-token hash
@@ -192,8 +192,8 @@ beforeEach(async () => {
   mockSqlLog.length = 0;
   const pw = await bcrypt.hash('OldPassw0rd!', 4);
   mockUsers = {
-    [USER_A]: { id: USER_A, password: pw, token_version: 1, reset_hash: sha(RESET_RAW) },
-    [USER_B]: { id: USER_B, password: pw, token_version: 1, reset_hash: null },
+    [USER_A]: { id: USER_A, role: 'trainer', organization_id: 'org-a', password: pw, token_version: 1, reset_hash: sha(RESET_RAW) },
+    [USER_B]: { id: USER_B, role: 'trainer', organization_id: 'org-a', password: pw, token_version: 1, reset_hash: null },
   };
   mockCurrentUser = { id: USER_A };
 });

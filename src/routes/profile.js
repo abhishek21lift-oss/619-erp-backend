@@ -15,6 +15,7 @@ const pool = require('../db/pool');
 const { syncTrainerName } = require('../lib/memberTrainer');
 const { detectFileType, PROFILE_IMAGES, LOGO_IMAGES } = require('../lib/fileSignatures');
 const { auth, requireTrainer, invalidateUserCache } = require('../middleware/auth');
+const { clearPortalCookies, legacyRefreshMatches, revokeRefreshTokensForUser } = require('../lib/authSession');
 const studioBranding = require('../lib/studioBranding');
 const studioDetails = require('../lib/studioDetails');
 const { logActivity } = require('../lib/activityLog');
@@ -1042,13 +1043,12 @@ router.delete('/sessions/:id', (req, res) => {
 router.post('/sessions/revoke-all', async (req, res, next) => {
   try {
     await pool.query('UPDATE users SET token_version = token_version + 1, updated_at = NOW() WHERE id = $1', [req.user.id]);
+    // Access tokens die with token_version; refresh rows are a separate store.
+    await revokeRefreshTokensForUser(req.user.id);
     invalidateUserCache(req.user.id);
     await logActivity(req, 'profile.sessions.revoke_all', 'user', req.user.id);
-    res.clearCookie('token', {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      path: '/',
+    clearPortalCookies(res, req.portal, {
+      legacy: req.portal ? legacyRefreshMatches(req, req.portal) : true,
     });
     res.json({ message: 'All sessions revoked' });
   } catch (err) {
