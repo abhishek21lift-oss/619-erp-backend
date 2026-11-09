@@ -231,43 +231,57 @@ describe('the per-trainer totals query', () => {
   // `trainers`, not `pt_trainers`: the latter is empty in production and no
   // foreign key references it, so this panel listed nobody. See
   // ptOs.payouts.tenantIsolation.test.js for the verification.
-  const trainerSessionsQuery = () => queryWith('FROM trainers t', 'LEFT JOIN pt_sessions s');
+  const trainerSessionsQuery = () => queryWith('FROM trainers t', 'LEFT JOIN done d');
 
-  it('lists only this organization\'s trainers', () => {
-    expect(trainerSessionsQuery()).toContain('t.organization_id = $1');
-  });
-
-  it('counts only this organization\'s sessions', () => {
-    // Separate from the trainer filter: without it a foreign session whose
-    // trainer_id happens to match a local trainer is COUNTED against them, and
-    // an inflated number is the last place anyone looks for a tenancy bug.
-    expect(trainerSessionsQuery()).toContain('s.organization_id = $1');
-  });
-
-  it('filters sessions in the JOIN, never in the WHERE', () => {
-    // In the WHERE clause the session filter discards the NULL-extended rows a
-    // LEFT JOIN produces, silently making it an INNER JOIN — every trainer
-    // with no sessions this month vanishes, which is precisely who a manager
-    // is scanning this list for. Asserted by position: the session's org
-    // filter must appear before the WHERE keyword.
+  it('counts completed from the workout log, the same table as the Done tile', () => {
+    // The breakdown used to read "0 done" beside a real Done figure because it
+    // counted pt_sessions, where no code path ever writes 'completed'.
     const q = trainerSessionsQuery();
-    const joinFilter = q.indexOf('s.organization_id = $1');
-    const whereAt = q.indexOf('WHERE t.deleted_at');
-    expect(joinFilter).toBeGreaterThan(-1);
-    expect(whereAt).toBeGreaterThan(-1);
-    expect(joinFilter).toBeLessThan(whereAt);
+    const done = q.slice(q.indexOf('WITH done AS'), q.indexOf('booked AS'));
+    expect(done).toMatch(/FROM\s+workout_sessions/);
+    expect(done).not.toMatch(/FROM\s+pt_sessions/);
+    expect(done).toMatch(/status\s*=\s*'completed'/);
+  });
+
+  it('keeps booked and missed on the diary, where they are actually written', () => {
+    const q = trainerSessionsQuery();
+    const booked = q.slice(q.indexOf('booked AS'));
+    expect(booked).toMatch(/FROM\s+pt_sessions/);
+    expect(booked).toMatch(/status\s*=\s*'scheduled'/);
+    expect(booked).toMatch(/'cancelled','no_show'/);
+  });
+
+  it('lists only this organization\'s trainers and sessions', () => {
+    const q = trainerSessionsQuery();
+    expect(q).toContain('t.organization_id = $1');
+    // Both CTEs carry the filter: without it a foreign session whose trainer_id
+    // happens to match a local trainer is COUNTED against them.
+    expect(q.match(/WHERE organization_id = \$1/g)).toHaveLength(2);
+  });
+
+  it('keeps trainers with no sessions this month', () => {
+    // LEFT JOIN, not INNER: a manager scanning this list is looking for the
+    // trainer with nothing on it as much as the busiest one.
+    const q = trainerSessionsQuery();
+    expect(q).toContain('LEFT JOIN done d   ON d.trainer_id = t.id');
+    expect(q).toContain('LEFT JOIN booked b ON b.trainer_id = t.id');
+    expect(q).toContain('COALESCE(d.completed, 0)');
+    expect(q).toContain('COALESCE(b.scheduled, 0)');
+  });
+
+  it('gives workouts with no assigned trainer their own row', () => {
+    // A client can train without a trainer assigned. Those completed workouts
+    // still appear in Done, so dropping them here would make the breakdown
+    // disagree with the tile above it.
+    const q = trainerSessionsQuery();
+    expect(q).toMatch(/UNION ALL/);
+    expect(q).toContain("SELECT 'Unassigned'");
+    expect(q).toContain('d.trainer_id IS NULL');
   });
 
   it('is actually given the org id — it used to take no parameters', () => {
     // pool.query(`…`) with no second argument is what the leak looked like.
-    // The template is interpolated with $1, so a missing bindings array would
-    // now throw rather than quietly return the platform.
-    //
-    // Anchored on THIS query's own text and read forward to its argument
-    // list. The previous form sliced from the first `FROM trainers t` in the
-    // file to the very end, so it would have passed on any of the other three
-    // queries' bareParams.
-    const at = SRC.indexOf('LEFT JOIN pt_sessions s');
+    const at = SRC.indexOf('const { rows: trainer_sessions } = await pool.query(');
     expect(at).toBeGreaterThan(-1);
     const call = SRC.slice(at, SRC.indexOf(');', at) + 2);
     expect(call).toContain('`, bareParams);');
