@@ -23,7 +23,7 @@ const {
   issueRefreshToken, bodyTokensAllowed, sessionUserPayload,
   requestPortal, portalCookieNames, legacyRefreshMatches,
 } = require('../lib/authSession');
-const { normalisePortal, portalProblem, portalForSession } = require('../lib/authPortal');
+const { normalisePortal, portalProblem, portalForSession, resolveLoginPortal } = require('../lib/authPortal');
 const recovery = require('../lib/mfaRecoveryCodes');
 const { sendPasswordReset } = require('../lib/email');
 
@@ -130,8 +130,8 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // session's AUDIENCE — a token minted here may drive the control plane, a
     // token minted at the studio door may not, whatever role the account
     // holds. See middleware/platformAuth.js.
-    const portal = normalisePortal(req.body.portal);
-    const problem = portalProblem(user, portal);
+    const requestedPortal = normalisePortal(req.body.portal);
+    const problem = portalProblem(user, requestedPortal);
     if (problem) {
       if (problem.code === 'ACCOUNT_MISCONFIGURED') {
         logger.error({ userId: user.id }, 'login refused: account role/tenant is misconfigured');
@@ -253,6 +253,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // The audience is the door, not the role: an operator who signs in at the
     // studio door gets a tenant session and cannot drive the control plane
     // with it.
+    const portal = resolveLoginPortal(user, requestedPortal);
     const audience = portal === 'platform'
       ? platformAuth.AUD_PLATFORM
       : platformAuth.AUD_TENANT;

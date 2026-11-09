@@ -345,6 +345,29 @@ describe('the platform plane is never downgraded', () => {
   });
 });
 
+describe('the unified door restores whichever tenant session is present', () => {
+  test('unified member login is found by /me with no X-Portal', async () => {
+    const { res, cookies } = await signIn('unified', 'client@x.com');
+    expect(setCookieNames(res)).toContain('member_token');
+
+    const neutral = await request(app()).get('/api/auth/me')
+      .set('Cookie', cookieHeader(cookies));
+
+    expect(neutral.status).toBe(200);
+    expect(neutral.body.user.id).toBe(MEMBER);
+  });
+
+  test('refresh with no X-Portal selects the member refresh cookie', async () => {
+    const { cookies } = await signIn('unified', 'client@x.com');
+
+    const rotated = await request(app()).post('/api/auth/refresh')
+      .set('Cookie', cookieHeader(cookies));
+
+    expect(rotated.status).toBe(200);
+    expect(setCookieNames(rotated)).toContain('member_token');
+  });
+});
+
 describe('the portal header selects, it does not authorize', () => {
   test('a bearer token is not bound to a portal cookie namespace', async () => {
     const login = await signIn('trainer', 'coach@x.com');

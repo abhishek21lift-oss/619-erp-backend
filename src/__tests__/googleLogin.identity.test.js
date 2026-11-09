@@ -214,6 +214,49 @@ describe('POST /api/auth/google-link', () => {
   });
 });
 
+describe('the unified door on Google', () => {
+  it('admits a trainer and mints the trainer session', async () => {
+    mockUser(row());
+    const res = await request(app()).post('/api/auth/google-login')
+      .send({ credential: 'c', portal: 'unified' });
+
+    expect(res.status).toBe(200);
+    const cookies = (res.headers['set-cookie'] || []).join(';');
+    expect(cookies).toContain('trainer_token=');
+    expect(cookies).not.toContain('member_token=');
+  });
+
+  it('admits a member and mints the member session', async () => {
+    mockUser(row({ role: 'member' }));
+    const res = await request(app()).post('/api/auth/google-login')
+      .send({ credential: 'c', portal: 'unified' });
+
+    expect(res.status).toBe(200);
+    const cookies = (res.headers['set-cookie'] || []).join(';');
+    expect(cookies).toContain('member_token=');
+    expect(cookies).not.toContain('trainer_token=');
+  });
+
+  it('refuses a super_admin at the unified door before minting a session', async () => {
+    mockUser(row({ role: 'super_admin', organization_id: null }));
+    const res = await request(app()).post('/api/auth/google-login')
+      .send({ credential: 'c', portal: 'unified' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('GOOGLE_ACCOUNT_NOT_SUPPORTED');
+    expect(res.headers['set-cookie']).toBeUndefined();
+  });
+
+  it('links a member at the unified door and signs in with the member session', async () => {
+    mockUser(row({ role: 'member', google_sub: null }));
+    const res = await request(app()).post('/api/auth/google-link')
+      .send({ credential: 'c', password: PASSWORD, portal: 'unified' });
+
+    expect(res.status).toBe(200);
+    expect((res.headers['set-cookie'] || []).join(';')).toContain('member_token=');
+  });
+});
+
 it('puts google-link behind both login limiters', () => {
   const fs = require('node:fs');
   const path = require('node:path');

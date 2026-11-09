@@ -20,7 +20,7 @@ const pool = require('../db/pool');
 const logger = require('../lib/logger');
 const loginEvents = require('../lib/loginEvents');
 const { verifyGoogleCredential } = require('../lib/googleIdentity');
-const { normalisePortal, portalProblem } = require('../lib/authPortal');
+const { normalisePortal, portalProblem, resolveLoginPortal } = require('../lib/authPortal');
 const {
   setAccessCookie, signAccessToken, issueRefreshToken,
   bodyTokensAllowed, sessionUserPayload,
@@ -69,7 +69,7 @@ function deny(res, status, code, message, extra = {}) {
 }
 
 async function issueSession(req, res, user) {
-  const portal = normalisePortal(req.body.portal);
+  const portal = resolveLoginPortal(user, normalisePortal(req.body.portal));
   const token = signAccessToken(user.id, user.token_version, AUD_TENANT);
   setAccessCookie(res, portal, token, { mirrorLegacy: true });
   let refreshToken;

@@ -48,7 +48,7 @@ const authSchemas = {
       // Anything added to this enum must be handled in routes/auth.js, and
       // anything handled there must appear here. auth.portal.test.js now posts
       // a real login for each value to keep the two in step.
-      portal: z.enum(['trainer', 'staff', 'member', 'platform'])
+      portal: z.enum(['trainer', 'staff', 'member', 'platform', 'unified'])
         .transform((p) => (p === 'staff' ? 'trainer' : p))
         .optional(),
     }),

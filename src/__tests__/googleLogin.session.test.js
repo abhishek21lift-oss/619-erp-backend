@@ -79,6 +79,17 @@ it('sets a 15-minute access cookie and a rotating 7-day refresh cookie', async (
   );
 });
 
+it('unified Google login writes the resolved namespace, not a unified cookie', async () => {
+  const res = await request(app())
+    .post('/api/auth/google-login')
+    .send({ credential: 'stub', portal: 'unified' });
+
+  expect(res.status).toBe(200);
+  const cookies = (res.headers['set-cookie'] || []).join(';');
+  expect(cookies).toContain('trainer_token=');
+  expect(cookies).not.toContain('unified_token=');
+});
+
 it('does not put tokens in a browser response body', async () => {
   const res = await request(app())
     .post('/api/auth/google-login')

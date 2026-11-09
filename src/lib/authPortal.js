@@ -38,9 +38,22 @@ function portalMatchesSession(portal, user, aud) {
 }
 
 function normalisePortal(raw) {
+  if (raw === 'unified') return 'unified';
   if (raw === 'member') return 'member';
   if (raw === 'platform') return 'platform';
   return 'trainer';
+}
+
+/**
+ * The cookie namespace a verified account's session belongs to.
+ *
+ * 'unified' is a request selector, never a session: the database row picks the
+ * existing trainer or member door, and the platform door stays separate.
+ */
+function resolveLoginPortal(user, portal) {
+  if (portal !== 'unified') return portal;
+  // portalProblem() has already refused super_admin before this runs.
+  return portalForSession(user, null);
 }
 
 /**
@@ -62,6 +75,15 @@ function portalProblem(user, portal) {
       status: 403,
       code: 'ACCOUNT_MISCONFIGURED',
       message: 'This account cannot sign in. Contact support.',
+    };
+  }
+
+  if (portal === 'unified' && isPlatformAccount) {
+    return {
+      status: 403,
+      code: 'WRONG_PORTAL',
+      portal: 'platform',
+      message: 'This is the studio sign-in. Use the Command Center to sign in as the platform operator.',
     };
   }
 
@@ -112,4 +134,4 @@ function portalProblem(user, portal) {
   return null;
 }
 
-module.exports = { normalisePortal, portalProblem, portalForSession, portalMatchesSession };
+module.exports = { normalisePortal, portalProblem, portalForSession, portalMatchesSession, resolveLoginPortal };

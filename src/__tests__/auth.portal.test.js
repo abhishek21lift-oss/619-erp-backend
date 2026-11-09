@@ -292,7 +292,7 @@ describe('the Command Center door', () => {
   it('still accepts every door the schema declares', async () => {
     // Guards the specific failure mode: a value the handler knows about that
     // the schema has never heard of. Posting each one proves the two agree.
-    for (const portal of ['staff', 'member', 'platform']) {
+    for (const portal of ['staff', 'member', 'platform', 'unified']) {
       pool.query.mockReset();
       pool.query.mockResolvedValueOnce({ rows: [] });   // no such user
       pool.query.mockResolvedValue({ rows: [] });
@@ -301,5 +301,41 @@ describe('the Command Center door', () => {
       // and into the handler, which is the only thing being asserted here.
       expect([portal, res.body?.error?.code]).not.toEqual([portal, 'VALIDATION']);
     }
+  });
+});
+
+describe('Unified sign-in resolves the door from the database row', () => {
+  it.each([
+    ['trainer', 'trainer_token', 'member_token'],
+    ['member', 'member_token', 'trainer_token'],
+  ])('admits a %s and writes only its namespace', async (role, own, other) => {
+    pool.query.mockResolvedValue({ rows: [row(role)] });
+
+    const res = await signIn({ portal: 'unified' });
+
+    expect(res.status).toBe(200);
+    const cookies = (res.headers['set-cookie'] || []).join(';');
+    expect(cookies).toContain(`${own}=`);
+    expect(cookies).not.toContain(`${other}=`);
+  });
+
+  it('refuses a super_admin and names the operator door', async () => {
+    pool.query.mockResolvedValueOnce({ rows: [row('super_admin')] });
+
+    const res = await signIn({ portal: 'unified' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatchObject({ code: 'WRONG_PORTAL', portal: 'platform' });
+    expect(res.headers['set-cookie']).toBeUndefined();
+  });
+});
+
+describe('resolveLoginPortal', () => {
+  const { resolveLoginPortal } = require('../lib/authPortal');
+
+  it('resolves unified by role and leaves explicit doors alone', () => {
+    expect(resolveLoginPortal({ role: 'member' }, 'unified')).toBe('member');
+    expect(resolveLoginPortal({ role: 'trainer' }, 'unified')).toBe('trainer');
+    expect(resolveLoginPortal({ role: 'member' }, 'trainer')).toBe('trainer');
   });
 });

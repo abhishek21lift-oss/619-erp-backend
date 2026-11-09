@@ -76,6 +76,9 @@ const PUBLIC_COLUMNS = `
  * logged for the operator and reported to the applicant the same way a genuine
  * new application is.
  */
+// This endpoint writes an application row only. It must never read role,
+// account_type, or user_role from req.body; approval is the only path that
+// creates an organisation, trainer, or user.
 async function create(req, res, next) {
   try {
     const { error, value } = validate(req.body || {});
