@@ -1,8 +1,8 @@
 'use strict';
-// K11 four-test flexibility battery (protocol k11-2026.01).
+// K11 five-test flexibility battery (protocol k11-2026.02).
 //
 // Step 7 of the fitness assessment used to be a free-form two-slot battery.
-// The supplied K11 protocol replaces it with four tests recorded in a fixed
+// The supplied K11 protocol replaces it with five tests recorded in a fixed
 // order, each measuring a different joint with its own raw values and its own
 // interpretation. Two consequences are deliberate:
 //
@@ -20,7 +20,10 @@
 const { z } = require('../../lib/validation');
 const { checkAsymmetry, classifySitAndReach, K11_SIT_AND_REACH_TABLE_VERSION } = require('./fitness-scoring');
 
-const PROTOCOL_VERSION = 'k11-2026.01';
+const PROTOCOL_VERSION = 'k11-2026.02';
+// Four-test rows saved before the shoulder reach existed. Still parsed and
+// round-tripped until the trainer re-records the battery.
+const LEGACY_PROTOCOL_VERSION = 'k11-2026.01';
 const ZERO_POINT_INCHES = 15;
 const HAMSTRINGS_REFERENCE = Object.freeze({
   min_deg: 70,
@@ -36,6 +39,7 @@ const NORM_UNAVAILABLE = Object.freeze({
 const TIGHTNESS = ['Normal', 'Mild', 'Moderate', 'Marked'];
 const HIP_TIGHTNESS = ['Normal', 'Possible restriction', 'Requires reassessment'];
 const THIGH_POSITIONS = ['below', 'at', 'above'];
+const SHOULDER_REACH_RESULTS = ['overlap', 'touch', 'gap'];
 
 const boolOrNull = (v) => (typeof v === 'boolean' ? v : null);
 const str = (v) => (typeof v === 'string' ? v : '');
@@ -167,6 +171,33 @@ function deriveHipFlexors(raw) {
   };
 }
 
+function deriveShoulderReach(raw) {
+  const state = testState(raw);
+  if (state.unable_to_complete) return unableResult(state);
+  const src = (raw && raw.sides) || {};
+  const side = (s) => {
+    s = s || {};
+    return {
+      reach: enumOrNull(SHOULDER_REACH_RESULTS, s.reach),
+      pain: boolOrNull(s.pain),
+      notes: str(s.notes),
+    };
+  };
+  const left = side(src.left);
+  const right = side(src.right);
+  // K11's three outcomes: overlap and touch are clear, a gap is the one
+  // possible restriction. The wording stays "possible" — it is a screen.
+  const interpret = (s) => (s.reach == null ? null
+    : s.reach === 'gap' ? 'Possible restriction' : 'Clear');
+  return {
+    sides: { left, right },
+    sides_interpretation: { left: interpret(left), right: interpret(right) },
+    completed: state.completed,
+    unable_to_complete: false,
+    unable_reason: null,
+  };
+}
+
 function deriveSitAndReach(raw, context = {}) {
   const state = testState(raw);
   if (state.unable_to_complete) return unableResult(state);
@@ -241,7 +272,15 @@ function deriveFlexibility(recorded, context = {}) {
   const hamstrings = deriveHamstrings(t.hamstrings);
   const hip_flexors = deriveHipFlexors(t.hip_flexors);
   const sit_and_reach = deriveSitAndReach(t.sit_and_reach, context);
-  const all = [quadriceps, hamstrings, hip_flexors, sit_and_reach];
+  const shoulder_reach = deriveShoulderReach(t.shoulder_reach);
+  // A stored `k11-2026.01` row predates the shoulder test. It stays a complete
+  // four-test battery until the trainer re-records — an old row must not turn
+  // incomplete, or every unrelated edit of it would be refused.
+  const expectsShoulder = r.protocol_version === PROTOCOL_VERSION
+    || Object.prototype.hasOwnProperty.call(t, 'shoulder_reach');
+  const all = expectsShoulder
+    ? [quadriceps, hamstrings, hip_flexors, sit_and_reach, shoulder_reach]
+    : [quadriceps, hamstrings, hip_flexors, sit_and_reach];
   const allRecorded = all.every((x) => x.completed);
   const incomplete = all.filter((x) => !x.completed);
   const overrideReason = r.override && typeof r.override.reason === 'string' ? r.override.reason.trim() : '';
@@ -250,7 +289,8 @@ function deriveFlexibility(recorded, context = {}) {
   const followUp = quadriceps.overall_interpretation === 'Possible tightness'
     || ['left', 'right'].some((s) => (hamstrings.sides_interpretation || {})[s] === 'Below reference range')
     || ['left', 'right'].some((s) => (hamstrings.sides_validity || {})[s] === 'invalid_repeat')
-    || ['left', 'right'].some((s) => (hip_flexors.sides_interpretation || {})[s] === 'Possible hip flexor restriction');
+    || ['left', 'right'].some((s) => (hip_flexors.sides_interpretation || {})[s] === 'Possible hip flexor restriction')
+    || ['left', 'right'].some((s) => (shoulder_reach.sides_interpretation || {})[s] === 'Possible restriction');
   const overall_status = allRecorded
     ? (followUp ? 'follow_up_recommended' : 'all_tests_recorded')
     : (override_used ? 'completed_with_override' : 'incomplete');
@@ -258,15 +298,18 @@ function deriveFlexibility(recorded, context = {}) {
   const qr = (quadriceps.sides || {}).right || {};
   const hl = (hip_flexors.sides || {}).left || {};
   const hr = (hip_flexors.sides || {}).right || {};
+  const shl = (shoulder_reach.sides || {}).left || {};
+  const shr = (shoulder_reach.sides || {}).right || {};
   const has_asymmetry = checkAsymmetry(
     (hamstrings.sides || {}).left ? hamstrings.sides.left.hip_flexion_deg : null,
     (hamstrings.sides || {}).right ? hamstrings.sides.right.hip_flexion_deg : null,
   )
     || (typeof ql.contact === 'boolean' && typeof qr.contact === 'boolean' && ql.contact !== qr.contact)
     || (hl.thigh_position != null && hr.thigh_position != null
-      && (hl.thigh_position === 'below') !== (hr.thigh_position === 'below'));
+      && (hl.thigh_position === 'below') !== (hr.thigh_position === 'below'))
+    || (shl.reach != null && shr.reach != null && (shl.reach === 'gap') !== (shr.reach === 'gap'));
   return {
-    tests: { quadriceps, hamstrings, hip_flexors, sit_and_reach },
+    tests: { quadriceps, hamstrings, hip_flexors, sit_and_reach, shoulder_reach },
     override_used,
     overall_status,
     has_asymmetry,
@@ -304,6 +347,12 @@ const hipFlexorsSideSchema = z.object({
   pelvic_compensation: z.boolean(),
   pain: z.boolean(),
   tightness: z.enum(['Normal', 'Possible restriction', 'Requires reassessment']),
+  notes: notesField,
+});
+
+const shoulderReachSideSchema = z.object({
+  reach: z.enum(['overlap', 'touch', 'gap']),
+  pain: z.boolean(),
   notes: notesField,
 });
 
@@ -351,15 +400,31 @@ const sitAndReachTestSchema = batteryTest(
   'Record 1-3 attempts with at least one valid attempt, or record why it cannot be completed.'
 );
 
-const recordedSchema = z.object({
+const shoulderReachTestSchema = batteryTest(
+  { sides: z.object({ left: shoulderReachSideSchema, right: shoulderReachSideSchema }).optional() },
+  (v) => !!v.sides,
+  'Record both sides of the shoulder reach test, or record why it cannot be completed.'
+);
+
+const LEGACY_TEST_SCHEMAS = {
+  quadriceps: quadricepsTestSchema,
+  hamstrings: hamstringsTestSchema,
+  hip_flexors: hipFlexorsTestSchema,
+  sit_and_reach: sitAndReachTestSchema,
+};
+
+const overrideSchema = z.object({ reason: z.string().max(500).optional().nullable() }).optional().nullable();
+
+const recordedSchemaV1 = z.object({
+  protocol_version: z.literal(LEGACY_PROTOCOL_VERSION),
+  tests: z.object({ ...LEGACY_TEST_SCHEMAS }),
+  override: overrideSchema,
+});
+
+const recordedSchemaV2 = z.object({
   protocol_version: z.literal(PROTOCOL_VERSION),
-  tests: z.object({
-    quadriceps: quadricepsTestSchema,
-    hamstrings: hamstringsTestSchema,
-    hip_flexors: hipFlexorsTestSchema,
-    sit_and_reach: sitAndReachTestSchema,
-  }),
-  override: z.object({ reason: z.string().max(500).optional().nullable() }).optional().nullable(),
+  tests: z.object({ ...LEGACY_TEST_SCHEMAS, shoulder_reach: shoulderReachTestSchema }),
+  override: overrideSchema,
 });
 
 /** A payload carrying the K11 protocol marker (anything else is legacy). */
@@ -370,7 +435,17 @@ const isRecordedBattery = (v) => !!(v && v.protocol_version != null);
  * `{ ok: false, message }` — the route turns that into FLEXIBILITY_INVALID.
  */
 function parseRecorded(input) {
-  const result = recordedSchema.safeParse(input);
+  // The version picks the schema: a stored four-test row is still valid, and
+  // an unknown version is refused rather than parsed as one of them.
+  const schema = input && input.protocol_version === PROTOCOL_VERSION
+    ? recordedSchemaV2
+    : input && input.protocol_version === LEGACY_PROTOCOL_VERSION
+      ? recordedSchemaV1
+      : null;
+  if (!schema) {
+    return { ok: false, message: `flexibility_test_data — protocol_version: unsupported version (expected ${LEGACY_PROTOCOL_VERSION} or ${PROTOCOL_VERSION}).` };
+  }
+  const result = schema.safeParse(input);
   if (result.success) return { ok: true, recorded: result.data };
   const issue = (result.error.issues && result.error.issues[0]) || {};
   const where = issue.path && issue.path.length ? `${issue.path.join('.')}: ` : '';
@@ -382,12 +457,16 @@ const TEST_LABELS = {
   hamstrings: 'Hamstrings 70° Reach',
   hip_flexors: 'Hip Flexors (Thomas test)',
   sit_and_reach: 'YMCA Sit and Reach',
+  shoulder_reach: 'Shoulder Reach',
 };
 
 /** Why the battery may not be stored yet, or null when it may. */
 function validateForStorage(recorded) {
   const tests = recorded.tests || {};
-  const incomplete = Object.keys(TEST_LABELS).filter((k) => !tests[k] || tests[k].completed !== true);
+  const required = recorded.protocol_version === PROTOCOL_VERSION
+    ? Object.keys(TEST_LABELS)
+    : Object.keys(LEGACY_TEST_SCHEMAS);
+  const incomplete = required.filter((k) => !tests[k] || tests[k].completed !== true);
   if (!incomplete.length) return null;
   const stillRecorded = incomplete.filter((k) => !tests[k] || tests[k].unable_to_complete !== true);
   if (stillRecorded.length) {
@@ -407,13 +486,19 @@ function validateForStorage(recorded) {
  */
 function assembleStored(recorded, { userId = null, prev = null, now = new Date(), age = null, gender = null } = {}) {
   const derived = deriveFlexibility(recorded, { age, gender });
-  const previous = prev && prev.protocol_version === PROTOCOL_VERSION ? prev : null;
+  const previous = prev && (prev.protocol_version === PROTOCOL_VERSION || prev.protocol_version === LEGACY_PROTOCOL_VERSION)
+    ? prev
+    : null;
   const prevOverride = (previous && previous.override) || {};
   const reason = recorded.override && typeof recorded.override.reason === 'string' ? recorded.override.reason.trim() : '';
   const used = derived.override_used;
+  // A four-test row keeps its version and its exact payload: re-saving an
+  // unrelated field must not add a shoulder test nobody performed.
+  const tests = { ...derived.tests };
+  if (!recorded.tests || !Object.prototype.hasOwnProperty.call(recorded.tests, 'shoulder_reach')) delete tests.shoulder_reach;
   return {
-    protocol_version: PROTOCOL_VERSION,
-    tests: derived.tests,
+    protocol_version: recorded.protocol_version === LEGACY_PROTOCOL_VERSION ? LEGACY_PROTOCOL_VERSION : PROTOCOL_VERSION,
+    tests,
     override: {
       used,
       reason: used ? reason : null,
@@ -428,6 +513,7 @@ function assembleStored(recorded, { userId = null, prev = null, now = new Date()
 
 module.exports = {
   PROTOCOL_VERSION,
+  LEGACY_PROTOCOL_VERSION,
   ZERO_POINT_INCHES,
   HAMSTRINGS_REFERENCE,
   deriveFlexibility,
