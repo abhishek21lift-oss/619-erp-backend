@@ -897,40 +897,69 @@ async function getOpsSummary(scope = {}) {
 
   // Per-trainer totals for the month — scoped, unlike every other query here.
   //
-  // This one took no parameters at all: it listed every active trainer on the
-  // PLATFORM and their session counts, to every studio that loaded a
-  // dashboard. Names of other studios' staff, and how busy they are, is
-  // competitive information; it is also the exact class of bug the tenant
-  // filter exists to prevent, sitting in the middle of a function where every
-  // sibling query was already scoped.
+  // Completed comes from workout_sessions, the same table the Total/Done tiles
+  // above count. Finishing a workout writes there; nothing moves a pt_sessions
+  // booking past 'scheduled'. Counting completed off the diary is what made
+  // this breakdown read "0 done" beside a real Done figure. Booked and missed
+  // stay on pt_sessions because only the diary knows them.
   //
-  // Both sides need the filter, for different reasons. On `t` it decides which
-  // trainers are listed at all. On `s` it stops a foreign session being
-  // COUNTED against a local trainer — the ids are per-table, so a collision is
-  // unlikely rather than impossible, and a count is exactly where a stray row
-  // would go unnoticed.
+  // Both reads need the org filter, for different reasons. On `t` it decides
+  // which trainers are listed at all. On the counts it stops a foreign session
+  // being COUNTED against a local trainer — the ids are per-table, so a
+  // collision is unlikely rather than impossible, and a count is exactly where
+  // a stray row would go unnoticed.
   //
-  // The `s` filter belongs in the JOIN condition, not the WHERE clause. In the
-  // WHERE it would discard the NULL-extended rows a LEFT JOIN produces and
-  // silently turn this into an INNER JOIN, dropping every trainer who has no
-  // sessions this month — who are precisely the ones the trainer is looking for.
+  // LEFT JOINs keep trainers with no sessions this month in the list — they are
+  // precisely the ones a manager is scanning for. A workout logged against a
+  // client with no assigned trainer carries trainer_id NULL; those totals get
+  // their own "Unassigned" row rather than vanishing and leaving the breakdown
+  // short of the Done tile.
   const { rows: trainer_sessions } = await pool.query(`
+    WITH done AS (
+      SELECT trainer_id, COUNT(*)::INT AS completed
+        FROM workout_sessions
+       WHERE organization_id = $1
+         AND status = 'completed'
+         AND session_date >= DATE_TRUNC('month', CURRENT_DATE)
+         AND session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+       GROUP BY trainer_id
+    ),
+    booked AS (
+      SELECT
+        trainer_id,
+        COUNT(*) FILTER (WHERE status = 'scheduled')::INT AS scheduled,
+        COUNT(*) FILTER (WHERE status IN ('cancelled','no_show'))::INT AS missed
+        FROM pt_sessions
+       WHERE organization_id = $1
+         AND deleted_at IS NULL
+         AND session_date >= DATE_TRUNC('month', CURRENT_DATE)
+         AND session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+       GROUP BY trainer_id
+    )
     SELECT
       t.name AS trainer_name,
-      COUNT(s.id) FILTER (WHERE s.status = 'completed')::INT AS completed,
-      COUNT(s.id) FILTER (WHERE s.status = 'scheduled')::INT AS scheduled,
-      COUNT(s.id) FILTER (WHERE s.status IN ('cancelled','no_show'))::INT AS missed
+      COALESCE(d.completed, 0)::INT AS completed,
+      COALESCE(b.scheduled, 0)::INT AS scheduled,
+      COALESCE(b.missed, 0)::INT AS missed
     FROM trainers t
-    LEFT JOIN pt_sessions s
-      ON s.trainer_id = t.id
-      AND s.session_date >= DATE_TRUNC('month', CURRENT_DATE)
-      AND s.session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
-      AND s.deleted_at IS NULL
-      AND s.organization_id = $1
-    WHERE t.deleted_at IS NULL AND t.status = 'active'
-      AND t.organization_id = $1
-    GROUP BY t.id, t.name
-    ORDER BY completed DESC
+    LEFT JOIN done d   ON d.trainer_id = t.id
+    LEFT JOIN booked b ON b.trainer_id = t.id
+    WHERE t.organization_id = $1
+      -- Active trainers stay on the list even with nothing to show. A trainer
+      -- who has since left still appears if they own sessions this month.
+      AND (
+        (t.deleted_at IS NULL AND t.status = 'active')
+        OR COALESCE(d.completed, 0) > 0
+        OR COALESCE(b.scheduled, 0) > 0
+        OR COALESCE(b.missed, 0) > 0
+      )
+    UNION ALL
+    SELECT 'Unassigned', COALESCE(d.completed, 0), COALESCE(b.scheduled, 0), COALESCE(b.missed, 0)
+      FROM (SELECT 1) one
+      LEFT JOIN done d   ON d.trainer_id IS NULL
+      LEFT JOIN booked b ON b.trainer_id IS NULL
+     WHERE COALESCE(d.completed, 0) + COALESCE(b.scheduled, 0) + COALESCE(b.missed, 0) > 0
+    ORDER BY completed DESC, trainer_name
   `, bareParams);
 
   return {
