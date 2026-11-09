@@ -1,5 +1,5 @@
 'use strict';
-// POST/PATCH /progress/assessments with the K11 four-test flexibility payload
+// POST/PATCH /progress/assessments with the K11 five-test flexibility payload
 // (v3 in flexibility_test_data). The DB is mocked at the pool boundary; the
 // route, validation and repository SQL all run for real.
 
@@ -50,6 +50,7 @@ jest.mock('../middleware/auth', () => ({
 const express = require('express');
 const request = require('supertest');
 const { clientInOrg } = require('../lib/orgGuard');
+const { PROTOCOL_VERSION } = require('../modules/progress/flexibility-protocol');
 
 function app() {
   const a = express();
@@ -73,16 +74,20 @@ const hamSide = (over = {}) => ({
 const hipSide = (over = {}) => ({
   thigh_position: 'below', knee_flexion_deg: 30, pelvic_compensation: false, pain: false, tightness: 'Normal', notes: '', ...over,
 });
+const shoulderSide = (over = {}) => ({ reach: 'overlap', pain: false, notes: '', ...over });
 
 function battery() {
   return {
-    protocol_version: 'k11-2026.01',
+    protocol_version: PROTOCOL_VERSION,
     tests: {
       quadriceps: { sides: { left: quadSide(), right: quadSide() }, completed: true },
       hamstrings: { sides: { left: hamSide(), right: hamSide() }, completed: true },
       hip_flexors: { sides: { left: hipSide(), right: hipSide() }, completed: true },
       sit_and_reach: {
         attempts: [{ inches: 16, valid: true }], knee_bending: false, bouncing: false, notes: '', completed: true,
+      },
+      shoulder_reach: {
+        sides: { left: shoulderSide(), right: shoulderSide() }, completed: true,
       },
     },
   };
@@ -114,7 +119,7 @@ describe('POST /progress/assessments — K11 battery', () => {
 
     const cols = insertCols();
     const stored = JSON.parse(cols.flexibility_test_data);
-    expect(stored.protocol_version).toBe('k11-2026.01');
+    expect(stored.protocol_version).toBe(PROTOCOL_VERSION);
     expect(stored.tests.quadriceps.sides_interpretation).toEqual({ left: 'Normal', right: 'Normal' });
     expect(stored.tests.sit_and_reach.score_inches).toBe(1); // 16 in − 15 in zero point
     expect(stored.tests.sit_and_reach.norm.category).toBe('Good'); // male 36, 16 in

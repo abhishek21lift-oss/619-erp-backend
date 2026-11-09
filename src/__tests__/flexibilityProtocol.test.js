@@ -1,5 +1,5 @@
 'use strict';
-// K11 four-test flexibility battery: derivation, validation and the stored
+// K11 five-test flexibility battery: derivation, validation and the stored
 // payload. Module under test: src/modules/progress/flexibility-protocol.js.
 
 const protocol = require('../modules/progress/flexibility-protocol');
@@ -13,6 +13,7 @@ const hamSide = (over = {}) => ({
 const hipSide = (over = {}) => ({
   thigh_position: 'below', knee_flexion_deg: 30, pelvic_compensation: false, pain: false, tightness: 'Normal', notes: '', ...over,
 });
+const shoulderSide = (over = {}) => ({ reach: 'overlap', pain: false, notes: '', ...over });
 
 function battery() {
   return {
@@ -23,6 +24,9 @@ function battery() {
       hip_flexors: { sides: { left: hipSide(), right: hipSide() }, completed: true },
       sit_and_reach: {
         attempts: [{ inches: 16, valid: true }], knee_bending: false, bouncing: false, notes: '', completed: true,
+      },
+      shoulder_reach: {
+        sides: { left: shoulderSide(), right: shoulderSide() }, completed: true,
       },
     },
   };
@@ -51,6 +55,7 @@ describe('K11 flexibility derivation', () => {
     expect(d.has_asymmetry).toBe(false);
     expect(d.tests.quadriceps.overall_interpretation).toBe('Normal');
     expect(d.tests.hip_flexors.sides_interpretation).toEqual({ left: 'Clear', right: 'Clear' });
+    expect(d.tests.shoulder_reach.sides_interpretation).toEqual({ left: 'Clear', right: 'Clear' });
   });
 
   test('quadriceps: Normal needs contact with no pain and no pelvic compensation', () => {
@@ -115,6 +120,20 @@ describe('K11 flexibility derivation', () => {
       sides: { left: hipSide({ pelvic_compensation: true }), right: hipSide() }, completed: true,
     }));
     expect(belowButCompensated.tests.hip_flexors.sides_interpretation.left).toBe('Possible hip flexor restriction');
+  });
+
+  test('shoulder reach: overlap and touch are Clear, a gap is a possible restriction', () => {
+    const clear = derive(withTest('shoulder_reach', {
+      sides: { left: shoulderSide({ reach: 'touch' }), right: shoulderSide({ reach: 'overlap' }) }, completed: true,
+    })).tests.shoulder_reach;
+    expect(clear.sides_interpretation).toEqual({ left: 'Clear', right: 'Clear' });
+
+    const gap = derive(withTest('shoulder_reach', {
+      sides: { left: shoulderSide({ reach: 'gap' }), right: shoulderSide() }, completed: true,
+    }));
+    expect(gap.tests.shoulder_reach.sides_interpretation.left).toBe('Possible restriction');
+    expect(gap.overall_status).toBe('follow_up_recommended');
+    expect(gap.has_asymmetry).toBe(true);
   });
 
   test('sit and reach: the score is best valid reach minus the 15-inch zero point, negatives allowed', () => {
@@ -239,6 +258,19 @@ describe('K11 stored payload', () => {
     expect(JSON.stringify(again)).toBe(first);
     expect(again.assessor_id).toBe('u1');
     expect(again.recorded_at).toBe('2026-10-19T05:00:00.000Z');
+  });
+
+  test('a four-test k11-2026.01 row still parses and round-trips byte-identically', () => {
+    const legacy = battery();
+    legacy.protocol_version = protocol.LEGACY_PROTOCOL_VERSION;
+    delete legacy.tests.shoulder_reach;
+    const stored = protocol.assembleStored(parsed(legacy), { userId: 'u1', now: new Date('2026-10-19T05:00:00.000Z') });
+    expect(stored.protocol_version).toBe(protocol.LEGACY_PROTOCOL_VERSION);
+    expect(stored.tests.shoulder_reach).toBeUndefined();
+    expect(stored.overall_status).toBe('all_tests_recorded');
+
+    const again = protocol.assembleStored(parsed(JSON.parse(JSON.stringify(stored))), { userId: 'u9', prev: stored });
+    expect(JSON.stringify(again)).toBe(JSON.stringify(stored));
   });
 
   test('an override is stamped once and preserved on later edits', () => {
