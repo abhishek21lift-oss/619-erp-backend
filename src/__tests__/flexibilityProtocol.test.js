@@ -268,6 +268,7 @@ describe('K11 stored payload', () => {
     expect(stored.protocol_version).toBe(protocol.LEGACY_PROTOCOL_VERSION);
     expect(stored.tests.shoulder_reach).toBeUndefined();
     expect(stored.overall_status).toBe('all_tests_recorded');
+    expect(protocol.deriveFlexibility(legacy).tests.shoulder_reach).toBeUndefined();
 
     const again = protocol.assembleStored(parsed(JSON.parse(JSON.stringify(stored))), { userId: 'u9', prev: stored });
     expect(JSON.stringify(again)).toBe(JSON.stringify(stored));

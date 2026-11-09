@@ -309,7 +309,9 @@ function deriveFlexibility(recorded, context = {}) {
       && (hl.thigh_position === 'below') !== (hr.thigh_position === 'below'))
     || (shl.reach != null && shr.reach != null && (shl.reach === 'gap') !== (shr.reach === 'gap'));
   return {
-    tests: { quadriceps, hamstrings, hip_flexors, sit_and_reach, shoulder_reach },
+    tests: expectsShoulder
+      ? { quadriceps, hamstrings, hip_flexors, sit_and_reach, shoulder_reach }
+      : { quadriceps, hamstrings, hip_flexors, sit_and_reach },
     override_used,
     overall_status,
     has_asymmetry,
