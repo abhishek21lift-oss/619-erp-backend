@@ -1334,7 +1334,7 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
     ...(outcomes && outcomes.accepted ? [describeOutcomes(outcomes), ''] : []),
     describeFacts(facts),
     '',
-    describeInterview(ctx.interview),
+    describeInterview(ctx.interview, ctx.lifestyle),
     `- Injuries / limitations: ${p.injuries || 'NOT RECORDED'}`,
   ];
   if (p.health_conditions) userPrompt.push(`- Health conditions: ${p.health_conditions}`);
