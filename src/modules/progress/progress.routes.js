@@ -38,7 +38,7 @@ const MOVED_LIFESTYLE_FIELDS = {
 
 const MOVED_NUTRITION_FIELDS = {
   alcoholic_drinks_per_week: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
-  meal_timing_consistency: { owner: 'Client Interview', endpoint: 'POST/PATCH /api/pt-os/clients/:id/interviews' },
+  meal_timing_consistency: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
   medical_conditions: { owner: 'PAR-Q', endpoint: 'POST/PATCH /api/pt-os/parq/forms' },
 };
 
@@ -1219,6 +1219,8 @@ const lifestyleAssessmentCreateSchema = {
     drinks_per_week: intIn(0, 100),
 
     screen_time_bracket: z.enum(['<2', '2_4', '4_6', '6_8', '8_plus']).optional().nullable(),
+    sitting_hours: numIn(0, 24),
+    meal_regularity: z.enum(['regular', 'irregular', 'inconsistent']).optional().nullable(),
     travel_frequency: z.enum(['rarely', 'monthly', 'weekly', 'daily']).optional().nullable(),
     energy_level: intIn(1, 10), motivation_to_exercise: intIn(1, 10),
     recovery_quality: z.enum(['poor', 'average', 'good', 'excellent']).optional().nullable(),
@@ -1383,7 +1385,7 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
        years_of_experience,
        nutrition_score,
        smoking_status, cigarettes_per_day, years_smoking, alcohol_status, drinks_per_week,
-       screen_time_bracket, travel_frequency, energy_level, recovery_quality, recovery_score,
+       screen_time_bracket, sitting_hours, meal_regularity, travel_frequency, energy_level, recovery_quality, recovery_score,
        sedentary_risk, recovery_risk, habit_risk_score, risk_factors, lifestyle_score, lifestyle_readiness,
        coach_notes, created_by, organization_id
      ) VALUES (
@@ -1395,9 +1397,9 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
        $17,
        $18,
        $19,$20,$21,$22,$23,
-       $24,$25,$26,$27,$28,
-       $29,$30,$31,$32,$33,$34,
-       $35::jsonb,$36,$37
+       $24,$25,$26,$27,$28,$29,$30,
+       $31,$32,$33,$34,$35,$36,
+       $37::jsonb,$38,$39
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || studioToday(),
@@ -1408,7 +1410,8 @@ router.post('/lifestyle-assessments', auth, requireTrainer, validate(lifestyleAs
       b.years_of_experience ?? null,
       analysis.nutritionScore,
       b.smoking_status || null, b.cigarettes_per_day ?? null, b.years_smoking ?? null, b.alcohol_status || null, b.drinks_per_week ?? null,
-      b.screen_time_bracket || null, b.travel_frequency || null, b.energy_level ?? null, b.recovery_quality || null, analysis.recoveryScore,
+      b.screen_time_bracket || null, b.sitting_hours ?? null, b.meal_regularity || null,
+      b.travel_frequency || null, b.energy_level ?? null, b.recovery_quality || null, analysis.recoveryScore,
       analysis.sedentaryRisk, analysis.recoveryRisk, analysis.habitRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.lifestyleScore, analysis.lifestyleReadiness,
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
@@ -1422,7 +1425,7 @@ router.patch('/lifestyle-assessments/:id', auth, validate(lifestyleAssessmentUpd
     'assessment_date', 'sleep_duration_hours', 'bed_time', 'wake_time', 'sleep_quality', 'stress_level',
     'occupation_type', 'daily_steps_bracket', 'years_of_experience',
     'smoking_status', 'cigarettes_per_day', 'years_smoking', 'alcohol_status', 'drinks_per_week',
-    'screen_time_bracket', 'travel_frequency', 'energy_level', 'recovery_quality', 'coach_notes',
+    'screen_time_bracket', 'sitting_hours', 'meal_regularity', 'travel_frequency', 'energy_level', 'recovery_quality', 'coach_notes',
   ];
 
   // Scoped read before the write. Unscoped, this loaded — and the UPDATE below

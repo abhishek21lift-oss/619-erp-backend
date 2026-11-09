@@ -448,4 +448,18 @@ describe('the client interview, as the model reads it', () => {
     const text = describeInterview({ training_challenges: [] });
     expect(text).not.toContain('Training challenges:');
   });
+
+  test('reads sitting hours and meal regularity from Lifestyle, with the interview as fallback', () => {
+    const owned = describeInterview(
+      { lifestyle_sitting_hours: 8, lifestyle_meal_regularity: 'inconsistent' },
+      { sitting_hours: '5.5', meal_regularity: 'regular' },
+    );
+    expect(owned).toContain('Sitting hours a day: 5.5');
+    expect(owned).toContain('Meal regularity: regular');
+    expect(owned).not.toContain('Sitting hours a day: 8');
+
+    const legacy = describeInterview({ lifestyle_sitting_hours: 8, lifestyle_meal_regularity: 'irregular' });
+    expect(legacy).toContain('Sitting hours a day: 8');
+    expect(legacy).toContain('Meal regularity: irregular');
+  });
 });

@@ -615,8 +615,9 @@ const CHALLENGE_LABEL = Object.freeze({
   other: 'other',
 });
 
-function describeInterview(interview) {
+function describeInterview(interview, lifestyle = null) {
   const i = interview || {};
+  const l = lifestyle || {};
   const clientLines = [];
   const add = (label, value, max = 2000) => {
     const v = text(value, max);
@@ -636,8 +637,10 @@ function describeInterview(interview) {
     clientLines.push(`- Days a week they can train: ${i.lifestyle_training_days}`);
   }
   add('Availability notes', i.availability, 1000);
-  add('Sitting hours a day', i.lifestyle_sitting_hours, 10);
-  add('Meal regularity', i.lifestyle_meal_regularity, 20);
+  // Lifestyle owns these two; the Interview columns are legacy fallbacks for
+  // records written before the move.
+  add('Sitting hours a day', l.sitting_hours ?? i.lifestyle_sitting_hours, 10);
+  add('Meal regularity', l.meal_regularity ?? i.lifestyle_meal_regularity, 20);
   add('Motivation', i.motivation);
   add('Preferences', i.preferences, 1000);
   add("In the client's words", i.important_client_statements);

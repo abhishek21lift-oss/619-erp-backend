@@ -16,15 +16,17 @@ router.use(auth, requireTrainer);
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const NOT_FOUND = { error: { code: 'NOT_FOUND', message: 'Client not found' } };
 
-// The Interview owns the quick screen only. These five were written here
-// before the Lifestyle assessment became their owner; the columns stay
-// readable, but a write is refused rather than silently dropped.
+// The Interview owns the quick screen (training days) only. These seven were
+// written here before the Lifestyle assessment became their owner; the columns
+// stay readable, but a write is refused rather than silently dropped.
 const MOVED_INTERVIEW_FIELDS = {
   lifestyle_occupation: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
   lifestyle_screen_time: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
   lifestyle_sleep_hours: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
   lifestyle_smoking: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
   lifestyle_alcohol: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  lifestyle_sitting_hours: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
+  lifestyle_meal_regularity: { owner: 'Lifestyle', endpoint: 'POST/PATCH /api/progress/lifestyle-assessments' },
 };
 
 /** An interview input error as a 4xx; anything else to the error handler. */

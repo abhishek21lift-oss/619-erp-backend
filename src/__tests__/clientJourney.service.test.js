@@ -108,8 +108,6 @@ describe('structured interview answers are checked before the database', () => {
     ['lifestyle_training_days', -1],
     ['lifestyle_training_days', 3.5],
     ['lifestyle_training_days', 'five'],
-    ['lifestyle_sitting_hours', 'abc'],
-    ['lifestyle_meal_regularity', 'sometimes'],
     ['previous_workout_experience', 'expert'],
     ['training_challenges', 'time'],
     ['training_challenges', ['time', 'sleeping']],
@@ -157,9 +155,9 @@ describe('structured interview answers are checked before the database', () => {
   it('normalises numeric strings so the driver receives numbers', async () => {
     pool.query.mockResolvedValueOnce({ rowCount: 1 });
     pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1' }] });
-    await attempt({ lifestyle_sitting_hours: '3', lifestyle_training_days: '5' });
+    await attempt({ lifestyle_training_days: '5' });
     const insertParams = pool.query.mock.calls[1][1];
-    expect(insertParams).toEqual(expect.arrayContaining([3, 5]));
+    expect(insertParams).toEqual(expect.arrayContaining([5]));
   });
 
   it('ignores fields owned by Lifestyle instead of writing them here', async () => {
@@ -168,17 +166,18 @@ describe('structured interview answers are checked before the database', () => {
     await attempt({
       lifestyle_occupation: 'desk_job', lifestyle_screen_time: '<2', lifestyle_sleep_hours: 7,
       lifestyle_smoking: 'never', lifestyle_alcohol: 'never',
+      lifestyle_sitting_hours: '6', lifestyle_meal_regularity: 'regular',
     });
     const insertSql = pool.query.mock.calls[1][0];
     for (const column of ['lifestyle_occupation', 'lifestyle_screen_time', 'lifestyle_sleep_hours',
-      'lifestyle_smoking', 'lifestyle_alcohol']) {
+      'lifestyle_smoking', 'lifestyle_alcohol', 'lifestyle_sitting_hours', 'lifestyle_meal_regularity']) {
       expect(insertSql).not.toContain(column);
     }
   });
 
   it('still completes a legacy draft whose only answers are in moved columns', async () => {
     pool.query.mockResolvedValueOnce({
-      rows: [{ id: 'interview-1', status: 'draft', lifestyle_occupation: 'desk_job' }],
+      rows: [{ id: 'interview-1', status: 'draft', lifestyle_sitting_hours: '6.0', lifestyle_meal_regularity: 'regular' }],
     });
     pool.query.mockResolvedValueOnce({ rows: [{ id: 'interview-1', status: 'completed' }] });
     const saved = await updateInterview(ORG, 'interview-1', 'user-1', { status: 'completed' });

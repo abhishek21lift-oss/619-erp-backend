@@ -22,10 +22,10 @@ const { hasPtTermSql } = require('../../lib/ptTerm');
 const INTERVIEW_FIELDS = Object.freeze([
   'training_history', 'pain_and_injuries', 'lifestyle', 'motivation',
   'availability', 'preferences', 'notes',
-  // The Interview owns the quick screen: sitting hours, meal regularity and
-  // training days. Sleep, smoking, alcohol, occupation and screen time belong
-  // to the Lifestyle assessment and are no longer writable here.
-  'lifestyle_sitting_hours', 'lifestyle_meal_regularity', 'lifestyle_training_days',
+  // The Interview owns training days only. Sitting hours, meal regularity,
+  // sleep, smoking, alcohol, occupation and screen time belong to the Lifestyle
+  // assessment and are no longer writable here.
+  'lifestyle_training_days',
   // Migration 254 — the redesigned interview's own fields.
   'job_details', 'occupation_other_details', 'previous_workout_experience',
   'training_challenges', 'challenge_other', 'important_client_statements',
@@ -36,16 +36,15 @@ const INTERVIEW_FIELDS = Object.freeze([
 const LEGACY_INTERVIEW_FIELDS = Object.freeze([
   'lifestyle_occupation', 'lifestyle_screen_time', 'lifestyle_sleep_hours',
   'lifestyle_smoking', 'lifestyle_alcohol',
+  'lifestyle_sitting_hours', 'lifestyle_meal_regularity',
 ]);
 const INTERVIEW_READ_FIELDS = Object.freeze([...INTERVIEW_FIELDS, ...LEGACY_INTERVIEW_FIELDS]);
-const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, lifestyle_meal_regularity: 20, occupation_other_details: 500, challenge_other: 500 });
+const FIELD_MAX = Object.freeze({ availability: 1000, preferences: 1000, occupation_other_details: 500, challenge_other: 500 });
 
 // Structured answers are enums or bounded numbers, and the database's CHECK
 // constraints reject a bad one — but as a 23514, which surfaced as a 500. The
 // values are checked here first, so a bad answer is a 400 with a field name.
 const STRUCTURED = Object.freeze({
-  lifestyle_sitting_hours: { min: 0, max: 24 },
-  lifestyle_meal_regularity: { oneOf: ['regular', 'irregular', 'inconsistent'] },
   lifestyle_training_days: { min: 0, max: 7, integer: true },
   previous_workout_experience: { oneOf: ['never', 'beginner', 'intermediate', 'advanced'] },
 });

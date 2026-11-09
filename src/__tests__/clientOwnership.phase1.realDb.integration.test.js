@@ -127,17 +127,22 @@ describeIf('client data ownership Phase 1, against a real database', () => {
       expect(movedWarnings()).toHaveLength(1);
     });
 
-    test('sitting hours, meal regularity and training days are stored', async () => {
+    test('sitting hours and meal regularity are refused; training days are stored', async () => {
       const clientId = await newClient('Interview Own');
+      const moved = await request().post(`/api/pt-os/clients/${clientId}/interviews`).send({
+        lifestyle_sitting_hours: '6', lifestyle_meal_regularity: 'regular',
+      });
+      expect(moved.status).toBe(422);
+      expect(moved.body.error.fields.map((f) => f.field).sort())
+        .toEqual(['lifestyle_meal_regularity', 'lifestyle_sitting_hours']);
+
       const r = await request().post(`/api/pt-os/clients/${clientId}/interviews`).send({
-        lifestyle_sitting_hours: '6', lifestyle_meal_regularity: 'regular', lifestyle_training_days: 4,
-        occupation_other_details: 'Site supervisor',
+        lifestyle_training_days: 4, occupation_other_details: 'Site supervisor',
       });
       expect(r.status).toBe(201);
-      expect(Number(r.body.data.lifestyle_sitting_hours)).toBe(6);
-      expect(r.body.data.lifestyle_meal_regularity).toBe('regular');
       expect(r.body.data.lifestyle_training_days).toBe(4);
-      expect(r.body.data.lifestyle_sleep_hours).toBeNull();
+      expect(r.body.data.lifestyle_sitting_hours).toBeNull();
+      expect(r.body.data.lifestyle_meal_regularity).toBeNull();
     });
 
     test('a legacy draft whose only answer is in a moved column can still be completed', async () => {
@@ -154,7 +159,7 @@ describeIf('client data ownership Phase 1, against a real database', () => {
     test('an edit cannot write a moved field', async () => {
       const clientId = await newClient('Interview Edit');
       const c = await request().post(`/api/pt-os/clients/${clientId}/interviews`)
-        .send({ lifestyle_meal_regularity: 'irregular' });
+        .send({ job_details: 'Shift supervisor' });
       const p = await request().patch(`/api/pt-os/interviews/${c.body.data.id}`)
         .send({ lifestyle_screen_time: '<2' });
       expect(p.status).toBe(422);
@@ -339,13 +344,13 @@ describeIf('client data ownership Phase 1, against a real database', () => {
       expect(movedReads().some(([p]) => p.field === 'medical_conditions')).toBe(false);
     });
 
-    test('an edit cannot write a Lifestyle, Interview or PAR-Q field', async () => {
+    test('an edit cannot write a Lifestyle or PAR-Q field', async () => {
       const clientId = await newClient('Nutrition Edit');
       const c = await request().post('/api/progress/nutrition-assessments')
         .send({ client_id: clientId, meals_per_day: 3 });
       for (const [field, value, owner] of [
         ['alcoholic_drinks_per_week', 3, 'Lifestyle'],
-        ['meal_timing_consistency', 'consistent', 'Client Interview'],
+        ['meal_timing_consistency', 'consistent', 'Lifestyle'],
         ['medical_conditions', ['asthma'], 'PAR-Q'],
       ]) {
         const p = await request().patch(`/api/progress/nutrition-assessments/${c.body.data.id}`)
