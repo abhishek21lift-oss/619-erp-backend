@@ -123,6 +123,21 @@ describe('forgot-password', () => {
     expect(loggedOutcome()).toBe('sent');
   });
 
+  test('logs a fingerprint of the address, never the address itself', async () => {
+    await request(app()).post('/api/auth/forgot-password')
+      .send({ email: 'admin@myptstudio.com' });
+    await request(app()).post('/api/auth/forgot-password')
+      .send({ email: 'nobody@example.com' });
+    await flush();
+
+    const dump = JSON.stringify([
+      ...mockLog.info.mock.calls, ...mockLog.warn.mock.calls, ...mockLog.error.mock.calls,
+    ]);
+    expect(dump).not.toContain('admin@myptstudio.com');
+    expect(dump).not.toContain('nobody@example.com');
+    expect(dump).toMatch(/email_fingerprint/);
+  });
+
   test('a stored address with stray whitespace still matches', async () => {
     // Easy to introduce by pasting into an admin field, and it previously made
     // the account permanently unable to reset — silently.

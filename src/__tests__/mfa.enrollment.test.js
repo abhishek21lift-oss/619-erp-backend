@@ -196,8 +196,35 @@ describe('POST /api/profile/mfa/verify — proving possession', () => {
 });
 
 describe('DELETE /api/profile/mfa — turning it off', () => {
-  test('clears the secret, the flag AND the stored recovery codes', async () => {
+  const bcrypt = require('bcryptjs');
+  const passwordHash = bcrypt.hashSync('correct-password', 4);
+
+  function withPasswordRow({ hash = passwordHash } = {}) {
+    mockQueryImpl = async (sql, params) => {
+      queries.push({ sql: String(sql).replace(/\s+/g, ' ').trim(), params });
+      if (/^SELECT password FROM users WHERE id = \$1/.test(String(sql).replace(/\s+/g, ' ').trim())) {
+        return { rows: hash ? [{ password: hash }] : [], rowCount: hash ? 1 : 0 };
+      }
+      return { rows: [], rowCount: 0 };
+    };
+  }
+
+  test('requires the current password before removing the second factor', async () => {
     const res = await request(app()).delete('/api/profile/mfa');
+    expect(res.status).toBe(400);
+    expect(queries.find((q) => /UPDATE user_profiles SET mfa_enabled = FALSE/i.test(q.sql))).toBeUndefined();
+  });
+
+  test('refuses a wrong current password', async () => {
+    withPasswordRow();
+    const res = await request(app()).delete('/api/profile/mfa').send({ currentPassword: 'wrong-password' });
+    expect(res.status).toBe(400);
+    expect(queries.find((q) => /UPDATE user_profiles SET mfa_enabled = FALSE/i.test(q.sql))).toBeUndefined();
+  });
+
+  test('clears the secret, the flag AND the stored recovery codes', async () => {
+    withPasswordRow();
+    const res = await request(app()).delete('/api/profile/mfa').send({ currentPassword: 'correct-password' });
 
     expect(res.status).toBe(200);
     const upd = queries.find((q) => /UPDATE user_profiles/i.test(q.sql));
@@ -246,5 +273,28 @@ describe('the login validator accepts both second-factor shapes', () => {
 
   test('remains optional, so non-MFA logins are unaffected', () => {
     expect(authSchemas.login.body.safeParse({ email: 'a@b.test', password: 'x' }).success).toBe(true);
+  });
+});
+
+describe('MFA enrolment is limited to the accounts login enforces it for', () => {
+  test('a trainer cannot enrol — password login ignores mfa_enabled for that role', async () => {
+    // The Settings page offered this to every role and then said "Active",
+    // while routes/auth.js only challenges super_admin. Enrolling was a
+    // security claim the login flow never kept.
+    mockUser = { ...USER, role: 'trainer', organization_id: 'org-1' };
+
+    const res = await request(app()).post('/api/profile/mfa/setup');
+
+    expect(res.status).toBe(403);
+    expect(queries.find((q) => /INSERT INTO user_profiles/i.test(q.sql))).toBeUndefined();
+  });
+
+  test('a trainer cannot disable an MFA enrolment through this endpoint either', async () => {
+    mockUser = { ...USER, role: 'trainer', organization_id: 'org-1' };
+
+    const res = await request(app()).delete('/api/profile/mfa');
+
+    expect(res.status).toBe(403);
+    expect(queries.find((q) => /UPDATE user_profiles SET mfa_enabled = FALSE/i.test(q.sql))).toBeUndefined();
   });
 });

@@ -15,6 +15,7 @@ const pool = require('../db/pool');
 const { syncTrainerName } = require('../lib/memberTrainer');
 const { detectFileType, PROFILE_IMAGES, LOGO_IMAGES } = require('../lib/fileSignatures');
 const { auth, requireTrainer, invalidateUserCache } = require('../middleware/auth');
+const { requireSuperAdmin } = require('../middleware/tenant');
 const { clearPortalCookies, legacyRefreshMatches, revokeRefreshTokensForUser } = require('../lib/authSession');
 const studioBranding = require('../lib/studioBranding');
 const studioDetails = require('../lib/studioDetails');
@@ -25,6 +26,7 @@ const { sendEmailChangedNotice } = require('../lib/email');
 const emailChange = require('../lib/emailChange');
 const { saveFile, deleteFile } = require('../lib/fileStorage');
 const credentials = require('../lib/credentials');
+const { verifyCurrentPassword } = require('../lib/currentPassword');
 const profileFields = require('../lib/profileFields');
 const { profileCompletion } = require('../lib/profileCompletion');
 const portfolio = require('../lib/portfolio');
@@ -828,9 +830,8 @@ router.put('/password', async (req, res, next) => {
     if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Both current and new password are required' });
     if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
 
-    const { rows } = await pool.query('SELECT password FROM users WHERE id = $1', [req.user.id]);
-    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-    const valid = await bcrypt.compare(currentPassword, rows[0].password);
+    const valid = await verifyCurrentPassword(req.user.id, currentPassword);
+    if (valid === null) return res.status(404).json({ error: 'User not found' });
     if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
 
     const hashed = await bcrypt.hash(newPassword, 12);
@@ -864,7 +865,10 @@ router.put('/password', async (req, res, next) => {
   }
 });
 
-router.post('/mfa/setup', async (req, res, next) => {
+// Only the platform operator's login challenges for MFA (routes/auth.js). A
+// trainer could enrol here and see "Active" in Settings while password login
+// ignored it entirely — a second factor that was never asked for.
+router.post('/mfa/setup', requireSuperAdmin, async (req, res, next) => {
   try {
     await ensureSchema();
     const secret = generateSecret();
@@ -885,7 +889,8 @@ router.post('/mfa/setup', async (req, res, next) => {
 });
 
 // A 6-digit TOTP code is a 1M-value space; throttle harder than the general
-// per-user API limit so it can't be brute-forced from a single account.
+// per-user API limit so it can't be brute-forced from a single account. The
+// same limiter covers disabling MFA, which re-checks the account password.
 const mfaVerifyLimiter = rateLimit({
   store: makeStore('mfa'),
   passOnStoreError: true,
@@ -893,10 +898,10 @@ const mfaVerifyLimiter = rateLimit({
   max: 15,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many MFA verification attempts. Please wait 15 minutes.' },
+  message: { error: 'Too many MFA attempts. Please wait 15 minutes.' },
 });
 
-router.post('/mfa/verify', mfaVerifyLimiter, async (req, res, next) => {
+router.post('/mfa/verify', requireSuperAdmin, mfaVerifyLimiter, async (req, res, next) => {
   try {
     const code = String(req.body.code || '').trim();
     if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Valid MFA code is required' });
@@ -934,8 +939,18 @@ router.post('/mfa/verify', mfaVerifyLimiter, async (req, res, next) => {
   }
 });
 
-router.delete('/mfa', async (req, res, next) => {
+router.delete('/mfa', requireSuperAdmin, mfaVerifyLimiter, async (req, res, next) => {
   try {
+    // Removing the second factor must cost the password, or a hijacked session
+    // can quietly turn the account back into password-only and stay inside it.
+    // Turning MFA ON needs no re-auth: that direction strengthens the account.
+    const supplied = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
+    if (!supplied) {
+      return res.status(400).json({ error: 'Current password is required to disable two-factor authentication' });
+    }
+    const valid = await verifyCurrentPassword(req.user.id, supplied);
+    if (!valid) return res.status(400).json({ error: 'Password is incorrect' });
+
     await ensureSchema();
     await pool.query('UPDATE user_profiles SET mfa_enabled = FALSE, mfa_secret = NULL, updated_at = NOW() WHERE user_id = $1', [req.user.id]);
     // Codes outlive nothing. Leaving them behind would mean a re-enrolment

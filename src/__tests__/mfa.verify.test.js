@@ -35,10 +35,12 @@ function withAuth(req) {
   return req.set('Authorization', 'Bearer ' + trainerToken);
 }
 
+// The endpoint is super-admin-only now: that is the only role password login
+// challenges for a second factor (see mfa.enrollment.test.js).
 const adminUser = {
-  id: 'usr-1', name: 'Admin', email: 'admin@619fitness.com', role: 'trainer',
+  id: 'usr-1', name: 'Admin', email: 'admin@619fitness.com', role: 'super_admin',
   trainer_id: null, member_id: null, is_active: true, token_version: 0,
-  organization_id: '11111111-1111-4111-8111-111111111111',
+  organization_id: null,
 };
 
 describe('POST /api/profile/mfa/verify', () => {

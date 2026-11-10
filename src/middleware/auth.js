@@ -99,7 +99,10 @@ async function auth(req, res, next) {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    // Explicit allowlist: this session verifier accepts the algorithm the auth
+    // routes mint with and nothing else, rather than trusting the key type to
+    // narrow it.
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
     // Only a session token is a session. The same secret also signs short-lived
     // single-purpose tokens (the WebAuthn step-up action token carries `id` and

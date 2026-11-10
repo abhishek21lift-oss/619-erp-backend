@@ -112,8 +112,8 @@ const MEMBER_MAY = {
   'GET /api/profile/sessions': "Lists active login sessions belonging to the caller themselves; query is strictly filtered WHERE user_id = req.user.id.",
   'DELETE /api/profile/sessions/1': "Revokes a single active login session belonging to the caller themselves; strictly scoped to req.user.id.",
   'POST /api/profile/sessions/revoke-all': "Revokes all other active sessions belonging to the caller themselves; mutation is strictly scoped to req.user.id.",
-  'POST /api/profile/mfa/setup': "Initiates multi-factor authentication setup for the caller's OWN account, generating a TOTP secret bound to req.user.id.",
-  'DELETE /api/profile/mfa': "Disables multi-factor authentication for the caller's OWN account; the operation is strictly scoped to req.user.id.",
+  // MFA enrolment is deliberately absent: requireSuperAdmin gates it, because
+  // password login only challenges super_admin for a second factor.
   'PUT /api/profile/notifications': "Updates notification preferences for the caller's OWN user account; mutation is strictly scoped to req.user.id.",
   'PUT /api/profile/preferences': "Updates UI display preferences (theme, timezone, locale) for the caller's OWN account; strictly scoped to req.user.id.",
 

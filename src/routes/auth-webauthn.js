@@ -16,7 +16,9 @@ const { tenantScope } = require('../lib/tenant-db');
 const logger   = require('../lib/logger');
 const loginEvents = require('../lib/loginEvents');
 const { AUD_TENANT } = require('../middleware/platformAuth');
-const { setAccessCookie } = require('../lib/authSession');
+const {
+  setAccessCookie, issueRefreshToken, signAccessToken, bodyTokensAllowed, sessionUserPayload,
+} = require('../lib/authSession');
 const rateLimit = require('express-rate-limit');
 const { makeStore } = require('../lib/rateLimitStore');
 
@@ -354,11 +356,6 @@ function wauthn() {
   return _wauthn;
 }
 
-// The staff passkey door is a studio door, so its access cookie lives in the
-// trainer namespace. Kept at the legacy 7-day lifetime this route has always
-// used; see the session note in lib/authSession.js.
-const STAFF_PASSKEY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-
 // userID for WebAuthn must be a Uint8Array in @simplewebauthn/server v13+.
 // Passing a string throws "String values for `userID` are no longer supported".
 function userIdToWebAuthn(uuid) {
@@ -691,12 +688,19 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
 
     // Tenant audience — the passkey door is the studio door. See the same
     // note in routes/auth-google.js and middleware/platformAuth.js.
-    const token = jwt.sign(
-      { id: user.id, token_version: user.token_version ?? 0, aud: AUD_TENANT },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
-    setAccessCookie(res, 'trainer', token, { maxAgeMs: STAFF_PASSKEY_TTL_MS, mirrorLegacy: true });
+    //
+    // The SAME session as password login: a 15-minute access token plus a
+    // rotating refresh token. This route used to mint a 7-day bearer with no
+    // refresh token, so a passkey session could neither be refreshed nor
+    // revoked by the mechanisms every other session uses.
+    const token = signAccessToken(user.id, user.token_version ?? 0, AUD_TENANT);
+    setAccessCookie(res, 'trainer', token, { mirrorLegacy: true });
+    let refreshToken;
+    try {
+      refreshToken = await issueRefreshToken(res, user.id, AUD_TENANT, 'trainer', { mirrorLegacy: true });
+    } catch (rfErr) {
+      logger.warn({ err: rfErr.message }, 'passkey refresh_token issue failed (non-critical)');
+    }
 
     pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]).catch(() => {});
     loginEvents.record(req, {
@@ -710,16 +714,8 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
 
     res.json({
       success: true,
-      user: {
-        id: user.id, name: user.name, email: user.email,
-        role: user.role, trainer_id: user.trainer_id, pt_client_id: user.pt_client_id,
-        organization_id: user.organization_id,
-        organization_name: user.organization_name,
-        organization_logo_url: user.organization_logo_url,
-        is_founder: Boolean(user.is_founder),
-        founder_number: user.founder_number ?? null,
-        avatar_url: user.avatar_url ?? null,
-      },
+      user: sessionUserPayload(user),
+      ...(bodyTokensAllowed(req) ? { token, refresh_token: refreshToken } : {}),
     });
   } catch (err) { next(err); }
 }));
