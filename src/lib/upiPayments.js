@@ -26,7 +26,7 @@
 const { randomUUID } = require('crypto');
 const QRCode = require('qrcode');
 const pool = require('../db/pool');
-const { dbDate } = require('./appTime');
+const { dbDate, today } = require('./appTime');
 const { genReceiptNo } = require('../db/receipts');
 const logger = require('./logger');
 const automation = require('../modules/automation/automation.triggers');
@@ -228,7 +228,9 @@ async function generateQrDataUrl(intentUrl) {
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function todayIso() {
-  return new Date().toISOString().slice(0, 10);
+  // Studio-local, not UTC: toISOString() is yesterday between 00:00 and 05:30
+  // IST, which stamped the payment, invoice and membership start a day early.
+  return today();
 }
 
 /**
@@ -1213,8 +1215,10 @@ async function cancel({ orderId, orgId, actor }, db = pool) {
       `UPDATE payment_orders SET status = $1
         WHERE id = $2 AND organization_id = $3 AND status = ANY($4::text[])
         RETURNING ${ORDER_COLUMNS.replace(/o\./g, '')}`,
-      [ORDER_STATUS.CANCELLED, orderId, orgId,
-       [...OPEN_ORDER_STATUSES, ORDER_STATUS.VERIFICATION_PENDING]]
+      // Once a UTR is submitted the money may already be in the studio's
+      // account; withdrawing the order removed it from verification with no
+      // way to approve or reopen it. Staff reject the submission instead.
+      [ORDER_STATUS.CANCELLED, orderId, orgId, [...OPEN_ORDER_STATUSES]]
     );
     if (!rows[0]) {
       throw new PaymentError(
