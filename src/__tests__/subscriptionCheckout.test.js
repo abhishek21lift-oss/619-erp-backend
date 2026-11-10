@@ -505,7 +505,9 @@ describe('approve', () => {
   test('an upgrade passes resetPeriod, the frozen proration credit and the previous plan to activate()', async () => {
     on(/FROM subscription_payment_requests r JOIN organizations o/, {
       rows: [submitted({
-        direction: 'upgrade', previous_plan_code: 'starter', proration_credit_inr: 1200, amount_inr: 3799,
+        direction: 'upgrade', previous_plan_code: 'starter', proration_credit_inr: 1200,
+        // priceFor stores the proration-adjusted gross; no coupon here, so net = gross.
+        list_price_inr: 3799, amount_inr: 3799,
       })],
     });
     on(/UPDATE subscription_payment_requests SET status = \$1, reviewed_by = \$2/, { rows: [], rowCount: 1 });
@@ -550,6 +552,22 @@ describe('approve', () => {
     await checkout.approve({ requestId: REQ_ID, actor: OPERATOR });
 
     expect(subscription.activate.mock.calls[0][2]).toMatchObject({ couponCode: 'LAUNCH50' });
+  });
+
+  test('approval hands activate() the GROSS price, so the coupon is applied exactly once', async () => {
+    // priceFor() already stores amount_inr net of the coupon. Passing that net
+    // figure as amount_inr *and* the coupon code made activate() discount it a
+    // second time: the studio paid ₹2,499 and the ledger said ₹1,999.
+    on(/FROM subscription_payment_requests r JOIN organizations o/,
+      { rows: [submitted({ coupon_code: 'LAUNCH50', list_price_inr: 2999, amount_inr: 2499 })] });
+    on(/UPDATE subscription_payment_requests SET status = \$1, reviewed_by = \$2/, { rows: [], rowCount: 1 });
+    subscription.activate.mockResolvedValue({ invoice_no: 'INV-3' });
+
+    await checkout.approve({ requestId: REQ_ID, actor: OPERATOR });
+
+    expect(subscription.activate.mock.calls[0][2]).toMatchObject({
+      amount_inr: 2999, couponCode: 'LAUNCH50',
+    });
   });
 
   test('two operators approving at once: the loser gets a 409 and activate() runs once', async () => {

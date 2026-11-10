@@ -55,6 +55,7 @@ jest.mock('../modules/automation/automation.triggers', () => new Proxy({}, {
 
 const ORG_A = 'a4a4a4a4-a4a4-4a4a-a4a4-a4a4a4a4a4a4';
 const ORG_B = 'b4b4b4b4-b4b4-4b4b-8b4b-b4b4b4b4b4b4';
+const { dbDate } = require('../lib/appTime');
 
 jest.setTimeout(180000);
 
@@ -219,7 +220,7 @@ describeIf('Phase 4 production-shape ownership, against a real database', () => 
       const brief = await readService.getClientTrainingBrief(ORG_A, c.id);
       expect(brief.sections.body.weight_kg).toBe(76);
       expect(brief.sections.body.as_of).toBe(
-        (await canonicalAssessment(c.id)).assessment_date.toISOString().slice(0, 10),
+        dbDate((await canonicalAssessment(c.id)).assessment_date),
       );
 
       const ctx = await ai.loadAuthoritativeClient(c.id, ORG_A);
@@ -525,7 +526,7 @@ describeIf('Phase 4 production-shape ownership, against a real database', () => 
       // Content date, not typing date: the trap row typed last is the older test.
       const latest = await canonicalAssessment(c.id);
       expect(series.at(-1)).toEqual({
-        date: latest.assessment_date.toISOString().slice(0, 10),
+        date: dbDate(latest.assessment_date),
         value: Number(latest.weight),
       });
     });

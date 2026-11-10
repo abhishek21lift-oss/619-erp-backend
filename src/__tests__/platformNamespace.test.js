@@ -91,9 +91,17 @@ describe('every session token declares its plane', () => {
   // that slips in unnoticed. The count assertion below is what forces that.
   const MINTERS = [
     ['lib/authSession.js', null],                                   // both planes — the caller decides
-    ['routes/auth-webauthn.js', 'AUD_TENANT'],                  // studio door (passkey)
     ['modules/platform/super-admin/impersonation.js', 'AUD_TENANT'], // operator entering a studio
   ];
+
+  // The passkey door used to sign its own 7-day bearer. It now shares the
+  // standard session helper, so its plane is pinned here the same way the
+  // Google door's is.
+  it('routes/auth-webauthn.js mints its session on the tenant plane', () => {
+    const src = code(read('routes', 'auth-webauthn.js'));
+    expect(src).toMatch(/signAccessToken\(user\.id, user\.token_version \?\? 0, AUD_TENANT\)/);
+    expect(src).toMatch(/issueRefreshToken\(res, user\.id, AUD_TENANT, 'trainer', \{ mirrorLegacy: true \}\)/);
+  });
 
   it.each(MINTERS.filter(([, aud]) => aud))('%s mints a %s session', (file, aud) => {
     expect(code(read(...file.split('/')))).toMatch(new RegExp(`aud:\\s*${aud}`));
@@ -130,9 +138,10 @@ describe('every session token declares its plane', () => {
   it('has no minting site outside that list', () => {
     // Walks the tree rather than trusting the list above to be current.
     // Files that mint a non-session token belong here, so being on this list
-    // is a decision rather than an oversight. Empty today: the Google Calendar
-    // OAuth `state` signer was removed with the calendar integration (244).
-    const NON_SESSION = [];
+    // is a decision rather than an oversight.
+    // auth-webauthn mints a 5-minute step-up token for /action/verify, not a
+    // session. It carries a purpose claim and is never accepted as an access token.
+    const NON_SESSION = ['routes/auth-webauthn.js'];
     const found = [];
     const walk = (dir) => {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {

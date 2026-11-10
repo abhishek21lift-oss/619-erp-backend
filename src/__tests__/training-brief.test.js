@@ -66,6 +66,14 @@ describe('what the brief admits it does not know', () => {
     });
     expect(brief.sections.body.as_of).toBe('2026-03-14');
     expect(brief.sections.capacity.as_of).toBe('2026-03-14');
+
+    // pg returns DATE as a JS Date at local midnight. Formatting it as UTC
+    // moved every studio-local date one day earlier.
+    const dated = buildBrief({
+      client: CLIENT,
+      assessment: { assessment_date: new Date(2026, 2, 14), weight: 72 },
+    });
+    expect(dated.sections.body.as_of).toBe('2026-03-14');
   });
 });
 

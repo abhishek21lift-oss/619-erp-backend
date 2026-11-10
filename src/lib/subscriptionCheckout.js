@@ -458,7 +458,10 @@ async function approve({ requestId, actor }, db = pool) {
   let result;
   try {
     result = await subscription.activate(request.organization_id, request.plan_code, {
-      amount_inr: request.amount_inr,
+      // The GROSS price. request.amount_inr is already net of the coupon
+      // (priceFor() stores it that way), and activate() applies the coupon
+      // again below — handing it the net figure discounted the charge twice.
+      amount_inr: request.list_price_inr,
       method: 'upi',
       reference: request.utr,
       notes: `Self-checkout ${request.request_no}`,

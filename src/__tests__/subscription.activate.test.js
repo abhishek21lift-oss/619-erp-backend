@@ -215,14 +215,28 @@ describe('duplicate activation does not stack a second period', () => {
     expect(writtenPeriodEnd().getUTCFullYear()).toBe(2028);
   });
 
-  test('a prorated upgrade is untouched: resetPeriod skips the guard entirely', async () => {
-    scriptActivePeriod({ recentPayment: true });
+  test('the first prorated change is not blocked', async () => {
+    scriptActivePeriod({ recentPayment: false });
     await subscription.activate(ORG, 'elite', {
       amount_inr: 7999, method: 'upi', resetPeriod: true, previousPlanCode: 'pro',
     });
-    // resetPeriod means "start from now", so the guard must not run at all.
-    expect(ranSql(/^SELECT id, created_at FROM subscription_payments/)).toBe(false);
     expect(writtenPeriodEnd().getTime()).toBeGreaterThan(YEAR_END.getTime());
+  });
+
+  test('a second prorated change within the window is refused, not charged twice', async () => {
+    // A double-clicked Apply on an upgrade quoted the same credit twice and
+    // wrote two full payments; resetPeriod deliberately skipped the stacking
+    // guard, so nothing stopped it. The advisory lock serialises the two calls
+    // — this guard turns the loser into a clean 409 before it writes money.
+    scriptActivePeriod({ recentPayment: true });
+
+    await expect(subscription.activate(ORG, 'elite', {
+      amount_inr: 7999, method: 'upi', resetPeriod: true, previousPlanCode: 'pro',
+    })).rejects.toMatchObject({ code: 'PLAN_CHANGE_ALREADY_RECORDED', status: 409 });
+
+    expect(ranSql(/^INSERT INTO subscription_payments/)).toBe(false);
+    expect(ranSql(/^INSERT INTO subscription_invoices/)).toBe(false);
+    expect(ranSql(/^ROLLBACK$/)).toBe(true);
   });
 
   test('a first activation is never treated as a duplicate', async () => {
@@ -230,5 +244,30 @@ describe('duplicate activation does not stack a second period', () => {
     scriptHappyPathUpToPayment();
     await subscription.activate(ORG, 'pro', { amount_inr: 1999, method: 'cash' });
     expect(ranSql(/^SELECT id, created_at FROM subscription_payments/)).toBe(false);
+  });
+});
+
+describe('a comped activation does not create a free-forever founder', () => {
+  test('amount_inr 0 activates the term but grants no locked price', async () => {
+    // grantFounder used to depend only on term length and a free slot, so a
+    // ₹0 comp on a 12-month plan wrote locked_price_inr = 0 — and every later
+    // plan change quoted ₹0 for that studio.
+    on(/^SELECT \* FROM subscription_plans WHERE code = \$1/,
+      { rows: [{ code: 'elite', client_limit: null, price_inr: 9999, launch_price_inr: 7999, duration_months: 12 }] });
+    on(/^SELECT \* FROM organizations WHERE id = \$1/,
+      { rows: [{ id: ORG, is_founder: false, founder_number: null, locked_price_inr: null, current_period_end: null }] });
+    on(/^SELECT count\(\*\)::int AS n FROM founder_members/, { rows: [{ n: 5 }] }); // a slot is free
+    on(/^UPDATE organizations SET subscription_status/, { rows: [], rowCount: 1 });
+    on(/^INSERT INTO subscription_payments/s, { rows: [{ id: 'pay-comp' }] });
+    on(/^SELECT \* FROM platform_billing_settings WHERE id = TRUE/, { rows: [] });
+    on(/^SELECT nextval\('subscription_invoice_seq'\) AS n/, { rows: [{ n: 1 }] });
+    on(/^INSERT INTO subscription_invoices/s, { rows: [], rowCount: 1 });
+
+    await subscription.activate(ORG, 'elite', { amount_inr: 0, method: 'comp' });
+
+    expect(ranSql(/^INSERT INTO founder_members/)).toBe(false);
+    const upd = state.log.find((e) => /^UPDATE organizations SET subscription_status/.test(e.sql));
+    expect(upd.params[5]).toBe(false); // is_founder
+    expect(upd.params[7]).toBeNull();  // locked_price_inr
   });
 });

@@ -125,6 +125,21 @@ function effectivePrice(plan, slotsRemaining) {
   return { amount: plan.price_inr, isLaunch: false };
 }
 
+/**
+ * The price a studio would be charged for a plan change or renewal.
+ *
+ * The founder lock is a price for the plan they BOUGHT, not a platform-wide
+ * discount. Applying it to any target plan priced a year of Elite at the
+ * ₹1,499 Starter lock, and made a short downgrade look like an upgrade.
+ * Same-plan renewals keep the lock; everything else is priced from the plan.
+ */
+function planChangePrice(org, newPlan, currentPlan, slotsRemaining) {
+  const { amount: listPrice, isLaunch } = effectivePrice(newPlan, slotsRemaining);
+  const locked = Boolean(currentPlan) && currentPlan.code === newPlan.code
+    && org.is_founder && org.locked_price_inr != null;
+  return { amount: locked ? Number(org.locked_price_inr) : listPrice, isLaunch };
+}
+
 // A priced quote for a plan (what a studio would pay to subscribe right now).
 async function quote(code) {
   const plan = await getPlan(code);
@@ -371,12 +386,15 @@ async function activate(orgId, planCode, opts = {}) {
     // The term actually being bought, needed before the founder decision.
     const months = opts.periodMonths || plan.duration_months;
 
-    const grantFounder = !alreadyFounder && slots > 0 && months >= FOUNDER_MIN_TERM_MONTHS;
-
     const { amount: effAmount } = effectivePrice(plan, slots);
     const paidAmount = opts.amount_inr != null ? Number(opts.amount_inr)
       : (alreadyFounder && org.locked_price_inr != null) ? org.locked_price_inr
       : effAmount;
+
+    // A comp must not mint a founder. The lock is meant to be the price they
+    // paid; granting it on a ₹0 activation would price every future plan at ₹0.
+    const grantFounder = !alreadyFounder && slots > 0
+      && months >= FOUNDER_MIN_TERM_MONTHS && paidAmount > 0;
 
     const now = new Date();
     // Renewals stack on top of any time still remaining, so a studio never
@@ -413,7 +431,7 @@ async function activate(orgId, planCode, opts = {}) {
     // for the same plan, is not a thing studios do; anything outside the
     // window, or for a different plan, stacks exactly as before.
     let duplicateOf = null;
-    if (!opts.resetPeriod && org.current_period_end) {
+    if (opts.resetPeriod || org.current_period_end) {
       const recent = await client.query(
         `SELECT id, created_at
            FROM subscription_payments
@@ -426,6 +444,16 @@ async function activate(orgId, planCode, opts = {}) {
         [orgId, planCode, String(DUPLICATE_ACTIVATION_WINDOW_MINUTES)]
       );
       if (recent.rows[0]) {
+        // A prorated change has no "record it and refund later" story: the
+        // second submission is the same change, already paid. Refuse it under
+        // the same advisory lock that serialised the two requests, before it
+        // writes a second full payment and invoice.
+        if (opts.resetPeriod) {
+          throw Object.assign(
+            new Error('This plan change has already been recorded. Reload before trying again.'),
+            { status: 409, code: 'PLAN_CHANGE_ALREADY_RECORDED' }
+          );
+        }
         duplicateOf = recent.rows[0].id;
         // Leave the period exactly where the first activation put it.
         periodEnd = new Date(org.current_period_end);
@@ -639,12 +667,9 @@ async function quotePlanChange(orgId, newPlanCode) {
   const currentPlan = org.plan_code ? await getPlan(org.plan_code) : null;
   const slots = await founderSlotsRemaining();
 
-  // Founders keep their locked price for the life of the account; everyone else
-  // pays the current effective (launch-aware) price.
-  const { amount: listPrice, isLaunch } = effectivePrice(newPlan, slots);
-  const newPrice = (org.is_founder && org.locked_price_inr != null)
-    ? Number(org.locked_price_inr)
-    : listPrice;
+  // Founders keep their locked price on the plan they bought; a change to a
+  // different plan is priced from that plan (launch-aware).
+  const { amount: newPrice, isLaunch } = planChangePrice(org, newPlan, currentPlan, slots);
 
   const paid = await amountPaidForCurrentPeriod(orgId, org);
   const credit = prorationCredit(org, paid);
@@ -866,6 +891,7 @@ module.exports = {
   getPlan,
   founderSlotsRemaining,
   effectivePrice,
+  planChangePrice,
   quote,
   logEvent,
   startTrial,

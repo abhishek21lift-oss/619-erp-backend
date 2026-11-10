@@ -96,3 +96,28 @@ describe('Founder Club cap', () => {
     expect(subscription.FOUNDER_LIMIT).toBe(20);
   });
 });
+
+describe('planChangePrice — the founder lock is a price for ONE plan', () => {
+  const starter = { code: 'starter', price_inr: 1499, launch_price_inr: null, duration_months: 1 };
+  const elite = { code: 'elite', price_inr: 9999, launch_price_inr: 7999, duration_months: 12 };
+  const founder = { is_founder: true, locked_price_inr: 1499 };
+
+  test('a founder renewing the plan they locked keeps the locked price', () => {
+    expect(subscription.planChangePrice(founder, starter, starter, 5).amount).toBe(1499);
+  });
+
+  test('a founder switching plans pays the new plan price, not the old lock', () => {
+    // The bug: Elite priced at the ₹1,499 Starter lock — a year of Elite for
+    // the price of one month of Starter.
+    expect(subscription.planChangePrice(founder, elite, starter, 5).amount).toBe(7999);
+  });
+
+  test('a non-founder never gets a locked price', () => {
+    const org = { is_founder: false, locked_price_inr: 1499 };
+    expect(subscription.planChangePrice(org, elite, starter, 5).amount).toBe(7999);
+  });
+
+  test('a first activation (no current plan) is priced from the plan itself', () => {
+    expect(subscription.planChangePrice(founder, elite, null, 5).amount).toBe(7999);
+  });
+});

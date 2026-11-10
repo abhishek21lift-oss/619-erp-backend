@@ -490,6 +490,22 @@ describe('cancellation', () => {
     await expect(upi.cancel({ orderId: ORDER_ID, orgId: ORG, actor: ACTOR }))
       .rejects.toMatchObject({ code: 'NOT_CANCELLABLE', status: 409 });
   });
+
+  test('a member cannot withdraw an order after submitting a UTR', async () => {
+    // Money may already be in the studio's account. Cancelling here removed
+    // the order from the verification queue with no way to approve or reopen
+    // it — cash received, nothing recorded. Staff can still reject the
+    // submission, which returns the order to PAYMENT_PENDING.
+    on(/UPDATE payment_orders SET status = \$1 WHERE id = \$2 AND organization_id = \$3/s,
+      { rows: [] });
+
+    await expect(upi.cancel({ orderId: ORDER_ID, orgId: ORG, actor: ACTOR }))
+      .rejects.toMatchObject({ code: 'NOT_CANCELLABLE' });
+
+    const q = state.log.find((e) =>
+      /UPDATE payment_orders SET status = \$1 WHERE id = \$2 AND organization_id = \$3/.test(e.sql));
+    expect(q.params[3]).not.toContain(upi.ORDER_STATUS.VERIFICATION_PENDING);
+  });
 });
 
 describe('expiry sweep', () => {

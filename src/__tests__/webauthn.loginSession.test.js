@@ -102,3 +102,26 @@ it('returns the studio fields the shell needs, like password login', async () =>
     avatar_url: '/uploads/avatar.png',
   }));
 });
+
+// Audit finding #9: the route used to sign with JWT_EXPIRES_IN || '7d' and set
+// the cookie for seven days, with no refresh token at all — while every other
+// login gave a 15-minute access token plus a rotating refresh token.
+it('issues the same 15-minute access token as password login, not a 7-day bearer', async () => {
+  const res = await request(app())
+    .post('/api/auth/webauthn/login/verify')
+    .send({
+      authentication: {
+        id: CRED,
+        response: { clientDataJSON: b64url({ challenge: 'challenge-1' }) },
+      },
+    });
+
+  const cookies = res.headers['set-cookie'] || [];
+  const access = cookies.find((c) => c.startsWith('trainer_token='));
+  expect(access).toBeTruthy();
+  expect(access).toMatch(/Max-Age=900\b/);
+  expect(cookies.find((c) => c.startsWith('trainer_refresh='))).toBeTruthy();
+  // Cookieless callers get the same pair password login hands them.
+  expect(typeof res.body.token).toBe('string');
+  expect(typeof res.body.refresh_token).toBe('string');
+});

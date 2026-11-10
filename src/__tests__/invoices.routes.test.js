@@ -26,6 +26,8 @@ const ORG_B = '22222222-2222-2222-2222-222222222222';
 const mockTxLog = [];
 let mockClientRow;
 let mockInvoiceRow;
+let mockInvoiceSelectRow;
+let mockInvoiceUpdateRowCount = 1;
 
 const mockTxClient = {
   query: jest.fn(async (sql, params) => {
@@ -46,7 +48,22 @@ const mockTxClient = {
 
 jest.mock('../db/pool', () => ({
   connect: jest.fn(async () => mockTxClient),
-  query: jest.fn(async () => ({ rows: [{ id: 'inv-new' }], rowCount: 1 })),
+  query: jest.fn(async (sql) => {
+    const text = String(sql).replace(/\s+/g, ' ').trim();
+    if (/^SELECT \* FROM invoices WHERE id=\$1/.test(text)) {
+      return {
+        rows: mockInvoiceSelectRow ? [mockInvoiceSelectRow] : [],
+        rowCount: mockInvoiceSelectRow ? 1 : 0,
+      };
+    }
+    if (/^UPDATE invoices SET/.test(text)) {
+      return {
+        rows: mockInvoiceUpdateRowCount && mockInvoiceSelectRow ? [mockInvoiceSelectRow] : [],
+        rowCount: mockInvoiceUpdateRowCount,
+      };
+    }
+    return { rows: [{ id: 'inv-new' }], rowCount: 1 };
+  }),
 }));
 
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
@@ -59,6 +76,7 @@ jest.mock('../middleware/auth', () => ({
 
 const express = require('express');
 const request = require('supertest');
+const pool = require('../db/pool');
 const { errorHandler } = require('../middleware/errorHandler');
 
 function app() {
@@ -79,6 +97,8 @@ beforeEach(() => {
   mockTxClient.release.mockClear();
   mockClientRow = { id: 'ptc-1', name: 'A Client' };
   mockInvoiceRow = null;
+  mockInvoiceSelectRow = { id: 'inv-1', status: 'sent' };
+  mockInvoiceUpdateRowCount = 1;
   mockUser = { id: 'usr-admin', role: 'trainer', organization_id: ORG_A, trainer_id: null };
 });
 
@@ -162,6 +182,18 @@ describe('POST /api/invoices — totals and shape', () => {
 
     const [ins] = sqlAt(/INSERT INTO invoices/i);
     expect(ins.params[4]).toBe(2500);
+  });
+
+  test('gives every invoice a dated, random-suffixed number', async () => {
+    // `'INV-' + Date.now()` collided when two invoices were created in the
+    // same millisecond (double-click, two tabs) against a globally UNIQUE
+    // invoice_no, turning the second into a 500.
+    await create({ client_id: 'ptc-1', items: [{ description: 'PT block', unit_price: 2500 }] });
+
+    const [ins] = sqlAt(/INSERT INTO invoices/i);
+    expect(ins.params).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^INV-\d{8}-[0-9A-F]{6}$/),
+    ]));
   });
 
   test('writes one invoice_items row per line', async () => {
@@ -301,6 +333,27 @@ describe('PUT status and remind', () => {
   test('PUT still moves an invoice through its unpaid states', async () => {
     const res = await request(app()).put('/api/invoices/inv-1').send({ status: 'sent' });
     expect(res.status).toBe(200);
+  });
+
+  test('PUT refuses when the invoice changed between the read and the write', async () => {
+    // A concurrent mark-paid committed after this handler read the row. The
+    // unguarded UPDATE wrote the stale 'sent' back over it, un-paying it and
+    // making it cancellable with money already booked against it.
+    mockInvoiceUpdateRowCount = 0;
+
+    const res = await request(app()).put('/api/invoices/inv-1').send({ notes: 'late edit' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/changed|reload/i);
+  });
+
+  test('the PUT update carries the editable-status guard', async () => {
+    await request(app()).put('/api/invoices/inv-1').send({ notes: 'x' });
+
+    const call = pool.query.mock.calls.find(([sql]) => /UPDATE invoices SET/.test(String(sql)));
+    expect(String(call[0])).toMatch(/status = ANY/);
+    const statuses = call[1].find((v) => Array.isArray(v)) || [];
+    expect(statuses).toEqual(expect.arrayContaining(['draft', 'sent', 'overdue']));
   });
 
   test('remind says plainly that nothing is sent', async () => {

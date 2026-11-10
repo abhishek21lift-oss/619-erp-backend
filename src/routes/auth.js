@@ -27,6 +27,19 @@ const { normalisePortal, portalProblem, portalForSession, resolveLoginPortal } =
 const recovery = require('../lib/mfaRecoveryCodes');
 const { sendPasswordReset } = require('../lib/email');
 
+// Compared against when the address is unknown. It is not a credential — no
+// account has this password — only a real bcrypt hash, so a failed lookup
+// costs the same work as a wrong password and response time stops revealing
+// which addresses are registered. Built from the repo's locked placeholder
+// rather than pasted: no credential-shaped constant is committed, and cost 12
+// matches what a real password row costs to compare.
+const DUMMY_PASSWORD_HASH = '$2a$12$' + '.'.repeat(53);
+
+/** A stable, log-safe stand-in for an address: same address, same fingerprint. */
+function emailFingerprint(email) {
+  return crypto.createHash('sha256').update(String(email).trim().toLowerCase()).digest('hex').slice(0, 12);
+}
+
 async function revokeRefreshToken(rawToken) {
   if (!rawToken) return;
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
@@ -79,6 +92,7 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
       // because the RESPONSE is the same — distinguishing them here would tell
       // an attacker which addresses are real.
       loginEvents.record(req, { outcome: loginEvents.OUTCOMES.UNKNOWN_USER, email });
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH).catch(() => {});
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
@@ -475,8 +489,11 @@ router.post('/forgot-password', async (req, res) => {
     //
     // The RESPONSE is deliberately unchanged: it must not reveal whether an
     // address is registered. The logs are operator-only and can be honest.
+    // Fingerprints, never addresses: the logs are operator-only, but an email
+    // address is still PII and a log file is still a copy of it.
+    const fingerprint = emailFingerprint(email);
     if (!rows.length) {
-      logger.warn({ email, outcome: 'unknown_address' },
+      logger.warn({ email_fingerprint: fingerprint, outcome: 'unknown_address' },
         'Password reset requested for an address with no user account — nothing sent');
     } else {
       await pool.query(
@@ -487,14 +504,14 @@ router.post('/forgot-password', async (req, res) => {
       sendPasswordReset(email, rawToken)
         .then(function(result) {
           if (result && result.sent === false) {
-            logger.error({ email, outcome: 'smtp_not_configured' },
+            logger.error({ email_fingerprint: fingerprint, outcome: 'smtp_not_configured' },
               'Password reset email NOT sent: SMTP is not configured on this deploy');
           } else {
-            logger.info({ email, outcome: 'sent' }, 'Password reset email sent');
+            logger.info({ email_fingerprint: fingerprint, outcome: 'sent' }, 'Password reset email sent');
           }
         })
         .catch(function(err) {
-          logger.error({ email, outcome: 'send_failed', err: err.message },
+          logger.error({ email_fingerprint: fingerprint, outcome: 'send_failed', err: err.message },
             'Password reset email failed to send');
         });
     }

@@ -7,6 +7,7 @@ const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 const { parseStrict } = require('../lib/zodNumbers');
 const { logActivity } = require('../lib/activityLog');
+const { today } = require('../lib/appTime');
 const automation = require('../modules/automation/automation.triggers');
 
 // Payments audit PAY-5. The unpaid lifecycle states — the only ones a caller
@@ -190,7 +191,10 @@ router.post('/', auth, async (req, res, next) => {
     }
 
     const id = randomUUID();
-    const invNo = 'INV-' + Date.now();
+    // Dated + random suffix. `Date.now()` alone collided when two invoices
+    // were created in the same millisecond (double-click, two tabs) against a
+    // globally UNIQUE invoice_no, turning the second into a 500.
+    const invNo = `INV-${today().replace(/-/g, '')}-${randomUUID().slice(0, 6).toUpperCase()}`;
     let subtotal = 0;
 
     if (isSimplified) {
@@ -268,8 +272,9 @@ router.put('/:id', auth, async (req, res, next) => {
       `SELECT * FROM invoices WHERE id=$1${gCol}`, gParams
     );
     if (!ex[0]) return res.status(404).json({ error: 'Invoice not found' });
-    if (ex[0].status === 'paid')
-      return res.status(400).json({ error: 'Cannot update a paid invoice' });
+    if (!EDITABLE_STATUSES.includes(ex[0].status)) {
+      return res.status(400).json({ error: 'Only draft, sent or overdue invoices can be edited' });
+    }
 
     const d = req.body;
     // Only the unpaid lifecycle states are settable (EDITABLE_STATUSES, above).
@@ -285,10 +290,14 @@ router.put('/:id', auth, async (req, res, next) => {
         notes = COALESCE($3, notes),
         due_date = COALESCE($4, due_date),
         updated_at = NOW()
-      WHERE id = $5 RETURNING *`,
+      WHERE id = $5 AND status = ANY($6::text[]) RETURNING *`,
       [d.status || ex[0].status, d.payment_method ?? ex[0].payment_method,
-       d.notes ?? ex[0].notes, d.due_date ?? ex[0].due_date, req.params.id]
+       d.notes ?? ex[0].notes, d.due_date ?? ex[0].due_date, req.params.id,
+       EDITABLE_STATUSES]
     );
+    if (!rows[0]) {
+      return res.status(409).json({ error: 'This invoice changed while you were editing it — reload and try again.' });
+    }
     await logActivity(req, 'invoice.update', 'invoice', req.params.id, rows[0], ex[0]);
     res.json({ message: 'Invoice updated', invoice: rows[0] });
   } catch (err) {

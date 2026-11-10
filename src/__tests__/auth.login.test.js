@@ -89,6 +89,22 @@ describe('POST /api/auth/login', () => {
       .send({ email: 'nobody@619fitness.com', password: 'correct-password' });
     expect(res.status).toBe(401);
   });
+
+  it('spends a bcrypt comparison on an unknown address too, so the response time does not reveal it', async () => {
+    // Returning before bcrypt made "no such account" measurably faster than
+    // "wrong password", which is a user-enumeration oracle that needs no
+    // error-message difference to read.
+    const bcrypt = require('bcryptjs');
+    bcrypt.compare.mockClear();
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'nobody@619fitness.com', password: 'any-password' });
+
+    expect(res.status).toBe(401);
+    expect(bcrypt.compare).toHaveBeenCalledTimes(1);
+    expect(bcrypt.compare.mock.calls[0][1]).toMatch(/^\$2[aby]\$/);
+  });
 });
 
 // ── Session tokens in the JSON body ─────────────────────────────────────────

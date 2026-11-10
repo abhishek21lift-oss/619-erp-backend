@@ -18,6 +18,7 @@ const { auth } = require('../middleware/auth');
 const { requireTrainer } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { saveFile } = require('../lib/fileStorage');
+const { detectFileType, SIGNATURES } = require('../lib/fileSignatures');
 const { SUPPORTED_MIME_TYPES } = require('../lib/ai/textExtract');
 const { ingestDocument, deleteDocument, retrieveContext } = require('../lib/ai/knowledgeBase');
 const logger = require('../lib/logger');
@@ -65,10 +66,24 @@ router.post('/', auth, requireTrainer, (req, res, next) => {
       });
     }
 
+    // The declared mimetype is caller-controlled. pdf.js parses whatever
+    // bytes arrive, so a file that only CLAIMS to be a PDF must be refused
+    // before it is stored and handed to the extractor. text/plain has no
+    // magic bytes; a NUL is the one thing genuine text never contains.
+    const pdf = detectFileType(req.file.buffer, [SIGNATURES.pdf]);
+    const isPlainText = !pdf && req.file.mimetype === 'text/plain'
+      && !req.file.buffer.includes(0);
+    if (!pdf && !isPlainText) {
+      return res.status(400).json({
+        error: { code: 'VALIDATION', message: 'File content does not match its declared type' },
+      });
+    }
+
     const id = randomUUID();
-    const ext = EXT_BY_MIME[req.file.mimetype] || 'bin';
+    const mimeType = pdf ? pdf.mime : req.file.mimetype;
+    const ext = EXT_BY_MIME[mimeType] || 'bin';
     const fileKey = `knowledge/${id}.${ext}`;
-    await saveFile('knowledge', `${id}.${ext}`, req.file.buffer, req.file.mimetype,
+    await saveFile('knowledge', `${id}.${ext}`, req.file.buffer, mimeType,
       { organizationId: req.user?.organization_id, uploadedBy: req.user?.id });
 
     const { rows } = await pool.query(
@@ -76,7 +91,7 @@ router.post('/', auth, requireTrainer, (req, res, next) => {
          (id, organization_id, is_global, title, category, filename, file_key, mime_type, file_size_bytes, uploaded_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        RETURNING id, organization_id, is_global, title, category, filename, mime_type, file_size_bytes, status, chunk_count, created_at`,
-      [id, organizationId, isGlobal, title, category, req.file.originalname, fileKey, req.file.mimetype, req.file.size, req.user.id]
+      [id, organizationId, isGlobal, title, category, req.file.originalname, fileKey, mimeType, req.file.size, req.user.id]
     );
 
     res.status(201).json({ data: rows[0] });
