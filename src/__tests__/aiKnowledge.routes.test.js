@@ -153,3 +153,20 @@ describe('POST /api/ai/knowledge/:id/reindex', () => {
     expect(pool.query).not.toHaveBeenCalled();
   });
 });
+
+describe('POST /api/ai/knowledge — upload', () => {
+  test('rejects a file that claims to be a PDF but is not', async () => {
+    // This route filtered on the client-declared mimetype alone, so arbitrary
+    // bytes labelled application/pdf reached pdf.js in the ingestion worker.
+    pool.query.mockResolvedValue({ rows: [{ id: 'doc-1' }], rowCount: 1 });
+
+    const res = await request(app)
+      .post('/api/ai/knowledge')
+      .field('title', 'SOP')
+      .attach('file', Buffer.from('this is not a pdf'), {
+        filename: 'sop.pdf', contentType: 'application/pdf',
+      });
+
+    expect(res.status).toBe(400);
+  });
+});
