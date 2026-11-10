@@ -10,6 +10,16 @@ const {
   audit, invalidateUserCache, pool, subscription,
 } = require('./shared');
 const { parseStrict } = require('../../../lib/zodNumbers');
+
+/** A whole number of rupees, 0 or more; absent stays absent. */
+function wholeRupees(raw) {
+  if (raw === undefined) return { ok: true, value: undefined };
+  const parsed = parseStrict(raw);
+  if (!parsed.ok || !Number.isInteger(parsed.value) || parsed.value < 0) {
+    return { ok: false, message: 'amount_inr must be a whole number of rupees, 0 or more' };
+  }
+  return { ok: true, value: parsed.value };
+}
 // GET /subscriptions — every studio's billing state + platform KPIs.
 router.get('/subscriptions', async (req, res, next) => {
   try {
@@ -486,8 +496,10 @@ router.post('/organizations/:id/subscription/activate', async (req, res, next) =
   try {
     const { plan_code, amount_inr, method, reference, notes, period_months, coupon_code } = req.body;
     if (!plan_code) return res.status(400).json({ error: { code: 'VALIDATION', message: 'plan_code is required' } });
+    const amount = wholeRupees(amount_inr);
+    if (!amount.ok) return res.status(400).json({ error: { code: 'VALIDATION', message: amount.message } });
     const result = await subscription.activate(req.params.id, plan_code, {
-      amount_inr: amount_inr != null ? Number(amount_inr) : undefined,
+      amount_inr: amount.value,
       method, reference, notes,
       periodMonths: period_months != null ? Number(period_months) : undefined,
       // Redeemed under a row lock inside the activation transaction.
@@ -527,8 +539,10 @@ router.post('/organizations/:id/subscription/change', async (req, res, next) => 
   try {
     const { plan_code, amount_inr, method, reference, notes } = req.body;
     if (!plan_code) return res.status(400).json({ error: { code: 'VALIDATION', message: 'plan_code is required' } });
+    const amount = wholeRupees(amount_inr);
+    if (!amount.ok) return res.status(400).json({ error: { code: 'VALIDATION', message: amount.message } });
     const result = await subscription.changePlan(req.params.id, plan_code, {
-      amount_inr: amount_inr != null ? Number(amount_inr) : undefined,
+      amount_inr: amount.value,
       method, reference, notes,
       actor: { id: req.user.id, name: req.user.name },
     });
