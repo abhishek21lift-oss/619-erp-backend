@@ -26,6 +26,7 @@
 /** Sections a brief can carry, in the order a trainer would want to read them. */
 const SECTIONS = ['readiness', 'body', 'capacity', 'limitations', 'lifestyle', 'goal', 'history'];
 const { ageFromDob: ageFrom } = require('../../lib/age');
+const { dbDate } = require('../../lib/appTime');
 const { classifyWaistRisk } = require('../progress/fitness-scoring');
 
 /**
@@ -276,7 +277,7 @@ function buildBrief({
   // around. The gate status is the studio's own decision, recorded on the form.
   sections.readiness = parq ? {
     present: true,
-    as_of: dateOf(parq.assessment_date),
+    as_of: dbDate(parq.assessment_date),
     risk_level: parq.risk_level ?? null,
     risk_message: parq.risk_message ?? null,
     gate_status: parq.workout_gate_status ?? null,
@@ -289,7 +290,7 @@ function buildBrief({
 
   sections.body = assessment ? {
     present: true,
-    as_of: dateOf(assessment.assessment_date),
+    as_of: dbDate(assessment.assessment_date),
     height_cm: num(assessment.height_cm),
     weight_kg: num(assessment.weight),
     bmi: num(assessment.bmi),
@@ -328,7 +329,7 @@ function buildBrief({
   };
   sections.capacity = assessment ? {
     present: true,
-    as_of: dateOf(assessment.assessment_date),
+    as_of: dbDate(assessment.assessment_date),
     overall: num(assessment.overall_fitness_score),
     strength: {
       score: num(assessment.strength_score_computed ?? assessment.strength_score),
@@ -355,13 +356,13 @@ function buildBrief({
   sections.limitations = (posture || mobility || client?.injuries) ? {
     present: true,
     posture: posture ? {
-      as_of: dateOf(posture.assessment_date),
+      as_of: dbDate(posture.assessment_date),
       risk_level: posture.posture_risk_level ?? null,
       issues: postureIssues,
       notes: textFrom(posture.coach_notes),
     } : null,
     mobility: mobility ? {
-      as_of: dateOf(mobility.assessment_date),
+      as_of: dbDate(mobility.assessment_date),
       category: mobility.mobility_category ?? null,
       score: num(mobility.mobility_score),
       // Only the joints that came back painful or restricted, each carrying
@@ -379,7 +380,7 @@ function buildBrief({
   // ── Lifestyle: how much training this person can actually recover from.
   sections.lifestyle = lifestyle ? {
     present: true,
-    as_of: dateOf(lifestyle.assessment_date),
+    as_of: dbDate(lifestyle.assessment_date),
     // Enrollment owns this fact; the Lifestyle row's copy is legacy and may
     // contradict it. No fallback: an unrecorded level stays null.
     experience_level: client?.workout_experience_level ?? null,
@@ -399,13 +400,13 @@ function buildBrief({
 
   sections.goal = goal ? {
     present: true,
-    as_of: dateOf(goal.created_at),
+    as_of: dbDate(goal.created_at),
     goal_type: goal.goal_type ?? null,
     priority: goal.priority_goal ?? null,
     description: textFrom(goal.goal_description),
     target_weight: num(goal.target_weight),
     target_body_fat: num(goal.target_body_fat),
-    target_date: dateOf(goal.target_date),
+    target_date: dbDate(goal.target_date),
     commitment_level: goal.commitment_level ?? null,
     motivation_level: goal.motivation_level ?? null,
     challenges: labelsFrom(goal.biggest_challenges),
@@ -420,7 +421,7 @@ function buildBrief({
     present: true,
     plan_id: assignment.plan_id,
     plan_name: assignment.plan_name,
-    started_on: dateOf(assignment.start_date),
+    started_on: dbDate(assignment.start_date),
     duration_weeks: num(assignment.duration_weeks),
     days_per_week: num(assignment.planned_days_count),
     progress_pct: num(assignment.progress_pct),
@@ -450,13 +451,6 @@ function buildBrief({
     stale,
     completeness_pct: Math.round(((SECTIONS.length - missing.length) / SECTIONS.length) * 100),
   };
-}
-
-/** YYYY-MM-DD, or null. Dates arrive from pg as Date or string depending. */
-function dateOf(v) {
-  if (!v) return null;
-  const s = typeof v === 'string' ? v : v.toISOString?.();
-  return s ? String(s).slice(0, 10) : null;
 }
 
 module.exports = {
