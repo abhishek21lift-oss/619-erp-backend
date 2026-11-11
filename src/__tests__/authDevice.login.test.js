@@ -71,7 +71,7 @@ beforeEach(() => {
     knownDevice: true,
     consumed: [{ user_id: USER }],
   };
-  pool.query.mockImplementation(async (sql, params) => {
+  pool.query.mockImplementation(async (sql, _params) => {
     if (/FROM user_webauthn_credentials/.test(sql)) {
       // /login/verify selects the public key; /login/options does not.
       if (/c\.public_key/.test(sql)) {

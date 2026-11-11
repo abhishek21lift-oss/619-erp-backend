@@ -374,6 +374,11 @@ const HANDLER_EXCEPTIONS = {
     + 'the caller). A code minted for a foreign id is useless: POST /scan '
     + 'resolves the person org-filtered, so the check-in simply is not found. '
     + 'See attendance.tenant-isolation.test.js.',
+  'routes/auth-device.js::POST /login/options':
+    'Pre-authentication native device ceremony. Resolves the account by the '
+    + 'device credential id the caller supplies (no email) so it can return a '
+    + 'single-use challenge; the ECDSA signature over that challenge is '
+    + 'verified against the stored public key before any session is issued.',
 };
 
 describe('tenant-scope convention — no route reads a tenant table unscoped', () => {
