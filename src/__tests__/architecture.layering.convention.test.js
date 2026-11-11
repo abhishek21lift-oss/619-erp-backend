@@ -124,6 +124,7 @@ const BUDGETS = {
   'routes/qr-checkin.js': 14,
   'modules/automation/automation.routes.js': 14,
   'routes/payments.js': 7,
+  'routes/auth-device.js': 7,
   'routes/diet.js': 12,
   'routes/client-login.js': 11,
   'routes/communication.js': 10,
@@ -225,8 +226,9 @@ describe('the migration has a number attached to it', () => {
     // (Command Center audit CC-2). 661 → 660 when the email-change re-auth moved
     // profile.js's uniqueness check to lib/emailChange.js. 660 → 659 when consent completion moved to
     // informed-consent.repository (screening audit 2026-10-08); 659 → 653 once the gym-ERP routes
-    // (plans.js, classes.js) were removed. Lower it with each extraction — the number only means
-    // something if it tracks reality.
-    expect(ceiling).toBe(653);
+    // (plans.js, classes.js) were removed; 653 → 660 for the device biometric routes (auth-device.js,
+    // 7 literals) — the same ceremony shape auth-webauthn.js already carries. Lower it with each extraction —
+    // the number only means something if it tracks reality.
+    expect(ceiling).toBe(660);
   });
 });
