@@ -447,7 +447,8 @@ router.post('/register/options', auth, withConfigCheck(async (req, res, next) =>
 
     const { rows: existing } = await pool.query(
       `SELECT credential_id, transports FROM user_webauthn_credentials
-       WHERE user_id = $1 AND deleted_at IS NULL`,
+       WHERE user_id = $1 AND deleted_at IS NULL
+         AND credential_id NOT LIKE 'native:%'`,
       [user.id]
     );
 
@@ -583,7 +584,8 @@ router.post('/login/options', authnLimiter, withConfigCheck(async (req, res, nex
         userId = users[0].id;
         const { rows: creds } = await pool.query(
           `SELECT credential_id, transports FROM user_webauthn_credentials
-           WHERE user_id = $1 AND is_active = true AND deleted_at IS NULL`,
+           WHERE user_id = $1 AND is_active = true AND deleted_at IS NULL
+             AND credential_id NOT LIKE 'native:%'`,
           [userId]
         );
         allowCredentials = creds.map(r => ({
@@ -731,7 +733,8 @@ router.post('/action/options', auth, withConfigCheck(async (req, res, next) => {
     const user = req.user;
     const { rows: creds } = await pool.query(
       `SELECT credential_id, transports FROM user_webauthn_credentials
-       WHERE user_id = $1 AND is_active = true AND deleted_at IS NULL`,
+       WHERE user_id = $1 AND is_active = true AND deleted_at IS NULL
+         AND credential_id NOT LIKE 'native:%'`,
       [user.id]
     );
     if (!creds.length) {
@@ -824,7 +827,7 @@ router.post('/action/verify', auth, withConfigCheck(async (req, res, next) => {
 router.get('/credentials', auth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, device_name, device_type, backed_up, is_active,
+      `SELECT id, credential_id, device_name, device_type, backed_up, is_active,
               created_at, last_used_at
        FROM user_webauthn_credentials
        WHERE user_id = $1 AND deleted_at IS NULL
