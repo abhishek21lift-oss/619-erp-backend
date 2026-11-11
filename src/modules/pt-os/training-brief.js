@@ -340,11 +340,11 @@ function buildBrief({
     },
     cardio: { score: num(assessment.cardio_score_computed ?? assessment.cardio_score), category: assessment.cardio_category ?? null, vo2_max: num(assessment.vo2_max), max: STEP_MAX.cardio },
     endurance: { score: num(assessment.endurance_score_computed), category: assessment.endurance_category ?? null, max: STEP_MAX.endurance },
-    // The dashboard's "Flexibility" category is the computed 0-100 score from
-    // the flexibility composite (stored as mobility_score_computed). The legacy
-    // `flexibility_score` column is a raw 0-10 on a different scale and is no
-    // longer written, so it is NOT substituted here — an unavailable computed
-    // score stays null rather than masquerading as a 0-100 value.
+    // The dashboard's "Flexibility" category is the 100-point framework's
+    // flexibility step, stored as mobility_score_computed (points out of 15).
+    // The legacy `flexibility_score` column is a raw 0-10 on a different scale
+    // and is no longer written, so it is NOT substituted here — an unavailable
+    // computed score stays null rather than masquerading as 0-15 points.
     flexibility: { score: num(assessment.mobility_score_computed), category: assessment.flexibility_category ?? null, max: STEP_MAX.flexibility },
   } : { present: false };
 
