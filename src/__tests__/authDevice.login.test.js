@@ -143,6 +143,7 @@ it('signs in with a valid signature and issues the standard cookie session', asy
   expect(cookies.find((c) => c.startsWith('trainer_token='))).toBeTruthy();
   expect(cookies.find((c) => c.startsWith('trainer_refresh='))).toBeTruthy();
   expect(pool.query.mock.calls.some(([sql]) => /INSERT INTO refresh_tokens/.test(sql))).toBe(true);
+  expect(pool.query.mock.calls.some(([sql]) => /UPDATE user_webauthn_credentials/.test(sql))).toBe(true);
   expect(loginEvents.record).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
     outcome: 'success', method: 'passkey', userId: USER,
   }));
