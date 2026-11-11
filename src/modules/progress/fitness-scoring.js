@@ -6,9 +6,8 @@
 // never trusted from client-submitted values.
 //
 // Formula-bundle version. Bump whenever any formula in this module changes.
-// Persisting it per assessment requires the approval-gated migration described
-// in F10 (new nullable `scoring_formula_version` column on pt_assessments);
-// until then this is documentation only and legacy rows are treated as unknown.
+// The per-row framework version is stored in pt_assessments.scoring_formula_version
+// (2 = the 100-point framework); this constant tracks the bundle for parity tests.
 const FITNESS_SCORING_VERSION = '7';
 
 function round(n, decimals = 1) {
