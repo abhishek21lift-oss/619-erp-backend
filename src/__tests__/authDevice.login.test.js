@@ -102,19 +102,20 @@ function login(challenge, privateKey, extra = {}) {
     });
 }
 
-it('binds a known device challenge to the user and an unknown one to nobody', async () => {
+it('binds a known device challenge to the user and stores nothing for an unknown one', async () => {
   const known = await requestCode('trainer');
   expect(known.status).toBe(200);
   expect(known.body.challenge).toMatch(/^[0-9a-f]{64}$/);
-  let insert = pool.query.mock.calls.find(([sql]) => /INSERT INTO webauthn_challenges/.test(sql));
-  expect(insert[1]).toEqual([known.body.challenge, USER, 'device_authentication']);
+  const insert = pool.query.mock.calls.find(([sql]) => /INSERT INTO webauthn_challenges/.test(sql));
+  expect(insert[1]).toEqual([known.body.challenge, USER, 'authentication']);
 
   state.knownDevice = false;
+  const before = pool.query.mock.calls.filter(([sql]) => /INSERT INTO webauthn_challenges/.test(sql)).length;
   const unknown = await requestCode('trainer');
   expect(unknown.status).toBe(200);
   expect(unknown.body.challenge).toMatch(/^[0-9a-f]{64}$/);
-  insert = pool.query.mock.calls.filter(([sql]) => /INSERT INTO webauthn_challenges/.test(sql)).pop();
-  expect(insert[1]).toEqual([unknown.body.challenge, null, 'device_authentication']);
+  const after = pool.query.mock.calls.filter(([sql]) => /INSERT INTO webauthn_challenges/.test(sql)).length;
+  expect(after).toBe(before);
 });
 
 it('signs in with a valid signature and issues the standard cookie session', async () => {

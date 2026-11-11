@@ -58,14 +58,14 @@ beforeEach(() => {
   });
 });
 
-it('register/options stores a device_registration challenge for the signed-in user', async () => {
+it('register/options stores a registration challenge for the signed-in user', async () => {
   const res = await request(app()).post('/api/auth/device/register/options').send({});
 
   expect(res.status).toBe(200);
   expect(res.body.challenge).toMatch(/^[0-9a-f]{64}$/);
   const insert = pool.query.mock.calls.find(([sql]) => /INSERT INTO webauthn_challenges/.test(sql));
   expect(insert).toBeTruthy();
-  expect(insert[1]).toEqual([res.body.challenge, USER, 'device_registration']);
+  expect(insert[1]).toEqual([res.body.challenge, USER, 'registration']);
 });
 
 it('register/verify stores the public key under native:<deviceId>', async () => {

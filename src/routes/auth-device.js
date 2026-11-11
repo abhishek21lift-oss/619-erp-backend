@@ -91,20 +91,15 @@ async function saveChallenge(challenge, userId, type) {
 /**
  * Consume a challenge exactly once.
  *
- * Registration is always bound to the user. Login may also consume an
- * anonymous row: /login/options writes one when the device id is unknown or
- * revoked, and the flow must still reach the revoked-credential answer.
+ * The row must be bound to the same user and type that issued it: a device
+ * challenge is only ever consumed by the device ceremony.
  */
-async function consumeChallenge(challenge, type, userId, { allowAnonymous = false } = {}) {
-  const params = userId ? [challenge, type, userId] : [challenge, type];
-  const userCond = userId
-    ? `AND (user_id = $3${allowAnonymous ? ' OR user_id IS NULL' : ''})`
-    : 'AND user_id IS NULL';
+async function consumeChallenge(challenge, type, userId) {
   const { rows } = await pool.query(
     `DELETE FROM webauthn_challenges
-      WHERE challenge = $1 AND type = $2 AND expires_at > NOW() ${userCond}
+      WHERE challenge = $1 AND type = $2 AND user_id = $3 AND expires_at > NOW()
       RETURNING user_id`,
-    params
+    [challenge, type, userId]
   );
   return rows.length > 0;
 }
@@ -146,7 +141,12 @@ function tenantOnly(req, res, next) {
 router.post('/register/options', auth, tenantOnly, async (req, res, next) => {
   try {
     const challenge = crypto.randomBytes(32).toString('hex');
-    await saveChallenge(challenge, req.user.id, 'device_registration');
+    // The same challenge type the passkey enrolment uses: production's
+    // webauthn_challenges carries a CHECK that predates the device ceremony,
+    // and the values already proven live are 'registration' and
+    // 'authentication'. The signed messages differ, so a challenge from one
+    // ceremony cannot be replayed into the other.
+    await saveChallenge(challenge, req.user.id, 'registration');
     res.json({ challenge });
   } catch (err) {
     next(err);
@@ -171,7 +171,7 @@ router.post('/register/verify', auth, tenantOnly, async (req, res, next) => {
     }
     const label = String(req.body?.label || 'Android device').trim().slice(0, 60) || 'Android device';
 
-    const consumed = await consumeChallenge(challenge, 'device_registration', req.user.id);
+    const consumed = await consumeChallenge(challenge, 'registration', req.user.id);
     if (!consumed) {
       return res.status(401).json({ error: 'Registration expired. Try again.' });
     }
@@ -219,18 +219,24 @@ router.post('/login/options', loginLimiter, async (req, res, next) => {
       return res.status(400).json({ error: 'deviceId is invalid' });
     }
 
+    // Look up the row even when it is revoked: a valid signature over the
+    // stored challenge is what earns the revoked answer. The user join still
+    // keeps disabled accounts on the generic failure.
     const { rows } = await pool.query(
       `SELECT c.user_id
          FROM user_webauthn_credentials c
          JOIN users u ON u.id = c.user_id AND u.is_active = true AND u.deleted_at IS NULL
-        WHERE c.credential_id = $1 AND c.deleted_at IS NULL AND c.is_active = true`,
+        WHERE c.credential_id = $1`,
       ['native:' + deviceId]
     );
 
     const challenge = crypto.randomBytes(32).toString('hex');
-    // An unknown device still gets a challenge: the client cannot tell "no
-    // such credential" from "revoked" at this point, and neither can a probe.
-    await saveChallenge(challenge, rows[0]?.user_id || null, 'device_authentication');
+    // Only a known credential gets a stored challenge: production's
+    // webauthn_challenges rejects an anonymous row (a CHECK that predates the
+    // device ceremony), and an unknown device id must look the same as a
+    // revoked one anyway — both answer the generic 401 at /login/verify
+    // unless the key actually verifies.
+    if (rows.length) await saveChallenge(challenge, rows[0].user_id, 'authentication');
     res.json({ challenge });
   } catch (err) {
     next(err);
@@ -266,9 +272,7 @@ router.post('/login/verify', loginLimiter, async (req, res, next) => {
     if (!rows.length) return res.status(401).json({ error: GENERIC_LOGIN_ERROR });
     const cred = rows[0];
 
-    const consumed = await consumeChallenge(
-      challenge, 'device_authentication', cred.user_id, { allowAnonymous: true }
-    );
+    const consumed = await consumeChallenge(challenge, 'authentication', cred.user_id);
     if (!consumed) return res.status(401).json({ error: GENERIC_LOGIN_ERROR });
 
     if (!verifySignature(cred.public_key, loginMessage(challenge), signature)) {
