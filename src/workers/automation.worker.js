@@ -34,12 +34,24 @@ const { runRecovery } = require('../modules/automation/automation.recovery');
 const { expireEndedTerms } = require('../modules/pt-os/pt-os.service');
 const { runSessionReminders } = require('../modules/pt-os/session-reminders');
 const { runFeedbackReminders } = require('../modules/session-feedback/feedback-reminders');
+const { runAutoCheckout } = require('../modules/attendance/auto-checkout');
 
 const SWEEP_JOB_ID = 'automation-daily-sweep';
 const RECOVERY_JOB_ID = 'automation-orphan-recovery';
 const TERM_EXPIRY_JOB_ID = 'pt-term-expiry';
 const SESSION_REMINDERS_JOB_ID = 'pt-session-reminders';
 const FEEDBACK_REMINDERS_JOB_ID = 'pt-feedback-reminders';
+const AUTO_CHECKOUT_JOB_ID = 'attendance-auto-checkout';
+
+/**
+ * How often open check-ins are closed.
+ *
+ * Five minutes, not hourly: the timestamp written is `check_in + the studio's
+ * minutes`, which does not depend on when the sweep runs, so a slow schedule
+ * would only delay how long the dashboard shows a client "still inside". The
+ * pass is one indexed UPDATE and normally touches nothing.
+ */
+const DEFAULT_AUTO_CHECKOUT_CRON = '*/5 * * * *';
 
 /**
  * When the sweep runs.
@@ -108,6 +120,11 @@ async function processSweepJob(job) {
   if (job.name === 'feedback-reminders') {
     const out = await runFeedbackReminders();
     logger.info({ scanned: out.scanned, sent: out.sent, skipped: out.skipped }, 'feedback reminders completed');
+    return out;
+  }
+  if (job.name === 'auto-checkout') {
+    const out = await runAutoCheckout();
+    logger.info({ closed: out.closed, orgs: out.orgs }, 'auto checkout completed');
     return out;
   }
   throw new Error(`Unknown automation job: ${job.name}`);
@@ -237,13 +254,27 @@ async function scheduleAutomationSweep() {
     }
   ), 5000);
 
-  logger.info({ cron, recoveryCron, termExpiryCron, remindersCron, feedbackCron }, 'automation sweep cron scheduled');
+  const autoCheckoutCron = process.env.AUTO_CHECKOUT_CRON || DEFAULT_AUTO_CHECKOUT_CRON;
+  await withTimeout(automationSweepQueue.upsertJobScheduler(
+    AUTO_CHECKOUT_JOB_ID,
+    { pattern: autoCheckoutCron },
+    {
+      name: 'auto-checkout',
+      data: {},
+      // Idempotent: a closed row is no longer a candidate, so the next tick is
+      // a better retry than an immediate one.
+      opts: { attempts: 1, removeOnComplete: true, removeOnFail: true },
+    }
+  ), 5000);
+
+  logger.info({ cron, recoveryCron, termExpiryCron, remindersCron, feedbackCron, autoCheckoutCron }, 'automation sweep cron scheduled');
   return {
     sweep: { jobSchedulerId: SWEEP_JOB_ID },
     recovery: { jobSchedulerId: RECOVERY_JOB_ID },
     termExpiry: { jobSchedulerId: TERM_EXPIRY_JOB_ID },
     sessionReminders: { jobSchedulerId: SESSION_REMINDERS_JOB_ID },
     feedbackReminders: { jobSchedulerId: FEEDBACK_REMINDERS_JOB_ID },
+    autoCheckout: { jobSchedulerId: AUTO_CHECKOUT_JOB_ID },
     jobSchedulerId: SWEEP_JOB_ID,
   };
 }
@@ -273,9 +304,11 @@ module.exports = {
   TERM_EXPIRY_JOB_ID,
   SESSION_REMINDERS_JOB_ID,
   FEEDBACK_REMINDERS_JOB_ID,
+  AUTO_CHECKOUT_JOB_ID,
   DEFAULT_SWEEP_CRON,
   DEFAULT_RECOVERY_CRON,
   DEFAULT_TERM_EXPIRY_CRON,
   DEFAULT_SESSION_REMINDERS_CRON,
   DEFAULT_FEEDBACK_REMINDERS_CRON,
+  DEFAULT_AUTO_CHECKOUT_CRON,
 };
