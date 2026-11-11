@@ -202,7 +202,7 @@ describe('K11 strength norms are applied and persisted', () => {
     // bench is 80th at 1.12 and 90th at 1.24, so this is 80th — the supplied
     // table places the 80th percentile in Above Average (70–80%).
     expect(cols.strength_category).toBe('Above Average');
-    expect(cols.strength_score_computed).toBe(70);
+    expect(cols.strength_score_computed).toBe(6);
     expect(storedStrength().test1).toMatchObject({
       k11_percentile: 80, k11_age_band: '30-39', strength_ratio: 1.17,
     });
@@ -257,7 +257,7 @@ describe('K11 YMCA step-test category is persisted from client demographics', ()
     expect(res.status).toBe(201);
     const cols = assessmentCols();
     expect(cols.cardio_category).toBe('Above Average');
-    expect(cols.cardio_score_computed).toBe(70);
+    expect(cols.cardio_score_computed).toBe(13);
   });
 
   test('a 30-year-old female at 94 bpm is graded on the female table', async () => {
@@ -266,7 +266,7 @@ describe('K11 YMCA step-test category is persisted from client demographics', ()
     expect(res.status).toBe(201);
     const cols = assessmentCols();
     expect(cols.cardio_category).toBe('Good');
-    expect(cols.cardio_score_computed).toBe(80);
+    expect(cols.cardio_score_computed).toBe(16);
   });
 
   test('the female 46–55 source gap at 94 bpm stays unclassified, never scored', async () => {
@@ -284,6 +284,22 @@ describe('K11 YMCA step-test category is persisted from client demographics', ()
     expect(res.status).toBe(201);
     expect(assessmentCols().cardio_category).toBeNull();
     expect(assessmentCols().cardio_score_computed).toBeNull();
+  });
+});
+
+describe('100-point totals are stored with their measured max', () => {
+  test('a blood-pressure-only assessment scales to 100 over a 10-point max', async () => {
+    mockClient = { gender: 'Male', dob: dobForAge(30), workout_experience_level: 'intermediate' };
+    const res = await request(app()).post('/api/progress/assessments')
+      .send({ client_id: 'c1', bp_systolic: 118, bp_diastolic: 70 });
+    expect(res.status).toBe(201);
+    const cols = assessmentCols();
+    expect(cols.bp_points).toBe(10);
+    expect(cols.overall_points).toBe(10);
+    expect(cols.overall_max).toBe(10);
+    expect(cols.overall_fitness_score).toBe(100);
+    expect(cols.health_risk_score).toBeNull();
+    expect(cols.scoring_formula_version).toBe(2);
   });
 });
 

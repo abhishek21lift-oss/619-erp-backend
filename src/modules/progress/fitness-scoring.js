@@ -9,7 +9,7 @@
 // Persisting it per assessment requires the approval-gated migration described
 // in F10 (new nullable `scoring_formula_version` column on pt_assessments);
 // until then this is documentation only and legacy rows are treated as unknown.
-const FITNESS_SCORING_VERSION = '6';
+const FITNESS_SCORING_VERSION = '7';
 
 function round(n, decimals = 1) {
   const f = 10 ** decimals;
@@ -640,52 +640,9 @@ function scoreCategory(category) {
   return CATEGORY_SCORES[category] ?? null;
 }
 
-// Body Composition Score: K11 gives an upper bound only — 100 at or below 15%
-// for men and 20% for women, then four points off per percentage point above
-// it. No lower-bound penalty is invented where K11 supplies none. Returns null
-// when gender is missing or 'Other' — no sex-neutral reference exists.
-const K11_IDEAL_BODY_FAT_MAX = { Male: 15, Female: 20 };
-function scoreBodyComposition(bodyFatPct, gender) {
-  if (bodyFatPct == null || !Number.isFinite(bodyFatPct)) return null;
-  const g = sexOf(gender);
-  if (!g) return null;
-  const max = K11_IDEAL_BODY_FAT_MAX[g];
-  if (bodyFatPct <= max) return 100;
-  return Math.max(0, Math.round(100 - (bodyFatPct - max) * 4));
-}
-
-// Health Score (stored column `health_risk_score`): average of a BP-category
-// subscore and a BMI-category subscore. Higher is better — 100 is normal BP
-// within the healthy BMI band — same direction as the other five axes. BP bands
-// follow AHA BP categories.
-//
-// The BMI bands below are deliberately NOT the MPTS/Asian anthropometric
-// categories in classifyBmi(): they are the pre-existing project risk proxy,
-// left unchanged so stored Health Scores stay comparable. A BMI of 23–24.9 is
-// therefore "Overweight" in the anthropometric block while this score still
-// treats 18.5–<25 as healthy. This divergence is documented and pinned by a
-// regression test; do not silently reconcile it here.
-//
-// Healthy 100, overweight/underweight 60, obese 30 — no separate underweight
-// penalty. Discontinuity: 24.9 → 100, 25.0 → 60.
-const BP_RISK_SCORE = { Normal: 100, Elevated: 80, 'Hypertension Stage 1': 55, 'Hypertension Stage 2': 20, 'Hypertensive Crisis': 5, Hypotension: 40 };
-function scoreBmiRisk(bmi) {
-  if (bmi == null) return null;
-  if (bmi >= 18.5 && bmi < 25) return 100;
-  if (bmi < 18.5) return 60;
-  if (bmi < 30) return 60;
-  return 30;
-}
-function scoreHealthRisk(bpCategory, bmi) {
-  const bpScore = BP_RISK_SCORE[bpCategory] ?? null;
-  const bmiScore = scoreBmiRisk(bmi);
-  const scores = [bpScore, bmiScore].filter((s) => s != null);
-  if (!scores.length) return null;
-  return Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
-}
-
-// Combined Muscular Endurance score: average of the two required tests'
-// sub-scores (same averaging pattern as scoreHealthRisk above).
+// Legacy flexibility composite (0-100): the old two-slot rows keep their
+// original averaging so the backfill can read them. New rows score the
+// framework's seven steps instead (see the point tables below).
 function scoreEnduranceBattery(score1, score2) {
   const scores = [score1, score2].filter((s) => s != null);
   if (!scores.length) return null;
@@ -855,12 +812,6 @@ function scoreFlexibilityPoints(derived, legacyComposite = null) {
   return max === 0 ? { points: null, max: 0 } : { points, max };
 }
 
-function computeOverallScore(scores) {
-  const vals = Object.values(scores).filter((v) => v != null);
-  if (!vals.length) return null;
-  return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
-}
-
 module.exports = {
   FITNESS_SCORING_VERSION,
   classifyBp,
@@ -893,10 +844,7 @@ module.exports = {
   checkAsymmetry,
   classifyFlexibilityScore,
   scoreCategory,
-  scoreBodyComposition,
-  scoreHealthRisk,
   scoreEnduranceBattery,
-  computeOverallScore,
   STEP_MAX,
   scoreBpPoints,
   scoreAnthropometricPoints,

@@ -341,7 +341,6 @@ function computeAssessment(b, age, gender, opts = {}) {
     cardioCategory = scoring.classifyStepTestRecovery(num(cd.recoveryHr, null), age, gender);
   }
   if (vo2Max != null && !cardioCategory) cardioCategory = scoring.classifyVo2Max(vo2Max, age, gender);
-  const cardioScore = scoring.scoreCategory(cardioCategory);
 
   // ── Step 5: Strength (two-test battery; the combined score averages both) ──
   const sd = b.strength_test_data && typeof b.strength_test_data === 'object' && !Array.isArray(b.strength_test_data)
@@ -367,7 +366,6 @@ function computeAssessment(b, age, gender, opts = {}) {
   const strengthDetail2 = scoring.classifyStrengthDetail(strengthOneRm2, b.weight ?? null, b.strength_exercise_2 || null, gender, age);
   const strengthCategory = strengthDetail1 ? strengthDetail1.category : null;
   const strengthCategory2 = strengthDetail2 ? strengthDetail2.category : null;
-  const strengthScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(strengthCategory), scoring.scoreCategory(strengthCategory2));
   // Percentile detail belongs to the test it was computed from. It rides in
   // the existing JSONB (no migration); the category columns stay the source
   // for the dashboard, score and historical rows. Explicit nulls on every
@@ -402,7 +400,6 @@ function computeAssessment(b, age, gender, opts = {}) {
   const enduranceValue2 = isRepBasedEndurance(b.endurance_test_type_2) ? num(t2.reps, null) : num(t2.durationSec, null);
   const enduranceCategory = scoring.classifyEndurance(b.endurance_test_type, enduranceValue1, gender, age);
   const enduranceCategory2 = scoring.classifyEndurance(b.endurance_test_type_2, enduranceValue2, gender, age);
-  const enduranceScore = scoring.scoreEnduranceBattery(scoring.scoreCategory(enduranceCategory), scoring.scoreCategory(enduranceCategory2));
 
   // ── Step 7: Flexibility (K11 four-test battery or legacy two-slot blob) ──
   // A v3 payload is validated and re-derived here — the single writer of the
@@ -416,13 +413,14 @@ function computeAssessment(b, age, gender, opts = {}) {
   let flexibilityCategory2 = null;
   let mobilityScore = null;
   let hasAsymmetry;
+  let flexibilityDerived = null;
   if (flexibilityProtocol.isRecordedBattery(fd)) {
     const parsed = flexibilityProtocol.parseRecorded(fd);
     if (!parsed.ok) return { error: { status: 400, code: 'FLEXIBILITY_INVALID', message: parsed.message } };
     const incomplete = flexibilityProtocol.validateForStorage(parsed.recorded);
     if (incomplete) return { error: { status: 400, code: 'FLEXIBILITY_INCOMPLETE', message: incomplete } };
-    const derived = flexibilityProtocol.deriveFlexibility(parsed.recorded, { age, gender });
-    hasAsymmetry = derived.has_asymmetry;
+    flexibilityDerived = flexibilityProtocol.deriveFlexibility(parsed.recorded, { age, gender });
+    hasAsymmetry = flexibilityDerived.has_asymmetry;
     flexibilityCell = JSON.stringify(flexibilityProtocol.assembleStored(parsed.recorded, {
       userId: opts.userId,
       prev: opts.existingFlexibility,
@@ -440,12 +438,27 @@ function computeAssessment(b, age, gender, opts = {}) {
     flexibilityCell = JSON.stringify(fd);
   }
 
-  // ── Dashboard scores ──
-  const bodyCompositionScore = scoring.scoreBodyComposition(b.body_fat_pct ?? null, gender);
-  const healthRiskScore = scoring.scoreHealthRisk(bpCategory, bmi);
-  const overallScore = scoring.computeOverallScore({
-    bodyComposition: bodyCompositionScore, endurance: enduranceScore,
-    mobility: mobilityScore, cardio: cardioScore, healthRisk: healthRiskScore, strength: strengthScore,
+  // ── Dashboard scores: the 100-point framework's seven steps ──
+  const bpStep = scoring.scoreBpPoints(bpCategory);
+  const anthropometricStep = scoring.scoreAnthropometricPoints({
+    bmi,
+    waistIliacCm: b.waist_iliac_cm ?? null,
+    waistCm: b.waist_cm ?? null,
+    waistHipRatio,
+  }, gender);
+  const bodyCompositionStep = scoring.scoreBodyCompositionPoints(b.body_fat_pct ?? null, gender);
+  const cardioStep = scoring.scoreCardioPoints(cardioCategory);
+  const strengthStep = scoring.scoreStrengthBattery(strengthDetail1, strengthDetail2);
+  const enduranceStep = scoring.scoreEnduranceBatteryPoints(enduranceCategory, enduranceCategory2);
+  const flexibilityStep = scoring.scoreFlexibilityPoints(flexibilityDerived, mobilityScore);
+  const total = scoring.computeTotalScore({
+    bp: bpStep,
+    anthropometric: anthropometricStep,
+    bodyComposition: bodyCompositionStep,
+    cardio: cardioStep,
+    strength: strengthStep,
+    endurance: enduranceStep,
+    flexibility: flexibilityStep,
   });
 
   const NOT_MEASURED = 'Resting blood pressure not measured (confirmed by trainer).';
@@ -480,16 +493,19 @@ function computeAssessment(b, age, gender, opts = {}) {
       visceral_fat: b.visceral_fat ?? null, subcutaneous_fat_pct: b.subcutaneous_fat_pct ?? null, body_water_pct: b.body_water_pct ?? null,
       bone_mass_kg: b.bone_mass_kg ?? null, bmr, bmr_auto_suggested: bmrAutoSuggested, metabolic_age: b.metabolic_age ?? null,
       cardio_test_type: b.cardio_test_type || null, cardio_test_data: JSON.stringify(cd), vo2_max: vo2Max,
-      cardio_category: cardioCategory, cardio_score_computed: cardioScore,
+      cardio_category: cardioCategory, cardio_score_computed: cardioStep.points,
       strength_exercise: b.strength_exercise || null, strength_exercise_2: b.strength_exercise_2 || null,
       strength_category: strengthCategory, strength_category_2: strengthCategory2,
-      strength_test_data: JSON.stringify(sd), strength_score_computed: strengthScore,
+      strength_test_data: JSON.stringify(sd), strength_score_computed: strengthStep.points,
       endurance_test_type: b.endurance_test_type || null, endurance_test_type_2: b.endurance_test_type_2 || null,
       endurance_test_data: JSON.stringify(ed), endurance_category: enduranceCategory, endurance_category_2: enduranceCategory2,
-      endurance_score_computed: enduranceScore,
+      endurance_score_computed: enduranceStep.points,
       flexibility_test_data: flexibilityCell, flexibility_category: flexibilityCategory, flexibility_category_2: flexibilityCategory2,
-      has_asymmetry: hasAsymmetry, mobility_score_computed: mobilityScore,
-      body_composition_score: bodyCompositionScore, health_risk_score: healthRiskScore, overall_fitness_score: overallScore,
+      has_asymmetry: hasAsymmetry, mobility_score_computed: flexibilityStep.points,
+      bp_points: bpStep.points, anthropometric_points: anthropometricStep.points,
+      body_composition_score: bodyCompositionStep.points, health_risk_score: null,
+      overall_points: total.points, overall_max: total.max, overall_fitness_score: total.score,
+      scoring_formula_version: 2,
       posture_notes: b.posture_notes || null, health_notes: healthNotes,
       testing_conditions: b.testing_conditions || null,
     },
