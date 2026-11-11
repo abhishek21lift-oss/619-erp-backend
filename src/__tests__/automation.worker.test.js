@@ -20,6 +20,10 @@ const mockRunFeedbackReminders = jest.fn();
 jest.mock('../modules/session-feedback/feedback-reminders', () => ({
   runFeedbackReminders: (...a) => mockRunFeedbackReminders(...a),
 }));
+const mockRunAutoCheckout = jest.fn();
+jest.mock('../modules/attendance/auto-checkout', () => ({
+  runAutoCheckout: (...a) => mockRunAutoCheckout(...a),
+}));
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn() }));
 
 const mockUpsert = jest.fn();
@@ -37,11 +41,13 @@ beforeEach(() => {
   mockExpire.mockResolvedValue({ expired: 0, paused: 0, clientIds: [] });
   mockRunReminders.mockResolvedValue({ sent: 0, skipped: 0 });
   mockRunFeedbackReminders.mockResolvedValue({ scanned: 0, sent: 0, skipped: 0 });
+  mockRunAutoCheckout.mockResolvedValue({ closed: 0, orgs: 0 });
   delete process.env.AUTOMATION_SWEEP_CRON;
   delete process.env.AUTOMATION_RECOVERY_CRON;
   delete process.env.PT_TERM_EXPIRY_CRON;
   delete process.env.PT_SESSION_REMINDERS_CRON;
   delete process.env.PT_FEEDBACK_REMINDERS_CRON;
+  delete process.env.AUTO_CHECKOUT_CRON;
 });
 
 describe('job routing', () => {
@@ -62,6 +68,16 @@ describe('job routing', () => {
     // firing into nothing, which looks healthy from every angle.
     await expect(worker.processSweepJob({ name: 'whatever' })).rejects.toThrow(/Unknown automation job/);
   });
+
+  test('the auto-checkout job closes open sessions and nothing else', async () => {
+    mockRunAutoCheckout.mockResolvedValue({ closed: 3, orgs: 2 });
+    const out = await worker.processSweepJob({ name: 'auto-checkout' });
+    expect(mockRunAutoCheckout).toHaveBeenCalledTimes(1);
+    expect(mockRunAutoCheckout).toHaveBeenCalledWith();
+    expect(out).toEqual({ closed: 3, orgs: 2 });
+    expect(mockRunSweep).not.toHaveBeenCalled();
+    expect(mockRunRecovery).not.toHaveBeenCalled();
+  });
 });
 
 describe('cron registration', () => {
@@ -72,9 +88,9 @@ describe('cron registration', () => {
     expect(ids).toEqual([
       worker.SWEEP_JOB_ID, worker.RECOVERY_JOB_ID,
       worker.TERM_EXPIRY_JOB_ID, worker.SESSION_REMINDERS_JOB_ID,
-      worker.FEEDBACK_REMINDERS_JOB_ID,
+      worker.FEEDBACK_REMINDERS_JOB_ID, worker.AUTO_CHECKOUT_JOB_ID,
     ]);
-    expect(new Set(ids).size).toBe(5);
+    expect(new Set(ids).size).toBe(6);
     // Distinct ids, or the second upsert would overwrite the first and one of
     // the two passes would simply stop existing.
     expect(worker.SWEEP_JOB_ID).not.toBe(worker.RECOVERY_JOB_ID);
@@ -85,7 +101,7 @@ describe('cron registration', () => {
     // under a name processSweepJob does not handle throws on every fire.
     await worker.scheduleAutomationSweep();
     const names = mockUpsert.mock.calls.map(([, , opts]) => opts.name);
-    expect(names).toEqual(['daily', 'recovery', 'term-expiry', 'session-reminders', 'feedback-reminders']);
+    expect(names).toEqual(['daily', 'recovery', 'term-expiry', 'session-reminders', 'feedback-reminders', 'auto-checkout']);
     for (const name of names) {
       await expect(worker.processSweepJob({ name })).resolves.toBeDefined();
     }
@@ -108,6 +124,17 @@ describe('cron registration', () => {
     await worker.scheduleAutomationSweep();
     expect(mockUpsert.mock.calls[0][1].pattern).toBe('0 4 * * *');
     expect(mockUpsert.mock.calls[1][1].pattern).toBe('*/5 * * * *');
+  });
+
+  test('auto checkout runs every five minutes by default and is configurable', async () => {
+    await worker.scheduleAutomationSweep();
+    const call = mockUpsert.mock.calls.find(([id]) => id === worker.AUTO_CHECKOUT_JOB_ID);
+    expect(call[1].pattern).toBe('*/5 * * * *');
+
+    process.env.AUTO_CHECKOUT_CRON = '*/10 * * * *';
+    await worker.scheduleAutomationSweep();
+    const tuned = mockUpsert.mock.calls.filter(([id]) => id === worker.AUTO_CHECKOUT_JOB_ID).pop();
+    expect(tuned[1].pattern).toBe('*/10 * * * *');
   });
 
   test('neither pass retries inside itself', async () => {

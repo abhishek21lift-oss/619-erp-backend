@@ -145,8 +145,8 @@ const GYM_DEFAULTS = {
   enable_touch_id: true,
   enable_gps: true,
   duplicate_window_minutes: 60,
-  auto_checkout: false,
-  auto_checkout_minutes: 120,
+  auto_checkout: true,
+  auto_checkout_minutes: 60,
 };
 
 // GET /api/settings/gym
