@@ -758,6 +758,56 @@ function scoreCardioPoints(category) {
   return points == null ? { points: null, max: 0 } : { points, max: STEP_MAX.cardio };
 }
 
+const STRENGTH_POINTS_BY_PERCENTILE = {
+  90: 7.5, 80: 6, 70: 6, 60: 4.5, 50: 4.5, 40: 3, 30: 3, 20: 1.5, 10: 1.5,
+};
+function strengthPointsFor(detail) {
+  if (!detail) return null;
+  if (detail.percentile != null) return STRENGTH_POINTS_BY_PERCENTILE[detail.percentile] ?? null;
+  // A valid ratio below every supplied K11 row has no percentile but is still
+  // a performed test, and sits below the 10th-percentile bucket.
+  return detail.category === 'Below Supported Range' ? 1.5 : null;
+}
+function batteryPoints(perTest) {
+  const measured = perTest.filter((p) => p != null);
+  if (!measured.length) return { points: null, max: 0 };
+  return { points: round(measured.reduce((a, b) => a + b, 0), 1), max: measured.length * 7.5 };
+}
+function scoreStrengthBattery(detail1, detail2) {
+  return batteryPoints([strengthPointsFor(detail1), strengthPointsFor(detail2)]);
+}
+
+const ENDURANCE_POINTS_BY_CATEGORY = {
+  Excellent: 7.5, 'Well Above Average': 7.5,
+  'Very Good': 6, 'Above Average': 6,
+  Good: 4.5, Average: 4.5,
+  Fair: 3, 'Below Average': 3,
+  Poor: 1.5, 'Well Below Average': 1.5, 'Below Supported Range': 1.5,
+};
+function scoreEnduranceBatteryPoints(category1, category2) {
+  const per = [category1, category2].map((c) => (c == null ? null : (ENDURANCE_POINTS_BY_CATEGORY[c] ?? null)));
+  return batteryPoints(per);
+}
+
+function tierForScore(score) {
+  if (score == null || !Number.isFinite(score)) return null;
+  if (score >= 85) return 'Optimal';
+  if (score >= 70) return 'Fit';
+  if (score >= 50) return 'Moderate';
+  return 'Needs Attention';
+}
+
+// Steps with no measured input carry max 0; `overall_max` is the sum of the
+// measured maxima, so a partial assessment scales to 100 without pretending
+// the missing steps were scored.
+function computeTotalScore(steps = {}) {
+  const measured = Object.values(steps).filter((s) => s && s.points != null && s.max > 0);
+  const points = round(measured.reduce((a, s) => a + s.points, 0), 1);
+  const max = round(measured.reduce((a, s) => a + s.max, 0), 1);
+  const score = max > 0 ? Math.round((points / max) * 100) : null;
+  return { points, max, score, tier: max === 100 ? tierForScore(score) : null };
+}
+
 function computeOverallScore(scores) {
   const vals = Object.values(scores).filter((v) => v != null);
   if (!vals.length) return null;
@@ -805,4 +855,8 @@ module.exports = {
   scoreAnthropometricPoints,
   scoreBodyCompositionPoints,
   scoreCardioPoints,
+  scoreStrengthBattery,
+  scoreEnduranceBatteryPoints,
+  tierForScore,
+  computeTotalScore,
 };
