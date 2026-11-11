@@ -101,6 +101,8 @@ const MEMBER_MAY = {
   'GET /api/v1/auth/webauthn/credentials': 'Versioned alias of the same self-scoped passkey list.',
   'POST /api/v1/auth/webauthn/register/options': 'Versioned alias of the same self-scoped enrolment start.',
   'POST /api/v1/auth/webauthn/login/options': 'Versioned alias of the same pre-session ceremony start.',
+  'POST /api/auth/device/register/options': "Begins enrolling this phone's native biometric credential for the caller themselves; the challenge is bound to their own user id and the credential is stored under it.",
+  'POST /api/v1/auth/device/register/options': 'Versioned alias of the same self-scoped native device enrolment start.',
   'GET /api/v1/notifications/': 'svc.inbox(req.user.id) — the caller\'s own notification inbox, keyed by their user id.',
   'PATCH /api/v1/notifications/1/read': "Marks one of the caller's OWN notifications read; the update is keyed by user id as well as notification id.",
   'PATCH /api/v1/notifications/read-all': "Marks the caller's OWN inbox read; scoped to req.user.id.",
