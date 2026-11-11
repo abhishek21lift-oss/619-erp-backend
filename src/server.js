@@ -751,9 +751,14 @@ app.use('/api/registrations',     require('./routes/registrations'));
 app.use('/api/auth',              require('./routes/auth'));
 app.use('/api/auth',              require('./routes/auth-google'));
 app.use('/api/auth/webauthn',     require('./routes/auth-webauthn'));
+// Native Android device credentials: fingerprint / strong-face sign-in for the
+// WebView shell. Separate from the WebAuthn router because the ceremony is a
+// plain ECDSA signature over a server challenge, not a FIDO2 assertion.
+app.use('/api/auth/device',       require('./routes/auth-device'));
 app.use('/api/v1/auth',           require('./routes/auth'));
 app.use('/api/v1/auth',           require('./routes/auth-google'));
 app.use('/api/v1/auth/webauthn',  require('./routes/auth-webauthn'));
+app.use('/api/v1/auth/device',    require('./routes/auth-device'));
 app.use('/api/profile',           require('./routes/profile'));
 // Read-only: the caller's own studio's feature flags. Additive — nothing that
 // existed before this route consults it (see lib/features.js).
