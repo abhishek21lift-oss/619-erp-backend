@@ -17,6 +17,7 @@ const DOMAINS = [
   {
     key: 'blood_pressure', label: 'Blood Pressure & Resting',
     metrics: [
+      { key: 'bp_points', label: 'BP score', unit: '/10', higherIsBetter: true, decimals: 0, versionGuard: true },
       { key: 'bp_systolic', label: 'Systolic BP', unit: 'mmHg', higherIsBetter: false, decimals: 0 },
       { key: 'bp_diastolic', label: 'Diastolic BP', unit: 'mmHg', higherIsBetter: false, decimals: 0 },
       { key: 'resting_heart_rate', label: 'Resting heart rate', unit: 'bpm', higherIsBetter: false, decimals: 0 },
@@ -26,6 +27,7 @@ const DOMAINS = [
   {
     key: 'anthropometric', label: 'Anthropometric',
     metrics: [
+      { key: 'anthropometric_points', label: 'Anthropometric score', unit: '/10', higherIsBetter: true, decimals: 1, versionGuard: true },
       { key: 'weight', label: 'Weight', unit: 'kg', higherIsBetter: null, decimals: 1 },
       { key: 'bmi', label: 'BMI', unit: 'kg/m²', higherIsBetter: null, decimals: 1 },
       { key: 'waist_cm', label: 'Waist', unit: 'cm', higherIsBetter: false, decimals: 1 },
@@ -60,13 +62,13 @@ const DOMAINS = [
     key: 'cardio', label: 'Cardiorespiratory',
     metrics: [
       { key: 'vo2_max', label: 'VO₂ max', unit: 'mL/kg/min', higherIsBetter: true, decimals: 2, protocol: 'cardio_test_type' },
-      { key: 'cardio_score_computed', label: 'Cardio score', unit: '/100', higherIsBetter: true, decimals: 0 },
+      { key: 'cardio_score_computed', label: 'Cardio score', unit: '/20', higherIsBetter: true, decimals: 0, versionGuard: true },
     ],
   },
   {
     key: 'strength', label: 'Muscular Strength',
     metrics: [
-      { key: 'strength_score_computed', label: 'Strength score', unit: '/100', higherIsBetter: true, decimals: 0 },
+      { key: 'strength_score_computed', label: 'Strength score', unit: '/15', higherIsBetter: true, decimals: 1, versionGuard: true },
       { key: 'strength_test1_1rm', label: 'Lift 1 estimated 1RM', unit: 'kg', higherIsBetter: true, decimals: 1, protocol: 'strength_exercise' },
       { key: 'strength_test2_1rm', label: 'Lift 2 estimated 1RM', unit: 'kg', higherIsBetter: true, decimals: 1, protocol: 'strength_exercise_2' },
     ],
@@ -74,7 +76,7 @@ const DOMAINS = [
   {
     key: 'endurance', label: 'Muscular Endurance',
     metrics: [
-      { key: 'endurance_score_computed', label: 'Endurance score', unit: '/100', higherIsBetter: true, decimals: 0 },
+      { key: 'endurance_score_computed', label: 'Endurance score', unit: '/15', higherIsBetter: true, decimals: 1, versionGuard: true },
       { key: 'endurance_test1_reps', label: 'Test 1 reps', unit: 'reps', higherIsBetter: true, decimals: 0, protocol: 'endurance_test_type' },
       { key: 'endurance_test1_duration', label: 'Test 1 duration', unit: 's', higherIsBetter: true, decimals: 0, protocol: 'endurance_test_type' },
       { key: 'endurance_test2_reps', label: 'Test 2 reps', unit: 'reps', higherIsBetter: true, decimals: 0, protocol: 'endurance_test_type_2' },
@@ -84,7 +86,7 @@ const DOMAINS = [
   {
     key: 'flexibility', label: 'Flexibility & Mobility',
     metrics: [
-      { key: 'mobility_score_computed', label: 'Flexibility score', unit: '/100', higherIsBetter: true, decimals: 0 },
+      { key: 'mobility_score_computed', label: 'Flexibility score', unit: '/15', higherIsBetter: true, decimals: 0, versionGuard: true },
       { key: 'flexibility_test1_score', label: 'Test 1 score', unit: 'score', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type' },
       { key: 'flexibility_test1_right', label: 'Test 1 right', unit: 'cm', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type' },
       { key: 'flexibility_test1_left', label: 'Test 1 left', unit: 'cm', higherIsBetter: true, decimals: 1, protocol: 'flexibility_test_type' },
@@ -102,6 +104,14 @@ const DOMAINS = [
     ],
   },
 ];
+
+// The 0-100 total is not a domain of its own: it is the headline the domains
+// add up to, so it travels beside them. `overall_max` proves the denominator
+// was stored, not re-derived.
+const OVERALL_METRIC = {
+  key: 'overall_fitness_score', label: 'Overall fitness score', unit: '/100',
+  higherIsBetter: true, decimals: 0, versionGuard: true, requireOverallMax: true,
+};
 
 const NUMBER_FIELDS = new Set(DOMAINS.flatMap((d) => d.metrics.map((m) => m.key)));
 
@@ -189,6 +199,16 @@ function protocolValue(assessment, key) {
 }
 
 function protocolFor(metric, a, b) {
+  // The same stored column means a different thing under a different formula:
+  // 70/100 cardio is not 70/20. A cross-formula delta would be a plausible
+  // number that is not true, so it is withheld instead.
+  if (metric.versionGuard
+    && String(a?.scoring_formula_version ?? '') !== String(b?.scoring_formula_version ?? '')) {
+    return { comparable: false, reason: 'Scoring formula version changed' };
+  }
+  if (metric.requireOverallMax && (num(a?.overall_max) == null || num(b?.overall_max) == null)) {
+    return { comparable: false, reason: 'Scoring model not recorded for both assessments' };
+  }
   if (!metric.protocol) return { comparable: true, reason: null };
   const pa = protocolValue(a, metric.protocol);
   const pb = protocolValue(b, metric.protocol);
@@ -294,6 +314,7 @@ function compareAssessments(baseline, latest, previous = null) {
     baseline: summarizeAssessment(baseline),
     latest: summarizeAssessment(latest),
     previous: summarizeAssessment(previous),
+    overall: compareMetric(OVERALL_METRIC, baseline, latest),
     domains,
     summary,
     conditions: {

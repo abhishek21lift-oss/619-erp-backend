@@ -18,18 +18,23 @@ function assessment(overrides = {}) {
     body_comp_method: 'BIA Machine',
     cardio_test_type: 'Cooper 12-Minute Run',
     vo2_max: '30.00',
-    cardio_score_computed: 40,
+    cardio_score_computed: 13,
     strength_exercise: 'Back Squat',
     strength_test_data: JSON.stringify({ test1: { weightKg: 60, reps: 10, formula: 'epley' } }),
-    strength_score_computed: 40,
+    strength_score_computed: 6,
     endurance_test_type: 'Push Up Test',
     endurance_test_data: JSON.stringify({ test1: { reps: 20 }, test2: { durationSec: 60 } }),
-    endurance_score_computed: 50,
+    endurance_score_computed: 7.5,
     flexibility_test_data: JSON.stringify({ test1: { testType: 'Sit and Reach', left: 10, right: 12, score: 4 } }),
-    mobility_score_computed: 45,
+    mobility_score_computed: 9,
+    bp_points: 7,
+    anthropometric_points: 6,
+    overall_points: 61.5,
+    overall_max: 85,
+    overall_fitness_score: 72,
+    scoring_formula_version: 2,
     bp_systolic: 130,
     bp_diastolic: 85,
-    overall_fitness_score: 42,
     testing_conditions: 'Morning, fasted',
     ...overrides,
   };
@@ -41,7 +46,7 @@ describe('Module 5 seven-domain comparison', () => {
     const latest = assessment({
       id: 'a2', assessment_date: '2026-06-10', assessment_number: 2,
       weight: '78.0', bmi: '24.1', waist_cm: '95.0', body_fat_pct: '28.0',
-      muscle_mass_pct: '31.0', strength_score_computed: 35, bp_systolic: 135,
+      muscle_mass_pct: '31.0', strength_score_computed: 3, bp_systolic: 135,
       neck_cm: '40',
     });
     const result = compareAssessments(baseline, latest);
@@ -63,6 +68,46 @@ describe('Module 5 seven-domain comparison', () => {
     expect(systolic.outcome).toBe('declined');
     expect(result.summary.improved).toBeGreaterThanOrEqual(3);
     expect(result.summary.declined).toBeGreaterThanOrEqual(2);
+  });
+
+  it('reports the step points over their fixed step maximum', () => {
+    const result = compareAssessments(assessment(), assessment({ id: 'a2', assessment_date: '2026-06-10' }));
+    const metricOf = (key) => result.domains.flatMap((d) => d.metrics).find((m) => m.key === key);
+    expect(metricOf('bp_points')).toMatchObject({ baseline_value: 7, latest_value: 7, unit: '/10', decimals: 0 });
+    expect(metricOf('anthropometric_points')).toMatchObject({ baseline_value: 6, unit: '/10', decimals: 1 });
+    expect(metricOf('cardio_score_computed')).toMatchObject({ unit: '/20' });
+    expect(metricOf('strength_score_computed')).toMatchObject({ unit: '/15', decimals: 1 });
+    expect(metricOf('endurance_score_computed')).toMatchObject({ unit: '/15', decimals: 1 });
+    expect(metricOf('mobility_score_computed')).toMatchObject({ unit: '/15' });
+    expect(metricOf('health_risk_score')).toBeUndefined();
+  });
+
+  it('compares the total only when both rows share the scoring formula', () => {
+    const baseline = assessment({ overall_fitness_score: 60 });
+    const latest = assessment({ id: 'a2', assessment_date: '2026-06-10', overall_fitness_score: 72 });
+    const result = compareAssessments(baseline, latest);
+    expect(result.overall).toMatchObject({
+      key: 'overall_fitness_score', baseline_value: 60, latest_value: 72,
+      absolute_change: 12, outcome: 'improved', comparable: true,
+    });
+  });
+
+  it('withholds cross-formula score deltas and says why', () => {
+    const baseline = assessment({
+      scoring_formula_version: 1, overall_max: null, overall_fitness_score: 42,
+      strength_score_computed: 70, cardio_score_computed: 80,
+    });
+    const latest = assessment({ id: 'a2', assessment_date: '2026-06-10' });
+    const result = compareAssessments(baseline, latest);
+    expect(result.overall).toMatchObject({
+      key: 'overall_fitness_score', comparable: false,
+      incomparable_reason: 'Scoring formula version changed', outcome: 'incomparable',
+    });
+    const strength = result.domains[4].metrics.find((m) => m.key === 'strength_score_computed');
+    expect(strength).toMatchObject({ comparable: false, outcome: 'incomparable' });
+    // Raw measurements are the same measurement under either formula.
+    const weight = result.domains[1].metrics.find((m) => m.key === 'weight');
+    expect(weight.comparable).toBe(true);
   });
 
   it('never treats a missing value as zero', () => {

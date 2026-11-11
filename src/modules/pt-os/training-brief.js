@@ -27,7 +27,7 @@
 const SECTIONS = ['readiness', 'body', 'capacity', 'limitations', 'lifestyle', 'goal', 'history'];
 const { ageFromDob: ageFrom } = require('../../lib/age');
 const { dbDate } = require('../../lib/appTime');
-const { classifyWaistRisk } = require('../progress/fitness-scoring');
+const { classifyWaistRisk, STEP_MAX } = require('../progress/fitness-scoring');
 
 /**
  * How old a section may be before it is reported as stale, in days.
@@ -336,15 +336,16 @@ function buildBrief({
       category: assessment.strength_category ?? null,
       percentile: num(strengthTest('test1').k11_percentile),
       percentile_2: num(strengthTest('test2').k11_percentile),
+      max: STEP_MAX.strength,
     },
-    cardio: { score: num(assessment.cardio_score_computed ?? assessment.cardio_score), category: assessment.cardio_category ?? null, vo2_max: num(assessment.vo2_max) },
-    endurance: { score: num(assessment.endurance_score_computed), category: assessment.endurance_category ?? null },
+    cardio: { score: num(assessment.cardio_score_computed ?? assessment.cardio_score), category: assessment.cardio_category ?? null, vo2_max: num(assessment.vo2_max), max: STEP_MAX.cardio },
+    endurance: { score: num(assessment.endurance_score_computed), category: assessment.endurance_category ?? null, max: STEP_MAX.endurance },
     // The dashboard's "Flexibility" category is the computed 0-100 score from
     // the flexibility composite (stored as mobility_score_computed). The legacy
     // `flexibility_score` column is a raw 0-10 on a different scale and is no
     // longer written, so it is NOT substituted here — an unavailable computed
     // score stays null rather than masquerading as a 0-100 value.
-    flexibility: { score: num(assessment.mobility_score_computed), category: assessment.flexibility_category ?? null },
+    flexibility: { score: num(assessment.mobility_score_computed), category: assessment.flexibility_category ?? null, max: STEP_MAX.flexibility },
   } : { present: false };
 
   // ── Limitations: the section that changes exercise SELECTION rather than

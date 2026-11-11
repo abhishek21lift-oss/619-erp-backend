@@ -101,11 +101,13 @@ function buildInsights({ comparison = null, analytics = null, schedule = null, g
     }
 
     const strength = metric(comparison, 'strength_score_computed');
-    if (strength?.comparable && strength.absolute_change != null && Math.abs(strength.absolute_change) >= 5) {
+    // Two points on a 15-point step is a real move; five was the old 0-100
+    // threshold and would now be a third of the step.
+    if (strength?.comparable && strength.absolute_change != null && Math.abs(strength.absolute_change) >= 2) {
       out.push(base({
         key: 'strength_change', type: 'observation', severity: 'info',
         title: `Strength score ${strength.absolute_change > 0 ? 'improved' : 'declined'} ${Math.abs(strength.absolute_change)} points`,
-        detail: `${fmt(strength.baseline_value, '/100')} to ${fmt(strength.latest_value, '/100')} between ${period}.`,
+        detail: `${fmt(strength.baseline_value, '/15')} to ${fmt(strength.latest_value, '/15')} between ${period}.`,
         evidence: { metric: 'strength_score_computed', baseline: strength.baseline_value, latest: strength.latest_value, period },
       }));
     }
