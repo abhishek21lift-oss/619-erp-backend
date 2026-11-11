@@ -808,6 +808,53 @@ function computeTotalScore(steps = {}) {
   return { points, max, score, tier: max === 100 ? tierForScore(score) : null };
 }
 
+const SIT_AND_REACH_POINTS = {
+  Excellent: 7, Good: 5, Average: 3, 'Below Average': 1, 'Well Below Average': 0,
+};
+
+function bothSides(values, ok) {
+  return values != null && ok(values.left) && ok(values.right);
+}
+
+/**
+ * Framework step 7: 2 points per ROM test recorded (max 8) plus 7 for the
+ * sit-and-reach norm. A test that is absent from the payload adds no max; a
+ * test that was recorded but not passed (including "unable to complete") keeps
+ * its max and earns 0.
+ */
+function scoreFlexibilityPoints(derived, legacyComposite = null) {
+  if (legacyComposite != null) {
+    // Legacy two-slot rows stored a 0-100 composite; the framework scale is 15.
+    return { points: Math.round(legacyComposite * 0.15), max: STEP_MAX.flexibility };
+  }
+  const tests = (derived && derived.tests) || {};
+  let points = 0;
+  let max = 0;
+  const add = (key, stepMax, earned) => {
+    if (!(key in tests)) return;
+    max += stepMax;
+    if (earned) points += stepMax;
+  };
+  add('quadriceps', 2, tests.quadriceps?.overall_interpretation === 'Normal');
+  add('hamstrings', 2,
+    bothSides(tests.hamstrings?.sides_interpretation,
+      (i) => i === 'Within reference range' || i === 'Above reference range')
+    && bothSides(tests.hamstrings?.sides_validity, (v) => v === 'valid'));
+  add('hip_flexors', 2, bothSides(tests.hip_flexors?.sides_interpretation, (i) => i === 'Clear'));
+  add('shoulder_reach', 2, bothSides(tests.shoulder_reach?.sides_interpretation, (i) => i === 'Clear'));
+  // A performed sit-and-reach with no age/sex norm is unclassifiable, so it
+  // adds no max — same rule as an unclassifiable waist measurement.
+  const sar = tests.sit_and_reach;
+  if (sar) {
+    const category = sar.norm && sar.norm.category;
+    if (category != null || sar.unable_to_complete === true) {
+      max += 7;
+      points += SIT_AND_REACH_POINTS[category] ?? 0;
+    }
+  }
+  return max === 0 ? { points: null, max: 0 } : { points, max };
+}
+
 function computeOverallScore(scores) {
   const vals = Object.values(scores).filter((v) => v != null);
   if (!vals.length) return null;
@@ -859,4 +906,5 @@ module.exports = {
   scoreEnduranceBatteryPoints,
   tierForScore,
   computeTotalScore,
+  scoreFlexibilityPoints,
 };
