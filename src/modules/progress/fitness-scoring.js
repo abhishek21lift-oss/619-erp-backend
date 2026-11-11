@@ -692,6 +692,72 @@ function scoreEnduranceBattery(score1, score2) {
   return Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
 }
 
+// ── 100-point framework: step point tables ──────────────────
+// Spec: docs/superpowers/specs/2026-11-11-fitness-scoring-100-point-design.md
+const STEP_MAX = Object.freeze({
+  bp: 10, anthropometric: 10, bodyComposition: 15, cardio: 20,
+  strength: 15, endurance: 15, flexibility: 15,
+});
+
+const BP_POINTS = {
+  Normal: 10, Elevated: 7, Hypotension: 7,
+  'Hypertension Stage 1': 4, 'Hypertension Stage 2': 0, 'Hypertensive Crisis': 0,
+};
+function scoreBpPoints(category) {
+  const points = category == null ? null : (BP_POINTS[category] ?? null);
+  return points == null ? { points: null, max: 0 } : { points, max: STEP_MAX.bp };
+}
+
+// Three parameters; each one that is out of range costs a band. Missing sex
+// leaves waist/WHR unclassifiable, so they contribute no max — a measurement
+// that can never earn a point must not lower the client's ceiling.
+const ANTHRO_OUT_RATIO = { 0: 1, 1: 0.7, 2: 0.4, 3: 0.2 };
+function scoreAnthropometricPoints(input = {}, gender) {
+  const g = sexOf(gender);
+  const waist = input.waistIliacCm ?? input.waistCm ?? null;
+  let present = 0;
+  let out = 0;
+  if (input.bmi != null && Number.isFinite(input.bmi)) {
+    present += 1;
+    if (!(input.bmi >= 18.5 && input.bmi < 23)) out += 1;
+  }
+  if (g && waist != null && Number.isFinite(waist)) {
+    present += 1;
+    if (!(waist < WAIST_LOW_RISK_CM[g])) out += 1;
+  }
+  if (g && input.waistHipRatio != null && Number.isFinite(input.waistHipRatio)) {
+    present += 1;
+    if (!(input.waistHipRatio < WHR_LOW_RISK[g])) out += 1;
+  }
+  if (present === 0) return { points: null, max: 0 };
+  const max = round((STEP_MAX.anthropometric * present) / 3, 1);
+  return { points: round(max * ANTHRO_OUT_RATIO[Math.min(out, 3)], 1), max };
+}
+
+// Points follow the stored category, so the tile's label and its points agree.
+const BODY_FAT_POINTS = {
+  'Essential Fat': 15, 'Athletic / Ideal': 15,
+  'Acceptable / Average': 11, 'Above Ideal Range': 7, 'Overfat / High Risk': 3,
+};
+function scoreBodyCompositionPoints(bodyFatPct, gender) {
+  const category = classifyBodyFat(bodyFatPct, gender);
+  if (!category) return { points: null, max: 0 };
+  return { points: BODY_FAT_POINTS[category], max: STEP_MAX.bodyComposition };
+}
+
+// The framework prints six buckets; the classifiers emit their own vocabulary,
+// mapped onto the nearest bucket. Strength-only `Below Supported Range` is
+// included because the map is shared by every point reader.
+const CARDIO_POINTS = {
+  Superior: 20, Excellent: 20, 'Very Good': 16, Good: 16,
+  'Above Average': 13, Average: 10, Fair: 10,
+  'Below Average': 6, Poor: 2, 'Very Poor': 2, 'Below Supported Range': 2,
+};
+function scoreCardioPoints(category) {
+  const points = category == null ? null : (CARDIO_POINTS[category] ?? null);
+  return points == null ? { points: null, max: 0 } : { points, max: STEP_MAX.cardio };
+}
+
 function computeOverallScore(scores) {
   const vals = Object.values(scores).filter((v) => v != null);
   if (!vals.length) return null;
@@ -734,4 +800,9 @@ module.exports = {
   scoreHealthRisk,
   scoreEnduranceBattery,
   computeOverallScore,
+  STEP_MAX,
+  scoreBpPoints,
+  scoreAnthropometricPoints,
+  scoreBodyCompositionPoints,
+  scoreCardioPoints,
 };
