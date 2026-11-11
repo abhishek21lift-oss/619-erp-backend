@@ -299,6 +299,7 @@ All optional; boolean unless noted.
 | Resting heart rate | `resting_heart_rate` | number | O | — | 25–220 | Fitness Testing |
 | Resting SpO₂ | `resting_spo2` | number | O | — | 50–100 | Fitness Testing |
 | BP category | `bp_category` | derived | — | — | server | Fitness Testing |
+| BP points | `bp_points` | derived | — | BP category | 0–10 step points | Fitness Testing |
 
 ### 5.3 Anthropometric
 
@@ -311,6 +312,7 @@ All optional; boolean unless noted.
 | Waist-iliac | `waist_iliac_cm` | number | O | — | 30–250 | Fitness Testing |
 | Hips | `hips_cm` | number | O | — | 30–250 | Fitness Testing |
 | WHR | `waist_hip_ratio` | derived | — | Waist and hips | server | Fitness Testing |
+| Anthropometric points | `anthropometric_points` | derived | — | BMI always; waist and WHR only when sex is known | 0–10 step points, scaled by recorded inputs | Fitness Testing |
 | Neck | `neck_cm` | number | O | — | 15–80 | Fitness Testing |
 | Chest | `chest_cm` | number | O | — | 40–250 | Fitness Testing |
 | Right arm | `arm_right_cm` | number | O | — | 10–100 | Fitness Testing |
@@ -347,7 +349,7 @@ All optional; boolean unless noted.
 | Protocol data | `cardio_test_data` JSONB | mixed | C | Per test type | JSONB; flexible | Fitness Testing |
 | VO₂ max | `vo2_max` | derived | — | Enough protocol data | server | Fitness Testing |
 | Category | `cardio_category` | derived | — | — | server | Fitness Testing |
-| Score | `cardio_score_computed` | derived | — | — | 0–100 server | Fitness Testing |
+| Score | `cardio_score_computed` | derived | — | — | 0–20 step points | Fitness Testing |
 
 ### 5.6 Muscular strength (test)
 
@@ -362,7 +364,7 @@ All optional; boolean unless noted.
 | Formula | `strength_logs.one_rm_formula` | select | O | — | epley, brzycki | Fitness Testing |
 | Direct 1RM | `strength_logs.is_direct_1rm` | checkbox | O | — | boolean | Fitness Testing |
 | 1RM | `strength_logs.one_rm_estimate` | derived | C | Direct or estimated | server | Fitness Testing |
-| Strength score | `strength_score_computed` | derived | — | — | 0–100 server | Fitness Testing |
+| Strength score | `strength_score_computed` | derived | — | — | 0–15 step points (7.5 per classifiable test) | Fitness Testing |
 
 ### 5.7 Muscular endurance
 
@@ -372,7 +374,7 @@ All optional; boolean unless noted.
 | Test type 2 | `endurance_test_type_2` | select | O | — | same | Fitness Testing |
 | Test payload | `endurance_test_data` JSONB | mixed | C | Per test | reps or duration | Fitness Testing |
 | Category | `endurance_category` | derived | — | — | server | Fitness Testing |
-| Score | `endurance_score_computed` | derived | — | — | 0–100 server | Fitness Testing |
+| Score | `endurance_score_computed` | derived | — | — | 0–15 step points (7.5 per classifiable test) | Fitness Testing |
 
 ### 5.8 Flexibility / mobility battery
 
@@ -385,18 +387,20 @@ All optional; boolean unless noted.
 | Ankle mobility | `flexibility_test_data.distance_cm` | number | O | — | 0–60 cm | Fitness Testing |
 | Asymmetry | `has_asymmetry` | derived | — | Left/right difference | 10% threshold | Fitness Testing |
 | Category | `flexibility_category` | derived | — | — | server | Fitness Testing |
-| Score | `mobility_score_computed` | derived | — | — | 0–100 server | Fitness Testing |
+| Score | `mobility_score_computed` | derived | — | — | 0–15 step points | Fitness Testing |
 
 ### 5.9 Overall and history
 
 | Field / data point | Current location | Input | Req | Conditional | Validation | Target owner |
 |---|---|---|---|---|---|---|
-| Body composition score | `body_composition_score` | derived | — | — | 0–100 | Fitness Testing |
-| Health risk score | `health_risk_score` | derived | — | — | 0–100 | Fitness Testing |
-| Overall score | `overall_fitness_score` | derived | — | — | 0–100 | Fitness Testing |
+| Body composition score | `body_composition_score` | derived | — | Body fat category | 0–15 step points | Fitness Testing |
+| Health risk score | `health_risk_score` | retired | — | — | Null for formula-2 rows; historical values are 0–100 | Fitness Testing |
+| Overall points | `overall_points` | derived | — | Sum of measured step points | numeric | Fitness Testing |
+| Overall max | `overall_max` | derived | — | Sum of measured step maxima; 100 only when all seven steps are complete | numeric | Fitness Testing |
+| Overall score | `overall_fitness_score` | derived | — | `overall_points / overall_max × 100` | 0–100; tier only when `overall_max = 100` | Fitness Testing |
 | Posture notes | `posture_notes` | textarea | O | — | max 2000 | Fitness Testing (legacy; Posture owns current) |
 | Health notes | `health_notes` | textarea | O | — | max 2000 | Fitness Testing |
-| Scoring version | — | — | O | — | **does not exist** | Fitness Testing | additive |
+| Scoring version | `scoring_formula_version` | derived | — | 2 = 100-point framework; 1 = retired mean model | 1 or 2, default 1 | Fitness Testing |
 
 ---
 
@@ -626,8 +630,8 @@ All optional; boolean unless noted.
 | Lean body mass | weight, body fat | `pt_assessments.lean_body_mass_kg` | `w × (1 − bf/100)` | server |
 | Fat mass | weight, body fat | `pt_assessments.fat_mass_kg` | `w × bf/100` | server |
 | VO₂ max | protocol data | `pt_assessments.vo2_max` | Rockport, Cooper, Bruce, Harvard | server |
-| Category scores | test data + norms | `*_category`, `*_score_computed` | `fitness-scoring.js` | server |
-| Overall score | category scores | `overall_fitness_score` | weighted score function | server |
+| Category scores | test data + norms | `*_category`, step points in `*_score_computed`, `bp_points`, `anthropometric_points` | `fitness-scoring.js` (framework v2) | server |
+| Overall score | step points and measured maxima | `overall_points`, `overall_max`, `overall_fitness_score` | sum of measured step points ÷ sum of measured maxima × 100; tier only when the measured max is 100 | server |
 | 1RM | weight, reps, formula | `strength_logs.one_rm_estimate` | Epley, Brzycki | server; direct 1RM only client value |
 | Goal required rate | start, target, days | `estimated_weekly_rate_kg` | `(target − start) / weeks` | server |
 | Goal safe rate | metric, current | `safe_weekly_rate_kg` | `goal-scoring.js` | server |

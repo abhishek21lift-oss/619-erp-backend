@@ -228,7 +228,7 @@ describe('K11 strength percentiles', () => {
       },
     });
     expect(brief.sections.capacity.strength).toEqual({
-      score: 80, category: 'Above Average', percentile: 80, percentile_2: 30,
+      score: 80, category: 'Above Average', percentile: 80, percentile_2: 30, max: 15,
     });
   });
 
@@ -238,8 +238,30 @@ describe('K11 strength percentiles', () => {
       assessment: { assessment_date: '2026-07-01', strength_category: 'Average' },
     });
     expect(brief.sections.capacity.strength).toEqual({
-      score: null, category: 'Average', percentile: null, percentile_2: null,
+      score: null, category: 'Average', percentile: null, percentile_2: null, max: 15,
     });
+  });
+});
+
+describe('100-point capacity scales', () => {
+  it('carries each step maximum so the points can be read against it', () => {
+    const brief = buildBrief({
+      client: CLIENT,
+      assessment: {
+        assessment_date: '2026-07-01',
+        scoring_formula_version: 2,
+        cardio_score_computed: 13,
+        strength_score_computed: 7.5,
+        endurance_score_computed: 6,
+        mobility_score_computed: 12,
+        overall_fitness_score: 78,
+      },
+    });
+    expect(brief.sections.capacity.strength).toMatchObject({ score: 7.5, max: 15 });
+    expect(brief.sections.capacity.cardio).toMatchObject({ score: 13, max: 20 });
+    expect(brief.sections.capacity.endurance).toMatchObject({ score: 6, max: 15 });
+    expect(brief.sections.capacity.flexibility).toMatchObject({ score: 12, max: 15 });
+    expect(brief.sections.capacity.overall).toBe(78);
   });
 });
 

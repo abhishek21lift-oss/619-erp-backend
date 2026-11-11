@@ -6,10 +6,9 @@
 // never trusted from client-submitted values.
 //
 // Formula-bundle version. Bump whenever any formula in this module changes.
-// Persisting it per assessment requires the approval-gated migration described
-// in F10 (new nullable `scoring_formula_version` column on pt_assessments);
-// until then this is documentation only and legacy rows are treated as unknown.
-const FITNESS_SCORING_VERSION = '6';
+// The per-row framework version is stored in pt_assessments.scoring_formula_version
+// (2 = the 100-point framework); this constant tracks the bundle for parity tests.
+const FITNESS_SCORING_VERSION = '7';
 
 function round(n, decimals = 1) {
   const f = 10 ** decimals;
@@ -640,62 +639,176 @@ function scoreCategory(category) {
   return CATEGORY_SCORES[category] ?? null;
 }
 
-// Body Composition Score: K11 gives an upper bound only — 100 at or below 15%
-// for men and 20% for women, then four points off per percentage point above
-// it. No lower-bound penalty is invented where K11 supplies none. Returns null
-// when gender is missing or 'Other' — no sex-neutral reference exists.
-const K11_IDEAL_BODY_FAT_MAX = { Male: 15, Female: 20 };
-function scoreBodyComposition(bodyFatPct, gender) {
-  if (bodyFatPct == null || !Number.isFinite(bodyFatPct)) return null;
-  const g = sexOf(gender);
-  if (!g) return null;
-  const max = K11_IDEAL_BODY_FAT_MAX[g];
-  if (bodyFatPct <= max) return 100;
-  return Math.max(0, Math.round(100 - (bodyFatPct - max) * 4));
-}
-
-// Health Score (stored column `health_risk_score`): average of a BP-category
-// subscore and a BMI-category subscore. Higher is better — 100 is normal BP
-// within the healthy BMI band — same direction as the other five axes. BP bands
-// follow AHA BP categories.
-//
-// The BMI bands below are deliberately NOT the MPTS/Asian anthropometric
-// categories in classifyBmi(): they are the pre-existing project risk proxy,
-// left unchanged so stored Health Scores stay comparable. A BMI of 23–24.9 is
-// therefore "Overweight" in the anthropometric block while this score still
-// treats 18.5–<25 as healthy. This divergence is documented and pinned by a
-// regression test; do not silently reconcile it here.
-//
-// Healthy 100, overweight/underweight 60, obese 30 — no separate underweight
-// penalty. Discontinuity: 24.9 → 100, 25.0 → 60.
-const BP_RISK_SCORE = { Normal: 100, Elevated: 80, 'Hypertension Stage 1': 55, 'Hypertension Stage 2': 20, 'Hypertensive Crisis': 5, Hypotension: 40 };
-function scoreBmiRisk(bmi) {
-  if (bmi == null) return null;
-  if (bmi >= 18.5 && bmi < 25) return 100;
-  if (bmi < 18.5) return 60;
-  if (bmi < 30) return 60;
-  return 30;
-}
-function scoreHealthRisk(bpCategory, bmi) {
-  const bpScore = BP_RISK_SCORE[bpCategory] ?? null;
-  const bmiScore = scoreBmiRisk(bmi);
-  const scores = [bpScore, bmiScore].filter((s) => s != null);
-  if (!scores.length) return null;
-  return Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
-}
-
-// Combined Muscular Endurance score: average of the two required tests'
-// sub-scores (same averaging pattern as scoreHealthRisk above).
+// Legacy flexibility composite (0-100): the old two-slot rows keep their
+// original averaging so the backfill can read them. New rows score the
+// framework's seven steps instead (see the point tables below).
 function scoreEnduranceBattery(score1, score2) {
   const scores = [score1, score2].filter((s) => s != null);
   if (!scores.length) return null;
   return Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
 }
 
-function computeOverallScore(scores) {
-  const vals = Object.values(scores).filter((v) => v != null);
-  if (!vals.length) return null;
-  return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+// ── 100-point framework: step point tables ──────────────────
+// Spec: docs/superpowers/specs/2026-11-11-fitness-scoring-100-point-design.md
+const STEP_MAX = Object.freeze({
+  bp: 10, anthropometric: 10, bodyComposition: 15, cardio: 20,
+  strength: 15, endurance: 15, flexibility: 15,
+});
+
+const BP_POINTS = {
+  Normal: 10, Elevated: 7, Hypotension: 7,
+  'Hypertension Stage 1': 4, 'Hypertension Stage 2': 0, 'Hypertensive Crisis': 0,
+};
+function scoreBpPoints(category) {
+  const points = category == null ? null : (BP_POINTS[category] ?? null);
+  return points == null ? { points: null, max: 0 } : { points, max: STEP_MAX.bp };
+}
+
+// Three parameters; each one that is out of range costs a band. Missing sex
+// leaves waist/WHR unclassifiable, so they contribute no max — a measurement
+// that can never earn a point must not lower the client's ceiling.
+const ANTHRO_OUT_RATIO = { 0: 1, 1: 0.7, 2: 0.4, 3: 0.2 };
+function scoreAnthropometricPoints(input = {}, gender) {
+  const g = sexOf(gender);
+  const waist = input.waistIliacCm ?? input.waistCm ?? null;
+  let present = 0;
+  let out = 0;
+  if (input.bmi != null && Number.isFinite(input.bmi)) {
+    present += 1;
+    if (!(input.bmi >= 18.5 && input.bmi < 23)) out += 1;
+  }
+  if (g && waist != null && Number.isFinite(waist)) {
+    present += 1;
+    if (!(waist < WAIST_LOW_RISK_CM[g])) out += 1;
+  }
+  if (g && input.waistHipRatio != null && Number.isFinite(input.waistHipRatio)) {
+    present += 1;
+    if (!(input.waistHipRatio < WHR_LOW_RISK[g])) out += 1;
+  }
+  if (present === 0) return { points: null, max: 0 };
+  const max = round((STEP_MAX.anthropometric * present) / 3, 1);
+  return { points: round(max * ANTHRO_OUT_RATIO[Math.min(out, 3)], 1), max };
+}
+
+// Points follow the stored category, so the tile's label and its points agree.
+const BODY_FAT_POINTS = {
+  'Essential Fat': 15, 'Athletic / Ideal': 15,
+  'Acceptable / Average': 11, 'Above Ideal Range': 7, 'Overfat / High Risk': 3,
+};
+function scoreBodyCompositionPoints(bodyFatPct, gender) {
+  const category = classifyBodyFat(bodyFatPct, gender);
+  if (!category) return { points: null, max: 0 };
+  return { points: BODY_FAT_POINTS[category], max: STEP_MAX.bodyComposition };
+}
+
+// The framework prints six buckets; the classifiers emit their own vocabulary,
+// mapped onto the nearest bucket. Strength-only `Below Supported Range` is
+// included because the map is shared by every point reader.
+const CARDIO_POINTS = {
+  Superior: 20, Excellent: 20, 'Very Good': 16, Good: 16,
+  'Above Average': 13, Average: 10, Fair: 10,
+  'Below Average': 6, Poor: 2, 'Very Poor': 2, 'Below Supported Range': 2,
+};
+function scoreCardioPoints(category) {
+  const points = category == null ? null : (CARDIO_POINTS[category] ?? null);
+  return points == null ? { points: null, max: 0 } : { points, max: STEP_MAX.cardio };
+}
+
+const STRENGTH_POINTS_BY_PERCENTILE = {
+  90: 7.5, 80: 6, 70: 6, 60: 4.5, 50: 4.5, 40: 3, 30: 3, 20: 1.5, 10: 1.5,
+};
+function strengthPointsFor(detail) {
+  if (!detail) return null;
+  if (detail.percentile != null) return STRENGTH_POINTS_BY_PERCENTILE[detail.percentile] ?? null;
+  // A valid ratio below every supplied K11 row has no percentile but is still
+  // a performed test, and sits below the 10th-percentile bucket.
+  return detail.category === 'Below Supported Range' ? 1.5 : null;
+}
+function batteryPoints(perTest) {
+  const measured = perTest.filter((p) => p != null);
+  if (!measured.length) return { points: null, max: 0 };
+  return { points: round(measured.reduce((a, b) => a + b, 0), 1), max: measured.length * 7.5 };
+}
+function scoreStrengthBattery(detail1, detail2) {
+  return batteryPoints([strengthPointsFor(detail1), strengthPointsFor(detail2)]);
+}
+
+const ENDURANCE_POINTS_BY_CATEGORY = {
+  Excellent: 7.5, 'Well Above Average': 7.5,
+  'Very Good': 6, 'Above Average': 6,
+  Good: 4.5, Average: 4.5,
+  Fair: 3, 'Below Average': 3,
+  Poor: 1.5, 'Well Below Average': 1.5, 'Below Supported Range': 1.5,
+};
+function scoreEnduranceBatteryPoints(category1, category2) {
+  const per = [category1, category2].map((c) => (c == null ? null : (ENDURANCE_POINTS_BY_CATEGORY[c] ?? null)));
+  return batteryPoints(per);
+}
+
+function tierForScore(score) {
+  if (score == null || !Number.isFinite(score)) return null;
+  if (score >= 85) return 'Optimal';
+  if (score >= 70) return 'Fit';
+  if (score >= 50) return 'Moderate';
+  return 'Needs Attention';
+}
+
+// Steps with no measured input carry max 0; `overall_max` is the sum of the
+// measured maxima, so a partial assessment scales to 100 without pretending
+// the missing steps were scored.
+function computeTotalScore(steps = {}) {
+  const measured = Object.values(steps).filter((s) => s && s.points != null && s.max > 0);
+  const points = round(measured.reduce((a, s) => a + s.points, 0), 1);
+  const max = round(measured.reduce((a, s) => a + s.max, 0), 1);
+  const score = max > 0 ? Math.round((points / max) * 100) : null;
+  return { points, max, score, tier: max === 100 ? tierForScore(score) : null };
+}
+
+const SIT_AND_REACH_POINTS = {
+  Excellent: 7, Good: 5, Average: 3, 'Below Average': 1, 'Well Below Average': 0,
+};
+
+function bothSides(values, ok) {
+  return values != null && ok(values.left) && ok(values.right);
+}
+
+/**
+ * Framework step 7: 2 points per ROM test recorded (max 8) plus 7 for the
+ * sit-and-reach norm. A test that is absent from the payload adds no max; a
+ * test that was recorded but not passed (including "unable to complete") keeps
+ * its max and earns 0.
+ */
+function scoreFlexibilityPoints(derived, legacyComposite = null) {
+  if (legacyComposite != null) {
+    // Legacy two-slot rows stored a 0-100 composite; the framework scale is 15.
+    return { points: Math.round(legacyComposite * 0.15), max: STEP_MAX.flexibility };
+  }
+  const tests = (derived && derived.tests) || {};
+  let points = 0;
+  let max = 0;
+  const add = (key, stepMax, earned) => {
+    if (!(key in tests)) return;
+    max += stepMax;
+    if (earned) points += stepMax;
+  };
+  add('quadriceps', 2, tests.quadriceps?.overall_interpretation === 'Normal');
+  add('hamstrings', 2,
+    bothSides(tests.hamstrings?.sides_interpretation,
+      (i) => i === 'Within reference range' || i === 'Above reference range')
+    && bothSides(tests.hamstrings?.sides_validity, (v) => v === 'valid'));
+  add('hip_flexors', 2, bothSides(tests.hip_flexors?.sides_interpretation, (i) => i === 'Clear'));
+  add('shoulder_reach', 2, bothSides(tests.shoulder_reach?.sides_interpretation, (i) => i === 'Clear'));
+  // A performed sit-and-reach with no age/sex norm is unclassifiable, so it
+  // adds no max — same rule as an unclassifiable waist measurement.
+  const sar = tests.sit_and_reach;
+  if (sar) {
+    const category = sar.norm && sar.norm.category;
+    if (category != null || sar.unable_to_complete === true) {
+      max += 7;
+      points += SIT_AND_REACH_POINTS[category] ?? 0;
+    }
+  }
+  return max === 0 ? { points: null, max: 0 } : { points, max };
 }
 
 module.exports = {
@@ -730,8 +843,15 @@ module.exports = {
   checkAsymmetry,
   classifyFlexibilityScore,
   scoreCategory,
-  scoreBodyComposition,
-  scoreHealthRisk,
   scoreEnduranceBattery,
-  computeOverallScore,
+  STEP_MAX,
+  scoreBpPoints,
+  scoreAnthropometricPoints,
+  scoreBodyCompositionPoints,
+  scoreCardioPoints,
+  scoreStrengthBattery,
+  scoreEnduranceBatteryPoints,
+  tierForScore,
+  computeTotalScore,
+  scoreFlexibilityPoints,
 };

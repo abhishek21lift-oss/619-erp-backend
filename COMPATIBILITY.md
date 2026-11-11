@@ -47,6 +47,35 @@ exists to catch.
 | whatsapp gateway | `contract: 1` | backend `>= 1` | `src/release.ts` |
 | frontend | — | backend `>= 1` | `src/lib/release.ts` |
 
+## Additive API changes (no contract bump)
+
+`contract` covers the backend↔gateway seam. A change that only widens the HTTP
+surface cannot break a client already in the field, so it does not raise it:
+
+- **Android device sign-in** — `POST /api/auth/device/register/options`,
+  `/register/verify`, `/login/options`, `/login/verify`. New routes; older
+  clients never call them and no minimum app version is introduced.
+- `GET /api/auth/webauthn/credentials` now also returns `credential_id` on each
+  row. An added field, not a renamed or narrowed one; existing consumers ignore
+  it.
+
+## Fitness assessment scoring formula v2 (synchronized release)
+
+`pt_assessments` gains `scoring_formula_version`, `bp_points`,
+`anthropometric_points`, `overall_points` and `overall_max`. The existing
+`*_score_computed` columns keep their names but now store **step points**
+(cardio 0–20; strength, endurance, flexibility and body composition 0–15), not
+the retired 0–100 mean. `health_risk_score` is written as `null` for new rows.
+`overall_fitness_score` stays 0–100 and is now
+`overall_points / overall_max × 100`.
+
+This is additive on the wire and does not raise `contract`, but it is **not**
+safe to stretch across releases: an old backend writes formula-1 values that a
+new frontend would display as step points. Backend and frontend ship in one
+release; the backfill (`node scripts/backfill-fitness-scores.js --apply`) runs
+after that release and rewrites historical rows to formula 2. Until it
+finishes, cross-version comparisons are suppressed rather than shown as wrong.
+
 ## Where each service reports itself
 
 | Service | Endpoint | Also |

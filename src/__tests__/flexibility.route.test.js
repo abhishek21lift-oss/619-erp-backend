@@ -113,7 +113,7 @@ beforeEach(() => {
 });
 
 describe('POST /progress/assessments — K11 battery', () => {
-  test('stores the derived v3 payload, with the K11 sit-and-reach norm and no mobility score', async () => {
+  test('stores the derived v3 payload, with the K11 sit-and-reach norm and its step points', async () => {
     const res = await post({ flexibility_test_data: battery() });
     expect(res.status).toBe(201);
 
@@ -130,7 +130,9 @@ describe('POST /progress/assessments — K11 battery', () => {
     expect(typeof stored.recorded_at).toBe('string');
     expect(cols.flexibility_category).toBeNull();
     expect(cols.flexibility_category_2).toBeNull();
-    expect(cols.mobility_score_computed).toBeNull();
+    // 2 points each for the four recorded ROM tests + 5 for a Good
+    // sit-and-reach norm. The step total replaces the retired 0-100 mean.
+    expect(cols.mobility_score_computed).toBe(13);
     expect(cols.has_asymmetry).toBe(false);
   });
 

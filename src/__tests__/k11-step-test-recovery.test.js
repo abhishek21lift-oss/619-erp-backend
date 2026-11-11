@@ -119,6 +119,6 @@ describe('K11 category scoring', () => {
   });
 
   test('bumps the formula-bundle version for the changed classifier', () => {
-    expect(fitness.FITNESS_SCORING_VERSION).toBe('6');
+    expect(fitness.FITNESS_SCORING_VERSION).toBe('7');
   });
 });

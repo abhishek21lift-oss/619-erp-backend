@@ -280,24 +280,6 @@ describe('K11 sit-and-reach norms', () => {
   });
 });
 
-describe('K11 body-fat ideal', () => {
-  test('male ideal is <=15%, female <=20%, with no lower-bound penalty', () => {
-    expect(fitness.scoreBodyComposition(15, 'Male')).toBe(100);
-    expect(fitness.scoreBodyComposition(16, 'Male')).toBe(96);
-    expect(fitness.scoreBodyComposition(25, 'Male')).toBe(60);
-    expect(fitness.scoreBodyComposition(5, 'Male')).toBe(100);
-    expect(fitness.scoreBodyComposition(20, 'Female')).toBe(100);
-    expect(fitness.scoreBodyComposition(21, 'Female')).toBe(96);
-    expect(fitness.scoreBodyComposition(25, 'Female')).toBe(80);
-    expect(fitness.scoreBodyComposition(5, 'Female')).toBe(100);
-  });
-
-  test('missing or unsupported sex still has no score', () => {
-    expect(fitness.scoreBodyComposition(15, null)).toBeNull();
-    expect(fitness.scoreBodyComposition(15, 'Other')).toBeNull();
-  });
-});
-
 describe('K11 flexibility battery norm', () => {
   test('derives the sit-and-reach category when age and sex are known', () => {
     const d = flexibility.deriveFlexibility(battery(), { age: 30, gender: 'Male' });
@@ -318,7 +300,7 @@ describe('K11 flexibility battery norm', () => {
 });
 
 describe('K11 formula bundle', () => {
-  test('version 5', () => {
-    expect(fitness.FITNESS_SCORING_VERSION).toBe('6');
+  test('version 7', () => {
+    expect(fitness.FITNESS_SCORING_VERSION).toBe('7');
   });
 });

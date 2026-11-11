@@ -33,7 +33,6 @@ describe('no invented categories (F-4, F-8)', () => {
     expect(fitness.classifyEndurance('Push Up Test', 25, null, 30)).toBeNull();
     expect(fitness.classifyEndurance('Push Up Test', 25, 'Other', 30)).toBeNull();
     expect(fitness.classifyEndurance('Push Up Test', 25, 'male', 30)).toBe(fitness.classifyEndurance('Push Up Test', 25, 'Male', 30));
-    expect(fitness.scoreBodyComposition(15, null)).toBeNull();
   });
 });
 
@@ -130,56 +129,6 @@ describe('flexibility composite bounds (F2a)', () => {
   });
   test('10 is the top of the scale (Excellent)', () => {
     expect(fitness.classifyFlexibilityScore(10)).toBe('Excellent');
-  });
-});
-
-describe('body composition prerequisites (F14)', () => {
-  test('returns null for missing or unsupported gender — no invented range', () => {
-    expect(fitness.scoreBodyComposition(15, null)).toBeNull();
-    expect(fitness.scoreBodyComposition(15, 'Other')).toBeNull();
-  });
-  test('still scores supported genders', () => {
-    expect(fitness.scoreBodyComposition(15, 'Male')).toBe(100);
-    expect(fitness.scoreBodyComposition(25, 'Female')).toBe(80);
-  });
-});
-
-describe('health score direction and bands (F15)', () => {
-  test('100 is normal BP + healthy BMI', () => {
-    expect(fitness.scoreHealthRisk('Normal', 22)).toBe(100);
-  });
-  test('BMI band discontinuity: 24.9 → 100, 25.0 → 80 (normal BP)', () => {
-    expect(fitness.scoreHealthRisk('Normal', 24.9)).toBe(100);
-    expect(fitness.scoreHealthRisk('Normal', 25)).toBe(80);
-  });
-  test('BMI 30+ → 65 with normal BP', () => {
-    expect(fitness.scoreHealthRisk('Normal', 30)).toBe(65);
-  });
-  test('underweight (<18.5) treated like overweight (60)', () => {
-    expect(fitness.scoreHealthRisk('Normal', 17)).toBe(80);
-  });
-  test('BP-only input still scores', () => {
-    expect(fitness.scoreHealthRisk('Hypertension Stage 1', null)).toBe(55);
-  });
-  test('both missing → null, never 0', () => {
-    expect(fitness.scoreHealthRisk(null, null)).toBeNull();
-  });
-  test('Hypertension Stage 2 is the worst BP band (20)', () => {
-    expect(fitness.scoreHealthRisk('Hypertension Stage 2', 22)).toBe(60);
-  });
-
-  // The anthropometric block uses the adult Asian BMI bands, while the stored
-  // Health Score deliberately keeps its older project bands (18.5–<25 healthy).
-  // This regression pins the divergence so a future change cannot silently
-  // move Health Score bands to match classifyBmi.
-  test.each([
-    [18.4, 'Underweight', 80],
-    [23.0, 'Overweight', 100],
-    [24.9, 'Overweight', 100],
-    [25.0, 'Obese', 80],
-  ])('BMI %p is %s while Health Score remains %p', (bmi, category, healthScore) => {
-    expect(fitness.classifyBmi(bmi)).toBe(category);
-    expect(fitness.scoreHealthRisk('Normal', bmi)).toBe(healthScore);
   });
 });
 
@@ -303,12 +252,6 @@ describe('vitals norms (BP, resting heart rate, SpO₂)', () => {
     expect(result.level).toBe('safe');
     expect(result.requiresMedicalClearance).toBe(false);
     expect(result.repeatBp).toBe(false);
-  });
-
-  test('crisis is the worst health-risk BP band', () => {
-    expect(fitness.scoreHealthRisk('Hypertensive Crisis', 22)).toBeLessThan(
-      fitness.scoreHealthRisk('Hypertension Stage 2', 22),
-    );
   });
 });
 
