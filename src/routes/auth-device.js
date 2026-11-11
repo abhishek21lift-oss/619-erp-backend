@@ -288,6 +288,15 @@ router.post('/login/verify', loginLimiter, async (req, res, next) => {
       });
     }
 
+    // The passkey settings page reads this to answer "when was this phone last
+    // used"; without it a working credential reads "Never used".
+    await pool.query(
+      `UPDATE user_webauthn_credentials
+          SET last_used_at = NOW(), updated_at = NOW()
+        WHERE credential_id = $1`,
+      ['native:' + deviceId]
+    );
+
     const portal = normalisePortal(req.body.portal);
     const problem = portalProblem(cred, portal);
     if (problem) {
