@@ -199,13 +199,27 @@ async function myDiet(clientId, orgId) {
 
   const { rows: meals } = await pool.query(
     `SELECT dpm.diet_template_id, dpm.day_of_week, dpm.sort_order,
-            m.name, m.description, m.meal_type, m.calories, m.protein_g, m.carbs_g, m.fats_g, m.serving_size
+            m.id AS meal_id, m.name, m.description, m.meal_type, m.calories,
+            m.protein_g, m.carbs_g, m.fats_g, m.serving_size,
+            dpm.slot, dpm.serve_time, dpm.day_offset
        FROM diet_plan_meals dpm
        JOIN meals m ON m.id = dpm.meal_id
       WHERE dpm.diet_template_id = ANY($1::text[])
         AND (m.organization_id IS NULL OR m.organization_id = $2)
       ORDER BY dpm.diet_template_id, dpm.day_of_week NULLS FIRST, dpm.sort_order`,
     [plans.map((p) => p.template_id), orgId],
+  );
+
+  // diet_meal_foods has no organization_id of its own: its policy walks to
+  // `meals`, which the query above already scoped. One read for every meal.
+  const mealIds = meals.map((m) => m.meal_id);
+  const { rows: foods } = mealIds.length === 0 ? { rows: [] } : await pool.query(
+    `SELECT meal_id, name, quantity, unit, grams, calories,
+            protein_g, carbs_g, fats_g, fiber_g, nutrition_source
+       FROM diet_meal_foods
+      WHERE meal_id = ANY($1::text[])
+      ORDER BY meal_id, sort_order`,
+    [mealIds],
   );
 
   const n = (v) => (v == null ? null : Number(v));
@@ -229,6 +243,17 @@ async function myDiet(clientId, orgId) {
         day_of_week: m.day_of_week, calories: m.calories,
         protein_g: n(m.protein_g), carbs_g: n(m.carbs_g), fats_g: n(m.fats_g),
         serving_size: m.serving_size,
+        slot: m.slot,
+        // Legacy rows store the meal time in `serving_size`; new ones in
+        // `serve_time`. Both are the same fact, so the read answers one field.
+        serve_time: m.serve_time ?? m.serving_size,
+        day_offset: m.day_offset,
+        foods: foods.filter((f) => f.meal_id === m.meal_id).map((f) => ({
+          name: f.name, quantity: n(f.quantity), unit: f.unit, grams: n(f.grams),
+          calories: n(f.calories), protein_g: n(f.protein_g), carbs_g: n(f.carbs_g),
+          fats_g: n(f.fats_g), fiber_g: n(f.fiber_g),
+          nutrition_source: f.nutrition_source,
+        })),
       })),
   }));
 }
