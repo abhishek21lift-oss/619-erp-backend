@@ -13,6 +13,7 @@ const { z } = require('../../lib/validation');
 const { optionalNumber } = require('../../lib/zodNumbers');
 const retests = require('./retests.service');
 const habits = require('./habits.service');
+const fitness = require('./member-fitness.service');
 
 router.use(auth, requireClient);
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -89,6 +90,18 @@ router.get('/progress/comparison', wrap(async (req, res) => {
   if (!self) return;
   try {
     res.json({ data: memberSafe(await retests.comparisonFor(self.orgId, self.clientId)) });
+  } catch (err) { fail(res, err); }
+}));
+
+// GET /api/me/fitness-tests — the member's own testing history, read-only.
+// There is no client id parameter and no write method beside it: a member can
+// read their own rows, and nothing on this path can create, change or delete
+// an assessment.
+router.get('/fitness-tests', wrap(async (req, res) => {
+  const self = requireSelf(req, res);
+  if (!self) return;
+  try {
+    res.json({ data: memberSafe(await fitness.dashboard(self.orgId, self.clientId)) });
   } catch (err) { fail(res, err); }
 }));
 
