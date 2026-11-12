@@ -98,4 +98,13 @@ describe('the repository is the whitelist', () => {
       expect(repo).not.toMatch(new RegExp(`\\b${column}\\b`));
     }
   });
+
+  it('selects the vitals and anthropometric readings the dashboard shows', () => {
+    for (const column of [
+      'bp_systolic', 'bp_diastolic', 'resting_heart_rate', 'resting_spo2',
+      'waist_iliac_cm', 'waist_hip_ratio', 'bmi_category',
+    ]) {
+      expect(repo).toMatch(new RegExp(`\\b${column}\\b`));
+    }
+  });
 });
