@@ -270,9 +270,40 @@ async function getSessionState(db, { orgId, sessionId }) {
   return rows[0] || null;
 }
 
+/**
+ * May this session still be edited in the trainer's log?
+ *
+ * A member's submitted workout is the record the member confirmed and the
+ * trainer is about to review. Editing its exercises or sets afterwards would
+ * silently rewrite what they submitted, so it is refused. Trainer-led sessions
+ * and member sessions still in progress are unaffected.
+ *
+ * @returns {{ok: true} | {ok: false, status: number, code: string, message: string}}
+ */
+async function ensureSessionWritable(db, { orgId, sessionId }) {
+  const { rows } = await db.query(
+    `SELECT source, status, submitted_at FROM workout_sessions
+      WHERE id = $1 AND organization_id = $2`,
+    [sessionId, orgId],
+  );
+  const session = rows[0];
+  if (!session) {
+    return { ok: false, status: 404, code: 'NOT_FOUND', message: 'Session not found' };
+  }
+  if (session.source === 'member' && (session.status === 'completed' || session.submitted_at)) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'SUBMITTED_WORKOUT_LOCKED',
+      message: 'This workout was submitted by the member and can no longer be edited.',
+    };
+  }
+  return { ok: true };
+}
+
 module.exports = {
   recomputeAssignmentProgress, computePrFlags, startSession, closeStaleSessions,
-  abandonEmptyStaleSessions, getSessionState, SessionStartError,
+  abandonEmptyStaleSessions, getSessionState, ensureSessionWritable, SessionStartError,
   // exported for tests
   requestDate, weekdayOf,
 };

@@ -23,6 +23,9 @@ jest.mock('../db/pool', () => ({
     if (/^SELECT status, source FROM workout_sessions/i.test(flat)) {
       return { rows: mockCurrent ? [mockCurrent] : [], rowCount: mockCurrent ? 1 : 0 };
     }
+    if (/^SELECT source, status, submitted_at FROM workout_sessions/i.test(flat)) {
+      return { rows: [{ source: 'studio', status: 'in_progress', submitted_at: null }], rowCount: 1 };
+    }
     if (/^UPDATE workout_sessions SET/i.test(flat)) {
       return { rows: [mockUpdated], rowCount: 1 };
     }

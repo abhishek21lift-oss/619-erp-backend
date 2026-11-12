@@ -31,7 +31,8 @@ const { adherence, muscleWeek, prTimeline, missedDays, weekStart } = require('./
 const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
 // Shared with the member app's self-logged workouts (client-portal).
 const {
-  recomputeAssignmentProgress, computePrFlags, startSession, getSessionState, SessionStartError,
+  recomputeAssignmentProgress, computePrFlags, startSession, getSessionState, ensureSessionWritable,
+  SessionStartError,
 } = require('./workout-log.service');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
@@ -40,6 +41,20 @@ const {
 router.use(auth, requireTrainer);
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+/**
+ * Refuse a write to a member's submitted session. Returns true when the
+ * response has already been sent. Trainer-led sessions never hit this.
+ */
+async function refuseIfLocked(req, res, sessionId) {
+  const writable = await ensureSessionWritable(pool, {
+    orgId: tenantScope(req).orgId,
+    sessionId,
+  });
+  if (writable.ok) return false;
+  res.status(writable.status).json({ error: { code: writable.code, message: writable.message } });
+  return true;
+}
 
 const numOpt = () => z.coerce.number().optional().nullable();
 
@@ -220,11 +235,20 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   if (!session) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   const exercises = exercisesRes.rows;
 
-  // "Planned for today": when this session is linked to an active plan
-  // assignment, show what the plan prescribes for the matching day-of-week
-  // so the trainer can compare/load it in without re-typing the program.
+  // "Planned for today": a member's submitted session carries the exact plan
+  // day they were shown, snapshotted at start. Prefer that over recomputing
+  // from the assignment — the plan may have been edited since, and the
+  // trainer is reviewing what the member was actually prescribed.
   let planned = null;
-  if (session.workout_assignment_id) {
+  if (session.prescribed && Array.isArray(session.prescribed.exercises)) {
+    planned = {
+      plan_name: session.prescribed.plan_name,
+      day_of_week: session.prescribed.day_of_week,
+      week: session.prescribed.current_week,
+      source: 'snapshot',
+      exercises: session.prescribed.exercises,
+    };
+  } else if (session.workout_assignment_id) {
     const dayIndex = session.workout_day ? WEEKDAYS.indexOf(session.workout_day) : -1;
     const { rows: planRows } = await pool.query(
       `SELECT wp.id AS plan_id, wp.name AS plan_name, wp.duration_weeks,
@@ -312,6 +336,101 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   });
 }));
 
+// GET /workout-log/pending-review?client_id=
+//
+// The trainer's queue: member sessions that were submitted and not yet
+// reviewed. Org-scoped like every read here; a client_id narrows it, it never
+// widens it.
+router.get('/workout-log/pending-review', auth, wrap(async (req, res) => {
+  const scope = tenantScope(req);
+  const params = [scope.orgId];
+  let clientClause = '';
+  if (req.query.client_id) {
+    params.push(req.query.client_id);
+    clientClause = ` AND ws.client_id = $${params.length}`;
+  }
+  const { rows } = await pool.query(
+    `SELECT ws.id, ws.client_id, c.name AS client_name,
+            ws.session_date, ws.submitted_at, ws.program_name, ws.workout_day,
+            ws.duration_minutes,
+            (SELECT COUNT(*)::int FROM workout_session_exercises wse
+              WHERE wse.session_id = ws.id) AS exercise_count,
+            (SELECT COUNT(*)::int FROM workout_sets s
+               JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+              WHERE wse.session_id = ws.id AND s.completed = TRUE) AS set_count,
+            COALESCE((SELECT SUM(s.weight_kg * s.reps)
+                        FROM workout_sets s
+                        JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+                       WHERE wse.session_id = ws.id AND s.completed = TRUE), 0) AS volume
+       FROM workout_sessions ws
+       JOIN pt_clients c ON c.id = ws.client_id
+      WHERE ws.organization_id = $1
+        AND ws.source = 'member' AND ws.status = 'completed'
+        AND ws.review_status = 'pending'${clientClause}
+      ORDER BY ws.submitted_at DESC NULLS LAST, ws.created_at DESC
+      LIMIT 100`,
+    params,
+  );
+  res.json({ data: rows });
+}));
+
+// POST /workout-log/sessions/:id/review — approve or ask for changes
+//
+// The only write allowed on a submitted member session. The member is told
+// the outcome and sees the feedback in their workout history.
+router.post('/workout-log/sessions/:id/review', auth, requireTrainer, wrap(async (req, res) => {
+  const decision = req.body?.decision;
+  const feedback = typeof req.body?.feedback === 'string' ? req.body.feedback.trim() : '';
+  if (!['approved', 'changes_requested'].includes(decision)) {
+    return res.status(400).json({ error: {
+      code: 'INVALID_DECISION',
+      message: 'decision must be approved or changes_requested.',
+    } });
+  }
+  if (feedback.length > 2000) {
+    return res.status(400).json({ error: {
+      code: 'FEEDBACK_TOO_LONG',
+      message: 'Keep feedback to 2000 characters.',
+    } });
+  }
+
+  const scope = tenantScope(req);
+  const { rows } = await pool.query(
+    `UPDATE workout_sessions
+        SET review_status = $3, reviewed_by = $4, reviewed_at = NOW(),
+            review_feedback = $5, updated_at = NOW()
+      WHERE id = $1 AND organization_id = $2
+        AND source = 'member' AND status = 'completed'
+      RETURNING id, client_id, review_status, review_feedback, reviewed_at`,
+    [req.params.id, scope.orgId, decision, req.user.id, feedback || null],
+  );
+  const reviewed = rows[0];
+  if (!reviewed) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+
+  const body = feedback || (decision === 'approved'
+    ? 'Your trainer approved this workout.'
+    : 'Your trainer reviewed this workout and left notes for next time.');
+  await pool.query(
+    `INSERT INTO notifications (user_id, type, title, body, link)
+     SELECT u.id, 'workout_review', $2, $3, '/member/workout'
+       FROM users u
+      WHERE u.pt_client_id = $1 AND u.organization_id = $4
+        AND u.deleted_at IS NULL`,
+    [
+      reviewed.client_id,
+      decision === 'approved' ? 'Workout approved' : 'Workout feedback',
+      body,
+      scope.orgId,
+    ],
+  );
+
+  await logActivity(req, 'workout_log.member.review', 'workout_session', reviewed.id, {
+    decision,
+    feedback: Boolean(feedback),
+  });
+  res.json({ data: reviewed });
+}));
+
 // POST /workout-log/sessions
 router.post('/workout-log/sessions', auth, requireTrainer, validate(sessionCreateSchema), wrap(async (req, res) => {
   const b = req.body;
@@ -384,6 +503,7 @@ router.get('/workout-log/sessions/:sessionId/planned-day-options', auth, wrap(as
 router.patch('/workout-log/sessions/:id', auth, requireTrainer, validate(sessionUpdateSchema), wrap(async (req, res) => {
   const { id } = req.params;
   const b = req.body;
+  if (await refuseIfLocked(req, res, id)) return;
   const allowed = ['session_date', 'program_name', 'workout_day', 'notes', 'duration_minutes', 'status'];
   const sets = [];
   const params = [id];
@@ -455,6 +575,7 @@ router.patch('/workout-log/sessions/:id', auth, requireTrainer, validate(session
 // DELETE /workout-log/sessions/:id
 router.delete('/workout-log/sessions/:id', auth, requireTrainer, wrap(async (req, res) => {
   const scope = tenantScope(req);
+  if (await refuseIfLocked(req, res, req.params.id)) return;
   const guard = ' AND organization_id = $2';
   const { rows } = await pool.query(
     `DELETE FROM workout_sessions WHERE id = $1${guard} RETURNING id, client_id, workout_assignment_id`,
@@ -473,6 +594,7 @@ router.post('/workout-log/sessions/:sessionId/exercises', auth, requireTrainer, 
   const { sessionId } = req.params;
   const b = req.body;
   const scope = tenantScope(req);
+  if (await refuseIfLocked(req, res, sessionId)) return;
   const guard = ' AND organization_id = $2';
   const { rows: sessionRows } = await pool.query(
     `SELECT id FROM workout_sessions WHERE id = $1${guard}`,
@@ -496,15 +618,24 @@ router.post('/workout-log/sessions/:sessionId/exercises', auth, requireTrainer, 
 // DELETE /workout-log/exercises/:id
 router.delete('/workout-log/exercises/:id', auth, requireTrainer, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  let query = 'DELETE FROM workout_session_exercises WHERE id = $1 RETURNING id';
-  let params = [req.params.id];
   // Gate on the parent session's org — the leaf table has no org column.
-  query = `DELETE FROM workout_session_exercises wse
-             USING workout_sessions ws
-            WHERE wse.id = $1 AND ws.id = wse.session_id AND ws.organization_id = $2
-            RETURNING wse.id`;
-  params = [req.params.id, scope.orgId];
-  const { rows } = await pool.query(query, params);
+  const { rows: found } = await pool.query(
+    `SELECT ws.id AS session_id
+       FROM workout_session_exercises wse
+       JOIN workout_sessions ws ON ws.id = wse.session_id
+      WHERE wse.id = $1 AND ws.organization_id = $2`,
+    [req.params.id, scope.orgId],
+  );
+  if (!found[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (await refuseIfLocked(req, res, found[0].session_id)) return;
+
+  const { rows } = await pool.query(
+    `DELETE FROM workout_session_exercises wse
+           USING workout_sessions ws
+          WHERE wse.id = $1 AND ws.id = wse.session_id AND ws.organization_id = $2
+          RETURNING wse.id`,
+    [req.params.id, scope.orgId],
+  );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ message: 'Exercise removed' });
 }));
@@ -527,6 +658,7 @@ router.post('/workout-log/exercises/:sessionExerciseId/sets', auth, requireTrain
   );
   const ex = exRows[0];
   if (!ex) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (await refuseIfLocked(req, res, ex.session_id)) return;
 
   let prFlags = { is_pr_weight: false, is_pr_reps: false, is_pr_volume: false };
   if (b.completed && b.weight_kg != null && b.reps != null) {
@@ -584,6 +716,7 @@ router.patch('/workout-log/sets/:id', auth, requireTrainer, validate(setUpdateSc
   );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (await refuseIfLocked(req, res, existing.session_id)) return;
 
   const merged = {
     weight_kg: b.weight_kg !== undefined ? b.weight_kg : existing.weight_kg,
@@ -620,16 +753,26 @@ router.patch('/workout-log/sets/:id', auth, requireTrainer, validate(setUpdateSc
 // DELETE /workout-log/sets/:id
 router.delete('/workout-log/sets/:id', auth, requireTrainer, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  let query = 'DELETE FROM workout_sets WHERE id = $1 RETURNING id';
-  let params = [req.params.id];
   // Gate on the parent session's org — the leaf table has no org column.
-  query = `DELETE FROM workout_sets s
-             USING workout_session_exercises wse, workout_sessions ws
-            WHERE s.id = $1 AND wse.id = s.session_exercise_id AND ws.id = wse.session_id
-              AND ws.organization_id = $2
-            RETURNING s.id`;
-  params = [req.params.id, scope.orgId];
-  const { rows } = await pool.query(query, params);
+  const { rows: found } = await pool.query(
+    `SELECT ws.id AS session_id
+       FROM workout_sets s
+       JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+       JOIN workout_sessions ws ON ws.id = wse.session_id
+      WHERE s.id = $1 AND ws.organization_id = $2`,
+    [req.params.id, scope.orgId],
+  );
+  if (!found[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (await refuseIfLocked(req, res, found[0].session_id)) return;
+
+  const { rows } = await pool.query(
+    `DELETE FROM workout_sets s
+           USING workout_session_exercises wse, workout_sessions ws
+          WHERE s.id = $1 AND wse.id = s.session_exercise_id AND ws.id = wse.session_id
+            AND ws.organization_id = $2
+          RETURNING s.id`,
+    [req.params.id, scope.orgId],
+  );
   if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   res.json({ message: 'Set deleted' });
 }));
