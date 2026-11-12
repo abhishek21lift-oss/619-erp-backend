@@ -633,16 +633,11 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
   const isRegenerate = Boolean(regenerate) && Boolean(conversation_id);
 
   // Conversation ownership gate. A caller-supplied conversation_id must
-  // belong to the authenticated user and their studio — the same
-  // `WHERE id = $1 AND user_id = $2` convention as GET/PATCH/DELETE
-  // /conversations/:id below, plus the tenant boundary Phase 4.3D found
-  // missing from the write path. It runs before the SSE headers so the
-  // failure is a JSON 404, and before any message read/write so a foreign
-  // conversation can never reach the prompt, RAG, tools, or the model.
-  // Unknown and foreign UUIDs answer identically. Conversations created
-  // before organizations were stamped (organization_id IS NULL) match no
-  // org and are therefore no longer reopenable — fail closed, never guessed
-  // into a studio.
+  // belong to the authenticated user — the same `WHERE id = $1 AND user_id = $2`
+  // convention as GET/PATCH/DELETE /conversations/:id below. It runs before
+  // the SSE headers so the failure is a JSON 404, and before any message
+  // read/write so a foreign conversation can never reach the prompt, RAG,
+  // tools, or the model. Unknown and foreign UUIDs answer identically.
   // `client_id` arrives in the request body and was PERSISTED unchecked onto
   // the conversation row below.
   //
@@ -683,8 +678,8 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
   if (convId) {
     try {
       const { rows } = await pool.query(
-        'SELECT id FROM ai_conversations WHERE id = $1 AND user_id = $2 AND organization_id = $3',
-        [convId, req.user.id, req.user.organization_id]
+        'SELECT id FROM ai_conversations WHERE id = $1 AND user_id = $2',
+        [convId, req.user.id]
       );
       if (!rows.length) return res.status(404).json({ error: 'Conversation not found' });
     } catch (err) {
@@ -718,8 +713,8 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     if (!convId) {
       const title = message.slice(0, 60).trim();
       const { rows } = await pool.query(
-        `INSERT INTO ai_conversations (user_id, client_id, title, organization_id) VALUES ($1,$2,$3,$4) RETURNING id`,
-        [req.user.id, ownedClientId, title, req.user.organization_id]
+        `INSERT INTO ai_conversations (user_id, client_id, title) VALUES ($1,$2,$3) RETURNING id`,
+        [req.user.id, ownedClientId, title]
       );
       convId = rows[0].id;
     }
@@ -3117,10 +3112,10 @@ router.get('/conversations', auth, async (req, res) => {
             (SELECT content FROM ai_messages WHERE conversation_id=c.id ORDER BY created_at DESC LIMIT 1) AS last_message,
             (SELECT COUNT(*) FROM ai_messages WHERE conversation_id=c.id) AS message_count
      FROM ai_conversations c
-     WHERE c.user_id=$1 AND c.organization_id=$2
+     WHERE c.user_id=$1
      ORDER BY c.pinned DESC, c.updated_at DESC
-     LIMIT $3 OFFSET $4`,
-    [req.user.id, orgParam(req), limit, offset]
+     LIMIT $2 OFFSET $3`,
+    [req.user.id, limit, offset]
   );
   res.json({ data: rows });
 });
@@ -3134,10 +3129,7 @@ router.patch('/conversations/:id', auth, async (req, res) => {
   const { title, pinned } = req.body || {};
 
   const sets = [];
-  // The tenant boundary is checked alongside user ownership, so a thread from
-  // a studio the caller has left (or a pre-273 thread with no org) is not
-  // reopenable. `organization_id = NULL` matches nothing: fail closed.
-  const params = [req.params.id, req.user.id, orgParam(req)];
+  const params = [req.params.id, req.user.id];
 
   if (title !== undefined) {
     const clean = String(title).trim().slice(0, 200);
@@ -3156,7 +3148,7 @@ router.patch('/conversations/:id', auth, async (req, res) => {
   // reshuffle the "most recent" ordering of the history list under the user.
   const { rows } = await pool.query(
     `UPDATE ai_conversations SET ${sets.join(', ')}
-     WHERE id = $1 AND user_id = $2 AND organization_id = $3
+     WHERE id = $1 AND user_id = $2
      RETURNING id, title, pinned, client_id, created_at, updated_at`,
     params
   );
@@ -3166,8 +3158,8 @@ router.patch('/conversations/:id', auth, async (req, res) => {
 
 router.get('/conversations/:id', auth, async (req, res) => {
   const { rows: [conv] } = await pool.query(
-    'SELECT * FROM ai_conversations WHERE id=$1 AND user_id=$2 AND organization_id=$3',
-    [req.params.id, req.user.id, orgParam(req)]
+    'SELECT * FROM ai_conversations WHERE id=$1 AND user_id=$2',
+    [req.params.id, req.user.id]
   );
   if (!conv) return res.status(404).json({ error: 'Conversation not found' });
 
@@ -3181,8 +3173,8 @@ router.get('/conversations/:id', auth, async (req, res) => {
 
 router.delete('/conversations/:id', auth, async (req, res) => {
   const { rowCount } = await pool.query(
-    'DELETE FROM ai_conversations WHERE id=$1 AND user_id=$2 AND organization_id=$3',
-    [req.params.id, req.user.id, orgParam(req)]
+    'DELETE FROM ai_conversations WHERE id=$1 AND user_id=$2',
+    [req.params.id, req.user.id]
   );
   if (!rowCount) return res.status(404).json({ error: 'Conversation not found' });
   res.json({ message: 'Conversation deleted' });
