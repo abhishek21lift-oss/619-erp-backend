@@ -462,6 +462,13 @@ const DOMAINS = {
       // 229) for the same reason platform_owners is: a table of credentials is
       // not something app_tenant may ever read, even by accident.
       'platform_hostinger_credentials', 'platform_hostinger_approvals',
+      // `audit_log` is the pre-v4 audit table: no organization_id, and nothing
+      // in the backend writes or reads it (the super-admin audit UI uses
+      // activity_log, which carries organization_id and stays on the tenant
+      // plane). Migration 283 dropped its permissive app_tenant policy and DML
+      // grants during the app_tenant cutover, so it is owner-only until
+      // something retires it.
+      'audit_log',
     ],
   },
 
@@ -485,9 +492,11 @@ const DOMAINS = {
     tenancy: TENANCY.DIRECT,
     description:
       'Who did what to which studio\'s data. Append-only. Every domain writes here; '
-      + 'no domain reads another\'s rows through it.',
+      + 'no domain reads another\'s rows through it. The legacy `audit_log` table is '
+      + 'not part of this domain: it carries no organization_id and nothing writes '
+      + 'or reads it, so it sits on the platform plane.',
     dependsOn: ['tenancy'],
-    tables: ['audit_log', 'activity_log'],
+    tables: ['activity_log'],
   },
 };
 
