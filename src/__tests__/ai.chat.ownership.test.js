@@ -1,7 +1,8 @@
 'use strict';
 // POST /api/ai/chat — conversation ownership authorization.
 //
-// A caller-supplied conversation_id must belong to the authenticated user.
+// A caller-supplied conversation_id must belong to the authenticated user in
+// the authenticated studio.
 // The route answers 404 for unknown AND foreign conversation UUIDs alike,
 // before any SSE header is flushed, so a foreign thread can never reach the
 // prompt, RAG, tools, or the model. This file proves:
@@ -48,8 +49,9 @@ const app = express();
 app.use(express.json());
 app.use('/api/ai', aiRouter);
 
-// The single ownership SELECT the route must issue first.
-const OWNERSHIP_SQL = /SELECT id FROM ai_conversations WHERE id = \$1 AND user_id = \$2/;
+// The single ownership SELECT the route must issue first. User AND studio:
+// the tenant boundary is part of ownership, not a separate later check.
+const OWNERSHIP_SQL = /SELECT id FROM ai_conversations WHERE id = \$1 AND user_id = \$2 AND organization_id = \$3/;
 
 // Streams the same way the real routedStream does: async generator of chunks.
 const streamChunks = (chunks) => jest.fn().mockImplementation(async function* () {
@@ -90,7 +92,7 @@ describe('POST /api/ai/chat — owned conversation', () => {
     // The ownership SELECT ran first, and the thread was then written to.
     const [firstSql, firstParams] = pool.query.mock.calls[0];
     expect(firstSql).toMatch(OWNERSHIP_SQL);
-    expect(firstParams).toEqual(['conv-1', 'usr-1']);
+    expect(firstParams).toEqual(['conv-1', 'usr-1', 'org-1']);
     expect(pool.query.mock.calls.some(([s]) => s.includes('INSERT INTO ai_messages'))).toBe(true);
     expect(logUsage).toHaveBeenCalledTimes(1);
   });
@@ -115,7 +117,7 @@ describe('POST /api/ai/chat — owned conversation', () => {
 
     const ownershipCall = pool.query.mock.calls[0];
     expect(ownershipCall[0]).toMatch(OWNERSHIP_SQL);
-    expect(ownershipCall[1]).toEqual(['conv-1', 'usr-1']);
+    expect(ownershipCall[1]).toEqual(['conv-1', 'usr-1', 'org-1']);
     expect(routedStream).toHaveBeenCalledTimes(1); // only reached after ownership passed
   });
 
@@ -129,7 +131,8 @@ describe('POST /api/ai/chat — owned conversation', () => {
     expect(sql).toContain('$1');
     expect(sql).toContain('$2');
     expect(sql).not.toContain('conv-1');       // no interpolation of the value
-    expect(params).toEqual(['conv-1', 'usr-1']); // bound, in order
+    expect(sql).toContain('$3');
+    expect(params).toEqual(['conv-1', 'usr-1', 'org-1']); // bound, in order
   });
 });
 
@@ -150,7 +153,7 @@ describe('POST /api/ai/chat — foreign conversation', () => {
     expect(pool.query).toHaveBeenCalledTimes(1);
     const [sql, params] = pool.query.mock.calls[0];
     expect(sql).toMatch(OWNERSHIP_SQL);
-    expect(params).toEqual(['foreign-conv', 'usr-1']);
+    expect(params).toEqual(['foreign-conv', 'usr-1', 'org-1']);
     expect(sql).not.toMatch(/ai_messages/);
     expect(sql).not.toMatch(/INSERT|DELETE/);
 
@@ -179,9 +182,9 @@ describe('POST /api/ai/chat — foreign conversation', () => {
   });
 
   it('rejects a conversation owned by a user in a different tenant', async () => {
-    // The check is user-scoped: it must NOT rely on organization_id at all,
-    // so a conversation from another tenant (or same tenant, another user)
-    // is rejected by the same single bound query.
+    // Ownership includes the studio: the same user id is not enough if the
+    // conversation belongs to another organization. One bound query decides
+    // user, studio, and existence, and answers 404 identically for all three.
     pool.query.mockResolvedValue({ rows: [] });
 
     const res = await request(app)
@@ -191,8 +194,7 @@ describe('POST /api/ai/chat — foreign conversation', () => {
     expect(res.status).toBe(404);
     const [sql, params] = pool.query.mock.calls[0];
     expect(sql).toMatch(OWNERSHIP_SQL);
-    expect(sql).not.toMatch(/organization_id/);
-    expect(params).toEqual(['other-tenant-conv', 'usr-1']);
+    expect(params).toEqual(['other-tenant-conv', 'usr-1', 'org-1']);
   });
 });
 
@@ -248,10 +250,11 @@ describe('POST /api/ai/chat — new conversation', () => {
     expect(res.text).toContain('"type":"done"');
 
     const [createSql, createParams] = pool.query.mock.calls[0];
-    expect(createSql).toMatch(/INSERT INTO ai_conversations \(user_id, client_id, title\)/);
+    expect(createSql).toMatch(/INSERT INTO ai_conversations \(user_id, client_id, title, organization_id\)/);
     expect(createParams[0]).toBe('usr-1');      // owner = authenticated user
     expect(createParams[1]).toBeNull();         // no client_id sent
     expect(createParams[2]).toBe('Hello coach');
+    expect(createParams[3]).toBe('org-1');      // studio = authenticated user's
 
     // No ownership SELECT is issued for a brand-new conversation.
     expect(pool.query.mock.calls.some(([s]) => s.match(OWNERSHIP_SQL))).toBe(false);
@@ -280,7 +283,7 @@ describe('POST /api/ai/chat — new conversation', () => {
     const insert = pool.query.mock.calls.find(
       ([sql]) => sql.includes('INSERT INTO ai_conversations'));
     expect(insert).toBeTruthy();
-    expect(insert[1]).toEqual(['usr-1', 'cli-9', 'Coach me']);
+    expect(insert[1]).toEqual(['usr-1', 'cli-9', 'Coach me', 'org-1']);
   });
 
   it('does not persist a client_id the caller studio does not own', async () => {
@@ -298,7 +301,7 @@ describe('POST /api/ai/chat — new conversation', () => {
     const insert = pool.query.mock.calls.find(
       ([sql]) => sql.includes('INSERT INTO ai_conversations'));
     expect(insert).toBeTruthy();
-    expect(insert[1]).toEqual(['usr-1', null, 'Coach me']);
+    expect(insert[1]).toEqual(['usr-1', null, 'Coach me', 'org-1']);
   });
 });
 

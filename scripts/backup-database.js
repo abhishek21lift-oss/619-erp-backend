@@ -173,7 +173,14 @@ async function main() {
     console.log('A backup on the same host as the thing it protects is not off-site.');
   }
 
-  recordSuccess({ url, size, tables, offsite });
+  // A deploy-time restore point must not overwrite the nightly job's row: it
+  // is local-only by design, and recording it would flip the Command Center's
+  // backup card to "not off-site" every time someone deployed.
+  if (process.env.BACKUP_SKIP_STATUS === '1') {
+    console.log('BACKUP_SKIP_STATUS=1 — leaving platform_backup_status alone (deploy-time restore point).');
+  } else {
+    recordSuccess({ url, size, tables, offsite });
+  }
 }
 
 /**

@@ -489,6 +489,38 @@ pool.ownerPoolForDiagnostics = function ownerPoolForDiagnostics() {
   return SEPARATE_ADMIN_CONNECTION ? ownerPool() : null;
 };
 
+/**
+ * The tenant pool, for the RLS preflight to inspect — raw connections, with
+ * no routing and no instrumentation.
+ *
+ * `pool.query` decides owner-or-tenant from the ambient request context. Boot
+ * has no request context, so `isPlatformWide()` is true and the preflight was
+ * measuring the OWNER connection while calling it the tenant — Phase 4.3D's
+ * F2, visible as `tenant_role=postgres` on a correctly cut-over box.
+ *
+ * Borrowing `_origConnect` is not optional here: `_origQuery` is bound to the
+ * same Pool object, and `Pool.prototype.query` calls `this.connect`, which this
+ * module replaced — so the "original" query still routed to the owner pool.
+ * A raw client, queried and released here, asks the connection application
+ * traffic actually uses.
+ *
+ * Named "forDiagnostics" for the same reason as the owner handle: nothing
+ * else may route business queries through it.
+ */
+pool.tenantPoolForDiagnostics = function tenantPoolForDiagnostics() {
+  return {
+    async query(...args) {
+      const client = await _origConnect();
+      try {
+        return await client.query(...args);
+      } finally {
+        client.release();
+      }
+    },
+    connect: _origConnect,
+  };
+};
+
 // Test connection on startup. Don't crash here — Render's healthcheck will
 // surface a 5xx and you can read the log. Crashing prevents redeploys from
 // recovering when Supabase has a brief connectivity blip.

@@ -10,6 +10,7 @@ const crypto = require('crypto');
 // what v12's `{ window: 1 }` meant.
 const { verifySync } = require('otplib');
 const pool   = require('../db/pool');
+const devices = require('../modules/devices/devices.service');
 const logger = require('../lib/logger');
 const { auth, invalidateUserCache } = require('../middleware/auth');
 const platformAuth = require('../middleware/platformAuth');
@@ -41,11 +42,27 @@ function emailFingerprint(email) {
 }
 
 async function revokeRefreshToken(rawToken) {
-  if (!rawToken) return;
+  if (!rawToken) return null;
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-  await pool.query('UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1', [tokenHash])
-    .catch(() => {});
+  // Read the owner before revoking: a retried logout (the first response was
+  // lost) must still be able to revoke the device token, so an already-revoked
+  // row must still identify its user. A failed UPDATE is not swallowed — the
+  // route returns 500 and leaves the cookies alone rather than reporting a
+  // logout that did not happen.
+  const { rows } = await pool.query(
+    'SELECT user_id FROM refresh_tokens WHERE token_hash = $1',
+    [tokenHash]
+  );
+  await pool.query(
+    'UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1',
+    [tokenHash]
+  );
+  return rows[0]?.user_id || null;
 }
+
+// Same shape the registration route accepts. A malformed value is ignored
+// rather than failing the logout: signing out must not depend on push.
+const FCM_TOKEN_RE = /^[A-Za-z0-9_:-]{20,4096}$/;
 
 // POST /api/auth/login
 router.post('/login', validate(authSchemas.login), async (req, res) => {
@@ -314,7 +331,25 @@ router.post('/logout', async function(req, res) {
   const portal = requestPortal(req);
   const ownRefresh = portal ? req.cookies?.[portalCookieNames(portal).refresh] : null;
   const rawToken = (portal ? ownRefresh : req.cookies?.refresh_token) || req.body?.refresh_token;
-  await revokeRefreshToken(rawToken);
+  const deviceToken = typeof req.body?.device_token === 'string' ? req.body.device_token : null;
+  const ownerId = await revokeRefreshToken(rawToken);
+
+  // Revoke this device in the same request that ends the session. The web
+  // client used to send DELETE /api/v1/devices alongside the logout and could
+  // lose that race; a token that outlived its session kept alerting the
+  // previous account. Ownership is checked against the refresh token's user,
+  // so a caller cannot revoke somebody else's device by naming its token.
+  if (ownerId && deviceToken && FCM_TOKEN_RE.test(deviceToken)) {
+    try {
+      await devices.revoke({ userId: ownerId, token: deviceToken, reason: 'logout' });
+    } catch (err) {
+      // A device-table failure must not trap the user in a session they asked
+      // to end. The refresh token is already revoked, and FCM will retire the
+      // token on its next send if the row survives.
+      logger.warn({ err: err.message }, 'logout device revoke failed');
+    }
+  }
+
   clearPortalCookies(res, portal, {
     legacy: portal ? legacyRefreshMatches(req, portal) : true,
   });

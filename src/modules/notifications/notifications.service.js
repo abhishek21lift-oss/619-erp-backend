@@ -15,6 +15,7 @@
 const crypto = require('crypto');
 const pool = require('../../db/pool');
 const logger = require('../../lib/logger');
+const pushGate = require('../../lib/pushGate');
 const { providerSignal } = require('../../lib/providerTimeout');
 const { escapeHtml } = require('../../lib/escape-html');
 
@@ -167,38 +168,19 @@ const channels = {
     return { status: 'not_configured', provider_id: null };
   },
 
-  push: async ({ device_token, title, body }) => {
-    if (!device_token) return { status: 'failed', error: 'no token' };
-
-    const serverKey = process.env.FCM_SERVER_KEY;
-    if (serverKey) {
-      try {
-        const res = await fetch('https://fcm.googleapis.com/fcm/send', {
-          method: 'POST',
-          headers: {
-            'Content-Type':  'application/json',
-            'Authorization': `key=${serverKey}`,
-          },
-          body: JSON.stringify({
-            to: device_token,
-            notification: { title, body },
-          }),
-          signal: providerSignal(),
-        });
-        const data = await res.json();
-        if (!res.ok || data.failure) {
-          logger.error({ data }, 'fcm push failed');
-          return { status: 'failed', error: data.results?.[0]?.error || 'fcm error' };
-        }
-        return { status: 'sent', provider_id: data.multicast_id?.toString() };
-      } catch (err) {
-        logger.error({ err: err.message }, 'fcm push exception');
-        return { status: 'failed', error: err.message };
-      }
-    }
-
-    logger.warn({ title }, 'push not_configured (set FCM_SERVER_KEY)');
-    return { status: 'not_configured', provider_id: null };
+  // Push is one transport for this notification, not a second system: the
+  // registry and the FCM v1 call live in push.service.js, and the inbox row is
+  // still written by the inapp job.
+  push: async ({ user_id, organization_id, type, title, body, link, dedupeKey }) => {
+    const { sendPush } = require('./push.service');
+    return sendPush({
+      recipient: { user_id, organization_id },
+      type,
+      title,
+      body,
+      link,
+      dedupeKey,
+    });
   },
 };
 
@@ -207,6 +189,8 @@ const templates = {
   payment_received: ({ name, amount, currency = '₹' }) => ({
     title: 'Payment received',
     body: `Hi ${name}, we received your payment of ${currency}${amount}. Thanks!`,
+    // Push copy is lock-screen safe: no name, amount or currency.
+    push: { title: 'Payment received', body: 'Open My PT Studio to view the receipt.' },
     email: {
       subject: 'Payment receipt — MY PT STUDIO',
       html: `<p>Hi ${escapeHtml(name)},</p><p>We received your payment of <b>${escapeHtml(currency)}${escapeHtml(amount)}</b>.</p>`,
@@ -216,6 +200,7 @@ const templates = {
   membership_expiring: ({ name, days, plan }) => ({
     title: `Membership expiring in ${days} days`,
     body: `Your ${plan} plan ends in ${days} days. Renew to keep training.`,
+    push: { title: 'Membership renewal', body: 'Open My PT Studio to see the renewal date.' },
     email: {
       subject: `Your membership expires in ${days} days`,
       html: `<p>Hi ${escapeHtml(name)},</p><p>Your <b>${escapeHtml(plan)}</b> ends in <b>${escapeHtml(days)} days</b>.</p>`,
@@ -225,6 +210,7 @@ const templates = {
   assessment_reminder: ({ name, scheduled_date, days }) => ({
     title: `Fitness re-test in ${days} days`,
     body: `Hi ${name}, your next fitness assessment is due on ${scheduled_date}. Reply to your trainer if you need to move it.`,
+    push: { title: 'Fitness assessment reminder', body: 'Open My PT Studio to view the scheduled date.' },
     email: {
       subject: `Fitness re-test in ${days} days`,
       html: `<p>Hi ${escapeHtml(name)},</p><p>Your next fitness assessment is due on <b>${escapeHtml(scheduled_date)}</b>.</p><p>Reply to your trainer if you need to move it.</p>`,
@@ -233,6 +219,7 @@ const templates = {
   assessment_due: ({ name, scheduled_date }) => ({
     title: 'Fitness re-test due today',
     body: `Hi ${name}, your fitness assessment is due today (${scheduled_date}). Your trainer will confirm the time.`,
+    push: { title: 'Fitness assessment due', body: 'Open My PT Studio to view the details.' },
     email: {
       subject: 'Fitness re-test due today',
       html: `<p>Hi ${escapeHtml(name)},</p><p>Your fitness assessment is due today, <b>${escapeHtml(scheduled_date)}</b>.</p><p>Your trainer will confirm the time.</p>`,
@@ -241,6 +228,7 @@ const templates = {
   assessment_overdue: ({ name, scheduled_date, days }) => ({
     title: 'Fitness re-test is overdue',
     body: `Hi ${name}, your fitness assessment was due on ${scheduled_date} (${days} days ago). Your trainer can help you rebook.`,
+    push: { title: 'Fitness assessment overdue', body: 'Open My PT Studio to rebook.' },
     email: {
       subject: 'Fitness re-test is overdue',
       html: `<p>Hi ${escapeHtml(name)},</p><p>Your fitness assessment was due on <b>${escapeHtml(scheduled_date)}</b> (${escapeHtml(days)} days ago).</p><p>Your trainer can help you rebook.</p>`,
@@ -261,6 +249,8 @@ const templates = {
     return {
       title: subject,
       body: `Hi ${name}, ${client_name}'s fitness re-test ${timing}. Open the progress hub to confirm or move it.`,
+      // Never put the client's name on a lock screen.
+      push: { title: 'Assessment needs attention', body: 'Open the progress hub to review.' },
       email: {
         subject,
         html: `<p>Hi ${escapeHtml(name)},</p><p><b>${escapeHtml(client_name)}</b>'s fitness re-test ${escapeHtml(timing)}.</p><p>Open the progress hub to confirm or move it.</p>`,
@@ -280,6 +270,8 @@ const templates = {
     return {
       title,
       body: `Hi ${name}, ${lead}: ${who}. Open At-risk Clients to see why and what to do.`,
+      // The count is safe; client names are not.
+      push: { title: 'Clients need attention', body: 'Open At-risk Clients to review.' },
       email: {
         subject: title,
         html: `<p>Hi ${escapeHtml(name)},</p><p>${escapeHtml(lead)}:</p><p><b>${escapeHtml(who)}</b></p><p><a href="${escapeHtml(href)}">Open At-risk Clients</a></p>`,
@@ -289,16 +281,19 @@ const templates = {
   class_reminder: ({ name, class_name, time }) => ({
     title: `${class_name} starts soon`,
     body: `Hi ${name}, reminder: ${class_name} at ${time}.`,
+    push: { title: 'Class reminder', body: 'A class starts soon. Open My PT Studio for details.' },
     whatsapp: { template: 'class_reminder', variables: [name, class_name, time] },
   }),
   booking_confirmed: ({ name, class_name, time }) => ({
     title: 'Booking confirmed',
     body: `Hi ${name}, you're booked for ${class_name} at ${time}.`,
+    push: { title: 'Booking confirmed', body: 'Open My PT Studio to view your booking.' },
     whatsapp: { template: 'booking_confirmed', variables: [name, class_name, time] },
   }),
   waitlist_promoted: ({ name, class_name, time }) => ({
     title: 'A spot opened up!',
     body: `Hi ${name}, you've been moved from the waitlist to confirmed for ${class_name} at ${time}.`,
+    push: { title: 'A spot opened up', body: 'Open My PT Studio to view your booking.' },
     whatsapp: { template: 'waitlist_promoted', variables: [name, class_name, time] },
   }),
 };
@@ -308,9 +303,13 @@ const templates = {
  * the channel adapter, and write the attempt to notification_log. Shared by
  * the inline fallback path (send) and the notifications worker.
  */
-async function deliverChannel(ch, type, recipient, data) {
+async function deliverChannel(ch, type, recipient, data, opts = {}) {
   const tpl = templates[type]?.({ ...data, name: recipient.name });
   if (!tpl) throw new Error(`Unknown notification template: ${type}`);
+  // Lock-screen copy is separate from the in-app/email body. A template that
+  // forgets it gets the generic line, never the full body: names, amounts and
+  // health detail must not appear on a lock screen by accident.
+  const pushCopy = tpl.push || { title: 'My PT Studio', body: 'Open the app to view this notification.' };
 
   // A client who opted out of this channel (migration 226) gets nothing on it
   // but what they are owed. Read fresh here rather than trusted from the
@@ -336,7 +335,18 @@ async function deliverChannel(ch, type, recipient, data) {
       ...tpl.whatsapp,
     }; break;
     case 'sms':      adapterArgs = { to: recipient.phone, body: tpl.body }; break;
-    case 'push':     adapterArgs = { device_token: recipient.device_token, title: tpl.title, body: tpl.body }; break;
+    // The user and tenant are the ones the resolver established, never values
+    // from the job payload's `data`. The push service looks the devices up
+    // inside that pair and revokes what FCM declares dead.
+    case 'push':     adapterArgs = {
+      user_id: recipient.user_id,
+      organization_id: recipient.organization_id,
+      type,
+      title: pushCopy.title,
+      body: pushCopy.body,
+      link: data.link,
+      dedupeKey: opts.dedupeKey,
+    }; break;
     default: throw new Error(`Unknown channel: ${ch}`);
   }
 
@@ -378,8 +388,8 @@ async function logAttempt(ch, type, recipient, data, res) {
  */
 const TRANSACTIONAL_NOTIFICATIONS = new Set(['payment_received', 'payment_failed', 'booking_confirmed', 'waitlist_promoted']);
 
-/** Opt-out flag per channel. Only email and WhatsApp have one. */
-const OPT_OUT_COLUMN = { email: 'email_opt_out', whatsapp: 'whatsapp_opt_out' };
+/** Opt-out flag per channel. Email, WhatsApp and push have one. */
+const OPT_OUT_COLUMN = { email: 'email_opt_out', whatsapp: 'whatsapp_opt_out', push: 'push_opt_out' };
 
 /**
  * Has this recipient opted out of `ch`? A PT client (recipientFromClient) is
@@ -406,7 +416,7 @@ async function optedOut(ch, recipient) {
  * queue outage costs latency, never a lost message.
  *
  * @param {string} type - template key
- * @param {object} recipient - { user_id, member_id, email, phone, device_token, name }
+ * @param {object} recipient - { user_id, organization_id, member_id, email, phone, name }
  * @param {object} data - template variables
  * @param {string[]} via - channels to use (default: ['inapp'])
  */
@@ -416,6 +426,14 @@ async function send(type, recipient, data, via = ['inapp']) {
   const results = {};
   for (const ch of via) {
     if (!channels[ch]) continue;
+
+    // Activation is server-side and per tenant. A request that names push on a
+    // disabled studio gets a recorded, visible `disabled` result and no queue
+    // job, so a stale config cannot start sending.
+    if (ch === 'push' && !pushGate.isEnabledFor(recipient?.organization_id)) {
+      results.push = { status: 'disabled', error: 'push_disabled' };
+      continue;
+    }
 
     let queued = null;
     try {
@@ -441,10 +459,27 @@ async function send(type, recipient, data, via = ['inapp']) {
  * silently completing it.
  */
 async function processNotificationJob(job) {
+  // The same queue carries the daily retention pass. It is not a channel job,
+  // so it is handled before the channel/template validation below.
+  if (job.name === 'push-retention') {
+    const { pruneDeliveries } = require('./push.service');
+    return pruneDeliveries();
+  }
+
   const { ch, type, recipient, data } = job.data || {};
   if (!channels[ch]) throw new Error(`Unknown notification channel: ${ch}`);
   if (!templates[type]) throw new Error(`Unknown notification template: ${type}`);
-  return deliverChannel(ch, type, recipient, data);
+  const res = await deliverChannel(ch, type, recipient, data, {
+    // The job id is stable across retries, so the push ledger can skip the
+    // devices that already accepted an earlier attempt.
+    dedupeKey: job.id != null ? `job:${job.id}` : null,
+  });
+  if (res?.retryable) {
+    const err = new Error(`retryable ${ch} failure: ${res.error || 'provider error'}`);
+    err.retryable = true;
+    throw err;
+  }
+  return res;
 }
 
 /**

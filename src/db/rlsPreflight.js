@@ -209,7 +209,7 @@ function finding(code, severity, detail) {
  * without taking a gym's software offline to make the point. `strict` is one
  * environment variable away once DATABASE_URL points at app_tenant.
  */
-async function verifyRlsPosture({ tenantPool, ownerPool, env = process.env } = {}) {
+async function verifyRlsPosture({ tenantPool, ownerPool, env = process.env, orgIds = null } = {}) {
   const enabled = rlsEnforcementEnabled(env);
   const strict = rlsStrictModeEnabled(env);
   const posture = !enabled ? 'off' : strict ? 'strict' : 'on';
@@ -281,7 +281,12 @@ async function verifyRlsPosture({ tenantPool, ownerPool, env = process.env } = {
 
   // ── The live proof ───────────────────────────────────────────────────────
   try {
-    const ids = await probeOrgIds(ownerPool || tenantPool);
+    // Production callers omit `orgIds` and let probeOrgIds pick the two
+    // busiest studios. Tests pass their own synthetic pair so the assertion
+    // does not depend on which real organizations a restored database holds.
+    const ids = Array.isArray(orgIds) && orgIds.length === 2
+      ? orgIds
+      : await probeOrgIds(ownerPool || tenantPool);
     if (!ids) {
       findings.push(finding(
         'isolation_probe_skipped', 'info',

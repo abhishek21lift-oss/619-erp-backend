@@ -12,10 +12,12 @@ process.env.TWILIO_ACCOUNT_SID = 'AC_test';
 process.env.TWILIO_AUTH_TOKEN = 'token';
 process.env.TWILIO_WHATSAPP_FROM = 'whatsapp:+10000000000';
 process.env.TWILIO_SMS_FROM = '+10000000000';
-process.env.FCM_SERVER_KEY = 'fcm-key';
 
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 jest.mock('../db/pool', () => ({ query: jest.fn(), connect: jest.fn() }));
+jest.mock('google-auth-library', () => ({
+  JWT: class { getAccessToken() { return Promise.resolve({ token: 'test-access-token' }); } },
+}));
 
 /** A provider that accepts the connection and never answers. */
 function hangingFetch() {
@@ -48,9 +50,18 @@ describe('provider calls time out', () => {
     expect(out.status).toBe('failed');
   });
 
-  it('FCM push', async () => {
-    const { channels } = require('../modules/notifications/notifications.service');
-    const out = await withinMs(channels.push({ device_token: 'tok', title: 't', body: 'b' }), 2000);
-    expect(out.status).toBe('failed');
+  it('FCM HTTP v1', async () => {
+    // The legacy server-key path is gone; the timeout now belongs to the v1
+    // client, so this exercises the same guarantee through its real entry.
+    process.env.FIREBASE_SERVICE_ACCOUNT = JSON.stringify({
+      project_id: 'myptstudio-test',
+      client_email: 'push@myptstudio-test.iam.gserviceaccount.com',
+      private_key: 'test-key',
+    });
+    const { sendMessage } = require('../lib/fcm');
+    const out = await withinMs(sendMessage({ token: 'tok', title: 't', body: 'b' }), 2000);
+    expect(out.ok).toBe(false);
+    expect(out.retryable).toBe(true);
+    expect(global.fetch.mock.calls[0][1].signal).toBeDefined();
   });
 });

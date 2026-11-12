@@ -84,7 +84,7 @@ describe('POST /api/ai/chat gates the client id', () => {
     const [insert] = conversationWrites();
     expect(insert).toBeDefined();
     // The conversation is opened with NO client rather than another studio's.
-    expect(insert.params).toEqual(['usr-1', null, 'hello']);
+    expect(insert.params).toEqual(['usr-1', null, 'hello', ORG_A]);
   });
 
   it('persists a client the caller studio does own', async () => {
@@ -97,7 +97,7 @@ describe('POST /api/ai/chat gates the client id', () => {
       .send({ message: 'hello', client_id: 'our-client' });
 
     const [insert] = conversationWrites();
-    expect(insert.params).toEqual(['usr-1', 'our-client', 'hello']);
+    expect(insert.params).toEqual(['usr-1', 'our-client', 'hello', ORG_A]);
   });
 
   it('a foreign client is indistinguishable from an unknown one', async () => {
@@ -142,6 +142,6 @@ describe('POST /api/ai/chat gates the client id', () => {
     await request(app).post('/api/ai/chat').send({ message: 'hello' });
     expect(mockQueries.some((q) => /FROM pt_clients/i.test(q.sql))).toBe(false);
     const [insert] = conversationWrites();
-    expect(insert.params).toEqual(['usr-1', null, 'hello']);
+    expect(insert.params).toEqual(['usr-1', null, 'hello', ORG_A]);
   });
 });
