@@ -13,9 +13,15 @@
 // with an `app_tenant` login. RLS_TEST_TENANT_PASSWORD supplies its password.
 
 const { Pool } = require('pg');
+const { randomUUID } = require('crypto');
 
 const DB_URL = process.env.RLS_TEST_DATABASE_URL;
 const describeIf = DB_URL ? describe : describe.skip;
+
+// Synthetic pair for the isolation probe. Seeded below so the probe runs even
+// when the restored database does not happen to hold two studios with clients.
+const ORG_A = randomUUID();
+const ORG_B = randomUUID();
 
 if (process.env.CI && !DB_URL) {
   describe('RLS preflight real-database proof', () => {
@@ -63,9 +69,20 @@ describeIf('RLS preflight against a real database', () => {
 
   beforeAll(async () => {
     owner = new Pool({ connectionString: DB_URL, max: 4 });
+    await owner.query(
+      `INSERT INTO organizations (id, name, slug) VALUES ($1,'Preflight A',$3), ($2,'Preflight B',$4)
+       ON CONFLICT (id) DO NOTHING`,
+      [ORG_A, ORG_B, `preflight-a-${ORG_A.slice(0, 8)}`, `preflight-b-${ORG_B.slice(0, 8)}`]
+    );
+    await owner.query(
+      `INSERT INTO pt_clients (id, name, organization_id) VALUES ($1,'Preflight A Member',$3), ($2,'Preflight B Member',$4)`,
+      [`preflight-a-${ORG_A.slice(0, 8)}`, `preflight-b-${ORG_B.slice(0, 8)}`, ORG_A, ORG_B]
+    );
   });
 
   afterAll(async () => {
+    await owner.query(`DELETE FROM pt_clients WHERE organization_id IN ($1,$2)`, [ORG_A, ORG_B]);
+    await owner.query(`DELETE FROM organizations WHERE id IN ($1,$2)`, [ORG_A, ORG_B]);
     await appPool?.end();
     const ownerDiag = appPool?.ownerPoolForDiagnostics?.();
     if (ownerDiag && ownerDiag !== appPool) await ownerDiag.end().catch(() => {});
@@ -93,6 +110,7 @@ describeIf('RLS preflight against a real database', () => {
       tenantPool: appPool.tenantPoolForDiagnostics(),
       ownerPool: appPool.ownerPoolForDiagnostics(),
       env: { TENANT_RLS_ENFORCE: 'on' },
+      orgIds: [ORG_A, ORG_B],
     });
     setRlsPosture(result);
 

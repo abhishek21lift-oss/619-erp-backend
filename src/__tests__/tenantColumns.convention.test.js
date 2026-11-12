@@ -155,6 +155,7 @@ const NO_TENANT_COLUMN_BY_DESIGN = {
   webauthn_challenges: 'Short-lived passkey ceremony state, keyed on the account.',
   mfa_recovery_codes: 'Credential, keyed on user_id, with its own user-scoped RLS policy (migration 169).',
   notifications: 'Keyed on the recipient user, who belongs to exactly one studio.',
+  push_deliveries: 'Retry-state ledger keyed by dedupe_key + token_hash, not by studio. The push sender runs on the owner/service-role connection and app_tenant is explicitly revoked (migration 272); token ownership lives on device_tokens, which carries organization_id.',
   ai_conversations: 'Keyed on user_id, and every read carries `AND user_id = $n` bound from the session — a conversation belongs to the account that had it, not to a studio.',
 };
 

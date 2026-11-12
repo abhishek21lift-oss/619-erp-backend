@@ -24,7 +24,7 @@ describe('PATCH /api/ai/conversations/:id', () => {
     expect(res.status).toBe(200);
     expect(res.body.data.title).toBe('Renewals plan');
     const [sql, params] = pool.query.mock.calls[0];
-    expect(sql).toMatch(/SET title = \$3/);
+    expect(sql).toMatch(/SET title = \$4/);
     // Scoped to the caller — another user's conversation can't be renamed.
     expect(params[1]).toBe('usr-1');
     // Renaming is not activity: updated_at must not be bumped, or the
@@ -37,14 +37,14 @@ describe('PATCH /api/ai/conversations/:id', () => {
     const res = await request(app).patch('/api/ai/conversations/c1').send({ pinned: true });
     expect(res.status).toBe(200);
     expect(res.body.data.pinned).toBe(true);
-    expect(pool.query.mock.calls[0][0]).toMatch(/SET pinned = \$3/);
+    expect(pool.query.mock.calls[0][0]).toMatch(/SET pinned = \$4/);
   });
 
   it('updates both fields at once', async () => {
     pool.query.mockResolvedValueOnce({ rows: [{ id: 'c1', title: 'y', pinned: true }] });
     const res = await request(app).patch('/api/ai/conversations/c1').send({ title: 'y', pinned: true });
     expect(res.status).toBe(200);
-    expect(pool.query.mock.calls[0][0]).toMatch(/title = \$3, pinned = \$4/);
+    expect(pool.query.mock.calls[0][0]).toMatch(/title = \$4, pinned = \$5/);
   });
 
   it('rejects an empty title rather than blanking it', async () => {
