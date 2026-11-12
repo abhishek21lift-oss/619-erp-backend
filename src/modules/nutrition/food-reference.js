@@ -91,7 +91,7 @@ const round2 = (n) => Math.round(n * 100) / 100;
 async function loadFoodReference(orgId) {
   const { rows } = await pool.query(
     `SELECT id, organization_id, name, normalized_name, aliases, category, culture, region,
-            serving_unit, serving_grams, calories, protein_g, carbs_g, fats_g, fiber_g
+            source, serving_unit, serving_grams, calories, protein_g, carbs_g, fats_g, fiber_g
        FROM foods
       WHERE is_active = TRUE
         AND (organization_id IS NULL OR organization_id = $1)
@@ -129,12 +129,17 @@ function referenceFromRows(rows = []) {
       // A mixed kitchen is every kitchen: the default has to offer the
       // Indian seed too, or a client with no recorded culture gets a plan
       // with no reference foods at all.
+      // The prompt carries 120 names. Studio foods go first, then curated
+      // staples, then the imported datasets: an alphabetical slice of the
+      // 1,622-food catalog would drop roti, dal and rice from the prompt.
+      const rank = (food) => (food.organization_id != null ? 0 : food.source === 'curated' ? 1 : 2);
       const names = foods
         .filter((food) => {
           if (!wanted || wanted === 'mixed') return true;
           const c = String(food.culture ?? '').trim().toLowerCase();
           return c === 'mixed' || c === wanted;
         })
+        .sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name)))
         .map((food) => food.name)
         .filter(Boolean);
       return [...new Set(names)].slice(0, 120);
