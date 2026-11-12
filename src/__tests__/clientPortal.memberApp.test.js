@@ -111,6 +111,50 @@ describe('GET /api/me/diet', () => {
     expect(res.body.data[0].daily.protein_g).toBe(150);
     expect(res.body.data[0].meals[0]).toMatchObject({ name: 'Oats', protein_g: 20 });
   });
+
+  it('returns the saved foods and the serve time per meal', async () => {
+    mockResponder = (sql) => {
+      if (/FROM diet_assignments/.test(sql)) {
+        return { rows: [{ assignment_id: 'd1', template_id: 't1', name: 'Lean', daily_calories: 2000 }] };
+      }
+      if (/FROM diet_plan_meals/.test(sql)) {
+        return { rows: [{ diet_template_id: 't1', meal_id: 'm1', name: 'Breakfast', meal_type: 'breakfast',
+          calories: 400, slot: 'breakfast', serve_time: '07:30', day_offset: 0 }] };
+      }
+      return { rows: [{ meal_id: 'm1', name: 'Oats', quantity: '60.00', unit: 'g', grams: '60.00',
+        calories: '230.0', protein_g: '8.0', carbs_g: '40.0', fats_g: '4.0', fiber_g: '6.0',
+        nutrition_source: 'reference' }] };
+    };
+    const res = await request(app).get('/api/me/diet').expect(200);
+    const meal = res.body.data[0].meals[0];
+    expect(meal).toMatchObject({ slot: 'breakfast', serve_time: '07:30', day_offset: 0 });
+    expect(meal.foods[0]).toMatchObject({ name: 'Oats', quantity: 60, unit: 'g', nutrition_source: 'reference' });
+    expect(meal.foods[0].protein_g).toBe(8);
+  });
+
+  it('does not query foods when the plan has no meals', async () => {
+    mockResponder = (sql) => (/FROM diet_assignments/.test(sql)
+      ? { rows: [{ assignment_id: 'd1', template_id: 't1', name: 'Lean' }] }
+      : { rows: [] });
+    await request(app).get('/api/me/diet').expect(200);
+    expect(mockQueries.some((q) => /FROM diet_meal_foods/.test(q.sql))).toBe(false);
+  });
+
+  it('falls back to the legacy serving_size time when serve_time is null', async () => {
+    mockResponder = (sql) => {
+      if (/FROM diet_assignments/.test(sql)) {
+        return { rows: [{ assignment_id: 'd1', template_id: 't1', name: 'Lean' }] };
+      }
+      if (/FROM diet_plan_meals/.test(sql)) {
+        return { rows: [{ diet_template_id: 't1', meal_id: 'm1', name: 'Breakfast',
+          meal_type: 'breakfast', calories: 400, slot: null, serve_time: null,
+          day_offset: null, serving_size: '08:00' }] };
+      }
+      return { rows: [] };
+    };
+    const res = await request(app).get('/api/me/diet').expect(200);
+    expect(res.body.data[0].meals[0].serve_time).toBe('08:00');
+  });
 });
 
 describe('GET /api/me/checkins', () => {

@@ -130,6 +130,7 @@ const NO_TENANT_COLUMN_BY_DESIGN = {
   workout_sets: 'Child of workout_session_exercises, itself a child of an org-scoped session.',
   invoice_items: 'Child of invoices, which carries organization_id and is scoped there.',
   diet_plan_meals: 'Join between diet_templates and meals; both now carry the column.',
+  diet_meal_foods: 'Child of meals, reached only through meal_id; its RLS policy walks back to meals.organization_id and both readers join meals.',
   support_ticket_messages: 'Child of support_tickets, which carries organization_id.',
   ai_messages: 'Child of ai_conversations, which is keyed on the user who owns it.',
   pt_os_measurements: 'Child of pt_clients via client_id. Both readers scope on a client id taken from the session, never the request; migration 177 gives it the parent-walk RLS policy 159 uses for this shape.',

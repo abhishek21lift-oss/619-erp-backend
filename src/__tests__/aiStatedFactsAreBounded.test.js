@@ -122,4 +122,21 @@ describe('a stated fact inside the range', () => {
     expect(numInRange(40, 'meal_frequency')).toBeNull();
     expect(numInRange(5, 'meal_frequency')).toBe(5);
   });
+
+  // Same arrangement for the diet engine's other typed inputs: the bounds live
+  // in this one table so "a target weight of 900" is refused here rather than
+  // anywhere downstream that happens to remember to check.
+  test('the diet engine gets its stated bounds from this table too', () => {
+    expect(STATED_RANGE.target_weight_kg).toEqual([30, 400]);
+    expect(STATED_RANGE.workout_duration_minutes).toEqual([20, 180]);
+    expect(FIELDS).not.toContain('target_weight_kg');
+    expect(FIELDS).not.toContain('workout_duration_minutes');
+
+    expect(numInRange(72, 'target_weight_kg')).toBe(72);
+    expect(numInRange(29, 'target_weight_kg')).toBeNull();
+    expect(numInRange(401, 'target_weight_kg')).toBeNull();
+    expect(numInRange(90, 'workout_duration_minutes')).toBe(90);
+    expect(numInRange(19, 'workout_duration_minutes')).toBeNull();
+    expect(numInRange(181, 'workout_duration_minutes')).toBeNull();
+  });
 });

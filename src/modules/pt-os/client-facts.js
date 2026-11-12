@@ -194,6 +194,10 @@ const STATED_RANGE = {
   // the table so both prompts refuse the same impossible values. "40 meals a
   // day" is a prompt the model will try to satisfy.
   meal_frequency: [1, 12],
+  // Same reason: the diet engine's own stated inputs. A target weight outside
+  // this is a typo, and a 400-minute session is not a session.
+  target_weight_kg: [30, 400],
+  workout_duration_minutes: [20, 180],
 };
 
 function numInRange(v, field) {
@@ -668,4 +672,7 @@ module.exports = {
   FIELDS, BLOCKING, STATED_SUPERSEDES, resolveClientFacts, describeFacts, describeInterview,
   // Exported for the tests that pin the parsing rather than the resolution.
   countDays, ageFromDob, numInRange, STATED_RANGE,
+  // Exported for the diet facts resolver, which applies the same precedence
+  // and freshness rules to the nutrition planning record.
+  fromSources, when, withFreshness,
 };

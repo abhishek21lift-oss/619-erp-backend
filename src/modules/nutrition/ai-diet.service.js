@@ -55,6 +55,46 @@ function macro(v, field) {
   return num(v, 0, 1000, field);
 }
 
+/** "HH:MM" only — the shape diet_plan_meals.serve_time accepts. */
+function clockTime(value) {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(value ?? '').trim());
+  return m ? `${m[1]}:${m[2]}` : null;
+}
+
+/** Nullable non-negative number for a food's macros; absent is null, not 0. */
+function optionalNumber(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
+ * A food line that can become a diet_meal_foods row, or null for the legacy
+ * free-text quantity ("60 g") that only ever belonged in a description.
+ */
+function normaliseFood(f) {
+  const quantity = typeof f?.quantity === 'number' ? f.quantity : Number(f?.quantity);
+  const unit = str(f?.unit, 40);
+  const name = str(f?.name, 120);
+  const calories = Number(f?.calories);
+  if (!Number.isFinite(quantity) || quantity <= 0 || !unit || !name) return null;
+  if (!Number.isFinite(calories) || calories < 0) return null;
+  const grams = Number(f?.grams);
+  return {
+    food_id: str(f?.food_id, 120) || null,
+    name,
+    quantity,
+    unit,
+    grams: Number.isFinite(grams) && grams > 0 ? grams : null,
+    calories,
+    protein_g: optionalNumber(f?.protein_g),
+    carbs_g: optionalNumber(f?.carbs_g),
+    fats_g: optionalNumber(f?.fat_g),
+    fiber_g: optionalNumber(f?.fiber_g),
+    nutrition_source: f?.nutrition_source === 'reference' ? 'reference' : 'model',
+  };
+}
+
 /** The generator speaks in goals like "fat_loss"; the template column has a fixed set. */
 function templateGoal(goal) {
   const g = String(goal || '').toLowerCase().replace(/[\s-]+/g, '_');
@@ -104,18 +144,30 @@ function normalisePlan(plan) {
     const mealName = str(m?.name, 120);
     if (!mealName) throw new DietPlanError(`meal ${i + 1} needs a name`);
     const foods = Array.isArray(m.foods) ? m.foods.slice(0, 30) : [];
+    // A structured food is one a row can be written for: numeric quantity,
+    // a unit word, and a calorie figure the table accepts. Everything else
+    // keeps the old string-description path.
+    const structured = foods.map((f) => normaliseFood(f));
     const foodLines = foods
-      .map((f) => [str(f?.quantity, 60), str(f?.name, 120)].filter(Boolean).join(' '))
+      .map((f, j) => {
+        const food = structured[j];
+        const quantity = food ? `${food.quantity} ${food.unit}`.trim() : str(f?.quantity, 60);
+        return [quantity, str(f?.name, 120)].filter(Boolean).join(' ');
+      })
       .filter(Boolean);
     return {
       name: mealName,
       meal_type: mealType(mealName, m.time),
+      slot: str(m.slot, 40) || null,
+      serve_time: clockTime(m.time),
+      day_offset: Number(m.day_offset) === 1 ? 1 : 0,
       calories: Math.round(num(m.calories, 0, 5000, `meal ${i + 1} calories`)),
       protein_g: macro(m.protein_g, `meal ${i + 1} protein_g`),
       carbs_g: macro(m.carbs_g, `meal ${i + 1} carbs_g`),
       fats_g: macro(m.fat_g, `meal ${i + 1} fat_g`),
       serving_size: str(m.time, 40) || null,
       description: foodLines.length ? foodLines.join('\n').slice(0, 2000) : null,
+      foods: structured.filter(Boolean),
     };
   });
 
@@ -128,6 +180,7 @@ function normalisePlan(plan) {
     daily_protein_g: macro(macros.protein_g, 'plan.macros.protein_g'),
     daily_carbs_g: macro(macros.carbs_g, 'plan.macros.carbs_g'),
     daily_fats_g: macro(macros.fat_g, 'plan.macros.fat_g'),
+    fiber_g: macro(plan.fiber_g, 'plan.fiber_g'),
     meals,
   };
 }
@@ -136,19 +189,25 @@ function normalisePlan(plan) {
  * Write the plan and assign it. The caller has already checked that the
  * client belongs to `orgId`; every row written here is stamped with it.
  */
-async function saveAiDietPlan({ plan, clientId, orgId, userId, trainerId }) {
+async function saveAiDietPlan({ plan, calculation = null, clientId, orgId, userId, trainerId }) {
   const p = normalisePlan(plan);
+  const calcInputs = calculation?.inputs ?? {};
   const db = await pool.connect();
+  let foodsWritten = 0;
   try {
     await db.query('BEGIN');
 
     const templateId = randomUUID();
     await db.query(
       `INSERT INTO diet_templates (id, name, description, goal,
-         daily_calories, daily_protein_g, daily_carbs_g, daily_fats_g, created_by, organization_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+         daily_calories, daily_protein_g, daily_carbs_g, daily_fats_g, created_by, organization_id,
+         calculation_version, calculation, food_culture, dietary_pattern)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14)`,
       [templateId, p.name, p.description, p.goal, p.daily_calories,
-        p.daily_protein_g, p.daily_carbs_g, p.daily_fats_g, userId, orgId],
+        p.daily_protein_g, p.daily_carbs_g, p.daily_fats_g, userId, orgId,
+        calculation?.version ?? null,
+        calculation ? JSON.stringify(calculation) : null,
+        calcInputs.food_culture ?? null, calcInputs.dietary_pattern ?? null],
     );
 
     for (const [i, m] of p.meals.entries()) {
@@ -161,10 +220,22 @@ async function saveAiDietPlan({ plan, clientId, orgId, userId, trainerId }) {
           m.protein_g, m.carbs_g, m.fats_g, m.serving_size, userId, orgId],
       );
       await db.query(
-        `INSERT INTO diet_plan_meals (id, diet_template_id, meal_id, day_of_week, sort_order)
-         VALUES ($1,$2,$3,NULL,$4)`,
-        [randomUUID(), templateId, mealId, i],
+        `INSERT INTO diet_plan_meals (id, diet_template_id, meal_id, day_of_week, sort_order,
+           slot, serve_time, day_offset)
+         VALUES ($1,$2,$3,NULL,$4,$5,$6,$7)`,
+        [randomUUID(), templateId, mealId, i, m.slot, m.serve_time, m.day_offset],
       );
+      for (const [j, food] of m.foods.entries()) {
+        await db.query(
+          `INSERT INTO diet_meal_foods (id, meal_id, food_id, name, quantity, unit, grams,
+             calories, protein_g, carbs_g, fats_g, fiber_g, nutrition_source, sort_order)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+          [randomUUID(), mealId, food.food_id, food.name, food.quantity, food.unit,
+            food.grams, food.calories, food.protein_g, food.carbs_g, food.fats_g,
+            food.fiber_g, food.nutrition_source, j],
+        );
+        foodsWritten += 1;
+      }
     }
 
     // One active plan per client: the new plan supersedes the old one in the
@@ -185,7 +256,7 @@ async function saveAiDietPlan({ plan, clientId, orgId, userId, trainerId }) {
     );
 
     await db.query('COMMIT');
-    return { template_id: templateId, name: p.name, meals: p.meals.length, assignment: rows[0] };
+    return { template_id: templateId, name: p.name, meals: p.meals.length, foods: foodsWritten, assignment: rows[0] };
   } catch (err) {
     await db.query('ROLLBACK');
     throw err;

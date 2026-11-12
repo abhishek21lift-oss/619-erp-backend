@@ -284,7 +284,10 @@ const DOMAINS = {
     tenancy: TENANCY.DERIVED,
     description: 'Diet templates, assignments and logging.',
     dependsOn: ['tenancy', 'clients'],
-    tables: ['diet_templates', 'diet_plan_meals', 'diet_assignments', 'meals', 'nutrition_logs'],
+    tables: ['diet_templates', 'diet_plan_meals', 'diet_assignments', 'meals', 'nutrition_logs',
+      // Food-level planning (migration 280): the platform's food reference
+      // library and the per-meal foods saved from a generated plan.
+      'foods', 'diet_meal_foods'],
   },
 
   attendance: {
@@ -370,6 +373,10 @@ const DOMAINS = {
       // `training` because a proposal is not a plan — most are never accepted
       // and never become one.
       'ai_workout_generations',
+      // The diet engine's proposal ledger (migration 281): what was proposed,
+      // the targets/schedule it was judged against, and whether a trainer
+      // accepted it. Same shape and reasoning as ai_workout_generations.
+      'ai_diet_generations',
     ],
   },
 
