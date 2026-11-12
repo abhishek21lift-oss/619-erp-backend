@@ -80,8 +80,20 @@ const WORKOUT_PLAN = {
 };
 const DIET_PLAN = {
   name: 'Lean Fuel', description: 'deficit plan', goal: 'weight_loss',
-  total_calories: 1800, macros: { protein_g: 115, carbs_g: 200, fat_g: 50 },
-  meal_frequency: 5, meals: [], grocery_list: [], supplements: [],
+  total_calories: 1780, macros: { protein_g: 143, carbs_g: 178, fat_g: 48 },
+  fiber_g: 25, meal_frequency: 5,
+  // Internally consistent: meal calories sum to total_calories, the daily
+  // macros sum to the engine's targets for the fixture client, and the slots
+  // and times match what the scheduler produces for 5 meals. Validation stays
+  // green here so each test exercises only the behaviour it is named for.
+  meals: [
+    { name: 'Breakfast', slot: 'breakfast', time: '07:30', calories: 356, protein_g: 29, carbs_g: 36, fat_g: 10, foods: [] },
+    { name: 'Mid-morning snack', slot: 'snack_am', time: '11:00', calories: 356, protein_g: 29, carbs_g: 36, fat_g: 10, foods: [] },
+    { name: 'Lunch', slot: 'lunch', time: '13:00', calories: 356, protein_g: 29, carbs_g: 35, fat_g: 9, foods: [] },
+    { name: 'Evening snack', slot: 'snacks', time: '16:30', calories: 356, protein_g: 28, carbs_g: 35, fat_g: 10, foods: [] },
+    { name: 'Dinner', slot: 'dinner', time: '20:00', calories: 356, protein_g: 28, carbs_g: 36, fat_g: 9, foods: [] },
+  ],
+  grocery_list: [], supplements: [],
   hydration_ml: 3000, notes: '',
 };
 
@@ -582,6 +594,68 @@ describe('diet/generate', () => {
     expect(res.body.error).toBe('Client not found');
     expect(pool.query).toHaveBeenCalledTimes(1);
     expect(routedStream).not.toHaveBeenCalled();
+  });
+
+  test('a plan that omits a scheduled meal is revised once and ships flagged', async () => {
+    mockQueries(dietDB);
+    const missing = {
+      ...DIET_PLAN,
+      meals: DIET_PLAN.meals.filter((m) => m.slot !== 'snack_am'),
+    };
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(missing)]));
+
+    const res = await request(app).post('/api/ai/diet/generate').send({ client_id: 'client-1' });
+
+    expect(res.status).toBe(200);
+    expect(routedChat).toHaveBeenCalledTimes(1);
+    const instruction = routedChat.mock.calls[0][0].messages.at(-1).content;
+    expect(instruction).toContain('snack_am');
+
+    const done = donePayloadOf(res.text);
+    expect(done.validation.ok).toBe(false);
+    expect(done.validation.blockers.join(' ')).toMatch(/snack_am/);
+  });
+
+  test('a revision that removes the blockers is adopted', async () => {
+    mockQueries(dietDB);
+    const missing = {
+      ...DIET_PLAN,
+      meals: DIET_PLAN.meals.filter((m) => m.slot !== 'snack_am'),
+    };
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(missing)]));
+    routedChat.mockResolvedValue({
+      content: JSON.stringify({ ...DIET_PLAN, knowledge_citations: [1] }),
+      model: 'primary-model', usage: {},
+    });
+
+    const res = await request(app).post('/api/ai/diet/generate').send({ client_id: 'client-1' });
+
+    expect(res.status).toBe(200);
+    expect(routedChat).toHaveBeenCalledTimes(1);
+    const done = donePayloadOf(res.text);
+    expect(done.validation.ok).toBe(true);
+    expect(done.data.meals).toHaveLength(5);
+  });
+
+  test('a revision with more blockers is rejected after one attempt', async () => {
+    mockQueries(dietDB);
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(DIET_PLAN)]));
+    const worse = {
+      ...DIET_PLAN,
+      total_calories: 500,
+      meals: [DIET_PLAN.meals[0]],
+    };
+    routedChat.mockResolvedValue({
+      content: JSON.stringify(worse), model: 'primary-model', usage: {},
+    });
+
+    const res = await request(app).post('/api/ai/diet/generate').send({ client_id: 'client-1' });
+
+    expect(res.status).toBe(200);
+    expect(routedChat).toHaveBeenCalledTimes(1);
+    const done = donePayloadOf(res.text);
+    expect(done.validation.ok).toBe(true);
+    expect(done.data.meals).toHaveLength(5);
   });
 });
 

@@ -72,6 +72,7 @@ const { today: studioToday, dbDate } = require('../lib/appTime');
 // Deterministic nutrition: the server decides the numbers and the clock times.
 const { calculateTargets } = require('../modules/nutrition/nutrition-calculator');
 const { buildSchedule } = require('../modules/nutrition/meal-scheduler');
+const { validatePlan } = require('../modules/nutrition/diet-validation');
 const {
   normaliseActivityLevel, resolveDietPlanningFacts,
 } = require('../modules/nutrition/diet-facts');
@@ -2155,11 +2156,25 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     // ships flagged rather than refused — the token spend exists either way,
     // and validation_status is what protects the trainer.
     let structural = dietPlanNeedsWork(plan);
+    const validationOptions = {
+      targets: calculation,
+      schedule: schedule.slots,
+      restrictions: {
+        // Raw resolver strings; `validatePlan` splits and trims them itself.
+        allergies: p.allergies,
+        foodsToAvoid: p.foods_to_avoid,
+        dietaryPattern: p.dietary_pattern,
+      },
+    };
+    let validation = validatePlan(plan, validationOptions);
     let citationCheck = grounding.validateGroundedOutput(plan, evidence);
-    if (structural || citationCheck.status !== 'ok') {
+    if (structural || citationCheck.status !== 'ok' || validation.blockers.length) {
       const instruction = [
         structural
           ? 'Rewrite so the JSON has, at minimum, a numeric top-level "total_calories", a "macros" object, and a non-empty "meals" array. Fix only what is broken; keep the rest.'
+          : null,
+        validation.blockers.length
+          ? `Correct every validation blocker. Keep the AUTHORITATIVE TARGETS and MEAL SCHEDULE exactly as given: ${validation.blockers.join(' ')}`
           : null,
         'the top-level "knowledge_citations" array must hold ONLY bracket numbers [n] from the AUTHORIZED KNOWLEDGE BASE section of the request that you actually relied on — no number outside that section, "knowledge_citations": [] if you relied on none.',
         'Emit the complete corrected JSON object only — no prose.',
@@ -2179,17 +2194,22 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
         const fixed = extractJson(retry?.content || '');
         if (fixed) {
           // Adopt only on strict improvement — never in exchange for a new
-          // structural gap, and never on rank: invalid > none > ok.
+          // structural gap, and never with more blockers or worse citations
+          // than the plan already had.
           const rank = (s) => (s === 'ok' ? 2 : s === 'no_citations' ? 1 : 0);
           const fixedStructural = dietPlanNeedsWork(fixed);
+          const fixedValidation = validatePlan(fixed, validationOptions);
           const fixedCheck = grounding.validateGroundedOutput(fixed, evidence);
-          const better = fixedStructural === null
-            && (structural
-              ? rank(fixedCheck.status) >= rank(citationCheck.status)
-              : rank(fixedCheck.status) > rank(citationCheck.status));
-          if (better) {
+          const improved = fixedValidation.blockers.length < validation.blockers.length
+            || rank(fixedCheck.status) > rank(citationCheck.status)
+            || (structural && fixedStructural === null);
+          const notWorse = fixedStructural === null
+            && fixedValidation.blockers.length <= validation.blockers.length
+            && rank(fixedCheck.status) >= rank(citationCheck.status);
+          if (improved && notWorse) {
             plan = fixed;
             structural = fixedStructural;
+            validation = fixedValidation;
             citationCheck = fixedCheck;
           }
         }
@@ -2225,6 +2245,9 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       calculation,
       schedule: schedule.slots,
       prompt_version: DIET_PROMPT_VERSION,
+      // The plan's own pass/fail against targets, schedule and restrictions.
+      // Warnings ride along; blockers already cost one revision.
+      validation,
       // Same evidence block as workout: corpus version, validated citations
       // and the passages behind each. An unplanned revision surfaces here too.
       grounding: {
