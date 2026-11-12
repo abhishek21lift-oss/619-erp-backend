@@ -10,17 +10,21 @@
 
 const pool = require('../../db/pool');
 
-// Everything the member dashboard renders: the stored overall total, the six
-// domains it shows, and the per-test values behind them. Trainer-only notes,
-// the BP/vitals reading, audit columns and the raw test JSON are deliberately
-// absent — the portal is a result view, not the assessment record.
+// Everything the member dashboard renders: the stored overall total, the five
+// domains it shows, the readings behind them, and the vitals and body
+// measurements the dashboard summarises. Trainer-only notes, audit columns and
+// the raw test JSON are deliberately absent — the portal is a result view, not
+// the assessment record.
 const ASSESSMENT_COLUMNS = `
   id, assessment_number, assessment_date, assessment_type,
   overall_fitness_score, overall_points, overall_max, scoring_formula_version,
   body_composition_score, cardio_score_computed, strength_score_computed,
   endurance_score_computed, mobility_score_computed,
-  weight, bmi, body_fat_pct, muscle_mass_pct, lean_body_mass_kg, fat_mass_kg,
-  waist_cm, visceral_fat, body_water_pct, body_comp_method,
+  bp_systolic, bp_diastolic, bp_category,
+  resting_heart_rate, rhr_category, resting_spo2, spo2_category,
+  weight, height_cm, bmi, bmi_category, body_fat_pct, muscle_mass_pct, lean_body_mass_kg, fat_mass_kg,
+  waist_cm, waist_iliac_cm, hips_cm, waist_hip_ratio, waist_risk, whr_risk,
+  visceral_fat, body_water_pct, body_comp_method,
   cardio_test_type, vo2_max, cardio_category,
   strength_exercise, strength_exercise_2, strength_category, strength_category_2,
   endurance_test_type, endurance_test_type_2, endurance_category, endurance_category_2,
