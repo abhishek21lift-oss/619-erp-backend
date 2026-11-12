@@ -17,9 +17,9 @@ const schedule = [
 ];
 
 test('v2 names the targets as authoritative and forbids recalculation', () => {
-  const p = buildDietSystemPrompt('Sam', { calculation, schedule });
+  const p = buildDietSystemPrompt({ calculation, schedule });
 
-  expect(DIET_PROMPT_VERSION).toBe('2.0.0');
+  expect(DIET_PROMPT_VERSION).toBe('2.0.1');
   expect(p).toContain('AUTHORITATIVE TARGETS');
   expect(p).toContain('1709');
   expect(p).toContain('Do not recalculate');
@@ -31,7 +31,7 @@ test('v2 names the targets as authoritative and forbids recalculation', () => {
 });
 
 test('v2 carries the food culture and the reference food names', () => {
-  const p = buildDietSystemPrompt('Sam', {
+  const p = buildDietSystemPrompt({
     calculation, schedule, foodCulture: 'indian', foodOptions: ['Roti', 'Moong dal'],
   });
 
@@ -40,8 +40,16 @@ test('v2 carries the food culture and the reference food names', () => {
 });
 
 test('without options the prompt is still the legacy prompt', () => {
-  const p = buildDietSystemPrompt('Sam');
+  const p = buildDietSystemPrompt();
 
   expect(p).not.toContain('AUTHORITATIVE TARGETS');
   expect(p).toContain('Calculate accurate TDEE');
+});
+
+test('the prompt names the plan for the client, never the trainer', () => {
+  const p = buildDietSystemPrompt({ calculation });
+
+  expect(p).toContain('The CLIENT DATA names the person this plan is for');
+  expect(p).toContain('never name the trainer or the studio');
+  expect(p).not.toContain('assisting');
 });
