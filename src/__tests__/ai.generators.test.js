@@ -535,6 +535,24 @@ describe('diet/generate', () => {
     expect(done.generation_id).toBe(ledgerInsert[1][0]);
   });
 
+  test('the plan is named for the client, never for the trainer', async () => {
+    // The only human name in the prompt used to be the trainer's, and the
+    // model put it in the plan title: "… for Abhishek Katiyar" on a plan for
+    // a different client.
+    mockUser = { ...mockUser, name: 'Abhishek Katiyar' };
+    mockQueries(dietDB);
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(DIET_PLAN)]));
+
+    const res = await request(app).post('/api/ai/diet/generate').send({
+      client_id: 'client-1', activity_level: 'moderate', goal: 'weight_loss',
+    });
+
+    expect(res.status).toBe(200);
+    const call = routedStream.mock.calls[0][0];
+    expect(systemPromptOf(call)).not.toContain('Abhishek Katiyar');
+    expect(promptOf(call)).toContain('Name: Priya Sharma');
+  });
+
   test('an unclassifiable goal is refused before any model call', async () => {
     mockQueries({
       'FROM pt_clients WHERE id=$1': [{ ...CLIENT, goal: 'custom' }],

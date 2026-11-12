@@ -2025,6 +2025,9 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     // activity, goal, preferences, allergies, budget can all be trainer-
     // stated). The old header claimed every line below was authoritative.
     'CLIENT DATA (record-first; trainer-stated where the record is silent):',
+    // The only human name in the prompt used to be the trainer's, so the model
+    // titled the plan for the trainer. Name the client the plan is for.
+    `- Name: ${ctx.client.name}`,
     `- Age: ${p.age}`,
     `- Gender: ${p.gender}`,
     `- Weight: ${p.weight_kg} kg`,
@@ -2103,14 +2106,13 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
   const clientAbort = abortOnClose(res);
 
   try {
-    const trainerName = req.user?.name || '';
     let fullContent = '';
     let streamMeta  = { model: models.primary, tier: 'primary', used_fallback: false };
 
     const it = routedStream({
       intent:      'diet',
       messages:    [
-        { role: 'system', content: buildDietSystemPrompt(trainerName, dietPromptOptions) },
+        { role: 'system', content: buildDietSystemPrompt(dietPromptOptions) },
         { role: 'user',   content: userPromptText },
       ],
       temperature: 0.5,
@@ -2146,7 +2148,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       req,
       intent_type: 'diet_repair',
       intent: 'diet',
-      system: buildDietSystemPrompt(trainerName, dietPromptOptions),
+      system: buildDietSystemPrompt(dietPromptOptions),
       user: userPromptText,
       raw: fullContent,
       max_tokens: 18000,
@@ -2200,7 +2202,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
           temperature: 0.2,      // correction, not invention
           max_tokens: 18000,
           messages: [
-            { role: 'system', content: buildDietSystemPrompt(trainerName, dietPromptOptions) },
+            { role: 'system', content: buildDietSystemPrompt(dietPromptOptions) },
             { role: 'user', content: userPromptText },
             { role: 'assistant', content: JSON.stringify(plan) },
             { role: 'user', content: instruction },

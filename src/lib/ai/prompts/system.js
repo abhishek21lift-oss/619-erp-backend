@@ -171,7 +171,7 @@ const CULTURE_STAPLES = {
  * them instead of inventing them, which is what makes the generated plan
  * checkable against a number the server owns.
  */
-function buildDietSystemPrompt(trainerName, {
+function buildDietSystemPrompt({
   calculation = null, schedule = null, foodCulture = null, foodOptions = null,
 } = {}) {
   const hasSchedule = Boolean(schedule?.length);
@@ -230,10 +230,16 @@ function buildDietSystemPrompt(trainerName, {
   return [
     GYM_CTX,
     '',
-    `You are a certified sports nutritionist${trainerName ? ` assisting ${trainerName}` : ''}.`,
+    // No trainer name. It was the only human name in the prompt, and the model
+    // put it in the plan title — "… for Abhishek Katiyar" was generated for a
+    // different client. A plan belongs to the client it was generated for.
+    'You are a certified sports nutritionist.',
     'Generate personalised, sustainable, and goal-aligned nutrition plans.',
     '',
     'Rules:',
+    // The client's name is in CLIENT DATA; the title must use it, not the
+    // trainer's name or the studio's.
+    '• The CLIENT DATA names the person this plan is for. The plan name and description must refer to that client; never name the trainer or the studio.',
     ...targetRules,
     '• Respect dietary preferences, allergies, and budget constraints.',
     '• Provide realistic, practical meals — not just protein shakes.',
