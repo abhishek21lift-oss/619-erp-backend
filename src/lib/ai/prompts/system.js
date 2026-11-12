@@ -154,7 +154,79 @@ function buildWorkoutSystemPrompt() {
 
 /* ─── Diet Plan Generation ──────────────────────────────────────────────── */
 
-function buildDietSystemPrompt(trainerName) {
+const DIET_PROMPT_VERSION = '2.0.0';
+
+const CULTURE_LABELS = { indian: 'Indian', western: 'Western', mixed: 'Mixed' };
+const CULTURE_STAPLES = {
+  indian: 'roti, rice, dal, paneer, curd, seasonal vegetables and regional dishes',
+  western: 'oats, wholegrain bread, eggs, chicken, fish, dairy and salads',
+  mixed: 'both Indian and Western staples',
+};
+
+/**
+ * `options` is additive: called with nothing, this is the v1 prompt that older
+ * callers and older plans were written against.
+ *
+ * With `calculation`, the targets become authoritative — the model distributes
+ * them instead of inventing them, which is what makes the generated plan
+ * checkable against a number the server owns.
+ */
+function buildDietSystemPrompt(trainerName, {
+  calculation = null, schedule = null, foodCulture = null, foodOptions = null,
+} = {}) {
+  const hasSchedule = Boolean(schedule?.length);
+  const culture = CULTURE_LABELS[foodCulture] ?? null;
+
+  const targetRules = calculation
+    ? [
+      '• Distribute the AUTHORITATIVE TARGETS below — the server calculated them. Never recalculate BMR, TDEE, calories or macros.',
+      '• Meet the calorie target and the macro targets. If a food makes that impossible, choose a different food; do not change the target.',
+    ]
+    : [
+      '• Calculate accurate TDEE and adjust for goal (deficit/surplus/maintenance).',
+      '• Distribute macros appropriately for the client\'s goal (protein ≥ 1.6 g/kg BW for muscle).',
+    ];
+
+  const targetBlock = calculation
+    ? [
+      '',
+      `AUTHORITATIVE TARGETS — calculated by the server, engine v${calculation.version}. Use these values exactly.`,
+      `- BMR: ${calculation.bmr_kcal} kcal/day`,
+      `- TDEE: ${calculation.tdee_kcal} kcal/day`,
+      `- Daily calorie target: ${calculation.calorie_target} kcal`,
+      `- Protein / Carbs / Fat: ${calculation.macros.protein_g} g / ${calculation.macros.carbs_g} g / ${calculation.macros.fat_g} g`,
+      `- Fiber: ${calculation.fiber_g} g`,
+      `- Water: ${calculation.water_ml} ml`,
+      ...(calculation.warnings ?? []).map((w) => `- Note: ${w.message}`),
+      `The meals MUST sum to ${calculation.calorie_target} kcal. Do not recalculate these values.`,
+    ]
+    : [];
+
+  const scheduleBlock = hasSchedule
+    ? [
+      '',
+      'MEAL SCHEDULE — FIXED. Return exactly these slots, with exactly these times.',
+      '| slot | label | time | calories |',
+      '| --- | --- | --- | --- |',
+      ...schedule.map((s) => `| ${s.slot} | ${s.label} | ${s.time} | ${s.calories} |`),
+      'The pre_workout and post_workout slots are additional eating occasions; their calories are already inside the daily target.',
+    ]
+    : [];
+
+  const cultureBlock = culture
+    ? [
+      '',
+      `FOOD CULTURE: ${culture}.`,
+      `Use ${CULTURE_STAPLES[foodCulture]} by default. Respect the dietary pattern, allergies and foods to avoid absolutely.`,
+      ...(foodOptions?.length
+        ? [
+          'REFERENCE FOODS (names only; use them when they fit):',
+          ...foodOptions.slice(0, 120).map((n) => `- ${n}`),
+        ]
+        : []),
+    ]
+    : [];
+
   return [
     GYM_CTX,
     '',
@@ -162,8 +234,7 @@ function buildDietSystemPrompt(trainerName) {
     'Generate personalised, sustainable, and goal-aligned nutrition plans.',
     '',
     'Rules:',
-    '• Calculate accurate TDEE and adjust for goal (deficit/surplus/maintenance).',
-    '• Distribute macros appropriately for the client\'s goal (protein ≥ 1.6 g/kg BW for muscle).',
+    ...targetRules,
     '• Respect dietary preferences, allergies, and budget constraints.',
     '• Provide realistic, practical meals — not just protein shakes.',
     '• Include a concise grocery list and evidence-based supplement suggestions.',
@@ -179,6 +250,10 @@ function buildDietSystemPrompt(trainerName) {
     // designed around allergies it had been told did not exist.
     '• A field marked "NOT RECORDED" means the studio holds no record of it. It does not mean "none": never assume the client has no allergies or dietary restrictions. Design conservatively and state plainly what must be confirmed before the plan is used.',
     '• Grounding: when an "AUTHORIZED KNOWLEDGE BASE" section is present in the request, add a top-level "knowledge_citations" array — the bracket numbers [n] of ONLY the passages you actually relied on. Include ONLY numbers that exist in that section; relied on none ⇒ "knowledge_citations": []. If the section is absent, omit the field entirely. An invented citation is a fabricated provenance claim and is stripped and reported.',
+    '• Every food must carry a numeric quantity and a unit (g, ml, katori, roti, piece, slice, tbsp, tsp).',
+    ...targetBlock,
+    ...scheduleBlock,
+    ...cultureBlock,
     '',
     'CRITICAL: Respond ONLY with a valid JSON object. No markdown, no prose, no code fences.',
     'JSON schema:',
@@ -187,16 +262,28 @@ function buildDietSystemPrompt(trainerName) {
       description: 'string',
       goal: 'string',
       total_calories: 'number',
-      macros: { protein_g: 'number', carbs_g: 'number', fat_g: 'number' },
+      macros: { protein_g: 'number', carbs_g: 'number', fat_g: 'number', fiber_g: 'number' },
+      fiber_g: 'number',
       meal_frequency: 'number',
       meals: [{
         name: 'string',
-        time: 'string',
+        ...(hasSchedule ? { slot: 'string', time: 'string' } : { time: 'string' }),
         calories: 'number',
         protein_g: 'number',
         carbs_g: 'number',
         fat_g: 'number',
-        foods: [{ name: 'string', quantity: 'string', calories: 'number', protein_g: 'number', carbs_g: 'number', fat_g: 'number' }],
+        fiber_g: 'number',
+        foods: [{
+          name: 'string',
+          quantity: 'number',
+          unit: 'string',
+          grams: 'number',
+          calories: 'number',
+          protein_g: 'number',
+          carbs_g: 'number',
+          fat_g: 'number',
+          fiber_g: 'number',
+        }],
       }],
       grocery_list: [{ category: 'string', items: ['string'] }],
       supplements: [{ name: 'string', dose: 'string', timing: 'string', reason: 'string' }],
@@ -383,6 +470,7 @@ module.exports = {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
   buildDietSystemPrompt,
+  DIET_PROMPT_VERSION,
   buildProgressSystemPrompt,
   buildFitnessTestingSystemPrompt,
   buildPostureSystemPrompt,

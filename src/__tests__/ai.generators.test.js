@@ -480,7 +480,44 @@ describe('diet/generate', () => {
 
     expect(call.intent).toBe('diet');
     expect(call.temperature).toBe(0.5);
-    expect(call.max_tokens).toBe(14000);
+    expect(call.max_tokens).toBe(18000);
+
+    // The server's numbers and clock times reach the model as facts, and come
+    // back on the done event so the trainer can check the plan against them.
+    const system = systemPromptOf(call);
+    expect(system).toContain('AUTHORITATIVE TARGETS');
+    expect(system).toContain('MEAL SCHEDULE');
+
+    const done = donePayloadOf(res.text);
+    expect(typeof done.calculation.calorie_target).toBe('number');
+    expect(done.schedule.length).toBeGreaterThanOrEqual(3);
+    for (const slot of done.schedule) expect(slot.time).toMatch(/^\d{2}:\d{2}$/);
+    expect(done.prompt_version).toBe('2.0.0');
+  });
+
+  test('an unclassifiable goal is refused before any model call', async () => {
+    mockQueries({
+      'FROM pt_clients WHERE id=$1': [{ ...CLIENT, goal: 'custom' }],
+      'FROM pt_goals WHERE client_id=$1': [],
+    });
+
+    const res = await request(app).post('/api/ai/diet/generate').send({ client_id: 'client-1' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('Unsupported goal: custom. State a supported goal to generate a nutrition plan.');
+    expect(routedStream).not.toHaveBeenCalled();
+  });
+
+  test('an unknown gender names the field and never reaches the model', async () => {
+    mockQueries({ 'FROM pt_clients WHERE id=$1': [{ ...CLIENT, gender: 'other' }] });
+
+    const res = await request(app).post('/api/ai/diet/generate').send({
+      client_id: 'client-1', activity_level: 'moderate',
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('gender');
+    expect(routedStream).not.toHaveBeenCalled();
   });
 
   test('falls back to the body only for values the database does not hold', async () => {
