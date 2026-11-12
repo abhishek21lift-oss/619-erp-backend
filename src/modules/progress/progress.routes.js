@@ -1496,6 +1496,14 @@ const nutritionAssessmentCreateSchema = {
 
     diet_preferences: textList(60, 20),
 
+    // The diet engine's inputs. `dietary_pattern` is the unambiguous form of
+    // `diet_preferences`; the free-text list stays because "Jain" is a real
+    // preference that a four-value enum cannot hold.
+    dietary_pattern: z.enum(['vegetarian', 'eggetarian', 'non_vegetarian', 'vegan']).optional().nullable(),
+    food_culture: z.enum(['indian', 'western', 'mixed']).optional().nullable(),
+    regional_cuisines: textList(40, 5),
+    meal_timing_preference: z.enum(['early', 'standard', 'late', 'no_preference']).optional().nullable(),
+
     food_allergies: textList(100, 30),
     foods_to_avoid: textList(100, 30),
     foods_to_avoid_reason: z.enum(['medical', 'religious', 'personal_preference', 'taste', 'digestive_issue']).optional().nullable(),
@@ -1676,7 +1684,8 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
        meal_preparer, nutrition_budget, medical_notes,
        diet_quality_score, protein_score, protein_assessment, hydration_score, digestive_health_score,
        supplement_score, nutrition_risk_score, risk_factors, nutrition_score, nutrition_readiness,
-       coach_notes, created_by, organization_id
+       coach_notes, created_by, organization_id,
+       dietary_pattern, food_culture, regional_cuisines, meal_timing_preference
      ) VALUES (
        $1,(SELECT COALESCE(MAX(assessment_number), 0) + 1 FROM pt_nutrition_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,
@@ -1691,7 +1700,7 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
        $28,$29,$30,
        $31,$32,$33,$34,$35,
        $36,$37,$38,$39,$40,
-       $41::jsonb,$42,$43
+       $41::jsonb,$42,$43,$44,$45,$46,$47
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || studioToday(),
@@ -1711,6 +1720,9 @@ router.post('/nutrition-assessments', auth, requireTrainer, validate(nutritionAs
       analysis.dietQualityScore, analysis.proteinScore, analysis.proteinAssessment, analysis.hydrationScore, analysis.digestiveHealthScore,
       analysis.supplementScore, analysis.nutritionRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.nutritionScore, analysis.nutritionReadiness,
       b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
+      b.dietary_pattern || null, b.food_culture || null,
+      b.regional_cuisines && b.regional_cuisines.length ? b.regional_cuisines : null,
+      b.meal_timing_preference || null,
     ]
   ));
   res.status(201).json({ data: rows[0] });
@@ -1730,6 +1742,7 @@ router.patch('/nutrition-assessments/:id', auth, validate(nutritionAssessmentUpd
     'water_intake_liters', 'tea_cups_per_day', 'coffee_cups_per_day', 'soft_drinks_per_day', 'juices_per_day',
     'cravings', 'craving_frequency',
     'meal_preparer', 'nutrition_budget', 'medical_notes', 'coach_notes',
+    'dietary_pattern', 'food_culture', 'regional_cuisines', 'meal_timing_preference',
   ];
 
   // Scoped read before the write, as on the lifestyle PATCH above.
