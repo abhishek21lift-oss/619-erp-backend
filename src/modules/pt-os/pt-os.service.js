@@ -661,6 +661,100 @@ async function getTodayRoster({ date, scope = {} } = {}) {
 }
 
 /**
+ * The trainer's schedule — the studio's sessions, ascending, in a window.
+ *
+ * Extracted from GET /pt-os/sessions/my so the Copilot's get_trainer_schedule
+ * runs the same read the page runs, not a second query that could drift. The
+ * route and the tool differ only in shape and in the `limit` the tool adds.
+ */
+async function getTrainerSchedule(orgId, { from, to, limit } = {}) {
+  const params = [orgId];
+  const where = ['s.deleted_at IS NULL', 's.organization_id = $1'];
+  if (from) { params.push(from); where.push(`s.session_date >= $${params.length}`); }
+  if (to) { params.push(to); where.push(`s.session_date <= $${params.length}`); }
+
+  // A bound is only appended when the caller asks for one, so the page's
+  // emitted SQL and parameters stay exactly what they were.
+  let limitClause = '';
+  if (limit) {
+    params.push(Math.min(Math.max(Number(limit) || 1, 1), 100));
+    limitClause = `\n    LIMIT $${params.length}`;
+  }
+
+  const { rows } = await pool.query(`
+    SELECT s.*, c.name AS client_name, c.mobile AS client_mobile
+    FROM pt_sessions s
+    LEFT JOIN pt_clients c ON c.id = s.client_id AND c.organization_id = s.organization_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY s.session_date ASC, s.start_time ASC${limitClause}
+  `, params);
+  return rows;
+}
+
+/**
+ * Per-trainer session totals for the current month, org-scoped.
+ *
+ * The definitions (and why completed comes from workout_sessions while booked
+ * and missed stay on pt_sessions) are documented at the call site below, where
+ * they are returned; this function exists so the Copilot's
+ * get_trainer_workload reports the same numbers as the dashboard.
+ */
+async function getTrainerWorkload(orgId) {
+  // The org filter is applied in BOTH CTEs, not only on `t`. Without it a
+  // foreign session whose trainer_id happens to match a local trainer is
+  // COUNTED against them.
+  const bareParams = [orgId];
+  const { rows: trainer_sessions } = await pool.query(`
+    WITH done AS (
+      SELECT trainer_id, COUNT(*)::INT AS completed
+        FROM workout_sessions
+       WHERE organization_id = $1
+         AND status = 'completed'
+         AND session_date >= DATE_TRUNC('month', CURRENT_DATE)
+         AND session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+       GROUP BY trainer_id
+    ),
+    booked AS (
+      SELECT
+        trainer_id,
+        COUNT(*) FILTER (WHERE status = 'scheduled')::INT AS scheduled,
+        COUNT(*) FILTER (WHERE status IN ('cancelled','no_show'))::INT AS missed
+        FROM pt_sessions
+       WHERE organization_id = $1
+         AND deleted_at IS NULL
+         AND session_date >= DATE_TRUNC('month', CURRENT_DATE)
+         AND session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+       GROUP BY trainer_id
+    )
+    SELECT
+      t.name AS trainer_name,
+      COALESCE(d.completed, 0)::INT AS completed,
+      COALESCE(b.scheduled, 0)::INT AS scheduled,
+      COALESCE(b.missed, 0)::INT AS missed
+    FROM trainers t
+    LEFT JOIN done d   ON d.trainer_id = t.id
+    LEFT JOIN booked b ON b.trainer_id = t.id
+    WHERE t.organization_id = $1
+      -- Active trainers stay on the list even with nothing to show. A trainer
+      -- who has since left still appears if they own sessions this month.
+      AND (
+        (t.deleted_at IS NULL AND t.status = 'active')
+        OR COALESCE(d.completed, 0) > 0
+        OR COALESCE(b.scheduled, 0) > 0
+        OR COALESCE(b.missed, 0) > 0
+      )
+    UNION ALL
+    SELECT 'Unassigned', COALESCE(d.completed, 0), COALESCE(b.scheduled, 0), COALESCE(b.missed, 0)
+      FROM (SELECT 1) one
+      LEFT JOIN done d   ON d.trainer_id IS NULL
+      LEFT JOIN booked b ON b.trainer_id IS NULL
+     WHERE COALESCE(d.completed, 0) + COALESCE(b.scheduled, 0) + COALESCE(b.missed, 0) > 0
+    ORDER BY completed DESC, trainer_name
+  `, bareParams);
+  return trainer_sessions;
+}
+
+/**
  * getOpsSummary — powers the "Today's Operations" and "Session Activity"
  * dashboard sections.  Returns:
  *   today_sessions   — all pt_sessions scheduled/completed today
@@ -895,72 +989,10 @@ async function getOpsSummary(scope = {}) {
     WHERE TRUE${orgBare1}
   `, bareParams);
 
-  // Per-trainer totals for the month — scoped, unlike every other query here.
-  //
-  // Completed comes from workout_sessions, the same table the Total/Done tiles
-  // above count. Finishing a workout writes there; nothing moves a pt_sessions
-  // booking past 'scheduled'. Counting completed off the diary is what made
-  // this breakdown read "0 done" beside a real Done figure. Booked and missed
-  // stay on pt_sessions because only the diary knows them.
-  //
-  // Both reads need the org filter, for different reasons. On `t` it decides
-  // which trainers are listed at all. On the counts it stops a foreign session
-  // being COUNTED against a local trainer — the ids are per-table, so a
-  // collision is unlikely rather than impossible, and a count is exactly where
-  // a stray row would go unnoticed.
-  //
-  // LEFT JOINs keep trainers with no sessions this month in the list — they are
-  // precisely the ones a manager is scanning for. A workout logged against a
-  // client with no assigned trainer carries trainer_id NULL; those totals get
-  // their own "Unassigned" row rather than vanishing and leaving the breakdown
-  // short of the Done tile.
-  const { rows: trainer_sessions } = await pool.query(`
-    WITH done AS (
-      SELECT trainer_id, COUNT(*)::INT AS completed
-        FROM workout_sessions
-       WHERE organization_id = $1
-         AND status = 'completed'
-         AND session_date >= DATE_TRUNC('month', CURRENT_DATE)
-         AND session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
-       GROUP BY trainer_id
-    ),
-    booked AS (
-      SELECT
-        trainer_id,
-        COUNT(*) FILTER (WHERE status = 'scheduled')::INT AS scheduled,
-        COUNT(*) FILTER (WHERE status IN ('cancelled','no_show'))::INT AS missed
-        FROM pt_sessions
-       WHERE organization_id = $1
-         AND deleted_at IS NULL
-         AND session_date >= DATE_TRUNC('month', CURRENT_DATE)
-         AND session_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
-       GROUP BY trainer_id
-    )
-    SELECT
-      t.name AS trainer_name,
-      COALESCE(d.completed, 0)::INT AS completed,
-      COALESCE(b.scheduled, 0)::INT AS scheduled,
-      COALESCE(b.missed, 0)::INT AS missed
-    FROM trainers t
-    LEFT JOIN done d   ON d.trainer_id = t.id
-    LEFT JOIN booked b ON b.trainer_id = t.id
-    WHERE t.organization_id = $1
-      -- Active trainers stay on the list even with nothing to show. A trainer
-      -- who has since left still appears if they own sessions this month.
-      AND (
-        (t.deleted_at IS NULL AND t.status = 'active')
-        OR COALESCE(d.completed, 0) > 0
-        OR COALESCE(b.scheduled, 0) > 0
-        OR COALESCE(b.missed, 0) > 0
-      )
-    UNION ALL
-    SELECT 'Unassigned', COALESCE(d.completed, 0), COALESCE(b.scheduled, 0), COALESCE(b.missed, 0)
-      FROM (SELECT 1) one
-      LEFT JOIN done d   ON d.trainer_id IS NULL
-      LEFT JOIN booked b ON b.trainer_id IS NULL
-     WHERE COALESCE(d.completed, 0) + COALESCE(b.scheduled, 0) + COALESCE(b.missed, 0) > 0
-    ORDER BY completed DESC, trainer_name
-  `, bareParams);
+  // Per-trainer totals for the month. The definitions and the reason both
+  // CTEs carry the org filter live on getTrainerWorkload, which the Copilot
+  // calls too, so the dashboard and the tool cannot report different numbers.
+  const trainer_sessions = await getTrainerWorkload(scope.orgId);
 
   return {
     today_sessions, today_unscheduled, today_enrolled,
@@ -1047,7 +1079,7 @@ async function searchClients({ q, limit = 20, scope = {} }) {
  */
 async function getClientAttendance(clientId, { limit = 200, offset = 0 } = {}) {
   const { rows } = await pool.query(
-    `SELECT id, date, check_in_time, check_out_time, method, notes
+    `SELECT id, date, check_in_time, check_out_time, method, status, notes
        FROM attendance_logs
       WHERE ref_id = $1 AND ref_type = 'client'
       ORDER BY date DESC, check_in_time DESC
@@ -1260,6 +1292,8 @@ module.exports = {
   getClientPayments,
   getDashboardStats,
   getOpsSummary,
+  getTrainerSchedule,
+  getTrainerWorkload,
   getCheckinInsightInputs,
   getTransformations,
 };

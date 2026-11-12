@@ -103,7 +103,14 @@ END $$;
 --
 -- Dropped, leaving the unconditional deny added above.
 DROP POLICY IF EXISTS biometric_attendance_member_policy  ON public.biometric_attendance;
-DROP POLICY IF EXISTS gym_settings_admin_policy           ON public.gym_settings;
+-- gym_settings is created by no tracked migration (it exists on the live
+-- database only because it was created out of band), and DROP POLICY IF
+-- EXISTS still errors when the TABLE is absent. Guard it exactly as 101 does.
+DO $$ BEGIN
+  IF to_regclass('public.gym_settings') IS NOT NULL THEN
+    DROP POLICY IF EXISTS gym_settings_admin_policy ON public.gym_settings;
+  END IF;
+END $$;
 DROP POLICY IF EXISTS webauthn_challenges_member_policy   ON public.webauthn_challenges;
 DROP POLICY IF EXISTS webauthn_credentials_member_policy  ON public.webauthn_credentials;
 

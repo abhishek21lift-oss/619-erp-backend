@@ -66,6 +66,13 @@ function rlsHealthField() {
     posture: rlsPosture.posture,
     enforced: Boolean(rlsPosture.enforced),
     findings: (rlsPosture.findings || []).map((f) => f.code),
+    // Which connections the verdict is based on. `enforced` can only be true
+    // when the tenant connection was actually asked — F2 was a preflight that
+    // measured the owner pool and reported its role as the tenant. Booleans
+    // only: role names stay in the logs, not on an unauthenticated endpoint.
+    tenant_checked: Boolean(rlsPosture.tenant),
+    owner_checked: Boolean(rlsPosture.owner),
+    tenant_bypasses_rls: rlsPosture.tenant ? Boolean(rlsPosture.tenant.bypasses_rls) : null,
   };
 }
 

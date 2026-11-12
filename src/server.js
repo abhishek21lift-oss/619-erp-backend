@@ -938,6 +938,11 @@ app.use('/api/communication',     auth, requireTrainer, ...gate('communication')
 // guard fails open if the check itself errors — a cost control must not be
 // able to take the AI Suite down. See lib/aiQuota.js.
 app.use('/api/ai/knowledge',      userApiLimiter, ...gate('ai_knowledge_base'), aiLimiter, requireAiQuota(), require('./routes/aiKnowledge'));
+// Trainer Copilot context. Resolves identity, tenant, client scope and
+// permissions and returns the typed context object; it runs no model, so it
+// carries no quota guard. The studio gate still refuses a member or an
+// unentitled studio before the resolver can run.
+app.use('/api/ai/copilot',        ...studioGate('ai_suite'), userApiLimiter, require('./modules/copilot/copilot.routes'));
 // Executable actions. Mounted BEFORE routes/ai so /api/ai/actions/* is not
 // swallowed by anything there, and deliberately outside requireAiQuota():
 // these endpoints run no model. Confirming a WhatsApp send must not fail
@@ -1070,6 +1075,9 @@ app.use('/api/automation', userApiLimiter, auth, requireTrainer, require('./modu
 // /api/v1/notifications stays — it backs the notification bell and has a live
 // caller.
 app.use('/api/v1/notifications',  require('./modules/notifications/notifications.routes'));
+// Device registration for push. Auth is inside the router; the body carries a
+// token and nothing else, and the tenant comes from the session.
+app.use('/api/v1/devices',        require('./modules/devices/devices.routes'));
 
 // ────────────────────────
 // 404 + GLOBAL ERROR HANDLER
@@ -1140,7 +1148,12 @@ runMigrationsWithRetry()
       const dbPool = require('./db/pool');
       try {
         const posture = await enforceRlsPostureAtBoot({
-          tenantPool: dbPool,
+          // The raw tenant pool, not the routed export: at boot there is no
+          // request context, so `tenantPool.query` would route to the owner
+          // connection and report `postgres` as the tenant role (F2).
+          tenantPool: dbPool.tenantPoolForDiagnostics
+            ? dbPool.tenantPoolForDiagnostics()
+            : dbPool,
           ownerPool: dbPool.ownerPoolForDiagnostics ? dbPool.ownerPoolForDiagnostics() : null,
           logger,
         });

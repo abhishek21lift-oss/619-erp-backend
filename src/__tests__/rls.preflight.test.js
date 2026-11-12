@@ -125,6 +125,11 @@ describe('the finding this module exists for', () => {
     expect(result.findings).toEqual([]);
     expect(result.enforced).toBe(true);
     expect(result.ok).toBe(true);
+    // Which role each pool actually connected as, reported separately. F2:
+    // the boot check asked the routed pool with no request context, so it
+    // measured the owner connection and called it the tenant.
+    expect(result.tenant).toMatchObject({ role: 'app_tenant', bypasses_rls: false });
+    expect(result.owner).toMatchObject({ role: 'postgres', bypasses_rls: true });
     expect(result.probe).toMatchObject({ total: 38, a: 18, b: 16, isolated: true });
   });
 });
@@ -251,6 +256,54 @@ describe('boot wiring', () => {
     expect(serialised).not.toMatch(/postgres|password|@|rolbypassrls/);
     expect(rlsHealthField()).toMatchObject({ posture: 'on', enforced: false });
     expect(rlsHealthField().findings).toContain('tenant_connection_bypasses_rls');
+  });
+});
+
+describe('the health field reports both pools, not one verdict', () => {
+  const { setRlsPosture, rlsHealthField } = require('../lib/health');
+
+  test('says which connection was actually checked', async () => {
+    const tenant = afterCutover();
+    const owner = fakePool({
+      role: 'postgres', bypasses: true,
+      counts: { orgs: [ORG_A, ORG_B], total: 38, [ORG_A]: 38, [ORG_B]: 38 },
+    });
+
+    const result = await verifyRlsPosture({
+      tenantPool: tenant, ownerPool: owner, env: { TENANT_RLS_ENFORCE: 'on' },
+    });
+    setRlsPosture(result);
+
+    expect(rlsHealthField()).toMatchObject({
+      posture: 'on',
+      enforced: true,
+      tenant_checked: true,
+      owner_checked: true,
+      tenant_bypasses_rls: false,
+    });
+    // Still no identity: who the role is stays in the logs, not on an
+    // unauthenticated liveness endpoint.
+    expect(JSON.stringify(rlsHealthField())).not.toMatch(/postgres|app_tenant|password|@|rolbypassrls/);
+  });
+
+  test('an unchecked connection is never reported as enforced', async () => {
+    const broken = {
+      query: async () => { throw new Error('ECONNREFUSED'); },
+      connect: async () => { throw new Error('ECONNREFUSED'); },
+    };
+
+    const result = await verifyRlsPosture({
+      tenantPool: broken, ownerPool: null, env: { TENANT_RLS_ENFORCE: 'on' },
+    });
+    setRlsPosture(result);
+
+    expect(rlsHealthField()).toMatchObject({
+      posture: 'on',
+      enforced: false,
+      tenant_checked: false,
+      owner_checked: false,
+      tenant_bypasses_rls: null,
+    });
   });
 });
 

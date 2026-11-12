@@ -129,4 +129,40 @@ describe('deployment verification exists in both workflows', () => {
     const mvIdx = sh.indexOf('mv "${MARKER}.new"');
     expect(mvIdx).toBeGreaterThan(failIdx);
   });
+
+  it('takes a verified backup before running migrations', () => {
+    // Rules §4: no production migration without a verified fresh backup and a
+    // restore procedure. The nightly job runs at 02:30, so on its own it
+    // leaves every merge after that point without a restore point — exactly
+    // the window a deploy is most likely to apply a schema change.
+    const backupCall = backendDeploy.indexOf('scripts/deploy/pre-migrate-backup.sh');
+    const migrateCall = backendDeploy.indexOf('npm run migrate');
+
+    expect(backupCall).toBeGreaterThan(-1);
+    expect(migrateCall).toBeGreaterThan(-1);
+    expect(backupCall).toBeLessThan(migrateCall);
+
+    // The gate is only real if the deploy stops when it fails: the script is
+    // called directly under `set -e`, not piped or suffixed with `|| true`.
+    const backupLine = backendDeploy.slice(
+      backendDeploy.lastIndexOf('\n', backupCall) + 1,
+      backendDeploy.indexOf('\n', backupCall),
+    );
+    expect(backupLine.trim().startsWith('bash ')).toBe(true);
+    expect(backupLine).not.toMatch(/\|\||;\s*true/);
+  });
+
+  it('the backup gate refuses to migrate without a dump it verified', () => {
+    const sh = fs.readFileSync(
+      path.join(root, 'scripts', 'deploy', 'pre-migrate-backup.sh'),
+      'utf8',
+    );
+    // It must run the same verifier as the nightly job, with status recording
+    // left to the nightly job so the Command Center card keeps telling the
+    // truth about the off-site copy.
+    expect(sh).toMatch(/BACKUP_SKIP_STATUS=1/);
+    expect(sh).toMatch(/infra\/backup\/Dockerfile/);
+    // A deploy that cannot take a backup must not proceed to migrate.
+    expect(sh).toMatch(/exit 1/);
+  });
 });

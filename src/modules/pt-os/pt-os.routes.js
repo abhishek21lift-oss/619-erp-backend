@@ -1588,20 +1588,11 @@ router.get('/sessions', auth, wrap(async (req, res) => {
 // `trainer_linked` is kept in the response for the clients that read it; it
 // is always true now that every studio account is its trainer.
 router.get('/sessions/my', auth, wrap(async (req, res) => {
-  const params = [];
-  const where = ['s.deleted_at IS NULL'];
   const scope = tenantScope(req);
-  params.push(scope.orgId); where.push(`s.organization_id = $${params.length}`);
-  if (req.query.from) { params.push(req.query.from); where.push(`s.session_date >= $${params.length}`); }
-  if (req.query.to)   { params.push(req.query.to);   where.push(`s.session_date <= $${params.length}`); }
-
-  const { rows } = await pool.query(`
-    SELECT s.*, c.name AS client_name, c.mobile AS client_mobile
-    FROM pt_sessions s
-    LEFT JOIN pt_clients c ON c.id = s.client_id AND c.organization_id = s.organization_id
-    WHERE ${where.join(' AND ')}
-    ORDER BY s.session_date ASC, s.start_time ASC
-  `, params);
+  const rows = await svc.getTrainerSchedule(scope.orgId, {
+    from: req.query.from,
+    to: req.query.to,
+  });
   res.json({ data: rows, total: rows.length, trainer_linked: true });
 }));
 

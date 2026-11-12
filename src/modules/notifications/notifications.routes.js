@@ -3,6 +3,7 @@ const router = require('express').Router();
 const { auth } = require('../../middleware/auth');
 const { requireTrainer } = require('../../middleware/rbac');
 const svc = require('./notifications.service');
+const pushGate = require('../../lib/pushGate');
 const { orgIdOf } = require('../../lib/tenant-db');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -39,6 +40,14 @@ router.post('/broadcast', auth, requireTrainer, wrap(async (req, res) => {
   const { type, member_ids, data, channels } = req.body;
   if (!svc.templates[type]) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Unknown notification type' } });
   const orgId = orgIdOf(req);
+  // A direct request that names push on a disabled studio is refused whole,
+  // rather than silently dropping the channel and reporting the broadcast as
+  // sent. Event configuration goes through send(), which does drop it.
+  if (Array.isArray(channels) && channels.includes('push') && !pushGate.isEnabledFor(orgId)) {
+    return res.status(409).json({
+      error: { code: 'PUSH_DISABLED', message: 'Push notifications are not enabled for this studio.' },
+    });
+  }
   const sent = [];
   let skipped = 0;
   let suppressed = 0;

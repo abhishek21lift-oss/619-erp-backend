@@ -24,6 +24,7 @@ const pool = require('../../db/pool');
 const logger = require('../logger');
 const { tenantScope } = require('../tenant-db');
 const { parseDateRange } = require('./dateRange');
+const { recordToolRun } = require('../../modules/copilot/tools/ledger');
 
 /**
  * The organization every tool's query is filtered by: always the caller's own
@@ -374,30 +375,121 @@ const TOOLS = [
  * most one or two of these topics, and running more adds latency for no
  * real benefit.
  */
-async function runTools(req, message) {
+async function runTools(req, message, opts = {}) {
+  // The Phase 3 Copilot registry first: same deterministic routing, but with
+  // zod arguments, Phase 2 client scope, provenance and a durable ledger.
+  //
+  // Fallback is allowed ONLY when the planner matched no tool. Every planned
+  // call returns an envelope, including denials, validation failures, timeouts
+  // and execution errors; those are reported to the model and never re-enter
+  // the legacy readers. A thrown registry error is also a failure, not a
+  // no-match — running the old path after it could bypass the new gate.
+  try {
+    const { runRegistryTools } = require('../../modules/copilot/tools/execute');
+    const registered = await runRegistryTools(req, message, opts);
+    if (registered) return registered;
+  } catch (err) {
+    logger.warn({ err: err.message }, 'copilot_tools_registry_failed');
+    return {
+      toolNames: [],
+      contextText: '[Live data] The live-data tool layer failed before it could read anything. '
+        + 'Tell the user the studio records could not be read rather than answering from memory or estimating.',
+      envelopes: [],
+      runs: [],
+    };
+  }
+
+  return runLegacyTools(req, message, opts);
+}
+
+/** Record one legacy attempt. Best-effort: recordToolRun never throws. */
+async function recordLegacyRun(req, tool, {
+  conversationId, messageId, correlationId, ok, code = null, durationMs, ordinal,
+  extraResultMeta = null,
+}) {
+  if (!correlationId) return null;
+  const stored = await recordToolRun({
+    organizationId: req.user?.organization_id ?? null,
+    userId: req.user?.id ?? null,
+    conversationId,
+    messageId,
+    correlationId,
+    toolName: tool.name,
+    level: 'READ',
+    sensitivity: 'business',
+    clientId: null,
+    argsDigest: 'legacy',
+    argsMeta: null,
+    ok,
+    code,
+    durationMs,
+    provenance: {
+      source: `lib.ai.tools.${tool.name}`,
+      records: [],
+      as_of: null,
+      freshness: null,
+      missing: [],
+    },
+    extraResultMeta,
+    ordinal,
+    selectionReason: 'legacy_pattern',
+  });
+  return stored.run_id;
+}
+
+/** The pre-Copilot pattern-matched readers. Behaviour deliberately unchanged. */
+async function runLegacyTools(req, message, {
+  conversationId = null,
+  messageId = null,
+  correlationId = null,
+} = {}) {
   const matched = TOOLS.filter((t) => t.test(message)).slice(0, 2);
-  if (!matched.length) return { toolNames: [], contextText: '' };
+  if (!matched.length) return { toolNames: [], contextText: '', runs: [] };
 
   const toolNames = [];
   const contextParts = [];
+  const runs = [];
 
-  for (const tool of matched) {
+  for (let index = 0; index < matched.length; index += 1) {
+    const tool = matched[index];
+    const startedAt = Date.now();
     // Fail closed: a tool that names no roles is authorised for nobody.
     const authorized = Array.isArray(tool.roles) && tool.roles.includes(req.user.role);
     if (!authorized) {
+      const durationMs = Date.now() - startedAt;
+      const run_id = await recordLegacyRun(req, tool, {
+        conversationId, messageId, correlationId,
+        ok: false, code: 'FORBIDDEN', durationMs, ordinal: index,
+      });
+      runs.push({ tool: tool.name, run_id, ok: false, code: 'FORBIDDEN' });
       contextParts.push(`[${tool.label}] The current user's role ("${req.user.role}") is not permitted to view this data — say so plainly rather than answering.`);
       toolNames.push(tool.label);
       continue;
     }
     try {
       const match = tool.extract ? tool.extract(message) : null;
-      if (tool.extract && !match) continue; // pattern matched but couldn't extract a usable argument
+      if (tool.extract && !match) {
+        const durationMs = Date.now() - startedAt;
+        const run_id = await recordLegacyRun(req, tool, {
+          conversationId, messageId, correlationId,
+          ok: false, code: 'BAD_ARGS', durationMs, ordinal: index,
+        });
+        runs.push({ tool: tool.name, run_id, ok: false, code: 'BAD_ARGS' });
+        continue; // pattern matched but couldn't extract a usable argument
+      }
       const result = await tool.run(req, match, message);
       const text = tool.format(result, match);
       // An empty format() means the tool deliberately found nothing worth
       // saying (e.g. a guessed name that matched no client). Injecting an
       // empty "[Client Lookup]" heading, or claiming the tool was consulted
       // in the UI, would both be noise.
+      const durationMs = Date.now() - startedAt;
+      const run_id = await recordLegacyRun(req, tool, {
+        conversationId, messageId, correlationId,
+        ok: true, durationMs, ordinal: index,
+        extraResultMeta: text ? null : { empty: true },
+      });
+      runs.push({ tool: tool.name, run_id, ok: true, code: null });
       if (!text) continue;
       contextParts.push(`[${tool.label}] ${text}`);
       toolNames.push(tool.label);
@@ -414,12 +506,18 @@ async function runTools(req, message) {
       // authorization case; a failure is the same situation with a different
       // cause, so it takes the same shape rather than a new one.
       logger.warn({ tool: tool.name, err: err.message }, 'ai_tool_run_failed');
+      const durationMs = Date.now() - startedAt;
+      const run_id = await recordLegacyRun(req, tool, {
+        conversationId, messageId, correlationId,
+        ok: false, code: 'TOOL_FAILED', durationMs, ordinal: index,
+      });
+      runs.push({ tool: tool.name, run_id, ok: false, code: 'TOOL_FAILED' });
       contextParts.push(`[${tool.label}] This lookup failed just now, so no figures were retrieved. Tell the user the data could not be read rather than answering from memory or estimating.`);
       toolNames.push(tool.label);
     }
   }
 
-  return { toolNames, contextText: contextParts.join('\n\n') };
+  return { toolNames, contextText: contextParts.join('\n\n'), runs };
 }
 
 module.exports = { runTools, TOOLS };

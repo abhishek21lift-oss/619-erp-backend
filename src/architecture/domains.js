@@ -343,6 +343,10 @@ const DOMAINS = {
       // permission. It stays declared here because the table still exists and
       // still references `trainers`.
       'whatsapp_automation_settings', 'whatsapp_automation_trainer_grants',
+      // Push delivery (migration 272): which device belongs to which user in
+      // which studio, and a per-job ledger so a retried send does not alert a
+      // device twice. Delivery infrastructure, like the WhatsApp tables.
+      'device_tokens', 'push_deliveries',
     ],
   },
 
@@ -362,6 +366,10 @@ const DOMAINS = {
     tables: [
       'ai_documents', 'ai_document_chunks', 'ai_conversations', 'ai_messages',
       'ai_usage_log', 'ai_action_plans', 'ai_model_rates', 'ai_provider_settings',
+      // The tool-call ledger (migration 275): one row per attempted tool call,
+      // including denials and failures, linked to the conversation and message
+      // it served. Owned here with the rest of the assistant stack.
+      'ai_tool_runs',
       // The retrieval ledger (migration 232): one row per grounding attempt so
       // any generated artifact traces back to the approved corpus state it
       // was grounded in. Owned here with the rest of the retrieval stack.

@@ -26,6 +26,7 @@
 // prints the URL to export.
 
 const { Pool } = require('pg');
+const { randomUUID } = require('crypto');
 
 // Not named URL: that shadows the global URL class this file also needs.
 const DB_URL = process.env.RLS_TEST_DATABASE_URL;
@@ -55,8 +56,12 @@ if (process.env.CI && !DB_URL) {
   });
 }
 
-const ORG_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-const ORG_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+// Synthetic studios, unique per run. Fixed UUIDs could collide with a row in
+// a restored production database, and the cleanup below deletes by these ids.
+const ORG_A = randomUUID();
+const ORG_B = randomUUID();
+const SLUG_A = `studio-a-${ORG_A.slice(0, 8)}`;
+const SLUG_B = `studio-b-${ORG_B.slice(0, 8)}`;
 
 describeIf('cross-tenant isolation, against a real database', () => {
   /** Owner connection. Bypasses RLS — used only to set the world up and to check it after. */
@@ -72,8 +77,8 @@ describeIf('cross-tenant isolation, against a real database', () => {
     tenant = new Pool({ connectionString: tenantUrl.toString(), max: 2 });
 
     await owner.query(
-      `INSERT INTO organizations (id, name, slug) VALUES ($1,'Studio A','studio-a'), ($2,'Studio B','studio-b')
-       ON CONFLICT (id) DO NOTHING`, [ORG_A, ORG_B]);
+      `INSERT INTO organizations (id, name, slug) VALUES ($1,'Studio A',$3), ($2,'Studio B',$4)
+       ON CONFLICT (id) DO NOTHING`, [ORG_A, ORG_B, SLUG_A, SLUG_B]);
   });
 
   afterAll(async () => {
@@ -145,7 +150,9 @@ describeIf('cross-tenant isolation, against a real database', () => {
     // total tells you how many exist.
     const { rows } = await asOrg(ORG_A, (c) =>
       c.query(`SELECT count(*)::int AS n FROM pt_clients`));
-    const { rows: all } = await owner.query(`SELECT count(*)::int AS n FROM pt_clients`);
+    const { rows: all } = await owner.query(
+      `SELECT count(*)::int AS n FROM pt_clients WHERE organization_id IN ($1,$2)`,
+      [ORG_A, ORG_B]);
     expect(rows[0].n).toBe(1);
     expect(all[0].n).toBe(2);
   });
@@ -422,6 +429,10 @@ describeIf('cross-tenant isolation, against a real database', () => {
         // Migration bookkeeping. Owned by no domain, written only by
         // db/migrate.js on the owner connection, never read by a request.
         '_migrations',
+        // Backend-only delivery ledger. It has no organization_id, so there
+        // is no tenant policy to write; RLS with no app_tenant policy and no
+        // table grant denies the role entirely (migration 272).
+        'push_deliveries',
         ...Object.values(DOMAINS)
           .filter((d) => d.plane === PLANE.PLATFORM)
           .flatMap((d) => d.tables),
@@ -480,15 +491,17 @@ describeIf('cross-tenant isolation, against a real database', () => {
     const { verifyRlsPosture } = require('../db/rlsPreflight');
 
     beforeEach(async () => {
-      // The probe counts pt_clients per organization, so both studios need a
-      // row that only they can see. beforeEach above already inserts exactly
-      // one each, which is what makes the expected counts below 1 and 1.
+      // The probe is given these two synthetic orgs explicitly, so the
+      // expected counts are 1 and 1 regardless of which organizations a
+      // restored database already holds.
       await owner.query(`DELETE FROM pt_clients WHERE organization_id IN ($1,$2) AND id NOT IN ('client-a','client-b')`, [ORG_A, ORG_B]);
     });
 
     it('reports the owner connection as bypassing, with the probe to prove it', async () => {
       const result = await verifyRlsPosture({
-        tenantPool: owner, ownerPool: owner, env: { TENANT_RLS_ENFORCE: 'on' },
+        tenantPool: owner, ownerPool: owner,
+        env: { TENANT_RLS_ENFORCE: 'on' },
+        orgIds: [ORG_A, ORG_B],
       });
 
       const codes = result.findings.map((f) => f.code);
@@ -503,7 +516,9 @@ describeIf('cross-tenant isolation, against a real database', () => {
 
     it('reports the app_tenant connection as isolated, and would let strict boot', async () => {
       const result = await verifyRlsPosture({
-        tenantPool: tenant, ownerPool: owner, env: { TENANT_RLS_ENFORCE: 'strict' },
+        tenantPool: tenant, ownerPool: owner,
+        env: { TENANT_RLS_ENFORCE: 'strict' },
+        orgIds: [ORG_A, ORG_B],
       });
 
       expect(result.tenant.role).toBe('app_tenant');
@@ -520,7 +535,11 @@ describeIf('cross-tenant isolation, against a real database', () => {
     });
 
     it('the probe leaves no transaction and no GUC behind', async () => {
-      await verifyRlsPosture({ tenantPool: tenant, ownerPool: owner, env: { TENANT_RLS_ENFORCE: 'on' } });
+      await verifyRlsPosture({
+        tenantPool: tenant, ownerPool: owner,
+        env: { TENANT_RLS_ENFORCE: 'on' },
+        orgIds: [ORG_A, ORG_B],
+      });
 
       // A client returned to the pool mid-transaction poisons the next
       // borrower, and a session-level app.org_id would silently scope every

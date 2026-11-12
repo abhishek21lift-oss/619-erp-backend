@@ -119,7 +119,7 @@ async function startWorkers() {
   const { createEmailWorker } = require('./email.worker');
   const { createWhatsappWorker } = require('./whatsapp.worker');
   const { createAiWorker } = require('./ai.worker');
-  const { createNotificationsWorker } = require('./notifications.worker');
+  const { createNotificationsWorker, schedulePushRetention } = require('./notifications.worker');
   const { createAutomationWorker, scheduleAutomationSweep } = require('./automation.worker');
   const { createProgressWorker, scheduleProgressSweep } = require('./progress.worker');
   const { createChurnWorker, scheduleChurnDigest } = require('./churn.worker');
@@ -157,6 +157,12 @@ async function startWorkers() {
     await scheduleChurnDigest();
   } catch (err) {
     logger.error({ err: err.message }, 'churn digest cron not scheduled');
+  }
+
+  try {
+    await schedulePushRetention();
+  } catch (err) {
+    logger.error({ err: err.message }, 'push retention cron not scheduled');
   }
 
   activeWorkers = workers;

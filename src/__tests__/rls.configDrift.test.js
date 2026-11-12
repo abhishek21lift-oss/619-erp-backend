@@ -143,3 +143,15 @@ describe('the flag module is the only place the posture is decided', () => {
     expect(offenders).toEqual([]);
   });
 });
+
+describe('the boot preflight measures the tenant connection, not the routed pool', () => {
+  it('server.js hands the preflight the diagnostic tenant handle', () => {
+    // F2: server.js passed the routed `db/pool` export. At boot there is no
+    // request context, so `isPlatformWide()` routes every query to the owner
+    // pool and the check reports `tenant_role=postgres` on a correctly
+    // cut-over box. The diagnostic handle is the raw tenant pool, so this
+    // assertion pins the one line that decides which connection is measured.
+    const server = read('src/server.js');
+    expect(server).toMatch(/tenantPool:\s*dbPool\.tenantPoolForDiagnostics\s*\?/);
+  });
+});
