@@ -294,7 +294,8 @@ async function rosterForOverview(orgId) {
     `WITH latest_assessment AS (
        SELECT DISTINCT ON (a.client_id)
               a.client_id, a.assessment_date AS latest_date,
-              a.overall_fitness_score AS latest_score, a.testing_conditions
+              CASE WHEN a.overall_max IS NOT NULL THEN a.overall_fitness_score END AS latest_score,
+              a.testing_conditions
          FROM pt_assessments a
         WHERE a.organization_id = $1
         ORDER BY a.client_id, a.assessment_date DESC, a.created_at DESC

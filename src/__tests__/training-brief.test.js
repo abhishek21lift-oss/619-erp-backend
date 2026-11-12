@@ -219,6 +219,7 @@ describe('K11 strength percentiles', () => {
       client: CLIENT,
       assessment: {
         assessment_date: '2026-07-01',
+        overall_max: 100,
         strength_score_computed: 80,
         strength_category: 'Above Average',
         strength_test_data: JSON.stringify({
@@ -255,6 +256,7 @@ describe('100-point capacity scales', () => {
         endurance_score_computed: 6,
         mobility_score_computed: 12,
         overall_fitness_score: 78,
+        overall_max: 100,
       },
     });
     expect(brief.sections.capacity.strength).toMatchObject({ score: 7.5, max: 15 });
@@ -262,6 +264,28 @@ describe('100-point capacity scales', () => {
     expect(brief.sections.capacity.endurance).toMatchObject({ score: 6, max: 15 });
     expect(brief.sections.capacity.flexibility).toMatchObject({ score: 12, max: 15 });
     expect(brief.sections.capacity.overall).toBe(78);
+  });
+
+  it('withholds the numbers of a v1 row and keeps its stored categories', () => {
+    // v1 stored 0-100 component averages with no denominator; 55 is not 55 of
+    // 15 strength points, so only the classification is carried.
+    const brief = buildBrief({
+      client: CLIENT,
+      assessment: {
+        assessment_date: '2026-10-19',
+        scoring_formula_version: 1,
+        strength_score_computed: 55,
+        cardio_score_computed: 20,
+        endurance_score_computed: 20,
+        overall_fitness_score: 38,
+        strength_category: 'Below Supported Range',
+        cardio_category: 'Poor',
+      },
+    });
+    expect(brief.sections.capacity.overall).toBeNull();
+    expect(brief.sections.capacity.strength).toMatchObject({ score: null, category: 'Below Supported Range', max: 15 });
+    expect(brief.sections.capacity.cardio).toMatchObject({ score: null, category: 'Poor', max: 20 });
+    expect(brief.sections.capacity.endurance.score).toBeNull();
   });
 });
 
