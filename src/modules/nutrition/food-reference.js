@@ -95,8 +95,7 @@ async function loadFoodReference(orgId) {
        FROM foods
       WHERE is_active = TRUE
         AND (organization_id IS NULL OR organization_id = $1)
-      ORDER BY organization_id NULLS FIRST, name
-      LIMIT 1000`,
+      ORDER BY organization_id NULLS FIRST, name`,
     [orgId],
   );
   return referenceFromRows(rows);
