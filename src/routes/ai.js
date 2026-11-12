@@ -70,12 +70,13 @@ const { describeOutcomes } = require('../modules/pt-os/plan-outcomes');
 // The studio's today, not the server's. Same clock every other pt-os read uses.
 const { today: studioToday, dbDate } = require('../lib/appTime');
 // Deterministic nutrition: the server decides the numbers and the clock times.
-const { calculateTargets } = require('../modules/nutrition/nutrition-calculator');
+const { calculateTargets, NUTRITION_ENGINE_VERSION } = require('../modules/nutrition/nutrition-calculator');
 const { buildSchedule } = require('../modules/nutrition/meal-scheduler');
 const { validatePlan } = require('../modules/nutrition/diet-validation');
 const {
   loadFoodReference, stampPlanFoods, EMPTY_FOOD_REFERENCE,
 } = require('../modules/nutrition/food-reference');
+const { recordDietGeneration } = require('../modules/nutrition/diet-generation.repo');
 const {
   normaliseActivityLevel, resolveDietPlanningFacts,
 } = require('../modules/nutrition/diet-facts');
@@ -2173,6 +2174,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     // ships flagged rather than refused — the token spend exists either way,
     // and validation_status is what protects the trainer.
     let structural = dietPlanNeedsWork(plan);
+    let revised = false;
     const validationOptions = {
       targets: calculation,
       schedule: schedule.slots,
@@ -2230,6 +2232,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
             structural = fixedStructural;
             validation = fixedValidation;
             citationCheck = fixedCheck;
+            revised = true;
           }
         }
       } catch (err) {
@@ -2240,6 +2243,30 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
     // stripped, and the surviving (or empty) array is what both the done
     // event and any future ledger audit carry.
     grounding.sanitizeCitations(plan, citationCheck);
+
+    // Best-effort, exactly like the workout ledger: the plan succeeded, so a
+    // bookkeeping failure must not turn a usable generation into an error.
+    let generationId = null;
+    try {
+      generationId = await recordDietGeneration({
+        orgId: org,
+        clientId: client_id,
+        createdBy: req.user?.id ?? null,
+        requestId: req.id ?? null,
+        model: streamMeta.model,
+        revised,
+        plan,
+        inputs: p,
+        calculation,
+        schedule: schedule.slots,
+        validation,
+        grounding: grounding.groundingBlock(evidence, citationCheck),
+        engineVersion: NUTRITION_ENGINE_VERSION,
+        promptVersion: DIET_PROMPT_VERSION,
+      });
+    } catch (err) {
+      logger.warn({ err: err.message }, 'ai_diet_generation_record_failed');
+    }
 
     logUsage({
       user_id:           req.user.id,
@@ -2264,6 +2291,8 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       calculation,
       schedule: schedule.slots,
       prompt_version: DIET_PROMPT_VERSION,
+      // Null when the ledger write failed; the plan is still valid.
+      generation_id: generationId,
       // The plan's own pass/fail against targets, schedule and restrictions.
       // Warnings ride along; blockers already cost one revision.
       validation,

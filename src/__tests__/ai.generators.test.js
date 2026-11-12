@@ -529,6 +529,7 @@ describe('diet/generate', () => {
     expect(done.schedule.length).toBeGreaterThanOrEqual(3);
     for (const slot of done.schedule) expect(slot.time).toMatch(/^\d{2}:\d{2}$/);
     expect(done.prompt_version).toBe('2.0.0');
+    expect(done.generation_id === null || typeof done.generation_id === 'string').toBe(true);
   });
 
   test('an unclassifiable goal is refused before any model call', async () => {
