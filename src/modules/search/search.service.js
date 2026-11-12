@@ -503,7 +503,8 @@ async function searchAssessments(ctx) {
   return textSearch(ctx, {
     from: 'pt_assessments x JOIN pt_clients c ON c.id = x.client_id',
     columns: `x.id, x.client_id, x.assessment_number, x.assessment_type, x.assessment_date,
-              x.overall_fitness_score, c.name AS client_name, c.photo_url`,
+              CASE WHEN x.overall_max IS NOT NULL THEN x.overall_fitness_score END AS overall_fitness_score,
+              c.name AS client_name, c.photo_url`,
     primary: 'c.name',
     // assessment_number is a smallint, so it needs casting before it can be
     // pattern-matched at all.

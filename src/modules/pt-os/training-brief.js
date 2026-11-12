@@ -327,25 +327,28 @@ function buildBrief({
     const t = strengthData[key];
     return t && typeof t === 'object' && !Array.isArray(t) ? t : {};
   };
+  // A v1 row stored 0-100 component averages with no denominator; they are not
+  // points out of a step max, so withhold the numbers and keep the categories.
+  const hasV2Score = assessment != null && num(assessment.overall_max) != null;
   sections.capacity = assessment ? {
     present: true,
     as_of: dbDate(assessment.assessment_date),
-    overall: num(assessment.overall_fitness_score),
+    overall: hasV2Score ? num(assessment.overall_fitness_score) : null,
     strength: {
-      score: num(assessment.strength_score_computed ?? assessment.strength_score),
+      score: hasV2Score ? num(assessment.strength_score_computed ?? assessment.strength_score) : null,
       category: assessment.strength_category ?? null,
       percentile: num(strengthTest('test1').k11_percentile),
       percentile_2: num(strengthTest('test2').k11_percentile),
       max: STEP_MAX.strength,
     },
-    cardio: { score: num(assessment.cardio_score_computed ?? assessment.cardio_score), category: assessment.cardio_category ?? null, vo2_max: num(assessment.vo2_max), max: STEP_MAX.cardio },
-    endurance: { score: num(assessment.endurance_score_computed), category: assessment.endurance_category ?? null, max: STEP_MAX.endurance },
+    cardio: { score: hasV2Score ? num(assessment.cardio_score_computed ?? assessment.cardio_score) : null, category: assessment.cardio_category ?? null, vo2_max: num(assessment.vo2_max), max: STEP_MAX.cardio },
+    endurance: { score: hasV2Score ? num(assessment.endurance_score_computed) : null, category: assessment.endurance_category ?? null, max: STEP_MAX.endurance },
     // The dashboard's "Flexibility" category is the 100-point framework's
     // flexibility step, stored as mobility_score_computed (points out of 15).
     // The legacy `flexibility_score` column is a raw 0-10 on a different scale
     // and is no longer written, so it is NOT substituted here — an unavailable
     // computed score stays null rather than masquerading as 0-15 points.
-    flexibility: { score: num(assessment.mobility_score_computed), category: assessment.flexibility_category ?? null, max: STEP_MAX.flexibility },
+    flexibility: { score: hasV2Score ? num(assessment.mobility_score_computed) : null, category: assessment.flexibility_category ?? null, max: STEP_MAX.flexibility },
   } : { present: false };
 
   // ── Limitations: the section that changes exercise SELECTION rather than
