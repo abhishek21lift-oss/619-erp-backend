@@ -52,8 +52,11 @@ const boundToSelf = (q) => {
 describe('GET /api/me/workout', () => {
   it('reads only the session client in the session studio, whatever the query says', async () => {
     await request(app).get('/api/me/workout?client_id=someone-else&organization_id=other').expect(200);
-    expect(mockQueries).toHaveLength(1); // no assignments → no exercise query
-    boundToSelf(mockQueries[0]);
+    // The programme, the permission and the open session — three reads, all
+    // of them the session's own client; no exercise query without a programme.
+    expect(mockQueries).toHaveLength(3);
+    mockQueries.forEach(boundToSelf);
+    expect(mockQueries.some((q) => /SELECT we\.workout_plan_id/.test(q.sql))).toBe(false);
     expect(mockQueries[0].params).not.toContain('someone-else');
     expect(mockQueries[0].sql).toMatch(/a\.status = 'active'/);
   });

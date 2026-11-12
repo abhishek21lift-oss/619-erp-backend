@@ -591,6 +591,24 @@ router.delete('/workout/sessions/:id', wrap(async (req, res) => {
   }
 }));
 
+// POST /api/me/workout/sessions/:id/submit — finalise, and queue for review
+router.post('/workout/sessions/:id/submit', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    const result = await training.submitMyWorkout({
+      clientId, orgId, sessionId: req.params.id, draft: req.body?.draft,
+    });
+    await logActivity(req, 'workout_log.member.submit', 'workout_session', req.params.id, {
+      sets: result.summary.sets,
+      exercises: result.summary.exercises,
+      volume_kg: result.summary.volume_kg,
+    });
+    res.json({ data: result });
+  } catch (err) {
+    if (!inputError(res, err, training.TrainingInputError)) throw err;
+  }
+}));
+
 // POST /api/me/workouts — a finished workout the member did on their own
 router.post('/workouts', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
@@ -603,7 +621,10 @@ router.post('/workouts', wrap(async (req, res) => {
     } });
   }
   try {
-    const { created, summary } = await training.logMyWorkout(clientId, orgId, req.user.id, req.body || {});
+    // The plan day is snapshotted beside what the member did, so the trainer
+    // can review planned vs actual even after the plan changes.
+    const plans = await portal.myWorkout(clientId, orgId);
+    const { created, summary } = await training.logMyWorkout(clientId, orgId, req.user.id, req.body || {}, plans);
     res.status(created ? 201 : 200).json({ data: summary });
   } catch (err) {
     if (!inputError(res, err, training.TrainingInputError)) throw err;
