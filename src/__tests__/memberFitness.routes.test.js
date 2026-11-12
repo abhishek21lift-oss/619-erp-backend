@@ -99,8 +99,9 @@ describe('the repository is the whitelist', () => {
     }
   });
 
-  it('selects the vitals and anthropometric readings the dashboard shows', () => {
+  it('selects the seven step scores, vitals and anthropometric readings the dashboard shows', () => {
     for (const column of [
+      'bp_points', 'anthropometric_points',
       'bp_systolic', 'bp_diastolic', 'resting_heart_rate', 'resting_spo2',
       'waist_iliac_cm', 'waist_hip_ratio', 'bmi_category',
     ]) {
