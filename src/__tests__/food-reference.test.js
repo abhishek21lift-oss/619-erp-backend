@@ -61,11 +61,35 @@ describe('loadFoodReference', () => {
     expect(ref.namesForCulture('mixed')).toContain('Roti');
   });
 
+  test('namesForCulture keeps studio and curated foods inside the 120-name cap', async () => {
+    const imported = Array.from({ length: 130 }, (_, i) => ({
+      id: `food-imported-${i}`, organization_id: null, name: `Imported ${String(i).padStart(3, '0')}`,
+      normalized_name: `imported ${i}`, aliases: [], culture: 'indian', source: 'indb',
+    }));
+    pool.query.mockResolvedValue({
+      rows: [
+        ...imported,
+        {
+          id: 'food-roti', organization_id: null, name: 'Roti', normalized_name: 'roti',
+          aliases: [], culture: 'indian', source: 'curated',
+        },
+        {
+          id: 'food-org', organization_id: ORG, name: 'Studio Shake', normalized_name: 'studio shake',
+          aliases: [], culture: 'indian', source: 'curated',
+        },
+      ],
+    });
+    const names = (await loadFoodReference(ORG)).namesForCulture('indian');
+    expect(names).toHaveLength(120);
+    expect(names.slice(0, 2)).toEqual(['Studio Shake', 'Roti']);
+  });
+
   test('the query is tenant-scoped and active-only', async () => {
     await loadFoodReference(ORG);
     const sql = pool.query.mock.calls[0][0];
     expect(sql).toContain('is_active = TRUE');
     expect(sql).toContain('organization_id IS NULL OR organization_id = $1');
+    expect(sql).toContain('source');
     expect(pool.query.mock.calls[0][1]).toEqual([ORG]);
   });
 });

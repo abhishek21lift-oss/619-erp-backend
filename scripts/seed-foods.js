@@ -7,6 +7,9 @@
 // Sources (workspace root):
 //   data/ifct2017/compositions.csv  IFCT 2017, 542 foods, energy in kJ/100 g
 //   data/indb.csv                   INDB, 1,014 recipes, energy in kcal/100 g
+//   data/indb_servings.csv          INDB serving sizes (recipe_code,
+//                                   size_of_servings, servings_unit) from
+//                                   recipes_servingsize.xlsx
 
 const fs = require('fs');
 const path = require('path');
@@ -18,16 +21,9 @@ const DATA_DIR = process.env.FOOD_DATA_DIR
     .find((dir) => fs.existsSync(path.join(dir, 'indb.csv')));
 const BATCH = 200;
 
-if (!DATA_DIR) {
-  throw new Error('Food data not found: set FOOD_DATA_DIR or place indb.csv in data/.');
-}
-
-if (process.env.NODE_ENV === 'production' && !process.env.ALLOW_FOOD_SEED) {
-  throw new Error('Refusing to seed a production database without ALLOW_FOOD_SEED=1');
-}
-
 /** RFC 4180 parser: quoted fields, escaped quotes, CRLF, commas in names. */
-function parseCsv(text) {
+function parseCsv(raw) {
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
   const rows = [];
   let row = [];
   let field = '';
@@ -47,9 +43,13 @@ function parseCsv(text) {
   return rows;
 }
 
-/** CSV rows → objects keyed by header. */
-function records(file) {
+/** CSV rows → objects keyed by header; a renamed column fails the import. */
+function records(file, required = []) {
   const [header, ...body] = parseCsv(fs.readFileSync(file, 'utf8'));
+  const missing = required.filter((key) => !header.includes(key));
+  if (missing.length) {
+    throw new Error(`${path.basename(file)}: missing column(s): ${missing.join(', ')}`);
+  }
   return body
     .filter((row) => row.length > 1)
     .map((row) => Object.fromEntries(header.map((key, i) => [key, row[i] ?? ''])));
@@ -63,8 +63,18 @@ function num(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function ifctFoods() {
-  return records(path.join(DATA_DIR, 'ifct2017/compositions.csv')).map((r) => ({
+/** "2 triangle" when the count is known, the unit alone when it is not. */
+function householdServing(size, unit) {
+  const u = String(unit ?? '').trim();
+  if (!u) return null;
+  const s = String(size ?? '').trim();
+  return s ? `${s} ${u}` : u;
+}
+
+const IFCT_COLUMNS = ['code', 'name', 'lang', 'enerc', 'protcnt', 'choavldf', 'fatce', 'fibtg'];
+
+function ifctFoods(dir = DATA_DIR) {
+  return records(path.join(dir, 'ifct2017/compositions.csv'), IFCT_COLUMNS).map((r) => ({
     id: `food-ifct-${r.code}`,
     name: r.name.trim(),
     normalized_name: normaliseFoodName(r.name),
@@ -83,24 +93,38 @@ function ifctFoods() {
   }));
 }
 
-function indbFoods() {
-  return records(path.join(DATA_DIR, 'indb.csv')).map((r) => ({
-    id: `food-indb-${r.food_code}`,
-    name: r.food_name.trim(),
-    normalized_name: normaliseFoodName(r.food_name),
-    local_names: [],
-    category: null,
-    source: 'indb',
-    serving_unit: 'g',
-    serving_grams: 100,
-    calories: round1(num(r.energy_kcal)),
-    protein_g: round1(num(r.protein_g)),
-    carbs_g: round1(num(r.carb_g)),
-    fats_g: round1(num(r.fat_g)),
-    fiber_g: round1(num(r.fibre_g)),
-    household_serving: r.servings_unit ? `1 ${r.servings_unit.trim()}` : null,
-    culture: 'indian',
-  }));
+const INDB_COLUMNS = [
+  'food_code', 'food_name', 'energy_kcal', 'protein_g', 'carb_g', 'fat_g', 'fibre_g', 'servings_unit',
+];
+
+function indbFoods(dir = DATA_DIR) {
+  const servings = new Map(
+    records(path.join(dir, 'indb_servings.csv'), ['recipe_code', 'size_of_servings', 'servings_unit'])
+      .map((r) => [r.recipe_code.trim(), r]),
+  );
+  return records(path.join(dir, 'indb.csv'), INDB_COLUMNS).map((r) => {
+    const serving = servings.get(r.food_code.trim());
+    return {
+      id: `food-indb-${r.food_code}`,
+      name: r.food_name.trim(),
+      normalized_name: normaliseFoodName(r.food_name),
+      local_names: [],
+      category: null,
+      source: 'indb',
+      serving_unit: 'g',
+      serving_grams: 100,
+      calories: round1(num(r.energy_kcal)),
+      protein_g: round1(num(r.protein_g)),
+      carbs_g: round1(num(r.carb_g)),
+      fats_g: round1(num(r.fat_g)),
+      fiber_g: round1(num(r.fibre_g)),
+      household_serving: householdServing(
+        serving?.size_of_servings,
+        serving?.servings_unit || r.servings_unit,
+      ),
+      culture: 'indian',
+    };
+  });
 }
 
 const COLUMNS = [
@@ -131,6 +155,13 @@ async function insertAll(client, foods) {
 }
 
 async function main() {
+  if (!DATA_DIR) {
+    throw new Error('Food data not found: set FOOD_DATA_DIR or place indb.csv in data/.');
+  }
+  if (process.env.NODE_ENV === 'production' && !process.env.ALLOW_FOOD_SEED) {
+    throw new Error('Refusing to seed a production database without ALLOW_FOOD_SEED=1');
+  }
+
   const foods = [...ifctFoods(), ...indbFoods()];
   const client = await pool.connect();
   let inserted;
@@ -170,9 +201,15 @@ async function main() {
   console.log(`  total: ${totals.reduce((sum, t) => sum + t.count, 0)}`);
 }
 
-main()
-  .then(() => pool.end())
-  .catch((err) => {
-    console.error('Seed failed:', err.message);
-    pool.end().finally(() => process.exit(1));
-  });
+if (require.main === module) {
+  main()
+    .then(() => pool.end())
+    .catch((err) => {
+      console.error('Seed failed:', err.message);
+      pool.end().finally(() => process.exit(1));
+    });
+}
+
+module.exports = {
+  parseCsv, records, householdServing, indbFoods,
+};
