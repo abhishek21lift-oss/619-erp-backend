@@ -342,6 +342,44 @@ async function notifyTrainer(clientId, orgId, s) {
 }
 
 /**
+ * May this client start a workout without their trainer?
+ *
+ * OFF until a trainer turns it on. Read from the client row, never from the
+ * request; a missing/deleted client is a refusal, not an allow.
+ */
+async function selfWorkoutPermission(clientId, orgId, db = pool) {
+  const { rows } = await db.query(
+    `SELECT allow_self_workout FROM pt_clients
+      WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+    [clientId, orgId],
+  );
+  return rows[0]?.allow_self_workout === true;
+}
+
+/**
+ * The member's open self-workout session, if it is still resumable.
+ *
+ * A session left open for more than a day is not offered for resume — starting
+ * again retires it as 'abandoned' rather than resuming yesterday's draft.
+ * Revoking the permission does not affect this read: a member may always
+ * finish a session they already started.
+ */
+async function openSessionFor(clientId, orgId, db = pool) {
+  const { rows } = await db.query(
+    `SELECT id, started_at, draft, prescribed,
+            workout_assignment_id, program_name, workout_day
+       FROM workout_sessions
+      WHERE client_id = $1 AND organization_id = $2
+        AND source = 'member' AND status = 'in_progress'
+        AND started_at > NOW() - INTERVAL '24 hours'
+      ORDER BY started_at DESC, created_at DESC
+      LIMIT 1`,
+    [clientId, orgId],
+  );
+  return rows[0] || null;
+}
+
+/**
  * The member's active PT session packages. `session_balance` has no row-level
  * tenancy of its own beyond organization_id, and its client_id once pointed at
  * the dropped legacy `clients` table — migration 174 backfilled org from
@@ -365,6 +403,8 @@ module.exports = {
   normaliseWorkout,
   lastPerformance,
   logMyWorkout,
+  selfWorkoutPermission,
+  openSessionFor,
   DAILY_LIMIT,
   mySessionBalance,
 };

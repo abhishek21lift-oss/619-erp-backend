@@ -200,10 +200,16 @@ router.get('/measurements', wrap(async (req, res) => {
 // in client-portal.service.js; each route passes it the identity from the
 // session and nothing from the request.
 
-// GET /api/me/workout — active programmes, this week's exercises by day
+// GET /api/me/workout — active programmes, this week's exercises by day, and
+// whether the trainer has allowed the member to train on their own.
 router.get('/workout', wrap(async (req, res) => {
   const { clientId, orgId } = selfOf(req);
-  res.json({ data: await portal.myWorkout(clientId, orgId) });
+  const [data, allowSelfWorkout, openSession] = await Promise.all([
+    portal.myWorkout(clientId, orgId),
+    training.selfWorkoutPermission(clientId, orgId),
+    training.openSessionFor(clientId, orgId),
+  ]);
+  res.json({ data, allow_self_workout: allowSelfWorkout, open_session: openSession });
 }));
 
 // GET /api/me/diet — active diet plans with daily targets and meals
