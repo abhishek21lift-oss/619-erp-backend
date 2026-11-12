@@ -489,7 +489,7 @@ describe('diet/generate', () => {
 
     const res = await request(app).post('/api/ai/diet/generate').send({
       client_id: 'client-1', age: 41, gender: 'male', weight_kg: 88, height_cm: 178,
-      goal: 'muscle_gain', activity_level: 'high', dietary_preferences: 'eggetarian',
+      goal: 'muscle_gain', activity_level: 'very_active', dietary_preferences: 'eggetarian',
       allergies: 'shellfish', budget: 'high', meal_frequency: 6,
     });
 
@@ -500,7 +500,7 @@ describe('diet/generate', () => {
     expect(prompt).toContain('Weight: 71.3 kg');
     expect(prompt).toContain('Goal: weight_loss');
     // …and the body fills what the record does not hold.
-    expect(prompt).toContain('Activity level: high');
+    expect(prompt).toContain('Activity level: very_active');
     expect(prompt).toContain('Dietary preferences: eggetarian');
     expect(prompt).toContain('Allergies / intolerances: shellfish');
     expect(prompt).toContain('Budget: high');
@@ -1345,6 +1345,35 @@ describe('workout/context: what the diet still needs', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.diet.missing).toEqual([]);
+  });
+
+  test('carries the calculation, the schedule and where each fact came from', async () => {
+    mockQueries({
+      'FROM pt_lifestyle_assessments WHERE client_id=$1': [{ activity_level: 'moderately_active' }],
+    });
+    const res = await request(app).get('/api/ai/workout/context/client-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.diet.inputs.origins).toBeDefined();
+    // Nobody recorded a session length, so the engine chose one and says so.
+    expect(res.body.diet.inputs.origins.workout_duration_minutes).toBe('default');
+    expect(res.body.diet.calculation.calorie_target).toEqual(expect.any(Number));
+    expect(res.body.diet.schedule.length).toBeGreaterThanOrEqual(3);
+    expect(res.body.diet.schedule[0].time).toMatch(/^\d{2}:\d{2}$/);
+  });
+
+  test('a record with no classifiable goal cannot produce a calorie target', async () => {
+    mockQueries({
+      'FROM pt_clients WHERE id=$1': [{ ...CLIENT, goal: null }],
+      'FROM pt_goals WHERE client_id=$1': [{ goal_type: null }],
+      'FROM pt_goals': [{ goal_type: null }],
+      'FROM pt_lifestyle_assessments WHERE client_id=$1': [{ activity_level: 'moderately_active' }],
+    });
+    const res = await request(app).get('/api/ai/workout/context/client-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.diet.calculation.missing).toContain('goal');
+    expect(res.body.diet.missing).toContain('goal');
   });
 });
 

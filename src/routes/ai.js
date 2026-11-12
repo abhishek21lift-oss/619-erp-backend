@@ -69,6 +69,13 @@ const {
 const { describeOutcomes } = require('../modules/pt-os/plan-outcomes');
 // The studio's today, not the server's. Same clock every other pt-os read uses.
 const { today: studioToday, dbDate } = require('../lib/appTime');
+// Deterministic nutrition: the server decides the numbers and the clock times.
+const { calculateTargets } = require('../modules/nutrition/nutrition-calculator');
+const { buildSchedule } = require('../modules/nutrition/meal-scheduler');
+const {
+  normaliseActivityLevel, resolveDietPlanningFacts,
+} = require('../modules/nutrition/diet-facts');
+const { classifyGoal } = require('../modules/pt-os/goal-classification');
 const {
   buildCoachSystemPrompt,
   buildWorkoutSystemPrompt,
@@ -561,12 +568,19 @@ function resolveDietInputs({ client, profile, goals, latestAssessment, latestChe
   const statedHeight = numInRange(body.height_cm, 'height_cm');
   const statedAge    = numInRange(body.age, 'age');
 
+  // The nutrition-planning facts: typed enums, bounded numbers, and where each
+  // one came from. Same precedence as the rest of the resolver, with the one
+  // safety exception documented in the module.
+  const planning = resolveDietPlanningFacts({
+    client, profile, goals, latestAssessment, latestCheckin, lifestyle, nutrition, dietAssignments, parqMedical,
+  }, body);
+
   return {
     age:      ageFromDob(client.dob) ?? statedAge,
     gender:   firstDefined(client.gender, body.gender),
     weight_kg: firstDefined(latestWeight, statedWeight),
     height_cm: firstDefined(height, statedHeight),
-    activity_level: firstDefined(lifestyle?.activity_level, body.activity_level),
+    activity_level: normaliseActivityLevel(firstDefined(lifestyle?.activity_level, body.activity_level)),
     goal:     firstDefined(goal, body.goal),
     // Silent stays silent. The old `|| 'none'` printed a clean bill of health
     // for every client nobody had written a note about, and the model then
@@ -585,15 +599,20 @@ function resolveDietInputs({ client, profile, goals, latestAssessment, latestChe
     assigned_plan: active
       ? `${active.template_name || 'Unnamed plan'} (since ${String(active.start_date).slice(0, 10)})`
       : null,
+    ...planning,
   };
 }
 
 // The facts a calorie target cannot be calculated without. One list, used by
 // the generator's refusal AND by the pre-flight context route, so the disabled
-// button and the 400 name the same fields.
+// button and the 400 name the same fields. A goal the engine cannot classify
+// is missing in exactly the same way an empty one is: `custom` is a label, not
+// a prescription, and it cannot choose a calorie adjustment.
 const DIET_REQUIRED = ['age', 'gender', 'weight_kg', 'height_cm', 'activity_level', 'goal'];
 function missingDietFields(inputs) {
-  return DIET_REQUIRED.filter((field) => !inputs[field]);
+  const missing = DIET_REQUIRED.filter((field) => !inputs[field]);
+  if (inputs.goal && !classifyGoal(inputs.goal)) missing.push('goal');
+  return [...new Set(missing)];
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -608,11 +627,16 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
   const isRegenerate = Boolean(regenerate) && Boolean(conversation_id);
 
   // Conversation ownership gate. A caller-supplied conversation_id must
-  // belong to the authenticated user — the same `WHERE id = $1 AND user_id = $2`
-  // convention as GET/PATCH/DELETE /conversations/:id below. It runs before
-  // the SSE headers so the failure is a JSON 404, and before any message
-  // read/write so a foreign conversation can never reach the prompt, RAG,
-  // tools, or the model. Unknown and foreign UUIDs answer identically.
+  // belong to the authenticated user and their studio — the same
+  // `WHERE id = $1 AND user_id = $2` convention as GET/PATCH/DELETE
+  // /conversations/:id below, plus the tenant boundary Phase 4.3D found
+  // missing from the write path. It runs before the SSE headers so the
+  // failure is a JSON 404, and before any message read/write so a foreign
+  // conversation can never reach the prompt, RAG, tools, or the model.
+  // Unknown and foreign UUIDs answer identically. Conversations created
+  // before organizations were stamped (organization_id IS NULL) match no
+  // org and are therefore no longer reopenable — fail closed, never guessed
+  // into a studio.
   // `client_id` arrives in the request body and was PERSISTED unchecked onto
   // the conversation row below.
   //
@@ -639,12 +663,22 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
   // answer the user gets is unchanged.
   const ownedClientId = client_id && await clientInOrg(req, client_id) ? client_id : null;
 
+  // One correlation id per chat request. Every tool attempt in this turn
+  // shares it, so the ledger rows of one answer are groupable even after the
+  // conversation is archived or a message is removed. It is generated here,
+  // never accepted from the request body.
+  const correlationId = randomUUID();
+
   let convId = conversation_id;
+  // The originating user message, when this turn has one. Regenerate reuses
+  // the question already in the thread but does not look its id up — a null
+  // link is honest, a wrong link is not.
+  let userMessageId = null;
   if (convId) {
     try {
       const { rows } = await pool.query(
-        'SELECT id FROM ai_conversations WHERE id = $1 AND user_id = $2',
-        [convId, req.user.id]
+        'SELECT id FROM ai_conversations WHERE id = $1 AND user_id = $2 AND organization_id = $3',
+        [convId, req.user.id, req.user.organization_id]
       );
       if (!rows.length) return res.status(404).json({ error: 'Conversation not found' });
     } catch (err) {
@@ -678,8 +712,8 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     if (!convId) {
       const title = message.slice(0, 60).trim();
       const { rows } = await pool.query(
-        `INSERT INTO ai_conversations (user_id, client_id, title) VALUES ($1,$2,$3) RETURNING id`,
-        [req.user.id, ownedClientId, title]
+        `INSERT INTO ai_conversations (user_id, client_id, title, organization_id) VALUES ($1,$2,$3,$4) RETURNING id`,
+        [req.user.id, ownedClientId, title, req.user.organization_id]
       );
       convId = rows[0].id;
     }
@@ -698,10 +732,11 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
         [convId]
       );
     } else {
-      await pool.query(
-        `INSERT INTO ai_messages (conversation_id, role, content) VALUES ($1,'user',$2)`,
+      const { rows } = await pool.query(
+        `INSERT INTO ai_messages (conversation_id, role, content) VALUES ($1,'user',$2) RETURNING id`,
         [convId, message]
       );
+      userMessageId = rows[0]?.id ?? null;
     }
 
     // Build bounded conversation history — the most recent N messages (the
@@ -754,10 +789,17 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
     // model-driven function calling. Non-fatal on failure, same as RAG above.
     let toolNames = [];
     let toolCtx = '';
+    let toolRuns = [];
     try {
-      const toolResult = await runTools(req, message);
+      const toolResult = await runTools(req, message, {
+        clientId: ownedClientId,
+        conversationId: convId,
+        messageId: userMessageId,
+        correlationId,
+      });
       toolNames = toolResult.toolNames;
       toolCtx = toolResult.contextText;
+      toolRuns = Array.isArray(toolResult.runs) ? toolResult.runs : [];
     } catch (toolErr) {
       // The whole dispatcher failing is rarer than one tool failing (which
       // runTools reports inline), but it has the same hazard: the model must
@@ -867,10 +909,31 @@ router.post('/chat', auth, requireConfigured, async (req, res) => {
       return;
     }
 
+    // Provenance summary for this answer. References only: the durable tool
+    // detail is in ai_tool_runs, and source titles are already shown to the
+    // user. No prompt text, message body or tool payload is copied here.
+    const messageMeta = {
+      correlation_id: correlationId,
+      intent:         'chat',
+      model:          chatMeta?.model || routedModel,
+      grounding:      chatGrounding,
+      tools:          toolRuns.slice(0, 20).map((r) => ({
+        tool: r.tool,
+        run_id: r.run_id ?? null,
+        ok: r.ok,
+        code: r.code ?? null,
+      })),
+      sources:        [...new Set(knowledgeChunks.map((c) => c.title))]
+        .slice(0, 20)
+        .map((title) => String(title).slice(0, 200)),
+      client_id:      ownedClientId,
+    };
+
     // Save assistant message
     await pool.query(
-      `INSERT INTO ai_messages (conversation_id, role, content, provider) VALUES ($1,'assistant',$2,$3)`,
-      [convId, fullContent, aiConfig.providerFromBase()]
+      `INSERT INTO ai_messages (conversation_id, role, content, provider, meta)
+       VALUES ($1,'assistant',$2,$3,$4::jsonb)`,
+      [convId, fullContent, aiConfig.providerFromBase(), JSON.stringify(messageMeta)]
     );
 
     // Update conversation timestamp
@@ -971,14 +1034,40 @@ router.get('/workout/context/:client_id', auth, requireTrainer, async (req, res)
     logger.warn({ err: err.message }, 'ai_workout_context_twin_failed');
   }
 
+  // The diet generator's own pre-flight, from the same resolver it calls.
+  // Resolved without a body because this card has no diet fields to state:
+  // anything missing here is missing from the record. The calculation and the
+  // schedule are computed here rather than in the browser so the trainer sees
+  // the same numbers the generator will be held to.
+  const dietInputs = resolveDietInputs(ctx, {});
+  // The calculator speaks canonical goals; the record may still hold a legacy
+  // name (`weight_loss`), so classify before it becomes a calorie adjustment.
+  const dietGoal = classifyGoal(dietInputs.goal);
+  const dietCalculation = dietGoal
+    ? calculateTargets({ ...dietInputs, goal: dietGoal, today: studioToday() })
+    : null;
+  const dietSchedule = dietCalculation?.calorie_target != null
+    ? buildSchedule({
+      workout_time: dietInputs.workout_time,
+      workout_duration_minutes: dietInputs.workout_duration_minutes,
+      meal_frequency: dietInputs.meal_frequency,
+      meal_timing_preference: dietInputs.meal_timing_preference,
+      targets: dietCalculation,
+    }).slots
+    : [];
+
   res.json({
     client: { id: ctx.client.id, name: ctx.client.name },
     facts,
     data_quality: dataQuality,
-    // The diet generator's own pre-flight, from the same resolver it calls.
-    // Resolved without a body because this card has no diet fields to state:
-    // anything missing here is missing from the record.
-    diet: { missing: missingDietFields(resolveDietInputs(ctx, {})) },
+    diet: {
+      missing: missingDietFields(dietInputs),
+      inputs: dietInputs,
+      calculation: dietCalculation?.calorie_target != null
+        ? dietCalculation
+        : { missing: dietCalculation?.missing ?? ['goal'] },
+      schedule: dietSchedule,
+    },
     safety: twin
       ? {
         gate: twin.rules.gate,
@@ -2904,10 +2993,10 @@ router.get('/conversations', auth, async (req, res) => {
             (SELECT content FROM ai_messages WHERE conversation_id=c.id ORDER BY created_at DESC LIMIT 1) AS last_message,
             (SELECT COUNT(*) FROM ai_messages WHERE conversation_id=c.id) AS message_count
      FROM ai_conversations c
-     WHERE c.user_id=$1
+     WHERE c.user_id=$1 AND c.organization_id=$2
      ORDER BY c.pinned DESC, c.updated_at DESC
-     LIMIT $2 OFFSET $3`,
-    [req.user.id, limit, offset]
+     LIMIT $3 OFFSET $4`,
+    [req.user.id, orgParam(req), limit, offset]
   );
   res.json({ data: rows });
 });
@@ -2921,7 +3010,10 @@ router.patch('/conversations/:id', auth, async (req, res) => {
   const { title, pinned } = req.body || {};
 
   const sets = [];
-  const params = [req.params.id, req.user.id];
+  // The tenant boundary is checked alongside user ownership, so a thread from
+  // a studio the caller has left (or a pre-273 thread with no org) is not
+  // reopenable. `organization_id = NULL` matches nothing: fail closed.
+  const params = [req.params.id, req.user.id, orgParam(req)];
 
   if (title !== undefined) {
     const clean = String(title).trim().slice(0, 200);
@@ -2940,7 +3032,7 @@ router.patch('/conversations/:id', auth, async (req, res) => {
   // reshuffle the "most recent" ordering of the history list under the user.
   const { rows } = await pool.query(
     `UPDATE ai_conversations SET ${sets.join(', ')}
-     WHERE id = $1 AND user_id = $2
+     WHERE id = $1 AND user_id = $2 AND organization_id = $3
      RETURNING id, title, pinned, client_id, created_at, updated_at`,
     params
   );
@@ -2950,8 +3042,8 @@ router.patch('/conversations/:id', auth, async (req, res) => {
 
 router.get('/conversations/:id', auth, async (req, res) => {
   const { rows: [conv] } = await pool.query(
-    'SELECT * FROM ai_conversations WHERE id=$1 AND user_id=$2',
-    [req.params.id, req.user.id]
+    'SELECT * FROM ai_conversations WHERE id=$1 AND user_id=$2 AND organization_id=$3',
+    [req.params.id, req.user.id, orgParam(req)]
   );
   if (!conv) return res.status(404).json({ error: 'Conversation not found' });
 
@@ -2965,8 +3057,8 @@ router.get('/conversations/:id', auth, async (req, res) => {
 
 router.delete('/conversations/:id', auth, async (req, res) => {
   const { rowCount } = await pool.query(
-    'DELETE FROM ai_conversations WHERE id=$1 AND user_id=$2',
-    [req.params.id, req.user.id]
+    'DELETE FROM ai_conversations WHERE id=$1 AND user_id=$2 AND organization_id=$3',
+    [req.params.id, req.user.id, orgParam(req)]
   );
   if (!rowCount) return res.status(404).json({ error: 'Conversation not found' });
   res.json({ message: 'Conversation deleted' });
