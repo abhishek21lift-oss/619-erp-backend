@@ -270,12 +270,20 @@ function validatePlan(plan, {
     }
   }
 
-  // 13. Allergies and foods to avoid. Known terms expand to a group; an
+  // 13. Allergies and foods to avoid. Known terms expand to a group; a term
+  // that names a group member ("peanuts") expands to that member's group; an
   // unknown token still warns, because silence would read as clearance.
+  const groupFor = (token) => {
+    if (ALLERGEN_GROUPS[token]) return ALLERGEN_GROUPS[token];
+    const singular = token.replace(/s$/, '');
+    const key = Object.keys(ALLERGEN_GROUPS).find((g) => ALLERGEN_GROUPS[g].includes(singular));
+    return key ? ALLERGEN_GROUPS[key] : null;
+  };
   const checkRestriction = (raw, { phrase, id }) => {
     for (const token of asList(raw)) {
-      const terms = ALLERGEN_GROUPS[token] ?? [token];
-      const known = Boolean(ALLERGEN_GROUPS[token]);
+      const group = groupFor(token);
+      const terms = group ?? [token];
+      const known = Boolean(group);
       let hits = 0;
       for (const { meal, food, name } of foods) {
         const hit = terms.find((term) => hasTerm(name, term));
@@ -310,13 +318,18 @@ function validatePlan(plan, {
   if (foodsById) {
     for (const { meal, food } of foods) {
       if (food.food_id == null) continue;
-      const ref = foodsById[String(food.food_id)];
+      // Callers pass the reference Map (route) or a plain object (tests).
+      const ref = foodsById instanceof Map
+        ? foodsById.get(String(food.food_id))
+        : foodsById[String(food.food_id)];
       if (!ref) {
         flag('food_references', 'blocker', `Food "${food.name}" references an unknown food_id.`);
         continue;
       }
       const grams = num(food.grams);
-      const refCals = num(ref.calories_per_100g);
+      // Reference rows quote per serving; the check needs per 100 g.
+      const refCals = num(ref.calories_per_100g)
+        ?? (num(ref.serving_grams) > 0 ? (num(ref.calories) * 100) / num(ref.serving_grams) : null);
       if (grams != null && refCals != null) {
         const expected = (refCals * grams) / 100;
         if (!inTolerance(num(food.calories), expected, TOLERANCES.foodReferencePct)) {

@@ -9,7 +9,15 @@ const logger = require('../lib/logger');
 const { movedFields } = require('../lib/fieldOwnership');
 const { parseStrict } = require('../lib/zodNumbers');
 const { cleanDate } = require('../lib/credentials');
-const { saveAiDietPlan, DietPlanError } = require('../modules/nutrition/ai-diet.service');
+const { saveAiDietPlan, normalisePlan, DietPlanError } = require('../modules/nutrition/ai-diet.service');
+const {
+  readDietGeneration, markDietGenerationAccepted,
+} = require('../modules/nutrition/diet-generation.repo');
+const { resolveDietPlanningFacts } = require('../modules/nutrition/diet-facts');
+const { validatePlan, targetsStale } = require('../modules/nutrition/diet-validation');
+const { loadFoodReference } = require('../modules/nutrition/food-reference');
+const { loadClientSources } = require('../modules/pt-os/authoritative-client');
+const { classifyGoal } = require('../modules/pt-os/goal-classification');
 const {
   createTemplate, upsertTracker, updateAssignmentStatus, DietInputError,
 } = require('../modules/nutrition/diet.repository');
@@ -529,24 +537,101 @@ router.get('/supplements', auth, async (req, res, next) => {
 
 // ─── SAVE A GENERATED PLAN ───────────────────────────────────
 
-// POST /api/diet/plans/from-ai  { client_id, plan }
+// POST /api/diet/plans/from-ai  { client_id, plan } or { client_id, generation_id }
 //
 // The AI diet generator's output could only be previewed; a trainer who liked
 // it retyped it meal by meal. This saves the reviewed plan as the studio's own
 // template, its meals and an active assignment to the client, in one
 // transaction. The SQL lives in modules/nutrition/ai-diet.service.js — this
 // adapter parses, guards and answers.
+//
+// A generation_id saves what the engine proposed, with the numbers it was
+// judged against. The stored plan is re-checked against the client's LIVE
+// record: an allergy recorded after generation still refuses the save, while
+// a re-weighed client only warns that the targets are stale.
 router.post('/plans/from-ai', auth, requireTrainer, async (req, res, next) => {
   try {
-    const { client_id: clientId, plan } = req.body || {};
+    const { client_id: clientId, generation_id: generationId, plan } = req.body || {};
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
+    if (!generationId && !plan) return res.status(400).json({ error: 'plan or generation_id required' });
     // Same 404 as /assign: a caller who may not use a client should not learn
     // whether its id exists.
     if (!await clientInOrg(req, clientId)) return res.status(404).json({ error: 'Client not found' });
+    const orgId = orgIdOf(req);
+
+    if (generationId) {
+      const generation = await readDietGeneration(String(generationId), orgId);
+      // Foreign studio and unknown id answer identically, and a generation for
+      // a different client is not this client's to save.
+      if (!generation || generation.client_id !== clientId) {
+        return res.status(404).json({ error: 'Generation not found' });
+      }
+
+      const sources = await loadClientSources(clientId, orgId, {
+        generator: true, assessment: true, clinical: false,
+      });
+      if (!sources) return res.status(404).json({ error: 'Client not found' });
+
+      const liveFacts = resolveDietPlanningFacts(sources, {});
+      const restrictions = {
+        allergies: sources.nutrition?.food_allergies,
+        foodsToAvoid: sources.nutrition?.foods_to_avoid,
+        dietaryPattern: liveFacts.dietary_pattern,
+      };
+
+      // The frozen calculation is the save basis — targets do not move because
+      // the client was weighed again — but the live record decides whether this
+      // food may be assigned at all. Validation runs on the stored plan (it
+      // keeps `time` and `total_calories`); normalisePlan is the write model.
+      const normalised = normalisePlan(generation.proposed_plan);
+      const hasFoodIds = normalised.meals.some((meal) => meal.foods.some((f) => f.food_id));
+      const foodsById = hasFoodIds ? (await loadFoodReference(orgId)).byId : null;
+      const check = validatePlan(generation.proposed_plan, {
+        targets: generation.calculation,
+        schedule: generation.schedule,
+        restrictions,
+        foodsById,
+      });
+      if (check.blockers.length) {
+        return res.status(422).json({
+          error: 'This plan no longer passes validation against the client\'s current record',
+          code: 'VALIDATION_FAILED',
+          blockers: check.blockers,
+        });
+      }
+
+      const saved = await saveAiDietPlan({
+        plan: generation.proposed_plan,
+        calculation: generation.calculation,
+        clientId, orgId, userId: req.user.id, trainerId: req.user.trainer_id,
+      });
+
+      // The diet is already assigned; a failed stamp must not report the save
+      // as failed, only the proposal as unlinked.
+      await markDietGenerationAccepted(
+        String(generationId), saved.template_id, saved.assignment?.id ?? null, orgId,
+      ).catch((err) => logger.warn(
+        { err: err.message, generation_id: generationId }, 'diet_generation_link_missed',
+      ));
+
+      return res.status(201).json({
+        message: 'Diet plan saved and assigned',
+        ...saved,
+        generation_id: String(generationId),
+        targets_stale: targetsStale(generation.calculation, {
+          weight_kg: sources.latestAssessment?.weight,
+          height_cm: sources.latestAssessment?.height_cm ?? sources.client?.height,
+          // The engine stored the canonical goal; compare like with like so a
+          // legacy `weight_loss` is not reported as a change from `fat_loss`.
+          goal: classifyGoal(sources.goals?.[0]?.goal_type),
+        }),
+      });
+    }
+
     const saved = await saveAiDietPlan({
       plan,
       clientId,
-      orgId: orgIdOf(req),
+      orgId,
       userId: req.user.id,
       trainerId: req.user.trainer_id,
     });

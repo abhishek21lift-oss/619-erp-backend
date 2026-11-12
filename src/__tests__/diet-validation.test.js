@@ -113,3 +113,46 @@ test('the tolerance table is exported, not copied by callers', () => {
   expect(TOLERANCES.dailyCaloriesPct).toBe(0.05);
   expect(TOLERANCES.proteinMinPct).toBe(0.90);
 });
+
+test('a recorded allergen that names a group member expands to that group', () => {
+  const plan = planWith({
+    total_calories: 500,
+    meals: [meal({
+      calories: 190,
+      foods: [{
+        name: 'Peanut butter', quantity: 2, unit: 'tbsp',
+        calories: 190, protein_g: 7, carbs_g: 6, fat_g: 16,
+      }],
+    })],
+  });
+  const r = validatePlan(plan, { restrictions: { allergies: ['peanuts'] } });
+  expect(r.ok).toBe(false);
+  expect(r.blockers.join(' ')).toMatch(/Allergy "peanuts"/);
+});
+
+test('reference lookups accept the food reference Map and per-serving rows', () => {
+  const foodsById = new Map([['food-roti', {
+    id: 'food-roti', name: 'Roti', serving_unit: 'piece', serving_grams: 40,
+    calories: 120, protein_g: 3.5, carbs_g: 24, fats_g: 1.2,
+  }]]);
+  const roti = {
+    name: 'Roti', quantity: 2, unit: 'piece', grams: 80,
+    calories: 240, protein_g: 7, carbs_g: 48, fat_g: 2.4, food_id: 'food-roti',
+  };
+  const plan = planWith({
+    total_calories: 540,
+    meals: [
+      meal({ calories: 240, protein_g: 7, carbs_g: 48, fat_g: 2.4, foods: [roti] }),
+      meal({ name: 'Dinner', time: '20:00', calories: 300, protein_g: 0, carbs_g: 0, fat_g: 0 }),
+    ],
+  });
+
+  const match = validatePlan(plan, { foodsById });
+  expect(match.blockers.join(' ')).not.toMatch(/unknown food_id/);
+
+  const wrong = validatePlan(
+    { ...plan, meals: [{ ...plan.meals[0], foods: [{ ...roti, calories: 600 }] }, plan.meals[1]] },
+    { foodsById },
+  );
+  expect(wrong.warnings.join(' ')).toMatch(/do not match the reference food/);
+});
