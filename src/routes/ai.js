@@ -74,6 +74,9 @@ const { calculateTargets } = require('../modules/nutrition/nutrition-calculator'
 const { buildSchedule } = require('../modules/nutrition/meal-scheduler');
 const { validatePlan } = require('../modules/nutrition/diet-validation');
 const {
+  loadFoodReference, stampPlanFoods, EMPTY_FOOD_REFERENCE,
+} = require('../modules/nutrition/food-reference');
+const {
   normaliseActivityLevel, resolveDietPlanningFacts,
 } = require('../modules/nutrition/diet-facts');
 const { classifyGoal } = require('../modules/pt-os/goal-classification');
@@ -2010,6 +2013,16 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
   });
   calculation.warnings = [...calculation.warnings, ...schedule.warnings];
 
+  // One read per generation: the reference names shape the prompt and the
+  // reference rows label the plan afterwards. A lookup outage must not block
+  // a plan, so it logs and continues with an empty reference.
+  let foodReference = EMPTY_FOOD_REFERENCE;
+  try {
+    foodReference = await loadFoodReference(org);
+  } catch (err) {
+    logger.warn({ err: err.message }, 'ai_diet_food_reference_failed');
+  }
+
   const userPrompt = [
     // Record-first, but honest about the fallback: resolveDietInputs prefers
     // the client's record and fills gaps from the request body (gender,
@@ -2074,7 +2087,10 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
   // must survive the repair and revision rounds, or the numbers drift exactly
   // where the validator will later reject the plan.
   const dietPromptOptions = {
-    calculation, schedule: schedule.slots, foodCulture: p.food_culture,
+    calculation,
+    schedule: schedule.slots,
+    foodCulture: p.food_culture,
+    foodOptions: foodReference.namesForCulture(p.food_culture),
   };
   const userPromptText = userPrompt.join('\n');
 
@@ -2144,6 +2160,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
       res.end();
       return;
     }
+    plan = stampPlanFoods(plan, foodReference);
 
     // ── Minimal deterministic validation, then ONE bounded revision ────────
     //
@@ -2165,6 +2182,7 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
         foodsToAvoid: p.foods_to_avoid,
         dietaryPattern: p.dietary_pattern,
       },
+      foodsById: foodReference.byId,
     };
     let validation = validatePlan(plan, validationOptions);
     let citationCheck = grounding.validateGroundedOutput(plan, evidence);
@@ -2191,7 +2209,8 @@ router.post('/diet/generate', auth, requireConfigured, async (req, res) => {
             { role: 'user', content: instruction },
           ],
         });
-        const fixed = extractJson(retry?.content || '');
+        const fixedRaw = extractJson(retry?.content || '');
+        const fixed = fixedRaw ? stampPlanFoods(fixedRaw, foodReference) : null;
         if (fixed) {
           // Adopt only on strict improvement — never in exchange for a new
           // structural gap, and never with more blockers or worse citations

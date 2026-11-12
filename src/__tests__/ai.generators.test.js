@@ -97,6 +97,30 @@ const DIET_PLAN = {
   hydration_ml: 3000, notes: '',
 };
 
+const ROTI_FOOD = {
+  id: 'food-roti', organization_id: null, name: 'Roti', normalized_name: 'roti',
+  aliases: ['chapati', 'phulka'], culture: 'indian', serving_unit: 'piece',
+  serving_grams: 40, calories: 120, protein_g: 3.5, carbs_g: 24, fats_g: 1.2, fiber_g: 3,
+};
+
+// Same plan with one real food, so the reference lookup has something to
+// stamp. Breakfast is 240 kcal to match the food, and the total follows.
+const DIET_PLAN_WITH_FOOD = {
+  ...DIET_PLAN,
+  total_calories: 1664,
+  meals: [
+    {
+      ...DIET_PLAN.meals[0],
+      calories: 240,
+      foods: [{
+        name: 'Roti', quantity: 2, unit: 'piece', calories: 240,
+        protein_g: 7, carbs_g: 48, fat_g: 2.4, fiber_g: 6,
+      }],
+    },
+    ...DIET_PLAN.meals.slice(1),
+  ],
+};
+
 // ── The approved MPTS corpus fixture ──────────────────────────────────────
 //
 // The grounding gate (workout/diet/progress/fitness-testing) refuses any
@@ -656,6 +680,43 @@ describe('diet/generate', () => {
     const done = donePayloadOf(res.text);
     expect(done.validation.ok).toBe(true);
     expect(done.data.meals).toHaveLength(5);
+  });
+
+  test('a generated food is stamped against the reference table', async () => {
+    mockQueries({ ...dietDB, 'FROM foods': [ROTI_FOOD] });
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(DIET_PLAN_WITH_FOOD)]));
+
+    const res = await request(app).post('/api/ai/diet/generate').send({ client_id: 'client-1' });
+
+    expect(res.status).toBe(200);
+    const call = routedStream.mock.calls[0][0];
+    expect(systemPromptOf(call)).toContain('REFERENCE FOODS');
+    expect(systemPromptOf(call)).toContain('Roti');
+
+    const food = donePayloadOf(res.text).data.meals[0].foods[0];
+    expect(food.food_id).toBe('food-roti');
+    expect(food.grams).toBe(80);
+    expect(food.nutrition_source).toBe('reference');
+  });
+
+  test('a food reference read failure does not block generation', async () => {
+    mockQueries(dietDB);
+    const base = pool.query.getMockImplementation();
+    pool.query.mockImplementation((sql, params) => (
+      sql.includes('FROM foods')
+        ? Promise.reject(new Error('foods down'))
+        : base(sql, params)
+    ));
+    routedStream.mockReturnValue(streamChunks([JSON.stringify(DIET_PLAN_WITH_FOOD)]));
+
+    const res = await request(app).post('/api/ai/diet/generate').send({ client_id: 'client-1' });
+
+    expect(res.status).toBe(200);
+    const food = donePayloadOf(res.text).data.meals[0].foods[0];
+    expect(food.food_id).toBeUndefined();
+    expect(mockLogWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ err: 'foods down' }), 'ai_diet_food_reference_failed',
+    );
   });
 });
 
