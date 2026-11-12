@@ -528,7 +528,7 @@ describe('diet/generate', () => {
     expect(typeof done.calculation.calorie_target).toBe('number');
     expect(done.schedule.length).toBeGreaterThanOrEqual(3);
     for (const slot of done.schedule) expect(slot.time).toMatch(/^\d{2}:\d{2}$/);
-    expect(done.prompt_version).toBe('2.0.0');
+    expect(done.prompt_version).toBe('2.0.1');
     const ledgerInsert = pool.query.mock.calls
       .find(([sql]) => sql.includes('INSERT INTO ai_diet_generations'));
     expect(ledgerInsert).toBeTruthy();

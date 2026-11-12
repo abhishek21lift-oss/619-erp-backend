@@ -154,7 +154,7 @@ function buildWorkoutSystemPrompt() {
 
 /* ─── Diet Plan Generation ──────────────────────────────────────────────── */
 
-const DIET_PROMPT_VERSION = '2.0.0';
+const DIET_PROMPT_VERSION = '2.0.1';
 
 const CULTURE_LABELS = { indian: 'Indian', western: 'Western', mixed: 'Mixed' };
 const CULTURE_STAPLES = {

@@ -19,7 +19,7 @@ const schedule = [
 test('v2 names the targets as authoritative and forbids recalculation', () => {
   const p = buildDietSystemPrompt({ calculation, schedule });
 
-  expect(DIET_PROMPT_VERSION).toBe('2.0.0');
+  expect(DIET_PROMPT_VERSION).toBe('2.0.1');
   expect(p).toContain('AUTHORITATIVE TARGETS');
   expect(p).toContain('1709');
   expect(p).toContain('Do not recalculate');
