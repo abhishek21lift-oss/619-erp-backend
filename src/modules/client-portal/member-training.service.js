@@ -27,13 +27,19 @@ const logger = require('../../lib/logger');
 const { computePrFlags, recomputeAssignmentProgress } = require('../pt-os/workout-log.service');
 
 class TrainingInputError extends Error {
-  constructor(message, status = 400) { super(message); this.status = status; }
+  constructor(message, status = 400, code = null) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
 }
 
 const MAX_EXERCISES = 30;
 const MAX_SETS = 20;
 const DAILY_LIMIT = 4;
 const NAME_MAX = 120;
+const DRAFT_MAX_BYTES = 100 * 1024;
+const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
 const key = (name) => String(name).trim().toLowerCase();
 
@@ -380,6 +386,144 @@ async function openSessionFor(clientId, orgId, db = pool) {
 }
 
 /**
+ * Start a workout, or hand back the one already open.
+ *
+ * The prescription is snapshotted from exactly what the member was shown
+ * (`portal.myWorkout`), so planned-vs-actual can never drift when the plan is
+ * edited later. The permission is checked here — the route cannot start a
+ * session without it — and an older open session is retired, never deleted.
+ */
+async function startMyWorkout({ clientId, orgId, userId, plans, dayOfWeek, assignmentId }) {
+  if (!(await selfWorkoutPermission(clientId, orgId))) {
+    throw new TrainingInputError(
+      'Your trainer has not enabled self workouts.',
+      403,
+      'SELF_WORKOUT_NOT_ALLOWED',
+    );
+  }
+
+  const plan = assignmentId
+    ? (plans || []).find((p) => p.assignment_id === assignmentId)
+    : (plans || [])[0];
+  if (!plan) {
+    throw new TrainingInputError('You have no active workout programme.', 400, 'NO_PROGRAMME');
+  }
+
+  const day = dayOfWeek != null
+    ? (plan.days || []).find((d) => Number(d.day_of_week) === Number(dayOfWeek))
+    : (plan.days || [])[0];
+  if (!day || !Array.isArray(day.exercises) || day.exercises.length === 0) {
+    throw new TrainingInputError('That workout day has no exercises.', 400, 'NO_EXERCISES');
+  }
+
+  // Yesterday's unfinished draft is not today's workout.
+  await pool.query(
+    `UPDATE workout_sessions
+        SET status = 'abandoned', draft = NULL, updated_at = NOW()
+      WHERE client_id = $1 AND organization_id = $2
+        AND source = 'member' AND status = 'in_progress'
+        AND started_at <= NOW() - INTERVAL '24 hours'`,
+    [clientId, orgId],
+  );
+
+  const open = await openSessionFor(clientId, orgId);
+  if (open) return { session: open, resumed: true };
+
+  const prescribed = {
+    plan_name: plan.name,
+    current_week: plan.current_week,
+    day_of_week: day.day_of_week,
+    exercises: day.exercises,
+  };
+  const draft = { version: 1, current: 0, exercises: [] };
+  const dow = Number(day.day_of_week);
+  const workoutDay = dow >= 1 && dow <= 7 ? WEEKDAYS[dow - 1] : null;
+
+  const { rows } = await pool.query(
+    `INSERT INTO workout_sessions (
+       client_id, trainer_id, workout_assignment_id, session_date, program_name, workout_day,
+       status, source, started_at, prescribed, draft, created_by, organization_id
+     ) VALUES ($1, (SELECT trainer_id FROM pt_clients WHERE id = $1 AND organization_id = $9),
+               $2, $3::date, $4, $5, 'in_progress', 'member', NOW(),
+               $6::jsonb, $7::jsonb, $8, $9)
+     RETURNING *`,
+    [
+      clientId, plan.assignment_id, today(), plan.name, workoutDay,
+      JSON.stringify(prescribed), JSON.stringify(draft), userId, orgId,
+    ],
+  );
+  return { session: rows[0], resumed: false };
+}
+
+/** Validate an autosaved draft before it reaches the database. */
+function normaliseDraft(draft) {
+  if (!draft || typeof draft !== 'object' || Array.isArray(draft)) {
+    throw new TrainingInputError('draft must be an object', 400, 'INVALID_DRAFT');
+  }
+  if (Buffer.byteLength(JSON.stringify(draft)) > DRAFT_MAX_BYTES) {
+    throw new TrainingInputError('Workout draft is too large.', 413, 'DRAFT_TOO_LARGE');
+  }
+  return draft;
+}
+
+/** The session row this member may still write, or the right refusal. */
+async function writableMemberSession(clientId, orgId, sessionId) {
+  const { rows } = await pool.query(
+    `SELECT status, submitted_at FROM workout_sessions
+      WHERE id = $1 AND client_id = $2 AND organization_id = $3 AND source = 'member'`,
+    [sessionId, clientId, orgId],
+  );
+  const session = rows[0];
+  if (!session) throw new TrainingInputError('Workout session not found.', 404, 'NOT_FOUND');
+  if (session.status !== 'in_progress' || session.submitted_at) {
+    throw new TrainingInputError('This workout has already been submitted.', 409, 'WORKOUT_SUBMITTED');
+  }
+  return session;
+}
+
+/** Save the in-progress workout. Safe to call on every change. */
+async function autosaveMyWorkout({ clientId, orgId, sessionId, draft }) {
+  const body = normaliseDraft(draft);
+  await writableMemberSession(clientId, orgId, sessionId);
+
+  const { rows } = await pool.query(
+    `UPDATE workout_sessions SET draft = $4::jsonb, updated_at = NOW()
+      WHERE id = $1 AND client_id = $2 AND organization_id = $3
+        AND source = 'member' AND status = 'in_progress'
+      RETURNING updated_at`,
+    [sessionId, clientId, orgId, JSON.stringify(body)],
+  );
+  if (!rows[0]) {
+    throw new TrainingInputError('This workout has already been submitted.', 409, 'WORKOUT_SUBMITTED');
+  }
+  return { saved_at: rows[0].updated_at };
+}
+
+/** Abandon an open workout. The row is kept; nothing is deleted. */
+async function abandonMyWorkout({ clientId, orgId, sessionId }) {
+  const { rows } = await pool.query(
+    `SELECT status, submitted_at FROM workout_sessions
+      WHERE id = $1 AND client_id = $2 AND organization_id = $3 AND source = 'member'`,
+    [sessionId, clientId, orgId],
+  );
+  const session = rows[0];
+  if (!session) throw new TrainingInputError('Workout session not found.', 404, 'NOT_FOUND');
+  if (session.status === 'abandoned') return true;
+  if (session.status !== 'in_progress' || session.submitted_at) {
+    throw new TrainingInputError('This workout has already been submitted.', 409, 'WORKOUT_SUBMITTED');
+  }
+
+  await pool.query(
+    `UPDATE workout_sessions
+        SET status = 'abandoned', draft = NULL, updated_at = NOW()
+      WHERE id = $1 AND client_id = $2 AND organization_id = $3
+        AND source = 'member' AND status = 'in_progress'`,
+    [sessionId, clientId, orgId],
+  );
+  return true;
+}
+
+/**
  * The member's active PT session packages. `session_balance` has no row-level
  * tenancy of its own beyond organization_id, and its client_id once pointed at
  * the dropped legacy `clients` table — migration 174 backfilled org from
@@ -405,6 +549,9 @@ module.exports = {
   logMyWorkout,
   selfWorkoutPermission,
   openSessionFor,
+  startMyWorkout,
+  autosaveMyWorkout,
+  abandonMyWorkout,
   DAILY_LIMIT,
   mySessionBalance,
 };

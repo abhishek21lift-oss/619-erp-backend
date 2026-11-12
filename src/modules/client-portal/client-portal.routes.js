@@ -522,7 +522,7 @@ router.post('/checkins', wrap(async (req, res) => {
 function inputError(res, err, Kind) {
   if (!(err instanceof Kind)) return false;
   const status = err.status || 400;
-  const code = status === 429 ? 'RATE_LIMITED' : status === 409 ? 'CONFLICT' : status === 404 ? 'NOT_FOUND' : 'BAD_REQUEST';
+  const code = err.code || (status === 429 ? 'RATE_LIMITED' : status === 409 ? 'CONFLICT' : status === 404 ? 'NOT_FOUND' : 'BAD_REQUEST');
   res.status(status).json({ error: { code, message: err.message } });
   return true;
 }
@@ -533,6 +533,62 @@ router.get('/workout/last', wrap(async (req, res) => {
   const raw = req.query.name;
   const names = (Array.isArray(raw) ? raw : raw ? [raw] : []).map(String).filter((n) => n.length <= 120);
   res.json({ data: await training.lastPerformance(clientId, orgId, names) });
+}));
+
+// ── Self workout sessions ────────────────────────────────────────────────────
+//
+// Start/resume, autosave and discard. The permission is checked on START only:
+// revoking it must never strand a session the member already began, so
+// autosave and submit keep working on an open session. Ownership and tenancy
+// come from the session identity, never the request.
+
+// POST /api/me/workout/sessions — start today's workout, or resume the open one
+router.post('/workout/sessions', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  if (await isTrainingBlocked(clientId)) {
+    return res.status(403).json({ error: {
+      code: 'PARQ_BLOCKED',
+      message: 'Your health screening needs your trainer\'s clearance before you log workouts.',
+    } });
+  }
+  try {
+    const plans = await portal.myWorkout(clientId, orgId);
+    const { session, resumed } = await training.startMyWorkout({
+      clientId,
+      orgId,
+      userId: req.user.id,
+      plans,
+      dayOfWeek: req.body?.day_of_week ?? null,
+      assignmentId: req.body?.assignment_id ?? null,
+    });
+    res.status(resumed ? 200 : 201).json({ data: { session, resumed } });
+  } catch (err) {
+    if (!inputError(res, err, training.TrainingInputError)) throw err;
+  }
+}));
+
+// PATCH /api/me/workout/sessions/:id — autosave the in-progress workout
+router.patch('/workout/sessions/:id', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    const saved = await training.autosaveMyWorkout({
+      clientId, orgId, sessionId: req.params.id, draft: req.body?.draft,
+    });
+    res.json({ data: saved });
+  } catch (err) {
+    if (!inputError(res, err, training.TrainingInputError)) throw err;
+  }
+}));
+
+// DELETE /api/me/workout/sessions/:id — discard, never delete
+router.delete('/workout/sessions/:id', wrap(async (req, res) => {
+  const { clientId, orgId } = selfOf(req);
+  try {
+    await training.abandonMyWorkout({ clientId, orgId, sessionId: req.params.id });
+    res.status(204).end();
+  } catch (err) {
+    if (!inputError(res, err, training.TrainingInputError)) throw err;
+  }
 }));
 
 // POST /api/me/workouts — a finished workout the member did on their own
