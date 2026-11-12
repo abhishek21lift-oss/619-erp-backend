@@ -76,7 +76,13 @@ function assessVitalsSafety(v) {
   } else if (bp === 'Hypotension') {
     caution('Blood pressure is low (<90/60 mmHg). Check for dizziness or fainting and avoid sudden postural changes before testing.');
   } else if (bp === 'Hypertension Stage 1') {
-    caution('Blood pressure is at hypertension stage 1 (130–139/80–89 mmHg). Medical advice is suggested; rest 5–10 minutes and recheck, and regulate exercise intensity carefully.');
+    // Name the arm that crossed, not the band's range: a generic 130–139/80–89
+    // reads as a contradiction beside a 122/82 tile.
+    const arms = [
+      v.systolic != null && v.systolic >= 130 ? `systolic ${v.systolic}` : null,
+      v.diastolic != null && v.diastolic >= 80 ? `diastolic ${v.diastolic}` : null,
+    ].filter(Boolean).join(' and ');
+    caution(`Blood pressure is at hypertension stage 1 (${arms} mmHg). Medical advice is suggested; rest 5–10 minutes and recheck, and regulate exercise intensity carefully.`);
   } else if (bp === 'Elevated') {
     caution('Blood pressure is elevated (120–129/<80 mmHg). Rest 5–10 minutes and recheck; lifestyle modification is advised.');
   }
