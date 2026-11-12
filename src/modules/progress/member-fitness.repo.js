@@ -10,14 +10,15 @@
 
 const pool = require('../../db/pool');
 
-// Everything the member dashboard renders: the stored overall total, the five
-// domains it shows, the readings behind them, and the vitals and body
-// measurements the dashboard summarises. Trainer-only notes, audit columns and
-// the raw test JSON are deliberately absent — the portal is a result view, not
-// the assessment record.
+// Everything the member dashboard renders: the stored overall total, the seven
+// category points it shows, the readings behind them, and the vitals and body
+// measurements that sit under those categories. Trainer-only notes, audit
+// columns and the raw test JSON are deliberately absent — the portal is a
+// result view, not the assessment record.
 const ASSESSMENT_COLUMNS = `
   id, assessment_number, assessment_date, assessment_type,
   overall_fitness_score, overall_points, overall_max, scoring_formula_version,
+  bp_points, anthropometric_points,
   body_composition_score, cardio_score_computed, strength_score_computed,
   endurance_score_computed, mobility_score_computed,
   bp_systolic, bp_diastolic, bp_category,
