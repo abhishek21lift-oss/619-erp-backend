@@ -89,7 +89,7 @@ const DIET_PLAN = {
   meals: [
     { name: 'Breakfast', slot: 'breakfast', time: '07:30', calories: 356, protein_g: 29, carbs_g: 36, fat_g: 10, foods: [] },
     { name: 'Mid-morning snack', slot: 'snack_am', time: '11:00', calories: 356, protein_g: 29, carbs_g: 36, fat_g: 10, foods: [] },
-    { name: 'Lunch', slot: 'lunch', time: '13:00', calories: 356, protein_g: 29, carbs_g: 35, fat_g: 9, foods: [] },
+    { name: 'Lunch', slot: 'lunch', time: '13:30', calories: 356, protein_g: 29, carbs_g: 35, fat_g: 9, foods: [] },
     { name: 'Evening snack', slot: 'snacks', time: '16:30', calories: 356, protein_g: 28, carbs_g: 35, fat_g: 10, foods: [] },
     { name: 'Dinner', slot: 'dinner', time: '20:00', calories: 356, protein_g: 28, carbs_g: 36, fat_g: 9, foods: [] },
   ],
@@ -529,7 +529,10 @@ describe('diet/generate', () => {
     expect(done.schedule.length).toBeGreaterThanOrEqual(3);
     for (const slot of done.schedule) expect(slot.time).toMatch(/^\d{2}:\d{2}$/);
     expect(done.prompt_version).toBe('2.0.0');
-    expect(done.generation_id === null || typeof done.generation_id === 'string').toBe(true);
+    const ledgerInsert = pool.query.mock.calls
+      .find(([sql]) => sql.includes('INSERT INTO ai_diet_generations'));
+    expect(ledgerInsert).toBeTruthy();
+    expect(done.generation_id).toBe(ledgerInsert[1][0]);
   });
 
   test('an unclassifiable goal is refused before any model call', async () => {

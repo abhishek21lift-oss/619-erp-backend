@@ -101,6 +101,40 @@ test('meal times outside the main window block, pre/post may cross midnight', ()
   expect(r.blockers.join(' ')).not.toMatch(/00:00/);
 });
 
+test('allergy groups match regardless of case', () => {
+  const plan = planWith({ meals: [meal({ foods: [food('Almonds')] })] });
+  const r = validatePlan(plan, { restrictions: { allergies: ['Nuts'] } });
+  expect(r.ok).toBe(false);
+  expect(r.blockers.join(' ')).toMatch(/Nuts/);
+});
+
+test('meal clock times and day_offset must match the schedule', () => {
+  const schedule = [
+    { slot: 'breakfast', time: '07:30', day_offset: 0 },
+    { slot: 'post_workout', time: '00:00', day_offset: 1 },
+  ];
+  const wrongTime = planWith({ meals: [
+    meal({ slot: 'breakfast', time: '08:00' }),
+    meal({ slot: 'post_workout', time: '00:00', day_offset: 1 }),
+  ] });
+  expect(validatePlan(wrongTime, { schedule }).blockers.join(' ')).toMatch(/07:30/);
+
+  const wrongOffset = planWith({ meals: [
+    meal({ slot: 'breakfast', time: '07:30' }),
+    meal({ slot: 'post_workout', time: '00:00', day_offset: 0 }),
+  ] });
+  expect(validatePlan(wrongOffset, { schedule }).blockers.join(' ')).toMatch(/day offset|next day/i);
+});
+
+test('fiber is not counted twice when meals and foods both carry it', () => {
+  const plan = planWith({ meals: [meal({
+    fiber_g: 15,
+    foods: [{ ...food('Oats'), fiber_g: 15 }],
+  })] });
+  const r = validatePlan(plan, { targets: targets({ fiber_g: 30 }) });
+  expect(r.warnings.join(' ')).toMatch(/Fiber 15 g/);
+});
+
 test('target drift is reported, not blocked', () => {
   expect(targetsStale(
     { inputs: { weight_kg: 80, height_cm: 180, goal: 'fat_loss' } },

@@ -166,17 +166,21 @@ function calculateTargets(input = {}) {
       fat -= cut;
       carbs = Math.round((calorieTarget - 4 * protein - 9 * fat) / 4);
     }
-    if (carbs < carbFloor) {
-      carbs = carbFloor;
-      warn('macro_floor_conflict', 'Carbohydrates were raised to the minimum for body weight; macros may not sum to the calorie target.');
-    }
   }
 
-  // 9. Reconcile the rounding into carbs.
+  // 9. Reconcile the rounding into carbs. The floor outranks the target: a
+  // body-weight minimum is a health floor, so when the two conflict the plan
+  // is knowingly over target. Applying the floor before this step let the
+  // reconciliation quietly spend it again.
   const delta = calorieTarget - (4 * protein + 4 * carbs + 9 * fat);
+  let reconciled = delta !== 0;
   carbs += Math.round(delta / 4);
+  if (carbs < carbFloor) {
+    carbs = carbFloor;
+    reconciled = true;
+    warn('macro_floor_conflict', 'Carbohydrates were raised to the minimum for body weight; macros may not sum to the calorie target.');
+  }
   const reconciledKcal = 4 * protein + 4 * carbs + 9 * fat;
-  const reconciled = delta !== 0;
   if (Math.abs(calorieTarget - reconciledKcal) > 50) {
     warn('macro_reconciliation_gap', `Macros sum to ${reconciledKcal} kcal against a ${calorieTarget} kcal target.`);
   }

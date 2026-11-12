@@ -68,4 +68,20 @@ describe('280 food-level nutrition', () => {
     expect(values).toContain("'western'");
     expect(SQL.trimEnd()).toMatch(/ON CONFLICT DO NOTHING;$/);
   });
+
+  test('nut rows quote one edible serving, not ten', () => {
+    const values = statement(/FROM \(VALUES[\s\S]*?\) AS v\(/);
+    for (const name of ['Almonds', 'Walnuts']) {
+      const row = values.split('\n').find((line) => line.trim().startsWith(`('${name}'`));
+      expect(row).toBeTruthy();
+      // serving_unit, serving_grams, calories — the first two numbers after
+      // the unit. Per-100 g must land in a plausible nut range; 70 kcal in a
+      // 1.2 g almond is a decimal slipped one place.
+      const m = /'piece',([\d.]+),([\d.]+),/.exec(row);
+      expect(m).toBeTruthy();
+      const per100 = (Number(m[2]) * 100) / Number(m[1]);
+      expect(per100).toBeGreaterThan(450);
+      expect(per100).toBeLessThan(750);
+    }
+  });
 });

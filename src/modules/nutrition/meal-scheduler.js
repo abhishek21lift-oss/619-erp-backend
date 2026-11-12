@@ -96,11 +96,17 @@ function mainWeights(keys) {
     : MAIN_SLOT_DEFS[k].weight));
 }
 
+const clockDistance = (a, b) => {
+  const d = mod(a - b);
+  return Math.min(d, 1440 - d);
+};
+
 /** Shift main meals off the workout meals, then un-cramp them. */
 function placeMains(mains, preMinutes, postMinutes, warnings) {
   for (const meal of mains) {
-    const toPre = preMinutes == null ? Infinity : Math.abs(meal.minutes - preMinutes);
-    const toPost = postMinutes == null ? Infinity : Math.abs(meal.minutes - postMinutes);
+    // Clock distance, not numeric: 23:45 and 00:15 are thirty minutes apart.
+    const toPre = preMinutes == null ? Infinity : clockDistance(meal.minutes, preMinutes);
+    const toPost = postMinutes == null ? Infinity : clockDistance(meal.minutes, postMinutes);
     if (Math.min(toPre, toPost) > WORKOUT_CLEAR) continue;
 
     const edge = toPre <= toPost ? preMinutes - WORKOUT_CLEAR : postMinutes + WORKOUT_CLEAR;

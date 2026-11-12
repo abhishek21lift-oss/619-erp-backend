@@ -72,8 +72,18 @@ const WORKOUT_PLAN = {
 };
 const DIET_PLAN = {
   name: 'Lean Fuel', description: 'deficit plan', goal: 'weight_loss',
-  total_calories: 1800, macros: { protein_g: 115, carbs_g: 200, fat_g: 50 },
-  meal_frequency: 5, meals: [{ name: 'Breakfast', time: '08:00', calories: 500 }],
+  total_calories: 1714, macros: { protein_g: 143, carbs_g: 178, fat_g: 48 },
+  fiber_g: 25, meal_frequency: 4,
+  // Matches what the engine and scheduler produce for the fixture client
+  // (female 34, 71.3 kg, 160 cm, weight_loss, four meals, no workout time),
+  // so this plan is compliant and a "no revision" assertion tests the gate
+  // rather than the fixture. Keep it in step with §6.1 if a constant moves.
+  meals: [
+    { name: 'Breakfast', slot: 'breakfast', time: '07:30', calories: 429, protein_g: 36, carbs_g: 45, fat_g: 12 },
+    { name: 'Lunch', slot: 'lunch', time: '13:00', calories: 514, protein_g: 43, carbs_g: 53, fat_g: 14 },
+    { name: 'Evening snack', slot: 'snacks', time: '16:30', calories: 257, protein_g: 21, carbs_g: 27, fat_g: 7 },
+    { name: 'Dinner', slot: 'dinner', time: '20:00', calories: 514, protein_g: 43, carbs_g: 53, fat_g: 14 },
+  ],
   grocery_list: [], supplements: [], hydration_ml: 3000, notes: '',
 };
 // These tests are about citation grounding, so they take the explicit
@@ -253,7 +263,7 @@ describe('diet gate + deterministic validator + one bounded revision', () => {
     expect(res.status).toBe(200);
     expect(routedChat).toHaveBeenCalledTimes(1);
     const done = doneOf(res.text);
-    expect(done.data.total_calories).toBe(1800);
+    expect(done.data.total_calories).toBe(1714);
     expect(done.data.knowledge_citations).toEqual([1]);
     expect(done.grounding.validation_status).toBe('ok');
     expect(done.grounding.structure_ok).toBe(true);
@@ -287,7 +297,7 @@ describe('diet gate + deterministic validator + one bounded revision', () => {
     expect(routedChat).toHaveBeenCalledTimes(1);
     const done = doneOf(res.text);
     expect(done.grounding.structure_ok).toBe(true);
-    expect(done.data.total_calories).toBe(1800);
+    expect(done.data.total_calories).toBe(1714);
   });
 
   test('an unfixable plan still ships — flagged, after exactly one attempt', async () => {

@@ -152,11 +152,12 @@ function validatePlan(plan, {
     else flag(id, 'warn', `Daily ${label} ${Math.round(actual)} g is more than 15% from the ${target} g target.`);
   }
 
-  // 4. Fiber, only when the plan carries any.
-  const fiberValues = [
-    ...meals.map((m) => num(m?.fiber_g)),
-    ...foods.map(({ food }) => num(food.fiber_g)),
-  ].filter((n) => n != null);
+  // 4. Fiber, only when the plan carries any. Meal totals already include
+  // their foods; summing both would measure the plan against twice its fiber.
+  const mealFiber = meals.map((m) => num(m?.fiber_g)).filter((n) => n != null);
+  const fiberValues = mealFiber.length
+    ? mealFiber
+    : foods.map(({ food }) => num(food.fiber_g)).filter((n) => n != null);
   if (fiberValues.length && targets?.fiber_g != null) {
     const total = sumOf(fiberValues);
     if (total < targets.fiber_g * TOLERANCES.fiberMinPct) {
@@ -219,21 +220,39 @@ function validatePlan(plan, {
     }
   }
 
-  // 10–12. The schedule is fixed: its slots must exist at usable times.
+  // 10–12. The schedule is fixed: its slots must exist at the times and day
+  // offsets it named. A "pre-workout" meal after dinner is present, unique and
+  // ordered, and still the wrong meal.
   if (Array.isArray(schedule) && schedule.length) {
     const bySlot = new Map(meals.filter((m) => m?.slot).map((m) => [String(m.slot), m]));
+    const checkFixed = (slot, planned) => {
+      const name = String(planned?.name ?? slot.slot);
+      const plannedTime = String(planned?.time ?? '').trim();
+      if (plannedTime !== String(slot.time ?? '').trim()) {
+        flag('meal_times', 'blocker', `Meal "${name}" is at ${plannedTime || 'no time'}, but the schedule fixes ${slot.slot} at ${slot.time}.`);
+      }
+      const plannedOffset = Number(planned?.day_offset ?? 0);
+      const scheduledOffset = Number(slot.day_offset ?? 0);
+      if (plannedOffset !== scheduledOffset) {
+        flag('meal_times', 'blocker', `Meal "${name}" is on day offset ${plannedOffset}, but the schedule puts ${slot.slot} on day offset ${scheduledOffset}.`);
+      }
+    };
     for (const slot of schedule.filter((s) => PRE_POST.has(s?.slot))) {
-      if (!bySlot.has(slot.slot)) {
+      const planned = bySlot.get(String(slot.slot));
+      if (!planned) {
         flag('pre_post', 'blocker', `Scheduled ${slot.slot} meal (${slot.time}) is missing from the plan.`);
       } else {
         pass('pre_post');
+        checkFixed(slot, planned);
       }
     }
     for (const slot of schedule.filter((s) => !PRE_POST.has(s?.slot))) {
-      if (!bySlot.has(slot.slot)) {
+      const planned = bySlot.get(String(slot.slot));
+      if (!planned) {
         flag('meal_frequency', 'blocker', `Scheduled meal "${slot.slot}" (${slot.time}) is missing from the plan.`);
       } else {
         pass('meal_frequency');
+        checkFixed(slot, planned);
       }
     }
     if (meals.length !== schedule.length) {
@@ -273,7 +292,8 @@ function validatePlan(plan, {
   // 13. Allergies and foods to avoid. Known terms expand to a group; a term
   // that names a group member ("peanuts") expands to that member's group; an
   // unknown token still warns, because silence would read as clearance.
-  const groupFor = (token) => {
+  const groupFor = (rawToken) => {
+    const token = fold(rawToken);
     if (ALLERGEN_GROUPS[token]) return ALLERGEN_GROUPS[token];
     const singular = token.replace(/s$/, '');
     const key = Object.keys(ALLERGEN_GROUPS).find((g) => ALLERGEN_GROUPS[g].includes(singular));

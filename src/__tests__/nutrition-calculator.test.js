@@ -61,6 +61,17 @@ test('macros reconcile to the calorie target within 50 kcal', () => {
   }
 });
 
+test('the carb floor survives reconciliation', () => {
+  // 100 kg fat_loss at a 1720 kcal target: protein 200 g and fat 60 g leave
+  // less than 1 g/kg for carbs. The floor is the spec; the reconciliation
+  // step must not quietly spend it, and the warning must tell the trainer the
+  // macros are off target rather than claim a floor that no longer holds.
+  const r = calculateTargets({ age: 30, gender: 'female', weight_kg: 100, height_cm: 165,
+    activity_level: 'sedentary', goal: 'fat_loss' });
+  expect(r.macros.carbs_g).toBeGreaterThanOrEqual(100);
+  expect(r.warnings.map((w) => w.code)).toContain('macro_floor_conflict');
+});
+
 test('fiber and water follow the spec constants', () => {
   const r = calculateTargets({ age: 30, gender: 'male', weight_kg: 80, height_cm: 180,
     activity_level: 'moderately_active', goal: 'general_fitness' });
