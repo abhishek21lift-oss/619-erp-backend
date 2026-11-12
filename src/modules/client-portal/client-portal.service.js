@@ -376,7 +376,8 @@ const num = (v) => (v === null || v === undefined ? null : Number(v));
  */
 async function mySessions(clientId, orgId, { limit = 30 } = {}) {
   const { rows: sessions } = await pool.query(
-    `SELECT id, session_date, program_name, workout_day, duration_minutes, status, source
+    `SELECT id, session_date, program_name, workout_day, duration_minutes, status, source,
+            review_status, review_feedback
        FROM workout_sessions
       WHERE client_id = $1 AND organization_id = $2
       ORDER BY session_date DESC, created_at DESC
@@ -428,6 +429,8 @@ async function mySessions(clientId, orgId, { limit = 30 } = {}) {
     duration_minutes: s.duration_minutes,
     status: s.status,
     source: s.source,
+    review_status: s.review_status ?? null,
+    review_feedback: s.review_feedback ?? null,
     exercises: bySession.get(s.id) || [],
   }));
 }
