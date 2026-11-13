@@ -23,6 +23,7 @@ const { buildSnapshot } = require('./client-snapshot');
 const { generateCoach } = require('./coach-ai');
 const { generateCheckinInsight, MAX_WEEKS } = require('./checkin-ai');
 const { buildRecovery } = require('./recovery');
+const { getClient360 } = require('./client-360.service');
 const { routedChat } = require('../../lib/ai/router');
 const { meteredChat } = require('../../lib/ai/metering');
 const { requireAiQuota } = require('../../lib/aiQuota');
@@ -2037,6 +2038,18 @@ router.get('/clients/:id/training-brief', auth, wrap(async (req, res) => {
       recentSessions: sources.sessions,
     }),
   });
+}));
+
+// GET /clients/:id/360
+//
+// One read for the whole trainer dashboard. It aggregates the same rows the
+// seven tabs already read, through the same loaders, and returns null for a
+// client outside the caller's studio so the route can answer 404 without
+// revealing that the id exists elsewhere.
+router.get('/clients/:id/360', auth, wrap(async (req, res) => {
+  const data = await getClient360(tenantScope(req).orgId, req.params.id);
+  if (!data) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  return res.json({ data });
 }));
 
 // GET /clients/:id/snapshot
