@@ -55,6 +55,13 @@ CREATE INDEX IF NOT EXISTS workout_sessions_pending_review_idx
   ON workout_sessions (organization_id, submitted_at DESC)
   WHERE review_status = 'pending';
 
+-- One open self-workout per client. Two Start taps (or a retried request) can
+-- both pass the open-session read before either inserts; the database decides
+-- which one wins, and the service hands back that row.
+CREATE UNIQUE INDEX IF NOT EXISTS workout_sessions_one_open_member_idx
+  ON workout_sessions (client_id)
+  WHERE source = 'member' AND status = 'in_progress';
+
 COMMENT ON COLUMN pt_clients.allow_self_workout IS
   'Trainer-controlled: may this client start a workout in the member app without the trainer?';
 COMMENT ON COLUMN workout_sessions.prescribed IS

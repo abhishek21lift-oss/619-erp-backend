@@ -55,6 +55,12 @@ describe('283_trainer_controlled_self_workout.sql', () => {
     );
   });
 
+  it('allows only one open member session per client', () => {
+    expect(body).toMatch(
+      /CREATE UNIQUE INDEX IF NOT EXISTS workout_sessions_one_open_member_idx ON workout_sessions \(client_id\) WHERE source = 'member' AND status = 'in_progress'/
+    );
+  });
+
   it('is additive: no table is dropped, truncated or emptied', () => {
     expect(body).not.toMatch(/DROP TABLE|TRUNCATE|DELETE FROM/i);
     expect(body).not.toMatch(/\bBEGIN\b|\bCOMMIT\b/i);

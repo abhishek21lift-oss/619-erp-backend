@@ -63,10 +63,15 @@ const submitResponder = (session) => (sql) => {
   return { rows: [] };
 };
 
+const CANONICAL = {
+  duration_minutes: 45,
+  exercises: [{ name: 'Squat', sets: [{ weight_kg: 60, reps: 8 }] }],
+};
+
 describe('POST /api/me/workout/sessions/:id/submit', () => {
   it('materialises the draft once and marks the session pending review', async () => {
     mockResponder = submitResponder(openSession());
-    const res = await request(app).post('/api/me/workout/sessions/ws1/submit').send({}).expect(200);
+    const res = await request(app).post('/api/me/workout/sessions/ws1/submit').send({ draft: CANONICAL }).expect(200);
     expect(res.body.data).toMatchObject({ created: true, session_id: 'ws1' });
 
     const exercise = mockQueries.find((q) => /INSERT INTO workout_session_exercises/.test(q.sql));
@@ -91,6 +96,18 @@ describe('POST /api/me/workout/sessions/:id/submit', () => {
     expect(exercise.params[2]).toBe('Bench Press');
   });
 
+  it('refuses a bodyless submit rather than reading the autosaved UI draft', async () => {
+    // The autosaved draft is the phone's UI shape (weight/time/distance strings,
+    // a `done` flag) — not the canonical log input. Reading it as one drops
+    // every weight. The client always sends the canonical body.
+    mockResponder = submitResponder(openSession({
+      draft: { version: 1, exercises: [{ name: 'Squat', kind: 'load_reps', sets: [{ weight: '60', reps: '8', done: true }] }] },
+    }));
+    const res = await request(app).post('/api/me/workout/sessions/ws1/submit').send({}).expect(400);
+    expect(res.body.error.code).toBe('EMPTY_WORKOUT');
+    expect(mockQueries.some((q) => /INSERT INTO workout_sets/.test(q.sql))).toBe(false);
+  });
+
   it('refuses a second submit without writing any set', async () => {
     mockResponder = submitResponder(openSession({ status: 'completed', submitted_at: '2026-11-13T11:00:00Z' }));
     const res = await request(app).post('/api/me/workout/sessions/ws1/submit').send({}).expect(409);
@@ -109,12 +126,12 @@ describe('POST /api/me/workout/sessions/:id/submit', () => {
       if (/SELECT allow_self_workout FROM pt_clients/.test(sql)) return { rows: [{ allow_self_workout: false }] };
       return submitResponder(openSession())(sql);
     };
-    await request(app).post('/api/me/workout/sessions/ws1/submit').send({}).expect(200);
+    await request(app).post('/api/me/workout/sessions/ws1/submit').send({ draft: CANONICAL }).expect(200);
   });
 
   it('tells the trainer there is a workout to review', async () => {
     mockResponder = submitResponder(openSession());
-    await request(app).post('/api/me/workout/sessions/ws1/submit').send({}).expect(200);
+    await request(app).post('/api/me/workout/sessions/ws1/submit').send({ draft: CANONICAL }).expect(200);
     const notification = mockQueries.find((q) => /INSERT INTO notifications/.test(q.sql));
     expect(notification).toBeTruthy();
     expect(notification.sql).toContain("'/pt-os/clients/' || c.id || '/workout-log/' || $4");

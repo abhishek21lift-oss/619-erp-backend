@@ -110,6 +110,25 @@ describe('POST /api/me/workout/sessions', () => {
     expect(mockQueries.some((q) => /INSERT INTO workout_sessions/.test(q.sql))).toBe(false);
   });
 
+  it('returns the winner when two starts race past the open-session read', async () => {
+    let openReads = 0;
+    mockResponder = (sql, params) => {
+      if (/FROM workout_sessions/.test(sql) && /INTERVAL '24 hours'/.test(sql)) {
+        openReads += 1;
+        return { rows: openReads === 1 ? [] : [sessionRow()] };
+      }
+      if (/INSERT INTO workout_sessions/.test(sql)) {
+        const err = new Error('duplicate key value violates unique constraint');
+        err.code = '23505';
+        throw err;
+      }
+      return permission(true)(sql, params);
+    };
+    const res = await request(app).post('/api/me/workout/sessions').send({}).expect(200);
+    expect(res.body.data).toMatchObject({ resumed: true });
+    expect(res.body.data.session.id).toBe('ws1');
+  });
+
   it('retires a draft older than a day without deleting it', async () => {
     mockResponder = permission(true);
     await request(app).post('/api/me/workout/sessions').send({}).expect(201).catch(() => {});

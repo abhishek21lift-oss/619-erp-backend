@@ -413,7 +413,7 @@ async function submitMyWorkout({ clientId, orgId, sessionId, draft }) {
     await tx.query('BEGIN');
     const { rows } = await tx.query(
       `SELECT id, client_request_id, status, submitted_at, started_at,
-              workout_assignment_id, prescribed, draft
+              workout_assignment_id, prescribed
          FROM workout_sessions
         WHERE id = $1 AND client_id = $2 AND organization_id = $3 AND source = 'member'
         FOR UPDATE`,
@@ -429,7 +429,12 @@ async function submitMyWorkout({ clientId, orgId, sessionId, draft }) {
       throw new TrainingInputError('This workout has already been submitted.', 409, 'WORKOUT_SUBMITTED');
     }
 
-    const source = draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : session.draft;
+    // The body is the canonical log input, converted by the app's one mapper
+    // (`toLogInput`) from the UI draft. The autosaved `session.draft` is that
+    // UI shape — weight/time/distance strings and a `done` flag — and reading
+    // it here as canonical would drop every weight silently. A bodyless submit
+    // is refused so the client retries with its local draft intact.
+    const source = draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : null;
     if (!source || !Array.isArray(source.exercises)) {
       await tx.query('ROLLBACK');
       throw new TrainingInputError('Log at least one set before submitting.', 400, 'EMPTY_WORKOUT');
@@ -590,20 +595,31 @@ async function startMyWorkout({ clientId, orgId, userId, plans, dayOfWeek, assig
   const dow = Number(day.day_of_week);
   const workoutDay = dow >= 1 && dow <= 7 ? WEEKDAYS[dow - 1] : null;
 
-  const { rows } = await pool.query(
-    `INSERT INTO workout_sessions (
-       client_id, trainer_id, workout_assignment_id, session_date, program_name, workout_day,
-       status, source, started_at, prescribed, draft, created_by, organization_id
-     ) VALUES ($1, (SELECT trainer_id FROM pt_clients WHERE id = $1 AND organization_id = $9),
-               $2, $3::date, $4, $5, 'in_progress', 'member', NOW(),
-               $6::jsonb, $7::jsonb, $8, $9)
-     RETURNING *`,
-    [
-      clientId, plan.assignment_id, today(), plan.name, workoutDay,
-      JSON.stringify(prescribed), JSON.stringify(draft), userId, orgId,
-    ],
-  );
-  return { session: rows[0], resumed: false };
+  let result;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO workout_sessions (
+         client_id, trainer_id, workout_assignment_id, session_date, program_name, workout_day,
+         status, source, started_at, prescribed, draft, created_by, organization_id
+       ) VALUES ($1, (SELECT trainer_id FROM pt_clients WHERE id = $1 AND organization_id = $9),
+                 $2, $3::date, $4, $5, 'in_progress', 'member', NOW(),
+                 $6::jsonb, $7::jsonb, $8, $9)
+       RETURNING *`,
+      [
+        clientId, plan.assignment_id, today(), plan.name, workoutDay,
+        JSON.stringify(prescribed), JSON.stringify(draft), userId, orgId,
+      ],
+    );
+    result = { session: rows[0], resumed: false };
+  } catch (err) {
+    // Two starts can both see no open session; the partial unique index lets
+    // exactly one insert. Hand back the winner instead of failing the tap.
+    if (err.code !== '23505') throw err;
+    const winner = await openSessionFor(clientId, orgId);
+    if (!winner) throw err;
+    result = { session: winner, resumed: true };
+  }
+  return result;
 }
 
 /** Validate an autosaved draft before it reaches the database. */
