@@ -775,6 +775,51 @@ router.post('/clients/:id/renew', auth, requireTrainer, validate(renewSchema), w
   res.json({ data: result.client });
 }));
 
+// ─── Self workout permission ─────────────────────────────────
+// The trainer's decision, and the only writer of it. Kept apart from the
+// general client PATCH so the change has its own audit action and cannot be
+// set by accident with a bulk field update. Revoking it never touches an
+// already-open session: the member can always finish what they started.
+router.patch('/clients/:id/self-workout', auth, requireTrainer, wrap(async (req, res) => {
+  const allow = req.body?.allow_self_workout;
+  if (typeof allow !== 'boolean') {
+    return res.status(400).json({ error: {
+      code: 'VALIDATION',
+      field: 'allow_self_workout',
+      message: 'allow_self_workout must be true or false.',
+    } });
+  }
+
+  const params = [req.params.id];
+  const scope = orgWhere(req, params, 'organization_id');
+  const { rows: before } = await pool.query(
+    `SELECT allow_self_workout FROM pt_clients
+      WHERE id = $1${scope} AND deleted_at IS NULL`,
+    params,
+  );
+  if (!before[0]) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
+
+  params.push(allow);
+  const { rows } = await pool.query(
+    `UPDATE pt_clients SET allow_self_workout = $${params.length}, updated_at = NOW()
+      WHERE id = $1${scope} AND deleted_at IS NULL
+      RETURNING id, allow_self_workout`,
+    params,
+  );
+  if (!rows[0]) {
+    return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
+  }
+
+  await logActivity(
+    req, 'client.self_workout.update', 'pt_client', rows[0].id,
+    { allow_self_workout: rows[0].allow_self_workout },
+    { allow_self_workout: before[0].allow_self_workout },
+  );
+  res.json({ data: rows[0] });
+}));
+
 // ─── Update PT client ───────────────────────────────────────
 router.patch('/clients/:id', auth, requireTrainer, wrap(async (req, res) => {
   if (rejectMovedFields(req, res, 'PATCH /clients/:id', MOVED_CLIENT_FIELDS)) return;

@@ -45,6 +45,10 @@ beforeEach(() => {
   global.__mockUser = { id: 'u-1', role: 'trainer', organization_id: 'org-1' };
 });
 
+// Every write now asks whether the parent session is a submitted member
+// workout. These suites are trainer-led sessions, so it is always writable.
+const LOCK_ROW = { rows: [{ source: 'studio', status: 'in_progress', submitted_at: null }] };
+
 const insertCall = () =>
   pool.query.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO workout_sets'));
 
@@ -54,6 +58,7 @@ const updateCall = () =>
 describe('POST /workout-log/exercises/:id/sets — cardio actuals', () => {
   it('stores duration, distance+unit, calories and cadence', async () => {
     pool.query
+      .mockResolvedValueOnce(LOCK_ROW)
       .mockResolvedValueOnce(EX_ROW)
       .mockResolvedValueOnce({ rows: [{ id: 'set-1' }] });
 
@@ -80,6 +85,7 @@ describe('POST /workout-log/exercises/:id/sets — cardio actuals', () => {
 
   it('keeps strength sets cardio-clean — omitted fields persist as NULL', async () => {
     pool.query
+      .mockResolvedValueOnce(LOCK_ROW)
       .mockResolvedValueOnce(EX_ROW)
       .mockResolvedValueOnce({ rows: [{ id: 'set-2' }] });
 
@@ -111,6 +117,7 @@ describe('POST /workout-log/exercises/:id/sets — cardio actuals', () => {
     // volume everywhere the log is read. The INSERT matches no rows when the
     // (exercise, set_number) pair already exists, and the route says so.
     pool.query
+      .mockResolvedValueOnce(LOCK_ROW)
       .mockResolvedValueOnce(EX_ROW)
       .mockResolvedValueOnce({ rows: [] });
 
@@ -137,6 +144,7 @@ describe('PATCH /workout-log/sets/:id — cardio fields', () => {
 
   it('sets speed with its unit', async () => {
     pool.query
+      .mockResolvedValueOnce(LOCK_ROW)
       .mockResolvedValueOnce(EXISTING)
       .mockResolvedValueOnce({ rows: [{ id: 'set-1' }] });
 
@@ -154,6 +162,7 @@ describe('PATCH /workout-log/sets/:id — cardio fields', () => {
 
   it('clears a cardio field without touching weight/reps', async () => {
     pool.query
+      .mockResolvedValueOnce(LOCK_ROW)
       .mockResolvedValueOnce(EXISTING)
       .mockResolvedValueOnce({ rows: [{ id: 'set-1' }] });
 
@@ -173,6 +182,7 @@ describe('PATCH /workout-log/sets/:id — cardio fields', () => {
     // the edit — the UI kept showing a personal best for a set with no
     // weight. Anything not eligible for a recompute must clear.
     pool.query
+      .mockResolvedValueOnce(LOCK_ROW)
       .mockResolvedValueOnce({
         rows: [{ ...EXISTING.rows[0], completed: true, weight_kg: 80, reps: 5, is_pr_weight: true }],
       })

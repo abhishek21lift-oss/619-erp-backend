@@ -95,6 +95,8 @@ describeIf('member premium features against a real database', () => {
       `INSERT INTO pt_clients (id, name, mobile, organization_id, trainer_id)
        VALUES ($1, 'Mina Rao', '+919000021201', $3, $4), ($2, 'Other', '+919000021202', $3, $4)`,
       [CLIENT, OTHER, ORG, TRAINER]);
+    // The legacy self-log route now requires the trainer's permission.
+    await pool.query(`UPDATE pt_clients SET allow_self_workout = TRUE WHERE id = $1`, [CLIENT]);
     await pool.query(
       `INSERT INTO users (id, name, email, password, role, organization_id, pt_client_id, is_active)
        VALUES ($1, 'Mina', 'mina@premium.test', '!', 'member', $2, $3, TRUE)`, [USER, ORG, CLIENT]);
@@ -148,7 +150,7 @@ describeIf('member premium features against a real database', () => {
         `SELECT title, body, link FROM notifications WHERE user_id = $1 AND type = 'member_workout'`, [TRAINER_USER]);
       expect(notes.rows[0].title).toBe('Mina Rao logged a workout');
       expect(notes.rows[0].body).toBe('1 exercise, 2 sets, 2 personal bests.');
-      expect(notes.rows[0].link).toBe(`/pt-os/clients/${CLIENT}/workout-log`);
+      expect(notes.rows[0].link).toBe(`/pt-os/clients/${CLIENT}/workout-log/${res.body.data.session_id}`);
     });
 
     it('returns the same session for a retried request instead of logging twice', async () => {
