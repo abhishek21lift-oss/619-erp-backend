@@ -46,6 +46,7 @@ const body = (over = {}) => ({
 beforeEach(() => {
   mockQueries.length = 0;
   mockResponder = (sql) => {
+    if (/SELECT allow_self_workout FROM pt_clients/.test(sql)) return { rows: [{ allow_self_workout: true }] };
     if (/COUNT\(\*\)::int AS n/.test(sql)) return { rows: [{ n: 0 }] };
     if (/FROM workout_sessions WHERE client_id/.test(sql)) return { rows: [] };
     if (/INSERT INTO workout_sessions/.test(sql)) return { rows: [{ id: 's1' }] };

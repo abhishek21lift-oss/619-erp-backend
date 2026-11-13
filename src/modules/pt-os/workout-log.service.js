@@ -301,9 +301,94 @@ async function ensureSessionWritable(db, { orgId, sessionId }) {
   return { ok: true };
 }
 
+/**
+ * The trainer's queue: member sessions submitted and not yet reviewed.
+ * Org-scoped; `clientId` narrows it, it never widens it.
+ */
+async function pendingMemberReviews({ orgId, clientId = null }, db = pool) {
+  const params = [orgId];
+  let clientClause = '';
+  if (clientId) {
+    params.push(clientId);
+    clientClause = ` AND ws.client_id = $${params.length}`;
+  }
+  const { rows } = await db.query(
+    `SELECT ws.id, ws.client_id, c.name AS client_name,
+            ws.session_date, ws.submitted_at, ws.program_name, ws.workout_day,
+            ws.duration_minutes,
+            (SELECT COUNT(*)::int FROM workout_session_exercises wse
+              WHERE wse.session_id = ws.id) AS exercise_count,
+            (SELECT COUNT(*)::int FROM workout_sets s
+               JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+              WHERE wse.session_id = ws.id AND s.completed = TRUE) AS set_count,
+            COALESCE((SELECT SUM(s.weight_kg * s.reps)
+                        FROM workout_sets s
+                        JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
+                       WHERE wse.session_id = ws.id AND s.completed = TRUE), 0) AS volume
+       FROM workout_sessions ws
+       JOIN pt_clients c ON c.id = ws.client_id
+      WHERE ws.organization_id = $1
+        AND ws.source = 'member' AND ws.status = 'completed'
+        AND ws.review_status = 'pending'${clientClause}
+      ORDER BY ws.submitted_at DESC NULLS LAST, ws.created_at DESC
+      LIMIT 100`,
+    params,
+  );
+  return rows;
+}
+
+/**
+ * Record the trainer's verdict on a submitted member session and tell the
+ * member. Returns the updated row, or null when no such session is in scope.
+ */
+async function reviewMemberSession({ sessionId, orgId, reviewerId, decision, feedback = null }) {
+  const tx = await pool.connect();
+  try {
+    await tx.query('BEGIN');
+    const { rows } = await tx.query(
+      `UPDATE workout_sessions
+          SET review_status = $3, reviewed_by = $4, reviewed_at = NOW(),
+              review_feedback = $5, updated_at = NOW()
+        WHERE id = $1 AND organization_id = $2
+          AND source = 'member' AND status = 'completed'
+        RETURNING id, client_id, review_status, review_feedback, reviewed_at`,
+      [sessionId, orgId, decision, reviewerId, feedback],
+    );
+    const reviewed = rows[0];
+    if (!reviewed) {
+      await tx.query('ROLLBACK');
+      return null;
+    }
+    const body = feedback || (decision === 'approved'
+      ? 'Your trainer approved this workout.'
+      : 'Your trainer reviewed this workout and left notes for next time.');
+    await tx.query(
+      `INSERT INTO notifications (user_id, type, title, body, link)
+       SELECT u.id, 'workout_review', $2, $3, '/member/workout'
+         FROM users u
+        WHERE u.pt_client_id = $1 AND u.organization_id = $4
+          AND u.deleted_at IS NULL`,
+      [
+        reviewed.client_id,
+        decision === 'approved' ? 'Workout approved' : 'Workout feedback',
+        body,
+        orgId,
+      ],
+    );
+    await tx.query('COMMIT');
+    return reviewed;
+  } catch (err) {
+    await tx.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    tx.release();
+  }
+}
+
 module.exports = {
   recomputeAssignmentProgress, computePrFlags, startSession, closeStaleSessions,
   abandonEmptyStaleSessions, getSessionState, ensureSessionWritable, SessionStartError,
+  pendingMemberReviews, reviewMemberSession,
   // exported for tests
   requestDate, weekdayOf,
 };

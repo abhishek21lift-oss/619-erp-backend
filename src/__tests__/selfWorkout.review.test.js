@@ -20,6 +20,14 @@ jest.mock('../db/pool', () => ({
     mockQueries.push({ sql: flat, params: params || [] });
     return mockResponder(flat, params || []);
   }),
+  connect: jest.fn(async () => ({
+    query: jest.fn(async (sql, params) => {
+      const flat = String(sql).replace(/\s+/g, ' ').trim();
+      mockQueries.push({ sql: flat, params: params || [] });
+      return mockResponder(flat, params || []);
+    }),
+    release: () => {},
+  })),
 }));
 
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));

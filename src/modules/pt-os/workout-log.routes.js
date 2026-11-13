@@ -32,7 +32,7 @@ const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
 // Shared with the member app's self-logged workouts (client-portal).
 const {
   recomputeAssignmentProgress, computePrFlags, startSession, getSessionState, ensureSessionWritable,
-  SessionStartError,
+  SessionStartError, pendingMemberReviews, reviewMemberSession,
 } = require('./workout-log.service');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
@@ -343,34 +343,10 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
 // widens it.
 router.get('/workout-log/pending-review', auth, wrap(async (req, res) => {
   const scope = tenantScope(req);
-  const params = [scope.orgId];
-  let clientClause = '';
-  if (req.query.client_id) {
-    params.push(req.query.client_id);
-    clientClause = ` AND ws.client_id = $${params.length}`;
-  }
-  const { rows } = await pool.query(
-    `SELECT ws.id, ws.client_id, c.name AS client_name,
-            ws.session_date, ws.submitted_at, ws.program_name, ws.workout_day,
-            ws.duration_minutes,
-            (SELECT COUNT(*)::int FROM workout_session_exercises wse
-              WHERE wse.session_id = ws.id) AS exercise_count,
-            (SELECT COUNT(*)::int FROM workout_sets s
-               JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
-              WHERE wse.session_id = ws.id AND s.completed = TRUE) AS set_count,
-            COALESCE((SELECT SUM(s.weight_kg * s.reps)
-                        FROM workout_sets s
-                        JOIN workout_session_exercises wse ON wse.id = s.session_exercise_id
-                       WHERE wse.session_id = ws.id AND s.completed = TRUE), 0) AS volume
-       FROM workout_sessions ws
-       JOIN pt_clients c ON c.id = ws.client_id
-      WHERE ws.organization_id = $1
-        AND ws.source = 'member' AND ws.status = 'completed'
-        AND ws.review_status = 'pending'${clientClause}
-      ORDER BY ws.submitted_at DESC NULLS LAST, ws.created_at DESC
-      LIMIT 100`,
-    params,
-  );
+  const rows = await pendingMemberReviews({
+    orgId: scope.orgId,
+    clientId: req.query.client_id || null,
+  });
   res.json({ data: rows });
 }));
 
@@ -395,34 +371,14 @@ router.post('/workout-log/sessions/:id/review', auth, requireTrainer, wrap(async
   }
 
   const scope = tenantScope(req);
-  const { rows } = await pool.query(
-    `UPDATE workout_sessions
-        SET review_status = $3, reviewed_by = $4, reviewed_at = NOW(),
-            review_feedback = $5, updated_at = NOW()
-      WHERE id = $1 AND organization_id = $2
-        AND source = 'member' AND status = 'completed'
-      RETURNING id, client_id, review_status, review_feedback, reviewed_at`,
-    [req.params.id, scope.orgId, decision, req.user.id, feedback || null],
-  );
-  const reviewed = rows[0];
+  const reviewed = await reviewMemberSession({
+    sessionId: req.params.id,
+    orgId: scope.orgId,
+    reviewerId: req.user.id,
+    decision,
+    feedback: feedback || null,
+  });
   if (!reviewed) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-
-  const body = feedback || (decision === 'approved'
-    ? 'Your trainer approved this workout.'
-    : 'Your trainer reviewed this workout and left notes for next time.');
-  await pool.query(
-    `INSERT INTO notifications (user_id, type, title, body, link)
-     SELECT u.id, 'workout_review', $2, $3, '/member/workout'
-       FROM users u
-      WHERE u.pt_client_id = $1 AND u.organization_id = $4
-        AND u.deleted_at IS NULL`,
-    [
-      reviewed.client_id,
-      decision === 'approved' ? 'Workout approved' : 'Workout feedback',
-      body,
-      scope.orgId,
-    ],
-  );
 
   await logActivity(req, 'workout_log.member.review', 'workout_session', reviewed.id, {
     decision,
