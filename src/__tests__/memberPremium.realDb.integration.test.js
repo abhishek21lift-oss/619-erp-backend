@@ -150,7 +150,7 @@ describeIf('member premium features against a real database', () => {
         `SELECT title, body, link FROM notifications WHERE user_id = $1 AND type = 'member_workout'`, [TRAINER_USER]);
       expect(notes.rows[0].title).toBe('Mina Rao logged a workout');
       expect(notes.rows[0].body).toBe('1 exercise, 2 sets, 2 personal bests.');
-      expect(notes.rows[0].link).toBe(`/pt-os/clients/${CLIENT}/workout-log`);
+      expect(notes.rows[0].link).toBe(`/pt-os/clients/${CLIENT}/workout-log/${res.body.data.session_id}`);
     });
 
     it('returns the same session for a retried request instead of logging twice', async () => {
