@@ -1,5 +1,5 @@
 'use strict';
-// 283_trainer_controlled_self_workout.sql — the trainer's permission, the
+// 284_trainer_controlled_self_workout.sql — the trainer's permission, the
 // server-side in-progress member session, the prescription snapshot and the
 // review state.
 //
@@ -9,13 +9,13 @@
 const fs = require('fs');
 const path = require('path');
 
-const MIGRATION = path.join(__dirname, '..', 'db', 'migrations', '283_trainer_controlled_self_workout.sql');
+const MIGRATION = path.join(__dirname, '..', 'db', 'migrations', '284_trainer_controlled_self_workout.sql');
 const sql = fs.readFileSync(MIGRATION, 'utf8');
 // Comments stripped and whitespace collapsed: column alignment is not a fact
 // this test pins.
 const body = sql.replace(/--[^\n]*/g, ' ').replace(/\s+/g, ' ');
 
-describe('283_trainer_controlled_self_workout.sql', () => {
+describe('284_trainer_controlled_self_workout.sql', () => {
   it('is read, so nothing below can pass vacuously', () => {
     expect(sql.length).toBeGreaterThan(500);
   });

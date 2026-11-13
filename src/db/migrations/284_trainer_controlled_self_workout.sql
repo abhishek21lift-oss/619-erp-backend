@@ -1,4 +1,4 @@
--- 283_trainer_controlled_self_workout.sql
+-- 284_trainer_controlled_self_workout.sql
 --
 -- The trainer decides whether a client may train on their own. Until now the
 -- member app let any client with a programme start a guided workout and post
