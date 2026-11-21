@@ -76,7 +76,7 @@ function buildSslConfig() {
     }
   }
   // Supabase's Supavisor pooler uses a certificate chain that is not in the
-  // standard system CA trust store (Render, AWS, etc.). rejectUnauthorized:false
+  // standard system CA trust store (managed Postgres providers, AWS, etc.). rejectUnauthorized:false
   // keeps the connection encrypted but skips chain verification — this is the
   // approach Supabase officially recommends for pooler connections. Set
   // DATABASE_SSL_CA (above) to re-enable full chain verification.
@@ -521,17 +521,17 @@ pool.tenantPoolForDiagnostics = function tenantPoolForDiagnostics() {
   };
 };
 
-// Test connection on startup. Don't crash here — Render's healthcheck will
+// Test connection on startup. Don't crash here — the health probe will
 // surface a 5xx and you can read the log. Crashing prevents redeploys from
-// recovering when Supabase has a brief connectivity blip.
+// recovering when the database has a brief connectivity blip.
 pool.connect()
   .then(client => {
-    logger.info('Connected to Supabase PostgreSQL');
+    logger.info('Connected to PostgreSQL');
     client.release();
   })
   .catch(err => {
     logger.error({ err: err.message }, 'Database connection failed on startup');
-    logger.error('  1. Check DATABASE_URL is set in your .env / Render env');
+    logger.error('  1. Check DATABASE_URL is set in the deployment environment');
     logger.error('  2. Check the Supabase project is not paused');
     logger.error('  3. Check the password in the URI matches your DB password');
   });

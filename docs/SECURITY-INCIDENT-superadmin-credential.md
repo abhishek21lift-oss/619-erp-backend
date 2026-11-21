@@ -168,8 +168,11 @@ It must be `true` **before** step 3.
 
 ### 3. Turn the security flags on
 
-`src/server.js` now refuses to start in production unless all three are exactly
-`on`. Set them in the deployment environment:
+`src/server.js` refuses to start in production unless each is unset or exactly
+`on`/`off`; `off` is accepted only for staged rollout, and
+`PLATFORM_SESSION_ENFORCE=off` is itself fatal. Unset means **on** at the point
+of use (`!== 'off'`), so setting the flags explicitly is still the clearest
+record of intent. Set them in the deployment environment:
 
 ```
 TENANT_RLS_ENFORCE=on

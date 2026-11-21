@@ -77,24 +77,27 @@ application reads that schema. Each migration has a `.ROLLBACK.md` beside it.
 SELECT table_name FROM information_schema.tables WHERE table_schema = 'archive';
 ```
 
-## 4. What the legacy schema cannot express
+## 4. What the legacy columns cannot express directly
 
 Worth writing down, because it is the real argument the Training OS was built
-on, and it survives the Training OS being retired. `workout_exercises` has
-`sets INTEGER NOT NULL DEFAULT 3` and `reps INTEGER NOT NULL DEFAULT 12`, so
-every prescription must claim sets and reps. There is no `prescription_type`,
-no section (warm-up vs main vs cool-down), and no cardio columns — distance,
-duration, incline, pace and heart rate have nowhere to go.
+on, and it survives the Training OS being retired. `workout_exercises` still
+has `sets INTEGER NOT NULL DEFAULT 3` and `reps INTEGER NOT NULL DEFAULT 12`,
+so a row must claim sets and reps even when the prescription is a hold, a
+carry or a run. There is no section column (warm-up vs main vs cool-down).
 
-It does already carry `week_number`, `progression_type`/`progression_amount`/
-`progression_every_weeks`, `version`/`parent_plan_id`, `superset_group`,
-`target_weight`, `tempo`, `rpe`, `warmup_sets` and a `config` JSONB.
+The gap is closed in `config` JSONB rather than by widening the table:
+`config.duration_seconds`, `config.distance`/`distance_unit`,
+`config.target_heart_rate` and the K11 cardio fields carry time, distance and
+heart-rate prescriptions. `exercises.prescription_mode_primary` (migration
+221) tells the builder and logger which numbers to ask for, and
+`validateCardioPlanConfig` rejects invalid cardio configs at the write
+boundary. The builder and the member app both read this representation.
 
-**If cardio prescription is wanted, widen `workout_exercises`.** Make the
-sets/reps columns nullable behind a `prescription_type`, and add the cardio
-columns. That is a migration against the table 409 live rows already sit in.
-It is not a reason to stand up a second prescription domain — that is what was
-tried, and this file is the result.
+**Widening `workout_exercises` is no longer the plan.** The columns that
+already exist (`week_number`, progression fields, `version`/`parent_plan_id`,
+`superset_group`, `target_weight`, `tempo`, `rpe`, `warmup_sets`, `config`)
+carry the current model. A second prescription domain is what was tried, and
+this file is the result.
 
 ## 5. Guardrails
 

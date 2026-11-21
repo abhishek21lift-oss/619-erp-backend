@@ -18,7 +18,7 @@ const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET', 'FRONTEND_URL'];
 const missing = REQUIRED_ENV.filter(function(k) { return !process.env[k]; });
 if (missing.length) {
   logger.fatal({ missing }, 'Missing required environment variables');
-  console.error('  Set them in your .env file or your Render dashboard.');
+  console.error('  Set them in the deployment environment (Docker Compose / .env on the host).');
   process.exit(1);
 }
 
@@ -188,9 +188,10 @@ if (emailConfig.state === 'configured') {
 
 // ── Cloudflare R2 object storage ────────────────────────────────────────────
 // lib/fileStorage.js falls back to local disk whenever R2 is not fully
-// configured. On Render the filesystem is ephemeral, so that fallback silently
-// destroys every uploaded file — signed consent PDFs, PAR-Q forms, avatars —
-// on the next deploy or restart, with nothing in the logs to show for it.
+// configured. In a container the filesystem is ephemeral, so that fallback
+// silently destroys every uploaded file — signed consent PDFs, PAR-Q forms,
+// avatars — on the next deploy or restart, with nothing in the logs to show
+// for it.
 //
 // Partial configuration is always a mistake, so it is fatal in every
 // environment. A complete absence of R2 config is fatal in production only,
@@ -215,18 +216,22 @@ if (isProd && r2Set.length === 0) {
   process.exit(1);
 }
 
-// ── Security controls must be ON in production ──────────────────────────────
+// ── Security controls default to ON in production ───────────────────────────
 //
 // Three controls ship behind an env flag so they can be rolled out
-// deliberately (see db/migrations/TENANT-RLS-PLAN.md). Each is read as an
-// exact `=== 'on'` comparison at the point of use — deliberately strict, so
-// that a typo, an empty string, "true", "1" or "ON" all read as OFF rather
-// than being coerced into ON by a truthiness check. That strictness is the
-// right call and is preserved verbatim here.
+// deliberately (see db/migrations/TENANT-RLS-PLAN.md). Each is read at the
+// point of use as `!== 'off'` (src/lib/tenantRlsFlag.js,
+// src/middleware/platformAuth.js, src/middleware/tenant.js), so an unset
+// value means ON. The boot guard below is stricter: in production the value
+// must be unset, 'on', or 'off'. A typo, an empty string, "true", "1" or "ON"
+// is refused rather than coerced into ON or silently read as OFF.
 //
 // For NEW production deployments, these default to ON for security.
-// Existing deployments going through staged rollout can explicitly set
-// them to 'off' to disable. The value MUST be either 'on' or 'off' in production.
+// `TENANT_RLS_ENFORCE` and `SUPER_ADMIN_REQUIRE_MFA` may be explicitly set to
+// 'off' for a staged rollout (with the prerequisites below); the boot guard
+// logs a warning. `PLATFORM_SESSION_ENFORCE` may not: 'off' is fatal in
+// production because it makes tenant and platform sessions indistinguishable.
+// The value must be unset, 'on', or 'off' in production.
 //
 // ── Before deploying with these set ─────────────────────────────────────────
 //
@@ -392,13 +397,13 @@ const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// Behind Render / Vercel / Cloudflare — trust the proxy hops in front of us so
-// req.ip is the real client and rate-limit keys aren't bucketed to one IP.
+// Behind nginx / a CDN / a load balancer — trust the proxy hops in front of us
+// so req.ip is the real client and rate-limit keys aren't bucketed to one IP.
 //
 // The correct value is the NUMBER OF PROXIES in front of this process, and it
-// depends on the deployment topology: Render alone is 1, Cloudflare in front of
-// Render is 2. Setting it too low makes req.ip an infrastructure address, which
-// collapses every caller into a single rate-limit bucket and neuters the login
+// depends on the deployment topology: one proxy is 1, a CDN in front of it is
+// 2. Setting it too low makes req.ip an infrastructure address, which collapses
+// every caller into a single rate-limit bucket and neuters the login
 // brute-force protection below. Overridable so the value can match the actual
 // topology without a code change; verify by logging req.ip in production and
 // confirming it matches real client addresses.
@@ -1113,13 +1118,13 @@ runMigrationsWithRetry()
     require('./lib/ai/settings').start();
 
     // ── Background workers (BullMQ, in-process) ───────────────────────────────
-    // Single-instance deploys (Render) run the queue workers inside the API
-    // process instead of a second service: when Redis is configured, producer
-    // queues enqueue email/whatsapp/AI/notification work and these workers
-    // drain them on this same process. Set RUN_WORKERS=0 to keep workers in a
-    // separate process (see the "worker" script in package.json). Without
-    // Redis everything degrades to the pre-queue inline paths and this is a
-    // no-op, so dev machines and test runs are unaffected.
+    // Single-process deployments run the queue workers inside the API process
+    // instead of a second service: when Redis is configured, producer queues
+    // enqueue email/whatsapp/AI/notification work and these workers drain them
+    // on this same process. Set RUN_WORKERS=0 to keep workers in a separate
+    // process (see the "worker" script in package.json). Without Redis
+    // everything degrades to the pre-queue inline paths and this is a no-op,
+    // so dev machines and test runs are unaffected.
     let workers = [];
     if (process.env.RUN_WORKERS !== '0') {
       const { startWorkers } = require('./workers');

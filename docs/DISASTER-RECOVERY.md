@@ -1,8 +1,16 @@
 # Disaster recovery
 
+> **Historical baseline — do not read §1 as current state.** This document was
+> written when the platform had no automated backup. A nightly GitHub Actions
+> workflow (`.github/workflows/backup.yml`), `scripts/backup-database.js`, and
+> `scripts/restore-drill.js` now exist, and one dump was verified end to end
+> (see §2). Whether the nightly job is running, whether the R2 object is fresh,
+> and whether a production restore has been rehearsed are **unverified**. The
+> current gates are in `TRACKER.md` §3.3. No PITR exists on the free plan.
+
 **Read the first section before relying on anything here.** The headline
-finding is not a procedure gap — it is that, at the time of writing, this
-platform has **no automated database backup of any kind**.
+finding at the time of writing was not a procedure gap — it was that the
+platform had **no automated database backup of any kind**.
 
 ---
 
@@ -16,8 +24,8 @@ platform has **no automated database backup of any kind**.
 | **Automated daily backups** | **None.** Supabase backs up Pro/Team/Enterprise projects only |
 | **Point-in-Time Recovery** | **Not available.** PITR is a paid add-on above the free plan |
 | **Backup retention** | **n/a — nothing is being retained** |
-| **Effective RPO today** | **Total loss.** There is no restore point |
-| **Effective RTO today** | **Unbounded.** There is nothing to restore from |
+| **Effective RPO today** | **Up to 24h if the nightly workflow runs; unverified.** Before the workflow existed there was no restore point at all |
+| **Effective RTO today** | **Unbounded until a restore is rehearsed.** The dump exists; a production restore has not been proven |
 
 Verified two ways rather than assumed:
 
@@ -35,12 +43,12 @@ And the repository provided no substitute: a search for `pg_dump`,
 
 ### What that means concretely
 
-Six live studios' production data — clients, payments, invoices, attendance,
-assessments, signed consents, the exercise library — currently exists in
-exactly one place. A dropped table, a bad migration, a mistaken
+At the time of writing, six live studios' production data — clients, payments,
+invoices, attendance, assessments, signed consents, the exercise library —
+existed in exactly one place. A dropped table, a bad migration, a mistaken
 `DELETE`, a compromised credential (see
 `SECURITY-INCIDENT-superadmin-credential.md`), or Supabase losing the project
-takes all of it, permanently.
+would have taken all of it, permanently.
 
 Two related free-plan behaviours worth knowing:
 
