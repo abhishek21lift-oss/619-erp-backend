@@ -462,6 +462,11 @@ const DOMAINS = {
       // 229) for the same reason platform_owners is: a table of credentials is
       // not something app_tenant may ever read, even by accident.
       'platform_hostinger_credentials', 'platform_hostinger_approvals',
+      // Impersonation sessions (migration 285). This is the operator's grant
+      // record and the action log for a session in full mode; a tenant role
+      // must never read either, and deny-all RLS keeps that true even if a
+      // grant is added by accident.
+      'impersonation_sessions', 'impersonation_session_actions',
       // `audit_log` is the pre-v4 audit table: no organization_id, and nothing
       // in the backend writes or reads it (the super-admin audit UI uses
       // activity_log, which carries organization_id and stays on the tenant

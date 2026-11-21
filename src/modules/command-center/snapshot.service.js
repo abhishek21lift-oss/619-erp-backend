@@ -128,6 +128,9 @@ async function collect(opts = {}) {
     // things and they are fine" from "I checked two things and they are fine",
     // and those are wildly different claims to put a green dot on.
     observability: observabilityOf(cards),
+    // Graded companion to `status`: same evidence, finer resolution. Null when
+    // no card could be measured. See healthScore() for the weights.
+    health: healthScore(cards),
     degraded_reasons: degradedReasons(cards),
     // ── A card that grades itself healthy but has lost fields ─────────────
     //
@@ -202,6 +205,85 @@ function degradedReasons(cards) {
   return out;
 }
 
+// ── Graded health ───────────────────────────────────────────────────────────
+//
+// The rollup answers "is anything wrong" with one of six words. A score
+// answers a different question — "how much of the platform is healthy, and how
+// much of it am I blind to" — and the difference matters when two snapshots
+// both say WARNING but one has one slow probe and the other has four.
+//
+// The points are deliberately coarse and fixed rather than a tuned curve:
+// anybody reading the grade can reproduce it in their head from the component
+// counts, which is the property that makes a score trustworthy in an incident.
+//
+// UNAVAILABLE is not zero: the probe could not run, so the platform may be
+// perfectly fine. It scores low because blindness is a real operational risk,
+// but it stays above CRITICAL, which is evidence of an actual failure.
+const HEALTH_POINTS = {
+  healthy: 100,
+  warning: 70,
+  degraded: 55,
+  unavailable: 25,
+  timeout: 10,
+  critical: 0,
+};
+
+/**
+ * A 0–100 score over the cards that were actually measured.
+ *
+ * Two rules keep it honest:
+ *
+ *   1. A capability this deployment deliberately did not configure is excluded
+ *      entirely — it is neither health nor a blind spot.
+ *   2. PROCESS-scope cards count half. They describe the one API replica that
+ *      answered, not the platform, and a green runtime card must not outvote a
+ *      red database card.
+ *
+ * The score is null, never 0, when nothing was measurable: "I saw nothing" and
+ * "everything is down" are opposite claims.
+ */
+function healthScore(cards) {
+  const considered = cards.filter(
+    (c) => !(c.status === registry.STATUS.UNAVAILABLE && c.expected),
+  );
+  const components = {
+    healthy: 0, warning: 0, degraded: 0, timeout: 0, critical: 0, unavailable: 0,
+  };
+  let weighted = 0;
+  let weight = 0;
+  let processWeighted = false;
+
+  for (const c of considered) {
+    if (c.status in components) components[c.status] += 1;
+    const w = c.scope === registry.SCOPE.PROCESS ? 0.5 : 1;
+    if (w !== 1) processWeighted = true;
+    weighted += (HEALTH_POINTS[c.status] ?? 0) * w;
+    weight += w;
+  }
+
+  const measured = considered.length;
+  const score = weight > 0 ? Math.round(weighted / weight) : null;
+  const worst = considered.reduce((acc, c) => {
+    const i = registry.SEVERITY_ORDER.indexOf(c.status);
+    return i > registry.SEVERITY_ORDER.indexOf(acc) ? c.status : acc;
+  }, registry.STATUS.HEALTHY);
+
+  return {
+    score,
+    grade: score == null ? 'unknown'
+      : score >= 90 ? 'A'
+      : score >= 75 ? 'B'
+      : score >= 60 ? 'C'
+      : score >= 40 ? 'D'
+      : 'F',
+    worst,
+    measured,
+    not_configured: cards.length - measured,
+    process_weighted: processWeighted,
+    components,
+  };
+}
+
 /** Drop cached values so the next collect re-probes. */
 function invalidate(name) {
   if (name) cache.delete(name); else cache.clear();
@@ -209,5 +291,5 @@ function invalidate(name) {
 
 module.exports = {
   collect, invalidate, MAX_CONCURRENT_PROBES,
-  observabilityOf, degradedReasons, contractViolations, _mapBounded: mapBounded,
+  observabilityOf, degradedReasons, contractViolations, healthScore, _mapBounded: mapBounded,
 };

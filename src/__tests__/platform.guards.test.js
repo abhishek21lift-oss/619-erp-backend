@@ -30,7 +30,7 @@ function impToken({ ro }) {
     {
       id: ADMIN.id,
       token_version: ADMIN.token_version,
-      imp: { by: 'usr-super', byName: 'Operator', ro, org: ADMIN.organization_id },
+      imp: { by: 'usr-super', byName: 'Operator', ro, org: ADMIN.organization_id, sid: '33333333-3333-4333-8333-333333333333' },
     },
     process.env.JWT_SECRET,
     { expiresIn: '30m' }

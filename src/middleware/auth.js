@@ -8,6 +8,7 @@ const { platformSessionBlocked, TENANT_SESSION_REQUIRED, isTenantPlanePath } = r
 const { ROLES, TENANT_ROLES, ALL_ROLES } = require('./rbac');
 const { accessTokenFor } = require('../lib/authSession');
 const { portalMatchesSession } = require('../lib/authPortal');
+const logger = require('../lib/logger');
 
 // Defaults to ON in production for security. Explicitly set to 'off' to disable
 // (staged rollout only). See TENANT-RLS-PLAN.md and server.js startup validation.
@@ -239,9 +240,8 @@ async function auth(req, res, next) {
 
     // Super-admin impersonation: the token carries an `imp` claim minted by the
     // platform portal. req.user is already the impersonated account (loaded
-    // above), so the whole app renders as them. While read-only (`ro`), reject
-    // every mutating request — the operator must exit impersonation to make
-    // changes.
+    // above), so the whole app renders as them. While read-only, reject every
+    // mutating request — the operator must exit impersonation to make changes.
     if (decoded.imp) {
       // The claim names the studio it was minted for. The account it loaded
       // must still belong to that studio and still be a tenant account — a
@@ -250,14 +250,93 @@ async function auth(req, res, next) {
       if (!TENANT_ROLES.includes(user.role) || String(decoded.imp.org) !== String(user.organization_id)) {
         return res.status(401).json({ error: 'Session expired, please log in again' });
       }
-      req.impersonation = decoded.imp;
+
+      // ── The session row is authoritative, not the token ────────────────
+      //
+      // Migration 285 gave every impersonation a row so it can be ended or
+      // revoked before its TTL. The JWT's `sid` must still name a live row for
+      // THIS operator, target and studio. Anything else fails closed.
+      //
+      // Tokens minted before 285 carry no `sid`. They are refused rather than
+      // grandfathered: their maximum life is two hours, and accepting a token
+      // no revocation can reach is exactly the hole the table exists to close.
+      const sid = decoded.imp.sid;
+      if (!sid) {
+        return res.status(401).json({
+          error: {
+            code: 'IMPERSONATION_ENDED',
+            message: 'This impersonation session is no longer valid. Start a new one from the Command Center.',
+          },
+        });
+      }
+
+      let session;
+      try {
+        const { rows } = await pool.query(
+          `SELECT id, mode, ended_at, revoked_at, expires_at
+             FROM impersonation_sessions
+            WHERE id = $1 AND operator_id = $2 AND target_user_id = $3 AND organization_id = $4`,
+          [sid, decoded.imp.by, user.id, decoded.imp.org]
+        );
+        session = rows[0];
+      } catch (err) {
+        // Fails CLOSED. If the grant table cannot be read, the safe answer is
+        // "not in a session", not "carry on with the token's own claims".
+        logger.error({ err: err.message, sessionId: sid }, 'impersonation session lookup failed');
+        return res.status(503).json({
+          error: { code: 'IMPERSONATION_UNAVAILABLE', message: 'Could not verify the impersonation session. Try again.' },
+        });
+      }
+
+      if (!session) {
+        return res.status(401).json({
+          error: { code: 'IMPERSONATION_ENDED', message: 'This impersonation session has ended. Return to the Command Center.' },
+        });
+      }
+      if (session.ended_at || session.revoked_at) {
+        return res.status(401).json({
+          error: { code: 'IMPERSONATION_ENDED', message: 'This impersonation session was ended or revoked. Return to the Command Center.' },
+        });
+      }
+      // expires_at is set from the same TTL as the JWT. Checked separately so
+      // a clock skew in the token itself cannot extend the row's window.
+      if (session.expires_at && new Date(session.expires_at).getTime() <= Date.now()) {
+        return res.status(401).json({
+          error: { code: 'IMPERSONATION_ENDED', message: 'This impersonation session has expired. Return to the Command Center.' },
+        });
+      }
+
+      req.impersonation = { ...decoded.imp, sessionId: sid };
       const method = (req.method || 'GET').toUpperCase();
-      if (decoded.imp.ro && method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+      const mutating = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+      // The row's mode wins over the token claim: flipping a session to
+      // read-only in the database (or a token that lies) cannot grant writes.
+      const readOnly = session.mode ? session.mode === 'read_only' : Boolean(decoded.imp.ro);
+
+      if (readOnly && mutating) {
         return res.status(403).json({
           error: {
             code: 'IMPERSONATION_READONLY',
             message: 'Read-only impersonation: changes are disabled. Enter full access from the Command Center to make changes.',
           },
+        });
+      }
+
+      // ── Full-mode action trail ─────────────────────────────────────────
+      //
+      // Transport-level record of every write that actually succeeded. The
+      // domain-level audit row is still written by activityLog with
+      // `_impersonated_by`; this answers "which endpoints did this session
+      // touch" without needing to reconstruct it from many entity logs.
+      if (!readOnly && mutating) {
+        res.on('finish', () => {
+          if (res.statusCode >= 400) return;
+          const path = (req.originalUrl || req.url || '').split('?')[0].slice(0, 500);
+          pool.query(
+            `INSERT INTO impersonation_session_actions (session_id, method, path, status_code)
+             VALUES ($1,$2,$3,$4)`,
+            [sid, method, path, res.statusCode]
+          ).catch((err) => logger.warn({ err: err.message, sessionId: sid }, 'impersonation action log write failed'));
         });
       }
     }

@@ -40,8 +40,27 @@ const TARGET_ADMIN = {
 
 let mockDbUser = { ...TARGET_ADMIN };
 
+// A live session row for the token's `sid`. `mode` is null by default so the
+// existing read-only/full cases keep exercising the token claim; tests that
+// care about the row being authoritative set it explicitly.
+const SESSION_ID = '33333333-3333-4333-8333-333333333333';
+let mockSession = {
+  id: SESSION_ID,
+  mode: null,
+  ended_at: null,
+  revoked_at: null,
+  expires_at: null,
+};
+let mockSessionLookupFails = false;
+
 jest.mock('../db/pool', () => ({
-  query: jest.fn(async () => ({ rows: [{ ...mockDbUser }], rowCount: 1 })),
+  query: jest.fn(async (sql) => {
+    if (/impersonation_sessions/.test(String(sql))) {
+      if (mockSessionLookupFails) throw new Error('relation "impersonation_sessions" does not exist');
+      return { rows: mockSession ? [{ ...mockSession }] : [], rowCount: mockSession ? 1 : 0 };
+    }
+    return { rows: [{ ...mockDbUser }], rowCount: 1 };
+  }),
   connect: jest.fn(async () => ({
     query: jest.fn(async () => ({ rows: [{ ...mockDbUser }], rowCount: 1 })),
     release: jest.fn(),
@@ -54,13 +73,13 @@ const { auth, invalidateUserCache } = require('../middleware/auth');
 const { AUD_TENANT } = require('../middleware/platformAuth');
 
 /** A real signed impersonation token, exactly as the mint produces one. */
-function impToken({ ro = true, by = 'operator-1', org = ORG_A, tokenVersion = 7, expiresIn = '30m' } = {}) {
+function impToken({ ro = true, by = 'operator-1', org = ORG_A, tokenVersion = 7, expiresIn = '30m', sid = SESSION_ID } = {}) {
   return jwt.sign(
     {
       id: TARGET_ADMIN.id,
       token_version: tokenVersion,
       aud: AUD_TENANT,
-      imp: { by, byName: 'Operator', ro, org },
+      imp: { by, byName: 'Operator', ro, org, ...(sid ? { sid } : {}) },
     },
     process.env.JWT_SECRET,
     { expiresIn },
@@ -84,6 +103,8 @@ function appWithAuth(extra) {
 
 beforeEach(() => {
   mockDbUser = { ...TARGET_ADMIN };
+  mockSession = { id: SESSION_ID, mode: null, ended_at: null, revoked_at: null, expires_at: null };
+  mockSessionLookupFails = false;
   // auth() caches the resolved user for 30s. Without clearing it, every case
   // after the first would be graded against the first case's row — which is
   // how the deactivation and token_version cases first "failed": the middleware
@@ -212,7 +233,56 @@ describe('4. revoking the target revokes the impersonation', () => {
   });
 });
 
-describe('5. the mint refuses targets it must refuse', () => {
+describe('5. the session row is authoritative, and revocation is immediate', () => {
+  it('refuses a token with no sid — pre-285 tokens cannot outlive their TTL in the wild', async () => {
+    const res = await request(appWithAuth()).get('/probe').set('Authorization', `Bearer ${impToken({ sid: null })}`);
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('IMPERSONATION_ENDED');
+  });
+
+  it('refuses a session that was ended by the operator', async () => {
+    mockSession = { ...mockSession, ended_at: new Date().toISOString(), mode: 'read_only' };
+    const res = await request(appWithAuth()).get('/probe').set('Authorization', `Bearer ${impToken()}`);
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('IMPERSONATION_ENDED');
+  });
+
+  it('refuses a session that was revoked by another operator', async () => {
+    mockSession = { ...mockSession, ended_at: new Date().toISOString(), revoked_at: new Date().toISOString() };
+    const res = await request(appWithAuth()).get('/probe').set('Authorization', `Bearer ${impToken({ ro: false })}`);
+    expect(res.status).toBe(401);
+  });
+
+  it('refuses a session whose row has expired even if the JWT has not', async () => {
+    mockSession = { ...mockSession, expires_at: new Date(Date.now() - 1000).toISOString() };
+    const res = await request(appWithAuth()).get('/probe').set('Authorization', `Bearer ${impToken()}`);
+    expect(res.status).toBe(401);
+  });
+
+  it('refuses a sid that belongs to no session', async () => {
+    mockSession = null;
+    const res = await request(appWithAuth()).get('/probe').set('Authorization', `Bearer ${impToken()}`);
+    expect(res.status).toBe(401);
+  });
+
+  it('the row\'s read-only mode overrides a token that claims full access', async () => {
+    mockSession = { ...mockSession, mode: 'read_only' };
+    const res = await request(appWithAuth()).post('/probe')
+      .set('Authorization', `Bearer ${impToken({ ro: false })}`)
+      .send({ any: 'payload' });
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('IMPERSONATION_READONLY');
+  });
+
+  it('fails closed when the session table cannot be read', async () => {
+    mockSessionLookupFails = true;
+    const res = await request(appWithAuth()).get('/probe').set('Authorization', `Bearer ${impToken()}`);
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe('IMPERSONATION_UNAVAILABLE');
+  });
+});
+
+describe('6. the mint refuses targets it must refuse', () => {
   const src = require('node:fs').readFileSync(
     require.resolve('../modules/platform/super-admin/impersonation'), 'utf8',
   );
@@ -237,9 +307,21 @@ describe('5. the mint refuses targets it must refuse', () => {
     expect(fallback).toMatch(/organization_id = \$1/);
   });
 
-  it('writes an audit row naming the operator, the target and the mode', () => {
+  it('writes an audit row naming the operator, the target, the mode and the session', () => {
     expect(src).toMatch(/audit\(req, 'user_impersonated', 'user', target\.id/);
-    expect(src).toMatch(/mode: readonly \? 'read_only' : 'full'/);
+    expect(src).toMatch(/mode,\n\s+session_id: session\.id,/);
+    expect(src).toMatch(/reason,/);
+  });
+
+  it('records the session before minting, and puts its id in the token', () => {
+    expect(src).toMatch(/INSERT INTO impersonation_sessions/);
+    expect(src).toMatch(/expires_at\)\s*\n\s+VALUES/);
+    expect(src).toMatch(/sid: session\.id/);
+  });
+
+  it('requires a reason, so the audit trail answers "why"', () => {
+    expect(src).toMatch(/REASON_REQUIRED/);
+    expect(src).toMatch(/reason\.length < REASON_MIN/);
   });
 
   it('mints a TENANT-audience token, so the control plane will not take it', () => {
@@ -256,7 +338,7 @@ describe('5. the mint refuses targets it must refuse', () => {
   });
 });
 
-describe('6. the TTL is bounded, because nothing else bounds the session', () => {
+describe('7. the TTL is bounded, because nothing else bounds the session', () => {
   const { ttlMinutes, IMPERSONATION_TTL_MAX_MINUTES } = require('../modules/platform/super-admin/shared');
 
   it('reads the durations an operator would plausibly write', () => {
