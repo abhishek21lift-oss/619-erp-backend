@@ -273,10 +273,11 @@ async function getSessionState(db, { orgId, sessionId }) {
 /**
  * May this session still be edited in the trainer's log?
  *
- * A member's submitted workout is the record the member confirmed and the
- * trainer is about to review. Editing its exercises or sets afterwards would
- * silently rewrite what they submitted, so it is refused. Trainer-led sessions
- * and member sessions still in progress are unaffected.
+ * A member's workout is the member's record from the moment it starts. The
+ * trainer reads and reviews it but never edits it: editing an in-progress
+ * session races the member's autosave and submit, and editing a submitted one
+ * would silently rewrite what they confirmed. Trainer-led sessions are
+ * unaffected.
  *
  * @returns {{ok: true} | {ok: false, status: number, code: string, message: string}}
  */
@@ -290,12 +291,15 @@ async function ensureSessionWritable(db, { orgId, sessionId }) {
   if (!session) {
     return { ok: false, status: 404, code: 'NOT_FOUND', message: 'Session not found' };
   }
-  if (session.source === 'member' && (session.status === 'completed' || session.submitted_at)) {
+  if (session.source === 'member') {
+    const submitted = session.status === 'completed' || session.submitted_at != null;
     return {
       ok: false,
       status: 409,
-      code: 'SUBMITTED_WORKOUT_LOCKED',
-      message: 'This workout was submitted by the member and can no longer be edited.',
+      code: submitted ? 'SUBMITTED_WORKOUT_LOCKED' : 'MEMBER_WORKOUT_LOCKED',
+      message: submitted
+        ? 'This workout was submitted by the member and can no longer be edited.'
+        : 'This workout is still in progress in the member app and cannot be edited here.',
     };
   }
   return { ok: true };
@@ -351,6 +355,7 @@ async function reviewMemberSession({ sessionId, orgId, reviewerId, decision, fee
               review_feedback = $5, updated_at = NOW()
         WHERE id = $1 AND organization_id = $2
           AND source = 'member' AND status = 'completed'
+          AND review_status = 'pending'
         RETURNING id, client_id, review_status, review_feedback, reviewed_at`,
       [sessionId, orgId, decision, reviewerId, feedback],
     );
@@ -385,10 +390,27 @@ async function reviewMemberSession({ sessionId, orgId, reviewerId, decision, fee
   }
 }
 
+/**
+ * Current review state of a member session in this studio, or null.
+ *
+ * The review update is guarded on `review_status = 'pending'`, so a null
+ * result needs one read to answer honestly: not found, not submitted, or
+ * already reviewed. Kept here rather than in the route so the HTTP adapter
+ * holds no SQL of its own.
+ */
+async function memberSessionReviewState({ sessionId, orgId }) {
+  const { rows } = await pool.query(
+    `SELECT status, review_status FROM workout_sessions
+      WHERE id = $1 AND organization_id = $2 AND source = 'member'`,
+    [sessionId, orgId],
+  );
+  return rows[0] || null;
+}
+
 module.exports = {
   recomputeAssignmentProgress, computePrFlags, startSession, closeStaleSessions,
   abandonEmptyStaleSessions, getSessionState, ensureSessionWritable, SessionStartError,
-  pendingMemberReviews, reviewMemberSession,
+  pendingMemberReviews, reviewMemberSession, memberSessionReviewState,
   // exported for tests
   requestDate, weekdayOf,
 };

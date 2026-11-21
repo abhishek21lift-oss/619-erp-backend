@@ -83,7 +83,7 @@ describe('GET /api/me/workout', () => {
     expect(plan.days[0].exercises[0]).toMatchObject({ name: 'Squat', sets: 4 });
   });
 
-  it('returns ONE programme when legacy data has several active assignments', async () => {
+  it('returns every live programme, current first', async () => {
     mockResponder = (sql) => {
       if (/FROM workout_assignments/.test(sql)) {
         return {
@@ -96,8 +96,12 @@ describe('GET /api/me/workout', () => {
       return { rows: [{ workout_plan_id: 'p1', week_number: 1, day_of_week: 3, sort_order: 0, name: 'Squat', sets: 3, reps: 5 }] };
     };
     const res = await request(app).get('/api/me/workout').expect(200);
-    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data).toHaveLength(2);
     expect(res.body.data[0].assignment_id).toBe('today');
+    expect(res.body.data[1].assignment_id).toBe('newer');
+
+    const exerciseRead = mockQueries.find((q) => /FROM workout_exercises we/.test(q.sql) && /ANY\(\$1::text\[\]\)/.test(q.sql));
+    expect(exerciseRead.params[0]).toEqual(expect.arrayContaining(['p1', 'p2']));
   });
 });
 

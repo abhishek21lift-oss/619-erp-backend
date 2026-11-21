@@ -45,6 +45,8 @@ beforeEach(() => {
 
 const permission = (allow) => (sql) => {
   if (/SELECT allow_self_workout FROM pt_clients/.test(sql)) return { rows: [{ allow_self_workout: allow }] };
+  // The daily cap runs on every start; the default is an empty day.
+  if (/SELECT COUNT\(\*\)::int AS n FROM workout_sessions/.test(sql)) return { rows: [{ n: 0 }] };
   if (/FROM workout_assignments a/.test(sql)) {
     return { rows: [{
       assignment_id: 'a1', plan_id: 'p1', name: 'Base', duration_weeks: 8,
@@ -95,6 +97,28 @@ describe('POST /api/me/workout/sessions', () => {
     expect(JSON.parse(insert.params[6])).toMatchObject({ version: 1, exercises: [] });
     expect(insert.sql).toMatch(/status, source, started_at/);
     expect(insert.sql).toMatch(/'in_progress', 'member', NOW\(\)/);
+  });
+
+  it('refuses a fifth start on the same day, and creates nothing', async () => {
+    mockResponder = (sql, params) => {
+      if (/SELECT COUNT\(\*\)::int AS n FROM workout_sessions/.test(sql)) return { rows: [{ n: 4 }] };
+      return permission(true)(sql, params);
+    };
+    const res = await request(app).post('/api/me/workout/sessions').send({}).expect(429);
+    expect(res.body.error.code).toBe('DAILY_LIMIT_REACHED');
+    expect(mockQueries.some((q) => /INSERT INTO workout_sessions/.test(q.sql))).toBe(false);
+  });
+
+  it('still resumes an open session at the daily cap', async () => {
+    mockResponder = (sql, params) => {
+      if (/SELECT COUNT\(\*\)::int AS n FROM workout_sessions/.test(sql)) return { rows: [{ n: 4 }] };
+      if (/FROM workout_sessions/.test(sql) && /INTERVAL '24 hours'/.test(sql)) {
+        return { rows: [sessionRow()] };
+      }
+      return permission(true)(sql, params);
+    };
+    const res = await request(app).post('/api/me/workout/sessions').send({}).expect(200);
+    expect(res.body.data.resumed).toBe(true);
   });
 
   it('resumes the open session instead of inserting a second one', async () => {
