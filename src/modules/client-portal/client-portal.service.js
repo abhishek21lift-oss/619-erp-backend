@@ -15,7 +15,7 @@ const { today, dbDate, mondayOf } = require('../../lib/appTime');
 const logger = require('../../lib/logger');
 const { parseClientPhoto, PhotoInputError } = require('../../lib/clientPhoto');
 const { programmeWeek, resolveWeek } = require('../pt-os/progression');
-const { pickCurrent } = require('../pt-os/assignment-lifecycle');
+const { pickCurrent, isLive } = require('../pt-os/assignment-lifecycle');
 
 const MOODS = ['great', 'good', 'okay', 'tired', 'stressed'];
 
@@ -93,13 +93,17 @@ async function myWorkout(clientId, orgId) {
     [clientId, orgId, dow],
   );
 
-  // ONE programme. The schema allows several active rows (the unique key is
-  // plan+client), so legacy data and a deliberate keep_existing both produce
-  // them. Showing all of them gave a member two overlapping programmes with no
-  // indication which one their trainer meant. The resolver prefers the
+  // The current programme comes first, but every other live assignment is
+  // returned too. `keep_existing` deliberately leaves a second block active;
+  // hiding it made that programme unreachable in the member app. The page
+  // titles each programme when there is more than one, and marks the first as
+  // current, so the default is still unambiguous. The resolver prefers the
   // assignment that prescribes today, then the newest.
-  const current = pickCurrent(live, { today: now, prescribesDow: dow });
-  const assignments = current ? [current] : [];
+  const liveNow = live.filter((a) => isLive(a, now));
+  const current = pickCurrent(liveNow, { today: now, prescribesDow: dow });
+  const assignments = current
+    ? [current, ...liveNow.filter((a) => a.assignment_id !== current.assignment_id)]
+    : [];
   if (assignments.length === 0) return [];
 
   const { rows: exercises } = await pool.query(

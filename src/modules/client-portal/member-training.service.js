@@ -159,7 +159,7 @@ async function lastPerformance(clientId, orgId, names) {
   return out;
 }
 
-/** Sessions of either source for this client today — the member's daily cap. */
+/** Member-source sessions for this client today — the member's daily cap. */
 async function memberSessionsToday(clientId, orgId) {
   const { rows } = await pool.query(
     `SELECT COUNT(*)::int AS n FROM workout_sessions
@@ -270,6 +270,8 @@ function prescriptionFromPlans(plans, { assignmentId, workoutDay } = {}) {
 async function writeSessionSets(tx, { clientId, orgId, sessionId, exercises, prescribed }) {
   // Library ids for exercises this client has logged before, so a PR is
   // matched the way the trainer's log matches it (by id when there is one).
+  // Read before the delete below: a retried submit can still learn the id
+  // from the rows it is about to replace.
   const { rows: known } = await tx.query(
     `SELECT DISTINCT ON (lower(btrim(e.exercise_name))) lower(btrim(e.exercise_name)) AS k, e.exercise_id
        FROM workout_session_exercises e
@@ -280,6 +282,12 @@ async function writeSessionSets(tx, { clientId, orgId, sessionId, exercises, pre
     [clientId, orgId, exercises.map((x) => key(x.name))],
   );
   const idOf = new Map(known.map((r) => [r.k, r.exercise_id]));
+
+  // The member's submitted draft is the canonical record of this session.
+  // Clear anything already attached — an in-progress session edited before
+  // the trainer lock existed, or a retried submit — so the rows below are
+  // exactly what the member submitted, never a duplicate.
+  await tx.query('DELETE FROM workout_session_exercises WHERE session_id = $1', [sessionId]);
   const prescribedNames = Array.isArray(prescribed?.exercises)
     ? prescribed.exercises.map((x) => key(x.name))
     : [];
@@ -584,6 +592,17 @@ async function startMyWorkout({ clientId, orgId, userId, plans, dayOfWeek, assig
 
   const open = await openSessionFor(clientId, orgId);
   if (open) return { session: open, resumed: true };
+
+  // The same cap the one-shot path has always applied. Checked after resume:
+  // a member who already has a session open may always finish it, even if
+  // today's count has reached the limit.
+  if (await memberSessionsToday(clientId, orgId) >= DAILY_LIMIT) {
+    throw new TrainingInputError(
+      'You have already logged several workouts today. Talk to your trainer if this one is missing.',
+      429,
+      'DAILY_LIMIT_REACHED',
+    );
+  }
 
   const prescribed = {
     plan_name: plan.name,

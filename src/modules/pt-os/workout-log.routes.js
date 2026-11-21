@@ -378,7 +378,27 @@ router.post('/workout-log/sessions/:id/review', auth, requireTrainer, wrap(async
     decision,
     feedback: feedback || null,
   });
-  if (!reviewed) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+  if (!reviewed) {
+    // The update is guarded on review_status = 'pending', so null means one
+    // of three things. Read the row once on this failure path to answer
+    // honestly instead of calling an already-reviewed workout "not found".
+    const { rows } = await pool.query(
+      `SELECT status, review_status FROM workout_sessions
+        WHERE id = $1 AND organization_id = $2 AND source = 'member'`,
+      [req.params.id, scope.orgId],
+    );
+    if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+    if (rows[0].status !== 'completed') {
+      return res.status(409).json({ error: {
+        code: 'WORKOUT_NOT_SUBMITTED',
+        message: 'The member has not submitted this workout yet.',
+      } });
+    }
+    return res.status(409).json({ error: {
+      code: 'ALREADY_REVIEWED',
+      message: 'This workout has already been reviewed.',
+    } });
+  }
 
   await logActivity(req, 'workout_log.member.review', 'workout_session', reviewed.id, {
     decision,

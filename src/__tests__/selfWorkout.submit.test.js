@@ -87,6 +87,18 @@ describe('POST /api/me/workout/sessions/:id/submit', () => {
     expect(completed.sql).toMatch(/draft = NULL/);
   });
 
+  it('replaces any rows already attached to the session', async () => {
+    mockResponder = submitResponder(openSession());
+    await request(app).post('/api/me/workout/sessions/ws1/submit').send({ draft: CANONICAL }).expect(200);
+
+    const removed = mockQueries.find((q) => /DELETE FROM workout_session_exercises WHERE session_id = \$1/.test(q.sql));
+    expect(removed).toBeTruthy();
+    expect(removed.params).toEqual(['ws1']);
+    const removedAt = mockQueries.indexOf(removed);
+    const insertedAt = mockQueries.findIndex((q) => /INSERT INTO workout_session_exercises/.test(q.sql));
+    expect(removedAt).toBeLessThan(insertedAt);
+  });
+
   it('uses the body draft when one is sent', async () => {
     mockResponder = submitResponder(openSession());
     await request(app).post('/api/me/workout/sessions/ws1/submit')

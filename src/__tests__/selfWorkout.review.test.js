@@ -129,6 +129,38 @@ describe('POST /api/pt-os/workout-log/sessions/:id/review', () => {
       .send({ decision: 'approved' })
       .expect(404);
   });
+
+  it('refuses to overwrite an existing review', async () => {
+    mockResponder = (sql) => {
+      if (/UPDATE workout_sessions SET review_status/.test(sql)) return { rows: [] };
+      if (/SELECT status, review_status FROM workout_sessions/.test(sql)) {
+        return { rows: [{ status: 'completed', review_status: 'approved' }] };
+      }
+      return { rows: [] };
+    };
+    const res = await request(app)
+      .post('/api/pt-os/workout-log/sessions/ws1/review')
+      .send({ decision: 'changes_requested', feedback: 'Too late.' })
+      .expect(409);
+    expect(res.body.error.code).toBe('ALREADY_REVIEWED');
+    expect(mockQueries.some((q) => /INSERT INTO notifications/.test(q.sql))).toBe(false);
+  });
+
+  it('refuses to review a session the member has not submitted', async () => {
+    mockResponder = (sql) => {
+      if (/UPDATE workout_sessions SET review_status/.test(sql)) return { rows: [] };
+      if (/SELECT status, review_status FROM workout_sessions/.test(sql)) {
+        return { rows: [{ status: 'in_progress', review_status: null }] };
+      }
+      return { rows: [] };
+    };
+    const res = await request(app)
+      .post('/api/pt-os/workout-log/sessions/ws1/review')
+      .send({ decision: 'approved' })
+      .expect(409);
+    expect(res.body.error.code).toBe('WORKOUT_NOT_SUBMITTED');
+    expect(mockQueries.some((q) => /INSERT INTO notifications/.test(q.sql))).toBe(false);
+  });
 });
 
 describe('the submitted-workout lock', () => {
@@ -150,6 +182,21 @@ describe('the submitted-workout lock', () => {
       .expect(409);
     expect(res.body.error.code).toBe('SUBMITTED_WORKOUT_LOCKED');
     expect(mockQueries.some((q) => /INSERT INTO workout_sets/.test(q.sql))).toBe(false);
+  });
+
+  it('refuses a trainer edit while the member is still training', async () => {
+    mockResponder = (sql) => {
+      if (/SELECT source, status, submitted_at FROM workout_sessions/.test(sql)) {
+        return { rows: [{ source: 'member', status: 'in_progress', submitted_at: null }] };
+      }
+      return { rows: [] };
+    };
+    const res = await request(app)
+      .post('/api/pt-os/workout-log/sessions/ws1/exercises')
+      .send({ exercise_name: 'Bench Press' })
+      .expect(409);
+    expect(res.body.error.code).toBe('MEMBER_WORKOUT_LOCKED');
+    expect(mockQueries.some((q) => /INSERT INTO workout_session_exercises/.test(q.sql))).toBe(false);
   });
 
   it('refuses adding an exercise to a submitted member session', async () => {
