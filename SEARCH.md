@@ -79,14 +79,20 @@ exercises are ever added, that provider needs the `libraryScope()` treatment.
 `ai_conversations` is scoped to the **user**, not the org — a coach's chat
 history is personal even inside one studio.
 
-### Known gap
+### Resolved — 2026-11-20
 
 Migration 106 added `organization_id` to `workout_plans` and `diet_templates`
-and backfilled it from `created_by`, and both create routes now stamp it. The
-**existing GET routes for those two tables still read unscoped**, exactly as
-they did before. Narrowing them changes what current screens show, so it is its
-own change; the column is in place so it becomes a one-line `WHERE` when
-someone takes it. Search does not widen the exposure in the meantime.
+and backfilled it from `created_by`, and both create routes stamp it. The GET
+routes were subsequently scoped too:
+
+- `src/routes/workouts.js` `GET /plans` applies `planReadFilter()`, which
+  requires `wp.organization_id = $n OR wp.organization_id IS NULL` (NULL is the
+  shared platform library).
+- `src/routes/diet.js` `GET /templates` applies
+  `dt.organization_id = $n OR dt.organization_id IS NULL`.
+
+The earlier gap is recorded here as history. Do not reintroduce an unscoped
+read of either table; search does not widen the exposure in the meantime.
 
 ## Adding a searchable entity type
 

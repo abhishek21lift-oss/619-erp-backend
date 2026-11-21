@@ -3,7 +3,7 @@
 //
 // Central, backend-authoritative logic for the studio subscription lifecycle:
 //   trial → active → (expired | frozen | cancelled)
-// plus the Founder Club (first 50 paying studios keep a lifetime-locked price)
+// plus the Founder Club (first 20 paying studios keep a lifetime-locked price)
 // and the launch offer (Elite launch price while founder slots remain).
 //
 // `computeAccess` is a PURE function used by the auth layer to decide, on every
@@ -117,7 +117,7 @@ async function founderSlotsRemaining(client = pool) {
 }
 
 // Effective price for a plan given current founder-slot availability. The launch
-// price applies only while founder slots remain (first 50 studios).
+// price applies only while founder slots remain (first 20 studios).
 function effectivePrice(plan, slotsRemaining) {
   if (slotsRemaining > 0 && plan.launch_price_inr != null) {
     return { amount: plan.launch_price_inr, isLaunch: true };
@@ -340,10 +340,10 @@ async function startTrial(orgId, days = TRIAL_DAYS, actor = null) {
 
 // ── Activation / renewal (records a payment and activates the studio) ─────────
 // opts: { amount_inr?, method?, reference?, notes?, periodMonths?, actor }
-// Founder club: the first 50 studios to activate become permanent Founder
+// Founder club: the first 20 studios to activate become permanent Founder
 // Members with a lifetime-locked price. Founders keep their locked price on
 // renewal. The founder-slot check + assignment is serialized under a table lock
-// so the 50th slot can never be double-granted.
+// so the 20th slot can never be double-granted.
 async function activate(orgId, planCode, opts = {}) {
   const client = await pool.connect();
   try {
@@ -842,7 +842,7 @@ async function changeExpiry(orgId, { trialEndsAt, periodEnd }, actor) {
   await logEvent(pool, orgId, 'expiry_changed', { trialEndsAt, periodEnd }, actor);
 }
 
-// Manually grant founder status (outside the automatic first-50 flow).
+// Manually grant founder status (outside the automatic first-20 flow).
 async function grantFounder(orgId, actor) {
   const client = await pool.connect();
   try {

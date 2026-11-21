@@ -133,8 +133,8 @@ Can also run standalone: `node src/workers/subscription.worker.js`.
 
 ## Admin (command centre → Billing tab)
 
-View all subscriptions + KPIs (revenue, active/trial/frozen, founders x/50);
-record payment → activate/renew (auto-grants founder for the first 50); freeze /
+View all subscriptions + KPIs (revenue, active/trial/frozen, founders x/20);
+record payment → activate/renew (auto-grants founder for the first 20); freeze /
 reactivate (comp); change trial/renewal expiry; grant founder; cancel; refund a
 payment; per-studio invoice/payment/event history. Every mutation is audited and
 invalidates the user cache so it takes effect on the next request.
@@ -151,7 +151,7 @@ invalidates the user cache so it takes effect on the next request.
   2. Force `trial_ends_at` into the past (command centre → change expiry) → next
      request 402s → app redirects to `/subscription` frozen screen.
   3. Record a payment (e.g. Starter) → studio active, invoice created; if within
-     first 50, `is_founder` + locked price set.
+     first 20, `is_founder` + locked price set.
   4. Add clients up to the plan limit → next create returns `PLAN_LIMIT_REACHED`.
   5. Freeze from the command centre → studio blocked; reactivate → restored, all
      data intact.
@@ -159,10 +159,10 @@ invalidates the user cache so it takes effect on the next request.
 
 ## Deployment checklist
 
-- [ ] Backend deploy (Render) runs migration 099 on boot (idempotent; already
-      applied to the live DB).
-- [ ] Frontend deploy (Vercel) ships `/subscription`, the Billing tab, and the
-      402→/subscription redirect.
+- [ ] Backend deploy (GitHub Actions → Hostinger VPS → Docker Compose) runs
+      migration 099 on boot (idempotent; already applied to the live DB).
+- [ ] Frontend deploy (same pipeline) ships `/subscription`, the Billing tab,
+      and the 402→/subscription redirect.
 - [ ] Confirm existing studios still show `active` / unlimited (grandfathered).
 - [ ] (Optional) Set `RESEND_API_KEY` to also send reminder emails; in-app
       notifications work without it.

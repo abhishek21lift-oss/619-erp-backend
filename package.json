@@ -28,6 +28,7 @@
     "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch --forceExit",
     "verify:embeddings": "node scripts/verify-embeddings.js",
     "verify:indexes": "node scripts/verify-indexes.js",
+    "verify:rls": "node scripts/verify-rls.js",
     "e2e:setup": "bash scripts/e2e-setup.sh",
     "seed:e2e": "node scripts/seed-e2e.js"
   },
