@@ -159,3 +159,57 @@ describe('PATCH /api/workouts/assignments/:id', () => {
       .send({ status: 'archived' }).expect(400);
   });
 });
+
+// ── current_week ────────────────────────────────────────────────────────────
+//
+// The program-design screen shows the active plan's exercises for the client's
+// CURRENT week, and asks the plan API for `?week=`. It used to work the number
+// out in the browser, which is a second implementation of "what week is this
+// client on" — the exact drift client-context.js exists to prevent. The server
+// now reports it on the assignment, from progression.js.
+describe('GET /api/workouts/assignments — current_week', () => {
+  const { today } = require('../lib/appTime');
+
+  /** A studio day `n` days before today, as a DATE column would arrive. */
+  const daysAgo = (n) => {
+    const d = new Date(`${today()}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - n);
+    return d;
+  };
+
+  const assignment = (over = {}) => ({
+    id: 'a1', client_id: 'c1', status: 'active', duration_weeks: 8,
+    plan_name: 'PPL', start_date: daysAgo(14), ...over,
+  });
+
+  it('reports the week the programme is on', async () => {
+    // 14 days in is the third week: day 0-6 = week 1, 7-13 = week 2.
+    pool.query.mockResolvedValue({ rows: [assignment()] });
+    const res = await request(app).get('/api/workouts/assignments?client_id=c1').expect(200);
+    expect(res.body[0].current_week).toBe(3);
+  });
+
+  it('reads a DATE the driver returned as a Date object', async () => {
+    // node-postgres hands DATE columns back as JS Dates; the arithmetic has to
+    // survive that, or every client reads as week 1.
+    pool.query.mockResolvedValue({ rows: [assignment({ start_date: daysAgo(7) })] });
+    const res = await request(app).get('/api/workouts/assignments?client_id=c1').expect(200);
+    expect(res.body[0].current_week).toBe(2);
+  });
+
+  it('holds at the last week once the block has run out', async () => {
+    // A client still training after a 4-week block repeats week 4; there is no
+    // week 29 for the progression rule to keep loading.
+    pool.query.mockResolvedValue({ rows: [assignment({ start_date: daysAgo(200), duration_weeks: 4 })] });
+    const res = await request(app).get('/api/workouts/assignments?client_id=c1').expect(200);
+    expect(res.body[0].current_week).toBe(4);
+  });
+
+  it('reports the same week on the single-assignment read', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rows: [assignment()] })
+      .mockResolvedValueOnce({ rows: [] });
+    const res = await request(app).get('/api/workouts/assignments/a1').expect(200);
+    expect(res.body.current_week).toBe(3);
+  });
+});
