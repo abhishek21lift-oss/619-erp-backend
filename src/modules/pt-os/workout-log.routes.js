@@ -201,6 +201,79 @@ router.get('/workout-log/sessions', auth, wrap(async (req, res) => {
   res.json({ data: rows });
 }));
 
+/**
+ * The LIVE programme day behind a session, for editing from the session screen.
+ *
+ * `planned` answers "what was this member prescribed?" and is deliberately a
+ * snapshot for a member session. This answers "what does the plan say now?" —
+ * the plan, weekday and week the plan API needs, with the row ids the builder
+ * would hold. It reads the prescription only; the member's session exercises
+ * and sets are never part of it, which is what keeps a programme edit from
+ * becoming a log edit.
+ *
+ * A freestyle session (no assignment) has no programme day.
+ */
+async function resolveSessionProgramme(session, orgId) {
+  if (!session.workout_assignment_id) return null;
+
+  const { rows: planRows } = await pool.query(
+    `SELECT wp.id AS plan_id, wp.name AS plan_name, wp.duration_weeks,
+            wp.progression_type, wp.progression_amount, wp.progression_every_weeks,
+            wp.periodization_model, wp.block_phases,
+            wp.deload_every_weeks, wp.deload_intensity_pct,
+            wp.organization_id AS plan_org, wa.start_date
+       FROM workout_assignments wa
+       JOIN workout_plans wp ON wp.id = wa.workout_plan_id AND wp.deleted_at IS NULL
+      WHERE wa.id = $1 AND wa.client_id = $2 AND wa.organization_id = $3`,
+    [session.workout_assignment_id, session.client_id, orgId]
+  );
+  const plan = planRows[0];
+  if (!plan) return null;
+
+  // The session's own weekday wins. A member session started from a plan day
+  // carries it; the prescription snapshot is the fallback for an older row.
+  let dayIndex = session.workout_day ? WEEKDAYS.indexOf(session.workout_day) : -1;
+  if (dayIndex < 0 && session.prescribed?.day_of_week != null) {
+    const n = Number(session.prescribed.day_of_week);
+    if (Number.isInteger(n) && n >= 1 && n <= 7) dayIndex = n - 1;
+  }
+  if (dayIndex < 0) return null;
+
+  // Every week's rows for this weekday, not just week 1: resolveWeek needs
+  // the overrides as well as the base to decide which wins.
+  const { rows: allWeeks } = await pool.query(
+    `SELECT we.id AS row_id, we.exercise_id, e.name, e.prescription_mode_primary,
+            we.week_number, we.sets, we.reps, we.rest_seconds,
+            we.sort_order, we.notes, we.target_weight, we.tempo, we.rpe, we.rir,
+            we.warmup_sets, we.superset_group, we.config
+       FROM workout_exercises we
+       LEFT JOIN exercises e ON e.id = we.exercise_id
+      WHERE we.workout_plan_id = $1 AND we.day_of_week = $2
+      ORDER BY we.sort_order`,
+    [plan.plan_id, dayIndex + 1]
+  );
+  // The week of THIS session, not today: back-filling last Tuesday's workout
+  // must edit the week the client was actually in.
+  const week = programmeWeek(plan.start_date, session.session_date, plan.duration_weeks);
+  const resolved = resolveWeek(allWeeks, plan, week);
+
+  return {
+    plan_id: plan.plan_id,
+    plan_name: plan.plan_name,
+    assignment_id: session.workout_assignment_id,
+    day_of_week: dayIndex + 1,
+    week,
+    duration_weeks: plan.duration_weeks,
+    progression_type: plan.progression_type,
+    source: resolved.source,
+    // A shared platform template is readable by every studio and writable by
+    // none. The screen offers edit controls only when this is true; the plan
+    // API enforces the same rule server-side.
+    editable: plan.plan_org === orgId,
+    exercises: resolved.exercises,
+  };
+}
+
 // GET /workout-log/sessions/:id — full detail with exercises + sets + computed summary.
 router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   const { id } = req.params;
@@ -235,10 +308,16 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
   if (!session) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
   const exercises = exercisesRes.rows;
 
+  // The live prescription is what a trainer edits from this screen. It is
+  // resolved even for a member session, whose `planned` below is the snapshot
+  // they were shown: the programme can change without rewriting their log.
+  const programme = await resolveSessionProgramme(session, scope.orgId);
+
   // "Planned for today": a member's submitted session carries the exact plan
   // day they were shown, snapshotted at start. Prefer that over recomputing
   // from the assignment — the plan may have been edited since, and the
-  // trainer is reviewing what the member was actually prescribed.
+  // trainer is reviewing what the member was actually prescribed. The live
+  // programme beside it is what the edit controls write to.
   let planned = null;
   if (session.prescribed && Array.isArray(session.prescribed.exercises)) {
     planned = {
@@ -248,52 +327,11 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
       source: 'snapshot',
       exercises: session.prescribed.exercises,
     };
-  } else if (session.workout_assignment_id) {
-    const dayIndex = session.workout_day ? WEEKDAYS.indexOf(session.workout_day) : -1;
-    const { rows: planRows } = await pool.query(
-      `SELECT wp.id AS plan_id, wp.name AS plan_name, wp.duration_weeks,
-              wp.progression_type, wp.progression_amount, wp.progression_every_weeks,
-              wa.start_date
-         FROM workout_assignments wa
-         JOIN workout_plans wp ON wp.id = wa.workout_plan_id
-        WHERE wa.id = $1`,
-      [session.workout_assignment_id]
-    );
-    const plan = planRows[0];
-    if (plan && dayIndex >= 0) {
-      // Every week's rows for this weekday, not just week 1: resolveWeek needs
-      // the overrides as well as the base to decide which wins.
-      const { rows: allWeeks } = await pool.query(
-        `SELECT we.id AS row_id, we.exercise_id, e.name, e.prescription_mode_primary, we.week_number, we.sets, we.reps, we.rest_seconds,
-                we.sort_order, we.notes, we.target_weight, we.tempo, we.rpe, we.rir,
-                we.warmup_sets, we.superset_group, we.config
-           FROM workout_exercises we
-           LEFT JOIN exercises e ON e.id = we.exercise_id
-          WHERE we.workout_plan_id = $1 AND we.day_of_week = $2
-          ORDER BY we.sort_order`,
-        [plan.plan_id, dayIndex + 1]
-      );
-      // Which week the client is actually in, from the assignment's start date
-      // and the date of THIS session — not today. Back-filling last Tuesday's
-      // workout must show last Tuesday's week, or the trainer is handed the
-      // wrong prescription for a session that already happened.
-      const week = programmeWeek(plan.start_date, session.session_date, plan.duration_weeks);
-      const resolved = resolveWeek(allWeeks, plan, week);
-      planned = {
-        plan_id: plan.plan_id,
-        day_of_week: dayIndex + 1,
-        plan_name: plan.plan_name,
-        week,
-        duration_weeks: plan.duration_weeks,
-        progression_type: plan.progression_type,
-        // 'derived' means these numbers came from week 1 plus the rule;
-        // 'override' means the trainer wrote this week by hand. The UI says
-        // which, because a derived number is a suggestion and a written one
-        // is an instruction.
-        source: resolved.source,
-        exercises: resolved.exercises,
-      };
-    }
+  } else if (programme) {
+    // `editable` belongs to the edit surface, not to the prescription the
+    // session card renders.
+    const { editable, ...prescription } = programme;
+    planned = prescription;
   }
 
   let totalSets = 0, totalReps = 0, totalVolume = 0, rpeSum = 0, rpeCount = 0;
@@ -318,6 +356,7 @@ router.get('/workout-log/sessions/:id', auth, wrap(async (req, res) => {
       ...session,
       exercises,
       planned,
+      programme,
       summary: {
         total_sets: totalSets,
         total_reps: totalReps,

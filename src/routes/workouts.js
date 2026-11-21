@@ -5,7 +5,7 @@ const pool = require('../db/pool');
 const { auth, requireTrainer } = require('../middleware/auth');
 const { checkTrainingEligibility } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
-const { resolveWeek, previewWeeks, phaseOf, MAX_WEEKS } = require('../modules/pt-os/progression');
+const { resolveWeek, previewWeeks, phaseOf, programmeWeek, MAX_WEEKS } = require('../modules/pt-os/progression');
 const { markAccepted, acceptGeneration } = require('../modules/pt-os/programming-memory');
 const { validateCardioPlanConfig } = require('../modules/pt-os/cardio');
 const logger = require('../lib/logger');
@@ -1337,7 +1337,17 @@ router.get('/assignments', auth, requireTrainer, async (req, res, next) => {
        ORDER BY wa.created_at DESC`,
       params
     );
-    res.json(rows);
+    // Which week each programme is on, from the same arithmetic the session
+    // engine and the member app use. Screens that show a week's prescription
+    // ask the plan API for `?week=`, and they must not work the number out
+    // themselves: a second implementation of "what week is this client on"
+    // drifts, and the trainer ends up editing a different week than the one
+    // the member is training.
+    const today = studioToday();
+    res.json(rows.map((a) => ({
+      ...a,
+      current_week: programmeWeek(a.start_date, today, a.duration_weeks),
+    })));
   } catch (err) {
     if (err.message?.includes('does not exist')) return res.json([]);
     next(err);
@@ -1374,7 +1384,12 @@ router.get('/assignments/:id', auth, requireTrainer, async (req, res, next) => {
         ORDER BY we.day_of_week, we.sort_order`,
       [assignment.workout_plan_id]
     );
-    res.json({ ...assignment, exercises });
+    res.json({
+      ...assignment,
+      // Same figure as the list endpoint: the week this assignment is on now.
+      current_week: programmeWeek(assignment.start_date, studioToday(), assignment.duration_weeks),
+      exercises,
+    });
   } catch (err) {
     next(err);
   }
