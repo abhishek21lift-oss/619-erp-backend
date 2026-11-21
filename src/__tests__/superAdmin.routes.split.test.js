@@ -158,6 +158,8 @@ describe('super-admin API — the H-03 split', () => {
     'GET /hostinger/vps/:virtualMachineId',
     'GET /hostinger/vps/:virtualMachineId/docker/:projectName',
     'GET /hostinger/websites/:username/:domain/files',
+    'GET /impersonation/sessions',
+    'GET /impersonation/sessions/:id/actions',
     'GET /invitations',
     'GET /invitations/:id/events',
     'GET /mail/status',
@@ -177,6 +179,9 @@ describe('super-admin API — the H-03 split', () => {
     'GET /plans',
     'GET /platform-payment-settings',
     'GET /registrations',
+    // Platform revenue forecast (super-admin/forecast.js): a cash trend and a
+    // separate MRR run-rate scenario, both from existing tables.
+    'GET /revenue-forecast',
     // Phase 5 — CommandBar search (super-admin/search.js). Kinds are
     // studio/owner/trainer/client; org_id is on every result row by
     // design so the platform admin never sees an ambiguous tenant.
@@ -246,6 +251,10 @@ describe('super-admin API — the H-03 split', () => {
     'POST /hostinger/operations/execute',
     'POST /hostinger/operations/plan',
     'POST /hostinger/operations/read',
+    // Impersonation sessions (migration 285): the banner's Exit and the
+    // Security tab's revoke control.
+    'POST /impersonation/sessions/:id/end',
+    'POST /impersonation/sessions/:id/revoke',
     'POST /invitations/:id/cancel',
     'POST /invitations/:id/link',
     'POST /invitations/:id/resend',

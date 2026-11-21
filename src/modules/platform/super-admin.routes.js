@@ -87,6 +87,7 @@ router.use(require('./super-admin/organizations'));
 router.use(require('./super-admin/operations'));
 router.use(require('./super-admin/impersonation'));
 router.use(require('./super-admin/subscriptions'));
+router.use(require('./super-admin/forecast'));
 router.use(require('./super-admin/billing'));
 router.use(require('./super-admin/features'));
 router.use(require('./super-admin/announcements'));

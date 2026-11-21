@@ -167,6 +167,12 @@ const REVIEWED_EXCEPTIONS = {
     'operation history. Platform-operator audit rows with no owning ' +
     'organisation, under runAsPlatform. Same shape as ' +
     'restart-verification.js above.',
+  'modules/platform/super-admin/forecast.js':
+    'Platform revenue forecast. Aggregates subscription_payments and ' +
+    'subscription_events across every studio — that is the operator ' +
+    'console\'s purpose, and an org filter would defeat it. The response is ' +
+    'monthly totals, MRR and fit statistics only: no studio row, id, name or ' +
+    'payment reference. Mounted under /api/platform behind PLATFORM_GUARD.',
 };
 
 /** Every route/module source file. */
