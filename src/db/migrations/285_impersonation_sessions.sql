@@ -71,3 +71,38 @@ CREATE TABLE IF NOT EXISTS impersonation_session_actions (
 );
 CREATE INDEX IF NOT EXISTS idx_impersonation_session_actions_session
   ON impersonation_session_actions (session_id, at DESC);
+
+-- ── RLS ─────────────────────────────────────────────────────────────────────
+--
+-- Platform-only rows: no studio owns an impersonation session, and no tenant
+-- role has any business reading who entered which studio or why. The console
+-- reaches both tables over the owner connection; FORCE makes the deny-all
+-- policy apply even to the table owner unless it holds BYPASSRLS, so a future
+-- grant to app_tenant cannot quietly expose the audit trail.
+ALTER TABLE impersonation_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE impersonation_sessions FORCE ROW LEVEL SECURITY;
+ALTER TABLE impersonation_session_actions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE impersonation_session_actions FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS deny_all_direct_access ON impersonation_sessions;
+CREATE POLICY deny_all_direct_access ON impersonation_sessions
+  FOR ALL USING (false) WITH CHECK (false);
+DROP POLICY IF EXISTS deny_all_direct_access ON impersonation_session_actions;
+CREATE POLICY deny_all_direct_access ON impersonation_session_actions
+  FOR ALL USING (false) WITH CHECK (false);
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    EXECUTE 'REVOKE ALL ON public.impersonation_sessions FROM anon';
+    EXECUTE 'REVOKE ALL ON public.impersonation_session_actions FROM anon';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    EXECUTE 'REVOKE ALL ON public.impersonation_sessions FROM authenticated';
+    EXECUTE 'REVOKE ALL ON public.impersonation_session_actions FROM authenticated';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_tenant') THEN
+    EXECUTE 'REVOKE ALL ON public.impersonation_sessions FROM app_tenant';
+    EXECUTE 'REVOKE ALL ON public.impersonation_session_actions FROM app_tenant';
+  END IF;
+END $$;

@@ -99,6 +99,7 @@ const NO_TENANT_COLUMN_BY_DESIGN = {
   alert_silences: 'Command Centre maintenance windows. A studio cannot silence the operator\'s alerts; deny-all RLS in migration 241, read and written only through the guarded console.',
   command_center_status_samples: 'Command Centre card-status samples, platform-wide. Deny-all RLS in migration 240; written by the stream and read only by the guarded console.',
   platform_backup_status: 'The operator\'s newest verified database backup, one row for the whole platform. Deny-all RLS in migration 242.',
+  impersonation_session_actions: 'Transport-level write trail for an impersonation session. Reached only through impersonation_sessions.organization_id; platform audit with no studio of its own, deny-all RLS + FORCE in migration 285.',
   trials: 'Platform-level trial tracking for the SaaS subscription funnel.',
   admin_reset_intents: 'Break-glass reset intents, reachable only behind the platform guard.',
   tenancy_known_gaps: 'Command Centre Tenancy Health card — mirrors this very list. Deny-all RLS, read via the owner connection, mounted behind requirePlatformOwner.',
