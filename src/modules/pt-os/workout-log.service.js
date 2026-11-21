@@ -390,10 +390,27 @@ async function reviewMemberSession({ sessionId, orgId, reviewerId, decision, fee
   }
 }
 
+/**
+ * Current review state of a member session in this studio, or null.
+ *
+ * The review update is guarded on `review_status = 'pending'`, so a null
+ * result needs one read to answer honestly: not found, not submitted, or
+ * already reviewed. Kept here rather than in the route so the HTTP adapter
+ * holds no SQL of its own.
+ */
+async function memberSessionReviewState({ sessionId, orgId }) {
+  const { rows } = await pool.query(
+    `SELECT status, review_status FROM workout_sessions
+      WHERE id = $1 AND organization_id = $2 AND source = 'member'`,
+    [sessionId, orgId],
+  );
+  return rows[0] || null;
+}
+
 module.exports = {
   recomputeAssignmentProgress, computePrFlags, startSession, closeStaleSessions,
   abandonEmptyStaleSessions, getSessionState, ensureSessionWritable, SessionStartError,
-  pendingMemberReviews, reviewMemberSession,
+  pendingMemberReviews, reviewMemberSession, memberSessionReviewState,
   // exported for tests
   requestDate, weekdayOf,
 };

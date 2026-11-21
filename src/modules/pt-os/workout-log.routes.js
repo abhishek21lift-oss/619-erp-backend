@@ -32,7 +32,7 @@ const { generateWeeklyProgressPdf } = require('../../lib/weeklyProgressPdf');
 // Shared with the member app's self-logged workouts (client-portal).
 const {
   recomputeAssignmentProgress, computePrFlags, startSession, getSessionState, ensureSessionWritable,
-  SessionStartError, pendingMemberReviews, reviewMemberSession,
+  SessionStartError, pendingMemberReviews, reviewMemberSession, memberSessionReviewState,
 } = require('./workout-log.service');
 
 // The studio trainer only. server.js mounts this router behind requireTrainer
@@ -382,13 +382,12 @@ router.post('/workout-log/sessions/:id/review', auth, requireTrainer, wrap(async
     // The update is guarded on review_status = 'pending', so null means one
     // of three things. Read the row once on this failure path to answer
     // honestly instead of calling an already-reviewed workout "not found".
-    const { rows } = await pool.query(
-      `SELECT status, review_status FROM workout_sessions
-        WHERE id = $1 AND organization_id = $2 AND source = 'member'`,
-      [req.params.id, scope.orgId],
-    );
-    if (!rows[0]) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
-    if (rows[0].status !== 'completed') {
+    const state = await memberSessionReviewState({
+      sessionId: req.params.id,
+      orgId: scope.orgId,
+    });
+    if (!state) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
+    if (state.status !== 'completed') {
       return res.status(409).json({ error: {
         code: 'WORKOUT_NOT_SUBMITTED',
         message: 'The member has not submitted this workout yet.',
