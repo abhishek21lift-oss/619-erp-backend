@@ -295,12 +295,6 @@ jobs:
             FRAGMENT=619-erp-whatsapp/deploy/compose.whatsapp.yml
             [ -f "$FRAGMENT" ] || { echo "No $FRAGMENT — run the build stage first."; exit 1; }
 
-            if docker compose config --services | grep -qx whatsapp; then
-              echo "A 'whatsapp' service already exists. Nothing to insert."
-              docker compose up -d whatsapp
-              exit 0
-            fi
-
             echo "══ generate the two shared secrets, ON THE BOX ══════════════"
             # Never printed, never sent to GitHub. If they already exist they
             # are left alone — regenerating would break the backend's copy.
@@ -310,17 +304,58 @@ jobs:
             echo "present now:"
             sed -n 's/^\(WA_[A-Za-z0-9_]*\)=.*/  \1/p' .env
 
+            echo; echo "══ resolve the shared Docker network ════════════════════════"
+            # The fragment joins an EXTERNAL network by its real (not compose
+            # key) name, so it must be the network the backend and redis
+            # actually use. `docker compose config` resolves that name even
+            # when the base file relies on the implicit default network.
+            if ! grep -q '^WA_NETWORK_NAME=' .env; then
+              NET_NAME=$(docker compose config 2>/dev/null | awk '
+                /^networks:/ { f = 1; next }
+                f && /^  [A-Za-z0-9_.-]+:/ { next }
+                f && /^    name:/ { print $2; exit }
+                f && /^[^ ]/ { exit }
+              ')
+              [ -n "$NET_NAME" ] || NET_NAME="$(basename "$PWD")_default"
+              echo "WA_NETWORK_NAME=$NET_NAME" >> .env
+            fi
+            echo "network: $(sed -n 's/^WA_NETWORK_NAME=//p' .env)"
+
+            echo; echo "══ resolve the backend URL ══════════════════════════════════"
+            # Do not assume the container is called myptstudio-backend: the
+            # checked-in template names it erp-api and this box may name it
+            # anything. Ask compose for the real container name.
+            if ! grep -q '^WA_BACKEND_URL=' .env; then
+              BACKEND_CONTAINER=$(docker compose ps --format '{{.Name}}' \
+                "${{ inputs.backend_service }}" 2>/dev/null | head -1 || true)
+              [ -n "$BACKEND_CONTAINER" ] || BACKEND_CONTAINER="${{ inputs.backend_service }}"
+              echo "WA_BACKEND_URL=http://${BACKEND_CONTAINER}:5000" >> .env
+            fi
+            echo "backend: $(sed -n 's/^WA_BACKEND_URL=//p' .env)"
+
+            # Resolve the variables the fragment requires BEFORE the early
+            # exit: a previous run may have written the service and stopped
+            # before writing them, and `docker compose up` would then fail on
+            # the missing-substitution guard with no explanation.
+            if docker compose config --services | grep -qx whatsapp; then
+              echo "A 'whatsapp' service already exists. Nothing to insert."
+              docker compose up -d whatsapp
+              exit 0
+            fi
+
             echo; echo "══ back up the compose file ═════════════════════════════════"
             BAK="docker-compose.yml.bak.$(date +%Y%m%d-%H%M%S)"
             cp docker-compose.yml "$BAK"
             echo "$BAK"
 
             echo; echo "══ insert the service ═══════════════════════════════════════"
-            # Taken verbatim from the fragment: everything from `  whatsapp:`
-            # up to its top-level `volumes:` key. Inserted immediately after the
-            # existing `services:` line — first position in the mapping is
-            # always valid YAML and needs no search for the block's end.
-            awk '/^  whatsapp:/{f=1} /^volumes:/{f=0} f' "$FRAGMENT" > /tmp/wa-service.yml
+            # ONLY the service body. The fragment has a top-level `networks:`
+            # block between the service and `volumes:`, so the old stop at
+            # `^volumes:` pulled that block in too. Inserted after `services:`,
+            # it turned the live `redis` and `backend` services into network
+            # definitions and left `depends_on: redis` pointing at nothing.
+            # Stop at the first line that begins in column 0.
+            awk 'f && /^[^[:space:]]/ { exit } /^  whatsapp:/ { f=1 } f' "$FRAGMENT" > /tmp/wa-service.yml
             [ -s /tmp/wa-service.yml ] || { echo "could not extract the service block"; exit 1; }
 
             awk -v file=/tmp/wa-service.yml '
@@ -330,6 +365,52 @@ jobs:
                 done = 1
               }
             ' docker-compose.yml > /tmp/wa-compose.yml
+
+            echo; echo "══ insert the network definition ═══════════════════════════"
+            # The fragment's top-level networks block declares the external
+            # network the service above joins.
+            awk '/^networks:/{f=1} f && /^volumes:/{exit} f' "$FRAGMENT" > /tmp/wa-networks.yml
+
+            if grep -q '^networks:' /tmp/wa-compose.yml; then
+              # A networks: key already exists. Add only our child if missing;
+              # a second top-level `networks:` key is invalid YAML.
+              if ! awk '
+                /^networks:/ { f=1; next }
+                f && /^  myptstudio_network:/ { found=1 }
+                f && /^[^ ]/ { exit }
+                END { exit !found }
+              ' /tmp/wa-compose.yml; then
+                awk '
+                  /^  myptstudio_network:/ { p=1 }
+                  p && /^  [A-Za-z0-9_.-]+:/ && !/^  myptstudio_network:/ { exit }
+                  p
+                ' /tmp/wa-networks.yml > /tmp/wa-network-child.yml
+                [ -s /tmp/wa-network-child.yml ] || { echo "could not extract the network definition"; exit 1; }
+                awk -v file=/tmp/wa-network-child.yml '
+                  { print }
+                  /^networks:$/ && !done {
+                    while ((getline line < file) > 0) print line
+                    done = 1
+                  }
+                ' /tmp/wa-compose.yml > /tmp/wa-compose-net.yml
+                mv /tmp/wa-compose-net.yml /tmp/wa-compose.yml
+              fi
+            else
+              # No networks: key yet. Insert the fragment's whole block before
+              # volumes:, or append it when the file has no volumes: section.
+              if grep -q '^volumes:' /tmp/wa-compose.yml; then
+                awk -v file=/tmp/wa-networks.yml '
+                  /^volumes:$/ && !done {
+                    while ((getline line < file) > 0) print line
+                    done = 1
+                  }
+                  { print }
+                ' /tmp/wa-compose.yml > /tmp/wa-compose-net.yml
+                mv /tmp/wa-compose-net.yml /tmp/wa-compose.yml
+              else
+                cat /tmp/wa-networks.yml >> /tmp/wa-compose.yml
+              fi
+            fi
 
             if grep -q '^volumes:' /tmp/wa-compose.yml; then
               awk '{ print } /^volumes:$/ && !d { print "  whatsapp-sessions:"; d=1 }' \

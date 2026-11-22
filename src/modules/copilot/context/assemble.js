@@ -33,6 +33,7 @@ const {
 } = require('../../pt-os/client-read.service');
 const { SECTIONS, sectionDate } = require('../../pt-os/training-brief');
 const { ageFromDob } = require('../../../lib/age');
+const { today: studioToday } = require('../../../lib/appTime');
 const { resolveSelectedClient, listVisibleClients } = require('./client-scope');
 
 const CONTEXT_VERSION = 1;
@@ -70,7 +71,7 @@ function assessFreshness(asOf, staleAfterDays, now = new Date()) {
   if (!date) return { as_of: null, age_days: null, stale: null };
 
   const then = new Date(`${date}T00:00:00Z`);
-  const today = new Date(`${now.toISOString().slice(0, 10)}T00:00:00Z`);
+  const today = new Date(`${studioToday(now)}T00:00:00Z`);
   const days = Math.floor((today - then) / 86400000);
   if (!Number.isFinite(days) || days < 0) {
     return { as_of: date, age_days: null, stale: null };

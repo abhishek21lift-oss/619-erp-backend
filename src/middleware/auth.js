@@ -136,6 +136,10 @@ async function auth(req, res, next) {
                 u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
                 o.is_founder, o.founder_number,
                 o.status AS organization_status, o.subscription_status,
+                -- The plan code has to travel with the session: requireFeature()
+                -- resolves plan_features on it, and a NULL join silently falls
+                -- back to default_enabled for every studio.
+                o.plan_code,
                 o.trial_ends_at, o.current_period_end,
                 u.is_active, u.token_version,
                 -- The account's My Profile photo, for the top bar and sidebar.

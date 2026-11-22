@@ -44,10 +44,18 @@ describe('certificateStatus', () => {
     }
   });
 
-  it('does not depend on the time of day', () => {
+  it('does not depend on the time of day within the studio day', () => {
+    // 00:01Z and 18:29Z are 05:31 and 23:59 IST on the same studio day.
     const early = c.certificateStatus({ expires_on: '2026-07-30' }, new Date('2026-07-29T00:01:00Z'));
-    const late = c.certificateStatus({ expires_on: '2026-07-30' }, new Date('2026-07-29T23:59:00Z'));
+    const late = c.certificateStatus({ expires_on: '2026-07-30' }, new Date('2026-07-29T18:29:00Z'));
     expect(early).toEqual(late);
+    expect(early.daysLeft).toBe(1);
+  });
+
+  it('rolls over at studio midnight, not UTC midnight', () => {
+    // 20:00Z is 01:30 IST on 30 July: the certificate now expires today.
+    expect(c.certificateStatus({ expires_on: '2026-07-30' }, new Date('2026-07-29T20:00:00Z')))
+      .toMatchObject({ status: 'expiring', daysLeft: 0 });
   });
 
   it('handles a leap day without drifting', () => {

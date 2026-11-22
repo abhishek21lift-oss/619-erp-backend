@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const pool = require('../../db/pool');
 const { auth, requireTrainer } = require('../../middleware/auth');
+const { requireFeature } = require('../../lib/features');
 const { validate } = require('../../middleware/validate');
 const { z } = require('../../lib/validation');
 const { tenantScope, orgIdOf, orgWhere } = require('../../lib/tenant-db');
@@ -57,6 +58,18 @@ const MOVED_GOAL_STARTING_FIELDS = {
 // too; declaring it here as well means the guard travels with the router and
 // cannot be lost if the mount is edited or the router is mounted again.
 router.use(auth, requireTrainer);
+
+// The assessment suite is the 'screening' capability in the feature registry
+// (PAR-Q/consent are legal onboarding and live under /api/pt-os, not here).
+// The nav has no separate page for these forms yet, but the API has to agree
+// with the operator's toggle either way.
+router.use([
+  '/assessments',
+  '/lifestyle-assessments',
+  '/nutrition-assessments',
+  '/mobility-performance-assessments',
+  '/posture-assessments',
+], requireFeature('screening'));
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -1157,7 +1170,7 @@ router.delete('/strength-logs/:id', auth, requireTrainer, wrap(async (req, res) 
   res.status(204).end();
 }));
 
-router.get('/progress-photos', auth, wrap(async (req, res) => {
+router.get('/progress-photos', auth, requireFeature('progress_photos'), wrap(async (req, res) => {
   const { client_id, limit } = req.query;
   const where = []; const params = [];
   const scope = tenantScope(req);
@@ -1182,19 +1195,19 @@ const progressPhotoCreateSchema = {
   }),
 };
 
-router.post('/progress-photos', auth, requireTrainer, validate(progressPhotoCreateSchema), wrap(async (req, res) => {
+router.post('/progress-photos', auth, requireTrainer, requireFeature('progress_photos'), validate(progressPhotoCreateSchema), wrap(async (req, res) => {
   const { client_id, photo_url, photo_type, taken_at, notes } = req.body;
   if (!await clientInOrg(req, client_id)) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found' } });
   const { rows } = await pool.query(
     `INSERT INTO progress_photos (client_id, photo_url, photo_type, taken_at, notes, uploaded_by, organization_id)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [client_id, photo_url, photo_type || 'front', taken_at || new Date().toISOString().split('T')[0],
+    [client_id, photo_url, photo_type || 'front', taken_at || studioToday(),
      notes || null, req.user.id, orgIdOf(req)]
   );
   res.status(201).json({ data: rows[0] });
 }));
 
-router.delete('/progress-photos/:id', auth, wrap(async (req, res) => {
+router.delete('/progress-photos/:id', auth, requireFeature('progress_photos'), wrap(async (req, res) => {
   const scope = tenantScope(req);
   await pool.query('DELETE FROM progress_photos WHERE id = $1 AND organization_id = $2', [req.params.id, scope.orgId]);
   res.status(204).end();

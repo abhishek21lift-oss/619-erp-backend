@@ -9,7 +9,8 @@
 // ON rather than be coerced into OFF by a truthiness check.
 //
 // The guard validates:
-// - Invalid values (anything other than 'on' or 'off') cause fatal startup error
+// - Invalid values (anything other than 'on' or 'off', except
+//   TENANT_RLS_ENFORCE='strict') cause fatal startup error
 // - Explicit 'off' is allowed but warned (for staged rollout only)
 // - Unset defaults to 'on' (secure default)
 //
@@ -49,7 +50,7 @@ describe('production refuses to start with an INVALID security control value', (
     expect(GUARD_BLOCK()).toMatch(/if \(isProd\)/);
   });
 
-  test('the guard tests for exactly "on" or "off", never a truthiness coercion', () => {
+  test('the guard tests for exactly "on" or "off" (plus the strict exception), never a truthiness coercion', () => {
     const guard = GUARD_BLOCK();
     // Should check for invalid values (not 'on' and not 'off')
     expect(guard).toMatch(/val !== 'on' && val !== 'off'/);
@@ -57,6 +58,36 @@ describe('production refuses to start with an INVALID security control value', (
     expect(guard).not.toMatch(/Boolean\(/);
     expect(guard).not.toMatch(/!!/);
     expect(guard).not.toMatch(/\?\?/);
+  });
+
+  test('TENANT_RLS_ENFORCE may also be "strict", and only that flag', () => {
+    const guard = GUARD_BLOCK();
+    expect(guard).toMatch(/f\[0\] === 'TENANT_RLS_ENFORCE' && val === 'strict'/);
+    // The exception must be evaluated before the two-state check, or strict
+    // falls through and is rejected as invalid.
+    expect(guard.indexOf("val === 'strict'")).toBeLessThan(guard.indexOf("val !== 'on'"));
+  });
+
+  test('accepts TENANT_RLS_ENFORCE=strict but rejects every other invalid value', () => {
+    // Run the real guard, not a copy of it. The static assertions above pin
+    // its shape; this pins its behaviour, because rejecting 'strict' was the
+    // bug that made the documented fail-closed cutover unbootable.
+    const start = SERVER.indexOf('const SECURITY_FLAGS');
+    const end = SERVER.indexOf('const disabled = SECURITY_FLAGS', start);
+    const body = SERVER.slice(start, end) + '\n}';
+    const run = (value) => {
+      const env = value === undefined ? {} : { TENANT_RLS_ENFORCE: value };
+      const fakeProcess = { env, exit: () => { throw new Error('exited'); } };
+      new Function('isProd', 'process', 'logger', body)(true, fakeProcess, { fatal() {}, warn() {} });
+      return 'boots';
+    };
+
+    for (const good of [undefined, 'on', 'off', 'strict']) {
+      expect(run(good)).toBe('boots');
+    }
+    for (const bad of ['true', '1', 'ON', '']) {
+      expect(() => run(bad)).toThrow('exited');
+    }
   });
 
   test('explicit "off" is warned but allowed (for staged rollout)', () => {

@@ -87,7 +87,9 @@ describe('server.js wiring', () => {
   // Route-level gates count too: a router mounted without a gate can still
   // enforce one beside the handlers it protects (see automation.routes.js).
   const wiring = server + fs.readFileSync(
-    path.join(__dirname, '..', 'modules', 'automation', 'automation.routes.js'), 'utf8');
+    path.join(__dirname, '..', 'modules', 'automation', 'automation.routes.js'), 'utf8')
+    + fs.readFileSync(
+      path.join(__dirname, '..', 'modules', 'progress', 'progress.routes.js'), 'utf8');
 
   it('puts auth BEFORE requireFeature in the gate helper', () => {
     // If these ever swap, every gate silently stops enforcing.
@@ -108,10 +110,21 @@ describe('server.js wiring', () => {
     expect(helper[1].replace(/\s/g, '')).toBe('auth,requireTrainer,requireFeature(key)');
   });
 
+  it('loads the plan code the guard resolves against', () => {
+    // requireFeature passes req.user.plan_code to the plan_features join. If
+    // the auth SELECT drops it, every studio resolves as if it had no plan and
+    // every is_plan_gated feature silently falls back to default_enabled.
+    const auth = fs.readFileSync(path.join(__dirname, '..', 'middleware', 'auth.js'), 'utf8');
+    const features = fs.readFileSync(path.join(__dirname, '..', 'lib', 'features.js'), 'utf8');
+    expect(auth).toMatch(/o\.plan_code/);
+    expect(features).toMatch(/req\.user\.plan_code/);
+  });
+
   it('gates the capabilities the Control Centre advertises', () => {
     for (const key of [
       'ai_suite', 'ai_knowledge_base', 'attendance', 'programs',
       'insights', 'communication', 'integrations', 'packages', 'finance',
+      'exercise_library', 'progress_photos', 'screening',
     ]) {
       // Either helper counts: studioGate() is gate() plus requireTrainer, so a
       // capability behind it is still feature-gated. requireFeature('key') is

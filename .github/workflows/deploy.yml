@@ -39,18 +39,23 @@ env:
     export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "deploy: building $GIT_SHA"
     cd /opt/myptstudio
-    # This box's compose file is maintained outside the repo and defines only
-    # `backend` (no `worker` service), so build/up must name just that.
-    docker compose build --build-arg GIT_SHA="$GIT_SHA" --build-arg BUILD_TIME="$BUILD_TIME" backend
+    # Build the services this box actually defines. The checked-in template has
+    # `backend` + `worker`; production may still be single-process and define
+    # only `backend`. Never assume the worker exists, but never leave it on the
+    # previous image when it does — that is new code against an old schema.
+    SERVICES="backend"
+    if docker compose config --services | grep -qx worker; then SERVICES="backend worker"; fi
+    echo "deploy: services $SERVICES"
+    docker compose build --build-arg GIT_SHA="$GIT_SHA" --build-arg BUILD_TIME="$BUILD_TIME" $SERVICES
     # Rules §4: a production migration needs a verified fresh backup first.
     # This dump is local-only and fails the deploy if it cannot be taken.
     echo "deploy: built; taking pre-migrate backup"
     bash /opt/myptstudio/619-erp-backend/scripts/deploy/pre-migrate-backup.sh /opt/myptstudio
     echo "deploy: backup verified; running migrations"
     docker compose run --rm --no-deps backend npm run migrate
-    echo "deploy: migrated; replacing container"
-    docker compose rm -sf backend
-    docker compose up -d backend
+    echo "deploy: migrated; replacing containers"
+    docker compose rm -sf $SERVICES
+    docker compose up -d $SERVICES
     echo "deploy: container started; verifying it serves $GIT_SHA"
     bash /opt/myptstudio/619-erp-backend/scripts/deploy/verify-serving.sh "$GIT_SHA" /opt/myptstudio backend http://127.0.0.1:5000/api/health /opt/myptstudio/.backend-deployed-sha
     # Read-only topology probe: says whether a separate worker container exists

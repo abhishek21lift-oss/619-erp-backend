@@ -18,6 +18,7 @@
  * functions instead of embedding their own SQL for the same metric.
  */
 const pool = require('../../db/pool');
+const { today: studioToday } = require('../../lib/appTime');
 const { METRICS, CHECKED_IN_STATUSES } = require('./metric-definitions');
 
 function num(v, fallback = 0) {
@@ -26,8 +27,10 @@ function num(v, fallback = 0) {
 }
 
 function defaultRange(from, to) {
-  const t = to || new Date().toISOString().slice(0, 10);
-  const f = from || new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  // Studio-local dates, not UTC: between 00:00 and 05:30 IST the UTC date is
+  // yesterday, and the Insights default range would silently end a day early.
+  const t = to || studioToday();
+  const f = from || studioToday(new Date(Date.now() - 30 * 86400000));
   return { from: f, to: t };
 }
 

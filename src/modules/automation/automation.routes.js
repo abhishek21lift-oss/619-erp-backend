@@ -24,6 +24,7 @@ const pool = require('../../db/pool');
 const { auth, requireTrainer } = require('../../middleware/auth');
 const { requireFeature } = require('../../lib/features');
 const { orgWhere, orgIdOf } = require('../../lib/tenant-db');
+const { today: studioToday } = require('../../lib/appTime');
 const { clientInOrg } = require('../../lib/orgGuard');
 const repo = require('./automation.repository');
 const automation = require('./automation.triggers');
@@ -242,7 +243,7 @@ router.post('/session-balance', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(
     `INSERT INTO session_balance (client_id, total_sessions, used_sessions, package_name, start_date, end_date, organization_id)
      VALUES ($1,$2,0,$3,$4,$5,$6) RETURNING *`,
-    [client_id, parseInt(total_sessions), package_name || null, start_date || new Date().toISOString().split('T')[0], end_date || null, orgIdOf(req)]
+    [client_id, parseInt(total_sessions), package_name || null, start_date || studioToday(), end_date || null, orgIdOf(req)]
   );
   return res.status(201).json({ data: rows[0] });
 }));

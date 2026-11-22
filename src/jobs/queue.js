@@ -9,15 +9,14 @@
 // required rather than duplicated.
 //
 // Retry policy: every queue inherits DEFAULT_JOB_OPTIONS — bounded attempts
-// with exponential backoff. Individual jobs may override (the membership
-// renewal sweep, which touches payments, pins attempts: 1 so a retry can
-// never double-charge; the interval re-runs the idempotent sweep instead).
+// with exponential backoff. Individual jobs may override (the automation
+// sweeps pin attempts: 1 because they are idempotent passes, not deliveries).
 
 const { Queue } = require('bullmq');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 
-const QUEUE_NAMES = ['email', 'whatsapp', 'ai', 'notifications', 'membership-renewals', 'automation-sweep', 'progress-reminders', 'churn-digests'];
+const QUEUE_NAMES = ['email', 'whatsapp', 'ai', 'notifications', 'automation-sweep', 'progress-reminders', 'churn-digests'];
 
 const DEFAULT_JOB_OPTIONS = {
   // Bounded retries with exponential backoff: 2s, 4s, 8s …
@@ -96,7 +95,6 @@ module.exports = {
   whatsappQueue: lazyQueue('whatsapp'),
   aiQueue: lazyQueue('ai'),
   notificationsQueue: lazyQueue('notifications'),
-  membershipRenewalsQueue: lazyQueue('membership-renewals'),
   automationSweepQueue: lazyQueue('automation-sweep'),
   progressRemindersQueue: lazyQueue('progress-reminders'),
   churnDigestsQueue: lazyQueue('churn-digests'),

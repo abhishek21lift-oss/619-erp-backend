@@ -18,7 +18,7 @@
 
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://u:p@127.0.0.1:1/none';
 
-const mockQueueNames = ['email', 'whatsapp', 'ai', 'notifications', 'membership-renewals'];
+const mockQueueNames = ['email', 'whatsapp', 'ai', 'notifications'];
 
 // ── Doubles for everything the service can touch ────────────────────────────
 // Each is a spy, so "did not touch Redis" is a real assertion rather than a

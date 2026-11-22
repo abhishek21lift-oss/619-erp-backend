@@ -17,7 +17,7 @@
  *   - a worker `command` pointing at a file that no longer exists means the
  *     container restart-loops while the API keeps enqueueing into a queue
  *     nobody drains;
- *   - RUN_WORKERS unset on the api service means BOTH processes drain every
+ *   - RUN_WORKERS unset on the backend service means BOTH processes drain every
  *     queue, doubling the load on a box that has one core to spare;
  *   - an LRU eviction policy on Redis deletes job hashes under memory
  *     pressure, which is data loss dressed up as a cache miss;
@@ -64,8 +64,8 @@ describe('docker-compose.yml', () => {
     expect(fs.existsSync(COMPOSE)).toBe(true);
   });
 
-  it('declares redis, api and worker', () => {
-    for (const svc of ['redis', 'api', 'worker']) {
+  it('declares redis, backend and worker', () => {
+    for (const svc of ['redis', 'backend', 'worker']) {
       expect(raw).toContain(`\n  ${svc}:`);
     }
   });
@@ -114,9 +114,9 @@ describe('the worker service', () => {
   });
 });
 
-describe('the api service', () => {
+describe('the backend service', () => {
   const { raw } = readCompose();
-  const api = serviceBlock(raw, 'api');
+  const api = serviceBlock(raw, 'backend');
 
   it('does not also drain the queues', () => {
     // Both draining is not incorrect — BullMQ handles it — but it doubles the
@@ -142,9 +142,9 @@ describe('the WhatsApp gateway wiring', () => {
     'WA_GATEWAY_TIMEOUT_MS',
   ];
 
-  it.each(['api', 'worker'])('%s forwards the gateway variables', (svc) => {
+  it.each(['backend', 'worker'])('%s forwards the gateway variables', (svc) => {
     // Compose forwards only the variables an `environment:` line names. Without
-    // these the api answers 503 GATEWAY_NOT_CONFIGURED and the worker fails
+    // these the backend answers 503 GATEWAY_NOT_CONFIGURED and the worker fails
     // every send with NOT_CONFIGURED — WhatsApp is dead, with an honest error.
     const block = serviceBlock(raw, svc);
     expect(WA_VARS.filter((key) => !block.includes(key))).toEqual([]);
@@ -153,7 +153,7 @@ describe('the WhatsApp gateway wiring', () => {
   it('keeps the gateway optional, so the backend still starts without it', () => {
     // `${VAR:-}` not `${VAR}`: a required variable here would abort
     // `docker compose up` on every box that has no gateway.
-    for (const svc of ['api', 'worker']) {
+    for (const svc of ['backend', 'worker']) {
       const block = serviceBlock(raw, svc);
       for (const key of WA_VARS) {
         expect(block).toMatch(new RegExp(`${key}: \\$\\{${key}:-`));
@@ -185,7 +185,7 @@ describe('the redis service', () => {
 
   it('gates the dependants on a real healthcheck', () => {
     expect(redis).toContain('redis-cli');
-    for (const svc of ['api', 'worker']) {
+    for (const svc of ['backend', 'worker']) {
       expect(serviceBlock(raw, svc)).toMatch(/condition:\s*service_healthy/);
     }
   });

@@ -231,8 +231,9 @@ function assertQueue(name) {
  * Wait for a queue to finish what it is already running.
  *
  * Bounded at 30s to match the worker container's stop_grace_period: past that
- * point a deploy would SIGKILL the job anyway, and for membership-renewals a
- * job killed mid-flight is a card charged with no membership row written.
+ * point a deploy would SIGKILL the job anyway, and a delivery killed
+ * mid-flight has already produced its external side effect (an email sent, a
+ * WhatsApp message accepted) with no chance to record it.
  */
 async function drainQueue(queue, timeoutMs = 30_000) {
   const started = Date.now();

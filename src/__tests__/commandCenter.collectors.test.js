@@ -141,7 +141,7 @@ describe('queue collector', () => {
 
   test('no Redis still says what it COSTS, per queue', async () => {
     // The folklore is "Redis is optional, producers fall back to inline". That
-    // is wrong in the way that matters: renewals do not fall back at all.
+    // is wrong in the way that matters: some sweeps do not fall back at all.
     jest.doMock('../lib/redis', () => ({ isConfigured: () => false, isReady: () => false }));
     const card = await load().collect();
 
@@ -150,8 +150,8 @@ describe('queue collector', () => {
     );
     expect(modes.email).toBe('inline');
     expect(modes.whatsapp).toBe('deferred');
-    expect(modes['membership-renewals']).toBe('stopped');
-    expect(card.reason).toMatch(/membership-renewals/);
+    expect(modes['automation-sweep']).toBe('stopped');
+    expect(card.reason).toMatch(/automation-sweep/);
   });
 
   test('Redis configured but UNREACHABLE is DEGRADED, not unavailable', async () => {
@@ -194,14 +194,13 @@ describe('queue collector', () => {
     expect(card.reason).toMatch(/paused/i);
   });
 
-  test('one failed renewal is critical, one failed email is only a warning', async () => {
-    // A failed renewal is a card charged with no membership row written.
-    withQueues({ 'membership-renewals': { waiting: 0, active: 0, failed: 1, completed: 5, delayed: 0, paused: false } });
-    expect((await load().collect()).status).toBe(STATUS.CRITICAL);
-
-    jest.resetModules();
+  test('one failed job is a warning, a pile of them is critical', async () => {
     withQueues({ email: { waiting: 0, active: 0, failed: 1, completed: 5, delayed: 0, paused: false } });
     expect((await load().collect()).status).toBe(STATUS.WARNING);
+
+    jest.resetModules();
+    withQueues({ email: { waiting: 0, active: 0, failed: 25, completed: 5, delayed: 0, paused: false } });
+    expect((await load().collect()).status).toBe(STATUS.CRITICAL);
   });
 
   test('an unreachable queue is critical and named', async () => {
@@ -273,13 +272,13 @@ describe('queue identity', () => {
     expect(card.data.queues.map((q) => q.name)).not.toContain('0');
   });
 
-  it('grades the money queue harder — the rule that had never once fired', async () => {
-    // CRITICAL_QUEUES.has(name) was has("0"), which is never true, so a single
-    // failed renewal was graded exactly like a failed marketing email.
-    realShape([stat('membership-renewals', { failed: 1 })], ['membership-renewals']);
+  it('grades a pile of failures and names the queue', async () => {
+    // CRITICAL_QUEUES.has(name) was has("0"), which is never true; the
+    // collector's own FAILED_CRIT threshold is what grades this now.
+    realShape([stat('email', { failed: 25 })], ['email']);
     const card = await load().collect();
     expect(card.status).toBe(STATUS.CRITICAL);
-    expect(card.reason).toMatch(/membership-renewals/);
+    expect(card.reason).toMatch(/email/);
   });
 
   it('names the queue in its problem text', async () => {
@@ -289,9 +288,10 @@ describe('queue identity', () => {
   });
 
   it('flags a queue that VANISHED from the result as unreachable', async () => {
-    // collectQueueStats() does `.filter(Boolean)`, so a queue it could not
-    // reach is absent rather than null. Left alone the card renders one fewer
-    // healthy queue and says nothing — the quietest failure available.
+    // queueHealth now returns null for an unreachable queue, but a double (or
+    // an older caller) can omit it entirely. Comparing against the declared
+    // set catches both; without that the card renders one fewer healthy queue
+    // and says nothing — the quietest failure available.
     realShape([stat('email')], ['email', 'whatsapp']);
     const card = await load().collect();
 

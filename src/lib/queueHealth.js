@@ -48,9 +48,9 @@ async function queueStats(name) {
       completed,
       failed,
       paused,
-      // Queues that are full and draining nothing are the "amber" state; a
-      // healthy operator metric is roughly "waiting is moving".
-      backlog: waiting + delayed,
+      // Work nobody has picked up. Delayed jobs are scheduled (cron), not
+      // backlog; counting them made every healthy scheduler look degraded.
+      backlog: waiting,
     };
   } catch (err) {
     logger.error({ err: err.message, queue: name }, 'queue_stats_failed');
@@ -59,15 +59,16 @@ async function queueStats(name) {
 }
 
 /**
- * Snapshot every queue in parallel, omitting unreachable ones. When Redis is
- * not configured there is nothing to monitor, so it short-circuits instead of
- * waiting on connections that will never happen.
+ * Snapshot every queue in parallel. Unreachable queues stay in the result as
+ * `null` so summarize() can report them; filtering them out here was how a
+ * queue that failed to answer disappeared from the health payload entirely.
+ * When Redis is not configured there is nothing to monitor, so it
+ * short-circuits instead of waiting on connections that will never happen.
  */
 async function collectQueueStats() {
   const redis = require('./redis');
   if (!redis.isConfigured()) return [];
-  const results = await Promise.all(QUEUE_NAMES.map(queueStats));
-  return results.filter(Boolean);
+  return Promise.all(QUEUE_NAMES.map(queueStats));
 }
 
 /** Human-readable summary for a health payload. */
@@ -75,15 +76,37 @@ function summarize(stats) {
   if (!Array.isArray(stats) || stats.length === 0) {
     return { status: 'unknown', detail: 'queues unreachable' };
   }
-  const failed = stats.filter((s) => s === null).length;
-  const backlog = stats.reduce((sum, s) => sum + (s.backlog || 0), 0);
-  const completed = stats.reduce((sum, s) => sum + (s.completed || 0), 0);
-  const status = backlog > 0 ? 'degraded' : 'healthy';
+
+  const reachable = stats.filter(Boolean);
+  const unreachable = stats.length - reachable.length;
+  const sum = (key) => reachable.reduce((n, s) => n + (s[key] || 0), 0);
+
+  // ── Backlog is work nobody has picked up ────────────────────────────────
+  //
+  // `delayed` is not backlog. Every cron/scheduler queue keeps one or more
+  // delayed jobs parked between runs, so counting them made a healthy box
+  // permanently "degraded" (production: 11 delayed, 0 waiting, yet degraded).
+  const waiting = sum('waiting');
+  const active = sum('active');
+  const delayed = sum('delayed');
+  const failed = sum('failed');
+  const completed = sum('completed');
+
+  // A queue is degraded when something is actually wrong: work is waiting
+  // with nothing draining it, a job failed, or a queue could not be reached.
+  // An idle system, or one with only scheduled jobs, is healthy.
+  const starved = reachable.some((s) => (s.waiting || 0) > 0 && (s.active || 0) === 0 && !s.paused);
+  const status = unreachable > 0 || failed > 0 || starved ? 'degraded' : 'healthy';
+
   return {
     status,
     queues: stats.length,
-    unreachable: failed,
-    backlog,
+    unreachable,
+    backlog: waiting,
+    waiting,
+    active,
+    delayed,
+    failed,
     // ── Liveness, not backlog ───────────────────────────────────────────
     //
     // Everything else here comes from BullMQ's Redis counters, which answer
@@ -96,7 +119,7 @@ function summarize(stats) {
     // hour looks the same — but zero completed WITH a non-zero waiting count
     // is a dead worker, and before this field there was no way to ask.
     completed,
-    counts: stats.reduce((acc, s) => {
+    counts: reachable.reduce((acc, s) => {
       acc[s.name] = { waiting: s.waiting, active: s.active, delayed: s.delayed, completed: s.completed, failed: s.failed, paused: s.paused };
       return acc;
     }, {}),

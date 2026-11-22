@@ -33,7 +33,7 @@ jest.mock('../lib/logger', () => ({
 jest.mock('../lib/activityLog', () => ({ logActivity: (...a) => mockLogActivity(...a) }));
 jest.mock('../lib/redis', () => ({ isConfigured: () => true, isReady: () => false, ping: async () => 'PONG' }));
 jest.mock('../jobs/queue', () => ({
-  QUEUE_NAMES: ['email', 'whatsapp', 'ai', 'notifications', 'membership-renewals'],
+  QUEUE_NAMES: ['email', 'whatsapp', 'ai', 'notifications'],
   getQueue: () => mockQueue,
 }));
 jest.mock('../db/pool', () => ({

@@ -14,7 +14,7 @@
 # parsing YAML nobody has reviewed. `docker compose` merges a
 # docker-compose.override.yml beside it automatically — including on every
 # deploy — so this script writes ONLY that file and never touches the original.
-# Removing the file and re-running `docker compose up -d <api>` undoes it.
+# Removing the file and re-running `docker compose up -d <backend>` undoes it.
 #
 # ── What it will not do ─────────────────────────────────────────────────────
 #

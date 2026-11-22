@@ -1,8 +1,8 @@
 // The standalone worker process initialises Sentry — or the DSN it is handed does nothing.
 //
-// docker-compose.yml passes SENTRY_DSN to BOTH the api and the worker service:
-//   line 119  api     SENTRY_DSN: ${SENTRY_DSN:-}
-//   line 189  worker  SENTRY_DSN: ${SENTRY_DSN:-}
+// docker-compose.yml passes SENTRY_DSN to BOTH the backend and the worker service:
+//   line 164  backend SENTRY_DSN: ${SENTRY_DSN:-}
+//   line 292  worker  SENTRY_DSN: ${SENTRY_DSN:-}
 //
 // So the worker container has always received the variable. But nothing in
 // src/workers/ required src/instrument.js, and that file is the only thing in

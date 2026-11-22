@@ -17,6 +17,8 @@
 /** Certificates inside this window are "expiring" rather than "valid". */
 const EXPIRING_SOON_DAYS = 60;
 
+const { today } = require('./appTime');
+
 const MAX_CERTIFICATIONS = 40;
 const MAX_SPECIALISATIONS = 20;
 const LIMITS = { name: 120, issuer: 120, credential_id: 80, specialisation: 60, job_title: 120 };
@@ -75,11 +77,6 @@ function cleanMultilineText(v, max) {
 /** Whole days from `from` to `to`, both 'YYYY-MM-DD', in UTC. */
 function daysBetween(from, to) {
   return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000);
-}
-
-/** Today as 'YYYY-MM-DD' in UTC. Injectable so tests are not clock-dependent. */
-function today(now = new Date()) {
-  return now.toISOString().slice(0, 10);
 }
 
 /**

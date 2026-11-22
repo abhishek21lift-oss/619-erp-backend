@@ -133,7 +133,7 @@ const RULES = [
     conclusion:
       'Memory is near maxmemory and the eviction policy is noeviction, so Redis will '
       + 'REJECT new writes rather than evict anything. Queued work stops being accepted — '
-      + 'emails and membership renewals simply fail to enqueue.',
+      + 'emails, notifications and automation simply fail to enqueue.',
     triggers: [
       {
         key: 'memory_high',
