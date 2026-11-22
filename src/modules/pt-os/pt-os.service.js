@@ -837,8 +837,19 @@ async function getOpsSummary(scope = {}) {
   // Shape is unchanged: the roster returns a superset of the fields this panel
   // published, so its consumer (the AI Coach card) sees exactly what it did.
   const roster = await getTodayRoster({ date: today, scope });
+  // A completed session today is not "unbooked". A member self-workout writes
+  // only workout_sessions — never a pt_sessions row — so source_rank 2
+  // ("not booked") stays true after the client has trained, and this panel
+  // used to chase them anyway while Today's Sessions said "All done".
+  // buildTodayQueue drops completed rows on the client; apply the same rule
+  // here so the two cards cannot contradict each other.
+  //
+  // in_progress still counts as due: getTodayRoster's lateral prefers it over
+  // a completed log, so a client mid-session stays on the list.
   const today_unscheduled = roster.rows
-    .filter((r) => r.source_rank === 2 && Number(r.planned_exercises) > 0)
+    .filter((r) => r.source_rank === 2
+      && Number(r.planned_exercises) > 0
+      && r.session_status !== 'completed')
     .map((r) => ({
       assignment_id: r.assignment_id,
       client_id: r.client_id,
@@ -984,7 +995,22 @@ async function getOpsSummary(scope = {}) {
         WHERE session_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
           AND session_date <  DATE_TRUNC('month', CURRENT_DATE)
           AND status = 'completed'
-      )::INT AS last_month_completed
+      )::INT AS last_month_completed,
+      -- Last month up to the SAME day-of-month as today. The dashboard's
+      -- month-on-month badge used to compare this month's partial total with
+      -- last month's full total, which on the 3rd of a month produced a 450%
+      -- swing in a studio that was simply three days in. LEAST caps the
+      -- window at the start of this month, so comparing on the 31st of March
+      -- against February cannot spill into March.
+      COUNT(*) FILTER (
+        WHERE session_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+          AND session_date <  LEAST(
+            DATE_TRUNC('month', CURRENT_DATE),
+            DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+              + (EXTRACT(DAY FROM CURRENT_DATE) * INTERVAL '1 day')
+          )
+          AND status = 'completed'
+      )::INT AS last_month_completed_to_date
     FROM workout_sessions
     WHERE TRUE${orgBare1}
   `, bareParams);

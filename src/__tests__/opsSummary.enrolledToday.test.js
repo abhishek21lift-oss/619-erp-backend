@@ -180,7 +180,21 @@ describe('the programme panel is derived, not a second query', () => {
     // already means "not booked", because booked outranks programme in
     // MIN(source_rank). planned_exercises > 0 drops rest days, which is what
     // this panel has always meant by "says they train today".
-    expect(SRC).toContain("r.source_rank === 2 && Number(r.planned_exercises) > 0");
+    const block = SRC.slice(SRC.indexOf('const today_unscheduled = roster.rows'));
+    expect(block.slice(0, 800)).toContain('r.source_rank === 2');
+    expect(block.slice(0, 800)).toContain('Number(r.planned_exercises) > 0');
+  });
+
+  it('does not chase a client whose session today is already completed', () => {
+    // A member self-workout writes workout_sessions only — never a
+    // pt_sessions row — so source_rank stays 2 ("not booked") after the
+    // client has trained. This panel then called them "unbooked" while
+    // Today's Sessions said "All done" on the same screen.
+    //
+    // Today's card drops the completed row (buildTodayQueue); the panel must
+    // apply the same rule. This is the regression guard for that.
+    const block = SRC.slice(SRC.indexOf('const today_unscheduled = roster.rows'));
+    expect(block.slice(0, 800)).toContain("r.session_status !== 'completed'");
   });
 
   it('lists a client once, because the roster groups by client', () => {
@@ -331,6 +345,17 @@ describe('the session-stats query', () => {
   it('reaches back exactly one month for Last month', () => {
     const q = statsQuery();
     expect(q).toMatch(/DATE_TRUNC\('month', CURRENT_DATE\) - INTERVAL '1 month'/);
+  });
+
+  it('compares this month against the same point last month, not the whole month', () => {
+    // The badge compared a partial month with a finished one. On the 3rd that
+    // produced a 450% swing in a studio that was simply three days in.
+    const q = statsQuery();
+    expect(q).toMatch(/last_month_completed_to_date/);
+    expect(q).toMatch(/EXTRACT\(DAY FROM CURRENT_DATE\)/);
+    // Capped at this month's start, so 31 March cannot count 1-3 March as
+    // part of "last month up to the 31st".
+    expect(q).toMatch(/LEAST\(/);
   });
 
   it('is scoped to the studio', () => {
