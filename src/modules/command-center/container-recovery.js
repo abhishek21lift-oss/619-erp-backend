@@ -59,8 +59,8 @@ const RESTART_PATH = (id) => `/containers/${encodeURIComponent(id)}/restart`;
 
 /**
  * How long to wait for the container's own graceful stop before Docker kills
- * it. Matches the worker's stop_grace_period: a membership-renewals job killed
- * mid-flight is a card charged with no membership row written.
+ * it. Matches the worker's stop_grace_period: a delivery job killed mid-flight
+ * may have already produced its external side effect.
  */
 const STOP_TIMEOUT_S = Number(process.env.CC_RESTART_STOP_TIMEOUT_S) || 30;
 

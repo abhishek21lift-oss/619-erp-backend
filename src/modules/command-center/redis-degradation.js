@@ -6,8 +6,8 @@
 //
 // "Redis is optional, producers fall back to inline" is the folklore, and it
 // is wrong in a way that matters: the fallback is NOT uniform. Read from the
-// code, the five producers do three different things, and the difference
-// decides what an operator should do about it:
+// code, the producers do three different things, and the difference decides
+// what an operator should do about it:
 //
 //   email          sends INLINE, synchronously in the request. The mail still
 //                  goes. The cost is latency on the request and the loss of
@@ -29,13 +29,13 @@
 //                  until then.
 //                  (automation.engine.js -> Outcome.NOT_ENQUEUED)
 //
-//   membership-    worker-driven. With no Redis there is no worker tick, so
-//   renewals       renewals do not run at all until Redis returns. This is the
-//                  one that costs money silently.
+// Studio subscription renewals are NOT in this table: they run from a plain
+// interval in server.js (subscription.worker.runSubscriptionSweep), not from a
+// BullMQ worker, so Redis being down does not stop them.
 //
 // An operator looking at a red Redis card needs to know which of those three
 // they are in, because the answers differ: "nothing to do, latency is up",
-// "messages are waiting and will flush", and "billing has stopped".
+// "messages are waiting and will flush", and "scheduled sweeps have stopped".
 //
 // ── Read from the code, and pinned to it ───────────────────────────────────
 //
@@ -86,13 +86,6 @@ const DEGRADATION = {
       + 'arrives until Redis is back AND the automation-sweep scheduler below is running '
       + 'again, since the recovery pass rides that queue.',
     source: 'automation.engine.js records Outcome.NOT_ENQUEUED and leaves the row queued',
-  },
-  'membership-renewals': {
-    mode: MODE.STOPPED,
-    impact: 'Renewals DO NOT RUN. This is worker-driven, so with no queue there is no tick '
-      + 'and no renewal is processed until Redis returns. This is the one that costs money '
-      + 'while looking quiet.',
-    source: 'worker-driven; no producer fallback exists',
   },
   'automation-sweep': {
     mode: MODE.STOPPED,

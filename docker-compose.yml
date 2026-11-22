@@ -1,9 +1,9 @@
-# Production topology for the Hostinger VPS: Redis, API, queue workers.
+# Production topology for the Hostinger VPS: Redis, backend API, queue workers.
 #
 # ── Why this file exists ────────────────────────────────────────────────────
 #
 # BullMQ landed in #38 with everything it needs in the application — queues,
-# five workers, health checks, graceful shutdown, and a fallback to inline
+# the workers, health checks, graceful shutdown, and a fallback to inline
 # sends when Redis is absent. The only topology file this repo ever had described
 # a hosting platform the app does not run on.
 # Nothing described it for the VPS, which is where the app actually runs.
@@ -15,11 +15,11 @@
 #
 # ── Read this before deploying ──────────────────────────────────────────────
 #
-# The compose file that actually runs lives on the VPS at
-# /opt/myptstudio/619-erp-backend/, outside this repository, and deploy.sh
-# uses it. Committing this here does NOT change that file. Reconcile it by
-# hand, or copy this over it after checking the volume and network names match
-# what is already there.
+# The compose file that actually runs lives on the VPS at /opt/myptstudio/,
+# beside the checkout, and the deploy workflows run `docker compose` there.
+# Committing this here does NOT change that file. Reconcile it by hand, or copy
+# this over it after checking the volume and network names match what is
+# already there.
 #
 # ── Secrets ─────────────────────────────────────────────────────────────────
 #
@@ -59,9 +59,9 @@ services:
       retries: 5
       start_period: 5s
 
-  api:
+  backend:
     # A fixed name, because the socket-proxy allow-list and CC_API_CONTAINER
-    # both name this container; a compose-generated `<project>-api-1` would
+    # both name this container; a compose-generated `<project>-backend-1` would
     # change with the project directory.
     container_name: ${CC_API_CONTAINER:-erp-api}
     build:
@@ -89,33 +89,80 @@ services:
       # this size. Set to 1 and drop the worker service to run single-process.
       RUN_WORKERS: '0'
       DATABASE_URL: ${DATABASE_URL}
-      # Both optional and both blank by default, so adding this line changes
-      # nothing until the box's .env sets them: TENANT_RLS_ENFORCE defaults to
-      # "on" inside the app itself (src/lib/tenantRlsFlag.js) with no env var
-      # needed, and ADMIN_DATABASE_URL defaults to DATABASE_URL when unset.
+      # Both optional. ADMIN_DATABASE_URL is blank by default. TENANT_RLS_ENFORCE
+      # is passed as "on" to match the app default (src/lib/tenantRlsFlag.js);
+      # an empty string is NOT the same as unset at the production boot guard.
+      # ADMIN_DATABASE_URL defaults to DATABASE_URL when unset.
       #
       # It has to be declared here regardless, because Compose does not
       # forward arbitrary host/`.env` variables into a container — only the
       # ones an `environment:` line names. Before this line, setting
       # ADMIN_DATABASE_URL in the box's .env would have done nothing: the
-      # value would sit on the host, never reach the api/worker processes,
+      # value would sit on the host, never reach the backend/worker processes,
       # and server.js's boot guard (isProd && enforcement on && the two URLs
       # equal) would keep refusing to start with the same error a missing
       # ADMIN_DATABASE_URL produces — indistinguishable from never having set
       # it at all.
       ADMIN_DATABASE_URL: ${ADMIN_DATABASE_URL:-}
-      TENANT_RLS_ENFORCE: ${TENANT_RLS_ENFORCE:-}
+      TENANT_RLS_ENFORCE: ${TENANT_RLS_ENFORCE:-on}
+      # Both default to on inside the app; forwarded so an explicit box value
+      # wins. Production rejects anything but 'on'/'off' (TENANT_RLS_ENFORCE
+      # also accepts 'strict'), and rejects PLATFORM_SESSION_ENFORCE=off
+      # outright. Written as "on" rather than blank because an empty value is
+      # rejected by the boot guard.
+      SUPER_ADMIN_REQUIRE_MFA: ${SUPER_ADMIN_REQUIRE_MFA:-on}
+      PLATFORM_SESSION_ENFORCE: ${PLATFORM_SESSION_ENFORCE:-on}
       JWT_SECRET: ${JWT_SECRET}
       FRONTEND_URL: ${FRONTEND_URL}
+      # Number of proxies in front of Express. Unset collapses req.ip to the
+      # frontend container, turning the per-IP login limiter into one
+      # platform-wide bucket. The VPS path is nginx -> Next -> API, so 2.
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      APP_TIMEZONE: ${APP_TIMEZONE:-}
+      # QR check-in signatures. Unset falls back to JWT_SECRET; naming it here
+      # is what lets the box rotate it independently.
+      KIOSK_HMAC_SECRET: ${KIOSK_HMAC_SECRET:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-}
       EMAIL_FROM: ${EMAIL_FROM:-}
+      # Uploads and AI knowledge ingestion read/write object storage from the
+      # API process too; without these, uploads fall back to the local path.
       R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
       R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      # Push is off unless PUSH_ENABLED is exactly 'true'. The Firebase
+      # credentials must reach the process for turning it on to be possible.
+      PUSH_ENABLED: ${PUSH_ENABLED:-}
+      FIREBASE_SERVICE_ACCOUNT: ${FIREBASE_SERVICE_ACCOUNT:-}
+      FIREBASE_SERVICE_ACCOUNT_PATH: ${FIREBASE_SERVICE_ACCOUNT_PATH:-}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-}
+      # The API serves payment verification, UPI orders and the WhatsApp
+      # transport, so it needs the same provider credentials as the worker.
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
+      TWILIO_SMS_FROM: ${TWILIO_SMS_FROM:-}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      # Without this the webhook route cannot verify a signature and (by
+      # design) refuses every delivery, so a paying studio never activates.
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      # Google sign-in and passkey login are optional, but a value set in the
+      # box's .env must reach the process or the feature reports NOT_CONFIGURED.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      RP_ID: ${RP_ID:-}
+      WEBAUTHN_ORIGIN: ${WEBAUTHN_ORIGIN:-}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      # Connection tuning. DATABASE_SSL_CA is a path inside the container, so
+      # it is only useful when the box also mounts the CA file.
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-}
+      DATABASE_SSL_CA: ${DATABASE_SSL_CA:-}
+      LOG_CAPTURE: ${LOG_CAPTURE:-}
       SENTRY_DSN: ${SENTRY_DSN:-}
       # Rungs 4-5 of the Command Center recovery ladder. Blank = off (the
       # console shows the rungs disabled with the reason). See the
@@ -125,10 +172,10 @@ services:
       CC_WORKER_CONTAINER: ${CC_WORKER_CONTAINER:-erp-worker}
       # ── AI surface (round-2 remediation) ──────────────────────────────────
       # Compose forwards ONLY the variables named here — an entry in the box's
-      # .env that is not listed below never reaches the api process (this was
+      # .env that is not listed below never reaches the backend process (this was
       # round-1 P1: every AI var was missing, so deployed boxes reported AND
       # behaved as NOT_CONFIGURED). Blank defaults change nothing until the .env
-      # sets them; the api boot guard still fails loudly when a required var
+      # sets them; the backend boot guard still fails loudly when a required var
       # (JWT/JWT-level secrets, DB) is missing.
       AI_API_KEY: ${AI_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
@@ -161,7 +208,7 @@ services:
       AI_RAG_SIMILARITY_THRESHOLD: ${AI_RAG_SIMILARITY_THRESHOLD:-}
       AI_SETTINGS_REFRESH_MS: ${AI_SETTINGS_REFRESH_MS:-}
       # ── WhatsApp gateway ──────────────────────────────────────────────────
-      # Compose forwards ONLY the variables named here. Without these the api
+      # Compose forwards ONLY the variables named here. Without these the backend
       # answers 503 GATEWAY_NOT_CONFIGURED; blank defaults keep the integration
       # optional so a box with no gateway still starts.
       WA_GATEWAY_URL: ${WA_GATEWAY_URL:-}
@@ -176,13 +223,13 @@ services:
   #
   # Separate from the API because embedding a PDF pins a core for tens of
   # seconds, and doing that inside the process serving requests degrades every
-  # studio at once. RUN_WORKERS=1 on the api service is the single-container
+  # studio at once. RUN_WORKERS=1 on the backend service is the single-container
   # alternative if this box cannot spare a second one.
   worker:
     container_name: ${CC_WORKER_CONTAINER:-erp-worker}
     build:
       context: .
-      # The worker needs its own identity for the same reason the api does: it
+      # The worker needs its own identity for the same reason the backend does: it
       # is a separate container that can be running a different build after a
       # partial deploy, and its log lines are the ones nobody can attribute.
       args:
@@ -203,16 +250,19 @@ services:
       # not read this: it documents that THIS is the process that drains.
       RUN_WORKERS: '1'
       DATABASE_URL: ${DATABASE_URL}
-      # See the identical pair on the api service above for why these two
+      # See the identical pair on the backend service above for why these two
       # lines have to be here even though both are blank by default. The
-      # worker needs ADMIN_DATABASE_URL at least as much as the api process:
+      # worker needs ADMIN_DATABASE_URL at least as much as the backend process:
       # every job here (renewal sweep, subscription expiry, notification
       # fan-out) runs with no per-request org context at all, so once
       # DATABASE_URL points at app_tenant, a worker still using it would
       # match no tenant's RLS policy and silently process nothing — see
       # db/pool.js's isPlatformWide()/useOwnerConnection().
       ADMIN_DATABASE_URL: ${ADMIN_DATABASE_URL:-}
-      TENANT_RLS_ENFORCE: ${TENANT_RLS_ENFORCE:-}
+      TENANT_RLS_ENFORCE: ${TENANT_RLS_ENFORCE:-on}
+      # The worker renders reminders and report emails; keep "today" in the
+      # studio's zone here too.
+      APP_TIMEZONE: ${APP_TIMEZONE:-}
       JWT_SECRET: ${JWT_SECRET}
       FRONTEND_URL: ${FRONTEND_URL}
       SMTP_HOST: ${SMTP_HOST:-}
@@ -221,18 +271,28 @@ services:
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-}
       EMAIL_FROM: ${EMAIL_FROM:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      PUSH_ENABLED: ${PUSH_ENABLED:-}
+      FIREBASE_SERVICE_ACCOUNT: ${FIREBASE_SERVICE_ACCOUNT:-}
+      FIREBASE_SERVICE_ACCOUNT_PATH: ${FIREBASE_SERVICE_ACCOUNT_PATH:-}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-}
       # The worker sends WhatsApp and charges renewals; the API does not.
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
       TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
       RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
       RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      # The worker opens its own pool; tuning it here matters as much as in
+      # the API. DATABASE_SSL_CA is a container path (see the API service).
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-}
+      DATABASE_SSL_CA: ${DATABASE_SSL_CA:-}
+      LOG_CAPTURE: ${LOG_CAPTURE:-}
       # AI ingestion reads uploaded files back out of object storage.
       R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
       R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
       SENTRY_DSN: ${SENTRY_DSN:-}
-      # AI vars forwarded here for the same reason as on the api service
+      # AI vars forwarded here for the same reason as on the backend service
       # (Compose forwards only named lines): a background job that calls the
       # AI provider or the usage metering must see the same provider
       # configuration the API does. Blank defaults change nothing until the
@@ -285,7 +345,7 @@ services:
 # express "restart these two containers".
 #
 # wollomatic/socket-proxy allow-lists by method AND path regex. Below, the only
-# thing it forwards is POST /containers/<api or worker>/restart. The ERP client
+# thing it forwards is POST /containers/<backend or worker>/restart. The ERP client
 # (modules/command-center/container-recovery.js) builds only that call, so the
 # limit is held in two independent places.
 #
@@ -296,7 +356,7 @@ services:
 #
 #   COMPOSE_PROFILES=recovery
 #   DOCKER_PROXY_URL=http://docker-socket-proxy:2375
-#   CC_API_CONTAINER=<api container name>        letters, digits, _ and - only
+#   CC_API_CONTAINER=<backend container name>   letters, digits, _ and - only
 #   CC_WORKER_CONTAINER=<worker container name>  (no dots: they are regex here)
 #   DOCKER_GID=<gid of /var/run/docker.sock>     stat -c %g /var/run/docker.sock
 #
@@ -304,7 +364,7 @@ services:
 # (`docker run --rm wollomatic/socket-proxy:1.13.1 -help`) and exercised
 # against real containers: the two restarts answer 204; restarting any other
 # container, stop/start/kill/exec/create, images/volumes/networks/build/system,
-# every GET and HEAD, and any client other than the api are refused (403/405).
+# every GET and HEAD, and any client other than the backend are refused (403/405).
 # The proxy anchors each pattern with ^...$ itself.
 
   docker-socket-proxy:
@@ -316,9 +376,9 @@ services:
       - '-loglevel=INFO'
       # Listen inside the container network. Not published (see `expose`).
       - '-listenip=0.0.0.0'
-      # Only the api service may connect. Resolved per request, so it follows
-      # the api container across restarts and refuses whoever inherits its IP.
-      - '-allowfrom=api'
+      # Only the backend service may connect. Resolved per request, so it follows
+      # the backend container across restarts and refuses whoever inherits its IP.
+      - '-allowfrom=backend'
       # The whole allow-list. No other method is set, so every GET, HEAD, PUT,
       # DELETE and any other POST is refused.
       - '-allowPOST=(/v[0-9.]+)?/containers/(${CC_API_CONTAINER:-erp-api}|${CC_WORKER_CONTAINER:-erp-worker})/restart'
@@ -342,7 +402,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ['no-new-privileges:true']
-    # Never published to the host. Only the api container reaches it, over the
+    # Never published to the host. Only the backend container reaches it, over the
     # compose network, by service name.
     expose:
       - '2375'

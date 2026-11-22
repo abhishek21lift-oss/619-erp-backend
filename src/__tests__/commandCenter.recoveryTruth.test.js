@@ -29,7 +29,7 @@ jest.mock('../lib/logger', () => ({
   info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn(), fatal: jest.fn(),
 }));
 jest.mock('../jobs/queue', () => ({
-  QUEUE_NAMES: ['email', 'whatsapp', 'ai', 'notifications', 'membership-renewals'],
+  QUEUE_NAMES: ['email', 'whatsapp', 'ai', 'notifications'],
   getQueue: jest.fn(),
 }));
 
@@ -69,12 +69,12 @@ describe('gradeQueue refuses to call an unread queue healthy', () => {
     expect(gradeQueue(belowWarn).ok).toBe(true);
   });
 
-  it('grades a money queue harder, exactly as the card does', () => {
+  it('grades failures at the collector\'s own threshold', () => {
     const qc = require('../modules/command-center/collectors/queue.collector');
-    expect([...qc.CRITICAL_QUEUES]).toContain('membership-renewals');
-    const one = { reachable: true, waiting: 0, active: 1, failed: 1 };
-    expect(gradeQueue({ ...one, name: 'membership-renewals' }).ok).toBe(false);
-    expect(gradeQueue({ ...one, name: 'email' }).ok).toBe(true);
+    expect(qc.CRITICAL_QUEUES.size).toBe(0);
+    const one = { reachable: true, waiting: 0, active: 1, failed: qc.FAILED_CRIT };
+    expect(gradeQueue({ ...one, name: 'email' }).ok).toBe(false);
+    expect(gradeQueue({ ...one, name: 'email', failed: qc.FAILED_CRIT - 1 }).ok).toBe(true);
   });
 
   it('calls a genuinely healthy queue healthy', () => {

@@ -231,7 +231,8 @@ if (isProd && r2Set.length === 0) {
 // 'off' for a staged rollout (with the prerequisites below); the boot guard
 // logs a warning. `PLATFORM_SESSION_ENFORCE` may not: 'off' is fatal in
 // production because it makes tenant and platform sessions indistinguishable.
-// The value must be unset, 'on', or 'off' in production.
+// The value must be unset, 'on', or 'off' in production; TENANT_RLS_ENFORCE
+// additionally accepts 'strict' for the fail-closed cutover.
 //
 // ── Before deploying with these set ─────────────────────────────────────────
 //
@@ -268,7 +269,12 @@ if (isProd) {
   const invalid = SECURITY_FLAGS
     .filter(function(f) {
       const val = process.env[f[0]];
-      return val !== undefined && val !== 'on' && val !== 'off';
+      if (val === undefined) return false;
+      // TENANT_RLS_ENFORCE has a third documented value: 'strict' makes the
+      // process refuse to serve traffic unless the database proves isolation.
+      // The other two flags are genuinely two-state.
+      if (f[0] === 'TENANT_RLS_ENFORCE' && val === 'strict') return false;
+      return val !== 'on' && val !== 'off';
     })
     .map(function(f) { return { flag: f[0], value: process.env[f[0]] }; });
 
@@ -276,7 +282,8 @@ if (isProd) {
     logger.fatal(
       { invalid },
       'Refusing to start: security control has invalid value. '
-      + 'Each flag must be either "on" or "off" (or unset to default to "on").'
+      + 'Each flag must be either "on" or "off" (TENANT_RLS_ENFORCE may also be '
+      + '"strict"), or unset to default to "on".'
     );
     process.exit(1);
   }
@@ -902,10 +909,11 @@ app.use('/api/qr',               ...gate('attendance'), require('./routes/qr-che
 app.use('/api/settings',          auth, requireTrainer, require('./routes/settings'));
 app.use('/api/invoices',          ...studioGate('finance'), require('./routes/invoices'));
 app.use('/api/workouts',          ...gate('programs'), require('./routes/workouts'));
-// The Exercise Library. Sits behind the same 'programs' feature as the Workout
-// Builder it feeds — a studio with programmes always has the library, and one
-// without it has no use for either.
-app.use('/api/exercises',         ...gate('programs'), require('./routes/exercises'));
+// The Exercise Library has its own sellable key ('exercise_library', and its
+// own nav entry). Gating it by 'programs' made the operator's library toggle
+// hide the page while the API kept serving it — the entitlement hole this
+// mount now closes.
+app.use('/api/exercises',         ...gate('exercise_library'), require('./routes/exercises'));
 
 // '/api/training' was mounted here — the training domain's prescription API
 // (migrations 164-166), meant to replace '/api/workouts' once the UI was
@@ -914,7 +922,7 @@ app.use('/api/exercises',         ...gate('programs'), require('./routes/exercis
 // program/template half for the same reason: nothing had been authored
 // through it, and since 193 nothing downstream could assign or log a template
 // anyway. '/api/workouts' above is the one prescription API.
-app.use('/api/diet',              require('./routes/diet'));
+app.use('/api/diet',              ...gate('programs'), require('./routes/diet'));
 // '/api/biometric-attend' and '/api/webauthn' were mounted here: a second
 // check-in path (fingerprint / GPS) writing the same attendance_logs rows as
 // '/api/qr' above, plus the member fingerprint enrolment behind it. Check-in
@@ -931,8 +939,8 @@ app.use('/api/diet',              require('./routes/diet'));
 app.use('/api/integrations/whatsapp', ...gate('integrations'), require('./routes/whatsapp'));
 app.use('/api/integrations',      ...gate('integrations'), require('./routes/integrations'));
 app.use('/api/campaigns',         ...gate('communication'), require('./routes/campaigns'));
-app.use('/api/offers',            require('./routes/offers'));
-app.use('/api/feedback',          require('./routes/feedback'));
+app.use('/api/offers',            ...gate('communication'), require('./routes/offers'));
+app.use('/api/feedback',          ...gate('communication'), require('./routes/feedback'));
 app.use('/api/communication',     auth, requireTrainer, ...gate('communication'), require('./routes/communication'));
 // Mounted before /api/ai so /api/ai/knowledge/* is matched here first,
 // regardless of what routes/ai.js's own router does internally.
@@ -1043,7 +1051,7 @@ app.use('/api/form-links',       auth, requireTrainer, require('./routes/form-li
 // health records a page at a time.
 app.use('/api/progress',   userApiLimiter, auth, requireTrainer, require('./modules/progress/progress-module5.routes'));
 app.use('/api/progress',   userApiLimiter, auth, requireTrainer, require('./modules/progress/progress.routes'));
-app.use('/api/automation', userApiLimiter, auth, requireTrainer, require('./modules/automation/automation.routes'));
+app.use('/api/automation', userApiLimiter, ...studioGate('communication'), require('./modules/automation/automation.routes'));
 
 // ────────────────────────
 // v3 MODULE ROUTES

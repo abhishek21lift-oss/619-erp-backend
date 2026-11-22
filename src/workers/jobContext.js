@@ -8,8 +8,8 @@
 // middleware/requestId.js opens a correlation context so every log line an
 // HTTP request produces carries `req_id`. That context ends when the response
 // does — and a great deal of what this platform actually does happens after
-// that, on a BullMQ worker: the WhatsApp send, the renewal charge, the AI
-// generation, the notification.
+// that, on a BullMQ worker: the WhatsApp send, the AI generation, the
+// notification.
 //
 // So the request that enqueued the work was traceable, the work itself was
 // not, and the two could not be joined. "The welcome message never arrived"
@@ -30,7 +30,7 @@
 //
 // ── What happens when a job has no request behind it ───────────────────────
 //
-// Scheduled work — the nightly sweep, the renewal scan — has no originating
+// Scheduled work — the nightly sweep, the reminder scan — has no originating
 // request and never will. Those get a context built from the queue and job id
 // instead, which is still strictly better than nothing: every line from one
 // sweep shares an id, so a single pass can be read end to end.

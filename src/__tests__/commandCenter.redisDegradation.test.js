@@ -5,21 +5,24 @@
 //
 // "Redis is optional in this stack; producers fall back to inline." That is
 // written in several headers and it is wrong in the way that matters most:
-// the fallback is not uniform, and the queue it does NOT cover is the one that
-// takes money.
+// the fallback is not uniform, and the sweeps that do NOT fall back silently
+// stop running.
 //
 //   email / notifications / ai   send INLINE. Work still happens.
 //   whatsapp                     DOES NOT SEND. The row stays 'queued' and
 //                                automation.recovery re-drives it later —
 //                                deliberately, so the per-attempt bookkeeping
 //                                in communication_logs is not bypassed.
-//   membership-renewals          STOPS. Worker-driven, no producer fallback,
-//                                so no renewal runs until Redis returns.
+//   automation-sweep, etc.       STOP. The worker scheduler cannot register,
+//                                so the sweep does not run until Redis returns.
+//
+// Studio subscription renewals are not queue-backed: they run from an
+// interval in server.js, so they are deliberately absent from this table.
 //
 // An operator looking at a red Redis card has three very different situations
 // to tell apart: "latency is up", "messages are waiting and will flush", and
-// "billing has stopped". redis-degradation.js states which; these tests stop
-// that statement drifting away from the code.
+// "scheduled sweeps have stopped". redis-degradation.js states which; these
+// tests stop that statement drifting away from the code.
 
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://u:p@127.0.0.1:1/none';
 
@@ -90,16 +93,16 @@ describe('each claimed fallback is still what the code does', () => {
     expect(svc).not.toMatch(/sendInline|deliverInline/);
   });
 
-  it('membership-renewals has no producer fallback at all', () => {
+  it('a scheduler queue with no producer fallback is described as STOPPED', () => {
     // The claim is an ABSENCE, so it is asserted as one: no service module
-    // enqueues renewals with an inline path behind it.
-    expect(degradation.DEGRADATION['membership-renewals'].mode)
+    // enqueues the sweep with an inline path behind it.
+    expect(degradation.DEGRADATION['automation-sweep'].mode)
       .toBe(degradation.MODE.STOPPED);
     const services = fs.readdirSync(path.join(SRC, 'services'))
       .filter((f) => f.endsWith('.js'))
       .map((f) => code(path.join('services', f)))
       .join('\n');
-    expect(services).not.toMatch(/membershipRenewalsQueue/);
+    expect(services).not.toMatch(/automationSweepQueue/);
   });
 });
 
@@ -110,11 +113,11 @@ describe('describe() leads with the worst consequence', () => {
     expect(d.headline).toBeNull();
   });
 
-  it('names the STOPPED queue first when Redis is unreachable', () => {
+  it('names a STOPPED queue first when Redis is unreachable', () => {
     const d = degradation.describe('down');
     expect(d.active).toBe(true);
-    // An operator has seconds. The queue that has stopped goes first.
-    expect(d.headline.indexOf('membership-renewals'))
+    // An operator has seconds. A queue that has stopped goes first.
+    expect(d.headline.indexOf('automation-sweep'))
       .toBeLessThan(d.headline.indexOf('whatsapp'));
     expect(d.headline).toMatch(/HAVE STOPPED/);
   });
@@ -125,7 +128,7 @@ describe('describe() leads with the worst consequence', () => {
     expect(off.headline).not.toEqual(down.headline);
     expect(off.headline).toMatch(/No Redis on this deployment/);
     // Both must still name the cost — "not configured" is not "no consequence".
-    expect(off.headline).toMatch(/membership-renewals/);
+    expect(off.headline).toMatch(/automation-sweep/);
   });
 
   it('always returns every queue, whatever the state', () => {

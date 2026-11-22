@@ -14,9 +14,9 @@
 //   * waiting climbing while active stays flat  → workers are not draining.
 //     This is the brief's "Redis latency increased because the worker queue is
 //     growing" scenario, and it is the input the Guardian correlates on.
-//   * failed climbing at all → jobs are being lost. For membership-renewals
-//     that is a card charged with no membership row written, so it is graded
-//     harder than the other queues.
+//   * failed climbing at all → jobs are being lost. Every current queue is
+//     delivery or a scheduled sweep, so one failure is enough to warn; there
+//     is no payment queue left to grade harder than the rest.
 'use strict';
 
 const { STATUS, result, unavailable, degraded } = require('../registry');
@@ -30,8 +30,13 @@ const WAITING_CRIT = Number(process.env.CC_QUEUE_WAITING_CRIT) || 250;
 const FAILED_WARN = Number(process.env.CC_QUEUE_FAILED_WARN) || 1;
 const FAILED_CRIT = Number(process.env.CC_QUEUE_FAILED_CRIT) || 25;
 
-/** Losing one of these silently costs money or trust, so grade them harder. */
-const CRITICAL_QUEUES = new Set(['membership-renewals']);
+/**
+ * Losing one of these silently costs money or trust, so grade them harder.
+ * Empty today: the membership-renewals queue was removed because nothing
+ * produced or drained it (subscription renewals run in server.js on an
+ * interval). Add a name here only when a real money queue exists.
+ */
+const CRITICAL_QUEUES = new Set();
 
 async function collect() {
   const degradation = require('../redis-degradation');
@@ -44,7 +49,7 @@ async function collect() {
   //
   //   not configured  a deployment choice. EXPECTED, so it does not degrade
   //                   the platform rollup — but it is still shown, with what
-  //                   it costs, because "no Redis" means renewals never run.
+  //                   it costs, because "no Redis" stops the scheduled sweeps.
   //   configured but  the real incident. The queues are not merely unreadable;
   //   unreachable     each one has a DEFINED fallback and they are not the
   //                   same fallback. DEGRADED, naming the mode per queue.
@@ -58,9 +63,9 @@ async function collect() {
   }
 
   if (!redis.isReady()) {
-    // Not CRITICAL: work is still happening for three of the five queues, and
-    // calling that an outage overstates it. Not UNAVAILABLE either: we know
-    // exactly what is going on, which is the opposite of unobservable.
+    // Not CRITICAL: the deferred/inline queues still make progress, and calling
+    // that an outage overstates it. Not UNAVAILABLE either: we know exactly
+    // what is going on, which is the opposite of unobservable.
     const d = degradation.describe('down');
     return degraded(NAME, d.headline, { degradation: d });
   }
@@ -74,18 +79,16 @@ async function collect() {
 
   // ── collectQueueStats returns an ARRAY ────────────────────────────────────
   //
-  // It maps over QUEUE_NAMES and filters, so each element carries its own
-  // `.name`; there is no key to read. This used to be `Object.entries(stats)`,
-  // which on an array yields ["0", obj], ["1", obj] … — so every queue was
-  // named after its index.
+  // It maps over QUEUE_NAMES, so each element carries its own `.name`;
+  // unreachable queues are present as `null`. This used to be
+  // `Object.entries(stats)`, which on an array yields ["0", obj], ["1", obj] …
+  // — so every queue was named after its index.
   //
   // That was not cosmetic. Three things broke silently:
   //
   //   * The card listed queues called 0,1,2,3,4,5 and the problem strings read
   //     `0: 12 jobs waiting`, naming nothing an operator could act on.
-  //   * CRITICAL_QUEUES.has(name) became has("0"), which is never true — so
-  //     membership-renewals has never once been graded harder than any other
-  //     queue, and the "one failed renewal is critical" rule had never fired.
+  //   * CRITICAL_QUEUES.has(name) became has("0"), which is never true.
   //   * recovery.run looks its queue up by name and never found it, so its
   //     verification had nothing to read.
   //
@@ -140,10 +143,11 @@ async function collect() {
 
   // ── A queue that vanished is not a queue that is fine ────────────────────
   //
-  // collectQueueStats() does `.filter(Boolean)`, so a queue it could not reach
-  // is ABSENT from the result rather than present-and-null. Left alone, that
-  // is the quietest failure available: the card renders five healthy queues
-  // instead of six and nothing anywhere says the sixth could not be read.
+  // collectQueueStats() now returns null for an unreachable queue, but a double
+  // or an older caller can omit it entirely. Comparing against the declared
+  // set catches both. Left alone, an omission is the quietest failure
+  // available: the card renders one fewer healthy queue and nothing anywhere
+  // says the missing one could not be read.
   //
   // The old code had a `if (!s)` branch for this, which could never fire —
   // the filter upstream had already removed them. Comparing against the

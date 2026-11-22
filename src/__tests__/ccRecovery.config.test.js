@@ -42,7 +42,7 @@ describe('docker-compose.yml socket-proxy', () => {
     expect(allow).toEqual([
       '-allowPOST=(/v[0-9.]+)?/containers/(${CC_API_CONTAINER:-erp-api}|${CC_WORKER_CONTAINER:-erp-worker})/restart',
     ]);
-    expect(proxy.command).toContain('-allowfrom=api');
+    expect(proxy.command).toContain('-allowfrom=backend');
   });
 
   test('only the proxy holds the Docker socket', () => {
@@ -56,12 +56,12 @@ describe('docker-compose.yml socket-proxy', () => {
     }
   });
 
-  test('the API gets the proxy URL and both target names from the environment', () => {
-    const env = compose.services.api.environment;
+  test('the backend gets the proxy URL and both target names from the environment', () => {
+    const env = compose.services.backend.environment;
     expect(env.DOCKER_PROXY_URL).toBe('${DOCKER_PROXY_URL:-}');
     expect(env.CC_API_CONTAINER).toBe('${CC_API_CONTAINER:-erp-api}');
     expect(env.CC_WORKER_CONTAINER).toBe('${CC_WORKER_CONTAINER:-erp-worker}');
-    expect(compose.services.api.container_name).toBe('${CC_API_CONTAINER:-erp-api}');
+    expect(compose.services.backend.container_name).toBe('${CC_API_CONTAINER:-erp-api}');
     expect(compose.services.worker.container_name).toBe('${CC_WORKER_CONTAINER:-erp-worker}');
   });
 });

@@ -79,7 +79,7 @@ describe('docker-compose passes the variables to every process that needs them',
    * Parsed by slicing between service keys rather than with a YAML library:
    * this repo has no YAML dependency, and the question — does this variable
    * appear inside this service's block — is answerable from the text. A
-   * variable set on `api` but not `worker` is the exact failure being tested,
+   * variable set on `backend` but not `worker` is the exact failure being tested,
    * so the two blocks must be read separately.
    */
   function serviceBlock(name) {
@@ -90,11 +90,11 @@ describe('docker-compose passes the variables to every process that needs them',
     return nextService === -1 ? rest : rest.slice(0, nextService + 1);
   }
 
-  // The worker matters at least as much as the api. After the cutover a worker
-  // still connecting as app_tenant with no request context has no org id, so
-  // it matches no policy and every scheduled job reads nothing — the sweep
-  // finds no expiring memberships and reports success.
-  it.each(['api', 'worker'])('service %s receives both variables', (service) => {
+  // The worker matters at least as much as the backend. After the cutover a
+  // worker still connecting as app_tenant with no request context has no org
+  // id, so it matches no policy and every scheduled job reads nothing — the
+  // sweep finds no expiring memberships and reports success.
+  it.each(['backend', 'worker'])('service %s receives both variables', (service) => {
     const block = serviceBlock(service);
     for (const name of RLS_ENV_VARS) {
       expect(block).toContain(`${name}:`);
@@ -108,6 +108,12 @@ describe('docker-compose passes the variables to every process that needs them',
       // operator changing it.
       expect(COMPOSE).toMatch(new RegExp(`${name}:\\s*\\$\\{${name}(:-[^}]*)?\\}`));
     }
+  });
+
+  it('never passes an empty TENANT_RLS_ENFORCE, which the boot guard rejects', () => {
+    // `${TENANT_RLS_ENFORCE:-}` sets the variable to an empty string, and an
+    // empty value is neither unset nor 'on'/'off' at the production guard.
+    expect(COMPOSE).toMatch(/TENANT_RLS_ENFORCE:\s*\$\{TENANT_RLS_ENFORCE:-on\}/);
   });
 });
 

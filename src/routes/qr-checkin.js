@@ -283,7 +283,7 @@ router.get('/generate/:type/:id', auth, requireTrainer, qrLimiter, async (req, r
 
 // ── POST /api/qr/scan ─────────────────────────────────────────────────────────
 // Validate signed QR payload and mark attendance. Called by scanner.
-// Auth required (the studio trainer) OR a kiosk token.
+// Auth required (the studio trainer).
 const scanLimiter = rateLimit({
   store: makeStore('qrscan'),
   passOnStoreError: true,

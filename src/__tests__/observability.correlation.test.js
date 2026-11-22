@@ -239,7 +239,7 @@ describe('the build plumbing that makes sha real in production', () => {
     expect(dockerfile).toMatch(/GIT_SHA=\$GIT_SHA/);
   });
 
-  it('compose passes it to the api AND the worker', () => {
+  it('compose passes it to the backend AND the worker', () => {
     const compose = read('docker-compose.yml');
     const argBlocks = compose.match(/GIT_SHA: \$\{GIT_SHA:-unknown\}/g) || [];
     expect(argBlocks.length).toBe(2);
