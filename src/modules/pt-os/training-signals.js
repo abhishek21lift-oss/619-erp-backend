@@ -65,6 +65,19 @@ const RANK = Object.freeze({ critical: 0, warning: 1, info: 2 });
 
 const day = (v) => (v ? dbDate(v) : null);
 
+/**
+ * A date as the app writes it in prose: DD-MM-YYYY.
+ *
+ * `dbDate` stays ISO because API fields, ordering and date arithmetic all
+ * depend on it. This is only for the sentences a trainer reads on the
+ * dashboard, where every other date is DD-MM-YYYY and an ISO string reads as
+ * a different kind of fact.
+ */
+function displayDate(iso) {
+  const [y, m, d] = String(iso ?? '').slice(0, 10).split('-');
+  return y && m && d ? `${d}-${m}-${y}` : iso;
+}
+
 function daysBetween(from, to) {
   const a = new Date(`${day(from)}T00:00:00Z`).getTime();
   const b = new Date(`${day(to)}T00:00:00Z`).getTime();
@@ -118,7 +131,7 @@ function detectSignals({
         severity: SEVERITY.CRITICAL,
         headline: 'Paid but has never trained',
         evidence: `no completed session on record${sinceStart !== null ? `, ${sinceStart} days since the term began` : ''}`,
-        recommendation: 'Call them. A client who never starts does not renew, and the term is already running.',
+        recommendation: 'Contact them. A client who never starts does not renew, and the term is already running.',
       });
     }
   } else if (quietFor !== null && quietFor >= QUIET_DAYS) {
@@ -130,7 +143,7 @@ function detectSignals({
         id: 'gone_quiet',
         severity: gone ? SEVERITY.CRITICAL : SEVERITY.WARNING,
         headline: gone ? 'Paying, and stopped coming' : 'Paying, and gone quiet',
-        evidence: `last trained ${lastSession}, ${quietFor} days ago; term runs to ${term.end}`,
+        evidence: `last trained ${displayDate(lastSession)}, ${quietFor} days ago; term runs to ${displayDate(term.end)}`,
         recommendation: gone
           ? 'Contact them this week. They are paying for training they are not taking, which is the shape of a non-renewal.'
           : 'Check in before it becomes a habit.',
@@ -143,7 +156,7 @@ function detectSignals({
         id: 'term_ended_inactive',
         severity: SEVERITY.INFO,
         headline: 'Term finished, not training',
-        evidence: `last trained ${lastSession}, ${quietFor} days ago; term ended ${term.end}`,
+        evidence: `last trained ${displayDate(lastSession)}, ${quietFor} days ago; term ended ${displayDate(term.end)}`,
         recommendation: 'Win-back, not a chase. They completed what they bought.',
         days_quiet: quietFor,
       });
@@ -152,7 +165,7 @@ function detectSignals({
         id: 'gone_quiet',
         severity: SEVERITY.WARNING,
         headline: 'Gone quiet',
-        evidence: `last trained ${lastSession}, ${quietFor} days ago; no term dates on file`,
+        evidence: `last trained ${displayDate(lastSession)}, ${quietFor} days ago; no term dates on file`,
         recommendation: 'Check whether they are still a client at all — nothing records what they bought.',
         days_quiet: quietFor,
       });
@@ -303,6 +316,10 @@ function summariseRoster(rows = []) {
 
   return {
     clients: rows.length,
+    // The sweep reads the whole roster, including finished terms, because a
+    // win-back is a real signal. The header must not imply every one of those
+    // clients is currently paying, so the active count travels with the total.
+    active_clients: rows.filter((r) => r.term?.state === 'current').length,
     clients_with_signals: withSignals.length,
     critical: withSignals.filter((r) => r.worst === SEVERITY.CRITICAL).length,
     warning: withSignals.filter((r) => r.worst === SEVERITY.WARNING).length,

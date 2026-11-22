@@ -68,6 +68,11 @@ describe('the term decides what silence means', () => {
     expect(s).toBeTruthy();
     expect(s.severity).toBe(SEVERITY.WARNING);
     expect(s.evidence).toContain('16 days ago');
+    // The dashboard writes every date DD-MM-YYYY. An ISO date in the middle
+    // of this sentence is the one visible string on the card in another
+    // format, and the trainer reads it aloud when they call.
+    expect(s.evidence).toContain(daysAgo(16).split('-').reverse().join('-'));
+    expect(s.evidence).not.toMatch(/\d{4}-\d{2}-\d{2}/);
     expect(out.days_quiet).toBe(16);
   });
 
@@ -252,6 +257,9 @@ describe('the roster sweep', () => {
   it('lists only the clients with something to say', () => {
     const out = summariseRoster(roster());
     expect(out.clients).toBe(4);
+    // The sweep includes finished terms on purpose, but the header must not
+    // imply all four are paying. Only c has ended.
+    expect(out.active_clients).toBe(3);
     expect(out.clients_with_signals).toBe(3);
     // A sweep that returns all 34 every time is a sweep nobody reads twice.
     expect(out.clients_detail.map((r) => r.client_id)).not.toContain('a');
