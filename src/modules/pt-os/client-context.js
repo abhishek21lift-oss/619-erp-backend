@@ -510,6 +510,13 @@ function limitationsLine(twin, typed = null) {
  * with shoulder pain. A name this cannot match is left out of the result and
  * reported by the audit as unverified.
  *
+ * exercise_aliases is the one exception, and it is not a similarity guess: a
+ * human wrote down that this text names that row ("Seated Cable Row" →
+ * "Seated Cable Rows"). A name match always wins; aliases are consulted only
+ * for names the library does not hold. Within one scope the table allows one
+ * mapping per spelling, and a studio's own alias beats the built-in one, so
+ * resolution stays deterministic.
+ *
  * Tenancy is the exercise library's own rule (routes/exercises.js
  * visibilityClause): built-ins are shared, a studio's custom exercises are
  * visible to everyone in that studio. It deliberately does NOT narrow to
@@ -557,19 +564,58 @@ async function lookupExercisesByName(names = [], { orgId } = {}) {
   }
 
   const matches = [];
+  const matched = new Set();
   for (const w of wanted.values()) {
     const exact = byKey.get(w.key) || [];
     if (exact.length) {
       for (const row of exact) matches.push({ key: w.key, row });
+      matched.add(w.key);
       continue;
     }
     if (!w.base) continue;
     for (const row of byKey.get(w.base) || []) {
       if (w.suffix && w.suffix === normaliseName(row.muscle_group || row.body_part)) {
         matches.push({ key: w.key, row });
+        matched.add(w.key);
       }
     }
   }
+
+  // Aliases, for the spellings the library's own names did not answer. The
+  // query is scoped on both the alias and the exercise it points at: a global
+  // alias may name a built-in, and a studio alias may name that studio's
+  // custom row, but neither may reach across the tenant boundary.
+  const remaining = [...wanted.values()].filter((w) => !matched.has(w.key));
+  if (remaining.length) {
+    const { rows: aliased } = await pool.query(
+      `SELECT e.id, e.name, e.muscle_group, e.body_part, e.target_muscle,
+              e.movement_pattern, e.equipment, e.difficulty,
+              a.normalized, a.organization_id AS alias_org
+         FROM exercise_aliases a
+         JOIN exercises e ON e.id = a.exercise_id
+        WHERE (a.organization_id IS NULL OR a.organization_id = $1::uuid)
+          AND a.normalized = ANY($2::text[])
+          AND e.deleted_at IS NULL AND e.archived_at IS NULL
+          AND (e.organization_id IS NULL OR e.organization_id = $1::uuid)
+        ORDER BY a.organization_id NULLS LAST`,
+      [orgId, remaining.map((w) => w.key)],
+    );
+
+    // A studio alias for the same words overrides the built-in one. The
+    // partial unique indexes make this at most one row per scope.
+    const byAlias = new Map();
+    for (const row of aliased) {
+      if (!byAlias.has(row.normalized)) byAlias.set(row.normalized, []);
+      byAlias.get(row.normalized).push(row);
+    }
+    for (const [key, list] of byAlias) {
+      const scoped = list.filter((r) => r.alias_org !== null);
+      for (const row of scoped.length ? scoped : list) {
+        matches.push({ key, row });
+      }
+    }
+  }
+
   return matches;
 }
 
