@@ -353,7 +353,7 @@ describe('screening the exercises a plan actually named', () => {
   it('takes the stricter verdict when two library rows share a name', async () => {
     mockLibrary([LEG_PRESS_BODYWEIGHT, LEG_PRESS_MACHINE]);
     const out = await screenPlanExercises(['Leg Press'], {
-      orgId: 'org-1', userId: 'u1', screen: screenFor(['Bodyweight']),
+      orgId: 'org-1', screen: screenFor(['Bodyweight']),
     });
     // A studio with no machines has no machine leg press. Letting the
     // bodyweight twin clear the name would hand the client an exercise the
@@ -365,7 +365,7 @@ describe('screening the exercises a plan actually named', () => {
   it('does not invent a verdict when neither row is constrained', async () => {
     mockLibrary([LEG_PRESS_BODYWEIGHT, LEG_PRESS_MACHINE]);
     const out = await screenPlanExercises(['Leg Press'], {
-      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+      orgId: 'org-1', screen: screenFor(null),
     });
     expect(out.get('leg press').verdict).toBe('allow');
   });
@@ -373,7 +373,7 @@ describe('screening the exercises a plan actually named', () => {
   it('returns nothing for a name the library does not hold', async () => {
     mockLibrary([]);
     const out = await screenPlanExercises(['Overhead Press'], {
-      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+      orgId: 'org-1', screen: screenFor(null),
     });
     // Absent from the map, so the audit reports it unverified rather than
     // clearing it — see plan-critic.js on why fuzzy matching is unsafe here.
@@ -387,7 +387,7 @@ describe('screening the exercises a plan actually named', () => {
     // accepted only when it is that row's own muscle group.
     mockLibrary([{ ...LEG_PRESS_MACHINE, id: 'ex-leg-press' }]);
     const out = await screenPlanExercises(['Leg Press (Legs)'], {
-      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+      orgId: 'org-1', screen: screenFor(null),
     });
     expect(out.get('leg press legs')).toMatchObject({ name: 'Leg Press', verdict: 'allow' });
   });
@@ -395,7 +395,7 @@ describe('screening the exercises a plan actually named', () => {
   it('does not let a qualifier ride in as if it were the muscle group', async () => {
     mockLibrary([LEG_PRESS_MACHINE]);
     const out = await screenPlanExercises(['Leg Press (Decline)'], {
-      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+      orgId: 'org-1', screen: screenFor(null),
     });
     // "Decline Leg Press" is a different movement; resolving it to the plain
     // press would clear an exercise the trainer did not name.
@@ -404,34 +404,47 @@ describe('screening the exercises a plan actually named', () => {
 
   it('resolves the decorated name to the library row when saving', async () => {
     mockLibrary([{ ...LEG_PRESS_MACHINE, id: 'ex-leg-press' }]);
-    const map = await resolveExerciseNames(['Leg Press (Legs)'], { orgId: 'org-1', userId: 'u1' });
+    const map = await resolveExerciseNames(['Leg Press (Legs)'], { orgId: 'org-1' });
     expect(map.get('leg press legs')).toEqual({ id: 'ex-leg-press', name: 'Leg Press' });
   });
 
-  it('fails closed without an org or a user', async () => {
+  it('fails closed without an org', async () => {
     mockLibrary([LEG_PRESS_MACHINE]);
-    for (const args of [{ orgId: null, userId: 'u1' }, { orgId: 'org-1', userId: null }]) {
-      const out = await screenPlanExercises(['Leg Press'], { ...args, screen: screenFor(null) });
-      expect(out.size).toBe(0);
-    }
+    const out = await screenPlanExercises(['Leg Press'], { orgId: null, screen: screenFor(null) });
+    expect(out.size).toBe(0);
     // Nothing was cleared by an unscoped read, because no read happened.
     expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it('sees a colleague\'s custom exercise, as the library screen does', async () => {
+    // The old predicate narrowed custom rows to `created_by = <caller>`; the
+    // library screen (routes/exercises.js visibilityClause) shows every
+    // custom exercise in the org. The audit and the save path have to use the
+    // library's rule or they reject a plan the trainer can see is valid.
+    mockLibrary([LEG_PRESS_MACHINE]);
+    const out = await screenPlanExercises(['Leg Press'], {
+      orgId: 'org-1', screen: screenFor(null),
+    });
+    expect(out.get('leg press').verdict).toBe('allow');
+    const [sql, params] = pool.query.mock.calls[0];
+    expect(sql).toContain('(organization_id IS NULL OR organization_id = $1::uuid)');
+    expect(sql).not.toContain('created_by');
+    expect(params).toEqual(['org-1', ['leg press']]);
   });
 
   it('queries by normalised name through the library\'s own tenancy predicate', async () => {
     mockLibrary([]);
     await screenPlanExercises(['  BENCH-PRESS ', 'Bench Press'], {
-      orgId: 'org-1', userId: 'u1', screen: screenFor(null),
+      orgId: 'org-1', screen: screenFor(null),
     });
     const [sql, params] = pool.query.mock.calls[0];
-    expect(sql).toMatch(/organization_id IS NULL OR \(organization_id = \$1::uuid AND created_by = \$2\)/);
     // Both spellings collapse to one lookup value.
-    expect(params[2]).toEqual(['bench press']);
+    expect(params[1]).toEqual(['bench press']);
     // The COLUMN has to be folded the same way the parameter was. Comparing a
     // normalised parameter against a raw name matches nothing for any name
     // carrying punctuation — which fails safe (everything unverified) and
     // silently guts the audit's reach, so it is pinned rather than trusted.
-    expect(sql).toMatch(/regexp_replace\(lower\(btrim\(name\)\), '\[\^a-z0-9\]\+', ' ', 'g'\) = ANY/);
+    expect(sql).toMatch(/btrim\(regexp_replace\(lower\(btrim\(name\)\), '\[\^a-z0-9\]\+', ' ', 'g'\)\) = ANY/);
   });
 });
 

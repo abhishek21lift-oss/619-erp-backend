@@ -57,6 +57,17 @@ exercises
 - **API:** `/api/workouts` (plans, assignment), `/api/exercises` (library),
   `/api/pt-os/workout-log/*` (logging, analytics, landmarks).
   `/api/training` is gone.
+  - AI proposals become plans through `POST /api/workouts/plans/from-generation`
+    only: it reads the frozen proposal, writes the plan and exercises, and by
+    default assigns the plan in the same transaction. `assign: false` writes the
+    same rows unassigned as a draft for the builder; the screening gate runs at
+    the later assignment.
+  - `POST /api/workouts/plans` refuses `generation_id` with `USE_FROM_GENERATION`
+    because its caller does not yet know the client the plan will be assigned
+    to, so it cannot stamp provenance safely.
+  - `POST /api/workouts/plans/:id/duplicate` copies a studio-owned plan and every
+    stored exercise field into a new, unassigned plan. It is a copy, not a
+    version: `version = 1`, `parent_plan_id = NULL`.
 - **UI:** `/pt-os/workout-plans` (index, labelled "Workouts"),
   `/pt-os/workout-plans/[id]`, `/pt-os/workout-plans/[id]/builder`,
   `/pt-os/workout-plans/[id]/builder/add-exercises`, `/pt-os/workout-log`,
@@ -119,12 +130,11 @@ These fail loudly if the consolidation is undone by accident:
 - **32 sessions sit in `IN_PROGRESS` and are actually abandoned** — now in
   `archive.training_sessions`, so they no longer pollute any live query. Only
   worth touching if that archive is ever read.
-- **The AI workout generator does not persist.**
-  `POST /api/ai/workout/generate` streams a plan back as JSON and writes
-  nothing, so a trainer reads the generated programme and retypes it into the
-  builder. Three surfaces call it — `/ai/workout-generator`,
-  `ClientAiGenerateCard`, and `AiCoachPanel type="workout"` — all through the
-  one implementation, so this is a missing write path, not a duplicate one.
+- **Reuse is a copy, not a shared assignment.** `POST /plans/:id/duplicate`
+  covers the "run this block again" case without coupling two clients'
+  prescriptions. `is_template` still has no authoring surface — the New
+  programme form writes it false — so a studio cannot mark a plan as its own
+  reusable template yet.
 - **`workout_exercises.week_number` is 1 on all 409 rows.** Weeks beyond the
   first are resolved arithmetically by `modules/pt-os/progression.js` rather
   than stored, so a deload week still cannot be authored.

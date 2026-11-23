@@ -33,7 +33,7 @@
 
 const { randomUUID } = require('crypto');
 const pool = require('../../db/pool');
-const { planExercises, normaliseName } = require('./plan-critic');
+const { planExercises, planAlternatives, normaliseName } = require('./plan-critic');
 const { materialise } = require('./plan-materialise');
 const { validateProposedPlan } = require('./workout-validation');
 const { resolveExerciseNames } = require('./client-context');
@@ -290,7 +290,7 @@ function describeMemory(memory) {
  * to the request by the route; it runs after the generation is found and
  * before anything is written, and a block stops the save.
  */
-async function acceptGeneration({ generationId, orgId, userId, name = null, gate = null, keepExisting = false } = {}) {
+async function acceptGeneration({ generationId, orgId, userId, name = null, gate = null, keepExisting = false, assign = true } = {}) {
   if (!generationId) return { ok: false, reason: 'no_generation' };
 
   const { rows } = await pool.query(
@@ -317,8 +317,12 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
     return { ok: false, reason: 'critical_violations', violations: critical };
   }
 
+  // A draft is not live, so the live-screening gate belongs to the assignment
+  // it will later receive, not to writing the rows. The trainer may save an
+  // unfinished proposal, fix it in the builder, and assign it only when the
+  // plan is worth putting on the client's Today screen.
   let screeningWarnings = [];
-  if (gate && generation.client_id) {
+  if (assign && gate && generation.client_id) {
     const { blocked, warnings } = await gate(generation.client_id);
     if (blocked) return { ok: false, reason: 'screening_blocked', blocked };
     screeningWarnings = warnings || [];
@@ -332,14 +336,27 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
   if (!validation.ok) {
     return { ok: false, reason: 'invalid_plan', errors: validation.errors };
   }
-  // Custom library rows are visible to their creator. The proposal is resolved
-  // against the library as the trainer who GENERATED it saw it; using the
-  // accepting trainer's id made another trainer's custom exercises vanish.
+  // Custom library rows are visible to the whole studio, the same rule the
+  // library screen uses (routes/exercises.js visibilityClause). Scoping the
+  // resolver to the generator's own id used to make a colleague's custom
+  // exercise vanish for whoever accepted the proposal.
+  //
+  // Alternatives are resolved through the same pass as prescribed names: a
+  // substitute the client may pick has to be a real library row too, or the
+  // suggestion cannot be opened.
   const resolver = await resolveExerciseNames(
-    planExercises(proposed).map((e) => e.name),
-    { orgId, userId: generation.created_by || userId },
+    [...planExercises(proposed).map((e) => e.name),
+      ...planAlternatives(proposed).map((a) => a.name)],
+    { orgId },
   );
-  const built = materialise(proposed, resolver);
+  // Names the frozen audit excluded as substitutions. The library can resolve
+  // them, so they are dropped by verdict rather than by lookup.
+  const blockedAlternatives = new Set(
+    (generation.audit?.violations || [])
+      .filter((v) => v.rule === 'blocked_alternative_offered' && v.alternative)
+      .map((v) => normaliseName(v.alternative)),
+  );
+  const built = materialise(proposed, resolver, { blockedAlternatives });
 
   if (!built.exercises.length) {
     // Saving an empty plan and calling the proposal accepted would poison the
@@ -422,7 +439,7 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
     // assignment is exactly the state described above, and half-committing it
     // would recreate the bug one row at a time.
     let assigned = false;
-    if (orgId) {
+    if (assign && orgId) {
       // The programme's own length, start + weeks − 1 day — the same rule
       // POST /assign applies. Without an end date a finished block stayed
       // "active" on the Today roster for as long as nobody retired it by
@@ -455,14 +472,20 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
     // Counted on the same live window the Today roster and the session
     // auto-link use — an assignment whose end date has passed is not something
     // they are "on". Non-zero now means the trainer explicitly kept them.
-    const { rows: others } = await client.query(
-      `SELECT COUNT(*)::int AS n
-         FROM workout_assignments
-        WHERE client_id = $1 AND status = 'active' AND id <> $2
-          AND start_date <= $3::date AND (end_date IS NULL OR end_date >= $3::date)`,
-      [generation.client_id, assignmentId, startedOn],
-    );
-    otherActive = others[0]?.n ?? 0;
+    //
+    // Only meaningful when this save produced an assignment. A draft that
+    // assigns nothing is not "one of N"; reporting the client's other live
+    // programmes there would read as if the draft itself were live.
+    if (assigned) {
+      const { rows: others } = await client.query(
+        `SELECT COUNT(*)::int AS n
+           FROM workout_assignments
+          WHERE client_id = $1 AND status = 'active' AND id <> $2
+            AND start_date <= $3::date AND (end_date IS NULL OR end_date >= $3::date)`,
+        [generation.client_id, assignmentId, startedOn],
+      );
+      otherActive = others[0]?.n ?? 0;
+    }
     wasAssigned = assigned;
 
     // The accept stamp rides the SAME transaction. Marking it outside would
@@ -495,6 +518,10 @@ async function acceptGeneration({ generationId, orgId, userId, name = null, gate
     name: name || built.plan.name,
     saved: built.counts.saved,
     unresolved: built.unresolved,
+    // Substitutions that could not be stored: either not in the library or
+    // excluded for this client. Reported for the same reason as unresolved —
+    // the trainer should not discover a missing option by opening the plan.
+    dropped_alternatives: built.dropped_alternatives,
     unknown_days: built.unknown_days,
     // Whether the programme is actually live for this client, and what else
     // is. Reported rather than assumed: a save that produced a plan nobody is

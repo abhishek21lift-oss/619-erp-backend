@@ -105,8 +105,22 @@ describe('POST /plans/:id/versions', () => {
     // week_number travels with the row: a hand-written deload week is part of
     // what the programme said, and a snapshot missing it is not a snapshot.
     expect(copy).toMatch(/week_number/);
+    // Nor is intensity or coaching detail optional. The snapshot used to omit
+    // RIR, swaps and cues, so a version that looked complete was missing the
+    // part a trainer had actually written.
+    expect(copy).toMatch(/rir/);
+    expect(copy).toMatch(/alternatives/);
+    expect(copy).toMatch(/cues/);
     expect(sqls()).toContain('BEGIN');
     expect(sqls()).toContain('COMMIT');
+  });
+
+  it('keeps the protocol blocks and block metadata in the snapshot', async () => {
+    await request(app).post(`/api/workouts/plans/${PLAN}/versions`).expect(201);
+    const insert = find(/INSERT INTO workout_plans/);
+    expect(insert).toMatch(/warmup_protocol, mobility_protocol, cooldown_protocol/);
+    expect(insert).toMatch(/periodization_model, split_name, block_phases/);
+    expect(insert).toMatch(/deload_every_weeks, deload_intensity_pct/);
   });
 
   it('moves the LIVE plan forward and leaves the snapshot on the old number', async () => {
