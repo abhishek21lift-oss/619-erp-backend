@@ -140,6 +140,46 @@ function planExercises(plan) {
   return out;
 }
 
+/**
+ * The name inside one alternative.
+ *
+ * The generator writes plain strings, but a stored plan may hold
+ * `{ name, reason }` objects (the duplicate and version routes copy whatever
+ * is in `workout_exercises.alternatives`). Both shapes mean the same thing,
+ * so the audit and the save path read them through this one function.
+ */
+function alternativeName(item) {
+  if (typeof item === 'string') return text(item);
+  return text(item?.name);
+}
+
+/**
+ * Every alternative in the plan, flattened, keeping its parent's location.
+ *
+ * Alternatives are screened separately from the prescribed exercise. They are
+ * shown to the member as substitutions, so an excluded movement offered there
+ * is a real safety surface; but they are not part of this session's dosage, so
+ * an unknown one is reported rather than treated as a missing prescription.
+ */
+function planAlternatives(plan) {
+  const schedule = plan?.weekly_schedule;
+  if (!schedule || typeof schedule !== 'object') return [];
+  const out = [];
+  for (const [day, session] of Object.entries(schedule)) {
+    const list = Array.isArray(session?.exercises) ? session.exercises : [];
+    list.forEach((ex, i) => {
+      if (!ex || typeof ex !== 'object') return;
+      const alternatives = Array.isArray(ex.alternatives) ? ex.alternatives : [];
+      for (const item of alternatives) {
+        const name = alternativeName(item);
+        if (!name) continue;
+        out.push({ day, position: i + 1, exercise: text(ex.name), name });
+      }
+    });
+  }
+  return out;
+}
+
 /** Does this exercise owe sets and reps, or its own cardio fields? */
 function owesSetsReps(ex) {
   const type = text(ex?.prescription_type).toUpperCase();
@@ -198,6 +238,36 @@ function auditPlan(plan, { screened = new Map(), requested = {} } = {}) {
         where: `${ex.day} #${ex.position}`,
         exercise: ex.name,
         detail: `${ex.name} needs care: ${(hit.reasons || []).map((r) => r.because).join('; ')}`,
+      });
+    }
+  }
+
+  // ── Alternatives: a suggestion the client can act on ────────────────────
+  //
+  // The member app prints alternatives under the prescribed exercise, so an
+  // excluded movement offered as a substitute is a safety surface even though
+  // it is not this session's prescription. It is MAJOR, not CRITICAL: the
+  // planned exercise is safe and the trainer can still save. A name the
+  // library does not hold is reported separately — it cannot be resolved or
+  // screened, but it does not earn a second generation the way an unknown
+  // prescribed name does.
+  const alternatives = planAlternatives(plan);
+  const unverifiedAlternatives = [];
+  for (const alt of alternatives) {
+    const hit = screened.get(normaliseName(alt.name));
+    if (!hit) {
+      unverifiedAlternatives.push(alt);
+      continue;
+    }
+    if (hit.verdict === 'block') {
+      violations.push({
+        severity: SEVERITY.MAJOR,
+        rule: 'blocked_alternative_offered',
+        where: `${alt.day} #${alt.position} ${alt.exercise || '(unnamed)'}`,
+        alternative: alt.name,
+        matched: hit.name,
+        detail: `"${alt.name}" is offered as an alternative but is excluded for this client: ${
+          (hit.reasons || []).map((r) => r.because).join('; ')}`,
       });
     }
   }
@@ -333,16 +403,25 @@ function auditPlan(plan, { screened = new Map(), requested = {} } = {}) {
     // reporting the limit of its own reach, which the trainer has to cover
     // with their eyes.
     unverified,
+    // Same limit for the optional substitutions. Kept apart from `unverified`
+    // because an alternative is not prescribed: it must not shorten a saved
+    // session or spend a revision on its own.
+    unverified_alternatives: unverifiedAlternatives,
     counts: {
       exercises: total,
       verified,
+      alternatives: alternatives.length,
+      unverified_alternatives: unverifiedAlternatives.length,
       critical: violations.filter((v) => v.severity === SEVERITY.CRITICAL).length,
       major: violations.filter((v) => v.severity === SEVERITY.MAJOR).length,
       minor: violations.filter((v) => v.severity === SEVERITY.MINOR).length,
     },
     /** Whether a revision is worth spending a second generation on. */
     needs_revision: violations.some((v) => v.severity === SEVERITY.CRITICAL
-      || v.rule === 'frequency_mismatch' || v.rule === 'weekday_mismatch')
+      || v.rule === 'frequency_mismatch' || v.rule === 'weekday_mismatch'
+      // An alternative is shown to the client; an excluded one is worth one
+      // targeted pass, because the model can simply choose another name.
+      || v.rule === 'blocked_alternative_offered')
       // A name the library does not hold cannot be saved: the write path drops
       // it, so the trainer receives a shorter session than the one previewed.
       // One targeted pass asks the model to copy a listed name instead.
@@ -366,7 +445,7 @@ function scorePlan(audit) {
   const any = (...rules) => rules.some((r) => by(r).length > 0);
 
   const components = {
-    safety: any('blocked_exercise_prescribed') ? 0
+    safety: any('blocked_exercise_prescribed') || any('blocked_alternative_offered') ? 0
       : any('caution_exercise_prescribed') ? Math.round(SCORE_WEIGHTS.safety * 0.7)
         : SCORE_WEIGHTS.safety,
     structure: SCORE_WEIGHTS.structure
@@ -499,6 +578,8 @@ module.exports = {
   parseCritique,
   describeAudit,
   planExercises,
+  planAlternatives,
+  alternativeName,
   normaliseName,
   REPS_TYPES,
   CRITIC_SYSTEM_PROMPT,

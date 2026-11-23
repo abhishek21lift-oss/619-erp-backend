@@ -60,7 +60,7 @@ const WORKOUT_PROMPT_VERSION = '2026-11-01.interview';
 // Checking the plan the model returned against the rules that shaped it.
 const {
   auditPlan, scorePlan, buildRevisionInstruction, parseCritique, describeAudit,
-  planExercises, CRITIC_SYSTEM_PROMPT,
+  planExercises, planAlternatives, CRITIC_SYSTEM_PROMPT,
 } = require('../modules/pt-os/plan-critic');
 // What we proposed before, and what the trainer did with it.
 const {
@@ -355,8 +355,8 @@ async function retrieveRagChunks(org, query, logKey, stats = null, { route = 'in
 // `stats` (optional) is an out-param object used by workout/generate for the
 // ai_generate_rag_retrieval observability event: latency and the failure
 // flag only.
-async function retrieveExerciseLibrary({ organizationId, userId, limit = 1200 }, stats = null) {
-  if (!organizationId || !userId) {
+async function retrieveExerciseLibrary({ organizationId, limit = 1200 }, stats = null) {
+  if (!organizationId) {
     if (stats) stats.exercise = { latencyMs: 0, failed: false };
     return [];
   }
@@ -371,10 +371,10 @@ async function retrieveExerciseLibrary({ organizationId, userId, limit = 1200 },
               e.beginner_notes, e.advanced_notes
        FROM exercises e
        WHERE e.deleted_at IS NULL AND e.archived_at IS NULL
-         AND (e.organization_id IS NULL OR (e.organization_id = $1::uuid AND e.created_by = $2))
+         AND (e.organization_id IS NULL OR e.organization_id = $1::uuid)
        ORDER BY e.muscle_group NULLS LAST, e.name ASC
-       LIMIT $3`,
-      [organizationId, userId, limit]
+       LIMIT $2`,
+      [organizationId, limit]
     );
     if (stats) stats.exercise = { latencyMs: Date.now() - startedAt, failed: false };
     return rows;
@@ -424,7 +424,7 @@ async function retrieveExerciseLibrary({ organizationId, userId, limit = 1200 },
 //
 // `options.retrievalStats` (optional out-param) collects retrieval
 // latency/failure metadata for the ai_generate_rag_retrieval event.
-async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRoute = 'internal', withExerciseLibrary = false, exerciseUserId = null, ragUserId = null, retrievalStats = null, withTwin = false } = {}) {
+async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRoute = 'internal', withExerciseLibrary = false, ragUserId = null, retrievalStats = null, withTwin = false } = {}) {
   // Parent first — the same org-scoped gate the shared loader uses — so the
   // knowledge-base reads below only ever run after the client is confirmed.
   const client = await loadClientRow(client_id, org);
@@ -446,7 +446,7 @@ async function loadAuthoritativeClient(client_id, org, { ragQuery = null, ragRou
       ? [retrieveRagChunks(org, ragQuery, 'ai_client_context_rag_failed', retrievalStats, { route: ragRoute, userId: ragUserId })]
       : []),
     ...(withExerciseLibrary
-      ? [retrieveExerciseLibrary({ organizationId: org, userId: exerciseUserId }, retrievalStats)]
+      ? [retrieveExerciseLibrary({ organizationId: org }, retrievalStats)]
       : []),
   ]);
 
@@ -1122,7 +1122,6 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
       ragRoute: 'workout.generate',
       ragUserId: req.user?.id,
       withExerciseLibrary: true,
-      exerciseUserId: req.user?.id,
       retrievalStats,
       withTwin: true,
     });
@@ -1452,7 +1451,7 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
 
   // EXERCISE LIBRARY (AUTHORIZED AND SCREENED): the studio's whole library
   // through the library's own tenancy predicate (built-ins shared, customs =
-  // author's org + author only), one line per exercise. The name is quoted on
+  // every trainer in the org), one line per exercise. The name is quoted on
   // its own because the model previously copied the muscle group printed
   // beside it — "Bench Press (Chest)" — and every name failed the exact-match
   // audit.
@@ -1642,8 +1641,9 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
     };
     const auditWith = async (candidate) => {
       const screened = await screenPlanExercises(
-        planExercises(candidate).map((e) => e.name),
-        { orgId: org, userId: req.user?.id, screen: twin.rules },
+        [...planExercises(candidate).map((e) => e.name),
+          ...planAlternatives(candidate).map((a) => a.name)],
+        { orgId: org, screen: twin.rules },
       );
       return auditPlan(candidate, { screened, requested });
     };
@@ -1654,10 +1654,10 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
     // ── One revision, and only one ───────────────────────────────────────
     //
     // Spent only on findings a second pass can actually fix: a prescribed
-    // exclusion, or the wrong number of training days. Minor completeness
-    // gaps are reported to the trainer instead — they are a line to fill in,
-    // not a reason to spend another generation and another thirty seconds of
-    // somebody waiting.
+    // exclusion, an excluded substitute, or the wrong number of training days.
+    // Minor completeness gaps are reported to the trainer instead — they are a
+    // line to fill in, not a reason to spend another generation and another
+    // thirty seconds of somebody waiting.
     //
     // One, because a model that ignored an explicit "replace this exercise"
     // instruction once will usually ignore it twice, and a loop that keeps

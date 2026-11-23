@@ -132,12 +132,48 @@ describe('the prescription', () => {
   });
 
   it('keeps alternatives and coaching cues as written', () => {
-    const row = one({
-      alternatives: [{ name: 'Front Squat', reason: 'wrist pain' }],
-      coaching_cues: ['brace before descending', 'knees track out'],
-    });
+    const out = materialise(
+      plan({ Monday: [ex({
+        alternatives: [{ name: 'Front Squat', reason: 'wrist pain' }],
+        coaching_cues: ['brace before descending', 'knees track out'],
+      })] }),
+      resolver(['Barbell Squat', 'Front Squat']),
+    );
+    const row = out.exercises[0];
     expect(row.alternatives).toEqual([{ name: 'Front Squat', reason: 'wrist pain' }]);
     expect(row.cues).toEqual(['brace before descending', 'knees track out']);
+  });
+
+  it('resolves an alternative to the library name, or drops it and says why', () => {
+    // A substitute is a name the client can open, so free text is not enough:
+    // it has to be a row. "Front-Squat" resolves; an invented name is reported
+    // rather than stored as a suggestion that leads nowhere.
+    const out = materialise(
+      plan({ Monday: [ex({ alternatives: ['front squat', 'Zercher Squat'] })] }),
+      resolver(['Barbell Squat', 'Front Squat']),
+    );
+    expect(out.exercises[0].alternatives).toEqual(['Front Squat']);
+    expect(out.dropped_alternatives).toEqual([{
+      day: 'Monday', position: 1, exercise: 'Barbell Squat',
+      name: 'Zercher Squat', reason: 'not in the exercise library',
+    }]);
+    expect(out.counts.alternatives_dropped).toBe(1);
+  });
+
+  it('drops a blocked alternative even though the library resolves it', () => {
+    // Existence is not permission: the audit excluded this movement for this
+    // client, and resolving it first would file a legitimate-looking option
+    // the screen had just refused.
+    const out = materialise(
+      plan({ Monday: [ex({ alternatives: ['Overhead Press', 'Front Squat'] })] }),
+      resolver(['Barbell Squat', 'Overhead Press', 'Front Squat']),
+      { blockedAlternatives: new Set([normaliseName('Overhead Press')]) },
+    );
+    expect(out.exercises[0].alternatives).toEqual(['Front Squat']);
+    expect(out.dropped_alternatives).toEqual([{
+      day: 'Monday', position: 1, exercise: 'Barbell Squat',
+      name: 'Overhead Press', reason: 'excluded for this client',
+    }]);
   });
 
   it('carries a cardio prescription into config rather than faking reps', () => {
@@ -212,7 +248,7 @@ describe('what cannot be saved', () => {
     // One name in eight is the measured rate for humans using a picker. A
     // save that quietly shortened the session would be worse than one that
     // refused, so the trainer is told what to add in the builder.
-    expect(out.counts).toEqual({ saved: 1, unresolved: 1 });
+    expect(out.counts).toEqual({ saved: 1, unresolved: 1, alternatives_dropped: 0 });
     expect(out.unresolved).toEqual([
       { day: 'Monday', position: 2, name: 'Overhead Press', reason: 'not in the exercise library' },
     ]);
@@ -383,7 +419,7 @@ describe('the plan itself', () => {
     for (const bad of [null, undefined, {}, { weekly_schedule: 'x' }]) {
       const out = materialise(bad, new Map());
       expect(out.exercises).toEqual([]);
-      expect(out.counts).toEqual({ saved: 0, unresolved: 0 });
+      expect(out.counts).toEqual({ saved: 0, unresolved: 0, alternatives_dropped: 0 });
     }
   });
 });

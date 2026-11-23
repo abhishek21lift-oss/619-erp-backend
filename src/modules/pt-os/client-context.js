@@ -510,12 +510,14 @@ function limitationsLine(twin, typed = null) {
  * with shoulder pain. A name this cannot match is left out of the result and
  * reported by the audit as unverified.
  *
- * Tenancy is the exercise library's own predicate, identical to the one the
- * prompt retrieval uses: built-ins are shared, a studio's custom exercises
- * are visible only to their author inside their own org. Fail-closed — no org
- * or no user returns an empty map, so nothing is cleared by an unscoped read.
+ * Tenancy is the exercise library's own rule (routes/exercises.js
+ * visibilityClause): built-ins are shared, a studio's custom exercises are
+ * visible to everyone in that studio. It deliberately does NOT narrow to
+ * `created_by` — the library screen shows a colleague's custom exercise, so
+ * the audit and the save path must see it too. Fail-closed: no org returns
+ * an empty map, so nothing is cleared by an unscoped read.
  */
-async function lookupExercisesByName(names = [], { orgId, userId } = {}) {
+async function lookupExercisesByName(names = [], { orgId } = {}) {
   // The prompt prints a name and then its muscle group, and a model sometimes
   // copies both: "Bench Press (Chest)". The parenthetical is decoration ONLY
   // when it names the matched row's own muscle group. A qualifier such as
@@ -533,16 +535,16 @@ async function lookupExercisesByName(names = [], { orgId, userId } = {}) {
       suffix: paren ? normaliseName(paren[1]) : '',
     });
   }
-  if (!wanted.size || !orgId || !userId) return [];
+  if (!wanted.size || !orgId) return [];
 
   const values = [...new Set([...wanted.values()].flatMap((w) => [w.key, w.base]).filter(Boolean))];
   const { rows } = await pool.query(
     `SELECT id, name, muscle_group, body_part, target_muscle, movement_pattern, equipment, difficulty
        FROM exercises
       WHERE deleted_at IS NULL AND archived_at IS NULL
-        AND (organization_id IS NULL OR (organization_id = $1::uuid AND created_by = $2))
-        AND regexp_replace(lower(btrim(name)), '[^a-z0-9]+', ' ', 'g') = ANY($3::text[])`,
-    [orgId, userId, values],
+        AND (organization_id IS NULL OR organization_id = $1::uuid)
+        AND btrim(regexp_replace(lower(btrim(name)), '[^a-z0-9]+', ' ', 'g')) = ANY($2::text[])`,
+    [orgId, values],
   );
 
   // Every spelling → its rows. Duplicates are kept: two library rows can share
@@ -584,17 +586,17 @@ async function lookupExercisesByName(names = [], { orgId, userId } = {}) {
  * the same exercise, so filing under either is correct, whereas clearing a
  * safety verdict from the more permissive twin would not be.
  */
-async function resolveExerciseNames(names = [], { orgId, userId } = {}) {
+async function resolveExerciseNames(names = [], { orgId } = {}) {
   const out = new Map();
-  for (const { key, row } of await lookupExercisesByName(names, { orgId, userId })) {
+  for (const { key, row } of await lookupExercisesByName(names, { orgId })) {
     if (!out.has(key)) out.set(key, { id: row.id, name: row.name });
   }
   return out;
 }
 
-async function screenPlanExercises(names = [], { orgId, userId, screen } = {}) {
+async function screenPlanExercises(names = [], { orgId, screen } = {}) {
   if (!screen) return new Map();
-  const matches = await lookupExercisesByName(names, { orgId, userId });
+  const matches = await lookupExercisesByName(names, { orgId });
 
   const out = new Map();
   for (const { key, row } of matches) {

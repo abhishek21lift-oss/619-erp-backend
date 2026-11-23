@@ -6,7 +6,8 @@ const { auth, requireTrainer } = require('../middleware/auth');
 const { checkTrainingEligibility } = require('../lib/screeningGate');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
 const { resolveWeek, previewWeeks, phaseOf, programmeWeek, MAX_WEEKS } = require('../modules/pt-os/progression');
-const { markAccepted, acceptGeneration } = require('../modules/pt-os/programming-memory');
+const { acceptGeneration } = require('../modules/pt-os/programming-memory');
+const { duplicatePlan } = require('../modules/pt-os/plan-duplicate');
 const { validateCardioPlanConfig } = require('../modules/pt-os/cardio');
 const logger = require('../lib/logger');
 const { today: studioToday } = require('../lib/appTime');
@@ -525,6 +526,53 @@ router.get('/plans/:id', auth, requireTrainer, async (req, res, next) => {
   }
 });
 
+// POST /api/workouts/plans/:id/duplicate
+//
+// A reusable copy: same prescription, new plan id, nobody assigned. Training
+// use is "write a block once, run it for the next client" — before this the
+// only way to reuse one was to assign the same plan to another client, which
+// coupled their prescriptions (editing it for one edited it for everyone).
+//
+// Deliberately NOT a version snapshot: version/parent_plan_id describe one
+// plan's history, and a duplicate is a new programme. It copies every stored
+// field, including the protocol blocks and block metadata.
+router.post('/plans/:id/duplicate', auth, requireTrainer, async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const source = await loadEditablePlan(req, req.params.id, client);
+    if (!source) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Workout plan not found' });
+    }
+
+    const requested = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const name = (requested || `${source.name} (copy)`).slice(0, 200);
+
+    // The source was read in this transaction, but a concurrent delete can
+    // still land between the SELECT and the copy's INSERT. null means the copy
+    // did not happen, and returning 201 with no plan would strand the caller.
+    const copy = await duplicatePlan(client, { source, name, createdBy: req.user.id });
+    if (!copy) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Workout plan not found' });
+    }
+
+    await client.query('COMMIT');
+    logger.info({ source_plan_id: source.id, plan_id: copy.plan.id, exercises: copy.copied_exercises }, 'workout_plan_duplicated');
+    res.status(201).json({
+      message: 'Workout plan duplicated',
+      plan: copy.plan,
+      copied_exercises: copy.copied_exercises,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
 // POST /api/workouts/plans
 // POST /api/workouts/plans/from-generation
 //
@@ -562,6 +610,11 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       // whatever the client was on. `keep_existing` is the trainer's explicit
       // "run both".
       keepExisting: req.body?.keep_existing === true,
+      // `assign: false` saves the proposal as an unassigned draft so it can be
+      // edited in the builder before it reaches the client. The screening gate
+      // is the assignment gate, so it runs when the assignment happens, not
+      // when the rows are written.
+      assign: req.body?.assign !== false,
       // Accepting assigns the plan, so it passes the same gate as /assign.
       gate: (clientId) => checkTrainingEligibility(req, clientId, { action: 'accept_plan', allowUnenrolled: true }),
     });
@@ -612,6 +665,7 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
     logger.info({
       generation_id: generationId, plan_id: out.plan_id,
       saved: out.saved, unresolved: out.unresolved.length,
+      alternatives_dropped: out.dropped_alternatives.length,
       assigned: out.assigned, other_active: out.other_active_assignments,
       retired: out.retired_assignments,
     }, 'workout_plan_saved_from_generation');
@@ -627,6 +681,10 @@ router.post('/plans/from-generation', auth, requireTrainer, async (req, res, nex
       name: out.name,
       saved: out.saved,
       unresolved: out.unresolved,
+      // Substitutions that could not be stored, with the reason. Part of the
+      // success payload for the same reason as `unresolved`: the trainer should
+      // not discover a missing option by opening the plan.
+      dropped_alternatives: out.dropped_alternatives,
       unknown_days: out.unknown_days,
       // Whether it is LIVE, and what else is. A saved plan that is not
       // assigned never reaches Today and no session can ever be attributed
@@ -652,6 +710,19 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
   const d = req.body;
   if (!d.name?.trim())
     return res.status(400).json({ error: 'Plan name required' });
+
+  // A generation id names ONE client's proposal, and this endpoint does not
+  // know which client the plan will be assigned to — assignment is a separate
+  // call made later. Stamping the ledger here could file client A's proposal
+  // as accepted by client B's plan, which silently poisons the trainer-edit
+  // signal the ledger exists to measure. The atomic path knows the client and
+  // writes the plan, assignment and stamp together: POST /plans/from-generation.
+  if (d.generation_id) {
+    return res.status(400).json({
+      error: 'generation_id is not accepted here — save an AI proposal with POST /api/workouts/plans/from-generation',
+      code: 'USE_FROM_GENERATION',
+    });
+  }
   const badShape = shapeError(d);
   if (badShape) return res.status(400).json({ error: badShape });
   const badCardio = nestedCardioErrors(d.exercises);
@@ -704,30 +775,6 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
            num(ex.week_number, 1), num(ex.sort_order, 0), num(ex.sets, 3), num(ex.reps, 12),
            num(ex.rest_seconds, 60), ex.notes || null, ...exerciseParams(ex)]
         );
-      }
-    }
-
-    // ── Close the loop ────────────────────────────────────────────────────
-    //
-    // When this plan came from an AI proposal, the client sends back the
-    // generation_id it was given. Linking the two is what turns a suggestion
-    // into a comparable outcome: from here the engine can ask what the
-    // trainer changed about what it proposed, which is the only feedback it
-    // has ever had about its own selection.
-    //
-    // Org-scoped inside the UPDATE rather than trusted from here, and
-    // best-effort: a plan the trainer just saved must not fail to save
-    // because its provenance could not be stamped.
-    if (d.generation_id) {
-      try {
-        const linked = await markAccepted(String(d.generation_id), id, orgIdOf(req));
-        if (!linked) {
-          // Already linked, another studio's row, or an id that never existed.
-          // Worth a line, never worth an error: the plan is saved either way.
-          logger.warn({ generation_id: d.generation_id, plan_id: id }, 'workout_plan_generation_link_missed');
-        }
-      } catch (err) {
-        logger.warn({ err: err.message }, 'workout_plan_generation_link_failed');
       }
     }
 
@@ -875,10 +922,16 @@ router.post('/plans/:id/versions', auth, requireTrainer, async (req, res, next) 
          id, name, description, goal, difficulty, duration_weeks, sessions_per_week,
          is_template, is_active, created_by, organization_id,
          progression_type, progression_amount, progression_every_weeks,
+         warmup_protocol, mobility_protocol, cooldown_protocol,
+         periodization_model, split_name, block_phases,
+         deload_every_weeks, deload_intensity_pct,
          version, parent_plan_id)
        SELECT $1, name, description, goal, difficulty, duration_weeks, sessions_per_week,
               false, false, $2, organization_id,
               progression_type, progression_amount, progression_every_weeks,
+              warmup_protocol, mobility_protocol, cooldown_protocol,
+              periodization_model, split_name, block_phases,
+              deload_every_weeks, deload_intensity_pct,
               version, id
          FROM workout_plans WHERE id = $3`,
       [snapshotId, req.user.id, req.params.id]
@@ -891,10 +944,12 @@ router.post('/plans/:id/versions', auth, requireTrainer, async (req, res, next) 
       `INSERT INTO workout_exercises (
          id, workout_plan_id, exercise_id, day_of_week, week_number, sort_order,
          sets, reps, rest_seconds, notes,
-         target_weight, tempo, rpe, warmup_sets, superset_group, config)
+         target_weight, tempo, rpe, rir, warmup_sets, superset_group,
+         alternatives, cues, config)
        SELECT gen_random_uuid()::text, $1, exercise_id, day_of_week, week_number, sort_order,
               sets, reps, rest_seconds, notes,
-              target_weight, tempo, rpe, warmup_sets, superset_group, config
+              target_weight, tempo, rpe, rir, warmup_sets, superset_group,
+              alternatives, cues, config
          FROM workout_exercises WHERE workout_plan_id = $2`,
       [snapshotId, req.params.id]
     );

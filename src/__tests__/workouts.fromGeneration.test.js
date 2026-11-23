@@ -132,6 +132,76 @@ describe('saving a proposal', () => {
     expect(res.status).toBe(201);
   });
 
+  it('resolves alternatives and reports the ones it cannot keep', async () => {
+    mockDb({
+      generation: {
+        id: 'gen-1', client_id: 'cl-1', accepted_plan_id: null,
+        proposed_plan: {
+          ...PROPOSED,
+          weekly_schedule: {
+            Monday: { exercises: [{
+              name: 'Bench Press', sets: 4, reps: '8-10',
+              alternatives: ['Incline Bench Press', 'Zercher Squat'],
+            }] },
+            Thursday: { exercises: [{ name: 'Bench Press', sets: 3, reps: '10' }] },
+          },
+        },
+      },
+      library: [
+        { id: 'ex-bench', name: 'Bench Press' },
+        { id: 'ex-incline', name: 'Incline Bench Press' },
+      ],
+    });
+
+    const res = await post();
+    expect(res.status).toBe(201);
+    // "incline bench press" resolves to the library's own spelling; the
+    // invented name is dropped and reported rather than saved as a dead link.
+    const insert = pool.query.mock.calls.find(([s]) => /INSERT INTO workout_exercises/.test(String(s)));
+    expect(JSON.parse(insert[1][16])).toEqual(['Incline Bench Press']);
+    expect(res.body.dropped_alternatives).toEqual([{
+      day: 'Monday', position: 1, exercise: 'Bench Press',
+      name: 'Zercher Squat', reason: 'not in the exercise library',
+    }]);
+  });
+
+  it('drops an alternative the frozen audit excluded, even though the library has it', async () => {
+    mockDb({
+      generation: {
+        id: 'gen-1', client_id: 'cl-1', accepted_plan_id: null,
+        proposed_plan: {
+          ...PROPOSED,
+          weekly_schedule: {
+            Monday: { exercises: [{
+              name: 'Bench Press', sets: 4, reps: '8-10',
+              alternatives: ['Incline Bench Press'],
+            }] },
+            Thursday: { exercises: [{ name: 'Bench Press', sets: 3, reps: '10' }] },
+          },
+        },
+        audit: {
+          violations: [{
+            severity: 'major', rule: 'blocked_alternative_offered',
+            where: 'Monday #1 Bench Press', alternative: 'Incline Bench Press',
+            detail: 'excluded for this client',
+          }],
+        },
+      },
+      library: [
+        { id: 'ex-bench', name: 'Bench Press' },
+        { id: 'ex-incline', name: 'Incline Bench Press' },
+      ],
+    });
+
+    const res = await post();
+    expect(res.body.dropped_alternatives).toEqual([{
+      day: 'Monday', position: 1, exercise: 'Bench Press',
+      name: 'Incline Bench Press', reason: 'excluded for this client',
+    }]);
+    const insert = pool.query.mock.calls.find(([s]) => /INSERT INTO workout_exercises/.test(String(s)));
+    expect(insert[1][16]).toBeNull();
+  });
+
   it('lets the trainer name the programme', async () => {
     const res = await post({ generation_id: 'gen-1', name: '  Priya — Block 2  ' });
     expect(res.body.name).toBe('Priya — Block 2');
@@ -386,10 +456,10 @@ describe('the proposal has to actually reach the client', () => {
     expect(count).toMatch(/end_date IS NULL OR end_date >= \$3::date/);
   });
 
-  it('resolves custom exercises as the trainer who generated the plan', async () => {
-    // A custom library row is visible only to its creator. Resolving with the
-    // accepting trainer's id made another trainer's generation report its own
-    // custom exercises as "not in the library".
+  it('resolves custom exercises through the studio-wide library, not the generator', async () => {
+    // Custom rows used to be narrowed to `created_by = <generator>`, so a
+    // colleague accepting the proposal saw them vanish. The library screen
+    // shows the whole studio its custom exercises; this lookup must match it.
     mockDb({
       generation: {
         id: 'gen-1', client_id: 'cl-1', created_by: 'u-generator',
@@ -399,7 +469,9 @@ describe('the proposal has to actually reach the client', () => {
 
     await post();
     const lookup = pool.query.mock.calls.find(([s]) => /FROM exercises/.test(String(s)));
-    expect(lookup[1][1]).toBe('u-generator');
+    expect(String(lookup[0])).toContain('(organization_id IS NULL OR organization_id = $1::uuid)');
+    expect(String(lookup[0])).not.toContain('created_by');
+    expect(lookup[1]).toEqual([ORG, ['bench press', 'overhead press']]);
   });
 
   it('writes no assignment when the save fails', async () => {
@@ -431,6 +503,30 @@ describe('the proposal has to actually reach the client', () => {
 // Accepting a proposal ASSIGNS it, so it passes the same live PAR-Q / consent
 // gate as POST /assign. The gate ran only when the plan was generated, so a
 // client blocked since then could still be handed the programme.
+describe('saving as a draft', () => {
+  const { checkTrainingEligibility } = require('../lib/screeningGate');
+
+  // The workflow fix for "the plan goes live before the trainer can fix it":
+  // write the rows unassigned, edit in the builder, assign when the plan is
+  // actually ready. The screening gate belongs to that later assignment.
+  it('writes the plan without assigning it or running the assignment gate', async () => {
+    checkTrainingEligibility.mockClear();
+
+    const res = await post({ generation_id: 'gen-1', assign: false });
+
+    expect(res.status).toBe(201);
+    expect(res.body.assigned).toBe(false);
+    expect(res.body.assignment_id).toBeNull();
+    expect(sqls().some((s) => /INSERT INTO workout_assignments/.test(s))).toBe(false);
+    expect(sqls().some((s) => /UPDATE workout_assignments/.test(s))).toBe(false);
+    expect(checkTrainingEligibility).not.toHaveBeenCalled();
+
+    // The proposal is still saved and still stamped: it became a real plan.
+    expect(sqls().some((s) => /INSERT INTO workout_plans/.test(s))).toBe(true);
+    expect(sqls().some((s) => /UPDATE ai_workout_generations/.test(s))).toBe(true);
+  });
+});
+
 describe('the screening gate, at accept time', () => {
   const { checkTrainingEligibility } = require('../lib/screeningGate');
   afterEach(() => checkTrainingEligibility.mockImplementation(async () => ({ blocked: null, warnings: [] })));

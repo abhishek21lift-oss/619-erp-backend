@@ -531,46 +531,101 @@ describe('cardio prescriptions cannot bypass validation through whole-plan write
   });
 });
 
-describe('closing the loop — a saved plan remembers the proposal it came from', () => {
-  // Until migration 199 nothing recorded that a plan had come from the AI, so
-  // the moment one was saved it became indistinguishable from a plan a trainer
-  // typed by hand — and "what did the trainer change about what we suggested"
-  // had no answer at all. 95 generations had produced 9 live plans.
+describe('provenance — only the path that knows the client may stamp a proposal', () => {
+  // POST /plans used to accept a generation_id and stamp it after writing the
+  // plan. It cannot know which client the plan will later be assigned to, so
+  // one client's proposal could be filed as accepted by another client's plan.
+  // That corrupts the only signal the engine has about its own suggestions.
+  // The atomic path is /plans/from-generation, which reads the client from the
+  // ledger and writes the plan, assignment and stamp together.
 
-  it('stamps the generation when the client sends one back', async () => {
+  it('refuses a generation id and writes nothing', async () => {
     mockUser = TRAINER_A;
     const res = await request(app).post('/api/workouts/plans')
       .send({ name: 'From AI', generation_id: 'gen-7' });
 
-    expect(res.status).toBe(201);
-    const link = pool.query.mock.calls.find(([sql]) =>
-      /UPDATE ai_workout_generations/.test(String(sql)));
-    expect(link).toBeDefined();
-    // Org-scoped inside the UPDATE rather than trusted from the route: a write
-    // that relies on its caller having checked is one bad caller away from
-    // letting one studio stamp another's row.
-    expect(String(link[0]).replace(/\s+/g, ' ')).toMatch(/organization_id = \$3/);
-    expect(link[1][2]).toBe(ORG_A);
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('USE_FROM_GENERATION');
+    expect(sqls().some((s) => /INSERT INTO workout_plans/.test(s))).toBe(false);
+    expect(sqls().some((s) => /ai_workout_generations/.test(s))).toBe(false);
   });
 
   it('does not touch the ledger when the plan was written by hand', async () => {
     mockUser = TRAINER_A;
-    await request(app).post('/api/workouts/plans').send({ name: 'Hand written' });
+    const res = await request(app).post('/api/workouts/plans').send({ name: 'Hand written' });
+    expect(res.status).toBe(201);
     expect(sqls().some((s) => /ai_workout_generations/.test(s))).toBe(false);
   });
+});
 
-  it('still saves the plan when the stamp fails', async () => {
+describe('duplicating a plan', () => {
+  // Reuse used to mean assigning the SAME plan to several clients, which
+  // coupled their prescriptions. A duplicate is an independent, unassigned
+  // copy.
+
+  const mockSource = () => {
+    pool.query.mockImplementation((sql) => {
+      const s = String(sql).replace(/\s+/g, ' ');
+      if (/SELECT wp\.\* FROM workout_plans wp WHERE wp\.id/.test(s)) {
+        return Promise.resolve({ rows: [{ id: PLAN, name: 'Push Day', organization_id: ORG_A }] });
+      }
+      if (/INSERT INTO workout_plans/.test(s)) {
+        return Promise.resolve({ rows: [{ id: 'plan-copy', name: 'Push Day (copy)' }] });
+      }
+      if (/INSERT INTO workout_exercises/.test(s)) {
+        return Promise.resolve({ rows: [], rowCount: 4 });
+      }
+      return Promise.resolve({ rows: [], rowCount: 1 });
+    });
+  };
+
+  it('creates an unassigned copy and copies every stored exercise', async () => {
     mockUser = TRAINER_A;
-    pool.query.mockImplementation((sql) => (/ai_workout_generations/.test(String(sql))
-      ? Promise.reject(new Error('ledger down'))
-      : Promise.resolve({ rows: [{ id: PLAN, organization_id: ORG_A }] })));
+    mockSource();
 
-    const res = await request(app).post('/api/workouts/plans')
-      .send({ name: 'From AI', generation_id: 'gen-7' });
+    const res = await request(app).post(`/api/workouts/plans/${PLAN}/duplicate`).send({});
 
-    // The trainer just saved this. Provenance bookkeeping must never be the
-    // reason their work does not persist.
     expect(res.status).toBe(201);
+    expect(res.body.plan.name).toBe('Push Day (copy)');
+    expect(res.body.copied_exercises).toBe(4);
+
+    const newPlan = sqls().find((s) => /INSERT INTO workout_plans/.test(s));
+    expect(newPlan).toMatch(/FROM workout_plans WHERE id = \$4/);
+    // A duplicate is a new programme, not a version of the old one.
+    expect(newPlan).toMatch(/false, true, \$3, organization_id, 1, NULL/);
+    // The protocol blocks and block metadata are part of the programme, not
+    // decoration; a copy missing them is a different plan.
+    expect(newPlan).toMatch(/warmup_protocol, mobility_protocol, cooldown_protocol/);
+    expect(newPlan).toMatch(/periodization_model, split_name, block_phases/);
+    expect(newPlan).toMatch(/deload_every_weeks, deload_intensity_pct/);
+
+    const copied = sqls().find((s) => /INSERT INTO workout_exercises/.test(s));
+    expect(copied).toMatch(/SELECT gen_random_uuid\(\)::text, \$1, exercise_id/);
+    expect(copied).toMatch(/rir/);
+    expect(copied).toMatch(/alternatives, cues, config/);
+    expect(copied).toMatch(/WHERE workout_plan_id = \$2/);
+  });
+
+  it('honours a requested name', async () => {
+    mockUser = TRAINER_A;
+    mockSource();
+
+    await request(app).post(`/api/workouts/plans/${PLAN}/duplicate`)
+      .send({ name: '  Upper / Lower — Block 2  ' });
+
+    const insert = pool.query.mock.calls.find(([s]) => /INSERT INTO workout_plans/.test(String(s)));
+    expect(insert[1][1]).toBe('Upper / Lower — Block 2');
+  });
+
+  it('refuses another studio\'s plan and copies nothing', async () => {
+    mockUser = TRAINER_A;
+    pool.query.mockResolvedValue({ rows: [] });
+
+    const res = await request(app).post(`/api/workouts/plans/${PLAN}/duplicate`).send({});
+
+    expect(res.status).toBe(404);
+    expect(sqls().some((s) => /INSERT INTO workout_plans/.test(s))).toBe(false);
+    expect(sqls().some((s) => /INSERT INTO workout_exercises/.test(s))).toBe(false);
   });
 });
 

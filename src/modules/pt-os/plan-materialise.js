@@ -36,7 +36,7 @@
 // Pure functions, no database: the mapping is where this can be wrong, and it
 // is testable directly.
 
-const { planExercises, normaliseName, REPS_TYPES } = require('./plan-critic');
+const { planExercises, normaliseName, alternativeName, REPS_TYPES } = require('./plan-critic');
 const { classifyGoal } = require('./goal-classification');
 
 /** 1 = Monday, matching workout_exercises.day_of_week and the builder's tabs. */
@@ -178,11 +178,46 @@ function protocolFor(value) {
   return t ? [t] : null;
 }
 
-/** Per-exercise lists (alternatives, cues), kept as written. */
+/** Per-exercise lists (cues), kept as written. */
 function listFor(value) {
   if (Array.isArray(value)) return value.length ? value : null;
   const t = text(value);
   return t ? [t] : null;
+}
+
+/**
+ * Alternatives mapped onto library names.
+ *
+ * A stored alternative is a name the client may substitute, so it has to be a
+ * name the library can open and the screen has judged. The generator writes
+ * free text, so an alternative that does not resolve is dropped and reported
+ * rather than saved as a dangling suggestion. `{ name, reason }` keeps its
+ * reason; only the name is canonicalised.
+ *
+ * `blocked` comes from the frozen audit on the generation. It is checked
+ * before the resolver because a blocked exercise DOES exist in the library —
+ * resolving first would file it as a legitimate substitute.
+ */
+function alternativesFor(ex, resolver, blocked) {
+  const list = Array.isArray(ex?.alternatives) ? ex.alternatives : [];
+  const kept = [];
+  const dropped = [];
+  for (const item of list) {
+    const name = alternativeName(item);
+    if (!name) continue;
+    const key = normaliseName(name);
+    if (blocked.has(key)) {
+      dropped.push({ name, reason: 'excluded for this client' });
+      continue;
+    }
+    const hit = resolver.get(key);
+    if (!hit) {
+      dropped.push({ name, reason: 'not in the exercise library' });
+      continue;
+    }
+    kept.push(typeof item === 'string' ? hit.name : { ...item, name: hit.name });
+  }
+  return { kept: kept.length ? kept : null, dropped };
 }
 
 /**
@@ -214,10 +249,15 @@ function progressionFor(plan) {
  *                           library, built by the caller through the library's
  *                           own tenancy predicate. Nothing here reads the
  *                           database, so nothing here can widen it.
+ * @param {object=} options
+ * @param {Set<string>=} options.blockedAlternatives
+ *        Normalised names the frozen audit excluded for this client. Their
+ *        alternatives are dropped even though the library can resolve them.
  */
-function materialise(plan, resolver = new Map()) {
+function materialise(plan, resolver = new Map(), { blockedAlternatives = new Set() } = {}) {
   const rows = [];
   const unresolved = [];
+  const droppedAlternatives = [];
   const unknownDays = new Set();
 
   // Sort order is per day, so slot 3 on Tuesday is Tuesday's third exercise —
@@ -250,6 +290,12 @@ function materialise(plan, resolver = new Map()) {
     nextSort.set(day, sort + 1);
     const effort = parseEffort(ex.rir_or_rpe);
     const warmup = num(ex.warmup_sets);
+    const alternatives = alternativesFor(ex, resolver, blockedAlternatives);
+    for (const d of alternatives.dropped) {
+      droppedAlternatives.push({
+        day: ex.day, position: ex.position, exercise: ex.name || '(unnamed)', ...d,
+      });
+    }
 
     rows.push({
       exercise_id: hit.id,
@@ -269,7 +315,7 @@ function materialise(plan, resolver = new Map()) {
       target_weight: num(ex.target_weight ?? ex.weight),
       warmup_sets: warmup !== null && warmup >= 0 && warmup <= 20 ? Math.round(warmup) : null,
       superset_group: text(ex.superset_group) || null,
-      alternatives: listFor(ex.alternatives),
+      alternatives: alternatives.kept,
       cues: listFor(ex.cues ?? ex.coaching_cues),
       notes: notesFor(ex),
       config: configFor(ex),
@@ -305,8 +351,15 @@ function materialise(plan, resolver = new Map()) {
     // fault, and a save that quietly dropped them would be worse than one
     // that refused.
     unresolved,
+    // The same honesty for substitutions: a name the library cannot open, or
+    // one the screen excluded, is not stored as a broken suggestion.
+    dropped_alternatives: droppedAlternatives,
     unknown_days: [...unknownDays],
-    counts: { saved: rows.length, unresolved: unresolved.length },
+    counts: {
+      saved: rows.length,
+      unresolved: unresolved.length,
+      alternatives_dropped: droppedAlternatives.length,
+    },
   };
 }
 

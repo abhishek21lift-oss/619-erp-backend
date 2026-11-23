@@ -214,6 +214,74 @@ describe('safety', () => {
   });
 });
 
+describe('alternatives', () => {
+  // The member app prints alternatives under the prescribed movement, so a
+  // blocked exercise offered there is a real safety surface even though it is
+  // not this session's dosage.
+
+  it('flags an alternative the screen excluded', () => {
+    const p = plan({
+      weekly_schedule: {
+        Monday: { name: 'Lower', focus: 'Legs', exercises: [ex({
+          name: 'Barbell Squat',
+          alternatives: ['Overhead Press', 'Leg Press'],
+        })] },
+        Thursday: { name: 'Upper', focus: 'Chest', exercises: [ex({ name: 'Bench Press' })] },
+      },
+    });
+    const a = audit(p, screenedMap([
+      ['Barbell Squat', 'allow'], ['Bench Press', 'allow'],
+      ['Overhead Press', 'block', 'shoulder pain'], ['Leg Press', 'allow'],
+    ]));
+    const v = a.violations.find((x) => x.rule === 'blocked_alternative_offered');
+    expect(v).toBeTruthy();
+    expect(v.severity).toBe(SEVERITY.MAJOR);
+    expect(v.alternative).toBe('Overhead Press');
+    expect(v.detail).toContain('shoulder pain');
+    // Worth one targeted pass: choosing another name is a cheap fix.
+    expect(a.needs_revision).toBe(true);
+    // A blocked substitute is still a blocked movement offered to the client.
+    expect(scorePlan(a).components.safety).toBe(0);
+  });
+
+  it('reads { name, reason } alternatives copied out of a saved plan', () => {
+    const p = plan({
+      weekly_schedule: {
+        Monday: { name: 'Lower', focus: 'Legs', exercises: [ex({
+          name: 'Barbell Squat',
+          alternatives: [{ name: 'Front Squat', reason: 'wrist pain' }],
+        })] },
+        Thursday: { name: 'Upper', focus: 'Chest', exercises: [ex({ name: 'Bench Press' })] },
+      },
+    });
+    const a = audit(p, screenedMap([
+      ['Barbell Squat', 'allow'], ['Bench Press', 'allow'], ['Front Squat', 'block', 'wrist'],
+    ]));
+    expect(a.violations.find((x) => x.rule === 'blocked_alternative_offered').alternative)
+      .toBe('Front Squat');
+  });
+
+  it('reports an unknown alternative without treating it as a missing prescription', () => {
+    const p = plan({
+      weekly_schedule: {
+        Monday: { name: 'Lower', focus: 'Legs', exercises: [ex({
+          name: 'Barbell Squat', alternatives: ['Front Squat'],
+        })] },
+        Thursday: { name: 'Upper', focus: 'Chest', exercises: [ex({ name: 'Bench Press' })] },
+      },
+    });
+    const a = audit(p, CLEAN);
+    expect(a.unverified).toEqual([]);
+    expect(a.unverified_alternatives).toEqual([
+      { day: 'Monday', position: 1, exercise: 'Barbell Squat', name: 'Front Squat' },
+    ]);
+    expect(a.counts.alternatives).toBe(1);
+    expect(a.counts.unverified_alternatives).toBe(1);
+    // An alternative is optional; an unknown one must not cost a generation.
+    expect(a.needs_revision).toBe(false);
+  });
+});
+
 describe('structure', () => {
   it('catches the wrong number of training days', () => {
     const a = audit(plan(), CLEAN, { training_days: 4, duration_weeks: 8 });
