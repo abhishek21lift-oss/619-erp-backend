@@ -68,6 +68,12 @@ exercises
   - `POST /api/workouts/plans/:id/duplicate` copies a studio-owned plan and every
     stored exercise field into a new, unassigned plan. It is a copy, not a
     version: `version = 1`, `parent_plan_id = NULL`.
+  - Generated exercise names resolve by normalised exact name. `exercise_aliases`
+    (migration 287) carries written synonyms — built-in (`organization_id NULL`)
+    or studio-scoped — that the audit and save path consult only when no library
+    name matches; trigram/fuzzy matching is deliberately not used. Saved
+    alternatives keep `{ name, exercise_id, reason }` so a substitute opens the
+    exact library row.
 - **UI:** `/pt-os/workout-plans` (index, labelled "Workouts"),
   `/pt-os/workout-plans/[id]`, `/pt-os/workout-plans/[id]/builder`,
   `/pt-os/workout-plans/[id]/builder/add-exercises`, `/pt-os/workout-log`,

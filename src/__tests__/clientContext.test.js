@@ -416,6 +416,84 @@ describe('screening the exercises a plan actually named', () => {
     expect(pool.query).not.toHaveBeenCalled();
   });
 
+  /**
+   * A pool that answers name rows and alias rows separately.
+   *
+   * The two are distinct queries, and an alias is only consulted when the
+   * name query came back empty — so the fake has to answer both or the test
+   * would prove nothing about the path it names.
+   */
+  function mockAliasLibrary({ rows = [], aliases = [] } = {}) {
+    pool.query.mockReset();
+    pool.query.mockImplementation((sql) => Promise.resolve({
+      rows: /FROM exercise_aliases/.test(sql) ? aliases : (/FROM exercises/.test(sql) ? rows : []),
+    }));
+  }
+
+  const SEATED_ROW = {
+    id: 'ex-seated-rows', name: 'Seated Cable Rows', muscle_group: 'Back',
+    target_muscle: 'Middle Back', movement_pattern: 'Horizontal Pull',
+    equipment: 'Cable', difficulty: 'beginner',
+    normalized: 'seated cable row', alias_org: null,
+  };
+
+  it('resolves a synonym somebody wrote down, instead of failing the name', async () => {
+    // Production's historical miss was "Seated Cable Row" against the
+    // library's plural. An alias is an explicit equivalence, not a similarity
+    // score — the resolver still maps one spelling to exactly one row.
+    mockAliasLibrary({ aliases: [SEATED_ROW] });
+    const map = await resolveExerciseNames(['Seated Cable Row'], { orgId: 'org-1' });
+    expect(map.get('seated cable row')).toEqual({ id: 'ex-seated-rows', name: 'Seated Cable Rows' });
+  });
+
+  it('does not consult aliases when a library name already matches', async () => {
+    mockAliasLibrary({
+      rows: [{ ...LEG_PRESS_MACHINE, id: 'ex-leg-press' }],
+      aliases: [{ ...LEG_PRESS_MACHINE, id: 'ex-other', normalized: 'leg press', alias_org: null }],
+    });
+    const map = await resolveExerciseNames(['Leg Press'], { orgId: 'org-1' });
+    expect(map.get('leg press')).toEqual({ id: 'ex-leg-press', name: 'Leg Press' });
+    // One query: a name match settles the spelling, so the alias table is
+    // never asked and cannot override the row the library actually holds.
+    expect(pool.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('prefers the studio\'s own alias over the built-in one', async () => {
+    mockAliasLibrary({
+      aliases: [
+        { ...SEATED_ROW, id: 'ex-global', name: 'Global Cable Row' },
+        { ...SEATED_ROW, id: 'ex-studio', name: 'Studio Cable Row', alias_org: 'org-1' },
+      ],
+    });
+    const map = await resolveExerciseNames(['Seated Cable Row'], { orgId: 'org-1' });
+    expect(map.get('seated cable row')).toEqual({ id: 'ex-studio', name: 'Studio Cable Row' });
+  });
+
+  it('scopes the alias read on both the alias and the exercise it names', async () => {
+    mockAliasLibrary({ aliases: [SEATED_ROW] });
+    await resolveExerciseNames(['Seated Cable Row'], { orgId: 'org-1' });
+    const aliasCall = pool.query.mock.calls.find(([sql]) => /FROM exercise_aliases/.test(String(sql)));
+    expect(aliasCall).toBeDefined();
+    const [sql, params] = aliasCall;
+    expect(String(sql)).toContain('(a.organization_id IS NULL OR a.organization_id = $1::uuid)');
+    expect(String(sql)).toContain('(e.organization_id IS NULL OR e.organization_id = $1::uuid)');
+    expect(String(sql)).toMatch(/e\.deleted_at IS NULL AND e\.archived_at IS NULL/);
+    expect(params).toEqual(['org-1', ['seated cable row']]);
+  });
+
+  it('screens an aliased movement with the same verdict as its canonical name', async () => {
+    // The alias resolves to a machine leg press; a studio with no machines
+    // blocks it. If screening skipped aliases, the audit would call an
+    // unavailable substitute safe.
+    mockAliasLibrary({
+      aliases: [{ ...LEG_PRESS_MACHINE, id: 'ex-leg-press', normalized: 'leg press machine', alias_org: null }],
+    });
+    const out = await screenPlanExercises(['Leg Press Machine'], {
+      orgId: 'org-1', screen: screenFor(['Bodyweight']),
+    });
+    expect(out.get('leg press machine').verdict).toBe('block');
+  });
+
   it('sees a colleague\'s custom exercise, as the library screen does', async () => {
     // The old predicate narrowed custom rows to `created_by = <caller>`; the
     // library screen (routes/exercises.js visibilityClause) shows every

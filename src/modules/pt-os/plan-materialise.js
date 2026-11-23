@@ -192,7 +192,8 @@ function listFor(value) {
  * name the library can open and the screen has judged. The generator writes
  * free text, so an alternative that does not resolve is dropped and reported
  * rather than saved as a dangling suggestion. `{ name, reason }` keeps its
- * reason; only the name is canonicalised.
+ * reason; the name is canonicalised and `exercise_id` is added so a surface can
+ * open the row instead of matching its display name again.
  *
  * `blocked` comes from the frozen audit on the generation. It is checked
  * before the resolver because a blocked exercise DOES exist in the library —
@@ -215,7 +216,9 @@ function alternativesFor(ex, resolver, blocked) {
       dropped.push({ name, reason: 'not in the exercise library' });
       continue;
     }
-    kept.push(typeof item === 'string' ? hit.name : { ...item, name: hit.name });
+    kept.push(typeof item === 'string'
+      ? { name: hit.name, exercise_id: hit.id }
+      : { ...item, name: hit.name, exercise_id: hit.id });
   }
   return { kept: kept.length ? kept : null, dropped };
 }

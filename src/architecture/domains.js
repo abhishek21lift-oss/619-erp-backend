@@ -242,6 +242,7 @@ const DOMAINS = {
     // registry answers "what does this domain own", and it owns none of them.
     tables: [
       'exercises', 'exercise_categories', 'exercise_muscles', 'exercise_relations',
+      'exercise_aliases',
       'exercise_versions', 'exercise_favorites', 'exercise_recent_usage',
       'muscles', 'muscle_volume_landmarks', 'equipment_types',
       'workout_plans', 'workout_exercises', 'workout_assignments',

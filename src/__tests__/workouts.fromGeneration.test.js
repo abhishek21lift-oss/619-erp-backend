@@ -158,7 +158,9 @@ describe('saving a proposal', () => {
     // "incline bench press" resolves to the library's own spelling; the
     // invented name is dropped and reported rather than saved as a dead link.
     const insert = pool.query.mock.calls.find(([s]) => /INSERT INTO workout_exercises/.test(String(s)));
-    expect(JSON.parse(insert[1][16])).toEqual(['Incline Bench Press']);
+    expect(JSON.parse(insert[1][16])).toEqual([
+      { name: 'Incline Bench Press', exercise_id: 'ex-incline' },
+    ]);
     expect(res.body.dropped_alternatives).toEqual([{
       day: 'Monday', position: 1, exercise: 'Bench Press',
       name: 'Zercher Squat', reason: 'not in the exercise library',
