@@ -140,7 +140,9 @@ describe('the prescription', () => {
       resolver(['Barbell Squat', 'Front Squat']),
     );
     const row = out.exercises[0];
-    expect(row.alternatives).toEqual([{ name: 'Front Squat', reason: 'wrist pain' }]);
+    // The id is carried alongside the name so the builder/member surface can
+    // open the exact library row instead of matching the display text again.
+    expect(row.alternatives).toEqual([{ name: 'Front Squat', exercise_id: 'ex-front-squat', reason: 'wrist pain' }]);
     expect(row.cues).toEqual(['brace before descending', 'knees track out']);
   });
 
@@ -152,7 +154,7 @@ describe('the prescription', () => {
       plan({ Monday: [ex({ alternatives: ['front squat', 'Zercher Squat'] })] }),
       resolver(['Barbell Squat', 'Front Squat']),
     );
-    expect(out.exercises[0].alternatives).toEqual(['Front Squat']);
+    expect(out.exercises[0].alternatives).toEqual([{ name: 'Front Squat', exercise_id: 'ex-front-squat' }]);
     expect(out.dropped_alternatives).toEqual([{
       day: 'Monday', position: 1, exercise: 'Barbell Squat',
       name: 'Zercher Squat', reason: 'not in the exercise library',
@@ -169,7 +171,7 @@ describe('the prescription', () => {
       resolver(['Barbell Squat', 'Overhead Press', 'Front Squat']),
       { blockedAlternatives: new Set([normaliseName('Overhead Press')]) },
     );
-    expect(out.exercises[0].alternatives).toEqual(['Front Squat']);
+    expect(out.exercises[0].alternatives).toEqual([{ name: 'Front Squat', exercise_id: 'ex-front-squat' }]);
     expect(out.dropped_alternatives).toEqual([{
       day: 'Monday', position: 1, exercise: 'Barbell Squat',
       name: 'Overhead Press', reason: 'excluded for this client',
