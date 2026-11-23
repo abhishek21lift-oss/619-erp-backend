@@ -285,7 +285,69 @@ async function getDashboardStats(scope = {}) {
     ORDER BY month ASC
   `, orgParams);
 
-  return { ...totals, revenueTrend };
+  // A studio with no active or expired terms is either brand new or still
+  // enrolling its first client. Only then does the setup checklist need a
+  // count of what is already done; an established studio pays nothing for it.
+  const setup = totals.active_pt_clients === 0 && totals.expired_clients === 0
+    ? await getSetupProgress(scope)
+    : null;
+
+  return { ...totals, revenueTrend, setup };
+}
+
+/**
+ * First-run setup progress, one row.
+ *
+ * The dashboard's setup card used to be three static instructions. It can now
+ * say which of them the studio has already finished:
+ *
+ *   clients_added    every non-deleted client, enrolled or not
+ *   intake_complete  a client with a completed Informed Consent AND a
+ *                    submitted/reviewed PAR-Q (drafts do not count)
+ *   plan_assigned    a client with an active workout assignment
+ *
+ * Deliberately a count, not a boolean: a studio with two clients may have
+ * finished intake for one of them, and the card should still show that step
+ * as done. `intake_complete` means the paperwork was submitted, not that the
+ * PAR-Q cleared — a blocked PAR-Q is a medical-clearance task, not missing
+ * intake, and the Screening gaps card already names it.
+ *
+ * Set-based rather than a per-client loop: the same definitions the client
+ * journey uses (completed consent, non-draft PAR-Q, active assignment), so
+ * the checklist and the client record cannot disagree about "done".
+ */
+async function getSetupProgress(scope = {}) {
+  const { rows: [setup] } = await pool.query(`
+    SELECT
+      COUNT(*)::INT AS clients_added,
+      COUNT(*) FILTER (
+        WHERE EXISTS (
+          SELECT 1 FROM pt_informed_consents ic
+           WHERE ic.client_id = c.id
+             AND ic.organization_id = c.organization_id
+             AND ic.status = 'completed'
+        )
+        AND EXISTS (
+          SELECT 1 FROM pt_parq_forms f
+           WHERE f.client_id = c.id
+             AND f.organization_id = c.organization_id
+             AND f.deleted_at IS NULL
+             AND COALESCE(f.status, 'submitted') <> 'draft'
+        )
+      )::INT AS intake_complete,
+      COUNT(*) FILTER (
+        WHERE EXISTS (
+          SELECT 1 FROM workout_assignments wa
+           WHERE wa.client_id = c.id
+             AND wa.organization_id = c.organization_id
+             AND wa.status = 'active'
+        )
+      )::INT AS plan_assigned
+    FROM pt_clients c
+    WHERE c.deleted_at IS NULL
+      AND c.organization_id = $1
+  `, [scope.orgId]);
+  return setup;
 }
 
 /**
@@ -1317,6 +1379,7 @@ module.exports = {
   getClientAttendance,
   getClientPayments,
   getDashboardStats,
+  getSetupProgress,
   getOpsSummary,
   getTrainerSchedule,
   getTrainerWorkload,
