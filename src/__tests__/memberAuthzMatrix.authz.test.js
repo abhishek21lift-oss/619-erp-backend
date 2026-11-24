@@ -129,7 +129,7 @@ const MEMBER_MAY = {
   'GET /api/diet/supplements': 'Shared supplement reference library, same shape as meals.',
   'GET /api/diet/templates': 'Shared diet templates. Studio and platform content, carrying no client rows.',
   'GET /api/exercises/': 'The exercise library a member\'s own workout is built from. Platform and studio reference content.',
-  'GET /api/exercises/check-name': 'Name-availability probe against that same library; returns a boolean, no client data.',
+  'GET /api/exercises/check-name': 'Name-availability probe scoped to the shared library plus the caller\'s own studio; it returns a conflict only for a row the caller can already see.',
   'GET /api/exercises/1/versions': 'Edit history of a library exercise. Library content, and canEdit() still governs every mutation.',
   'GET /api/exercises/favorites': "The caller's OWN favourited exercises, keyed by user id.",
   'GET /api/exercises/recent': "The caller's OWN recently-used exercises, keyed by user id.",

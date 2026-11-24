@@ -32,7 +32,7 @@ jest.mock('../db/pool', () => ({
     query: jest.fn(async (sql, params) => {
       const flat = String(sql).replace(/\s+/g, ' ').trim();
       queries.push({ sql: flat, params });
-      if (/SELECT id, name FROM exercises/i.test(flat)) {
+      if (/SELECT e\.id, e\.name FROM exercises e/i.test(flat)) {
         return { rows: mockClashRows, rowCount: mockClashRows.length };
       }
       return { rows: [], rowCount: 0 };
@@ -127,8 +127,8 @@ describe('duplicating an exercise', () => {
       .post('/api/exercises/src/duplicate')
       .send({ name: 'Bench Press (Custom)' });
 
-    const check = queries.find((q) => /SELECT id, name FROM exercises/i.test(q.sql));
-    expect(check.sql).toMatch(/organization_id IS NULL OR organization_id = \$2/i);
+    const check = queries.find((q) => /SELECT e\.id, e\.name FROM exercises e/i.test(q.sql));
+    expect(check.sql).toMatch(/e\.organization_id IS NULL OR e\.organization_id = \$2/i);
     expect(check.params[1]).toBe(ORG_A);
   });
 });
