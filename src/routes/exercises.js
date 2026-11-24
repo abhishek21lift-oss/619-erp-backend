@@ -724,7 +724,34 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
 
     await client.query('BEGIN');
     const original = src[0];
-    const newName = String(req.body?.name || `${original.name} (Copy)`).trim().slice(0, 120);
+    // The frontend asks for a name before it duplicates. The fallback keeps an
+    // older client working, but a whitespace-only name must not become an
+    // empty exercise: `||` would accept '   ' and the insert would fail late.
+    const requested = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const newName = (requested || `${original.name} (Copy)`).slice(0, 120);
+
+    // A duplicate that keeps an existing name is the same identity problem the
+    // 2026-11-24 library audit found in `Pullups`/`Pushups`: two rows, one
+    // movement, and the screen can treat them differently. Reject it here
+    // rather than let the slug suffix hide it. Scoped to what this caller can
+    // see: another studio's custom row with the same name is not this studio's
+    // conflict.
+    const { rows: clash } = await client.query(
+      `SELECT id, name FROM exercises
+        WHERE deleted_at IS NULL
+          AND lower(btrim(name)) = lower($1)
+          AND (organization_id IS NULL OR organization_id = $2)
+        LIMIT 1`,
+      [newName, orgIdOf(req)]
+    );
+    if (clash[0]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: `An exercise named "${clash[0].name}" already exists`,
+        code: 'NAME_TAKEN',
+        conflict: clash[0],
+      });
+    }
 
     let slug = slugify(newName);
     const { rows: taken } = await client.query(

@@ -292,3 +292,27 @@ describe('the training history', () => {
     expect(prompt).toContain('NO lift has enough sessions logged for a trend');
   });
 });
+
+describe('the offered exercise line', () => {
+  it('names the type and pattern so a stretch cannot read as a strength movement', async () => {
+    // The library holds 123 Stretching rows next to 593 Strength rows, and the
+    // old line printed only name/group/equipment/difficulty. `Split Squats` is
+    // a HOLD stretch; without its type the model has no way to tell that from
+    // a strength movement of the same name.
+    const STRETCH = {
+      name: 'Split Squats', muscle_group: 'Legs', target_muscle: 'Quadriceps',
+      movement_pattern: 'Mobility', equipment: 'Bodyweight', difficulty: 'beginner',
+      exercise_type: 'Stretching',
+    };
+    mockDb({
+      parq: [{ workout_gate_status: 'cleared', past_history: {}, current_health: {} }],
+      exercises: [SQUAT, STRETCH],
+    });
+    const res = await request(app).post('/api/ai/workout/generate').send(BODY);
+    expect(res.status).toBe(200);
+
+    const prompt = promptOf();
+    expect(prompt).toContain('"Split Squats" | Legs | type Stretching | pattern Mobility');
+    expect(prompt).toContain('Use Stretching and Mobility rows only for warm-up, cool-down or mobility work');
+  });
+});
