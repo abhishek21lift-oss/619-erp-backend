@@ -41,6 +41,21 @@ function emailFingerprint(email) {
   return crypto.createHash('sha256').update(String(email).trim().toLowerCase()).digest('hex').slice(0, 12);
 }
 
+/**
+ * How long a SESSION may live, however often it is renewed.
+ *
+ * Rotation bounds a token to seven days; without this the session it belongs
+ * to is unbounded. Thirty days is the default for a studio back office —
+ * long enough that a trainer is not asked to sign in weekly, short enough that
+ * a forgotten laptop stops working on its own. An operator can raise or lower
+ * it, clamped so a typo cannot produce a one-minute session or an eternal one.
+ */
+function sessionMaxAgeMs() {
+  const days = parseInt(process.env.REFRESH_SESSION_MAX_DAYS, 10) || 30;
+  const clamped = Math.min(Math.max(days, 1), 365);
+  return clamped * 24 * 60 * 60 * 1000;
+}
+
 async function revokeRefreshToken(rawToken) {
   if (!rawToken) return null;
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
@@ -401,7 +416,7 @@ router.post('/refresh', async (req, res) => {
     let rows;
     try {
       ({ rows } = await pool.query(
-        `SELECT rt.user_id, rt.audience, u.role, u.organization_id,
+        `SELECT rt.user_id, rt.audience, rt.session_started_at, u.role, u.organization_id,
                 u.token_version, u.is_active, u.deleted_at
            FROM refresh_tokens rt
            JOIN users u ON u.id = rt.user_id
@@ -414,7 +429,8 @@ router.post('/refresh', async (req, res) => {
     } catch (err) {
       if (err && err.code === '42703') {
         ({ rows } = await pool.query(
-          `SELECT rt.user_id, NULL::text AS audience, u.role, u.organization_id,
+          `SELECT rt.user_id, NULL::text AS audience,
+                  rt.created_at AS session_started_at, u.role, u.organization_id,
                   u.token_version, u.is_active, u.deleted_at
              FROM refresh_tokens rt
              JOIN users u ON u.id = rt.user_id
@@ -459,21 +475,60 @@ router.post('/refresh', async (req, res) => {
       });
     }
 
+    // ── Absolute session lifetime ──────────────────────────────────────────
+    //
+    // Each rotation used to mint another seven days, so a session that was
+    // used never ended. `expires_at` bounds one TOKEN; this bounds the
+    // SESSION. The start travels on the row, so it survives rotation; a login
+    // starts a new one. Checked before the claim so an expired session does
+    // not revoke-and-rotate in the same request.
+    const sessionStartedAt = rows[0].session_started_at || null;
+    if (sessionStartedAt) {
+      const ageMs = Date.now() - new Date(sessionStartedAt).getTime();
+      if (Number.isFinite(ageMs) && ageMs > sessionMaxAgeMs()) {
+        await pool.query(
+          'UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL',
+          [tokenHash]
+        );
+        clearRejected();
+        return res.status(401).json({
+          error: {
+            code: 'SESSION_EXPIRED',
+            message: 'This session has reached its maximum lifetime. Sign in again.',
+          },
+        });
+      }
+    }
+
     // Rotate: claim the old token, then issue new ones.
     //
     // The claim is the UPDATE, not the SELECT above. That SELECT's FOR UPDATE
     // runs on an autocommitted pool.query, so its lock is released before this
     // line — two requests presenting the same token both passed it, and both
     // were issued a fresh pair. `AND revoked_at IS NULL` makes exactly one of
-    // them win; the loser gets the same 401 as an already-used token, so a
-    // replayed refresh token can never fork into two live sessions.
+    // them win, so a replayed refresh token can never fork into two live
+    // sessions.
     const claim = await pool.query(
       'UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL',
       [tokenHash]
     );
     if (claim.rowCount !== 1) {
-      clearRejected();
-      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+      // The row was live microseconds ago (the SELECT above) and is revoked
+      // now: another request holding the same cookie won the rotation. That is
+      // a race between two tabs, not a replay — a replayed token fails the
+      // SELECT and never reaches here.
+      //
+      // The loser must not clear cookies. `clearCookie` writes to the shared
+      // jar, so it would delete the pair the winner just set and sign the
+      // person out of a refresh that succeeded. 409 tells the client to retry
+      // with whatever cookie is now in the jar; the frontend already treats
+      // anything that is not 401/403 as transient.
+      return res.status(409).json({
+        error: {
+          code: 'REFRESH_IN_PROGRESS',
+          message: 'This session was renewed by another request. Retry with the new cookie.',
+        },
+      });
     }
 
     // Never downgrade a platform session: the portal decides the audience, and
@@ -486,7 +541,10 @@ router.post('/refresh', async (req, res) => {
 
     const newAccessToken = signAccessToken(user_id, token_version, newAudience);
     setAccessCookie(res, tokenPortal, newAccessToken, { mirrorLegacy });
-    const newRefreshToken = await issueRefreshToken(res, user_id, newAudience, tokenPortal, { mirrorLegacy });
+    const newRefreshToken = await issueRefreshToken(res, user_id, newAudience, tokenPortal, {
+      mirrorLegacy,
+      sessionStartedAt,
+    });
 
     res.json(isMobile ? { ok: true, token: newAccessToken, refresh_token: newRefreshToken } : { ok: true });
   } catch (err) {

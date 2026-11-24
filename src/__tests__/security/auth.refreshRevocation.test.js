@@ -374,7 +374,15 @@ describe('existing refresh semantics are preserved', () => {
       const raw = giveRefreshToken(USER_A);
       const results = await Promise.all([useRefresh(raw), useRefresh(raw)]);
       const statuses = results.map((r) => r.status).sort();
-      expect(statuses).toEqual([200, 401]);
+      // 409, not 401. Both requests carried the same cookie, and the loser is
+      // a second tab, not a replay: answering 401 made the client clear the
+      // cookie the winner had just set. A replay never reaches the claim — it
+      // fails the lookup and still gets 401 (case 14 below).
+      expect(statuses).toEqual([200, 409]);
+
+      const loser = results.find((r) => r.status === 409);
+      expect(loser.body.refresh_token).toBeUndefined();
+      expect(loser.body.error.code).toBe('REFRESH_IN_PROGRESS');
     } finally {
       pool.query.mockImplementation(real);
     }

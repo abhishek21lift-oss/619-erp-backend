@@ -490,6 +490,17 @@ app.use(cors({
 // H-06: route registers its own express.raw() parser so signature can be verified
 app.use('/api/webhooks/razorpay', require('./routes/razorpay-webhook'));
 
+// Say this once, at boot, where an operator will see it. The endpoint verifies
+// signatures and acknowledges payment events, but nothing writes them to the
+// ledger (there is no gateway column on pt_payments yet). Configuring the
+// webhook secret is exactly the state in which someone might also switch on
+// online checkout, and the only other trace would be an error line per event.
+if (process.env.RAZORPAY_WEBHOOK_SECRET) {
+  logger.warn(
+    'Razorpay webhook is configured, but gateway payments are acknowledged and logged, NOT written to the ledger. Do not enable online checkout until recording is implemented.'
+  );
+}
+
 // ────────────────────────
 // WHATSAPP GATEWAY WEBHOOK (raw body — must be before json middleware)
 // ────────────────────────

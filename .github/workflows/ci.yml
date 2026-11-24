@@ -268,3 +268,14 @@ jobs:
         # advisory lands, prefer `overrides` for a transitive dependency over
         # loosening this threshold.
         run: npm audit --audit-level=high
+
+      - name: Report advisories below the blocking threshold
+        # The gate above is `high`, so a `moderate` advisory does not fail the
+        # build — which is the right call while no patched release exists, and
+        # the wrong reason for one to sit unseen. This second pass lists what
+        # the gate let through in the job summary, so a new moderate shows up
+        # on the pull request instead of only inside a green log.
+        if: always()
+        run: |
+          npm audit --omit=dev --audit-level=moderate --json > /tmp/audit.json || true
+          node scripts/audit-summary.js /tmp/audit.json >> "$GITHUB_STEP_SUMMARY"

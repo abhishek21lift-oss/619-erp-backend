@@ -186,12 +186,14 @@ describe('the signature gate', () => {
     expect(writes()).toHaveLength(0);
   });
 
-  test('accepts a correctly signed body', async () => {
+  test('accepts a correctly signed body and says it was not recorded', async () => {
     const body = captured();
     const res = await post(appWithSecret(SECRET), body, sign(body));
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ received: true });
+    // `recorded: false` is the honest half of "acknowledge and log". A 200
+    // alone reads as "processed"; this says which part did not happen.
+    expect(res.body).toEqual({ received: true, recorded: false });
   });
 
   test('rejects valid-signature-but-invalid-JSON', async () => {
@@ -228,7 +230,7 @@ describe('event dispatch', () => {
     const res = await send(captured('pay_CAPTURE_1'));
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ received: true });
+    expect(res.body).toEqual({ received: true, recorded: false });
     expect(writes()).toHaveLength(0);
   });
 
@@ -254,12 +256,13 @@ describe('event dispatch', () => {
     expect(writes()).toHaveLength(0);
   });
 
-  test('a gateway event is logged rather than dropped in silence', async () => {
-    // Not recording it is a deliberate gap, so it has to be visible. An
-    // operator reconciling a Razorpay statement against the ledger needs to be
-    // able to find the events the ledger does not contain.
+  test('a gateway event is logged at error level rather than dropped in silence', async () => {
+    // Not recording it is a deliberate gap, so it has to be visible. `info`
+    // was not: it sits below the level most deployments retain for long, and
+    // an operator reconciling a Razorpay statement against the ledger needs to
+    // find the events the ledger does not contain.
     await send(captured('pay_LOGGED_1'));
-    expect(mockLog.info).toHaveBeenCalledWith(
+    expect(mockLog.error).toHaveBeenCalledWith(
       expect.objectContaining({ payment_id: 'pay_LOGGED_1' }),
       'razorpay_payment_event_not_recorded',
     );
@@ -301,7 +304,7 @@ describe('failure handling', () => {
     const res = await post(appWithSecret(SECRET), body, sign(body));
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ received: true });
+    expect(res.body).toEqual({ received: true, recorded: false });
     expect(pool.query).not.toHaveBeenCalled();
   });
 });

@@ -82,11 +82,19 @@ router.post('/', async (req, res) => {
     // longer claims to write a payment it cannot write.
     if (eventType === 'payment.captured' || eventType === 'payment.failed'
         || eventType === 'refund.processed') {
-      logger.info(
+      // Error, not info. This is a signed assertion from the payment provider
+      // that money moved, and the ledger does not contain it. At `info` it sat
+      // below the level most deployments retain, so the one trace of a gateway
+      // payment was the first thing dropped.
+      logger.error(
         { eventType, payment_id: event.payload?.payment?.entity?.id
           || event.payload?.refund?.entity?.payment_id || null },
         'razorpay_payment_event_not_recorded'
       );
+      // Still 200: there is nothing for Razorpay to retry until recording is
+      // implemented, and a retry storm would bury the signal. `recorded:false`
+      // is what stops the acknowledgement reading as "processed".
+      return res.json({ received: true, recorded: false });
     }
 
     // Unknown event types are acknowledged but ignored

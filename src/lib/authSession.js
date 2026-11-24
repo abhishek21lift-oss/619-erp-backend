@@ -135,10 +135,15 @@ function bodyTokensAllowed(req) {
   return !req.headers.origin;
 }
 
-async function issueRefreshToken(res, userId, audience = null, portal = 'trainer', { mirrorLegacy = true } = {}) {
+async function issueRefreshToken(res, userId, audience = null, portal = 'trainer', { mirrorLegacy = true, sessionStartedAt = null } = {}) {
   const rawToken = crypto.randomBytes(48).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
+  // When this SESSION began, carried forward on every rotation. `expires_at`
+  // is only the current token's seven days; this is the clock the absolute cap
+  // reads, so a session that is used still ends. A new login passes nothing
+  // and starts the clock here.
+  const startedAt = sessionStartedAt || new Date();
   // The audience rides on the refresh token because it is a property of the
   // SESSION, and the refresh token is the only part of a session that outlives
   // fifteen minutes. See migration 162.
@@ -149,8 +154,8 @@ async function issueRefreshToken(res, userId, audience = null, portal = 'trainer
   // not covering it is that nobody can sign in during those seconds.
   try {
     await pool.query(
-      'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, audience) VALUES ($1, $2, $3, $4)',
-      [userId, tokenHash, expiresAt, audience]
+      'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, audience, session_started_at) VALUES ($1, $2, $3, $4, $5)',
+      [userId, tokenHash, expiresAt, audience, startedAt]
     );
   } catch (err) {
     if (err && err.code === '42703') {
