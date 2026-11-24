@@ -34,6 +34,28 @@ const ORIGIN_EXEMPT_PREFIXES = [
   '/invitations/track/',
 ];
 
+function allowedOriginSet() {
+  const out = new Set();
+  const add = (raw) => {
+    try {
+      const url = new URL(String(raw).trim());
+      // Only schemes a browser sends as an Origin. A typo in an env value
+      // must not open the gate, so anything else is dropped rather than
+      // string-compared.
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+      out.add(url.origin);
+    } catch { /* malformed value: contributes nothing */ }
+  };
+  if (process.env.FRONTEND_URL) add(process.env.FRONTEND_URL);
+  if (process.env.CORS_ORIGIN) String(process.env.CORS_ORIGIN).split(',').forEach(add);
+  return out;
+}
+
+function isLocalDevHost(hostname) {
+  // `[::1]` is what URL.hostname reports for IPv6 loopback — brackets included.
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+}
+
 function originCheck(req, res, next) {
   // Skip for server-to-server calls (no origin) and health checks
   if (!req.headers.origin && !req.headers.referer) return next();
@@ -45,22 +67,20 @@ function originCheck(req, res, next) {
 
   try {
     const url = new URL(origin);
-    const hostname = url.hostname;
 
-    // Allow localhost in development
-    if (hostname === 'localhost' || hostname === '127.0.0.1') return next();
+    // localhost is a development affordance, not an origin the deployment
+    // configured. The CORS allowlist has always drawn that line; this
+    // middleware used to allow it in production too, which meant the check
+    // that exists to reject unconfigured origins accepted one by name.
+    if (process.env.NODE_ENV !== 'production' && isLocalDevHost(url.hostname)) return next();
 
-    // Allow known frontend domains
-    const allowedHosts = [
-      ...(process.env.FRONTEND_URL ? [new URL(process.env.FRONTEND_URL).hostname] : []),
-      ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(function(o) {
-        try { return new URL(o.trim()).hostname; } catch { return null; }
-      }).filter(Boolean) : []),
-    ];
+    // Compare the ORIGIN, not the hostname. Hostname-only made `http://` and
+    // `https://` interchangeable, so a plaintext page on the real host — what
+    // an active network attacker can actually serve — passed the same check
+    // as the TLS site.
+    if (allowedOriginSet().has(url.origin)) return next();
 
-    if (allowedHosts.includes(hostname)) return next();
-
-    logger.warn({ origin: origin, hostname: hostname, path: req.path }, 'Origin check failed');
+    logger.warn({ origin: url.origin, path: req.path }, 'Origin check failed');
     return res.status(403).json({ error: 'Forbidden' });
   } catch {
     // Invalid URL in origin/referer — just log and deny
