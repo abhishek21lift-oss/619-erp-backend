@@ -6,7 +6,8 @@
 // was one source: it defaulted the name to `${name} (Copy)` and accepted any
 // name, including one the library already had. The frontend now asks for a
 // name and opens a create form for a built-in instead of copying it on sight;
-// these tests pin the server side of that contract.
+// the server refuses a blank name and a name the library already has. These
+// tests pin that contract.
 
 const queries = [];
 let mockSource;
@@ -80,13 +81,28 @@ describe('duplicating an exercise', () => {
     expect(insert().params[1]).toBe('Bench Press (Custom)');
   });
 
-  it('falls back to a copy name when the name is only whitespace', async () => {
+  it('refuses a blank name instead of minting a copy name', async () => {
+    // `${name} (Copy)` is the default that created `Ab Roller (Copy)` and the
+    // no-space duplicate spellings. A blank name is a client bug, not a request
+    // to invent one.
     const res = await request(makeApp())
       .post('/api/exercises/src/duplicate')
       .send({ name: '   ' });
 
-    expect(res.status).toBe(201);
-    expect(insert().params[1]).toBe('Bench Press (Copy)');
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('NAME_REQUIRED');
+    expect(insert()).toBeUndefined();
+    expect(queries.some((q) => q.sql === 'BEGIN')).toBe(false);
+  });
+
+  it('refuses a missing name too', async () => {
+    const res = await request(makeApp())
+      .post('/api/exercises/src/duplicate')
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('NAME_REQUIRED');
+    expect(insert()).toBeUndefined();
   });
 
   it('refuses a name the caller can already see', async () => {

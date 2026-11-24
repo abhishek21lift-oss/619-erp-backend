@@ -722,13 +722,17 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
     const src = [await loadVisible(req, req.params.id, 'e.*')].filter(Boolean);
     if (!src[0]) return res.status(404).json({ error: 'Exercise not found' });
 
-    await client.query('BEGIN');
-    const original = src[0];
-    // The frontend asks for a name before it duplicates. The fallback keeps an
-    // older client working, but a whitespace-only name must not become an
-    // empty exercise: `||` would accept '   ' and the insert would fail late.
+    // The frontend asks for a name before it duplicates. A missing or
+    // whitespace-only name must not fall back to `${name} (Copy)`: that default
+    // is how `Ab Roller (Copy)` and the no-space duplicate spellings entered
+    // the library. Refuse it before opening the transaction.
     const requested = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-    const newName = (requested || `${original.name} (Copy)`).slice(0, 120);
+    if (!requested) {
+      return res.status(400).json({ error: 'A name is required for the copy', code: 'NAME_REQUIRED' });
+    }
+
+    await client.query('BEGIN');
+    const newName = requested.slice(0, 120);
 
     // A duplicate that keeps an existing name is the same identity problem the
     // 2026-11-24 library audit found in `Pullups`/`Pushups`: two rows, one
