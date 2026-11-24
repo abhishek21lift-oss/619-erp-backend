@@ -363,7 +363,7 @@ async function retrieveExerciseLibrary({ organizationId, limit = 1200 }, stats =
   const startedAt = Date.now();
   try {
     const { rows } = await pool.query(
-      `SELECT e.name, e.muscle_group, e.body_part, e.target_muscle, e.movement_pattern,
+      `SELECT e.name, e.exercise_type, e.muscle_group, e.body_part, e.target_muscle, e.movement_pattern,
               e.equipment, e.difficulty,
               e.prescription_mode_primary, e.prescription_mode_allowed,
               e.recommended_sets, e.recommended_reps, e.tempo_recommendation,
@@ -1471,9 +1471,12 @@ router.post('/workout/generate', auth, requireTrainer, requireConfigured, async 
       'EXERCISE LIBRARY (AUTHORIZED AND SCREENED):',
       'This is the complete list of exercises this client may be prescribed.',
       'For every exercise in your plan, copy the text inside the double quotes EXACTLY — same words, same spelling, same plural. The text after the closing quote describes the exercise; it is not part of its name. Do not add a parenthetical or qualifier of your own, and do not substitute a more familiar exercise you know from elsewhere. If the movement you wanted is not in this list, choose the closest exercise that IS in it.',
+      'The type and pattern on each line describe what the movement is. Use Stretching and Mobility rows only for warm-up, cool-down or mobility work, never as a strength slot; match the pattern to the slot you are filling.',
       ...offered.map((x) => [
         `- "${x.name}"`,
         x.muscle_group || x.body_part ? ` | ${x.muscle_group || x.body_part}` : '',
+        x.exercise_type ? ` | type ${x.exercise_type}` : '',
+        x.movement_pattern ? ` | pattern ${x.movement_pattern}` : '',
         x.equipment ? ` | ${x.equipment}` : '',
         x.difficulty ? ` | ${x.difficulty}` : '',
          x.prescription_mode_primary ? ` | primary mode ${x.prescription_mode_primary}` : '',

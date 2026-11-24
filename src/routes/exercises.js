@@ -722,9 +722,40 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
     const src = [await loadVisible(req, req.params.id, 'e.*')].filter(Boolean);
     if (!src[0]) return res.status(404).json({ error: 'Exercise not found' });
 
+    // The frontend asks for a name before it duplicates. A missing or
+    // whitespace-only name must not fall back to `${name} (Copy)`: that default
+    // is how `Ab Roller (Copy)` and the no-space duplicate spellings entered
+    // the library. Refuse it before opening the transaction.
+    const requested = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    if (!requested) {
+      return res.status(400).json({ error: 'A name is required for the copy', code: 'NAME_REQUIRED' });
+    }
+
     await client.query('BEGIN');
-    const original = src[0];
-    const newName = String(req.body?.name || `${original.name} (Copy)`).trim().slice(0, 120);
+    const newName = requested.slice(0, 120);
+
+    // A duplicate that keeps an existing name is the same identity problem the
+    // 2026-11-24 library audit found in `Pullups`/`Pushups`: two rows, one
+    // movement, and the screen can treat them differently. Reject it here
+    // rather than let the slug suffix hide it. Scoped to what this caller can
+    // see: another studio's custom row with the same name is not this studio's
+    // conflict.
+    const { rows: clash } = await client.query(
+      `SELECT id, name FROM exercises
+        WHERE deleted_at IS NULL
+          AND lower(btrim(name)) = lower($1)
+          AND (organization_id IS NULL OR organization_id = $2)
+        LIMIT 1`,
+      [newName, orgIdOf(req)]
+    );
+    if (clash[0]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: `An exercise named "${clash[0].name}" already exists`,
+        code: 'NAME_TAKEN',
+        conflict: clash[0],
+      });
+    }
 
     let slug = slugify(newName);
     const { rows: taken } = await client.query(
