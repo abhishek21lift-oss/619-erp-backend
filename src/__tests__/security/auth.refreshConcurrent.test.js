@@ -19,7 +19,6 @@ process.env.NODE_ENV = 'test';
 const crypto = require('crypto');
 
 const RAW = crypto.randomBytes(48).toString('hex');
-const TOKEN_HASH = crypto.createHash('sha256').update(RAW).digest('hex');
 
 const USER = {
   user_id: 'usr-refresh-1',
