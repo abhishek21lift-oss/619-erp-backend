@@ -32,6 +32,11 @@ jest.mock('../db/pool', () => ({
   connect: jest.fn(async () => ({
     query: jest.fn(async (sql, params) => {
       queries.push({ sql: String(sql).replace(/\s+/g, ' ').trim(), params });
+      // The name rule runs inside the create transaction. This suite is about
+      // tenancy, not identity, so it must not invent a clash.
+      if (/SELECT e\.id, e\.name FROM exercises e/i.test(String(sql))) {
+        return { rows: [], rowCount: 0 };
+      }
       return { rows: [{ id: 'e1' }], rowCount: 1 };
     }),
     release: jest.fn(),

@@ -124,6 +124,48 @@ async function loadVisible(req, id, columns = 'e.id, e.created_by, e.is_custom, 
   return rows[0] || null;
 }
 
+/**
+ * The one name rule, shared by check-name, create, update and duplicate.
+ *
+ * A name is a trimmed, case-insensitive identity, and the only identities that
+ * can conflict are the ones this caller can already see: the built-in library
+ * and their own studio's custom rows. Another studio's private exercise is
+ * neither a conflict nor a fact this caller may learn — the old check-name
+ * query had no visibility clause and returned that row's id and exact name to
+ * any authenticated user, members included.
+ *
+ * `db` is the pool or a transaction client. `excludeId` is the row being
+ * edited, so a rename that keeps the row's own name (or changes only its
+ * case) is not a conflict with itself.
+ */
+async function findNameConflict(db, name, { orgId, excludeId = null } = {}) {
+  const params = [name, orgId];
+  let excl = '';
+  if (excludeId) {
+    params.push(excludeId);
+    excl = ` AND e.id <> $${params.length}`;
+  }
+  const { rows } = await db.query(
+    `SELECT e.id, e.name FROM exercises e
+      WHERE e.deleted_at IS NULL
+        AND lower(btrim(e.name)) = lower(btrim($1))
+        AND (e.organization_id IS NULL OR e.organization_id = $2)
+        ${excl}
+      LIMIT 1`,
+    params
+  );
+  return rows[0] || null;
+}
+
+/** The 409 every name-taking write returns, so clients can key on `code`. */
+function nameTaken(res, conflict) {
+  return res.status(409).json({
+    error: `An exercise named "${conflict.name}" already exists`,
+    code: 'NAME_TAKEN',
+    conflict,
+  });
+}
+
 /** Shared column list for list/detail responses. One list, one source. */
 const EXERCISE_COLUMNS = `
   e.id, e.name, e.slug, e.description,
@@ -150,6 +192,29 @@ const EXERCISE_JOINS = `
   LEFT JOIN muscles             m ON m.id = e.primary_muscle_id
   LEFT JOIN equipment_types     q ON q.id = e.equipment_id
   LEFT JOIN exercise_categories c ON c.id = e.category_id`;
+
+/**
+ * The muscle map, aggregated for the list.
+ *
+ * The list used to return only the legacy `secondary_muscles` text, which is
+ * null for rows created through the API and was never rebuilt for most of the
+ * seeded library. The card already prefers the structured map; it just never
+ * received one outside the detail endpoint. `COALESCE` keeps the field an
+ * array for a row with no muscle entries, so the client never has to branch
+ * on null.
+ */
+const EXERCISE_MUSCLE_JOIN = `
+  LEFT JOIN LATERAL (
+    SELECT json_agg(json_build_object(
+             'slug', m2.slug,
+             'name', m2.name,
+             'body_region', m2.body_region,
+             'role', em.role
+           ) ORDER BY em.role, m2.sort_order) AS muscles
+      FROM exercise_muscles em
+      JOIN muscles m2 ON m2.id = em.muscle_id
+     WHERE em.exercise_id = e.id
+  ) mm ON TRUE`;
 
 // ─── LIST / SEARCH ────────────────────────────────────────────
 //
@@ -244,8 +309,11 @@ router.get('/', auth, async (req, res, next) => {
     // second scan of an 890-row (and growing) table.
     params.push(limit, offset);
     const { rows } = await pool.query(
-      `SELECT ${EXERCISE_COLUMNS}, ${favSelect}, COUNT(*) OVER () AS total_count
+      `SELECT ${EXERCISE_COLUMNS}, ${favSelect},
+              COALESCE(mm.muscles, '[]'::json) AS muscles,
+              COUNT(*) OVER () AS total_count
          ${EXERCISE_JOINS}
+         ${EXERCISE_MUSCLE_JOIN}
         WHERE ${where}
         ORDER BY ${orderBy}
         LIMIT $${params.length - 1} OFFSET $${params.length}`,
@@ -384,6 +452,11 @@ router.get('/recent', auth, async (req, res, next) => {
 
 // ─── NAME AVAILABILITY ────────────────────────────────────────
 // Powers live duplicate detection in the creator, before the user hits save.
+//
+// The probe is scoped like every other read: built-ins plus the caller's own
+// studio. A name another studio uses privately is available here, because this
+// studio cannot see the row that owns it — and the response must not describe
+// a row the caller cannot open.
 
 router.get('/check-name', auth, async (req, res, next) => {
   try {
@@ -391,21 +464,16 @@ router.get('/check-name', auth, async (req, res, next) => {
     if (!name) return res.json({ available: false, reason: 'Name is required' });
 
     const slug = slugify(name);
-    const params = [slug, name];
-    let excl = '';
-    if (req.query.exclude_id) { params.push(req.query.exclude_id); excl = ` AND e.id <> $3`; }
+    const excludeId = typeof req.query.exclude_id === 'string'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.query.exclude_id)
+      ? req.query.exclude_id
+      : null;
 
-    const { rows } = await pool.query(
-      `SELECT e.id, e.name FROM exercises e
-        WHERE e.deleted_at IS NULL AND (e.slug = $1 OR lower(e.name) = lower($2))${excl}
-        LIMIT 1`,
-      params
-    );
-    res.json({
-      available: rows.length === 0,
-      slug,
-      conflict: rows[0] || null,
+    const conflict = await findNameConflict(pool, name, {
+      orgId: orgIdOf(req),
+      excludeId,
     });
+    res.json({ available: !conflict, slug, conflict });
   } catch (err) { next(err); }
 });
 
@@ -501,6 +569,16 @@ router.post('/', auth, async (req, res, next) => {
     const trackingAllowed = tracking.allowed ?? (trackingPrimary ? [trackingPrimary] : []);
 
     await client.query('BEGIN');
+
+    // The same rule the duplicate route applies. Without it, the template
+    // flow (which creates) or any client that skips the advisory check could
+    // mint a second active row with a built-in or same-studio name; the slug
+    // suffix hid the duplicate instead of refusing it.
+    const conflict = await findNameConflict(client, name, { orgId: orgIdOf(req) });
+    if (conflict) {
+      await client.query('ROLLBACK');
+      return nameTaken(res, conflict);
+    }
 
     // Slug uniqueness is enforced by a partial unique index; resolve it here so
     // the user gets "Landmine Squat 2" instead of a 500.
@@ -605,6 +683,17 @@ router.put('/:id', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'Invalid difficulty' });
     if (d.name !== undefined && !String(d.name).trim())
       return res.status(400).json({ error: 'Exercise name cannot be empty' });
+
+    // A rename is a new identity. Check it against the same scoped rule as
+    // create and duplicate, excluding this row so a case-only change is not a
+    // conflict with itself.
+    if (d.name !== undefined) {
+      const conflict = await findNameConflict(pool, String(d.name).trim(), {
+        orgId: orgIdOf(req),
+        excludeId: req.params.id,
+      });
+      if (conflict) return nameTaken(res, conflict);
+    }
 
     let tracking;
     try {
@@ -737,24 +826,13 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
     // A duplicate that keeps an existing name is the same identity problem the
     // 2026-11-24 library audit found in `Pullups`/`Pushups`: two rows, one
     // movement, and the screen can treat them differently. Reject it here
-    // rather than let the slug suffix hide it. Scoped to what this caller can
-    // see: another studio's custom row with the same name is not this studio's
-    // conflict.
-    const { rows: clash } = await client.query(
-      `SELECT id, name FROM exercises
-        WHERE deleted_at IS NULL
-          AND lower(btrim(name)) = lower($1)
-          AND (organization_id IS NULL OR organization_id = $2)
-        LIMIT 1`,
-      [newName, orgIdOf(req)]
-    );
-    if (clash[0]) {
+    // rather than let the slug suffix hide it. The shared helper scopes the
+    // check to what this caller can see: another studio's custom row with the
+    // same name is not this studio's conflict.
+    const clash = await findNameConflict(client, newName, { orgId: orgIdOf(req) });
+    if (clash) {
       await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: `An exercise named "${clash[0].name}" already exists`,
-        code: 'NAME_TAKEN',
-        conflict: clash[0],
-      });
+      return nameTaken(res, clash);
     }
 
     let slug = slugify(newName);
@@ -799,12 +877,14 @@ router.post('/:id/duplicate', auth, async (req, res, next) => {
        ON CONFLICT DO NOTHING`,
       [id, req.params.id]
     );
+    await syncSecondaryText(client, id);
 
     await client.query('COMMIT');
     const detail = await loadOne(id, req);
     res.status(201).json({ message: 'Exercise duplicated', exercise: detail });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    if (err.code === '23505') return res.status(409).json({ error: 'An exercise with that name already exists' });
     next(err);
   } finally {
     client.release();
@@ -904,6 +984,34 @@ router.post('/:id/use', auth, async (req, res, next) => {
 
 // ─── INTERNAL ─────────────────────────────────────────────────
 
+/**
+ * Rebuild the legacy `secondary_muscles` text from the structured map.
+ *
+ * The map is authoritative; this column is the copy the legacy
+ * /api/workouts/exercises reader and exports still use. Keeping it in step
+ * here is what stops every API-created row from having `null` secondaries —
+ * the state the 2026-11-24 audit found on `Pull Ups`/`Push Ups` and on every
+ * custom row the editor had written.
+ *
+ * The guard makes a no-op update a genuine no-op, so a partial save that did
+ * not touch the muscles does not create a version-history row.
+ */
+async function syncSecondaryText(client, exerciseId) {
+  await client.query(
+    `WITH text AS (
+       SELECT string_agg(lower(m.name), ', ' ORDER BY m.name) AS value
+         FROM exercise_muscles em
+         JOIN muscles m ON m.id = em.muscle_id
+        WHERE em.exercise_id = $1 AND em.role = 'secondary'
+     )
+     UPDATE exercises e
+        SET secondary_muscles = (SELECT value FROM text)
+      WHERE e.id = $1
+        AND e.secondary_muscles IS DISTINCT FROM (SELECT value FROM text)`,
+    [exerciseId]
+  );
+}
+
 async function writeMuscleLinks(client, exerciseId, d) {
   if (d.primary_muscle_id) {
     await client.query(
@@ -920,6 +1028,7 @@ async function writeMuscleLinks(client, exerciseId, d) {
       [exerciseId, mid]
     );
   }
+  await syncSecondaryText(client, exerciseId);
 }
 
 async function writeRelations(client, exerciseId, d) {
