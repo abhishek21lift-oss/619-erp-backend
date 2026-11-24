@@ -75,7 +75,7 @@ it('sets a 15-minute access cookie and a rotating 7-day refresh cookie', async (
 
   expect(pool.query).toHaveBeenCalledWith(
     expect.stringContaining('INSERT INTO refresh_tokens'),
-    [USER, expect.any(String), expect.any(Date), 'tenant']
+    [USER, expect.any(String), expect.any(Date), 'tenant', expect.any(Date)]
   );
 });
 

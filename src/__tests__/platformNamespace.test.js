@@ -167,7 +167,7 @@ describe('the audience survives a refresh', () => {
 
   it('stores the plane on the refresh token', () => {
     expect(code(read('lib', 'authSession.js')))
-      .toMatch(/INSERT INTO refresh_tokens \(user_id, token_hash, expires_at, audience\)/);
+      .toMatch(/INSERT INTO refresh_tokens \(user_id, token_hash, expires_at, audience, session_started_at\)/);
   });
 
   it('reads it back rather than re-deciding', () => {
@@ -176,7 +176,7 @@ describe('the audience survives a refresh', () => {
   });
 
   it('re-issues the rotated refresh token on the same plane', () => {
-    expect(src).toMatch(/issueRefreshToken\(res, user_id, newAudience, tokenPortal, \{ mirrorLegacy \}\)/);
+    expect(src).toMatch(/issueRefreshToken\(res, user_id, newAudience, tokenPortal, \{\s*mirrorLegacy,\s*sessionStartedAt,?\s*\}\)/);
   });
 
   it('still works on a database that has not applied migration 162', () => {
