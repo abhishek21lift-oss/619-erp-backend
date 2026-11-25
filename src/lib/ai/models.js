@@ -82,6 +82,10 @@ const INTENT_ROUTES = {
   notify:        'secondary',
   communication: 'secondary',
   ops:           'primary',
+  // The trainer's morning brief and drafts. Same tier as `ops`; a distinct
+  // intent so spend is attributable in ai_usage_log and a future retune does
+  // not have to change both surfaces at once.
+  ops_queue:     'primary',
 
   // Money. These were on the fallback tier — openrouter/auto — so a question
   // about dues, an invoice or a subscription was answered by whichever model
