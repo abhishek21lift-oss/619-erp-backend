@@ -13,6 +13,9 @@ const MESSAGE_SET = new Set(MESSAGE_CODES);
 
 function studioLabel(name) {
   const raw = typeof name === 'string' ? name : '';
+  // Studio names are free text and end up in a message body; strip the same
+  // characters the first-name helper strips.
+  // eslint-disable-next-line no-control-regex -- intentionally strips control characters
   const cleaned = raw.replace(/[<>\u0000-\u001F\u007F]/g, ' ').replace(/\s+/g, ' ').trim();
   return cleaned ? cleaned.slice(0, 60) : 'the studio';
 }

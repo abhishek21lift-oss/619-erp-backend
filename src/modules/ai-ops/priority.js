@@ -252,6 +252,9 @@ function chooseAction(reasons, subject) {
 function firstName(name) {
   const raw = typeof name === 'string' ? name : '';
   const first = raw.trim().split(/\s+/)[0] || '';
+  // The name reaches WhatsApp, so strip angle brackets and control characters
+  // that would break the message or the template around it.
+  // eslint-disable-next-line no-control-regex -- intentionally strips control characters
   const cleaned = first.replace(/[<>\u0000-\u001F\u007F]/g, '').trim();
   if (!cleaned) return 'there';
   return cleaned.slice(0, 40);

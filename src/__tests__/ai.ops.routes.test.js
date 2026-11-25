@@ -40,7 +40,7 @@ function app() {
   });
   instance.use(requireTrainer);
   instance.use('/api/ai/ops', router);
-  instance.use((err, req, res, next) => {
+  instance.use((err, req, res, _next) => {
     res.status(500).json({ error: { code: 'INTERNAL', message: 'Something went wrong' } });
   });
   return instance;
