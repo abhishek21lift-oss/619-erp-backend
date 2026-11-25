@@ -203,11 +203,10 @@ function closedReasons(reasons) {
   return out;
 }
 
-function shouldReopen(reasons, item) {
+function shouldReopen(reasons, item, score = scoreReasons(reasons).score) {
   const distinct = dedupeReasons(reasons);
   if (!distinct.length) return false;
 
-  const { score } = scoreReasons(distinct);
   if (score >= (item.closed_score || 0) + 15) return true;
 
   const closed = new Map();
