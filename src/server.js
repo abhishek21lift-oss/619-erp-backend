@@ -1036,6 +1036,13 @@ app.use('/api/me',               auth, requireClient, require('./modules/client-
 // The client's own post-session feedback: requests and the one submission.
 // No route takes a client id; identity is req.user.pt_client_id.
 app.use('/api/me',               auth, requireClient, require('./modules/session-feedback/feedback.routes').member);
+// Member AI. The member side of the AI suite: identity from the session, the
+// studio's entitlement and allowance decided before any tool runs, and the
+// same per-user and AI burst limits as the trainer surfaces.
+app.use('/api/me/ai',
+  auth, requireClient, requireFeature('ai_suite'),
+  userApiLimiter, aiLimiter, requireAiQuota(),
+  require('./modules/member-ai/member-ai.routes'));
 
 // The studio's side of member ↔ studio messaging. The member's side is
 // /api/me/messages above; this one takes a client id, so it is trainer-only and
