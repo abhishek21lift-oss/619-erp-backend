@@ -8,12 +8,14 @@ jest.mock('../modules/client-portal/client-portal.service', () => ({
   myMeasurements: jest.fn(), myForms: jest.fn(),
 }));
 jest.mock('../modules/client-portal/member-coach.service', () => ({ coachFor: jest.fn() }));
+jest.mock('../modules/client-portal/client-booking.repository', () => ({ upcomingForClient: jest.fn() }));
 jest.mock('../modules/member-ai/member-ai.read', () => ({
   profile: jest.fn(), attendance: jest.fn(), membership: jest.fn(), payments: jest.fn(),
 }));
 
 const portal = require('../modules/client-portal/client-portal.service');
 const coach = require('../modules/client-portal/member-coach.service');
+const booking = require('../modules/client-portal/client-booking.repository');
 const read = require('../modules/member-ai/member-ai.read');
 const { run } = require('../modules/member-ai/member-ai.tools');
 
@@ -129,6 +131,89 @@ describe('getMyMeasurements', () => {
     expect(res.data.latest).toMatchObject({ weight_kg: 61, waist_cm: 78, body_fat_pct: 24 });
     expect(res.data.change).toEqual({ weight_kg: -3, waist_cm: -4, body_fat_pct: -3 });
     expect(res.data.entries[0]).not.toHaveProperty('id');
+  });
+});
+
+describe('getMyAttendance', () => {
+  it('counts present visits and reports the last one', async () => {
+    read.attendance.mockResolvedValue([
+      { date: '2026-11-24', status: 'present' },
+      { date: '2026-11-22', status: 'present' },
+      { date: '2026-11-10', status: 'absent' },
+      { date: '2026-10-01', status: 'late' },
+    ]);
+
+    const res = await run('getMyAttendance', CTX);
+    expect(res.data.last_visit).toBe('2026-11-24');
+    expect(res.data.visits_last_7_days).toBe(2);
+    expect(res.data.visits_last_30_days).toBe(2);
+    expect(res.data.recent).toEqual(['2026-11-24', '2026-11-22', '2026-10-01']);
+  });
+});
+
+describe('getMyMembership', () => {
+  it('returns the member own money and no commission', async () => {
+    read.membership.mockResolvedValue({
+      package_type: 'PT', pt_start_date: '2026-06-01', pt_end_date: '2026-12-01',
+      duration_months: 6, final_amount: 30000, paid_amount: 20000,
+      balance_amount: 10000, status: 'active', trainer_commission: 3000,
+    });
+
+    const res = await run('getMyMembership', CTX);
+    expect(res.data).toEqual({
+      package_type: 'PT', pt_start_date: '2026-06-01', pt_end_date: '2026-12-01',
+      duration_months: 6, final_amount: 30000, paid_amount: 20000,
+      balance_amount: 10000, status: 'active', days_left: 6,
+    });
+    expect(res.data).not.toHaveProperty('trainer_commission');
+  });
+});
+
+describe('getMyPayments', () => {
+  it('drops internal payment notes', async () => {
+    read.payments.mockResolvedValue([
+      { date: '2026-11-01', amount: 10000, payment_method: 'upi', notes: 'internal' },
+    ]);
+    const res = await run('getMyPayments', CTX);
+    expect(res.data.payments).toEqual([
+      { date: '2026-11-01', amount: 10000, method: 'upi' },
+    ]);
+  });
+});
+
+describe('getMyBookings', () => {
+  it('returns the next three sessions without ids', async () => {
+    booking.upcomingForClient.mockResolvedValue([
+      { id: 's1', session_date: '2026-11-26', start_time: '07:00', end_time: '08:00', duration_minutes: 60, status: 'scheduled' },
+      { id: 's2', session_date: '2026-11-28', start_time: '07:00', end_time: '08:00', duration_minutes: 60, status: 'scheduled' },
+      { id: 's3', session_date: '2026-11-30', start_time: '07:00', end_time: '08:00', duration_minutes: 60, status: 'scheduled' },
+      { id: 's4', session_date: '2026-12-02', start_time: '07:00', end_time: '08:00', duration_minutes: 60, status: 'scheduled' },
+    ]);
+
+    const res = await run('getMyBookings', CTX);
+    expect(res.data.sessions).toHaveLength(3);
+    expect(res.data.sessions[0]).toEqual({
+      date: '2026-11-26', start_time: '07:00', end_time: '08:00',
+      duration_minutes: 60, status: 'scheduled',
+    });
+    expect(res.data.sessions[0]).not.toHaveProperty('id');
+  });
+});
+
+describe('getMyForms', () => {
+  it('returns status only, never PAR-Q answers', async () => {
+    portal.myForms.mockResolvedValue({
+      parq: { status: 'submitted', assessment_date: '2026-10-01', risk_level: 'low',
+              risk_message: 'clear', parq_answers: { q1: 'yes' }, current_health: 'x' },
+      consent: { status: 'completed', completed_at: '2026-10-01', client_signed_at: 'x' },
+    });
+
+    const res = await run('getMyForms', CTX);
+    expect(res.data).toEqual({
+      parq: { status: 'submitted', assessment_date: '2026-10-01', risk_level: 'low' },
+      consent: { status: 'completed', completed_at: '2026-10-01' },
+    });
+    expect(JSON.stringify(res.data)).not.toContain('parq_answers');
   });
 });
 
