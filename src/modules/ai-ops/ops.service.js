@@ -493,6 +493,183 @@ async function dismiss({ orgId, itemId, reason, actor }) {
   return presentById(orgId, itemId);
 }
 
+const MAX_BODY = 1200;
+
+function normaliseBody(supplied, stored) {
+  if (supplied !== undefined) {
+    if (typeof supplied !== 'string') {
+      throw new OpsError(400, 'VALIDATION', 'Message body must be a string');
+    }
+    const trimmed = supplied.trim();
+    if (!trimmed) throw new OpsError(400, 'VALIDATION', 'Message body cannot be empty');
+    if (trimmed.length > MAX_BODY) {
+      throw new OpsError(400, 'VALIDATION', `Message body must be ${MAX_BODY} characters or fewer`);
+    }
+    return trimmed;
+  }
+
+  const fallback = typeof stored === 'string' ? stored.trim() : '';
+  if (!fallback) throw new OpsError(400, 'NO_DRAFT', 'No message draft to send');
+  if (fallback.length > MAX_BODY) {
+    throw new OpsError(400, 'VALIDATION', `Message body must be ${MAX_BODY} characters or fewer`);
+  }
+  return fallback;
+}
+
+// The one path that sends a client-facing message. The order is deliberate:
+// authorise the subject, prove the channel, validate the words, claim the item
+// atomically, record the intent in the same transaction, and only then send.
+// A crash after the claim leaves a queued log and an actioned item that a human
+// can reconcile; that is safer than a send with no record, and safer than a
+// retry that delivers twice.
+async function approve({ orgId, itemId, body, actor, requestId }) {
+  const item = await repo.findItem(orgId, itemId);
+  if (!item) throw new OpsError(404, 'NOT_FOUND', 'Queue item not found');
+  if (item.status === 'actioned') {
+    throw new OpsError(409, 'ALREADY_ACTIONED', 'This item was already actioned');
+  }
+  if (!['open', 'snoozed'].includes(item.status)) {
+    throw new OpsError(409, 'NOT_APPROVABLE', 'This item is closed');
+  }
+
+  const isClient = Boolean(item.client_id);
+  const subject = isClient
+    ? await repo.findClientForSend(orgId, item.client_id)
+    : await repo.findLeadForSend(orgId, item.lead_id);
+  if (!subject) throw new OpsError(404, 'NOT_FOUND', 'Client or lead not found');
+  if (isClient && subject.whatsapp_opt_out) {
+    throw new OpsError(409, 'OPTED_OUT', 'This client has opted out of WhatsApp');
+  }
+  if (!subject.mobile) throw new OpsError(409, 'NO_RECIPIENT', 'No mobile number on file');
+
+  const instance = await transport.resolveInstance(orgId);
+  if (!instance?.ok) {
+    throw new OpsError(409, 'CHANNEL_UNAVAILABLE', 'WhatsApp is not connected for this studio');
+  }
+
+  const chosen = normaliseBody(body, item.draft?.body);
+  const edited = Boolean(item.draft?.body) && chosen !== item.draft.body;
+  const now = new Date();
+  const bodySha = sha256(chosen);
+
+  const claimed = await repo.withTransaction(async (client) => {
+    const row = await repo.claimItem(orgId, itemId, {
+      status: 'actioned',
+      last_actioned_at: now,
+      last_error: null,
+      closed_reasons: closedReasons(storedReasons(item)),
+      closed_score: item.priority_score,
+      draft: {
+        ...(item.draft || {}),
+        body: chosen,
+        channel: 'whatsapp',
+        source: edited ? 'trainer' : (item.draft?.source ?? 'template'),
+        generated_at: item.draft?.generated_at ?? now.toISOString(),
+      },
+    }, client);
+    if (!row) throw new OpsError(409, 'ALREADY_ACTIONED', 'This item was already actioned');
+
+    const logId = await repo.insertCommunicationLog(orgId, {
+      recipientType: isClient ? 'client' : 'lead',
+      recipientId: isClient ? item.client_id : item.lead_id,
+      recipientName: subject.name,
+      recipientPhone: subject.mobile,
+      message: chosen,
+    }, client);
+    if (!logId) throw new OpsError(500, 'INTERNAL', 'Could not record the message');
+
+    // The human decision is audited before the send, so a delivery failure
+    // never erases the fact that the trainer approved this text.
+    await repo.insertEvent(orgId, {
+      itemId,
+      eventType: edited ? 'edited' : 'approved',
+      actorUserId: actor?.userId ?? null,
+      actorRole: actor?.role ?? null,
+      payload: {
+        body_sha256: bodySha,
+        body_length: chosen.length,
+        ...(edited ? { previous_sha256: sha256(item.draft.body) } : {}),
+      },
+    }, client);
+
+    return { row, logId };
+  });
+
+  let out;
+  try {
+    out = await transport.send({
+      orgId,
+      to: subject.mobile,
+      text: chosen,
+      clientMessageId: claimed.logId,
+      requestId: requestId ?? null,
+      allowSharedProvider: false,
+    });
+  } catch (err) {
+    out = { status: 'failed', error: err?.code || 'transport_error' };
+  }
+
+  if (out?.status === 'sent') {
+    await repo.markCommunicationSent(orgId, claimed.logId, {
+      external_id: out.provider_id || null,
+      provider: out.provider || null,
+      sent_at: new Date(),
+    });
+    await repo.updateItem(orgId, itemId, 'actioned', { last_contacted_at: new Date() });
+    await repo.insertEvent(orgId, {
+      itemId,
+      eventType: 'sent',
+      actorUserId: actor?.userId ?? null,
+      actorRole: actor?.role ?? null,
+      payload: {
+        communication_log_id: claimed.logId,
+        channel: 'whatsapp',
+        provider_id: out.provider_id || null,
+        status: 'sent',
+        body_sha256: bodySha,
+      },
+    });
+
+    return {
+      item: await presentById(orgId, itemId),
+      delivery: {
+        status: 'sent',
+        communication_log_id: claimed.logId,
+        provider_id: out.provider_id || null,
+        error: null,
+      },
+    };
+  }
+
+  const code = out?.error || out?.status || 'send_failed';
+  await repo.markCommunicationFailed(orgId, claimed.logId, { failure_reason: code });
+  await repo.updateItem(orgId, itemId, 'actioned', {
+    status: 'open',
+    last_error: { code: 'SEND_FAILED', message: code },
+  });
+  await repo.insertEvent(orgId, {
+    itemId,
+    eventType: 'send_failed',
+    actorUserId: actor?.userId ?? null,
+    actorRole: actor?.role ?? null,
+    payload: {
+      communication_log_id: claimed.logId,
+      code,
+      body_sha256: bodySha,
+    },
+  });
+
+  return {
+    item: await presentById(orgId, itemId),
+    delivery: {
+      status: 'failed',
+      communication_log_id: claimed.logId,
+      provider_id: null,
+      error: code,
+    },
+  };
+}
+
 async function resolveManually({ orgId, itemId, actor }) {
   const item = await repo.findItem(orgId, itemId);
   if (!item) throw new OpsError(404, 'NOT_FOUND', 'Queue item not found');
@@ -528,6 +705,7 @@ module.exports = {
   getQueue,
   refresh,
   getItem,
+  approve,
   snooze,
   dismiss,
   resolveManually,
