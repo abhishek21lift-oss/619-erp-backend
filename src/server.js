@@ -986,6 +986,11 @@ app.use('/api/ai/copilot',        ...studioGate('ai_suite'), userApiLimiter, req
 // monthly allowance is checked before the handler can spend a token. The
 // handler itself authorises the client BEFORE opening the SSE stream.
 app.use('/api/ai/client-agent',   ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/aiClientAgent'));
+// The trainer's AI Ops Queue. Mounted BEFORE the generic /api/ai router so
+// /api/ai/ops/* is matched here first. studioGate supplies auth, trainer role
+// and the ai_suite feature; only POST /refresh (inside the router) spends a
+// token, so only that route carries aiLimiter + requireAiQuota().
+app.use('/api/ai/ops', userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-ops/ops.routes'));
 app.use('/api/ai',               userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
 app.use('/api/ai',               ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/ai'));
 
