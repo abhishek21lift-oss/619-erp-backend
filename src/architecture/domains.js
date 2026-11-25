@@ -363,7 +363,8 @@ const DOMAINS = {
     plane: PLANE.TENANT,
     tenancy: TENANCY.DIRECT,
     description: 'Knowledge base, assistants and agent tasks. Quota-gated per studio.',
-    dependsOn: ['tenancy', 'clients', 'training', 'nutrition'],
+    // crm-leads owns pt_leads, which ai_ops_items.lead_id references.
+    dependsOn: ['tenancy', 'clients', 'training', 'nutrition', 'crm-leads'],
     tables: [
       'ai_documents', 'ai_document_chunks', 'ai_conversations', 'ai_messages',
       'ai_usage_log', 'ai_action_plans', 'ai_model_rates', 'ai_provider_settings',
@@ -386,6 +387,10 @@ const DOMAINS = {
       // the targets/schedule it was judged against, and whether a trainer
       // accepted it. Same shape and reasoning as ai_workout_generations.
       'ai_diet_generations',
+      // The trainer's attention queue (migration 291): one item per client or
+      // lead, plus the append-only audit of every transition. Owned here with
+      // the rest of the assistant stack; the send itself stays in messaging.
+      'ai_ops_items', 'ai_ops_events',
     ],
   },
 
