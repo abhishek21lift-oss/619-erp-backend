@@ -14,7 +14,9 @@
 const repo = require('./ops.repository');
 const { collectAll } = require('./signals');
 const { templateDraft } = require('./templates');
+const { generateDrafts } = require('./draft');
 const transport = require('../messaging/transport');
+const crypto = require('crypto');
 const {
   chooseAction, reasonIdentity, closedReasons, shouldReopen, evidenceHash,
 } = require('./priority');
@@ -327,6 +329,90 @@ async function getQueue({ orgId, today, now = new Date() }) {
   return buildQueue({ orgId, today });
 }
 
+function sha256(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
+
+async function refresh({ orgId, today, actor, requestId, now = new Date() }) {
+  await reconcile({ orgId, today, now });
+
+  // The cooldown is read from the audit table, not an in-process map: a second
+  // instance must not spend again just because it never saw the first call.
+  const lastAt = await repo.latestBriefAt(orgId);
+  if (lastAt && now.getTime() - new Date(lastAt).getTime() < COOLDOWN_MS) {
+    const queue = await buildQueue({ orgId, today });
+    return {
+      ...queue,
+      ai: { status: 'cooldown', message: 'Just refreshed.', last_generated_at: lastAt },
+    };
+  }
+
+  const queue = await buildQueue({ orgId, today });
+  const candidates = queue.items.filter(
+    (item) => item.recommended_action?.kind === 'message' && item.channel.status === 'connected',
+  );
+  if (!candidates.length) return queue;
+
+  const studioName = await repo.orgName(orgId);
+  const generated = await generateDrafts({
+    orgId, items: candidates, studioName, actor, requestId,
+  });
+  if (!generated.ok) {
+    return {
+      ...queue,
+      ai: { status: 'failed', message: generated.message, last_generated_at: null },
+    };
+  }
+
+  const generatedAt = new Date(now).toISOString();
+  await repo.insertEvent(orgId, {
+    itemId: null,
+    eventType: 'brief_generated',
+    actorUserId: actor?.userId ?? null,
+    actorRole: actor?.role ?? null,
+    payload: {
+      date: today,
+      text: generated.brief,
+      source: 'ai',
+      model: generated.model ?? null,
+      generated_at: generatedAt,
+    },
+  });
+
+  for (const item of candidates) {
+    const draft = generated.drafts?.get(item.id);
+    if (!draft) continue;
+
+    // Guarded by the status we read. If the trainer approved this item while
+    // the model was writing, the write loses and the approval stands.
+    const updated = await repo.updateItem(orgId, item.id, item.status, { draft });
+    if (!updated) continue;
+
+    await repo.insertEvent(orgId, {
+      itemId: item.id,
+      eventType: 'draft_generated',
+      actorUserId: actor?.userId ?? null,
+      actorRole: actor?.role ?? null,
+      payload: {
+        source: 'ai',
+        model: generated.model ?? null,
+        confidence: draft.confidence ?? null,
+        body_sha256: sha256(draft.body),
+        body_length: draft.body.length,
+      },
+    });
+  }
+
+  const finalQueue = await buildQueue({ orgId, today });
+  return {
+    ...finalQueue,
+    brief: finalQueue.brief || {
+      text: generated.brief, source: 'ai', generated_at: generatedAt,
+    },
+    ai: { status: 'ok', message: null, last_generated_at: generatedAt },
+  };
+}
+
 async function getItem({ orgId, itemId }) {
   const row = await repo.findItem(orgId, itemId);
   if (!row) throw new OpsError(404, 'NOT_FOUND', 'Queue item not found');
@@ -440,6 +526,7 @@ module.exports = {
   reconcile,
   buildQueue,
   getQueue,
+  refresh,
   getItem,
   snooze,
   dismiss,
