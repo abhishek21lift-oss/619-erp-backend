@@ -67,6 +67,12 @@ const INTENT_ROUTES = {
   analysis:      'primary',
   lookup:        'primary',
 
+  // Member Assistant intents (modules/member-ai). Chat is advice and analysis,
+  // lookup is a single fact — the same split the Client Assistant uses, so
+  // spend stays attributable and a retune does not move both at once.
+  member_chat:   'primary',
+  member_lookup: 'secondary',
+
   // Data lookups and operational work — the stable model.
   attendance:    'secondary',
   checkin:       'secondary',
