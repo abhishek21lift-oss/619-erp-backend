@@ -11,6 +11,7 @@
 
 const pool = require('../../db/pool');
 const { trainerOfClient } = require('../../lib/memberTrainer');
+const transport = require('../messaging/transport');
 const logger = require('../../lib/logger');
 
 const MAX_BODY = 2000;
@@ -32,7 +33,7 @@ function normaliseBody(raw) {
   return body;
 }
 
-const COLS = 'id, sender, body, read_at, created_at';
+const COLS = 'id, sender, body, read_at, created_at, channel, message_type, delivery_status, failure_reason';
 
 /**
  * The newest page of a thread, returned oldest-first for display. `before`
@@ -158,6 +159,7 @@ async function memberSend(clientId, orgId, userId, raw) {
 async function studioClient(orgId, clientId) {
   const { rows } = await pool.query(
     `SELECT c.id, c.name, c.photo_url, c.client_id AS member_code,
+            c.whatsapp, c.mobile,
             (SELECT u.id FROM users u
               WHERE u.pt_client_id = c.id AND u.role = 'member' AND u.is_active = TRUE AND u.deleted_at IS NULL
               LIMIT 1) AS member_user_id
@@ -175,7 +177,7 @@ async function studioClient(orgId, clientId) {
 async function inbox(orgId, { limit = 100 } = {}) {
   const { rows } = await pool.query(
     `WITH last AS (
-       SELECT DISTINCT ON (m.client_id) m.client_id, m.sender, m.body, m.created_at
+       SELECT DISTINCT ON (m.client_id) m.client_id, m.sender, m.body, m.created_at, m.channel
          FROM client_messages m
         WHERE m.organization_id = $1
         ORDER BY m.client_id, m.created_at DESC
@@ -186,6 +188,7 @@ async function inbox(orgId, { limit = 100 } = {}) {
      )
      SELECT l.client_id, c.name AS client_name, c.photo_url, c.client_id AS member_code,
             l.sender AS last_sender, l.body AS last_body, l.created_at AS last_at,
+            l.channel AS last_channel,
             COALESCE(u.n, 0) AS unread,
             EXISTS (SELECT 1 FROM users mu
                      WHERE mu.pt_client_id = c.id AND mu.role = 'member'
@@ -209,11 +212,44 @@ async function studioUnread(orgId) {
   return rows[0].n;
 }
 
+/**
+ * Which channel the composer should start on, and whether WhatsApp can be used
+ * at all right now.
+ *
+ * `resolveInstance` is the only module that knows what "connected" means, so
+ * this asks it rather than reading `whatsapp_instances` again. The latest
+ * channel only makes WhatsApp the default while the instance is connected:
+ * preferring a channel that cannot send would turn every reply into a failed
+ * bubble.
+ */
+async function channelState(orgId, clientId, latestChannel = null) {
+  let latest = latestChannel;
+
+  if (!latest) {
+    const { rows } = await pool.query(
+      `SELECT channel FROM client_messages
+        WHERE organization_id = $1 AND client_id = $2
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [orgId, clientId],
+    );
+    latest = rows[0]?.channel ?? null;
+  }
+
+  const instance = await transport.resolveInstance(orgId);
+  return {
+    default: latest === 'whatsapp' && instance.ok ? 'whatsapp' : 'in_app',
+    whatsapp_available: Boolean(instance.ok),
+  };
+}
+
 async function studioThread(orgId, client, opts) {
   const messages = await thread(orgId, client.id, opts);
   if (!opts?.before) await markRead(orgId, client.id, 'studio');
+  const channels = await channelState(orgId, client.id, messages[messages.length - 1]?.channel);
   return {
     messages,
+    channels,
     client: {
       id: client.id, name: client.name, photo_url: client.photo_url,
       member_code: client.member_code, has_login: Boolean(client.member_user_id),
@@ -233,4 +269,5 @@ module.exports = {
   notifyOnce,
   memberThread, memberUnread, memberSend,
   studioClient, inbox, studioUnread, studioThread, studioSend,
+  thread, channelState,
 };
