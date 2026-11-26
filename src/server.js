@@ -986,6 +986,11 @@ app.use('/api/ai/copilot',        ...studioGate('ai_suite'), userApiLimiter, req
 // monthly allowance is checked before the handler can spend a token. The
 // handler itself authorises the client BEFORE opening the SSE stream.
 app.use('/api/ai/client-agent',   ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/aiClientAgent'));
+// The trainer's AI Ops Queue. Mounted BEFORE the generic /api/ai router so
+// /api/ai/ops/* is matched here first. studioGate supplies auth, trainer role
+// and the ai_suite feature; only POST /refresh (inside the router) spends a
+// token, so only that route carries aiLimiter + requireAiQuota().
+app.use('/api/ai/ops', userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-ops/ops.routes'));
 app.use('/api/ai',               userApiLimiter, ...studioGate('ai_suite'), require('./modules/ai-actions/ai-actions.routes'));
 app.use('/api/ai',               ...studioGate('ai_suite'), aiLimiter, requireAiQuota(), require('./routes/ai'));
 
@@ -1031,6 +1036,13 @@ app.use('/api/me',               auth, requireClient, require('./modules/client-
 // The client's own post-session feedback: requests and the one submission.
 // No route takes a client id; identity is req.user.pt_client_id.
 app.use('/api/me',               auth, requireClient, require('./modules/session-feedback/feedback.routes').member);
+// Member AI. The member side of the AI suite: identity from the session, the
+// studio's entitlement and allowance decided before any tool runs, and the
+// same per-user and AI burst limits as the trainer surfaces.
+app.use('/api/me/ai',
+  auth, requireClient, requireFeature('ai_suite'),
+  userApiLimiter, aiLimiter, requireAiQuota(),
+  require('./modules/member-ai/member-ai.routes'));
 
 // The studio's side of member ↔ studio messaging. The member's side is
 // /api/me/messages above; this one takes a client id, so it is trainer-only and
