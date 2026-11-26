@@ -445,6 +445,7 @@ describe('what the ledger records about an event', () => {
     // applied_rows = 0 is the whole point. It is a real outcome, not an
     // absence of one, and it must survive log retention.
     pool.query.mockImplementation(async (sql) => {
+      if (/UPDATE client_messages/.test(sql)) return { rowCount: 0, rows: [] };
       if (/UPDATE communication_logs/.test(sql)) return { rowCount: 0, rows: [] };
       return { rowCount: 1, rows: [] };
     });
@@ -461,6 +462,12 @@ describe('what the ledger records about an event', () => {
   });
 
   test('a receipt that landed records the row it changed', async () => {
+    // The thread missed; communication_logs is the path being asserted.
+    pool.query.mockImplementation(async (sql) => {
+      if (/UPDATE client_messages/.test(sql)) return { rowCount: 0, rows: [] };
+      return { rowCount: 1, rows: [] };
+    });
+
     const res = await post(makeEvent({
       event_type: 'whatsapp.message.read',
       payload: { provider_message_id: 'WAMSG1' },
@@ -471,10 +478,15 @@ describe('what the ledger records about an event', () => {
   });
 
   test('an inert sent event still records WHICH message it was about', async () => {
-    // `sent` changes nothing by design. Recording its provider id anyway is
-    // what makes a later unmatched receipt diagnosable: the id the gateway
-    // sent under, and the id a receipt came looking for, in two rows of one
-    // table.
+    // When no thread row matches (an automation send), `sent` changes nothing
+    // here. Recording its provider id anyway is what makes a later unmatched
+    // receipt diagnosable: the id the gateway sent under, and the id a receipt
+    // came looking for, in two rows of one table.
+    pool.query.mockImplementation(async (sql) => {
+      if (/UPDATE client_messages/.test(sql)) return { rowCount: 0, rows: [] };
+      return { rowCount: 1, rows: [] };
+    });
+
     await post(makeEvent({
       event_type: 'whatsapp.message.sent',
       payload: { client_message_id: 'log-1', provider_message_id: 'WAMSG1' },
@@ -555,6 +567,17 @@ describe('what the ledger records about an event', () => {
 });
 
 describe('delivery receipts', () => {
+  // The thread is tried first now. These tests are about the
+  // communication_logs fallback for automation sends, so make the thread miss
+  // and let the fallback answer — otherwise a default mock of 1 would swallow
+  // the branch under test.
+  beforeEach(() => {
+    pool.query.mockImplementation(async (sql) => {
+      if (/UPDATE client_messages/.test(sql)) return { rowCount: 0, rows: [] };
+      return { rowCount: 1, rows: [] };
+    });
+  });
+
   /** Every UPDATE communication_logs this request issued. */
   const logUpdates = () =>
     pool.query.mock.calls
@@ -634,10 +657,12 @@ describe('delivery receipts', () => {
     expect(update.sql).toMatch(/status NOT IN \('sent', 'delivered', 'read', 'suppressed'\)/);
   });
 
-  test('a sent event changes nothing, because the worker already recorded it', async () => {
-    // The worker wrote the row synchronously from the HTTP response, which
-    // carried the same provider id, and did so before this event could arrive.
-    // Applying it again could pull a delivered row back to 'sent'.
+  test('a sent event writes no communication_logs row', async () => {
+    // The worker wrote its communication_logs row synchronously from the HTTP
+    // response, which carried the same provider id, and did so before this
+    // event could arrive. Here the event may heal the THREAD row's delivery
+    // state, but it must not write a second log row — or pull a delivered log
+    // back to 'sent'.
     const res = await post(makeEvent({
       event_type: 'whatsapp.message.sent',
       payload: { client_message_id: 'log-1', provider_message_id: 'WAMSG1', sent_at: new Date().toISOString() },

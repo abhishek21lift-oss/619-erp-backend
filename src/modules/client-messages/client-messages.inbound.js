@@ -105,6 +105,93 @@ const TRAINERS_SQL = `
    WHERE c.id = $1 AND c.organization_id = $2
 `;
 
+// ── Outbound receipts ───────────────────────────────────────────────────────
+//
+// The thread row is keyed by the ERP's own id for `sent`/`failed` and by the
+// provider's id for `delivered`/`read`, because that is the id WhatsApp's own
+// callbacks carry. `sent` is only a healing path: the send response normally
+// recorded it already, and the `delivery_status = 'queued'` guard stops a late
+// `sent` from pulling a delivered row backwards.
+const SENT_SQL = `
+  UPDATE client_messages
+     SET external_id = $3, delivery_status = 'sent'
+   WHERE id = $1 AND organization_id = $2
+     AND sender = 'studio' AND channel = 'whatsapp' AND delivery_status = 'queued'
+`;
+
+// Read is terminal. A `delivered` that arrives after it must not move the row
+// backwards; the CASE makes the ordering a property of the statement rather
+// than of the order the gateway happens to deliver in.
+const RECEIPT_SQL = `
+  UPDATE client_messages
+     SET delivery_status = CASE
+           WHEN $3 = 'read' THEN 'read'
+           WHEN $3 = 'delivered' AND delivery_status <> 'read' THEN 'delivered'
+           ELSE delivery_status END,
+         delivered_at = CASE
+           WHEN $3 IN ('delivered','read') THEN COALESCE(delivered_at, $4::timestamptz)
+           ELSE delivered_at END,
+         provider_read_at = CASE
+           WHEN $3 = 'read' THEN COALESCE(provider_read_at, $4::timestamptz)
+           ELSE provider_read_at END
+   WHERE organization_id = $1 AND external_id = $2
+     AND sender = 'studio' AND channel = 'whatsapp'
+`;
+
+// A failure cannot overwrite a message that has since been accepted. There is
+// no BullMQ job behind a manual reply, so `will_retry` is ignored: the
+// trainer's Retry button is the retry policy.
+const FAILURE_SQL = `
+  UPDATE client_messages
+     SET delivery_status = 'failed', failure_reason = $3
+   WHERE id = $1 AND organization_id = $2
+     AND sender = 'studio' AND channel = 'whatsapp'
+     AND delivery_status NOT IN ('sent','delivered','read')
+`;
+
+/**
+ * Lowercase before stripping: the gateway may send
+ * `RECIPIENT_NOT_ON_WHATSAPP`, and a sanitiser that dropped uppercase would
+ * discard the one reason the trainer can act on.
+ */
+function sanitiseFailureReason(reason) {
+  return String(reason || 'gateway_failed')
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_')
+    .slice(0, 64) || 'gateway_failed';
+}
+
+async function applyThreadSent({ tenantId, payload, client }) {
+  const clientMessageId = payload?.client_message_id;
+  const providerMessageId = payload?.provider_message_id;
+  if (!clientMessageId || !providerMessageId) return 0;
+
+  const result = await client.query(SENT_SQL, [clientMessageId, tenantId, providerMessageId]);
+  return result.rowCount || 0;
+}
+
+async function applyThreadReceipt({ tenantId, kind, payload, client }) {
+  const externalId = payload?.provider_message_id;
+  if (!externalId) return 0;
+
+  const at = kind === 'delivered' ? payload?.delivered_at : payload?.read_at;
+  const result = await client.query(RECEIPT_SQL, [tenantId, externalId, kind, at ?? null]);
+  return result.rowCount || 0;
+}
+
+async function applyThreadFailure({ tenantId, payload, client }) {
+  const clientMessageId = payload?.client_message_id;
+  if (!clientMessageId) return 0;
+
+  const result = await client.query(FAILURE_SQL, [
+    clientMessageId,
+    tenantId,
+    sanitiseFailureReason(payload?.reason_code),
+  ]);
+  return result.rowCount || 0;
+}
+
+
 function none(subject = null) {
   return { applied: 0, subject, notifications: [] };
 }
@@ -173,6 +260,10 @@ async function applyInboundMessage({ tenantId, payload, occurredAt, client }) {
 
 module.exports = {
   applyInboundMessage,
+  applyThreadSent,
+  applyThreadReceipt,
+  applyThreadFailure,
+  sanitiseFailureReason,
   // Exported for the webhook's unit tests and for a future linking flow.
   normalisePayload,
 };
