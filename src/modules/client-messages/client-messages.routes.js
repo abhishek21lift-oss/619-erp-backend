@@ -11,7 +11,12 @@
 
 const router = require('express').Router();
 const { orgIdOf } = require('../../lib/tenant-db');
+const { requireFeature } = require('../../lib/features');
+const { aiLimiter } = require('../../middleware/aiRateLimit');
+const { requireAiQuota } = require('../../lib/aiQuota');
+const aiConfig = require('../../lib/ai/config');
 const svc = require('./client-messages.service');
+const draft = require('./client-messages.draft');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -38,6 +43,41 @@ router.get('/:clientId', wrap(async (req, res) => {
     ? req.query.before : null;
   res.json({ data: await svc.studioThread(orgId, client, { before }) });
 }));
+
+// POST /api/messages/:clientId/ai-draft — a proposal, never a send
+//
+// The mount supplies auth + requireTrainer; these three guards are route-level
+// because the rest of /api/messages costs nothing and must keep working for a
+// studio without the AI suite.
+router.post('/:clientId/ai-draft',
+  requireFeature('ai_suite'), aiLimiter, requireAiQuota(),
+  wrap(async (req, res) => {
+    const orgId = orgIdOf(req);
+    const client = await svc.studioClient(orgId, req.params.clientId);
+    if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found.' } });
+
+    if (!aiConfig.isConfigured()) {
+      return res.status(501).json({
+        error: { code: 'AI_NOT_CONFIGURED', message: aiConfig.configurationProblem() },
+      });
+    }
+
+    const out = await draft.generateInboxDraft({
+      orgId,
+      client,
+      actor: { userId: req.user?.id ?? null, role: req.user?.role ?? null },
+      requestId: req.id ?? null,
+    });
+
+    if (!out.ok) {
+      return res.status(out.status).json({ error: { code: out.code, message: out.message } });
+    }
+
+    // No client_messages write here, by construction: the draft exists only in
+    // this response until the trainer sends it.
+    res.json({ data: { draft: out.draft, meta: out.meta } });
+  })
+);
 
 // POST /api/messages/:clientId — reply { body, channel? }
 router.post('/:clientId', wrap(async (req, res) => {
