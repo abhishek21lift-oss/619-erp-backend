@@ -39,14 +39,58 @@ router.get('/:clientId', wrap(async (req, res) => {
   res.json({ data: await svc.studioThread(orgId, client, { before }) });
 }));
 
-// POST /api/messages/:clientId — reply { body }
+// POST /api/messages/:clientId — reply { body, channel? }
 router.post('/:clientId', wrap(async (req, res) => {
   const orgId = orgIdOf(req);
   const client = await svc.studioClient(orgId, req.params.clientId);
   if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found.' } });
   try {
-    const msg = await svc.studioSend(orgId, client, req.user.id, req.body?.body, req.user.name);
-    res.status(201).json({ data: msg });
+    const { message, delivery } = await svc.studioSend(orgId, client, req.user.id, req.body?.body, {
+      senderName: req.user.name,
+      channel: req.body?.channel,
+      requestId: req.id,
+    });
+
+    // 502 with the row: the message exists and is visible as failed, so the
+    // trainer can retry it rather than wondering whether it was lost.
+    if (!delivery.ok) {
+      return res.status(502).json({
+        error: {
+          code: 'SEND_FAILED',
+          message: 'WhatsApp could not deliver this message. Retry when the number or connection is fixed.',
+        },
+        data: message,
+      });
+    }
+
+    res.status(201).json({ data: message });
+  } catch (err) {
+    if (err instanceof svc.MessageInputError) return sendInputError(res, err);
+    throw err;
+  }
+}));
+
+// POST /api/messages/:clientId/:messageId/retry — one failed WhatsApp row
+router.post('/:clientId/:messageId/retry', wrap(async (req, res) => {
+  const orgId = orgIdOf(req);
+  const client = await svc.studioClient(orgId, req.params.clientId);
+  if (!client) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Client not found.' } });
+
+  try {
+    const out = await svc.retryWhatsApp(orgId, client, req.params.messageId, { requestId: req.id });
+    if (!out) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Message not found.' } });
+
+    if (!out.delivery.ok) {
+      return res.status(502).json({
+        error: {
+          code: 'SEND_FAILED',
+          message: 'WhatsApp could not deliver this message. Retry when the number or connection is fixed.',
+        },
+        data: out.message,
+      });
+    }
+
+    res.json({ data: out.message });
   } catch (err) {
     if (err instanceof svc.MessageInputError) return sendInputError(res, err);
     throw err;
