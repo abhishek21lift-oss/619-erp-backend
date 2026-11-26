@@ -128,6 +128,7 @@ async function memberSend(clientId, orgId, userId, raw) {
   const { rows: [recent] } = await pool.query(
     `SELECT COUNT(*)::int AS n FROM client_messages
       WHERE organization_id = $1 AND client_id = $2 AND sender = 'member'
+        AND channel = 'in_app'
         AND created_at > NOW() - INTERVAL '1 hour'`,
     [orgId, clientId],
   );
@@ -229,6 +230,7 @@ async function studioSend(orgId, client, userId, raw, senderName) {
 
 module.exports = {
   normaliseBody, MessageInputError, MAX_BODY, MEMBER_HOURLY_LIMIT,
+  notifyOnce,
   memberThread, memberUnread, memberSend,
   studioClient, inbox, studioUnread, studioThread, studioSend,
 };

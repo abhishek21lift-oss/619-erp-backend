@@ -27,6 +27,8 @@ const express = require('express');
 const crypto  = require('crypto');
 const pool    = require('../db/pool');
 const logger  = require('../lib/logger');
+const inbound = require('../modules/client-messages/client-messages.inbound');
+const { notifyOnce } = require('../modules/client-messages/client-messages.service');
 
 const router = express.Router();
 
@@ -97,6 +99,12 @@ const STATUS_FOR_EVENT = {
 async function applyMessageEvent(eventType, payload, tenantId, occurredAt, client) {
   const repo = require('../modules/automation/automation.repository');
   const kind = eventType.slice('whatsapp.message.'.length);
+
+  // A member's WhatsApp message. Stored in the same thread as the in-app
+  // conversation; the notifications it returns run after COMMIT.
+  if (kind === 'received') {
+    return inbound.applyInboundMessage({ tenantId, payload, occurredAt, client });
+  }
 
   if (kind === 'delivered' || kind === 'read') {
     const externalId = payload.provider_message_id;
@@ -275,11 +283,20 @@ router.post('/', async (req, res) => {
     // 'delivered'/'read' status values have been waiting for since migration
     // 012 — until now nothing wrote them, because nothing sent anything.
     if (event_type.startsWith('whatsapp.message.')) {
-      const { applied, subject } = await applyMessageEvent(
+      const { applied, subject, notifications } = await applyMessageEvent(
         event_type, event.payload || {}, tenant_id, occurred_at, client
       );
       await recordOutcome(client, event_id, subject, applied);
       await client.query('COMMIT');
+
+      // After COMMIT on purpose: a best-effort notification insert must not be
+      // able to abort the message it is announcing. `notifyOnce` never throws.
+      for (const notification of notifications || []) {
+        await notifyOnce(
+          notification.userId, notification.title, notification.body, notification.link,
+        );
+      }
+
       // `applied: 0` on a receipt is the signal worth having: the event was
       // genuine and verified, and it matched no message this ERP sent. Logged
       // at warn (not info) with the id it was looking for, and recorded on the

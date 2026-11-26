@@ -38,6 +38,15 @@ jest.mock('../db/pool', () => {
   return { query, connect: jest.fn(async () => client), __client: client, __txn: txn };
 });
 
+// The notification is best-effort and deliberately runs after COMMIT, so this
+// suite needs to see the call without touching the notifications table. Only
+// `notifyOnce` is used from this module; the inbound module under test runs
+// for real.
+jest.mock('../modules/client-messages/client-messages.service', () => ({
+  notifyOnce: jest.fn(),
+}));
+const { notifyOnce } = require('../modules/client-messages/client-messages.service');
+
 const request = require('supertest');
 const express = require('express');
 const pool = require('../db/pool');
@@ -90,6 +99,8 @@ function post(body, opts = {}) {
 beforeEach(() => {
   pool.query.mockReset();
   pool.query.mockResolvedValue({ rowCount: 1, rows: [] });
+  notifyOnce.mockReset();
+  notifyOnce.mockResolvedValue(undefined);
 });
 
 describe('signature verification', () => {
@@ -336,7 +347,7 @@ describe('applying events', () => {
   it('acknowledges an unknown event type without changing anything', async () => {
     // The gateway may ship a new event type before this deploy does. Retrying
     // something we will never understand only fills the dead-letter list.
-    await post(makeEvent({ event_type: 'whatsapp.message.received' }));
+    await post(makeEvent({ event_type: 'whatsapp.message.reaction' }));
 
     const updates = pool.query.mock.calls.filter(([q]) => /UPDATE whatsapp_instances/i.test(q));
     expect(updates).toHaveLength(0);
@@ -670,5 +681,34 @@ describe('delivery receipts', () => {
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ duplicate: true });
     expect(logUpdates()).toHaveLength(0);
+  });
+});
+
+describe('inbound messages', () => {
+  it('applies a signed received event and notifies after commit', async () => {
+    pool.query
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })          // claim
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'c1', name: 'Ravi' }] }) // resolve
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'm1' }] }) // insert
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'u1' }] }) // trainers
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });          // ledger outcome
+
+    // The notification is best-effort and must not run inside the transaction:
+    // a failed insert there would abort the message it is announcing.
+    notifyOnce.mockImplementation(async () => {
+      expect(pool.__txn).toContain('COMMIT');
+    });
+
+    const res = await post(makeEvent({
+      event_type: 'whatsapp.message.received',
+      payload: {
+        provider_message_id: 'WAMSG1', from_phone: '919876543210', push_name: 'Ravi',
+        message_type: 'text', text: 'Hello', received_at: new Date().toISOString(),
+      },
+    }));
+
+    expect(res.status).toBe(200);
+    expect(pool.__txn).toContain('COMMIT');
+    expect(notifyOnce).toHaveBeenCalledWith('u1', 'New WhatsApp message from Ravi', 'Hello', '/pt-os/messages?client=c1');
   });
 });
