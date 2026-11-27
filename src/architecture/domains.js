@@ -332,6 +332,11 @@ const DOMAINS = {
     dependsOn: ['tenancy', 'compensation'],
     tables: [
       'whatsapp_instances', 'whatsapp_webhook_events',
+      // Inbound WhatsApp from a number the studio cannot resolve, or resolves
+      // to more than one client. It belongs here rather than in `engagement`:
+      // it is a transport record with no thread and no client, and dropping it
+      // would make "why did nobody answer?" unanswerable.
+      'whatsapp_unmatched_messages',
       // The permission gate for automated sending. It lives here rather than
       // with automation_rules in `engagement` because it is about DELIVERY —
       // whether this studio's WhatsApp may be used unattended — not about
