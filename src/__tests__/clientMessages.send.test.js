@@ -73,6 +73,7 @@ beforeEach(() => {
     if (/UPDATE client_messages/i.test(sql)) {
       const base = db.row || { id: 'm1', body: 'Hi', channel: 'whatsapp' };
       if (/delivery_status = 'sent'/i.test(sql)) {
+        if (db.sentMiss) return { rows: [], rowCount: 0 };
         return { rows: [{ ...base, delivery_status: 'sent', external_id: params[2] }], rowCount: 1 };
       }
       if (/delivery_status = 'failed'/i.test(sql)) {
@@ -199,4 +200,23 @@ it('refuses to retry a row that is not failed', async () => {
 
   expect(await retryWhatsApp(ORG, client, 'm1')).toBeNull();
   expect(transport.send).not.toHaveBeenCalled();
+});
+
+it('returns the row the sent event already advanced when the update misses', async () => {
+  // The webhook's `sent` event can win the race against this HTTP response.
+  // `markSent` then matches nothing because the row is no longer queued; the
+  // response must still carry the row's CURRENT state, or the bubble shows
+  // "Sending…" for a message that already went out.
+  transport.resolveInstance.mockResolvedValue({ ok: true });
+  transport.send.mockResolvedValue({ status: 'sent', provider_id: 'WAMSG1' });
+  db.sentMiss = true;
+  db.row = {
+    id: 'm1', client_id: 'c1', body: 'Hi', channel: 'whatsapp',
+    delivery_status: 'delivered', external_id: 'WAMSG1',
+  };
+
+  const { message, delivery } = await studioSend(ORG, client, 'u1', 'Hi', { channel: 'whatsapp' });
+
+  expect(delivery).toEqual({ ok: true, status: 'sent' });
+  expect(message.delivery_status).toBe('delivered');
 });

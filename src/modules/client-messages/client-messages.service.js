@@ -112,6 +112,23 @@ async function markFailed(orgId, messageId, reason) {
 }
 
 /**
+ * Read one row back by id.
+ *
+ * Needed when `markSent` matches nothing: the webhook's `sent` event can win
+ * the race against this HTTP response, so the row is already `sent` (or
+ * further along) and the guarded UPDATE is a no-op. Returning the queued row
+ * from memory would show "Sending…" on a message that already went out, until
+ * the next poll.
+ */
+async function readMessage(orgId, messageId) {
+  const { rows } = await pool.query(
+    `SELECT ${COLS} FROM client_messages WHERE id = $1 AND organization_id = $2`,
+    [messageId, orgId],
+  );
+  return rows[0] || null;
+}
+
+/**
  * Hand one queued thread row to the transport and record what happened.
  *
  * A thrown transport error still marks the row failed. Leaving it queued would
@@ -139,7 +156,10 @@ async function deliverWhatsApp(orgId, client, row, requestId) {
 
   if (result?.status === 'sent') {
     const sent = await markSent(orgId, row.id, result.provider_id || null);
-    return { message: sent || row, delivery: { ok: true, status: 'sent' } };
+    // A null here means the event path already advanced the row. Re-read it so
+    // the response carries the current state rather than the queued snapshot.
+    const message = sent || await readMessage(orgId, row.id) || row;
+    return { message, delivery: { ok: true, status: 'sent' } };
   }
 
   const reason = sanitiseFailureReason(result?.error || result?.status || 'send_failed');
