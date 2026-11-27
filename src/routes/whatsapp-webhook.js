@@ -27,6 +27,8 @@ const express = require('express');
 const crypto  = require('crypto');
 const pool    = require('../db/pool');
 const logger  = require('../lib/logger');
+const inbound = require('../modules/client-messages/client-messages.inbound');
+const { notifyOnce } = require('../modules/client-messages/client-messages.service');
 
 const router = express.Router();
 
@@ -98,9 +100,24 @@ async function applyMessageEvent(eventType, payload, tenantId, occurredAt, clien
   const repo = require('../modules/automation/automation.repository');
   const kind = eventType.slice('whatsapp.message.'.length);
 
+  // A member's WhatsApp message. Stored in the same thread as the in-app
+  // conversation; the notifications it returns run after COMMIT.
+  if (kind === 'received') {
+    return inbound.applyInboundMessage({ tenantId, payload, occurredAt, client });
+  }
+
   if (kind === 'delivered' || kind === 'read') {
     const externalId = payload.provider_message_id;
     if (!externalId) return { applied: 0, subject: null };
+
+    // The thread first: a message the trainer sent from this inbox must show
+    // its ticks. Only when no thread row matches do we fall through to the
+    // automation ledger, which is what communication_logs has always been.
+    const threadApplied = await inbound.applyThreadReceipt({
+      tenantId, kind, payload, client,
+    });
+    if (threadApplied > 0) return { applied: threadApplied, subject: externalId };
+
     const applied = await repo.applyReceipt(
       tenantId,
       externalId,
@@ -116,6 +133,13 @@ async function applyMessageEvent(eventType, payload, tenantId, occurredAt, clien
     if (!logId) return { applied: 0, subject: null };
     const reason = payload.reason_code || 'gateway_failed';
 
+    // Same order as receipts: the thread is the newer store, and a manual
+    // reply exists only there.
+    const threadApplied = await inbound.applyThreadFailure({
+      tenantId, payload, client,
+    });
+    if (threadApplied > 0) return { applied: threadApplied, subject: logId };
+
     // `will_retry` is the gateway's advice for the ERP's own BullMQ retry, not
     // a promise that it will retry. Marking the row failed here made the next
     // attempt skip it as already_failed, so one transient send error dropped
@@ -126,16 +150,22 @@ async function applyMessageEvent(eventType, payload, tenantId, occurredAt, clien
     return { applied, subject: logId };
   }
 
-  // `sent` is deliberately inert. The worker already recorded the send
-  // synchronously from the HTTP response, which carried the same provider id —
-  // and it did so before this event could arrive. Applying it again would at
-  // best be a no-op and at worst move a row that has since been delivered back
-  // to 'sent'.
-  //
-  // The provider id is still returned so the ledger records WHICH message the
-  // event was about. That is what makes a later unmatched receipt diagnosable:
-  // the id the gateway believes it sent under, next to the id a receipt came
-  // looking for, in two rows of the same table.
+  if (kind === 'sent') {
+    const providerMessageId = payload.provider_message_id;
+    if (!providerMessageId) {
+      return { applied: 0, subject: payload.client_message_id || null };
+    }
+
+    // A healing path for a lost HTTP response: only a still-queued thread row
+    // is touched, so a `sent` that arrives after `delivered` cannot move the
+    // row backwards.
+    const applied = await inbound.applyThreadSent({ tenantId, payload, client });
+    return { applied, subject: providerMessageId };
+  }
+
+  // Any other message event is inert, but the provider id is still returned so
+  // the ledger records WHICH message it was about. That is what makes a later
+  // unmatched receipt diagnosable.
   return { applied: 0, subject: payload.provider_message_id || payload.client_message_id || null };
 }
 
@@ -275,11 +305,20 @@ router.post('/', async (req, res) => {
     // 'delivered'/'read' status values have been waiting for since migration
     // 012 — until now nothing wrote them, because nothing sent anything.
     if (event_type.startsWith('whatsapp.message.')) {
-      const { applied, subject } = await applyMessageEvent(
+      const { applied, subject, notifications } = await applyMessageEvent(
         event_type, event.payload || {}, tenant_id, occurred_at, client
       );
       await recordOutcome(client, event_id, subject, applied);
       await client.query('COMMIT');
+
+      // After COMMIT on purpose: a best-effort notification insert must not be
+      // able to abort the message it is announcing. `notifyOnce` never throws.
+      for (const notification of notifications || []) {
+        await notifyOnce(
+          notification.userId, notification.title, notification.body, notification.link,
+        );
+      }
+
       // `applied: 0` on a receipt is the signal worth having: the event was
       // genuine and verified, and it matched no message this ERP sent. Logged
       // at warn (not info) with the id it was looking for, and recorded on the

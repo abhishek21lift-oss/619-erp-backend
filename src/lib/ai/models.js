@@ -92,6 +92,9 @@ const INTENT_ROUTES = {
   // intent so spend is attributable in ai_usage_log and a future retune does
   // not have to change both surfaces at once.
   ops_queue:     'primary',
+  // A trainer-facing reply draft. Distinct from ops_queue so the two spend
+  // lines can be read separately even though both are proposal-only.
+  inbox_draft:   'primary',
 
   // Money. These were on the fallback tier — openrouter/auto — so a question
   // about dues, an invoice or a subscription was answered by whichever model
