@@ -46,7 +46,7 @@ beforeEach(() => {
 const permission = (allow) => (sql) => {
   if (/SELECT allow_self_workout FROM pt_clients/.test(sql)) return { rows: [{ allow_self_workout: allow }] };
   // The daily cap runs on every start; the default is an empty day.
-  if (/SELECT COUNT\(\*\)::int AS n FROM workout_sessions/.test(sql)) return { rows: [{ n: 0 }] };
+  if (/SELECT COUNT\(\*\)::int AS n/.test(sql)) return { rows: [{ n: 0 }] };
   if (/FROM workout_assignments a/.test(sql)) {
     return { rows: [{
       assignment_id: 'a1', plan_id: 'p1', name: 'Base', duration_weeks: 8,
@@ -101,7 +101,7 @@ describe('POST /api/me/workout/sessions', () => {
 
   it('refuses a fifth start on the same day, and creates nothing', async () => {
     mockResponder = (sql, params) => {
-      if (/SELECT COUNT\(\*\)::int AS n FROM workout_sessions/.test(sql)) return { rows: [{ n: 4 }] };
+      if (/SELECT COUNT\(\*\)::int AS n/.test(sql)) return { rows: [{ n: 4 }] };
       return permission(true)(sql, params);
     };
     const res = await request(app).post('/api/me/workout/sessions').send({}).expect(429);
@@ -111,7 +111,7 @@ describe('POST /api/me/workout/sessions', () => {
 
   it('still resumes an open session at the daily cap', async () => {
     mockResponder = (sql, params) => {
-      if (/SELECT COUNT\(\*\)::int AS n FROM workout_sessions/.test(sql)) return { rows: [{ n: 4 }] };
+      if (/SELECT COUNT\(\*\)::int AS n/.test(sql)) return { rows: [{ n: 4 }] };
       if (/FROM workout_sessions/.test(sql) && /INTERVAL '24 hours'/.test(sql)) {
         return { rows: [sessionRow()] };
       }
@@ -119,6 +119,23 @@ describe('POST /api/me/workout/sessions', () => {
     };
     const res = await request(app).post('/api/me/workout/sessions').send({}).expect(200);
     expect(res.body.data.resumed).toBe(true);
+  });
+
+  // Closing an untouched session discards it. If the cap still counted it, four
+  // accidental starts would lock the member out for the rest of the day.
+  it('does not count an empty abandoned session towards the daily cap', async () => {
+    let countSql = '';
+    mockResponder = (sql, params) => {
+      if (/SELECT COUNT\(\*\)::int AS n/.test(sql)) {
+        countSql = sql;
+        return { rows: [{ n: 0 }] };
+      }
+      if (/INSERT INTO workout_sessions/.test(sql)) return { rows: [sessionRow()] };
+      return permission(true)(sql, params);
+    };
+    await request(app).post('/api/me/workout/sessions').send({}).expect(201);
+    expect(countSql).toMatch(/status <> 'abandoned'/);
+    expect(countSql).toMatch(/FROM workout_sets/);
   });
 
   it('resumes the open session instead of inserting a second one', async () => {
@@ -132,6 +149,56 @@ describe('POST /api/me/workout/sessions', () => {
     expect(res.body.data.resumed).toBe(true);
     expect(res.body.data.session.draft.exercises[0].name).toBe('Squat');
     expect(mockQueries.some((q) => /INSERT INTO workout_sessions/.test(q.sql))).toBe(false);
+  });
+
+  // Two programme days, so a request can name a day that is not the open one.
+  const twoDayProgramme = (openDay, openAssignment = 'a1') => (sql) => {
+    if (/SELECT allow_self_workout FROM pt_clients/.test(sql)) return { rows: [{ allow_self_workout: true }] };
+    if (/SELECT COUNT\(\*\)::int AS n/.test(sql)) return { rows: [{ n: 0 }] };
+    if (/FROM workout_assignments a/.test(sql)) {
+      return { rows: [{
+        assignment_id: 'a1', plan_id: 'p1', name: 'Base', duration_weeks: 8,
+        start_date: '2026-11-01', status: 'active', created_at: '2026-11-01', prescribes_dow: true,
+      }] };
+    }
+    if (/FROM workout_exercises we/.test(sql)) {
+      return { rows: [
+        { workout_plan_id: 'p1', exercise_id: 'e1', day_of_week: 4, week_number: 1, sort_order: 1, sets: 3, reps: 8, target_weight: '60', name: 'Squat', config: null },
+        { workout_plan_id: 'p1', exercise_id: 'e2', day_of_week: 5, week_number: 1, sort_order: 1, sets: 3, reps: 10, target_weight: '40', name: 'Bench', config: null },
+      ] };
+    }
+    if (/FROM workout_sessions/.test(sql) && /INTERVAL '24 hours'/.test(sql)) {
+      return { rows: [sessionRow({
+        workout_assignment_id: openAssignment,
+        prescribed: { plan_name: 'Base', day_of_week: openDay, exercises: [{ name: 'Squat' }] },
+      })] };
+    }
+    return { rows: [] };
+  };
+
+  it('flags a conflict when the open session is a different day', async () => {
+    mockResponder = twoDayProgramme(4);
+    const res = await request(app).post('/api/me/workout/sessions')
+      .send({ day_of_week: 5 }).expect(200);
+    expect(res.body.data).toMatchObject({ resumed: true, conflict: true });
+    expect(res.body.data.session.id).toBe('ws1');
+    expect(mockQueries.some((q) => /INSERT INTO workout_sessions/.test(q.sql))).toBe(false);
+  });
+
+  it('resumes without a conflict when the requested day is the open one', async () => {
+    mockResponder = twoDayProgramme(4);
+    const res = await request(app).post('/api/me/workout/sessions')
+      .send({ day_of_week: 4 }).expect(200);
+    expect(res.body.data).toMatchObject({ resumed: true });
+    expect(res.body.data.conflict).toBeUndefined();
+    expect(mockQueries.some((q) => /INSERT INTO workout_sessions/.test(q.sql))).toBe(false);
+  });
+
+  it('flags a conflict when the open session belongs to another programme', async () => {
+    mockResponder = twoDayProgramme(4, 'a2');
+    const res = await request(app).post('/api/me/workout/sessions')
+      .send({ assignment_id: 'a1', day_of_week: 4 }).expect(200);
+    expect(res.body.data).toMatchObject({ resumed: true, conflict: true });
   });
 
   it('returns the winner when two starts race past the open-session read', async () => {
@@ -151,6 +218,31 @@ describe('POST /api/me/workout/sessions', () => {
     const res = await request(app).post('/api/me/workout/sessions').send({}).expect(200);
     expect(res.body.data).toMatchObject({ resumed: true });
     expect(res.body.data.session.id).toBe('ws1');
+  });
+
+  it('flags a conflict when the race winner is a different day', async () => {
+    let openReads = 0;
+    const base = twoDayProgramme(4);
+    mockResponder = (sql, params) => {
+      if (/FROM workout_sessions/.test(sql) && /INTERVAL '24 hours'/.test(sql)) {
+        openReads += 1;
+        return {
+          rows: openReads === 1 ? [] : [sessionRow({
+            workout_assignment_id: 'a1',
+            prescribed: { plan_name: 'Base', day_of_week: 4, exercises: [{ name: 'Squat' }] },
+          })],
+        };
+      }
+      if (/INSERT INTO workout_sessions/.test(sql)) {
+        const err = new Error('duplicate key value violates unique constraint');
+        err.code = '23505';
+        throw err;
+      }
+      return base(sql, params);
+    };
+    const res = await request(app).post('/api/me/workout/sessions')
+      .send({ day_of_week: 5 }).expect(200);
+    expect(res.body.data).toMatchObject({ resumed: true, conflict: true });
   });
 
   it('retires a draft older than a day without deleting it', async () => {

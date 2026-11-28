@@ -19,9 +19,11 @@
 //                  (prescribes this weekday first, then newest); this is the
 //                  JS twin for member reads and tests.
 
-const { dbDate } = require('../../lib/appTime');
+const { dbDate, today: studioToday } = require('../../lib/appTime');
 
-const TODAY = () => new Date().toISOString().slice(0, 10);
+// The studio's calendar day, not UTC. A programme is live on the studio's
+// date; between 00:00 and 05:30 IST the UTC date is still yesterday.
+const TODAY = () => studioToday();
 
 // DATE columns come back from node-postgres as JS Dates, and String(date)
 // is "Mon Aug 03" — which compares wrongly against a YYYY-MM-DD today.

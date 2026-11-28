@@ -734,9 +734,26 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
     });
   }
 
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
+    // Validate every exercise before writing anything. The id is
+    // client-supplied: a row from another studio, or an archived movement,
+    // is a 404 here exactly as it is on the granular add. Doing it inside the
+    // transaction also means a bad id halfway down the list leaves no
+    // half-built plan behind.
+    if (Array.isArray(d.exercises)) {
+      for (const ex of d.exercises) {
+        if (!(await findVisibleExercise(ex.exercise_id, orgIdOf(req), client))) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: 'Exercise not found' });
+        }
+      }
+    }
+
     const id = randomUUID();
-    const { rows } = await pool.query(`
+    const { rows } = await client.query(`
       INSERT INTO workout_plans (id, name, description, goal, difficulty,
         duration_weeks, sessions_per_week, is_template, created_by, organization_id,
         warmup_protocol, mobility_protocol, cooldown_protocol,
@@ -765,7 +782,7 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
     // Add exercises if provided
     if (Array.isArray(d.exercises)) {
       for (const ex of d.exercises) {
-        await pool.query(`
+        await client.query(`
           INSERT INTO workout_exercises (id, workout_plan_id, exercise_id, day_of_week,
             week_number, sort_order, sets, reps, rest_seconds, notes,
             target_weight, tempo, rpe, rir, warmup_sets, superset_group,
@@ -778,10 +795,14 @@ router.post('/plans', auth, requireTrainer, async (req, res, next) => {
       }
     }
 
+    await client.query('COMMIT');
     res.status(201).json({ message: 'Workout plan created', plan: rows[0] });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     if (err.message?.includes('does not exist')) return res.status(400).json({ error: 'Tables not ready. Run migrations.' });
     next(err);
+  } finally {
+    client.release();
   }
 });
 
@@ -811,6 +832,20 @@ router.put('/plans/:id', auth, requireTrainer, async (req, res, next) => {
 
     const existing = await loadEditablePlan(req, req.params.id, client);
     if (!existing) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Workout plan not found' }); }
+
+    // Whole-plan replace deletes every row before re-inserting, so a bad
+    // exercise id has to be caught before the DELETE. Otherwise the plan is
+    // emptied and the replacement is refused, all inside the same
+    // transaction — a rollback would save it, but there is no reason to do
+    // the destructive work first.
+    if (Array.isArray(d.exercises)) {
+      for (const ex of d.exercises) {
+        if (!(await findVisibleExercise(ex.exercise_id, orgIdOf(req), client))) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: 'Exercise not found' });
+        }
+      }
+    }
 
     const { rows } = await client.query(`
       UPDATE workout_plans SET

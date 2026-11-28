@@ -209,7 +209,15 @@ router.get('/workout', wrap(async (req, res) => {
     training.selfWorkoutPermission(clientId, orgId),
     training.openSessionFor(clientId, orgId),
   ]);
-  res.json({ data, allow_self_workout: allowSelfWorkout, open_session: openSession });
+  res.json({
+    data,
+    allow_self_workout: allowSelfWorkout,
+    open_session: openSession,
+    // The studio's day, so the member app opens the day the trainer is
+    // actually on even when the phone is in another time zone. Optional for
+    // older clients; they fall back to the device's weekday.
+    today: today(),
+  });
 }));
 
 // GET /api/me/diet — active diet plans with daily targets and meals
@@ -553,7 +561,7 @@ router.post('/workout/sessions', wrap(async (req, res) => {
   }
   try {
     const plans = await portal.myWorkout(clientId, orgId);
-    const { session, resumed } = await training.startMyWorkout({
+    const { session, resumed, conflict } = await training.startMyWorkout({
       clientId,
       orgId,
       userId: req.user.id,
@@ -561,7 +569,9 @@ router.post('/workout/sessions', wrap(async (req, res) => {
       dayOfWeek: req.body?.day_of_week ?? null,
       assignmentId: req.body?.assignment_id ?? null,
     });
-    res.status(resumed ? 200 : 201).json({ data: { session, resumed } });
+    res.status(resumed ? 200 : 201).json({
+      data: { session, resumed, ...(conflict ? { conflict: true } : {}) },
+    });
   } catch (err) {
     if (!inputError(res, err, training.TrainingInputError)) throw err;
   }
