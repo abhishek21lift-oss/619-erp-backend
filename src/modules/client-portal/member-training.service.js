@@ -161,9 +161,23 @@ async function lastPerformance(clientId, orgId, names) {
 
 /** Member-source sessions for this client today — the member's daily cap. */
 async function memberSessionsToday(clientId, orgId) {
+  // The cap is about workouts, not taps. An empty session the member opened
+  // and closed is 'abandoned' and has no sets — counting it locked someone out
+  // after four accidental starts. An abandoned session that DID record sets
+  // still counts, so abandoning is not a way around the cap.
   const { rows } = await pool.query(
-    `SELECT COUNT(*)::int AS n FROM workout_sessions
-      WHERE client_id = $1 AND organization_id = $2 AND source = 'member' AND session_date = $3`,
+    `SELECT COUNT(*)::int AS n
+       FROM workout_sessions s
+      WHERE s.client_id = $1 AND s.organization_id = $2
+        AND s.source = 'member' AND s.session_date = $3
+        AND (
+          s.status <> 'abandoned'
+          OR EXISTS (
+            SELECT 1 FROM workout_sets ws
+              JOIN workout_session_exercises wse ON wse.id = ws.session_exercise_id
+             WHERE wse.session_id = s.id
+          )
+        )`,
     [clientId, orgId, today()],
   );
   return rows[0].n;
@@ -550,6 +564,28 @@ async function openSessionFor(clientId, orgId, db = pool) {
 }
 
 /**
+ * Hand back an already-open session, flagging a request that asked for a
+ * different workout.
+ *
+ * A request that names a day or a programme is a request for THAT workout.
+ * Handing back an open session from another day used to happen silently, and
+ * the app then built the tapped day's draft on the old session's prescription:
+ * every planned exercise looked skipped and every new one looked added on the
+ * day. The flag lets the member choose between finishing the open workout and
+ * discarding it. A snapshot from before day_of_week was recorded cannot prove
+ * a mismatch; only a known different day is a conflict.
+ */
+function resumeResult(open, day, dayOfWeek, assignmentId) {
+  const requestedDay = dayOfWeek != null ? Number(day.day_of_week) : null;
+  const openDay = Number(open.prescribed?.day_of_week);
+  const sameDay = requestedDay === null || !Number.isFinite(openDay) || openDay === requestedDay;
+  const sameAssignment = !assignmentId || open.workout_assignment_id === assignmentId;
+  return sameDay && sameAssignment
+    ? { session: open, resumed: true }
+    : { session: open, resumed: true, conflict: true };
+}
+
+/**
  * Start a workout, or hand back the one already open.
  *
  * The prescription is snapshotted from exactly what the member was shown
@@ -591,7 +627,7 @@ async function startMyWorkout({ clientId, orgId, userId, plans, dayOfWeek, assig
   );
 
   const open = await openSessionFor(clientId, orgId);
-  if (open) return { session: open, resumed: true };
+  if (open) return resumeResult(open, day, dayOfWeek, assignmentId);
 
   // The same cap the one-shot path has always applied. Checked after resume:
   // a member who already has a session open may always finish it, even if
@@ -636,7 +672,7 @@ async function startMyWorkout({ clientId, orgId, userId, plans, dayOfWeek, assig
     if (err.code !== '23505') throw err;
     const winner = await openSessionFor(clientId, orgId);
     if (!winner) throw err;
-    result = { session: winner, resumed: true };
+    result = resumeResult(winner, day, dayOfWeek, assignmentId);
   }
   return result;
 }

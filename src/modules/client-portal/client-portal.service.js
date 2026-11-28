@@ -381,7 +381,7 @@ const num = (v) => (v === null || v === undefined ? null : Number(v));
 async function mySessions(clientId, orgId, { limit = 30 } = {}) {
   const { rows: sessions } = await pool.query(
     `SELECT id, session_date, program_name, workout_day, duration_minutes, status, source,
-            review_status, review_feedback
+            review_status, review_feedback, prescribed
        FROM workout_sessions
       WHERE client_id = $1 AND organization_id = $2
       ORDER BY session_date DESC, created_at DESC
@@ -392,10 +392,13 @@ async function mySessions(clientId, orgId, { limit = 30 } = {}) {
 
   const { rows: sets } = await pool.query(
     `SELECT e.session_id, e.id AS exercise_row_id, e.exercise_name, e.sort_order,
+            e.prescribed_index, e.exercise_id,
+            ex.prescription_mode_primary,
             s.set_number, s.weight_kg, s.reps, s.rpe, s.completed,
             s.is_pr_weight, s.is_pr_reps, s.is_pr_volume,
             s.duration_seconds, s.distance, s.distance_unit
        FROM workout_session_exercises e
+       LEFT JOIN exercises ex ON ex.id = e.exercise_id
        LEFT JOIN workout_sets s ON s.session_exercise_id = e.id
       WHERE e.session_id = ANY($1::text[])
       ORDER BY e.session_id, e.sort_order NULLS LAST, e.created_at, s.set_number NULLS LAST`,
@@ -407,7 +410,15 @@ async function mySessions(clientId, orgId, { limit = 30 } = {}) {
   for (const r of sets) {
     let ex = exerciseIndex.get(r.exercise_row_id);
     if (!ex) {
-      ex = { name: r.exercise_name, sets: [] };
+      ex = {
+        name: r.exercise_name,
+        prescribed_index: r.prescribed_index,
+        // The library's current mode is the fallback for an old session whose
+        // snapshot is gone. The snapshot below wins when it is there, because
+        // that is what the member was actually shown.
+        tracking_mode: r.prescription_mode_primary ?? null,
+        sets: [],
+      };
       exerciseIndex.set(r.exercise_row_id, ex);
       bySession.get(r.session_id)?.push(ex);
     }
@@ -435,7 +446,26 @@ async function mySessions(clientId, orgId, { limit = 30 } = {}) {
     source: s.source,
     review_status: s.review_status ?? null,
     review_feedback: s.review_feedback ?? null,
-    exercises: bySession.get(s.id) || [],
+    exercises: (bySession.get(s.id) || []).map((ex) => {
+      const planned = Number.isInteger(ex.prescribed_index)
+        ? s.prescribed?.exercises?.[ex.prescribed_index]
+        : null;
+      const trackingMode = planned?.tracking_mode ?? ex.tracking_mode ?? null;
+      return {
+        name: ex.name,
+        // What the member was shown when they started. A repeat must keep the
+        // mode, or a run comes back as kg × reps and a hold loses its timer.
+        // Absent when the session never had one, so the shape of an older
+        // strength log is unchanged.
+        ...(trackingMode == null ? {} : {
+          tracking_mode: trackingMode,
+          target_duration_seconds: planned?.target_duration_seconds ?? null,
+          target_distance: planned?.target_distance ?? null,
+          target_distance_unit: planned?.target_distance_unit ?? null,
+        }),
+        sets: ex.sets,
+      };
+    }),
   }));
 }
 

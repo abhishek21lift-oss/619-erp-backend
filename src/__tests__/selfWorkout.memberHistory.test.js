@@ -74,4 +74,75 @@ describe('GET /api/me/sessions', () => {
     const res = await request(app).get('/api/me/sessions').expect(200);
     expect(res.body.data[0]).toMatchObject({ review_status: null, review_feedback: null });
   });
+
+  // A repeat rebuilds the workout from this history. Without the mode and the
+  // timed/distance targets a run comes back as kg × reps.
+  it('returns the tracking mode and targets the prescription had', async () => {
+    mockResponder = (sql) => {
+      if (/FROM workout_sessions/.test(sql)) {
+        return { rows: [{
+          id: 'ws3', session_date: '2026-11-11', program_name: 'Base', workout_day: 'Tuesday',
+          duration_minutes: 25, status: 'completed', source: 'member',
+          review_status: null, review_feedback: null,
+          prescribed: {
+            day_of_week: 2,
+            exercises: [{
+              name: 'Run', tracking_mode: 'TIME_DISTANCE',
+              target_duration_seconds: 1200, target_distance: 5, target_distance_unit: 'km',
+            }],
+          },
+        }] };
+      }
+      if (/FROM workout_session_exercises e/.test(sql)) {
+        return { rows: [{
+          session_id: 'ws3', exercise_row_id: 'wse1', exercise_name: 'Run', sort_order: 1,
+          prescribed_index: 0, exercise_id: 'e9', exercise_type: 'cardio',
+          prescription_mode_primary: 'TIME_DISTANCE',
+          set_number: 1, weight_kg: null, reps: null, rpe: 6, completed: true,
+          is_pr_weight: false, is_pr_reps: false, is_pr_volume: false,
+          duration_seconds: 1200, distance: 5, distance_unit: 'km',
+        }] };
+      }
+      return { rows: [] };
+    };
+    const res = await request(app).get('/api/me/sessions').expect(200);
+    expect(res.body.data[0].exercises[0]).toMatchObject({
+      name: 'Run',
+      tracking_mode: 'TIME_DISTANCE',
+      target_duration_seconds: 1200,
+      target_distance: 5,
+      target_distance_unit: 'km',
+    });
+  });
+
+  // The tracking fields exist for the repeat. A strength session that never
+  // had a mode keeps the shape it always had: no new null keys in the payload.
+  it('leaves the tracking keys off a session that never had a mode', async () => {
+    mockResponder = (sql) => {
+      if (/FROM workout_sessions/.test(sql)) {
+        return { rows: [{
+          id: 'ws4', session_date: '2026-11-10', program_name: 'Base', workout_day: 'Monday',
+          duration_minutes: 40, status: 'completed', source: 'member',
+          review_status: null, review_feedback: null,
+          prescribed: { day_of_week: 1, exercises: [{ name: 'Back squat' }] },
+        }] };
+      }
+      if (/FROM workout_session_exercises e/.test(sql)) {
+        return { rows: [{
+          session_id: 'ws4', exercise_row_id: 'wse2', exercise_name: 'Back squat', sort_order: 1,
+          prescribed_index: 0, exercise_id: 'e1', exercise_type: 'strength',
+          prescription_mode_primary: null,
+          set_number: 1, weight_kg: 60, reps: 8, rpe: null, completed: true,
+          is_pr_weight: false, is_pr_reps: false, is_pr_volume: false,
+          duration_seconds: null, distance: null, distance_unit: null,
+        }] };
+      }
+      return { rows: [] };
+    };
+    const res = await request(app).get('/api/me/sessions').expect(200);
+    const exercise = res.body.data[0].exercises[0];
+    expect(exercise).toMatchObject({ name: 'Back squat' });
+    expect(exercise).not.toHaveProperty('tracking_mode');
+    expect(exercise).not.toHaveProperty('target_duration_seconds');
+  });
 });

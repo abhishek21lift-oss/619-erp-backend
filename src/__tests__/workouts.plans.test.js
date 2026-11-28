@@ -181,6 +181,36 @@ describe('trainer access — the module is usable by the people it is for', () =
   });
 });
 
+describe('exercise references are checked at the boundary', () => {
+  // exercise_id is client-supplied. Without this check a plan could reference
+  // another studio's exercise (and the plan detail would then show its name),
+  // or an archived movement the trainer can no longer see.
+  const invisibleExercise = () => {
+    pool.query.mockImplementation((sql) => {
+      if (/FROM exercises/.test(String(sql))) return Promise.resolve({ rows: [] });
+      return Promise.resolve({ rows: [{ id: PLAN, organization_id: ORG_A }] });
+    });
+  };
+
+  it('refuses to create a plan with an exercise this studio cannot see', async () => {
+    invisibleExercise();
+    const res = await request(app).post('/api/workouts/plans').send({
+      name: 'Borrowed', exercises: [{ exercise_id: 'other-studio-ex' }],
+    });
+    expect(res.status).toBe(404);
+    expect(sqls().some((s) => /INSERT INTO workout_plans|INSERT INTO workout_exercises/.test(s))).toBe(false);
+  });
+
+  it('refuses a whole-plan replace with an exercise this studio cannot see, before deleting', async () => {
+    invisibleExercise();
+    const res = await request(app).put(`/api/workouts/plans/${PLAN}`).send({
+      name: 'Borrowed', exercises: [{ exercise_id: 'other-studio-ex' }],
+    });
+    expect(res.status).toBe(404);
+    expect(sqls().some((s) => /DELETE FROM workout_exercises|UPDATE workout_plans SET/.test(s))).toBe(false);
+  });
+});
+
 describe('numeric coercion — a prescribed zero survives', () => {
   it('keeps sets: 0 and rest_seconds: 0 instead of substituting defaults', async () => {
     // `parseInt(0) || 3` is 3. A superset with no rest between movements is a

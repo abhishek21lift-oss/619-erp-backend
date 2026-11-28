@@ -177,7 +177,7 @@ describe('POST /api/me/workouts — the legacy one-shot log', () => {
       if (/FROM workout_sessions WHERE client_id = \$1 AND organization_id = \$2 AND client_request_id/.test(sql)) {
         return { rows: [] };
       }
-      if (/SELECT COUNT\(\*\)::int AS n FROM workout_sessions/.test(sql)) return { rows: [{ n: 0 }] };
+      if (/SELECT COUNT\(\*\)::int AS n/.test(sql)) return { rows: [{ n: 0 }] };
       if (/INSERT INTO workout_sessions/.test(sql)) return { rows: [{ id: 'ws-legacy' }] };
       if (/INSERT INTO workout_session_exercises/.test(sql)) return { rows: [{ id: 'wse-l' }] };
       return { rows: [] };
