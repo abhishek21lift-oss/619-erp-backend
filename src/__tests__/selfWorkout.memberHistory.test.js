@@ -114,4 +114,35 @@ describe('GET /api/me/sessions', () => {
       target_distance_unit: 'km',
     });
   });
+
+  // The tracking fields exist for the repeat. A strength session that never
+  // had a mode keeps the shape it always had: no new null keys in the payload.
+  it('leaves the tracking keys off a session that never had a mode', async () => {
+    mockResponder = (sql) => {
+      if (/FROM workout_sessions/.test(sql)) {
+        return { rows: [{
+          id: 'ws4', session_date: '2026-11-10', program_name: 'Base', workout_day: 'Monday',
+          duration_minutes: 40, status: 'completed', source: 'member',
+          review_status: null, review_feedback: null,
+          prescribed: { day_of_week: 1, exercises: [{ name: 'Back squat' }] },
+        }] };
+      }
+      if (/FROM workout_session_exercises e/.test(sql)) {
+        return { rows: [{
+          session_id: 'ws4', exercise_row_id: 'wse2', exercise_name: 'Back squat', sort_order: 1,
+          prescribed_index: 0, exercise_id: 'e1', exercise_type: 'strength',
+          prescription_mode_primary: null,
+          set_number: 1, weight_kg: 60, reps: 8, rpe: null, completed: true,
+          is_pr_weight: false, is_pr_reps: false, is_pr_volume: false,
+          duration_seconds: null, distance: null, distance_unit: null,
+        }] };
+      }
+      return { rows: [] };
+    };
+    const res = await request(app).get('/api/me/sessions').expect(200);
+    const exercise = res.body.data[0].exercises[0];
+    expect(exercise).toMatchObject({ name: 'Back squat' });
+    expect(exercise).not.toHaveProperty('tracking_mode');
+    expect(exercise).not.toHaveProperty('target_duration_seconds');
+  });
 });

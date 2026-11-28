@@ -450,14 +450,19 @@ async function mySessions(clientId, orgId, { limit = 30 } = {}) {
       const planned = Number.isInteger(ex.prescribed_index)
         ? s.prescribed?.exercises?.[ex.prescribed_index]
         : null;
+      const trackingMode = planned?.tracking_mode ?? ex.tracking_mode ?? null;
       return {
         name: ex.name,
         // What the member was shown when they started. A repeat must keep the
         // mode, or a run comes back as kg × reps and a hold loses its timer.
-        tracking_mode: planned?.tracking_mode ?? ex.tracking_mode ?? null,
-        target_duration_seconds: planned?.target_duration_seconds ?? null,
-        target_distance: planned?.target_distance ?? null,
-        target_distance_unit: planned?.target_distance_unit ?? null,
+        // Absent when the session never had one, so the shape of an older
+        // strength log is unchanged.
+        ...(trackingMode == null ? {} : {
+          tracking_mode: trackingMode,
+          target_duration_seconds: planned?.target_duration_seconds ?? null,
+          target_distance: planned?.target_distance ?? null,
+          target_distance_unit: planned?.target_distance_unit ?? null,
+        }),
         sets: ex.sets,
       };
     }),
